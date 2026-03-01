@@ -154,7 +154,7 @@ build_base() {
 # 构建 Hub 镜像（本地）
 build_hub() {
     echo ">>> Building hub image (local)..."
-    docker build --pull=false -f aether-hub/Dockerfile -t aether-hub:local ./aether-hub
+    docker build --pull=false --build-arg CARGO_MIRROR=1 -f aether-hub/Dockerfile -t aether-hub:local ./aether-hub
     save_hub_hash
 }
 
