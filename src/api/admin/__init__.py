@@ -13,6 +13,7 @@ from .pool import router as pool_router
 from .provider_oauth import router as provider_oauth_router
 from .provider_ops import router as provider_ops_router
 from .provider_query import router as provider_query_router
+from .provider_sync import router as provider_sync_router
 from .provider_strategy import router as provider_strategy_router
 from .providers import router as providers_router
 from .security import router as security_router
@@ -38,6 +39,7 @@ router.include_router(models_router)
 router.include_router(security_router)
 router.include_router(stats_router)
 router.include_router(provider_query_router)
+router.include_router(provider_sync_router)
 router.include_router(modules_router)
 router.include_router(pool_router)
 router.include_router(provider_ops_router)

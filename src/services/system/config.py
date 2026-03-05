@@ -143,6 +143,26 @@ class SystemConfigService:
             "value": "01:05",
             "description": "Provider 自动签到执行时间（HH:MM 格式，24小时制）",
         },
+        "enable_all_api_hub_sync": {
+            "value": False,
+            "description": "是否启用 all-api-hub WebDAV Cookie 自动同步任务",
+        },
+        "all_api_hub_sync_time": {
+            "value": "01:35",
+            "description": "all-api-hub WebDAV Cookie 自动同步执行时间（HH:MM 格式，24小时制）",
+        },
+        "all_api_hub_webdav_url": {
+            "value": None,
+            "description": "all-api-hub WebDAV 备份文件 URL",
+        },
+        "all_api_hub_webdav_username": {
+            "value": None,
+            "description": "all-api-hub WebDAV 用户名",
+        },
+        "all_api_hub_webdav_password": {
+            "value": None,
+            "description": "all-api-hub WebDAV 密码（加密存储）",
+        },
         "enable_user_quota_reset": {
             "value": False,
             "description": "是否启用用户配额自动重置任务（按配置时间触发，按周期执行）",
@@ -409,7 +429,7 @@ class SystemConfigService:
         )
 
     # 敏感配置项，不返回实际值
-    SENSITIVE_KEYS = {"smtp_password"}
+    SENSITIVE_KEYS = {"smtp_password", "all_api_hub_webdav_password"}
 
     @classmethod
     def get_all_configs(cls, db: Session) -> list:

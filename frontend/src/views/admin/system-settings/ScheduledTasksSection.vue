@@ -119,6 +119,40 @@
             </div>
           </div>
 
+          <!-- all-api-hub 同步额外配置 -->
+          <div
+            v-if="task.id === 'all-api-hub-sync' && task.enabled"
+            class="px-4 pb-4 pt-0 space-y-3"
+          >
+            <div class="p-3 rounded-lg bg-muted/30 border border-border/50 space-y-2">
+              <div class="text-xs text-muted-foreground">
+                WebDAV 配置
+              </div>
+              <Input
+                :model-value="allApiHubWebdavUrl"
+                placeholder="WebDAV 备份 URL，例如 https://dav.example.com/backup.json"
+                class="h-8 text-xs"
+                @update:model-value="$emit('update:allApiHubWebdavUrl', String($event || ''))"
+              />
+              <Input
+                :model-value="allApiHubWebdavUsername"
+                placeholder="WebDAV 用户名"
+                class="h-8 text-xs"
+                @update:model-value="$emit('update:allApiHubWebdavUsername', String($event || ''))"
+              />
+              <Input
+                :model-value="allApiHubWebdavPassword"
+                type="password"
+                placeholder="WebDAV 密码（留空表示不修改）"
+                class="h-8 text-xs"
+                @update:model-value="$emit('update:allApiHubWebdavPassword', String($event || ''))"
+              />
+            </div>
+            <p class="text-[11px] text-muted-foreground ml-1">
+              同步时按站点域名匹配提供商（网站名称可不同）
+            </p>
+          </div>
+
           <!-- 额外配置区域（仅用户配额重置任务有） -->
           <div
             v-if="task.id === 'user-quota-reset' && task.enabled"
@@ -281,6 +315,9 @@ interface StandaloneKeyOption {
 
 defineProps<{
   scheduledTasks: ScheduledTask[]
+  allApiHubWebdavUrl: string
+  allApiHubWebdavUsername: string
+  allApiHubWebdavPassword: string
   quotaResetIntervalDays: number
   standaloneKeyResetIntervalDays: number
   standaloneKeyResetMode: string
@@ -289,6 +326,9 @@ defineProps<{
 }>()
 
 defineEmits<{
+  'update:allApiHubWebdavUrl': [value: string]
+  'update:allApiHubWebdavUsername': [value: string]
+  'update:allApiHubWebdavPassword': [value: string]
   'update:quotaResetIntervalDays': [value: number]
   'update:standaloneKeyResetIntervalDays': [value: number]
   'update:standaloneKeyResetMode': [value: string]

@@ -34,6 +34,11 @@ export interface SystemConfig {
   // 定时任务
   enable_provider_checkin: boolean
   provider_checkin_time: string
+  enable_all_api_hub_sync: boolean
+  all_api_hub_sync_time: string
+  all_api_hub_webdav_url: string
+  all_api_hub_webdav_username: string
+  all_api_hub_webdav_password: string
   enable_user_quota_reset: boolean
   user_quota_reset_time: string
   user_quota_reset_interval_days: number
@@ -76,6 +81,11 @@ const CONFIG_KEYS = [
   // 定时任务
   'enable_provider_checkin',
   'provider_checkin_time',
+  'enable_all_api_hub_sync',
+  'all_api_hub_sync_time',
+  'all_api_hub_webdav_url',
+  'all_api_hub_webdav_username',
+  'all_api_hub_webdav_password',
   'enable_user_quota_reset',
   'user_quota_reset_time',
   'user_quota_reset_interval_days',
@@ -119,6 +129,11 @@ function createDefaultConfig(): SystemConfig {
     // 定时任务
     enable_provider_checkin: true,
     provider_checkin_time: '01:05',
+    enable_all_api_hub_sync: false,
+    all_api_hub_sync_time: '01:35',
+    all_api_hub_webdav_url: '',
+    all_api_hub_webdav_username: '',
+    all_api_hub_webdav_password: '',
     enable_user_quota_reset: false,
     user_quota_reset_time: '05:00',
     user_quota_reset_interval_days: 1,
