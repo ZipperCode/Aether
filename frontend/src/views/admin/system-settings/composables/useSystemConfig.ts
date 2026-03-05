@@ -35,6 +35,7 @@ export interface SystemConfig {
   enable_provider_checkin: boolean
   provider_checkin_time: string
   enable_all_api_hub_sync: boolean
+  enable_all_api_hub_auto_create_provider_ops: boolean
   all_api_hub_sync_time: string
   all_api_hub_webdav_url: string
   all_api_hub_webdav_username: string
@@ -82,6 +83,7 @@ const CONFIG_KEYS = [
   'enable_provider_checkin',
   'provider_checkin_time',
   'enable_all_api_hub_sync',
+  'enable_all_api_hub_auto_create_provider_ops',
   'all_api_hub_sync_time',
   'all_api_hub_webdav_url',
   'all_api_hub_webdav_username',
@@ -130,6 +132,7 @@ function createDefaultConfig(): SystemConfig {
     enable_provider_checkin: true,
     provider_checkin_time: '01:05',
     enable_all_api_hub_sync: false,
+    enable_all_api_hub_auto_create_provider_ops: true,
     all_api_hub_sync_time: '01:35',
     all_api_hub_webdav_url: '',
     all_api_hub_webdav_username: '',

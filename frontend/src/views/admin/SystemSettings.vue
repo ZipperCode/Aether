@@ -113,6 +113,7 @@
           <ScheduledTasksSection
             id="section-scheduled"
             :scheduled-tasks="scheduledTasks"
+            :all-api-hub-auto-create-provider-ops="systemConfig.enable_all_api_hub_auto_create_provider_ops"
             :all-api-hub-webdav-url="systemConfig.all_api_hub_webdav_url"
             :all-api-hub-webdav-username="systemConfig.all_api_hub_webdav_username"
             :all-api-hub-webdav-password="systemConfig.all_api_hub_webdav_password"
@@ -121,6 +122,7 @@
             :standalone-key-reset-mode="systemConfig.standalone_key_quota_reset_mode"
             :standalone-key-reset-key-ids="systemConfig.standalone_key_quota_reset_key_ids"
             :standalone-keys="standaloneKeys"
+            @update:all-api-hub-auto-create-provider-ops="systemConfig.enable_all_api_hub_auto_create_provider_ops = $event"
             @update:all-api-hub-webdav-url="systemConfig.all_api_hub_webdav_url = $event"
             @update:all-api-hub-webdav-username="systemConfig.all_api_hub_webdav_username = $event"
             @update:all-api-hub-webdav-password="systemConfig.all_api_hub_webdav_password = $event"

@@ -18,6 +18,7 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
   const previousAllApiHubSyncTime = ref('')
   const previousAllApiHubWebdavUrl = ref('')
   const previousAllApiHubWebdavUsername = ref('')
+  const previousAllApiHubAutoCreateProviderOps = ref(true)
   // 用户配额重置时间的原始值
   const previousUserQuotaResetTime = ref('')
   const previousUserQuotaResetIntervalDays = ref(1)
@@ -31,6 +32,8 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
     previousAllApiHubSyncTime.value = systemConfig.value.all_api_hub_sync_time
     previousAllApiHubWebdavUrl.value = systemConfig.value.all_api_hub_webdav_url
     previousAllApiHubWebdavUsername.value = systemConfig.value.all_api_hub_webdav_username
+    previousAllApiHubAutoCreateProviderOps.value =
+      systemConfig.value.enable_all_api_hub_auto_create_provider_ops
     previousUserQuotaResetTime.value = systemConfig.value.user_quota_reset_time
     previousUserQuotaResetIntervalDays.value = systemConfig.value.user_quota_reset_interval_days
     previousStandaloneKeyResetTime.value = systemConfig.value.standalone_key_quota_reset_time
@@ -80,6 +83,8 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
       systemConfig.value.all_api_hub_sync_time !== previousAllApiHubSyncTime.value ||
       systemConfig.value.all_api_hub_webdav_url !== previousAllApiHubWebdavUrl.value ||
       systemConfig.value.all_api_hub_webdav_username !== previousAllApiHubWebdavUsername.value ||
+      systemConfig.value.enable_all_api_hub_auto_create_provider_ops !==
+      previousAllApiHubAutoCreateProviderOps.value ||
       !!systemConfig.value.all_api_hub_webdav_password
     )
   })
@@ -248,6 +253,8 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
     systemConfig.value.all_api_hub_sync_time = previousAllApiHubSyncTime.value
     systemConfig.value.all_api_hub_webdav_url = previousAllApiHubWebdavUrl.value
     systemConfig.value.all_api_hub_webdav_username = previousAllApiHubWebdavUsername.value
+    systemConfig.value.enable_all_api_hub_auto_create_provider_ops =
+      previousAllApiHubAutoCreateProviderOps.value
     systemConfig.value.all_api_hub_webdav_password = ''
   }
 
@@ -408,6 +415,21 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
         description: 'all-api-hub WebDAV 密码（加密存储）',
         onSuccess: () => {
           systemConfig.value.all_api_hub_webdav_password = ''
+        },
+      })
+    }
+
+    if (
+      systemConfig.value.enable_all_api_hub_auto_create_provider_ops !==
+      previousAllApiHubAutoCreateProviderOps.value
+    ) {
+      const enabled = systemConfig.value.enable_all_api_hub_auto_create_provider_ops
+      configItems.push({
+        key: 'enable_all_api_hub_auto_create_provider_ops',
+        value: enabled,
+        description: 'all-api-hub 同步时是否自动创建缺失 provider_ops 配置',
+        onSuccess: () => {
+          previousAllApiHubAutoCreateProviderOps.value = enabled
         },
       })
     }

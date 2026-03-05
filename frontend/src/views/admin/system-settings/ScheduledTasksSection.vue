@@ -128,6 +128,18 @@
               <div class="text-xs text-muted-foreground">
                 WebDAV 配置
               </div>
+              <label class="flex items-center justify-between gap-3 rounded-md border border-border/60 bg-background/70 px-3 py-2">
+                <div class="space-y-0.5">
+                  <div class="text-xs font-medium">自动补全 provider_ops</div>
+                  <div class="text-[11px] text-muted-foreground">
+                    域名匹配成功但未配置 provider_ops 时，自动创建最小可用配置
+                  </div>
+                </div>
+                <Switch
+                  :model-value="allApiHubAutoCreateProviderOps"
+                  @update:model-value="$emit('update:allApiHubAutoCreateProviderOps', Boolean($event))"
+                />
+              </label>
               <Input
                 :model-value="allApiHubWebdavUrl"
                 placeholder="WebDAV 备份 URL，例如 https://dav.example.com/backup.json"
@@ -315,6 +327,7 @@ interface StandaloneKeyOption {
 
 defineProps<{
   scheduledTasks: ScheduledTask[]
+  allApiHubAutoCreateProviderOps: boolean
   allApiHubWebdavUrl: string
   allApiHubWebdavUsername: string
   allApiHubWebdavPassword: string
@@ -326,6 +339,7 @@ defineProps<{
 }>()
 
 defineEmits<{
+  'update:allApiHubAutoCreateProviderOps': [value: boolean]
   'update:allApiHubWebdavUrl': [value: string]
   'update:allApiHubWebdavUsername': [value: string]
   'update:allApiHubWebdavPassword': [value: string]
