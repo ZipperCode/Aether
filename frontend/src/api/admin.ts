@@ -204,6 +204,64 @@ export interface CheckUpdateResponse {
   error: string | null
 }
 
+export interface SiteSyncRun {
+  id: string
+  trigger_source: string
+  status: string
+  error_message?: string | null
+  dry_run: boolean
+  total_accounts: number
+  total_providers: number
+  matched_providers: number
+  updated_providers: number
+  skipped_no_provider_ops: number
+  skipped_no_cookie: number
+  skipped_not_changed: number
+  started_at?: string | null
+  finished_at?: string | null
+  created_at?: string | null
+}
+
+export interface SiteSyncItem {
+  id: string
+  domain: string
+  site_url?: string | null
+  provider_id?: string | null
+  provider_name?: string | null
+  status: string
+  message?: string | null
+  cookie_field?: string | null
+  before_fingerprint?: string | null
+  after_fingerprint?: string | null
+  created_at?: string | null
+}
+
+export interface SiteCheckinRun {
+  id: string
+  trigger_source: string
+  status: string
+  error_message?: string | null
+  total_providers: number
+  success_count: number
+  failed_count: number
+  skipped_count: number
+  started_at?: string | null
+  finished_at?: string | null
+  created_at?: string | null
+}
+
+export interface SiteCheckinItem {
+  id: string
+  provider_id?: string | null
+  provider_name?: string | null
+  provider_domain?: string | null
+  status: string
+  message?: string | null
+  balance_total?: number | null
+  balance_currency?: string | null
+  created_at?: string | null
+}
+
 // LDAP 配置响应
 export interface LdapConfigResponse {
   server_url: string | null
@@ -702,6 +760,58 @@ export const adminApi = {
   async checkUpdate(): Promise<CheckUpdateResponse> {
     const response = await apiClient.get<CheckUpdateResponse>(
       '/api/admin/system/check-update'
+    )
+    return response.data
+  },
+
+  // Site management
+  async triggerSiteSync(payload: { dry_run?: boolean; backup?: Record<string, unknown> }): Promise<{
+    run_id: string
+    total_accounts: number
+    total_providers: number
+    matched_providers: number
+    updated_providers: number
+    skipped_no_provider_ops: number
+    skipped_no_cookie: number
+    skipped_not_changed: number
+    dry_run: boolean
+  }> {
+    const response = await apiClient.post('/api/admin/site-management/sync/trigger', payload)
+    return response.data
+  },
+
+  async triggerSiteCheckin(): Promise<{ ok: boolean; latest_run_id?: string | null }> {
+    const response = await apiClient.post('/api/admin/site-management/checkin/trigger')
+    return response.data
+  },
+
+  async getSiteSyncRuns(limit = 20): Promise<SiteSyncRun[]> {
+    const response = await apiClient.get<SiteSyncRun[]>('/api/admin/site-management/sync-runs', {
+      params: { limit },
+    })
+    return response.data
+  },
+
+  async getSiteSyncRunItems(runId: string, limit = 500): Promise<SiteSyncItem[]> {
+    const response = await apiClient.get<SiteSyncItem[]>(
+      `/api/admin/site-management/sync-runs/${runId}/items`,
+      { params: { limit } }
+    )
+    return response.data
+  },
+
+  async getSiteCheckinRuns(limit = 20): Promise<SiteCheckinRun[]> {
+    const response = await apiClient.get<SiteCheckinRun[]>(
+      '/api/admin/site-management/checkin-runs',
+      { params: { limit } }
+    )
+    return response.data
+  },
+
+  async getSiteCheckinRunItems(runId: string, limit = 500): Promise<SiteCheckinItem[]> {
+    const response = await apiClient.get<SiteCheckinItem[]>(
+      `/api/admin/site-management/checkin-runs/${runId}/items`,
+      { params: { limit } }
     )
     return response.data
   },

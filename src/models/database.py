@@ -2148,6 +2148,145 @@ class AuditLog(Base):
     user = relationship("User", back_populates="audit_logs")
 
 
+class SiteSyncRun(Base):
+    """站点同步运行记录（all-api-hub WebDAV Cookie 同步）"""
+
+    __tablename__ = "site_sync_runs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    trigger_source = Column(String(20), nullable=False, default="scheduled")  # scheduled/manual
+    status = Column(String(20), nullable=False, default="success")  # success/failed/partial
+    error_message = Column(Text, nullable=True)
+    dry_run = Column(Boolean, default=False, nullable=False)
+
+    total_accounts = Column(Integer, default=0, nullable=False)
+    total_providers = Column(Integer, default=0, nullable=False)
+    matched_providers = Column(Integer, default=0, nullable=False)
+    updated_providers = Column(Integer, default=0, nullable=False)
+    skipped_no_provider_ops = Column(Integer, default=0, nullable=False)
+    skipped_no_cookie = Column(Integer, default=0, nullable=False)
+    skipped_not_changed = Column(Integer, default=0, nullable=False)
+
+    started_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True,
+    )
+
+    items = relationship(
+        "SiteSyncItem",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class SiteSyncItem(Base):
+    """站点同步明细记录（按域名）"""
+
+    __tablename__ = "site_sync_items"
+    __table_args__ = (
+        Index("idx_site_sync_items_run_status", "run_id", "status"),
+        Index("idx_site_sync_items_domain", "domain"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    run_id = Column(
+        String(36),
+        ForeignKey("site_sync_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    domain = Column(String(255), nullable=False)
+    site_url = Column(String(500), nullable=True)
+
+    provider_id = Column(String(36), nullable=True)
+    provider_name = Column(String(100), nullable=True)
+
+    status = Column(String(30), nullable=False)  # updated/not_changed/no_provider_ops/no_cookie/unmatched
+    message = Column(Text, nullable=True)
+    cookie_field = Column(String(50), nullable=True)
+    before_fingerprint = Column(String(20), nullable=True)
+    after_fingerprint = Column(String(20), nullable=True)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    run = relationship("SiteSyncRun", back_populates="items")
+
+
+class SiteCheckinRun(Base):
+    """站点签到运行记录（provider_ops balance/checkin）"""
+
+    __tablename__ = "site_checkin_runs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    trigger_source = Column(String(20), nullable=False, default="scheduled")  # scheduled/manual
+    status = Column(String(20), nullable=False, default="success")  # success/failed/partial
+    error_message = Column(Text, nullable=True)
+
+    total_providers = Column(Integer, default=0, nullable=False)
+    success_count = Column(Integer, default=0, nullable=False)
+    failed_count = Column(Integer, default=0, nullable=False)
+    skipped_count = Column(Integer, default=0, nullable=False)
+
+    started_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True,
+    )
+
+    items = relationship(
+        "SiteCheckinItem",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class SiteCheckinItem(Base):
+    """站点签到明细记录（按 Provider）"""
+
+    __tablename__ = "site_checkin_items"
+    __table_args__ = (
+        Index("idx_site_checkin_items_run_status", "run_id", "status"),
+        Index("idx_site_checkin_items_provider", "provider_id"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    run_id = Column(
+        String(36),
+        ForeignKey("site_checkin_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider_id = Column(String(36), nullable=True)
+    provider_name = Column(String(100), nullable=True)
+    provider_domain = Column(String(255), nullable=True)
+
+    status = Column(String(20), nullable=False)  # success/failed/skipped
+    message = Column(Text, nullable=True)
+    balance_total = Column(Float, nullable=True)
+    balance_currency = Column(String(10), nullable=True)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    run = relationship("SiteCheckinRun", back_populates="items")
+
+
 class RequestCandidate(Base):
     """请求候选记录 - 追踪所有候选（包括未使用的）"""
 
