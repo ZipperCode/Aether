@@ -10,6 +10,7 @@ class ImportedAccount:
     domain: str
     session_cookie: str
     site_url: str
+    auth_type: str = "cookie"
 
 
 def _normalize_domain(site_url: str) -> str:
@@ -55,10 +56,19 @@ def parse_all_api_hub_accounts(raw: dict[str, Any]) -> list[ImportedAccount]:
         if not domain:
             continue
 
+        auth_type = str(account.get("authType") or "cookie").strip().lower()
         cookie_auth = account.get("cookieAuth")
         session_cookie = ""
         if isinstance(cookie_auth, dict):
             session_cookie = str(cookie_auth.get("sessionCookie") or "").strip()
+
+        # 新版 all-api-hub 结构：access_token 保存在 account_info 下
+        if not session_cookie:
+            account_info = account.get("account_info")
+            if isinstance(account_info, dict):
+                session_cookie = str(account_info.get("access_token") or "").strip()
+            if not session_cookie:
+                session_cookie = str(account.get("access_token") or "").strip()
 
         if not session_cookie:
             continue
@@ -68,6 +78,7 @@ def parse_all_api_hub_accounts(raw: dict[str, Any]) -> list[ImportedAccount]:
                 domain=domain,
                 session_cookie=session_cookie,
                 site_url=site_url,
+                auth_type=auth_type,
             )
         )
 

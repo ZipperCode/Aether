@@ -654,6 +654,14 @@ class AdminSetSystemConfigAdapter(AdminApiAdapter):
         payload = context.ensure_json_body()
         value = payload.get("value")
 
+        # WebDAV 配置统一做首尾空白裁剪，避免粘贴换行导致认证失败
+        if self.key in {
+            "all_api_hub_webdav_url",
+            "all_api_hub_webdav_username",
+            "all_api_hub_webdav_password",
+        } and isinstance(value, str):
+            value = value.strip()
+
         # 对敏感配置进行加密
         if self.key in self.ENCRYPTED_KEYS and value:
             from src.core.crypto import crypto_service
