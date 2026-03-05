@@ -27,6 +27,7 @@ from src.core.logger import logger
 from src.database import create_session
 from src.models.database import ApiKey, AuditLog, Provider, RequestCandidate, Usage
 from src.services.provider_ops.service import ProviderOpsService
+from src.services.provider_sync import AllApiHubSyncService
 from src.services.system.config import SystemConfigService
 from src.services.system.scheduler import get_scheduler
 from src.services.system.stats_aggregator import StatsAggregatorService
@@ -43,6 +44,8 @@ class MaintenanceScheduler:
     USER_QUOTA_RESET_JOB_ID = "user_quota_reset"
     # 独立密钥额度重置任务的 job_id
     STANDALONE_KEY_QUOTA_RESET_JOB_ID = "standalone_key_quota_reset"
+    # all-api-hub 同步任务的 job_id
+    ALL_API_HUB_SYNC_JOB_ID = "all_api_hub_sync"
 
     def __init__(self) -> None:
         self.running = False
@@ -72,6 +75,15 @@ class MaintenanceScheduler:
         try:
             time_str = SystemConfigService.get_config(db, "user_quota_reset_time", "05:00")
             return self._parse_user_quota_reset_time_string(time_str)
+        finally:
+            db.close()
+
+    def _get_all_api_hub_sync_time(self) -> tuple[int, int]:
+        """获取 all-api-hub 同步任务的执行时间"""
+        db = create_session()
+        try:
+            time_str = SystemConfigService.get_config(db, "all_api_hub_sync_time", "01:35")
+            return self._parse_all_api_hub_sync_time_string(time_str)
         finally:
             db.close()
 
@@ -117,6 +129,21 @@ class MaintenanceScheduler:
             return (5, 0)
         except (ValueError, IndexError):
             return (5, 0)
+
+    @staticmethod
+    def _parse_all_api_hub_sync_time_string(time_str: str) -> tuple[int, int]:
+        """解析 all-api-hub 同步时间字符串为 (hour, minute) 元组"""
+        try:
+            if not time_str or ":" not in time_str:
+                return (1, 35)
+            parts = time_str.split(":")
+            hour = int(parts[0])
+            minute = int(parts[1])
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return (hour, minute)
+            return (1, 35)
+        except (ValueError, IndexError):
+            return (1, 35)
 
     def update_checkin_time(self, time_str: str) -> bool:
         """更新签到任务的执行时间
@@ -189,6 +216,20 @@ class MaintenanceScheduler:
         if success:
             logger.info(f"独立密钥额度重置任务时间已更新为: {hour:02d}:{minute:02d}")
 
+        return success
+
+    def update_all_api_hub_sync_time(self, time_str: str) -> bool:
+        """更新 all-api-hub 同步任务的执行时间"""
+        hour, minute = self._parse_all_api_hub_sync_time_string(time_str)
+
+        scheduler = get_scheduler()
+        success = scheduler.reschedule_cron_job(
+            self.ALL_API_HUB_SYNC_JOB_ID,
+            hour=hour,
+            minute=minute,
+        )
+        if success:
+            logger.info("all-api-hub 同步任务时间已更新为: {:02d}:{:02d}", hour, minute)
         return success
 
     def get_checkin_job_info(self) -> dict | None:
@@ -318,6 +359,16 @@ class MaintenanceScheduler:
             name="Provider签到",
         )
 
+        # all-api-hub Cookie 同步任务 - 根据配置时间执行
+        all_api_hub_sync_hour, all_api_hub_sync_minute = self._get_all_api_hub_sync_time()
+        scheduler.add_cron_job(
+            self._scheduled_all_api_hub_sync,
+            hour=all_api_hub_sync_hour,
+            minute=all_api_hub_sync_minute,
+            job_id=self.ALL_API_HUB_SYNC_JOB_ID,
+            name="all-api-hub Cookie同步",
+        )
+
         # 用户配额重置任务 - 根据配置时间执行（按周期配置决定是否执行）
         quota_reset_hour, quota_reset_minute = self._get_user_quota_reset_time()
         scheduler.add_cron_job(
@@ -441,6 +492,10 @@ class MaintenanceScheduler:
     async def _scheduled_standalone_key_quota_reset(self) -> None:
         """独立密钥额度重置任务（定时调用）"""
         await self._perform_standalone_key_quota_reset()
+
+    async def _scheduled_all_api_hub_sync(self) -> None:
+        """all-api-hub Cookie 同步任务（定时调用）"""
+        await self._perform_all_api_hub_sync()
 
     # ========== 实际任务实现 ==========
 
@@ -1070,6 +1125,39 @@ class MaintenanceScheduler:
                 db.rollback()
             except Exception:
                 pass
+        finally:
+            db.close()
+
+    async def _perform_all_api_hub_sync(self) -> None:
+        """执行 all-api-hub WebDAV 同步任务"""
+        db = create_session()
+        try:
+            if not SystemConfigService.get_config(db, "enable_all_api_hub_sync", False):
+                logger.info("all-api-hub 同步任务未启用，跳过")
+                return
+
+            url = SystemConfigService.get_config(db, "all_api_hub_webdav_url")
+            username = SystemConfigService.get_config(db, "all_api_hub_webdav_username")
+            password = SystemConfigService.get_config(db, "all_api_hub_webdav_password")
+            if not url or not username or not password:
+                logger.warning("all-api-hub 同步配置不完整，需配置 url/username/password")
+                return
+
+            result = await AllApiHubSyncService().sync_from_webdav(
+                db,
+                url=url,
+                username=username,
+                password=password,
+                dry_run=False,
+            )
+            logger.info(
+                "all-api-hub 同步完成: accounts={}, matched={}, updated={}",
+                result.total_accounts,
+                result.matched_providers,
+                result.updated_providers,
+            )
+        except Exception as e:
+            logger.exception("all-api-hub 同步任务执行失败: {}", e)
         finally:
             db.close()
 

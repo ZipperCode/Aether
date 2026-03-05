@@ -631,7 +631,7 @@ class AdminGetSystemConfigAdapter(AdminApiAdapter):
     key: str
 
     # 敏感配置项，不返回实际值
-    SENSITIVE_KEYS = {"smtp_password"}
+    SENSITIVE_KEYS = {"smtp_password", "all_api_hub_webdav_password"}
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         value = SystemConfigService.get_config(context.db, self.key)
@@ -648,7 +648,7 @@ class AdminSetSystemConfigAdapter(AdminApiAdapter):
     key: str
 
     # 需要加密存储的配置项
-    ENCRYPTED_KEYS = {"smtp_password"}
+    ENCRYPTED_KEYS = {"smtp_password", "all_api_hub_webdav_password"}
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         payload = context.ensure_json_body()
@@ -696,6 +696,16 @@ class AdminSetSystemConfigAdapter(AdminApiAdapter):
                 scheduler.update_standalone_key_quota_reset_time(value)
             except Exception as e:
                 logger.warning(f"更新独立密钥额度重置任务时间失败: {e}")
+
+        # 如果更新的是 all-api-hub 同步任务时间，动态更新调度器
+        if self.key == "all_api_hub_sync_time" and value:
+            try:
+                from src.services.system.maintenance_scheduler import get_maintenance_scheduler
+
+                scheduler = get_maintenance_scheduler()
+                scheduler.update_all_api_hub_sync_time(value)
+            except Exception as e:
+                logger.warning(f"更新 all-api-hub 同步任务时间失败: {e}")
 
         # 如果更新的是调度模式或优先级模式，立即更新当前 Worker 的 Scheduler 单例
         if self.key in ("scheduling_mode", "provider_priority_mode"):
@@ -1047,7 +1057,7 @@ class AdminExportConfigAdapter(AdminApiAdapter):
         from src.models.database import SystemConfig
 
         # 敏感配置项需要解密导出
-        SENSITIVE_CONFIG_KEYS = {"smtp_password"}
+        SENSITIVE_CONFIG_KEYS = {"smtp_password", "all_api_hub_webdav_password"}
         system_configs = db.query(SystemConfig).all()
         system_configs_data = []
         for cfg in system_configs:
@@ -1786,7 +1796,7 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                 from src.models.database import SystemConfig
 
                 # 敏感配置项需要加密存储
-                SENSITIVE_CONFIG_KEYS = {"smtp_password"}
+                SENSITIVE_CONFIG_KEYS = {"smtp_password", "all_api_hub_webdav_password"}
 
                 for cfg_item in system_configs_data:
                     cfg_key = cfg_item.get("key")
