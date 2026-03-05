@@ -28,7 +28,7 @@ from src.config import config
 from src.core.exceptions import ExceptionHandlers, ProxyException
 from src.core.logger import logger
 from src.core.modules import get_module_registry
-from src.database import init_db
+from src.database import create_session, init_db
 from src.middleware.plugin_middleware import PluginMiddleware
 from src.plugins.manager import get_plugin_manager
 
@@ -74,6 +74,31 @@ async def initialize_providers() -> None:
 
     except Exception:
         logger.exception("从数据库初始化提供商失败")
+
+
+async def _run_module_lifecycle_hooks(
+    modules: list[Any],
+    module_registry: Any,
+    *,
+    phase: str,
+) -> None:
+    """仅对已启用模块执行生命周期钩子。"""
+    if phase not in {"startup", "shutdown"}:
+        raise ValueError("phase must be 'startup' or 'shutdown'")
+
+    db = create_session()
+    try:
+        for module in modules:
+            module_name = module.metadata.name
+            hook = module.on_startup if phase == "startup" else module.on_shutdown
+            if not hook:
+                continue
+            if not module_registry.is_enabled(module_name, db):
+                logger.info("模块 [{}] 未启用，跳过 {} 钩子", module_name, phase)
+                continue
+            await hook()
+    finally:
+        db.close()
 
 
 @asynccontextmanager
@@ -212,9 +237,8 @@ async def lifespan(app: FastAPI) -> Any:
             prefix = module.metadata.api_prefix or "(default)"
             logger.info(f"模块 [{module.metadata.name}] 路由已注册: {prefix}")
 
-        # 执行启动钩子
-        if module.on_startup:
-            await module.on_startup()
+    # 执行启动钩子（仅启用模块）
+    await _run_module_lifecycle_hooks(available_modules, module_registry, phase="startup")
 
     logger.info(f"功能模块初始化完成: {len(available_modules)}/{len(ALL_MODULES)} 个模块可用")
 
@@ -354,9 +378,8 @@ async def lifespan(app: FastAPI) -> Any:
 
     # 关闭功能模块
     logger.info("关闭功能模块...")
-    for module in available_modules:
-        if module.on_shutdown:
-            await module.on_shutdown()
+    module_registry = get_module_registry()
+    await _run_module_lifecycle_hooks(available_modules, module_registry, phase="shutdown")
 
     # 关闭并发管理器
     logger.info("关闭并发管理器...")
