@@ -75,6 +75,8 @@ docker compose -f docker-compose.build.yml up -d postgres redis
 
 # 后端
 uv sync
+# 首次建议执行一次迁移
+uv run alembic upgrade head
 ./dev.sh
 
 # 前端
