@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.core.crypto import crypto_service
 from src.services.system.maintenance_scheduler import MaintenanceScheduler
 
 
@@ -53,7 +54,8 @@ async def test_provider_sync_enabled_runs(monkeypatch):
             "enable_all_api_hub_sync": True,
             "all_api_hub_webdav_url": "https://dav.example.com/backup.json",
             "all_api_hub_webdav_username": "u",
-            "all_api_hub_webdav_password": "p",
+            "all_api_hub_webdav_password": crypto_service.encrypt("p"),
+            "enable_all_api_hub_auto_create_provider_ops": True,
         }
         return data.get(key, default)
 
@@ -85,3 +87,51 @@ async def test_provider_sync_enabled_runs(monkeypatch):
     assert kwargs["username"] == "u"
     assert kwargs["password"] == "p"
     assert kwargs["dry_run"] is False
+    assert kwargs["auto_create_provider_ops"] is True
+
+
+@pytest.mark.asyncio
+async def test_provider_sync_respects_auto_create_toggle(monkeypatch):
+    scheduler = MaintenanceScheduler()
+
+    mock_db = MagicMock()
+    monkeypatch.setattr(
+        "src.services.system.maintenance_scheduler.create_session",
+        lambda: mock_db,
+    )
+
+    def fake_get_config(cls, db, key, default=None):
+        data = {
+            "enable_all_api_hub_sync": True,
+            "all_api_hub_webdav_url": "https://dav.example.com/backup.json",
+            "all_api_hub_webdav_username": "u",
+            "all_api_hub_webdav_password": crypto_service.encrypt("p"),
+            "enable_all_api_hub_auto_create_provider_ops": False,
+        }
+        return data.get(key, default)
+
+    monkeypatch.setattr(
+        "src.services.system.maintenance_scheduler.SystemConfigService.get_config",
+        classmethod(fake_get_config),
+    )
+
+    sync_mock = AsyncMock(
+        return_value=MagicMock(
+            total_accounts=1,
+            matched_providers=1,
+            updated_providers=0,
+            skipped_no_provider_ops=1,
+            skipped_no_cookie=0,
+            skipped_not_changed=0,
+        )
+    )
+    monkeypatch.setattr(
+        "src.services.system.maintenance_scheduler.AllApiHubSyncService.sync_from_webdav",
+        sync_mock,
+    )
+
+    await scheduler._perform_all_api_hub_sync()
+
+    sync_mock.assert_awaited_once()
+    _, kwargs = sync_mock.await_args
+    assert kwargs["auto_create_provider_ops"] is False

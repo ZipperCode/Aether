@@ -163,6 +163,10 @@ class SystemConfigService:
             "value": None,
             "description": "all-api-hub WebDAV 密码（加密存储）",
         },
+        "enable_all_api_hub_auto_create_provider_ops": {
+            "value": True,
+            "description": "all-api-hub 同步时是否自动为匹配域名但未配置 provider_ops 的 Provider 创建最小配置",
+        },
         "enable_user_quota_reset": {
             "value": False,
             "description": "是否启用用户配额自动重置任务（按配置时间触发，按周期执行）",

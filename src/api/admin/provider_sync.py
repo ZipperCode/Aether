@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,6 +10,8 @@ from sqlalchemy.orm import Session
 from src.database import get_db
 from src.models.database import User
 from src.services.provider_sync import AllApiHubSyncService
+from src.services.site_management import SiteManagementLogService
+from src.services.system.config import SystemConfigService
 from src.utils.auth_utils import require_admin
 
 router = APIRouter(prefix="/api/admin/provider-sync", tags=["Provider Sync"])
@@ -31,9 +34,21 @@ async def trigger_sync(
     _: User = Depends(require_admin),
 ) -> Any:
     service = AllApiHubSyncService()
+    auto_create_provider_ops = SystemConfigService.get_config(
+        db,
+        "enable_all_api_hub_auto_create_provider_ops",
+        True,
+    )
+    started_at = datetime.now(timezone.utc)
+    run_id: str | None = None
     try:
         if payload.backup is not None:
-            result = service.sync_from_backup_object(db, payload.backup, dry_run=payload.dry_run)
+            result = service.sync_from_backup_object(
+                db,
+                payload.backup,
+                dry_run=payload.dry_run,
+                auto_create_provider_ops=bool(auto_create_provider_ops),
+            )
         else:
             result = await service.sync_from_webdav(
                 db,
@@ -41,11 +56,33 @@ async def trigger_sync(
                 username=payload.username,
                 password=payload.password,
                 dry_run=payload.dry_run,
+                auto_create_provider_ops=bool(auto_create_provider_ops),
             )
+        run = SiteManagementLogService.record_sync_run(
+            db=db,
+            trigger_source="manual",
+            status="success",
+            result=result,
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+        run_id = run.id
     except ValueError as exc:
+        try:
+            SiteManagementLogService.record_sync_run(
+                db=db,
+                trigger_source="manual",
+                status="failed",
+                error_message=str(exc),
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return {
+        "run_id": run_id,
         "total_accounts": result.total_accounts,
         "total_providers": result.total_providers,
         "matched_providers": result.matched_providers,

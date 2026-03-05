@@ -28,6 +28,8 @@ from src.database import create_session
 from src.models.database import ApiKey, AuditLog, Provider, RequestCandidate, Usage
 from src.services.provider_ops.service import ProviderOpsService
 from src.services.provider_sync import AllApiHubSyncService
+from src.services.site_management import SiteManagementLogService
+from src.services.site_management.log_service import CheckinItemLog
 from src.services.system.config import SystemConfigService
 from src.services.system.scheduler import get_scheduler
 from src.services.system.stats_aggregator import StatsAggregatorService
@@ -483,7 +485,7 @@ class MaintenanceScheduler:
 
     async def _scheduled_provider_checkin(self) -> None:
         """Provider 签到任务（定时调用）"""
-        await self._perform_provider_checkin()
+        await self._perform_provider_checkin(trigger_source="scheduled")
 
     async def _scheduled_user_quota_reset(self) -> None:
         """用户配额重置任务（定时调用）"""
@@ -495,7 +497,7 @@ class MaintenanceScheduler:
 
     async def _scheduled_all_api_hub_sync(self) -> None:
         """all-api-hub Cookie 同步任务（定时调用）"""
-        await self._perform_all_api_hub_sync()
+        await self._perform_all_api_hub_sync(trigger_source="scheduled")
 
     # ========== 实际任务实现 ==========
 
@@ -811,24 +813,41 @@ class MaintenanceScheduler:
         finally:
             db.close()
 
-    async def _perform_provider_checkin(self) -> None:
+    async def _perform_provider_checkin(
+        self,
+        *,
+        trigger_source: str = "scheduled",
+        ignore_enabled: bool = False,
+    ) -> None:
         """执行 Provider 签到任务
 
         遍历所有已配置 provider_ops 的 Provider，触发签到。
         签到会在余额查询时一起执行（先签到再查询余额）。
         """
         db = create_session()
+        started_at = datetime.now(timezone.utc)
         try:
-            # 检查是否启用签到任务
-            if not SystemConfigService.get_config(db, "enable_provider_checkin", True):
+            # 自动任务受配置开关控制；手动触发可忽略该开关
+            if not ignore_enabled and not SystemConfigService.get_config(
+                db, "enable_provider_checkin", True
+            ):
                 logger.info("Provider 签到已禁用，跳过签到任务")
                 return
 
             # 获取所有已配置 provider_ops 的活跃 Provider（只查询需要的字段）
             providers = (
-                db.query(Provider.id, Provider.config).filter(Provider.is_active.is_(True)).all()
+                db.query(Provider.id, Provider.name, Provider.website, Provider.config)
+                .filter(Provider.is_active.is_(True))
+                .all()
             )
             provider_ids = [p.id for p in providers if p.config and p.config.get("provider_ops")]
+            provider_meta_by_id: dict[str, dict[str, str]] = {
+                str(p.id): {
+                    "name": str(p.name or ""),
+                    "domain": AllApiHubSyncService._normalize_domain(getattr(p, "website", None)),
+                }
+                for p in providers
+            }
 
             if not provider_ids:
                 logger.info("无已配置的 Provider，跳过签到任务")
@@ -856,7 +875,7 @@ class MaintenanceScheduler:
             concurrency = 3  # 签到任务并发数
             semaphore = asyncio.Semaphore(concurrency)
 
-            async def _checkin_provider(provider_id: str) -> tuple[str, bool, str]:
+            async def _checkin_provider(provider_id: str) -> tuple[str, str, str, float | None, str | None]:
                 """执行单个 Provider 的签到"""
                 async with semaphore:
                     task_db = create_session()
@@ -867,19 +886,42 @@ class MaintenanceScheduler:
                         # 检查签到结果
                         checkin_success = None
                         checkin_message = ""
+                        balance_total = None
+                        balance_currency = None
+                        if result.data:
+                            balance_total = getattr(result.data, "total_available", None)
+                            balance_currency = getattr(result.data, "currency", None)
                         if result.data and hasattr(result.data, "extra") and result.data.extra:
                             checkin_success = result.data.extra.get("checkin_success")
                             checkin_message = result.data.extra.get("checkin_message", "")
                         if checkin_success is True:
-                            return provider_id, True, checkin_message
+                            return (
+                                provider_id,
+                                "success",
+                                checkin_message,
+                                balance_total,
+                                balance_currency,
+                            )
                         elif checkin_success is False:
-                            return provider_id, False, checkin_message
+                            return (
+                                provider_id,
+                                "failed",
+                                checkin_message,
+                                balance_total,
+                                balance_currency,
+                            )
                         else:
                             # None 表示未执行签到（可能没配置 Cookie）
-                            return provider_id, False, "未执行签到"
+                            return (
+                                provider_id,
+                                "skipped",
+                                "未执行签到",
+                                balance_total,
+                                balance_currency,
+                            )
                     except Exception as e:
                         logger.warning(f"Provider {provider_id} 签到失败: {e}")
-                        return provider_id, False, str(e)
+                        return provider_id, "failed", str(e), None, None
                     finally:
                         try:
                             task_db.close()
@@ -891,18 +933,70 @@ class MaintenanceScheduler:
             results = await asyncio.gather(*tasks)
 
             # 统计结果
-            success_count = sum(1 for _, success, _ in results if success)
+            success_count = sum(1 for _, status, _, _, _ in results if status == "success")
+            failed_count = sum(1 for _, status, _, _, _ in results if status == "failed")
+            skipped_count = sum(1 for _, status, _, _, _ in results if status == "skipped")
             logger.info(f"Provider 签到完成: {success_count}/{len(provider_ids)} 成功")
 
             # 记录详细结果
-            for provider_id, success, message in results:
-                if success:
+            item_logs = []
+            for provider_id, status, message, balance_total, balance_currency in results:
+                if status == "success":
                     logger.debug(f"  - {provider_id}: 签到成功 - {message}")
                 elif message != "未执行签到":
                     logger.debug(f"  - {provider_id}: 签到失败 - {message}")
+                meta = provider_meta_by_id.get(provider_id) or {"name": "", "domain": ""}
+                item_logs.append(
+                    {
+                        "provider_id": provider_id,
+                        "provider_name": meta["name"],
+                        "provider_domain": meta["domain"],
+                        "status": status,
+                        "message": message,
+                        "balance_total": balance_total,
+                        "balance_currency": balance_currency,
+                    }
+                )
+
+            logs_db = create_session()
+            try:
+                SiteManagementLogService.record_checkin_run(
+                    db=logs_db,
+                    trigger_source=trigger_source,
+                    status="success",
+                    total_providers=len(provider_ids),
+                    success_count=success_count,
+                    failed_count=failed_count,
+                    skipped_count=skipped_count,
+                    items=[CheckinItemLog(**item) for item in item_logs],
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc),
+                )
+            finally:
+                logs_db.close()
 
         except Exception as e:
             logger.exception(f"Provider 签到任务执行失败: {e}")
+            try:
+                logs_db = create_session()
+                try:
+                    SiteManagementLogService.record_checkin_run(
+                        db=logs_db,
+                        trigger_source=trigger_source,
+                        status="failed",
+                        total_providers=0,
+                        success_count=0,
+                        failed_count=0,
+                        skipped_count=0,
+                        items=[],
+                        error_message=str(e),
+                        started_at=started_at,
+                        finished_at=datetime.now(timezone.utc),
+                    )
+                finally:
+                    logs_db.close()
+            except Exception:
+                pass
         finally:
             if db is not None:
                 db.close()
@@ -1128,9 +1222,10 @@ class MaintenanceScheduler:
         finally:
             db.close()
 
-    async def _perform_all_api_hub_sync(self) -> None:
+    async def _perform_all_api_hub_sync(self, trigger_source: str = "scheduled") -> None:
         """执行 all-api-hub WebDAV 同步任务"""
         db = create_session()
+        started_at = datetime.now(timezone.utc)
         try:
             if not SystemConfigService.get_config(db, "enable_all_api_hub_sync", False):
                 logger.info("all-api-hub 同步任务未启用，跳过")
@@ -1138,7 +1233,17 @@ class MaintenanceScheduler:
 
             url = SystemConfigService.get_config(db, "all_api_hub_webdav_url")
             username = SystemConfigService.get_config(db, "all_api_hub_webdav_username")
-            password = SystemConfigService.get_config(db, "all_api_hub_webdav_password")
+            password_raw = SystemConfigService.get_config(db, "all_api_hub_webdav_password")
+            auto_create_provider_ops = SystemConfigService.get_config(
+                db,
+                "enable_all_api_hub_auto_create_provider_ops",
+                True,
+            )
+            try:
+                password = SiteManagementLogService.resolve_system_password(password_raw)
+            except Exception:
+                logger.warning("all-api-hub WebDAV 密码解密失败，请重新保存配置")
+                return
             if not url or not username or not password:
                 logger.warning("all-api-hub 同步配置不完整，需配置 url/username/password")
                 return
@@ -1149,6 +1254,15 @@ class MaintenanceScheduler:
                 username=username,
                 password=password,
                 dry_run=False,
+                auto_create_provider_ops=bool(auto_create_provider_ops),
+            )
+            SiteManagementLogService.record_sync_run(
+                db=db,
+                trigger_source=trigger_source,
+                status="success",
+                result=result,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
             )
             logger.info(
                 "all-api-hub 同步完成: accounts={}, matched={}, updated={}",
@@ -1158,6 +1272,17 @@ class MaintenanceScheduler:
             )
         except Exception as e:
             logger.exception("all-api-hub 同步任务执行失败: {}", e)
+            try:
+                SiteManagementLogService.record_sync_run(
+                    db=db,
+                    trigger_source=trigger_source,
+                    status="failed",
+                    error_message=str(e),
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc),
+                )
+            except Exception:
+                pass
         finally:
             db.close()
 

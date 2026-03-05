@@ -155,3 +155,112 @@ async def test_sync_from_webdav_uses_downloader() -> None:
     assert result.updated_providers == 1
     encrypted = provider.config["provider_ops"]["connector"]["credentials"]["session_cookie"]
     assert crypto_service.decrypt(encrypted) == "session=from-webdav"
+
+
+def test_sync_updates_access_token_credentials_by_domain() -> None:
+    provider = _provider(
+        "p2",
+        "https://example.com",
+        {
+            "provider_ops": {
+                "architecture_id": "new_api",
+                "connector": {
+                    "auth_type": "access_token",
+                    "config": {},
+                    "credentials": {"access_token": crypto_service.encrypt("old-token")},
+                },
+            }
+        },
+    )
+    db = _FakeSession([provider])
+
+    service = AllApiHubSyncService()
+    backup = {
+        "version": "2.0",
+        "accounts": {
+            "accounts": [
+                {
+                    "site_url": "https://example.com",
+                    "authType": "access_token",
+                    "account_info": {"access_token": "new-token"},
+                }
+            ]
+        },
+    }
+
+    result = service.sync_from_backup_object(db, backup)
+
+    assert result.matched_providers == 1
+    assert result.updated_providers == 1
+    assert db.commit_calls == 1
+    encrypted = provider.config["provider_ops"]["connector"]["credentials"]["access_token"]
+    assert crypto_service.decrypt(encrypted) == "new-token"
+
+
+def test_sync_auto_creates_provider_ops_for_access_token_account() -> None:
+    provider = _provider(
+        "p3",
+        "https://auto.example.com",
+        {
+            "some_other_config": True,
+        },
+    )
+    db = _FakeSession([provider])
+
+    service = AllApiHubSyncService()
+    backup = {
+        "version": "2.0",
+        "accounts": {
+            "accounts": [
+                {
+                    "site_url": "https://auto.example.com",
+                    "authType": "access_token",
+                    "account_info": {"access_token": "auto-token"},
+                }
+            ]
+        },
+    }
+
+    result = service.sync_from_backup_object(db, backup)
+
+    assert result.matched_providers == 1
+    assert result.updated_providers == 1
+    assert result.skipped_no_provider_ops == 0
+    assert db.commit_calls == 1
+    provider_ops = provider.config["provider_ops"]
+    assert provider_ops["architecture_id"] == "new_api"
+    encrypted = provider_ops["connector"]["credentials"]["api_key"]
+    assert crypto_service.decrypt(encrypted) == "auto-token"
+
+
+def test_sync_skips_auto_create_when_disabled() -> None:
+    provider = _provider(
+        "p4",
+        "https://auto.example.com",
+        {
+            "some_other_config": True,
+        },
+    )
+    db = _FakeSession([provider])
+
+    service = AllApiHubSyncService()
+    backup = {
+        "version": "2.0",
+        "accounts": {
+            "accounts": [
+                {
+                    "site_url": "https://auto.example.com",
+                    "authType": "access_token",
+                    "account_info": {"access_token": "auto-token"},
+                }
+            ]
+        },
+    }
+
+    result = service.sync_from_backup_object(db, backup, auto_create_provider_ops=False)
+
+    assert result.matched_providers == 1
+    assert result.updated_providers == 0
+    assert result.skipped_no_provider_ops == 1
+    assert db.commit_calls == 0
+    assert provider.config.get("provider_ops") is None
