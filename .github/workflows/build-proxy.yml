@@ -11,8 +11,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  GHCR_IMAGE: fawney19/aether-proxy
-  DOCKERHUB_IMAGE: fawney19/aether-proxy
+  GHCR_IMAGE: zippercode/aether-proxy
+  DOCKERHUB_IMAGE: zippercode/aether-proxy
 
 jobs:
   build:
@@ -98,6 +98,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    environment: production
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Download all artifacts
@@ -196,7 +197,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           VERSION="${TAG#proxy-v}"
-          BASE="https://github.com/fawney19/Aether/releases/download/${TAG}"
+          BASE="https://github.com/ZipperCode/Aether/releases/download/${TAG}"
           cd aether-proxy
 
           TABLE="| Platform | Download |\n|----------|----------|\n"
