@@ -257,8 +257,51 @@ export interface SiteCheckinItem {
   provider_domain?: string | null
   status: string
   message?: string | null
+  manual_verification_required?: boolean
   balance_total?: number | null
   balance_currency?: string | null
+  created_at?: string | null
+}
+
+export interface SiteManagementAccount {
+  site_url: string
+  domain: string
+  provider_id?: string | null
+  provider_name?: string | null
+  checkin_enabled?: boolean
+  auth_type: string
+  user_id?: string | null
+  access_token?: string | null
+  cookie?: string | null
+}
+
+export interface SiteSyncTriggerResponse {
+  run_id: string
+  total_accounts: number
+  total_providers: number
+  matched_providers: number
+  updated_providers: number
+  skipped_no_provider_ops: number
+  skipped_no_cookie: number
+  skipped_not_changed: number
+  checkin_pref_updated?: number
+  dry_run: boolean
+}
+
+export interface SiteManualCheckinResponse {
+  status: string
+  action_type: string
+  data: unknown
+  message?: string | null
+  executed_at: string
+  response_time_ms?: number | null
+  cache_ttl_seconds: number
+}
+
+export interface SiteProviderCheckinStatus {
+  status: string
+  message?: string | null
+  manual_verification_required?: boolean
   created_at?: string | null
 }
 
@@ -765,18 +808,46 @@ export const adminApi = {
   },
 
   // Site management
-  async triggerSiteSync(payload: { dry_run?: boolean; backup?: Record<string, unknown> }): Promise<{
-    run_id: string
-    total_accounts: number
-    total_providers: number
-    matched_providers: number
-    updated_providers: number
-    skipped_no_provider_ops: number
-    skipped_no_cookie: number
-    skipped_not_changed: number
-    dry_run: boolean
-  }> {
-    const response = await apiClient.post('/api/admin/site-management/sync/trigger', payload)
+  async triggerSiteSync(
+    payload: { dry_run?: boolean; backup?: Record<string, unknown> }
+  ): Promise<SiteSyncTriggerResponse> {
+    const response = await apiClient.post<SiteSyncTriggerResponse>(
+      '/api/admin/site-management/sync/trigger',
+      payload
+    )
+    return response.data
+  },
+
+  async getSiteAccounts(): Promise<SiteManagementAccount[]> {
+    const response = await apiClient.get<SiteManagementAccount[]>('/api/admin/site-management/accounts')
+    return response.data
+  },
+
+  async applySiteAccountsSync(payload: {
+    accounts: SiteManagementAccount[]
+    dry_run?: boolean
+  }): Promise<SiteSyncTriggerResponse> {
+    const response = await apiClient.post<SiteSyncTriggerResponse>(
+      '/api/admin/site-management/accounts/apply-sync',
+      payload
+    )
+    return response.data
+  },
+
+  async checkinProvider(providerId: string): Promise<SiteManualCheckinResponse> {
+    const response = await apiClient.post<SiteManualCheckinResponse>(
+      `/api/admin/provider-ops/providers/${providerId}/checkin`
+    )
+    return response.data
+  },
+
+  async getSiteAccountsCheckinStatuses(
+    providerIds: string[]
+  ): Promise<Record<string, SiteProviderCheckinStatus>> {
+    const response = await apiClient.post<Record<string, SiteProviderCheckinStatus>>(
+      '/api/admin/site-management/accounts/checkin-statuses',
+      { provider_ids: providerIds }
+    )
     return response.data
   },
 

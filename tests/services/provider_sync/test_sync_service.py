@@ -197,6 +197,145 @@ def test_sync_updates_access_token_credentials_by_domain() -> None:
     assert crypto_service.decrypt(encrypted) == "new-token"
 
 
+def test_sync_updates_new_api_user_id_for_access_token_credentials() -> None:
+    provider = _provider(
+        "p2b",
+        "https://example.com",
+        {
+            "provider_ops": {
+                "architecture_id": "new_api",
+                "connector": {
+                    "auth_type": "access_token",
+                    "config": {},
+                    "credentials": {
+                        "access_token": crypto_service.encrypt("old-token"),
+                        "user_id": "old-user",
+                    },
+                },
+            }
+        },
+    )
+    db = _FakeSession([provider])
+
+    service = AllApiHubSyncService()
+    backup = {
+        "version": "2.0",
+        "accounts": {
+            "accounts": [
+                {
+                    "site_url": "https://example.com",
+                    "authType": "access_token",
+                    "account_info": {
+                        "access_token": "new-token",
+                        "user_id": "new-user",
+                    },
+                }
+            ]
+        },
+    }
+
+    result = service.sync_from_backup_object(db, backup)
+
+    assert result.matched_providers == 1
+    assert result.updated_providers == 1
+    assert db.commit_calls == 1
+    credentials = provider.config["provider_ops"]["connector"]["credentials"]
+    assert crypto_service.decrypt(credentials["access_token"]) == "new-token"
+    assert credentials["user_id"] == "new-user"
+
+
+def test_sync_writes_cookie_for_new_api_when_backup_contains_cookie() -> None:
+    provider = _provider(
+        "p2c",
+        "https://example.com",
+        {
+            "provider_ops": {
+                "architecture_id": "new_api",
+                "connector": {
+                    "auth_type": "access_token",
+                    "config": {},
+                    "credentials": {
+                        "api_key": crypto_service.encrypt("old-token"),
+                        "user_id": "old-user",
+                    },
+                },
+            }
+        },
+    )
+    db = _FakeSession([provider])
+
+    service = AllApiHubSyncService()
+    backup = {
+        "version": "2.0",
+        "accounts": {
+            "accounts": [
+                {
+                    "site_url": "https://example.com",
+                    "authType": "access_token",
+                    "cookieAuth": {"sessionCookie": "session=from-cookie"},
+                    "account_info": {
+                        "access_token": "new-token",
+                        "user_id": "new-user",
+                    },
+                }
+            ]
+        },
+    }
+
+    result = service.sync_from_backup_object(db, backup)
+
+    assert result.matched_providers == 1
+    assert result.updated_providers == 1
+    assert db.commit_calls == 1
+    credentials = provider.config["provider_ops"]["connector"]["credentials"]
+    assert crypto_service.decrypt(credentials["cookie"]) == "session=from-cookie"
+
+
+def test_sync_clears_stale_user_id_when_backup_has_only_username() -> None:
+    provider = _provider(
+        "p2d",
+        "https://example.com",
+        {
+            "provider_ops": {
+                "architecture_id": "new_api",
+                "connector": {
+                    "auth_type": "access_token",
+                    "config": {},
+                    "credentials": {
+                        "api_key": crypto_service.encrypt("old-token"),
+                        "user_id": "stale-username",
+                    },
+                },
+            }
+        },
+    )
+    db = _FakeSession([provider])
+
+    service = AllApiHubSyncService()
+    backup = {
+        "version": "2.0",
+        "accounts": {
+            "accounts": [
+                {
+                    "site_url": "https://example.com",
+                    "authType": "access_token",
+                    "account_info": {
+                        "access_token": "new-token",
+                        "username": "alice",
+                    },
+                }
+            ]
+        },
+    }
+
+    result = service.sync_from_backup_object(db, backup)
+
+    assert result.updated_providers == 1
+    credentials = provider.config["provider_ops"]["connector"]["credentials"]
+    assert crypto_service.decrypt(credentials["api_key"]) == "new-token"
+    assert credentials.get("user_id", "") == ""
+
+
 def test_sync_auto_creates_provider_ops_for_access_token_account() -> None:
     provider = _provider(
         "p3",
@@ -215,7 +354,7 @@ def test_sync_auto_creates_provider_ops_for_access_token_account() -> None:
                 {
                     "site_url": "https://auto.example.com",
                     "authType": "access_token",
-                    "account_info": {"access_token": "auto-token"},
+                    "account_info": {"access_token": "auto-token", "user_id": "uid-1"},
                 }
             ]
         },
@@ -229,8 +368,9 @@ def test_sync_auto_creates_provider_ops_for_access_token_account() -> None:
     assert db.commit_calls == 1
     provider_ops = provider.config["provider_ops"]
     assert provider_ops["architecture_id"] == "new_api"
-    encrypted = provider_ops["connector"]["credentials"]["api_key"]
-    assert crypto_service.decrypt(encrypted) == "auto-token"
+    credentials = provider_ops["connector"]["credentials"]
+    assert crypto_service.decrypt(credentials["api_key"]) == "auto-token"
+    assert credentials["user_id"] == "uid-1"
 
 
 def test_sync_skips_auto_create_when_disabled() -> None:

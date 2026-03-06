@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from src.core.logger import logger
 from src.database import get_db
 from src.models.database import Provider, User
 from src.services.provider_ops import (
@@ -26,6 +27,9 @@ from src.services.provider_ops import (
     ProviderOpsService,
     get_registry,
 )
+from src.services.provider_sync import AllApiHubSyncService
+from src.services.site_management import SiteManagementLogService
+from src.services.site_management.log_service import CheckinItemLog
 from src.utils.auth_utils import require_admin
 
 router = APIRouter(prefix="/api/admin/provider-ops", tags=["Provider Operations"])
@@ -477,13 +481,100 @@ async def checkin(
     _: User = Depends(require_admin),
 ) -> Any:
     """签到（快捷方法）"""
+    started_at = None
+    provider = db.query(Provider).filter(Provider.id == provider_id).first()
+    provider_name = str(provider.name or "") if provider else ""
+    provider_domain = str(provider.website or "") if provider else ""
+    normalized_domain = AllApiHubSyncService._normalize_domain(provider_domain)
+    logger.info(
+        "手动签到开始: provider_id={}, provider_name={}, provider_domain={}",
+        provider_id,
+        provider_name,
+        provider_domain,
+    )
+
     service = ProviderOpsService(db)
+    from datetime import datetime, timezone
+
+    started_at = datetime.now(timezone.utc)
     result = await service.checkin(provider_id)
+    serialized_data = _serialize_data(result.data)
+    data_keys: list[str] = list(serialized_data.keys()) if isinstance(serialized_data, dict) else []
+
+    logger.info(
+        "手动签到完成: provider_id={}, status={}, message={}, response_time_ms={}, cache_ttl_seconds={}, data_keys={}",
+        provider_id,
+        result.status.value,
+        result.message,
+        result.response_time_ms,
+        result.cache_ttl_seconds,
+        data_keys,
+    )
+    if result.status.value != "success":
+        logger.warning(
+            "手动签到失败详情: provider_id={}, provider_name={}, provider_domain={}, action_type={}, message={}, data={}",
+            provider_id,
+            provider_name,
+            provider_domain,
+            result.action_type.value,
+            result.message,
+            serialized_data,
+        )
+    else:
+        logger.debug(
+            "手动签到成功详情: provider_id={}, action_type={}, data={}",
+            provider_id,
+            result.action_type.value,
+            serialized_data,
+        )
+
+    item_status = "failed"
+    checkin_success_value = None
+    if isinstance(serialized_data, dict):
+        checkin_success_value = serialized_data.get("checkin_success")
+    if result.status.value in {"success"}:
+        if checkin_success_value is True:
+            item_status = "success"
+        else:
+            item_status = "skipped"
+    elif result.status.value in {"already_done", "not_supported"}:
+        item_status = "skipped"
+    manual_verification_required = False
+    if isinstance(serialized_data, dict):
+        manual_verification_required = bool(serialized_data.get("manual_verification_required"))
+    item_message = str(result.message or "")
+    if manual_verification_required and item_message and "需手动核验" not in item_message:
+        item_message = f"{item_message}（需手动核验）"
+
+    try:
+        SiteManagementLogService.record_checkin_run(
+            db=db,
+            trigger_source="manual_single",
+            status="success" if item_status in {"success", "skipped"} else "failed",
+            total_providers=1,
+            success_count=1 if item_status == "success" else 0,
+            failed_count=1 if item_status == "failed" else 0,
+            skipped_count=1 if item_status == "skipped" else 0,
+            items=[
+                CheckinItemLog(
+                    provider_id=provider_id,
+                    provider_name=provider_name,
+                    provider_domain=normalized_domain,
+                    status=item_status,
+                    message=item_message,
+                )
+            ],
+            error_message=item_message if item_status == "failed" else None,
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+    except Exception as exc:
+        logger.warning("写入手动签到运行记录失败: provider_id={}, error={}", provider_id, exc)
 
     return ActionResultResponse(
         status=result.status.value,
         action_type=result.action_type.value,
-        data=_serialize_data(result.data),
+        data=serialized_data,
         message=result.message,
         executed_at=result.executed_at.isoformat(),
         response_time_ms=result.response_time_ms,

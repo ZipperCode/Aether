@@ -19,6 +19,16 @@ from src.services.provider_ops.architectures.base import (
 )
 from src.services.provider_ops.types import ConnectorAuthType, ProviderActionType
 
+COMPAT_USER_ID_HEADER_NAMES = (
+    "New-Api-User",
+    "New-API-User",
+    "Veloera-User",
+    "voapi-user",
+    "User-id",
+    "Rix-Api-User",
+    "neo-api-user",
+)
+
 
 class NewApiConnector(ProviderConnector):
     """
@@ -26,7 +36,7 @@ class NewApiConnector(ProviderConnector):
 
     特点：
     - 使用 Bearer Token 认证
-    - 需要 New-Api-User Header 传递用户 ID
+    - 可选 New-Api-User Header（部分站点需要）
     """
 
     auth_type = ConnectorAuthType.API_KEY
@@ -41,17 +51,18 @@ class NewApiConnector(ProviderConnector):
     async def connect(self, credentials: dict[str, Any]) -> bool:
         """建立连接"""
         api_key = credentials.get("api_key")
-        cookie = credentials.get("cookie")
+        cookie = (
+            credentials.get("cookie")
+            or credentials.get("session_cookie")
+            or credentials.get("cookie_string")
+            or credentials.get("auth_cookie")
+            or credentials.get("token_cookie")
+        )
         user_id = credentials.get("user_id")
 
         # api_key 和 cookie 至少需要一个
         if not api_key and not cookie:
             self._set_error("访问令牌和 Cookie 至少需要填写一个")
-            return False
-
-        # 使用 api_key 时必须提供 user_id，使用 cookie 时 user_id 可选
-        if api_key and not cookie and not user_id:
-            self._set_error("使用访问令牌时，用户 ID 不能为空")
             return False
 
         self._api_key = api_key
@@ -69,10 +80,10 @@ class NewApiConnector(ProviderConnector):
 
     async def is_authenticated(self) -> bool:
         """检查是否已认证"""
-        # 有 cookie 就行，或者有 api_key + user_id
+        # 有 cookie 或 api_key 即可视为已认证
         if self._cookie:
             return True
-        return self._api_key is not None and self._user_id is not None
+        return self._api_key is not None
 
     def _apply_auth(self, request: httpx.Request) -> httpx.Request:
         """为请求应用认证信息"""
@@ -83,7 +94,8 @@ class NewApiConnector(ProviderConnector):
         if self._api_key:
             request.headers["Authorization"] = f"Bearer {self._api_key}"
         if self._user_id:
-            request.headers["New-Api-User"] = self._user_id
+            for header_name in COMPAT_USER_ID_HEADER_NAMES:
+                request.headers[header_name] = self._user_id
         if self._cookie:
             request.headers["Cookie"] = self._cookie
         return request
@@ -109,7 +121,7 @@ class NewApiConnector(ProviderConnector):
                 "user_id": {
                     "type": "string",
                     "title": "用户 ID",
-                    "description": "使用访问令牌时必填，使用 Cookie 时可选",
+                    "description": "可选；仅部分站点需要 New-Api-User Header",
                 },
                 "cookie": {
                     "type": "string",
@@ -140,13 +152,6 @@ class NewApiConnector(ProviderConnector):
                     "fields": ["api_key", "cookie"],
                     "message": "访问令牌和 Cookie 至少需要填写一个",
                 },
-                {
-                    "type": "conditional_required",
-                    "if": "api_key",
-                    "unless": "cookie",
-                    "then": ["user_id"],
-                    "message": "使用访问令牌时，用户 ID 不能为空",
-                },
             ],
             "x-quota-divisor": 500000,
             "x-currency": "USD",
@@ -167,7 +172,7 @@ class NewApiArchitecture(ProviderArchitecture):
 
     特点：
     - 使用 Bearer Token 认证
-    - 需要 New-Api-User Header 传递用户 ID
+    - 可选 New-Api-User Header
     - 验证端点: /api/user/self
     - quota 单位通常是 1/500000 美元
     """
@@ -194,7 +199,7 @@ class NewApiArchitecture(ProviderArchitecture):
     }
 
     def get_credentials_schema(self) -> dict[str, Any]:
-        """New API 需要 api_key 和 user_id"""
+        """New API 需要 api_key，user_id 可选"""
         return NewApiConnector.get_credentials_schema()
 
     def get_verify_endpoint(self) -> str:
@@ -209,7 +214,7 @@ class NewApiArchitecture(ProviderArchitecture):
         """
         构建 New API 的验证请求 Headers
 
-        New API 特有：需要 New-Api-User Header 传递用户 ID
+        New API 可选 New-Api-User Header 传递用户 ID
         """
         # 以浏览器指纹 Headers 为基础，绕过 Cloudflare 等防护
         headers: dict[str, str] = {**BROWSER_FINGERPRINT_HEADERS}
@@ -222,7 +227,9 @@ class NewApiArchitecture(ProviderArchitecture):
         # New API 特有的 header
         user_id = credentials.get("user_id", "")
         if user_id:
-            headers["New-Api-User"] = str(user_id)
+            user_id_value = str(user_id)
+            for header_name in COMPAT_USER_ID_HEADER_NAMES:
+                headers[header_name] = user_id_value
 
         # 可选的 Cookie
         cookie = credentials.get("cookie", "")

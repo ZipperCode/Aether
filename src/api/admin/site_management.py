@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from src.database import get_db
-from src.models.database import SiteCheckinItem, SiteCheckinRun, SiteSyncItem, SiteSyncRun, User
+from src.models.database import Provider, SiteCheckinItem, SiteCheckinRun, SiteSyncItem, SiteSyncRun, User
 from src.services.provider_sync import AllApiHubSyncService
+from src.services.provider_sync.all_api_hub_backup import parse_all_api_hub_accounts
+from src.services.provider_sync.webdav_client import download_backup
 from src.services.site_management import SiteManagementLogService
 from src.services.system.config import SystemConfigService
 from src.services.system.maintenance_scheduler import get_maintenance_scheduler
@@ -18,12 +22,159 @@ from src.utils.auth_utils import require_admin
 router = APIRouter(prefix="/api/admin/site-management", tags=["Site Management"])
 
 
+def _checkin_message_requires_manual_verification(message: str | None) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    indicators = ("turnstile", "captcha", "验证码", "需手动核验", "manual verification")
+    return any(ind in text for ind in indicators)
+
+
 class TriggerSiteSyncRequest(BaseModel):
     dry_run: bool = Field(False, description="Preview mode, do not mutate provider cookies")
     backup: dict[str, Any] | None = Field(
         None,
         description="Optional inline backup payload (for testing/manual preview)",
     )
+
+
+class SiteManagementAccount(BaseModel):
+    site_url: str
+    domain: str
+    provider_id: str | None = None
+    provider_name: str | None = None
+    checkin_enabled: bool = True
+    auth_type: str = "cookie"
+    user_id: str | None = None
+    access_token: str | None = None
+    cookie: str | None = None
+
+
+class ApplySiteAccountsSyncRequest(BaseModel):
+    accounts: list[SiteManagementAccount]
+    dry_run: bool = False
+
+
+class SiteAccountsCheckinStatusRequest(BaseModel):
+    provider_ids: list[str] = Field(default_factory=list)
+
+
+def _build_backup_from_accounts(accounts: list[SiteManagementAccount]) -> dict[str, Any]:
+    payload_accounts: list[dict[str, Any]] = []
+    for account in accounts:
+        auth_type = (account.auth_type or "cookie").strip().lower()
+        item: dict[str, Any] = {
+            "site_url": (account.site_url or "").strip(),
+            "authType": auth_type,
+        }
+
+        user_id = (account.user_id or "").strip()
+        if user_id:
+            item["user_id"] = user_id
+
+        cookie_value = (account.cookie or "").strip()
+        if cookie_value:
+            item["cookieAuth"] = {"cookie": cookie_value}
+
+        access_token = (account.access_token or "").strip()
+        account_info: dict[str, Any] = {}
+        if access_token:
+            account_info["access_token"] = access_token
+        if user_id:
+            account_info["user_id"] = user_id
+        if account_info:
+            item["account_info"] = account_info
+
+        payload_accounts.append(item)
+
+    return {
+        "version": "2.0",
+        "accounts": {
+            "accounts": payload_accounts,
+        },
+    }
+
+
+async def _load_webdav_backup_payload(db: Session) -> dict[str, Any]:
+    url = SystemConfigService.get_config(db, "all_api_hub_webdav_url")
+    username = SystemConfigService.get_config(db, "all_api_hub_webdav_username")
+    password_raw = SystemConfigService.get_config(db, "all_api_hub_webdav_password")
+    if not url or not username or not password_raw:
+        raise HTTPException(status_code=400, detail="WebDAV 配置不完整，请先在系统设置中完成配置")
+    try:
+        password = SiteManagementLogService.resolve_system_password(password_raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="WebDAV 密码解密失败，请在系统设置中重新保存密码") from exc
+
+    try:
+        raw_text = await download_backup(str(url), str(username), password)
+        payload = json.loads(raw_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"读取 WebDAV 备份失败: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="WebDAV 备份格式错误")
+    return payload
+
+
+def _extract_provider_checkin_enabled(provider_config: dict[str, Any] | None) -> bool:
+    if not isinstance(provider_config, dict):
+        return True
+    provider_ops = provider_config.get("provider_ops")
+    if not isinstance(provider_ops, dict):
+        return True
+    schedule = provider_ops.get("schedule")
+    if not isinstance(schedule, dict):
+        return True
+    value = schedule.get("checkin_enabled")
+    if isinstance(value, bool):
+        return value
+    return True
+
+
+def _apply_account_checkin_preference(db: Session, accounts: list[SiteManagementAccount]) -> int:
+    provider_by_id: dict[str, Any] = {}
+    provider_by_domain: dict[str, Any] = {}
+    providers = db.query(Provider).all()
+    for provider in providers:
+        provider_by_id[str(provider.id)] = provider
+        domain = AllApiHubSyncService._normalize_domain(getattr(provider, "website", None))
+        if domain and domain not in provider_by_domain:
+            provider_by_domain[domain] = provider
+
+    changed = 0
+    for account in accounts:
+        provider_id = str(account.provider_id or "").strip()
+        provider = provider_by_id.get(provider_id) if provider_id else None
+        if provider is None:
+            account_domain = AllApiHubSyncService._normalize_domain(
+                str(account.site_url or account.domain or "").strip()
+            )
+            provider = provider_by_domain.get(account_domain)
+        if not provider:
+            continue
+        config = dict(provider.config or {})
+        provider_ops = config.get("provider_ops")
+        if not isinstance(provider_ops, dict):
+            continue
+        schedule = provider_ops.get("schedule")
+        if not isinstance(schedule, dict):
+            schedule = {}
+        expected_enabled = bool(account.checkin_enabled)
+        if schedule.get("checkin_enabled") == expected_enabled:
+            continue
+        schedule["checkin_enabled"] = expected_enabled
+        provider_ops["schedule"] = schedule
+        config["provider_ops"] = provider_ops
+        provider.config = config
+        try:
+            flag_modified(provider, "config")
+        except Exception:
+            pass
+        changed += 1
+    return changed
 
 
 @router.post("/sync/trigger")
@@ -99,6 +250,143 @@ async def trigger_site_sync(
         "skipped_not_changed": result.skipped_not_changed,
         "dry_run": result.dry_run,
     }
+
+
+@router.get("/accounts")
+async def list_site_accounts(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Any:
+    backup = await _load_webdav_backup_payload(db)
+    accounts = parse_all_api_hub_accounts(backup)
+    providers = db.query(Provider.id, Provider.name, Provider.website, Provider.config).all()
+    provider_by_domain: dict[str, dict[str, Any]] = {}
+    for provider in providers:
+        domain = AllApiHubSyncService._normalize_domain(getattr(provider, "website", None))
+        if not domain:
+            continue
+        if domain not in provider_by_domain:
+            provider_by_domain[domain] = {
+                "provider_id": str(provider.id),
+                "provider_name": str(provider.name or ""),
+                "checkin_enabled": _extract_provider_checkin_enabled(provider.config),
+            }
+
+    normalized = [
+        {
+            "site_url": account.site_url,
+            "domain": account.domain,
+            "provider_id": (provider_by_domain.get(account.domain) or {}).get("provider_id"),
+            "provider_name": (provider_by_domain.get(account.domain) or {}).get("provider_name"),
+            "checkin_enabled": (provider_by_domain.get(account.domain) or {}).get(
+                "checkin_enabled", True
+            ),
+            "auth_type": account.auth_type or "cookie",
+            "user_id": account.user_id,
+            "access_token": account.access_token,
+            "cookie": account.cookie_value,
+        }
+        for account in accounts
+    ]
+    normalized.sort(key=lambda x: ((x.get("domain") or ""), (x.get("site_url") or "")))
+    return normalized
+
+
+@router.post("/accounts/apply-sync")
+async def apply_site_accounts_sync(
+    payload: ApplySiteAccountsSyncRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Any:
+    auto_create_provider_ops = SystemConfigService.get_config(
+        db,
+        "enable_all_api_hub_auto_create_provider_ops",
+        True,
+    )
+    backup = _build_backup_from_accounts(payload.accounts)
+    service = AllApiHubSyncService()
+    started_at = datetime.now(timezone.utc)
+    try:
+        result = service.sync_from_backup_object(
+            db,
+            backup,
+            dry_run=payload.dry_run,
+            auto_create_provider_ops=bool(auto_create_provider_ops),
+        )
+        checkin_pref_updated = 0
+        if not payload.dry_run:
+            checkin_pref_updated = _apply_account_checkin_preference(db, payload.accounts)
+            if checkin_pref_updated > 0:
+                db.commit()
+        run = SiteManagementLogService.record_sync_run(
+            db=db,
+            trigger_source="manual_edit",
+            status="success",
+            result=result,
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+        )
+    except ValueError as exc:
+        try:
+            SiteManagementLogService.record_sync_run(
+                db=db,
+                trigger_source="manual_edit",
+                status="failed",
+                error_message=str(exc),
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "run_id": run.id,
+        "total_accounts": result.total_accounts,
+        "total_providers": result.total_providers,
+        "matched_providers": result.matched_providers,
+        "updated_providers": result.updated_providers,
+        "skipped_no_provider_ops": result.skipped_no_provider_ops,
+        "skipped_no_cookie": result.skipped_no_cookie,
+        "skipped_not_changed": result.skipped_not_changed,
+        "checkin_pref_updated": checkin_pref_updated if not payload.dry_run else 0,
+        "dry_run": result.dry_run,
+    }
+
+
+@router.post("/accounts/checkin-statuses")
+async def get_accounts_checkin_statuses(
+    payload: SiteAccountsCheckinStatusRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Any:
+    provider_ids = [str(pid).strip() for pid in payload.provider_ids if str(pid).strip()]
+    if not provider_ids:
+        return {}
+
+    items = (
+        db.query(SiteCheckinItem)
+        .filter(SiteCheckinItem.provider_id.in_(provider_ids))
+        .order_by(SiteCheckinItem.created_at.desc())
+        .limit(5000)
+        .all()
+    )
+
+    latest_by_provider: dict[str, Any] = {}
+    for item in items:
+        provider_id = str(item.provider_id or "").strip()
+        if not provider_id or provider_id in latest_by_provider:
+            continue
+        latest_by_provider[provider_id] = {
+            "status": item.status,
+            "message": item.message,
+            "manual_verification_required": _checkin_message_requires_manual_verification(
+                item.message
+            ),
+            "created_at": item.created_at.isoformat() if item.created_at else None,
+        }
+
+    return latest_by_provider
 
 
 @router.post("/checkin/trigger")
@@ -230,6 +518,9 @@ async def get_checkin_run_items(
             "provider_domain": item.provider_domain,
             "status": item.status,
             "message": item.message,
+            "manual_verification_required": _checkin_message_requires_manual_verification(
+                item.message
+            ),
             "balance_total": item.balance_total,
             "balance_currency": item.balance_currency,
             "created_at": item.created_at.isoformat() if item.created_at else None,

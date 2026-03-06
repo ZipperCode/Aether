@@ -423,11 +423,17 @@ class ProviderOpsService:
         # 合并操作配置
         saved_action_config = config.actions.get(action_type.value, {}).get("config", {})
         merged_config = {**saved_action_config, **(action_config or {})}
+        merged_config["_provider_id"] = provider_id
 
         # 注入 credentials 元信息（如是否配置了 Cookie），供 Action 使用
         decrypted_credentials = self._decrypt_credentials(config.connector_credentials)
-        if decrypted_credentials.get("cookie"):
+        cookie_candidates = ("cookie", "session_cookie", "cookie_string", "auth_cookie", "token_cookie")
+        has_cookie = any(
+            str(decrypted_credentials.get(key) or "").strip() for key in cookie_candidates
+        )
+        if has_cookie:
             merged_config["_has_cookie"] = True
+        merged_config["_has_user_id"] = bool(str(decrypted_credentials.get("user_id") or "").strip())
 
         # 创建操作实例
         action = architecture.get_action(action_type, merged_config)
@@ -689,6 +695,17 @@ class ProviderOpsService:
         Returns:
             操作结果
         """
+        provider_config = self.get_config(provider_id)
+        if provider_config and provider_config.architecture_id == "new_api":
+            # new_api 无独立 checkin 动作，使用 query_balance 的 checkin_only 模式执行签到。
+            merged_config = dict(config or {})
+            merged_config["checkin_only"] = True
+            return await self.execute_action(
+                provider_id,
+                ProviderActionType.QUERY_BALANCE,
+                merged_config,
+            )
+
         return await self.execute_action(provider_id, ProviderActionType.CHECKIN, config)
 
     # ==================== 辅助方法 ====================

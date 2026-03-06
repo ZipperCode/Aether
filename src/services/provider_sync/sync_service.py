@@ -133,6 +133,7 @@ class AllApiHubSyncService:
                     continue
                 auto_provider_ops = self._build_auto_provider_ops(
                     account_auth_type=account.auth_type,
+                    account_user_id=account.user_id,
                     provider_site_url=getattr(provider, "website", None),
                     account_site_url=account.site_url,
                 )
@@ -174,12 +175,37 @@ class AllApiHubSyncService:
                 result.item_results.append(base_item)
                 continue
 
-            new_cookie = account.session_cookie.strip()
-            encrypted_new = crypto_service.encrypt(new_cookie)
+            architecture_id = str(provider_ops.get("architecture_id") or "").strip().lower()
+            if cookie_key in self.TOKEN_CREDENTIAL_KEYS and account.access_token:
+                new_secret = account.access_token.strip()
+            elif cookie_key in self.COOKIE_CREDENTIAL_KEYS and account.cookie_value:
+                new_secret = account.cookie_value.strip()
+            else:
+                new_secret = account.session_cookie.strip()
+
+            encrypted_new = crypto_service.encrypt(new_secret)
             old_cookie_raw = self._decrypt_if_possible(credentials.get(cookie_key))
             before_fp = self._cookie_fingerprint(old_cookie_raw)
-            after_fp = self._cookie_fingerprint(new_cookie)
-            if credentials.get(cookie_key) == encrypted_new:
+            after_fp = self._cookie_fingerprint(new_secret)
+            should_sync_user_id = (
+                architecture_id == "new_api"
+                and (account.auth_type or "").strip().lower() == "access_token"
+            )
+            should_sync_new_api_cookie = architecture_id == "new_api" and bool(account.cookie_value)
+            old_user_id = str(credentials.get("user_id") or "").strip()
+            new_user_id = str(account.user_id or "").strip()
+            token_not_changed = credentials.get(cookie_key) == encrypted_new
+            user_id_not_changed = (not should_sync_user_id) or old_user_id == new_user_id
+            new_cookie_encrypted = (
+                crypto_service.encrypt(str(account.cookie_value or "").strip())
+                if should_sync_new_api_cookie
+                else None
+            )
+            cookie_not_changed = (not should_sync_new_api_cookie) or (
+                credentials.get("cookie") == new_cookie_encrypted
+            )
+
+            if token_not_changed and user_id_not_changed and cookie_not_changed:
                 result.skipped_not_changed += 1
                 base_item.status = "not_changed"
                 base_item.cookie_field = cookie_key
@@ -202,6 +228,12 @@ class AllApiHubSyncService:
             # Copy-on-write to avoid accidental shared references in JSON column objects.
             next_config = copy.deepcopy(provider_config)
             next_config["provider_ops"]["connector"]["credentials"][cookie_key] = encrypted_new
+            if should_sync_user_id:
+                next_config["provider_ops"]["connector"]["credentials"]["user_id"] = new_user_id
+            if should_sync_new_api_cookie and new_cookie_encrypted:
+                next_config["provider_ops"]["connector"]["credentials"]["cookie"] = (
+                    new_cookie_encrypted
+                )
             provider.config = next_config
             try:
                 flag_modified(provider, "config")
@@ -253,6 +285,7 @@ class AllApiHubSyncService:
     def _build_auto_provider_ops(
         *,
         account_auth_type: str,
+        account_user_id: str | None,
         provider_site_url: str | None,
         account_site_url: str | None,
     ) -> dict[str, Any] | None:
@@ -269,6 +302,7 @@ class AllApiHubSyncService:
                 "config": {},
                 "credentials": {
                     "api_key": "",
+                    "user_id": (account_user_id or "").strip(),
                 },
             },
             "actions": {},

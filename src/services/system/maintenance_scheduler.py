@@ -27,6 +27,7 @@ from src.core.logger import logger
 from src.database import create_session
 from src.models.database import ApiKey, AuditLog, Provider, RequestCandidate, Usage
 from src.services.provider_ops.service import ProviderOpsService
+from src.services.provider_ops.types import ActionStatus, ProviderActionType
 from src.services.provider_sync import AllApiHubSyncService
 from src.services.site_management import SiteManagementLogService
 from src.services.site_management.log_service import CheckinItemLog
@@ -840,7 +841,27 @@ class MaintenanceScheduler:
                 .filter(Provider.is_active.is_(True))
                 .all()
             )
-            provider_ids = [p.id for p in providers if p.config and p.config.get("provider_ops")]
+            configured_providers = [p for p in providers if p.config and p.config.get("provider_ops")]
+            provider_ids = [
+                p.id
+                for p in configured_providers
+                if p.config
+                and p.config.get("provider_ops")
+                and self._is_provider_checkin_enabled(p.config)
+            ]
+            excluded_provider_items = [
+                {
+                    "provider_id": str(p.id),
+                    "provider_name": str(p.name or ""),
+                    "provider_domain": AllApiHubSyncService._normalize_domain(getattr(p, "website", None)),
+                    "status": "skipped",
+                    "message": "签到开关关闭，已跳过",
+                    "balance_total": None,
+                    "balance_currency": None,
+                }
+                for p in configured_providers
+                if not self._is_provider_checkin_enabled(p.config)
+            ]
             provider_meta_by_id: dict[str, dict[str, str]] = {
                 str(p.id): {
                     "name": str(p.name or ""),
@@ -849,8 +870,27 @@ class MaintenanceScheduler:
                 for p in providers
             }
 
-            if not provider_ids:
+            if not configured_providers:
                 logger.info("无已配置的 Provider，跳过签到任务")
+                return
+            if not provider_ids:
+                logger.info("所有已配置 Provider 均被签到开关关闭，记录跳过结果")
+                logs_db = create_session()
+                try:
+                    SiteManagementLogService.record_checkin_run(
+                        db=logs_db,
+                        trigger_source=trigger_source,
+                        status="success",
+                        total_providers=len(configured_providers),
+                        success_count=0,
+                        failed_count=0,
+                        skipped_count=len(excluded_provider_items),
+                        items=[CheckinItemLog(**item) for item in excluded_provider_items],
+                        started_at=started_at,
+                        finished_at=datetime.now(timezone.utc),
+                    )
+                finally:
+                    logs_db.close()
                 return
 
             logger.info(f"开始执行 Provider 签到，共 {len(provider_ids)} 个...")
@@ -881,7 +921,24 @@ class MaintenanceScheduler:
                     task_db = create_session()
                     try:
                         service = ProviderOpsService(task_db)
-                        # 触发余额查询（会先执行签到）
+                        provider_ops_cfg = service.get_config(provider_id)
+                        if provider_ops_cfg and provider_ops_cfg.architecture_id == "new_api":
+                            # new_api 支持 checkin_only 模式：只执行签到，不触发余额查询。
+                            result = await service.execute_action(
+                                provider_id,
+                                ProviderActionType.QUERY_BALANCE,
+                                {"checkin_only": True},
+                            )
+                            payload = result.data if isinstance(result.data, dict) else {}
+                            checkin_success = payload.get("checkin_success")
+                            checkin_message = result.message or ""
+                            if result.status == ActionStatus.SUCCESS:
+                                if checkin_success is True:
+                                    return provider_id, "success", checkin_message, None, None
+                                return provider_id, "skipped", checkin_message or "未执行签到", None, None
+                            return provider_id, "failed", checkin_message or "签到失败", None, None
+
+                        # 旧架构：仍通过余额查询流程触发签到
                         result = await service.query_balance(provider_id)
                         # 检查签到结果
                         checkin_success = None
@@ -936,7 +993,14 @@ class MaintenanceScheduler:
             success_count = sum(1 for _, status, _, _, _ in results if status == "success")
             failed_count = sum(1 for _, status, _, _, _ in results if status == "failed")
             skipped_count = sum(1 for _, status, _, _, _ in results if status == "skipped")
-            logger.info(f"Provider 签到完成: {success_count}/{len(provider_ids)} 成功")
+            skipped_count += len(excluded_provider_items)
+            logger.info(
+                "Provider 签到完成: success={}/{}, failed={}, skipped={}",
+                success_count,
+                len(provider_ids),
+                failed_count,
+                skipped_count,
+            )
 
             # 记录详细结果
             item_logs = []
@@ -957,6 +1021,7 @@ class MaintenanceScheduler:
                         "balance_currency": balance_currency,
                     }
                 )
+            item_logs.extend(excluded_provider_items)
 
             logs_db = create_session()
             try:
@@ -964,7 +1029,7 @@ class MaintenanceScheduler:
                     db=logs_db,
                     trigger_source=trigger_source,
                     status="success",
-                    total_providers=len(provider_ids),
+                    total_providers=len(configured_providers),
                     success_count=success_count,
                     failed_count=failed_count,
                     skipped_count=skipped_count,
@@ -1000,6 +1065,22 @@ class MaintenanceScheduler:
         finally:
             if db is not None:
                 db.close()
+
+    @staticmethod
+    def _is_provider_checkin_enabled(provider_config: Any) -> bool:
+        """判断 Provider 是否启用签到任务（默认启用）。"""
+        if not isinstance(provider_config, dict):
+            return True
+        provider_ops = provider_config.get("provider_ops")
+        if not isinstance(provider_ops, dict):
+            return True
+        schedule = provider_ops.get("schedule")
+        if not isinstance(schedule, dict):
+            return True
+        value = schedule.get("checkin_enabled")
+        if isinstance(value, bool):
+            return value
+        return True
 
     async def _perform_user_quota_reset(self) -> None:
         """执行用户配额自动重置任务
