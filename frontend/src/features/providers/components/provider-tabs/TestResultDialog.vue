@@ -9,7 +9,6 @@
       v-if="result"
       class="space-y-4"
     >
-      <!-- 总体状态 -->
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-2">
           <Badge :variant="result.success ? 'success' : 'destructive'">
@@ -24,7 +23,6 @@
         </div>
       </div>
 
-      <!-- 模型信息 -->
       <div class="text-sm space-y-1">
         <div>
           <span class="text-muted-foreground">请求模型: </span>
@@ -40,7 +38,6 @@
         </div>
       </div>
 
-      <!-- 错误信息 -->
       <div
         v-if="result.error && !result.success"
         class="rounded-md bg-destructive/10 border border-destructive/20 px-3 py-2 text-xs text-destructive"
@@ -48,22 +45,89 @@
         {{ result.error }}
       </div>
 
-      <!-- Attempt 详情表 -->
+      <!-- mobile: list layout -->
       <div
         v-if="result.attempts.length > 0"
-        class="border rounded-md overflow-hidden"
+        class="space-y-2 sm:hidden"
       >
-        <table class="w-full text-xs">
+        <div
+          v-for="(attempt, idx) in result.attempts"
+          :key="'m' + idx"
+          class="rounded-md border px-3 py-2 text-xs"
+          :class="attemptRowClass(attempt.status)"
+        >
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-1.5 min-w-0">
+              <span class="text-muted-foreground shrink-0">#{{ attempt.candidate_index }}</span>
+              <Badge
+                :variant="statusVariant(attempt.status)"
+                class="text-[10px] px-1.5 py-0 shrink-0"
+              >
+                {{ attempt.status_code || statusLabel(attempt.status) }}
+              </Badge>
+              <span
+                v-if="attempt.latency_ms != null"
+                class="text-muted-foreground shrink-0 tabular-nums"
+              >
+                {{ attempt.latency_ms }}ms
+              </span>
+            </div>
+            <code class="text-[11px] bg-muted px-1 py-0.5 rounded shrink-0">{{ attempt.endpoint_api_format }}</code>
+          </div>
+          <div class="mt-1.5 space-y-0.5">
+            <div
+              v-if="attempt.key_name"
+              class="font-medium truncate"
+            >
+              {{ attempt.key_name }}
+            </div>
+            <div class="text-muted-foreground">
+              {{ maskKey(attempt.key_id) }}
+            </div>
+            <div
+              v-if="hasEffectiveModel && attempt.effective_model"
+              class="text-muted-foreground"
+            >
+              模型: {{ attempt.effective_model }}
+            </div>
+            <div
+              v-if="attemptDetail(attempt) !== '-'"
+              class="text-muted-foreground break-all mt-1"
+            >
+              {{ attemptDetail(attempt) }}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- desktop: table layout -->
+      <div
+        v-if="result.attempts.length > 0"
+        class="border rounded-md overflow-hidden hidden sm:block"
+      >
+        <table class="w-full text-xs table-fixed">
+          <colgroup>
+            <col class="w-8">
+            <col class="w-[22%]">
+            <col class="w-20">
+            <col
+              v-if="hasEffectiveModel"
+              class="w-[16%]"
+            >
+            <col class="w-16">
+            <col class="w-16">
+            <col>
+          </colgroup>
           <thead>
             <tr class="border-b bg-muted/30">
-              <th class="px-3 py-2 text-left font-medium">
+              <th class="pl-3 pr-1 py-2 text-left font-medium">
                 #
               </th>
               <th class="px-3 py-2 text-left font-medium">
                 Key
               </th>
               <th class="px-3 py-2 text-left font-medium">
-                格式
+                端点
               </th>
               <th
                 v-if="hasEffectiveModel"
@@ -86,27 +150,33 @@
             <tr
               v-for="(attempt, idx) in result.attempts"
               :key="idx"
-              class="border-b last:border-b-0"
+              class="border-b last:border-b-0 align-top"
               :class="attemptRowClass(attempt.status)"
             >
-              <td class="px-3 py-2 text-muted-foreground">
+              <td class="pl-3 pr-1 py-2 text-muted-foreground">
                 {{ attempt.candidate_index }}
               </td>
-              <td
-                class="px-3 py-2 max-w-[160px] truncate"
-                :title="attempt.key_name || attempt.key_id"
-              >
-                {{ attempt.key_name || (attempt.key_id.length > 8 ? attempt.key_id.slice(0, 8) + '...' : attempt.key_id) }}
-                <span class="text-muted-foreground ml-1">({{ attempt.auth_type }})</span>
+              <td class="px-3 py-2">
+                <div
+                  v-if="attempt.key_name"
+                  class="font-medium truncate"
+                  :title="attempt.key_name"
+                >
+                  {{ attempt.key_name }}
+                </div>
+                <div
+                  class="text-muted-foreground truncate"
+                  :title="attempt.key_id"
+                >
+                  {{ maskKey(attempt.key_id) }}
+                </div>
               </td>
               <td class="px-3 py-2">
-                <code class="text-[11px] bg-muted px-1 py-0.5 rounded">
-                  {{ attempt.endpoint_api_format }}
-                </code>
+                <code class="text-[11px] bg-muted px-1 py-0.5 rounded">{{ attempt.endpoint_api_format }}</code>
               </td>
               <td
                 v-if="hasEffectiveModel"
-                class="px-3 py-2 max-w-[180px] truncate"
+                class="px-3 py-2 truncate"
                 :title="attempt.effective_model || '-'"
               >
                 {{ attempt.effective_model || '-' }}
@@ -116,30 +186,25 @@
                   :variant="statusVariant(attempt.status)"
                   class="text-[10px] px-1.5 py-0"
                 >
-                  {{ statusLabel(attempt.status) }}
+                  {{ attempt.status_code || statusLabel(attempt.status) }}
                 </Badge>
-                <span
-                  v-if="attempt.status_code"
-                  class="text-muted-foreground ml-1"
-                >
-                  {{ attempt.status_code }}
-                </span>
               </td>
-              <td class="px-3 py-2 text-right text-muted-foreground">
+              <td class="px-3 py-2 text-right text-muted-foreground tabular-nums">
                 {{ attempt.latency_ms != null ? attempt.latency_ms + 'ms' : '-' }}
               </td>
-              <td
-                class="px-3 py-2 max-w-[200px] truncate text-muted-foreground"
-                :title="attemptDetail(attempt)"
-              >
-                {{ attemptDetail(attempt) }}
+              <td class="px-3 py-2 text-muted-foreground">
+                <div
+                  class="break-all line-clamp-2"
+                  :title="attemptDetail(attempt)"
+                >
+                  {{ attemptDetail(attempt) }}
+                </div>
               </td>
             </tr>
           </tbody>
         </table>
       </div>
 
-      <!-- 无 attempt -->
       <div
         v-else
         class="text-center text-sm text-muted-foreground py-4"
@@ -210,6 +275,11 @@ function attemptRowClass(status: string) {
   if (status === 'failed') return 'bg-red-500/5'
   if (status === 'skipped') return 'bg-muted/20'
   return ''
+}
+
+function maskKey(key: string): string {
+  if (key.length <= 8) return key
+  return `${key.slice(0, 4)}...${key.slice(-4)}`
 }
 
 function attemptDetail(attempt: TestAttemptDetail): string {

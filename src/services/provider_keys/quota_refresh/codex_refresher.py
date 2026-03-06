@@ -5,6 +5,8 @@ Codex 配额刷新策略。
 from __future__ import annotations
 
 import json
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -14,7 +16,14 @@ from src.api.handlers.base.request_builder import get_provider_auth
 from src.core.crypto import crypto_service
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
 from src.services.provider_keys.auth_type import normalize_auth_type
-from src.services.provider_keys.codex_usage_parser import parse_codex_wham_usage_response
+from src.services.provider.pool.account_state import (
+    OAUTH_ACCOUNT_BLOCK_PREFIX,
+    OAUTH_EXPIRED_PREFIX,
+)
+from src.services.provider_keys.codex_usage_parser import (
+    parse_codex_usage_headers,
+    parse_codex_wham_usage_response,
+)
 
 
 def _normalize_plan_type(value: Any) -> str | None:
@@ -22,6 +31,76 @@ def _normalize_plan_type(value: Any) -> str | None:
         return None
     normalized = value.strip().lower()
     return normalized or None
+
+
+def _build_quota_exhausted_fallback_metadata(plan_type: str | None) -> dict[str, Any]:
+    """Build conservative Codex quota metadata when wham/usage returns 402."""
+    normalized_plan = _normalize_plan_type(plan_type)
+    metadata: dict[str, Any] = {"updated_at": int(time.time())}
+    if normalized_plan:
+        metadata["plan_type"] = normalized_plan
+    # primary_* = weekly, secondary_* = 5H (aligned with parser semantics)
+    metadata["primary_used_percent"] = 100.0
+    if normalized_plan != "free":
+        metadata["secondary_used_percent"] = 100.0
+    return metadata
+
+
+def _extract_error_message_from_response(response: httpx.Response) -> str:
+    """Best-effort extraction of upstream error message for diagnostics."""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            err = payload.get("error")
+            if isinstance(err, dict):
+                message = str(err.get("message", "")).strip()
+                if message:
+                    return message
+            if isinstance(err, str) and err.strip():
+                return err.strip()
+            message = str(payload.get("message", "")).strip()
+            if message:
+                return message
+    except Exception:
+        pass
+    text = str(getattr(response, "text", "") or "").strip()
+    return text[:300] if text else ""
+
+
+def _looks_like_token_invalidated(message: str | None) -> bool:
+    lowered = str(message or '').strip().lower()
+    return 'authentication token has been invalidated' in lowered or 'token has been invalidated' in lowered
+
+
+def _looks_like_account_deactivated(message: str | None) -> bool:
+    lowered = str(message or '').strip().lower()
+    return 'account has been deactivated' in lowered or 'account deactivated' in lowered
+
+
+def _looks_like_workspace_deactivated(message: str | None) -> bool:
+    lowered = str(message or '').strip().lower()
+    return 'deactivated_workspace' in lowered or ('workspace' in lowered and 'deactivated' in lowered)
+
+
+def _build_structured_invalid_reason(*, status_code: int, upstream_message: str | None) -> str:
+    message = str(upstream_message or '').strip()
+
+    if status_code == 402 and _looks_like_workspace_deactivated(message):
+        return f'{OAUTH_ACCOUNT_BLOCK_PREFIX}工作区已停用 (deactivated_workspace)'
+
+    if _looks_like_account_deactivated(message):
+        detail = message or 'OpenAI 账号已停用'
+        return f'{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}'
+
+    if status_code == 401:
+        detail = message or 'Codex Token 无效或已过期 (401)'
+        return f'{OAUTH_EXPIRED_PREFIX}{detail}'
+
+    if status_code == 403:
+        detail = message or 'Codex 账户访问受限 (403)'
+        return f'{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}'
+
+    return message
 
 
 async def refresh_codex_key_quota(
@@ -96,12 +175,103 @@ async def refresh_codex_key_quota(
         response = await client.get(codex_wham_usage_url, headers=headers)
 
     if response.status_code != 200:
+        status_code = int(response.status_code)
+        err_msg = _extract_error_message_from_response(response)
+
+        header_quota = parse_codex_usage_headers(dict(response.headers) if response.headers else {})
+        if isinstance(header_quota, dict) and header_quota:
+            metadata_updates[key.id] = {"codex": header_quota}
+
+        if status_code == 401:
+            state_updates[key.id] = {
+                "is_active": False,
+                "oauth_invalid_at": datetime.now(timezone.utc),
+                "oauth_invalid_reason": _build_structured_invalid_reason(
+                    status_code=401,
+                    upstream_message=err_msg,
+                ),
+            }
+            return {
+                "key_id": key.id,
+                "key_name": key.name,
+                "status": "auth_invalid",
+                "message": f"wham/usage API 返回状态码 401{f': {err_msg}' if err_msg else ''}",
+                "status_code": 401,
+                "auto_disabled": True,
+            }
+
+        if status_code == 402:
+            if _looks_like_workspace_deactivated(err_msg):
+                codex_meta = metadata_updates.get(key.id, {}).get('codex')
+                if not isinstance(codex_meta, dict):
+                    codex_meta = {}
+                codex_meta = {
+                    **codex_meta,
+                    'updated_at': int(time.time()),
+                    'account_disabled': True,
+                    'reason': 'deactivated_workspace',
+                    'message': err_msg or 'deactivated_workspace',
+                }
+                if oauth_plan_type and not codex_meta.get('plan_type'):
+                    codex_meta['plan_type'] = oauth_plan_type
+                metadata_updates[key.id] = {'codex': codex_meta}
+                state_updates[key.id] = {
+                    'oauth_invalid_at': datetime.now(timezone.utc),
+                    'oauth_invalid_reason': _build_structured_invalid_reason(
+                        status_code=402,
+                        upstream_message=err_msg,
+                    ),
+                }
+                return {
+                    'key_id': key.id,
+                    'key_name': key.name,
+                    'status': 'workspace_deactivated',
+                    'message': f"wham/usage API 返回状态码 402{f': {err_msg}' if err_msg else ''}",
+                    'status_code': 402,
+                }
+
+            if key.id not in metadata_updates:
+                metadata_updates[key.id] = {
+                    "codex": _build_quota_exhausted_fallback_metadata(oauth_plan_type)
+                }
+            state_updates[key.id] = {
+                "oauth_invalid_at": None,
+                "oauth_invalid_reason": None,
+            }
+            return {
+                "key_id": key.id,
+                "key_name": key.name,
+                "status": "quota_exhausted",
+                "message": f"wham/usage API 返回状态码 402{f': {err_msg}' if err_msg else ''}",
+                "status_code": 402,
+            }
+
+        if status_code == 403:
+            state_updates[key.id] = {
+                "is_active": False,
+                "oauth_invalid_at": datetime.now(timezone.utc),
+                "oauth_invalid_reason": _build_structured_invalid_reason(
+                    status_code=403,
+                    upstream_message=err_msg,
+                ),
+            }
+            return {
+                "key_id": key.id,
+                "key_name": key.name,
+                "status": "forbidden",
+                "message": f"wham/usage API 返回状态码 403{f': {err_msg}' if err_msg else ''}",
+                "status_code": 403,
+                "auto_disabled": True,
+            }
+
         return {
             "key_id": key.id,
             "key_name": key.name,
             "status": "error",
-            "message": f"wham/usage API 返回状态码 {response.status_code}",
-            "status_code": response.status_code,
+            "message": (
+                f"wham/usage API 返回状态码 {status_code}{f': {err_msg}' if err_msg else ''}"
+            ),
+            "status_code": status_code,
         }
 
     # 解析 JSON 响应

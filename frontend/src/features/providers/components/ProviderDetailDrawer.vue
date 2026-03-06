@@ -892,6 +892,7 @@
                 :key="`models-${provider.id}`"
                 :provider="provider"
                 :models="providerModels"
+                :endpoints="endpoints"
                 @edit-model="handleEditModel"
                 @batch-assign="handleBatchAssign"
                 @refresh="loadEndpoints"
@@ -1101,6 +1102,7 @@ import {
 import type { UpstreamMetadata, AntigravityModelQuota } from '@/api/endpoints/types'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { isOAuthAccountProviderType, isKeyManagedProviderType } from '../utils/providerTypeUtils'
+import { isAccountLevelBlockReason, cleanAccountBlockReason } from '@/utils/accountBlock'
 
 // 扩展端点类型,包含密钥列表
 interface ProviderEndpointWithKeys extends ProviderEndpoint {
@@ -1273,6 +1275,8 @@ watch(
   [() => props.providerId, () => props.open],
   async ([newId, newOpen], [_oldId, oldOpen]) => {
     if (newOpen && newId) {
+      // mapping-preview 较慢，不阻塞首屏渲染
+      void loadMappingPreview()
       await Promise.all([
         loadProvider(),
         loadEndpoints(),
@@ -1568,8 +1572,7 @@ async function handleRefreshOAuth(key: EndpointAPIKey) {
 
 // 判断是否为账号级别的封禁（刷新 token 无法修复）
 function isAccountLevelBlock(key: EndpointAPIKey): boolean {
-  if (!key.oauth_invalid_reason) return false
-  return key.oauth_invalid_reason.startsWith('[ACCOUNT_BLOCK]')
+  return isAccountLevelBlockReason(key.oauth_invalid_reason)
 }
 
 // 清除 OAuth 失效标记
@@ -1958,6 +1961,7 @@ async function handleBatchAssignChanged() {
 
 // 处理模型映射变更
 async function handleModelMappingChanged() {
+  void loadMappingPreview()
   await loadEndpoints()
   emit('refresh')
 }
@@ -2056,19 +2060,16 @@ function startEditMultiplier(key: EndpointAPIKey, format: string) {
 function cancelEditMultiplier() {
   editingMultiplierKey.value = null
   editingMultiplierFormat.value = null
-  multiplierSaving.value = false
 }
 
 function handleMultiplierKeydown(e: KeyboardEvent, key: EndpointAPIKey, format: string) {
   if (e.key === 'Enter') {
     e.preventDefault()
     e.stopPropagation()
-    if (!multiplierSaving.value) {
-      multiplierSaving.value = true
-      saveMultiplier(key, format)
-    }
+    saveMultiplier(key, format)
   } else if (e.key === 'Escape') {
     e.preventDefault()
+    multiplierSaving.value = true // 阻止 blur 触发保存
     cancelEditMultiplier()
   }
 }
@@ -2079,7 +2080,7 @@ function handleMultiplierBlur(key: EndpointAPIKey, format: string) {
 }
 
 async function saveMultiplier(key: EndpointAPIKey, format: string) {
-  // 防止重复调用
+  // 防止重复调用（Enter 触发后阻止 blur 再次进入）
   if (multiplierSaving.value) return
   multiplierSaving.value = true
 
@@ -2090,6 +2091,7 @@ async function saveMultiplier(key: EndpointAPIKey, format: string) {
   if (!keyId || isNaN(newMultiplier)) {
     showError('请输入有效的倍率值')
     cancelEditMultiplier()
+    multiplierSaving.value = false
     return
   }
 
@@ -2097,6 +2099,7 @@ async function saveMultiplier(key: EndpointAPIKey, format: string) {
   if (newMultiplier <= 0 || newMultiplier > 100) {
     showError('倍率必须在 0.01 到 100 之间')
     cancelEditMultiplier()
+    multiplierSaving.value = false
     return
   }
 
@@ -2104,6 +2107,7 @@ async function saveMultiplier(key: EndpointAPIKey, format: string) {
   const currentMultiplier = getKeyRateMultiplier(key, format)
   if (Math.abs(currentMultiplier - newMultiplier) < 0.0001) {
     cancelEditMultiplier()
+    multiplierSaving.value = false
     return
   }
 
@@ -2501,7 +2505,10 @@ function getOAuthStatusTitle(key: EndpointAPIKey): string {
   const status = getKeyOAuthExpires(key)
   if (!status) return ''
   if (status.isInvalid) {
-    return status.invalidReason ? `Token 已失效: ${status.invalidReason}` : 'Token 已失效'
+    const cleaned = status.invalidReason && isAccountLevelBlockReason(status.invalidReason)
+      ? cleanAccountBlockReason(status.invalidReason)
+      : status.invalidReason
+    return cleaned ? `Token 已失效: ${cleaned}` : 'Token 已失效'
   }
   if (status.isExpired) {
     return 'Token 已过期，请重新授权'
@@ -2621,18 +2628,17 @@ async function loadEndpoints() {
   const requestId = ++endpointsLoadRequestId
 
   try {
-    // 并行加载端点列表、Provider 级别的 keys、models 和映射预览
-    const [endpointsList, providerKeysResult, modelsResult, mappingPreviewResult] = await Promise.all([
+    // 并行加载端点列表、Provider 级别的 keys 和 models
+    // mapping-preview 较慢，拆到 loadMappingPreview 独立加载，不阻塞首屏
+    const [endpointsList, providerKeysResult, modelsResult] = await Promise.all([
       getProviderEndpoints(props.providerId),
       getProviderKeys(props.providerId).catch(() => []),
       getProviderModels(props.providerId).catch(() => []),
-      getProviderMappingPreview(props.providerId).catch(() => null),
     ])
     if (requestId !== endpointsLoadRequestId) return
 
     providerKeys.value = providerKeysResult
     providerModels.value = modelsResult
-    providerMappingPreview.value = mappingPreviewResult
     // 按 API 格式排序
     endpoints.value = endpointsList.sort((a, b) => {
       const aIdx = API_FORMAT_ORDER.indexOf(a.api_format)
@@ -2645,6 +2651,16 @@ async function loadEndpoints() {
   } catch (err: unknown) {
     if (requestId !== endpointsLoadRequestId) return
     showError(parseApiError(err, '加载端点失败'), '错误')
+  }
+}
+
+// 加载映射预览（独立于 loadEndpoints，不阻塞首屏渲染）
+async function loadMappingPreview() {
+  if (!props.providerId) return
+  try {
+    providerMappingPreview.value = await getProviderMappingPreview(props.providerId)
+  } catch {
+    providerMappingPreview.value = null
   }
 }
 

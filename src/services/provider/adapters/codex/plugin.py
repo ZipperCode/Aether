@@ -176,6 +176,23 @@ def register_all() -> None:
     # Behavior
     register_behavior_variant("codex", same_format=True, cross_format=True)
 
+    # Default Body Rules (Codex-specific, not format-wide)
+    from src.core.api_format.metadata import register_provider_default_body_rules
+
+    _codex_body_rules = (
+        {"action": "drop", "path": "max_output_tokens"},
+        {"action": "drop", "path": "temperature"},
+        {"action": "drop", "path": "top_p"},
+        {"action": "set", "path": "store", "value": False},
+        {
+            "action": "set",
+            "path": "instructions",
+            "value": "You are GPT-5.",
+            "condition": {"path": "instructions", "op": "not_exists"},
+        },
+    )
+    register_provider_default_body_rules("codex", "openai:cli", _codex_body_rules)
+
     # Export: Codex uses the default export builder (strip null + temp fields)
     # No need to register a custom one — the default in export.py suffices.
 

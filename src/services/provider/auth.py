@@ -63,6 +63,14 @@ def _persist_refreshed_token(
     key.api_key = crypto_service.encrypt(access_token)
     key.auth_config = crypto_service.encrypt(json.dumps(token_meta))
 
+    # 刷新成功 => 清除非账号级别的 oauth_invalid 标记（如 [REFRESH_FAILED]）
+    from src.services.provider.oauth_token import is_account_level_block
+
+    if not is_account_level_block(getattr(key, "oauth_invalid_reason", None)):
+        if getattr(key, "oauth_invalid_at", None) is not None:
+            key.oauth_invalid_at = None
+            key.oauth_invalid_reason = None
+
     sess = object_session(key)
     if sess is not None:
         sess.add(key)
@@ -72,6 +80,100 @@ def _persist_refreshed_token(
             "[OAUTH_REFRESH] key {} refreshed but cannot persist (no session); "
             "next request will refresh again",
             key.id,
+        )
+
+
+def _extract_refresh_error_detail(error_body: str) -> str:
+    """Best-effort extraction of error detail from refresh token error response."""
+    try:
+        data = json.loads(error_body)
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict):
+                code = err.get("code") or ""
+                msg = err.get("message") or ""
+                return f"{code}: {msg}".strip(": ") if (code or msg) else ""
+            if isinstance(err, str):
+                return err
+            return str(data.get("error_description") or data.get("message") or "")
+    except Exception:
+        pass
+    return error_body[:200] if error_body else ""
+
+
+def _mark_refresh_token_invalid(
+    key: Any,
+    status_code: int,
+    error_body: str,
+) -> None:
+    """标记 refresh token 已失效（仅设置 oauth_invalid 标记，不停用 key）。
+
+    Access token 在过期前仍可正常使用。oauth_invalid_reason 使用 [REFRESH_FAILED]
+    前缀。注意：如果上游错误体中包含账号封禁关键词（如 "deactivated"），
+    该 reason 仍会被 account_state 的关键词匹配判定为 blocked，这是预期行为。
+    """
+    from datetime import datetime, timezone
+
+    detail = _extract_refresh_error_detail(error_body)
+    reason = f"[REFRESH_FAILED] Token 续期失败 ({status_code})"
+    if detail:
+        reason = f"{reason}: {detail}"
+
+    try:
+        key.oauth_invalid_at = datetime.now(timezone.utc)
+        key.oauth_invalid_reason = reason
+        # 不设置 is_active = False：access token 过期前 key 仍可调度
+
+        sess = object_session(key)
+        if sess is not None:
+            sess.add(key)
+            sess.commit()
+            logger.info(
+                "[OAUTH_REFRESH] key {} marked refresh_token invalid: {}",
+                str(getattr(key, "id", "?"))[:8],
+                reason[:120],
+            )
+    except Exception as exc:
+        logger.warning(
+            "[OAUTH_REFRESH] failed to mark key {} refresh invalid: {}",
+            str(getattr(key, "id", "?"))[:8],
+            str(exc),
+        )
+
+
+def _mark_oauth_token_expired(key: Any, expires_at: Any) -> None:
+    """标记 OAuth key 为 Token 已过期且无法续期，阻止后续调度。
+
+    当 refresh token 已失效且 access token 也已过期时调用。
+    使用 [OAUTH_EXPIRED] 前缀，account_state 会将其判定为 blocked。
+    不设置 is_active = False（管理员可通过重新导入凭据恢复）。
+    """
+    from datetime import datetime, timezone
+
+    # 如果已经有更严重的标记（[ACCOUNT_BLOCK]），不降级
+    existing = str(getattr(key, "oauth_invalid_reason", None) or "")
+    if existing.startswith("[ACCOUNT_BLOCK]"):
+        return
+
+    reason = f"[OAUTH_EXPIRED] Token 已过期且续期失败 (expired_at={expires_at})"
+
+    try:
+        key.oauth_invalid_at = datetime.now(timezone.utc)
+        key.oauth_invalid_reason = reason
+
+        sess = object_session(key)
+        if sess is not None:
+            sess.add(key)
+            sess.commit()
+            logger.info(
+                "[OAUTH_EXPIRED] key {} token expired and refresh failed, blocking scheduling",
+                str(getattr(key, "id", "?"))[:8],
+            )
+    except Exception as exc:
+        logger.warning(
+            "[OAUTH_EXPIRED] failed to mark key {} as expired: {}",
+            str(getattr(key, "id", "?"))[:8],
+            str(exc),
         )
 
 
@@ -216,12 +318,24 @@ async def _refresh_generic_oauth_token(
 
             _persist_refreshed_token(key, access_token, token_meta)
     else:
+        error_body = ""
+        try:
+            error_body = resp.text or ""
+        except Exception:
+            pass
+
         logger.warning(
-            "OAuth token refresh failed: provider={}, key_id={}, status={}",
+            "OAuth token refresh failed: provider={}, key_id={}, status={}, body={}",
             provider_type,
             getattr(key, "id", "?"),
             resp.status_code,
+            error_body[:500],
         )
+
+        # 标记 refresh token 失效（不停用 key，access token 过期前仍可调度）。
+        # 注意：如果上游错误包含账号封禁关键词（如 "deactivated"），
+        # oauth_invalid_reason 会被 account_state 关键词匹配判定为 blocked，这是预期行为。
+        _mark_refresh_token_invalid(key, resp.status_code, error_body)
 
     return token_meta
 
@@ -336,6 +450,7 @@ async def get_provider_auth(
                 should_refresh = True
 
         _refreshed = False
+        _lost_lock = False  # 其他实例持有刷新锁，不应标记过期
         if should_refresh and refresh_token and provider_type:
             try:
                 from src.core.provider_templates.fixed_providers import FIXED_PROVIDERS
@@ -359,9 +474,21 @@ async def get_provider_auth(
                     finally:
                         if got_lock:
                             await _release_refresh_lock(redis, key.id)
+                else:
+                    _lost_lock = True
             except Exception:
                 # 刷新失败不阻断请求；后续由上游返回 401 再触发管理端处理
                 pass
+
+        # Refresh 失败（非锁竞争）且 access token 已过期 → 升级标记为 [OAUTH_EXPIRED]
+        # 注意：未获取到锁说明其他实例正在刷新，不应在此标记为过期
+        if should_refresh and not _refreshed and not _lost_lock and expires_at is not None:
+            try:
+                token_truly_expired = int(time.time()) >= int(expires_at)
+            except Exception:
+                token_truly_expired = False
+            if token_truly_expired:
+                _mark_oauth_token_expired(key, expires_at)
 
         # 获取最终使用的 access_token
         # Kiro 优先使用 token_meta 中缓存的 access_token（刷新后会更新到 token_meta）

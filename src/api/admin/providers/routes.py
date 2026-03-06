@@ -69,6 +69,22 @@ def _get_fixed_provider_template(provider_type: str | None) -> Any | None:
         return None
 
 
+def _resolve_new_provider_priority(
+    current_min_priority: int | None, requested_priority: int | None
+) -> tuple[int, bool]:
+    """Resolve insertion priority for a newly created provider.
+
+    Returns ``(priority, needs_shift)``.  When the caller explicitly specifies
+    a priority we need to shift existing rows; when auto-topping we simply pick
+    ``min - 1`` so no shift is required.
+    """
+    if requested_priority is not None:
+        return int(requested_priority), True
+    if current_min_priority is not None:
+        return int(current_min_priority) - 1, False
+    return 100, False
+
+
 def _merge_pool_advanced_config(
     *,
     provider_config: dict[str, Any] | None,
@@ -265,7 +281,7 @@ async def create_provider(request: Request, db: Session = Depends(get_db)) -> An
     - `quota_reset_day`: 配额重置日期（1-31）（可选）
     - `quota_last_reset_at`: 上次配额重置时间（可选）
     - `quota_expires_at`: 配额过期时间（可选）
-    - `provider_priority`: 提供商优先级（数字越小优先级越高，默认 100）
+    - `provider_priority`: 提供商优先级（数字越小优先级越高；不传时自动置顶，并将原有提供商顺延一位）
     - `is_active`: 是否启用（默认 true）
     - `concurrent_limit`: 并发限制（可选）
     - `max_retries`: 最大重试次数（可选）
@@ -458,6 +474,20 @@ class AdminCreateProviderAdapter(AdminApiAdapter):
                 failover_rules_in_payload=validated_data.failover_rules is not None,
             )
 
+            current_min_priority = db.query(func.min(Provider.provider_priority)).scalar()
+            target_priority, needs_shift = _resolve_new_provider_priority(
+                current_min_priority=current_min_priority,
+                requested_priority=validated_data.provider_priority,
+            )
+            if needs_shift:
+                db.query(Provider).filter(
+                    Provider.provider_priority.isnot(None),
+                    Provider.provider_priority >= target_priority,
+                ).update(
+                    {Provider.provider_priority: Provider.provider_priority + 1},
+                    synchronize_session=False,
+                )
+
             # 创建 Provider 对象
             provider = Provider(
                 name=validated_data.name,
@@ -469,7 +499,8 @@ class AdminCreateProviderAdapter(AdminApiAdapter):
                 quota_reset_day=validated_data.quota_reset_day,
                 quota_last_reset_at=validated_data.quota_last_reset_at,
                 quota_expires_at=validated_data.quota_expires_at,
-                provider_priority=validated_data.provider_priority,
+                provider_priority=target_priority,
+                keep_priority_on_conversion=validated_data.keep_priority_on_conversion,
                 is_active=validated_data.is_active,
                 concurrent_limit=validated_data.concurrent_limit,
                 max_retries=validated_data.max_retries,
@@ -488,11 +519,20 @@ class AdminCreateProviderAdapter(AdminApiAdapter):
             # 固定类型 Provider：自动创建并锁定预置 Endpoints（同一事务）
             template = _get_fixed_provider_template(provider.provider_type)
             if template:
+                from src.core.api_format.metadata import get_default_body_rules_for_endpoint
+
                 now = datetime.now(timezone.utc)
                 for sig in template.endpoint_signatures:
                     endpoint_config: dict[str, str] | None = None
                     if provider.provider_type == ProviderType.CODEX.value and sig == "openai:cli":
                         endpoint_config = {"upstream_stream_policy": "force_stream"}
+                    # 获取 provider-scoped 默认 body rules
+                    default_body_rules = (
+                        get_default_body_rules_for_endpoint(
+                            sig, provider_type=provider.provider_type
+                        )
+                        or None
+                    )
                     endpoint = ProviderEndpoint(
                         id=str(uuid.uuid4()),
                         provider_id=provider.id,
@@ -502,6 +542,7 @@ class AdminCreateProviderAdapter(AdminApiAdapter):
                         base_url=template.api_base_url,
                         custom_path=None,
                         header_rules=None,
+                        body_rules=default_body_rules,
                         max_retries=provider.max_retries or 2,
                         is_active=True,
                         config=endpoint_config,
