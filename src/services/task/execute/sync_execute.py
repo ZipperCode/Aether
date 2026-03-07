@@ -228,25 +228,32 @@ class SyncTaskExecutionService:
                     candidate_record_id
                 )
 
-            response, _provider_name, attempt_id, _provider_id, _endpoint_id, _key_id = (
-                await request_dispatcher.dispatch(
-                    candidate=candidate,
-                    candidate_index=candidate_index,
-                    retry_index=retry_index,
-                    candidate_record_id=candidate_record_id,
-                    user_api_key=user_api_key,
-                    request_func=request_func,
-                    request_id=request_id,
-                    api_format=api_format_norm,
-                    model_name=model_name,
-                    affinity_key=affinity_key,
-                    global_model_id=global_model_id,
-                    attempt_counter=attempt_counter,
-                    max_attempts=max_attempts_local,
-                    is_stream=is_stream,
-                )
+            (
+                response,
+                _provider_name,
+                attempt_id,
+                _provider_id,
+                _endpoint_id,
+                _key_id,
+                _first_byte_time_ms,
+            ) = await request_dispatcher.dispatch(
+                candidate=candidate,
+                candidate_index=candidate_index,
+                retry_index=retry_index,
+                candidate_record_id=candidate_record_id,
+                user_api_key=user_api_key,
+                user_id=user_id,
+                request_func=request_func,
+                request_id=request_id,
+                api_format=api_format_norm,
+                model_name=model_name,
+                affinity_key=affinity_key,
+                global_model_id=global_model_id,
+                attempt_counter=attempt_counter,
+                max_attempts=max_attempts_local,
+                is_stream=is_stream,
             )
-            _ = (attempt_id, _provider_name, _provider_id, _endpoint_id, _key_id)
+            _ = (attempt_id, _provider_name, _provider_id, _endpoint_id, _key_id, _first_byte_time_ms)
 
             # Account Pool: on success, update sticky binding + LRU.
             await self._pool_ops.pool_on_success(candidate, request_body)
