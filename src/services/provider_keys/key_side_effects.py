@@ -4,12 +4,44 @@ Provider Key 写操作后的副作用处理。
 
 from __future__ import annotations
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.orm import Session
 
 from src.api.base.models_service import invalidate_models_list_cache
 from src.core.logger import logger
-from src.models.database import ProviderAPIKey
+from src.models.database import GeminiFileMapping, ProviderAPIKey, RequestCandidate, VideoTask
 from src.services.cache.provider_cache import ProviderCacheService
+
+_SQLITE_BATCH_SIZE = 900
+_DEFAULT_BATCH_SIZE = 2000
+
+
+def cleanup_key_references(db: Session, key_ids: list[str]) -> None:
+    """在删除 ProviderAPIKey 前，先清理关联表记录，避免 CASCADE 级联删除超时。"""
+    if not key_ids:
+        return
+    batch_size = _resolve_batch_size(db)
+    for batch in _iter_batches(key_ids, batch_size):
+        db.execute(sa_delete(RequestCandidate).where(RequestCandidate.key_id.in_(batch)))
+        db.execute(sa_delete(GeminiFileMapping).where(GeminiFileMapping.key_id.in_(batch)))
+        db.execute(sa_delete(VideoTask).where(VideoTask.key_id.in_(batch)))
+
+
+def _resolve_batch_size(db: Session) -> int:
+    try:
+        bind = db.get_bind()
+        dialect_name = str(getattr(getattr(bind, "dialect", None), "name", "") or "").lower()
+    except Exception:
+        dialect_name = ""
+    if dialect_name == "sqlite":
+        return _SQLITE_BATCH_SIZE
+    return _DEFAULT_BATCH_SIZE
+
+
+def _iter_batches(items: list[str], batch_size: int) -> list[list[str]]:
+    if batch_size <= 0:
+        return [items]
+    return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
 async def run_update_key_side_effects(

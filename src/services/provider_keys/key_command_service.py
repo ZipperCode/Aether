@@ -18,7 +18,10 @@ from src.core.crypto import crypto_service
 from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.core.logger import logger
 from src.core.provider_types import ProviderType
-from src.models.database import Provider, ProviderAPIKey
+from src.models.database import (
+    Provider,
+    ProviderAPIKey,
+)
 from src.models.endpoint_models import (
     EndpointAPIKeyCreate,
     EndpointAPIKeyResponse,
@@ -28,6 +31,7 @@ from src.services.provider.fingerprint import generate_fingerprint, normalize_fi
 from src.services.provider_keys.auth_type import normalize_auth_type
 from src.services.provider_keys.duplicate_check import check_duplicate_key
 from src.services.provider_keys.key_side_effects import (
+    cleanup_key_references,
     run_create_key_side_effects,
     run_delete_key_side_effects,
     run_update_key_side_effects,
@@ -518,7 +522,10 @@ async def batch_delete_endpoint_keys_response(db: Session, key_ids: list[str]) -
     # 批量 SQL DELETE，一次提交
     success_count = 0
     try:
-        db.execute(sa_delete(ProviderAPIKey).where(ProviderAPIKey.id.in_(list(found_ids))))
+        found_id_list = list(found_ids)
+        # 先清理关联表，避免 CASCADE 级联删除超时
+        cleanup_key_references(db, found_id_list)
+        db.execute(sa_delete(ProviderAPIKey).where(ProviderAPIKey.id.in_(found_id_list)))
         db.commit()
         success_count = len(found_ids)
     except Exception as exc:
