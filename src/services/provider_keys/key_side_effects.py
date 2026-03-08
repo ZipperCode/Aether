@@ -4,7 +4,10 @@ Provider Key 写操作后的副作用处理。
 
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.api.base.models_service import invalidate_models_list_cache
@@ -15,6 +18,10 @@ from src.services.cache.provider_cache import ProviderCacheService
 _SQLITE_BATCH_SIZE = 900
 _DEFAULT_BATCH_SIZE = 2000
 
+# RequestCandidate 等大表每轮 DELETE 的行数上限，
+# 避免单条 DELETE 语句扫描过多行导致超时。
+_ROW_DELETE_BATCH = 5000
+
 
 def cleanup_key_references(db: Session, key_ids: list[str]) -> None:
     """在删除 ProviderAPIKey 前，先清理关联表记录，避免 CASCADE 级联删除超时。"""
@@ -22,9 +29,30 @@ def cleanup_key_references(db: Session, key_ids: list[str]) -> None:
         return
     batch_size = _resolve_batch_size(db)
     for batch in _iter_batches(key_ids, batch_size):
-        db.execute(sa_delete(RequestCandidate).where(RequestCandidate.key_id.in_(batch)))
+        # RequestCandidate 数据量通常最大，分批按行数删除
+        _delete_in_row_batches(db, RequestCandidate, RequestCandidate.key_id, batch)
         db.execute(sa_delete(GeminiFileMapping).where(GeminiFileMapping.key_id.in_(batch)))
         db.execute(sa_delete(VideoTask).where(VideoTask.key_id.in_(batch)))
+
+
+def _delete_in_row_batches(db: Session, model: Any, fk_col: Any, key_id_batch: list[str]) -> int:
+    """分批删除大表记录，每次最多删除 _ROW_DELETE_BATCH 行，避免单条语句超时。"""
+    total = 0
+    while True:
+        row_ids = [
+            r[0]
+            for r in db.execute(
+                select(model.id).where(fk_col.in_(key_id_batch)).limit(_ROW_DELETE_BATCH)
+            )
+        ]
+        if not row_ids:
+            break
+        result = db.execute(sa_delete(model).where(model.id.in_(row_ids)))
+        deleted = getattr(result, "rowcount", 0) or 0
+        total += deleted
+        if len(row_ids) < _ROW_DELETE_BATCH:
+            break
+    return total
 
 
 def _resolve_batch_size(db: Session) -> int:

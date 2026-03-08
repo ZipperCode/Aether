@@ -172,3 +172,12 @@ class BatchActionRequest(BaseModel):
 class BatchActionResponse(BaseModel):
     affected: int = 0
     message: str = ""
+    task_id: str | None = None
+
+
+class BatchDeleteTaskResponse(BaseModel):
+    task_id: str
+    status: str  # pending / running / completed / failed
+    total: int = 0
+    deleted: int = 0
+    message: str = ""

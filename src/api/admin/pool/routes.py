@@ -46,6 +46,7 @@ from src.services.provider_keys.quota_reader import get_quota_reader
 from .schemas import (
     BatchActionRequest,
     BatchActionResponse,
+    BatchDeleteTaskResponse,
     BatchImportError,
     BatchImportRequest,
     BatchImportResponse,
@@ -449,6 +450,21 @@ async def batch_action_keys(
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
+@router.get(
+    "/{provider_id}/keys/batch-delete-task/{task_id}",
+    response_model=BatchDeleteTaskResponse,
+)
+async def get_batch_delete_task_status(
+    provider_id: str,
+    task_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> BatchDeleteTaskResponse:
+    """Query the progress of an async batch-delete task."""
+    adapter = AdminBatchDeleteTaskStatusAdapter(provider_id=provider_id, task_id=task_id)
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
 @router.post("/{provider_id}/keys/cleanup-banned", response_model=BatchActionResponse)
 async def cleanup_banned_keys(
     provider_id: str,
@@ -463,6 +479,28 @@ async def cleanup_banned_keys(
 # ---------------------------------------------------------------------------
 # Adapters
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class AdminBatchDeleteTaskStatusAdapter(AdminApiAdapter):
+    provider_id: str = ""
+    task_id: str = ""
+
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        from fastapi import HTTPException
+
+        from src.services.provider_keys.batch_delete_task import get_batch_delete_task
+
+        task = get_batch_delete_task(self.task_id)
+        if task is None or task.provider_id != self.provider_id:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return BatchDeleteTaskResponse(
+            task_id=task.task_id,
+            status=task.status,
+            total=task.total,
+            deleted=task.deleted,
+            message=task.message,
+        )
 
 
 class AdminListSchedulingPresetsAdapter(AdminApiAdapter):
@@ -1070,86 +1108,23 @@ class AdminBatchActionKeysAdapter(AdminApiAdapter):
         affected = 0
 
         if self.body.action == "delete":
-            delete_started_at = time.perf_counter()
-            sql_delete_ms = 0.0
-            cleanup_ms = 0.0
-            commit_ms = 0.0
-            side_effects_ms = 0.0
+            from src.services.provider_keys.batch_delete_task import submit_batch_delete
+
             key_ids = list(dict.fromkeys(self.body.key_ids))
-            delete_batch_size = _resolve_delete_batch_size(db)
-            delete_batch_count = 0
-            try:
-                # 先清理关联表，避免 CASCADE 级联删除导致超时
-                cleanup_started_at = time.perf_counter()
-                cleanup_key_references(db, key_ids)
-                cleanup_ms = (time.perf_counter() - cleanup_started_at) * 1000.0
-
-                for batch in _iter_batches(key_ids, delete_batch_size):
-                    batch_started_at = time.perf_counter()
-                    result = db.execute(
-                        sa_delete(ProviderAPIKey).where(
-                            ProviderAPIKey.provider_id == pid,
-                            ProviderAPIKey.id.in_(batch),
-                        )
-                    )
-                    sql_delete_ms += (time.perf_counter() - batch_started_at) * 1000.0
-                    delete_batch_count += 1
-                    rowcount = getattr(result, "rowcount", 0) or 0
-                    if rowcount > 0:
-                        affected += int(rowcount)
-                commit_started_at = time.perf_counter()
-                db.commit()
-                commit_ms = (time.perf_counter() - commit_started_at) * 1000.0
-            except Exception as exc:
-                db.rollback()
-                total_ms = (time.perf_counter() - delete_started_at) * 1000.0
-                logger.error(
-                    "batch delete commit failed: {} | provider={} requested={} batches={} sql_ms={:.2f} cleanup_ms={:.2f} commit_ms={:.2f} total_ms={:.2f}",
-                    exc,
-                    pid[:8],
-                    len(key_ids),
-                    delete_batch_count,
-                    sql_delete_ms,
-                    cleanup_ms,
-                    commit_ms,
-                    total_ms,
-                )
-                return BatchActionResponse(affected=0, message=f"commit failed: {exc}")
-
-            if affected > 0:
-                from src.services.provider_keys.key_side_effects import (
-                    run_delete_key_side_effects,
-                )
-
-                try:
-                    side_effects_started_at = time.perf_counter()
-                    await run_delete_key_side_effects(
-                        db=db,
-                        provider_id=pid,
-                        deleted_key_allowed_models=None,
-                    )
-                    side_effects_ms = (time.perf_counter() - side_effects_started_at) * 1000.0
-                except Exception as exc:
-                    side_effects_ms = (time.perf_counter() - side_effects_started_at) * 1000.0
-                    logger.error("batch delete side effects failed: {}", exc)
-
-            total_ms = (time.perf_counter() - delete_started_at) * 1000.0
+            task_id = submit_batch_delete(pid, key_ids)
+            admin_name = context.user.username if context.user else "admin"
             logger.info(
-                "[POOL_BATCH_DELETE_TIMING] provider={} requested={} affected={} batches={} batch_size={} cleanup_ms={:.2f} sql_ms={:.2f} commit_ms={:.2f} side_effects_ms={:.2f} total_ms={:.2f}",
+                "Pool batch delete submitted by {}: provider={}, keys={}, task_id={}",
+                admin_name,
                 pid[:8],
                 len(key_ids),
-                affected,
-                delete_batch_count,
-                delete_batch_size,
-                cleanup_ms,
-                sql_delete_ms,
-                commit_ms,
-                side_effects_ms,
-                total_ms,
+                task_id,
             )
-
-            admin_name = context.user.username if context.user else "admin"
-            affected_ids = [kid[:8] for kid in key_ids[:20]]
+            return BatchActionResponse(
+                affected=0,
+                message=f"delete task submitted ({len(key_ids)} keys)",
+                task_id=task_id,
+            )
         else:
             keys = (
                 db.query(ProviderAPIKey)

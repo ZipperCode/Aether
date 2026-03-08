@@ -266,7 +266,7 @@ import { RefreshCw, Play, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
-import { listPoolKeys, batchActionPoolKeys, type PoolKeyDetail } from '@/api/endpoints/pool'
+import { listPoolKeys, batchActionPoolKeys, getPoolBatchDeleteTask, type PoolKeyDetail } from '@/api/endpoints/pool'
 import { refreshProviderQuota } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
@@ -573,6 +573,36 @@ async function loadAllKeys(): Promise<void> {
   }
 }
 
+const DELETE_POLL_INTERVAL_MS = 2000
+const DELETE_POLL_MAX_MS = 10 * 60 * 1000
+const DELETE_POLL_MAX_FAILURES = 3
+
+async function pollDeleteTask(
+  providerId: string,
+  taskId: string,
+  progressOffset: number,
+): Promise<{ status: string; deleted: number }> {
+  const deadline = Date.now() + DELETE_POLL_MAX_MS
+  let consecutiveFailures = 0
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, DELETE_POLL_INTERVAL_MS))
+    try {
+      const task = await getPoolBatchDeleteTask(providerId, taskId)
+      consecutiveFailures = 0
+      progressDone.value = progressOffset + task.deleted
+      if (task.status === 'completed' || task.status === 'failed') {
+        return { status: task.status, deleted: task.deleted }
+      }
+    } catch {
+      consecutiveFailures++
+      if (consecutiveFailures >= DELETE_POLL_MAX_FAILURES) {
+        return { status: 'failed', deleted: 0 }
+      }
+    }
+  }
+  return { status: 'failed', deleted: 0 }
+}
+
 async function executeAction(): Promise<void> {
   if (executing.value) return
   if (selectedKeyIds.value.length === 0) {
@@ -638,7 +668,45 @@ async function executeAction(): Promise<void> {
 
         progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
       }
-    } else if (['delete', 'enable', 'disable', 'clear_proxy', 'set_proxy'].includes(selectedAction.value)) {
+    } else if (selectedAction.value === 'delete') {
+      // 删除走异步任务模式：提交后轮询进度
+      const targetIds = selectedKeys.map((key) => key.key_id)
+      const BATCH_SIZE = 2000
+      const totalBatches = Math.ceil(targetIds.length / BATCH_SIZE)
+
+      for (let i = 0; i < targetIds.length; i += BATCH_SIZE) {
+        const batchIndex = Math.floor(i / BATCH_SIZE) + 1
+        const batch = targetIds.slice(i, i + BATCH_SIZE)
+        if (totalBatches > 1) {
+          progressLabel.value = `正在${actionLabel}...（第 ${batchIndex}/${totalBatches} 批）`
+        }
+
+        try {
+          const result = await batchActionPoolKeys(props.providerId, {
+            key_ids: batch,
+            action: 'delete',
+          })
+
+          if (result.task_id) {
+            // 异步任务：轮询进度
+            progressLabel.value = `正在${actionLabel}...（后台执行中）`
+            const taskResult = await pollDeleteTask(props.providerId, result.task_id, i)
+            successCount += taskResult.deleted
+            if (taskResult.status === 'failed') {
+              failedCount += batch.length - taskResult.deleted
+            }
+          } else {
+            successCount += result.affected
+          }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(`batch delete failed (batch ${batchIndex}/${totalBatches}):`, err)
+          failedCount += batch.length
+        }
+
+        progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
+      }
+    } else if (['enable', 'disable', 'clear_proxy', 'set_proxy'].includes(selectedAction.value)) {
       const targetIds = selectedKeys.map((key) => key.key_id)
       const BATCH_SIZE = 2000
       const totalBatches = Math.ceil(targetIds.length / BATCH_SIZE)
@@ -657,7 +725,7 @@ async function executeAction(): Promise<void> {
         try {
           const result = await batchActionPoolKeys(props.providerId, {
             key_ids: batch,
-            action: selectedAction.value,
+            action: selectedAction.value as 'enable' | 'disable' | 'clear_proxy' | 'set_proxy',
             ...(payload ? { payload } : {}),
           })
           successCount += result.affected
