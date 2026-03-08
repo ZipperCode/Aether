@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 import uuid
 from collections.abc import Callable
 
@@ -27,8 +26,8 @@ STATUS_FAILED = "failed"
 # 任务完成后保留时长（秒），也用作 Redis key 的 TTL
 _TASK_RETAIN_SECONDS = 600
 
-# 删除 ProviderAPIKey 时的分批大小
-_DELETE_BATCH_SIZE = 500
+# 批量删除时每个独立事务处理的 key 数量
+_CLEANUP_BATCH_SIZE = 50
 
 # Redis key 前缀
 _REDIS_KEY_PREFIX = "batch_delete_task"
@@ -175,7 +174,8 @@ def _sync_delete(
 ) -> int:
     """在线程中执行的同步删除逻辑，避免阻塞事件循环。
 
-    每批 cleanup + DELETE + commit 作为独立事务，减少锁持有时间。
+    按小批次（_CLEANUP_BATCH_SIZE）清理关联表并删除 key，
+    每个批次独立事务，单批失败跳过并继续，确保进度条持续推进。
     """
     from src.database import create_session
     from src.models.database import ProviderAPIKey
@@ -184,8 +184,11 @@ def _sync_delete(
     db = create_session()
     try:
         affected = 0
-        for i in range(0, len(key_ids), _DELETE_BATCH_SIZE):
-            batch = key_ids[i : i + _DELETE_BATCH_SIZE]
+        total_batches = (len(key_ids) + _CLEANUP_BATCH_SIZE - 1) // _CLEANUP_BATCH_SIZE
+        batch_idx = 0
+        for i in range(0, len(key_ids), _CLEANUP_BATCH_SIZE):
+            batch = key_ids[i : i + _CLEANUP_BATCH_SIZE]
+            batch_idx += 1
             try:
                 cleanup_key_references(db, batch)
                 result = db.execute(
@@ -197,14 +200,19 @@ def _sync_delete(
                 rowcount = getattr(result, "rowcount", 0) or 0
                 affected += int(rowcount)
                 db.commit()
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "[BATCH_DELETE] batch failed (keys {}-{}): {}",
+                    i,
+                    i + len(batch),
+                    exc,
+                )
                 try:
                     db.rollback()
                 except Exception:
                     pass
-                raise
-            # 通过回调通知进度（在事件循环线程中更新 Redis）
-            if progress_callback is not None:
+            # 每 5 个批次或最后一个批次上报进度，避免过于频繁写 Redis
+            if progress_callback is not None and (batch_idx % 5 == 0 or batch_idx == total_batches):
                 progress_callback(affected)
         return affected
     finally:
@@ -222,16 +230,10 @@ async def _run_batch_delete(
     r = await get_redis_client(require_redis=False)
     await _update_task_field(task_id, r=r, status=STATUS_RUNNING)
 
-    # 用于从工作线程安全地触发 Redis 进度更新（按时间限频，最多每 2 秒写一次）
+    # 从工作线程安全地触发 Redis 进度更新
     loop = asyncio.get_running_loop()
-    last_report_time = [0.0]
-    _PROGRESS_INTERVAL = 2.0
 
     def on_progress(current: int) -> None:
-        now = time.monotonic()
-        if now - last_report_time[0] < _PROGRESS_INTERVAL:
-            return
-        last_report_time[0] = now
         try:
             asyncio.run_coroutine_threadsafe(
                 _update_task_field(task_id, r=r, deleted=current), loop
