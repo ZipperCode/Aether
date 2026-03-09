@@ -30,7 +30,6 @@ from src.core.api_format import (
     get_adapter_protected_keys_for_endpoint,
     get_auth_handler,
     get_default_auth_method_for_endpoint,
-    resolve_header_name_case,
 )
 from src.core.exceptions import (
     ProviderAuthException,
@@ -344,7 +343,6 @@ class HandlerAdapterBase(ApiAdapter):
         provider_api_key: Any | None = None,
         # 代理配置
         proxy_config: dict[str, Any] | None = None,
-        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """
         测试模型连接性（非流式）
@@ -460,8 +458,7 @@ class HandlerAdapterBase(ApiAdapter):
                 default_auth_header, _ = get_auth_config_for_endpoint(cls.FORMAT_ID)
                 if default_auth_header.lower() != "authorization":
                     headers.pop(default_auth_header, None)
-                auth_header_name = resolve_header_name_case(extra_headers, "Authorization")
-                headers[auth_header_name] = f"Bearer {api_key}"
+                headers["Authorization"] = f"Bearer {api_key}"
 
         # ---- Body ----
         body = cls.build_request_body(request_data, base_url=base_url, provider_type=provider_type)
@@ -530,7 +527,6 @@ class HandlerAdapterBase(ApiAdapter):
             api_key_id=api_key_id,
             model_name=effective_model_name,
             proxy_config=proxy_config,
-            timeout=timeout_seconds,
         )
 
     # =========================================================================

@@ -715,6 +715,33 @@ class AdminSetSystemConfigAdapter(AdminApiAdapter):
             except Exception as e:
                 logger.warning(f"更新 all-api-hub 同步任务时间失败: {e}")
 
+        if self.key == "site_account_sync_time" and value:
+            try:
+                from src.services.system.maintenance_scheduler import get_maintenance_scheduler
+
+                scheduler = get_maintenance_scheduler()
+                scheduler.update_site_account_sync_time(value)
+            except Exception as e:
+                logger.warning(f"更新站点账号同步任务时间失败: {e}")
+
+        if self.key == "site_account_checkin_time" and value:
+            try:
+                from src.services.system.maintenance_scheduler import get_maintenance_scheduler
+
+                scheduler = get_maintenance_scheduler()
+                scheduler.update_site_account_checkin_time(value)
+            except Exception as e:
+                logger.warning(f"更新站点账号签到任务时间失败: {e}")
+
+        if self.key == "site_account_balance_sync_time" and value:
+            try:
+                from src.services.system.maintenance_scheduler import get_maintenance_scheduler
+
+                scheduler = get_maintenance_scheduler()
+                scheduler.update_site_account_balance_sync_time(value)
+            except Exception as e:
+                logger.warning(f"更新站点账号余额同步任务时间失败: {e}")
+
         # 如果更新的是调度模式或优先级模式，立即更新当前 Worker 的 Scheduler 单例
         if self.key in ("scheduling_mode", "provider_priority_mode"):
             try:

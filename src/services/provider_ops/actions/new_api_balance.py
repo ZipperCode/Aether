@@ -31,6 +31,13 @@ class NewApiBalanceAction(BalanceAction):
     _ALREADY_CHECKED_INDICATORS = ("already", "已签到", "已经签到", "今日已签", "重复签到")
     _AUTH_FAIL_INDICATORS = ("未登录", "请登录", "login", "unauthorized", "无权限", "权限不足")
     _MANUAL_VERIFICATION_INDICATORS = ("turnstile", "captcha", "验证码", "校验", "verify")
+    _CHECKIN_NOT_SUPPORTED_INDICATORS = (
+        "签到功能未启用",
+        "签到功能未开放",
+        "签到未开放",
+        "not enabled",
+        "not support",
+    )
 
     async def execute(self, client: httpx.AsyncClient):
         """
@@ -57,6 +64,13 @@ class NewApiBalanceAction(BalanceAction):
         success = checkin_result.get("success")
         message = checkin_result.get("message") or ""
         if success is False:
+            if bool(checkin_result.get("not_supported")):
+                return ActionResult(
+                    status=ActionStatus.NOT_SUPPORTED,
+                    action_type=self.action_type,
+                    message=message or "站点未开放签到功能",
+                    cache_ttl_seconds=0,
+                )
             if checkin_result.get("auth_failed"):
                 data = {
                     "manual_verification_required": bool(
@@ -150,7 +164,7 @@ class NewApiBalanceAction(BalanceAction):
             # 404 表示签到功能未开放
             if response.status_code == 404:
                 logger.debug(f"[{site}] 签到功能未开放")
-                return None
+                return {"success": False, "not_supported": True, "message": "签到功能未开放"}
 
             # 401/403 通常表示未授权；Cookie 模式下大多意味着 Cookie 已失效
             if response.status_code in (401, 403):
@@ -193,6 +207,14 @@ class NewApiBalanceAction(BalanceAction):
                     )
                     return {"success": True, "message": message or "签到成功"}
                 else:
+                    is_not_supported = self._contains_checkin_not_supported_signal(message)
+                    if is_not_supported:
+                        logger.debug(f"[{site}] 站点未开放签到功能: {message}")
+                        return {
+                            "success": False,
+                            "not_supported": True,
+                            "message": message or "签到功能未启用",
+                        }
                     # 检查是否是"已签到"的情况
                     is_already = any(
                         ind.lower() in message_lower for ind in self._ALREADY_CHECKED_INDICATORS
@@ -275,6 +297,12 @@ class NewApiBalanceAction(BalanceAction):
         if not text:
             return False
         return any(ind in text for ind in self._MANUAL_VERIFICATION_INDICATORS)
+
+    def _contains_checkin_not_supported_signal(self, message: str | None) -> bool:
+        text = str(message or "").strip().lower()
+        if not text:
+            return False
+        return any(ind in text for ind in self._CHECKIN_NOT_SUPPORTED_INDICATORS)
 
     def _extract_response_message(self, response: httpx.Response) -> str:
         try:

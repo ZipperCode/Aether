@@ -6,19 +6,9 @@ Provider 操作模块
 - 可扩展的操作类型（余额查询、签到等）
 """
 
-from src.services.provider_ops.registry import ArchitectureRegistry, get_registry
-from src.services.provider_ops.service import ProviderOpsService
-from src.services.provider_ops.types import (
-    ActionResult,
-    ActionStatus,
-    BalanceInfo,
-    CheckinInfo,
-    ConnectorAuthType,
-    ConnectorState,
-    ConnectorStatus,
-    ProviderActionType,
-    ProviderOpsConfig,
-)
+from __future__ import annotations
+
+from typing import Any
 
 __all__ = [
     # 服务
@@ -37,3 +27,57 @@ __all__ = [
     "ProviderActionType",
     "ProviderOpsConfig",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"ArchitectureRegistry", "get_registry"}:
+        from src.services.provider_ops.registry import ArchitectureRegistry, get_registry
+
+        values = {
+            "ArchitectureRegistry": ArchitectureRegistry,
+            "get_registry": get_registry,
+        }
+        return values[name]
+
+    if name == "ProviderOpsService":
+        from src.services.provider_ops.service import ProviderOpsService
+
+        return ProviderOpsService
+
+    if name in {
+        "ActionResult",
+        "ActionStatus",
+        "BalanceInfo",
+        "CheckinInfo",
+        "ConnectorAuthType",
+        "ConnectorState",
+        "ConnectorStatus",
+        "ProviderActionType",
+        "ProviderOpsConfig",
+    }:
+        from src.services.provider_ops.types import (
+            ActionResult,
+            ActionStatus,
+            BalanceInfo,
+            CheckinInfo,
+            ConnectorAuthType,
+            ConnectorState,
+            ConnectorStatus,
+            ProviderActionType,
+            ProviderOpsConfig,
+        )
+
+        values = {
+            "ActionResult": ActionResult,
+            "ActionStatus": ActionStatus,
+            "BalanceInfo": BalanceInfo,
+            "CheckinInfo": CheckinInfo,
+            "ConnectorAuthType": ConnectorAuthType,
+            "ConnectorState": ConnectorState,
+            "ConnectorStatus": ConnectorStatus,
+            "ProviderActionType": ProviderActionType,
+            "ProviderOpsConfig": ProviderOpsConfig,
+        }
+        return values[name]
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

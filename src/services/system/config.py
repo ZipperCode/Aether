@@ -167,6 +167,42 @@ class SystemConfigService:
             "value": True,
             "description": "all-api-hub 同步时是否自动为匹配域名但未配置 provider_ops 的 Provider 创建最小配置",
         },
+        "enable_site_account_sync": {
+            "value": False,
+            "description": "是否启用站点账号自动同步任务（读取 WebDAV 快照并更新 site_accounts）",
+        },
+        "site_account_sync_time": {
+            "value": "01:45",
+            "description": "站点账号自动同步执行时间（HH:MM 格式，24小时制）",
+        },
+        "site_account_snapshot_cache_ttl_seconds": {
+            "value": 300,
+            "description": "站点账号快照缓存 TTL（秒），到期后才重新拉取 WebDAV",
+        },
+        "site_account_sync_apply_policy": {
+            "value": "matched_and_unmatched",
+            "description": "站点账号同步策略：matched_only 或 matched_and_unmatched",
+        },
+        "enable_site_account_sync_to_provider": {
+            "value": True,
+            "description": "站点账号同步后是否自动回写匹配 Provider 的认证凭据",
+        },
+        "enable_site_account_checkin": {
+            "value": False,
+            "description": "是否启用站点账号自动签到任务",
+        },
+        "site_account_checkin_time": {
+            "value": "02:05",
+            "description": "站点账号自动签到执行时间（HH:MM 格式，24小时制）",
+        },
+        "enable_site_account_balance_sync": {
+            "value": False,
+            "description": "是否启用站点账号自动余额同步任务",
+        },
+        "site_account_balance_sync_time": {
+            "value": "02:20",
+            "description": "站点账号自动余额同步执行时间（HH:MM 格式，24小时制）",
+        },
         "enable_user_quota_reset": {
             "value": False,
             "description": "是否启用用户配额自动重置任务（按配置时间触发，按周期执行）",

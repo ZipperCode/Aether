@@ -22,9 +22,9 @@ from src.core.logger import logger
 from src.database import create_session
 from src.models.database import Provider
 from src.services.provider_ops.architectures import ProviderConnector
+from src.services.provider_ops.execution_engine import OpsExecutionEngine, OpsExecutionTarget
 from src.services.provider_ops.registry import get_registry
 from src.services.provider_ops.types import (
-    SENSITIVE_CREDENTIAL_FIELDS,
     ActionResult,
     ActionStatus,
     BalanceInfo,
@@ -43,9 +43,6 @@ AUTH_FAILED_CACHE_TTL = 60
 # 后台余额刷新并发限制（避免启动时耗尽连接池）
 # 使用较小的值（3）确保不会对连接池造成过大压力
 _balance_refresh_semaphore: asyncio.Semaphore | None = None
-
-# 正在异步刷新余额的 provider 集合（per-provider 防重入）
-_refreshing_providers: set[str] = set()
 
 
 def _get_balance_refresh_semaphore() -> asyncio.Semaphore:
@@ -98,11 +95,22 @@ class ProviderOpsService:
     """
 
     # 凭据中需要加密的字段
-    SENSITIVE_FIELDS = SENSITIVE_CREDENTIAL_FIELDS
+    SENSITIVE_FIELDS = {
+        "api_key",
+        "password",
+        "refresh_token",
+        "session_token",
+        "session_cookie",
+        "token_cookie",
+        "auth_cookie",
+        "cookie_string",
+        "cookie",
+    }
 
     def __init__(self, db: Session):
         self.db = db
         self.crypto = CryptoService()
+        self.execution_engine = OpsExecutionEngine()
 
         # 连接器缓存 {provider_id: ProviderConnector}
         self._connectors: dict[str, ProviderConnector] = {}
@@ -265,24 +273,10 @@ class ProviderOpsService:
         if not config:
             return False, "未配置操作设置"
 
-        # 获取架构
-        registry = get_registry()
-        architecture = registry.get_or_default(config.architecture_id)
-
         # 获取 base_url：优先从 config 读取
         base_url = config.base_url or self._get_provider_base_url(provider)
         if not base_url:
             return False, "Provider 未配置 base_url"
-
-        # 创建连接器
-        try:
-            connector = architecture.get_connector(
-                base_url=base_url,
-                auth_type=config.connector_auth_type,
-                config=config.connector_config,
-            )
-        except ValueError as e:
-            return False, str(e)
 
         # 使用提供的凭据或已保存的凭据
         if credentials:
@@ -292,6 +286,22 @@ class ProviderOpsService:
 
         if not actual_credentials:
             return False, "未提供凭据"
+
+        target = self._build_execution_target(
+            provider_id=provider_id,
+            config=config,
+            credentials=actual_credentials,
+            provider=provider,
+            base_url=base_url,
+        )
+        if not target:
+            return False, "Provider 未配置 base_url"
+
+        # 创建连接器
+        try:
+            connector = self.execution_engine.create_connector(target)
+        except ValueError as e:
+            return False, str(e)
 
         # Avoid holding a DB connection while awaiting network I/O.
         self._release_db_connection_before_await()
@@ -402,44 +412,28 @@ class ProviderOpsService:
                 message="未配置操作设置",
             )
 
-        # 获取架构
-        registry = get_registry()
-        architecture = registry.get_or_default(config.architecture_id)
-
-        # 检查是否支持该操作
-        if not architecture.supports_action(action_type):
-            return ActionResult(
-                status=ActionStatus.NOT_SUPPORTED,
-                action_type=action_type,
-                message=f"架构 {architecture.architecture_id} 不支持 {action_type.value} 操作",
-            )
-
-        # 合并操作配置
-        saved_action_config = config.actions.get(action_type.value, {}).get("config", {})
-        merged_config = {**saved_action_config, **(action_config or {})}
-        merged_config["_provider_id"] = provider_id
-
-        # 注入 credentials 元信息（如是否配置了 Cookie），供 Action 使用
         decrypted_credentials = self._decrypt_credentials(config.connector_credentials)
-        cookie_candidates = ("cookie", "session_cookie", "cookie_string", "auth_cookie", "token_cookie")
-        has_cookie = any(
-            str(decrypted_credentials.get(key) or "").strip() for key in cookie_candidates
+        target = self._build_execution_target(
+            provider_id=provider_id,
+            config=config,
+            credentials=decrypted_credentials,
         )
-        if has_cookie:
-            merged_config["_has_cookie"] = True
-        merged_config["_has_user_id"] = bool(str(decrypted_credentials.get("user_id") or "").strip())
-
-        # 创建操作实例
-        action = architecture.get_action(action_type, merged_config)
+        if not target:
+            return ActionResult(
+                status=ActionStatus.NOT_CONFIGURED,
+                action_type=action_type,
+                message="Provider 未配置 base_url",
+            )
 
         # Avoid holding a DB connection while awaiting the upstream action.
         self._release_db_connection_before_await()
 
-        # 执行操作
-        async with connector.get_client() as client:
-            result = await action.execute(client)
-
-        return result
+        return await self.execution_engine.execute(
+            connector=connector,
+            target=target,
+            action_type=action_type,
+            action_config=action_config,
+        )
 
     async def query_balance(
         self,
@@ -520,14 +514,7 @@ class ProviderOpsService:
         避免长时间占用连接池资源。
 
         使用信号量限制并发数，避免启动时多个刷新任务同时运行导致连接池耗尽。
-        使用 _refreshing_providers 集合防止同一 provider 被并发刷新。
         """
-        # per-provider 防重入
-        if provider_id in _refreshing_providers:
-            logger.debug("异步刷新余额跳过（已在刷新中）: provider_id={}", provider_id)
-            return
-        _refreshing_providers.add(provider_id)
-
         semaphore = _get_balance_refresh_semaphore()
 
         # 尝试获取信号量，如果无法立即获取则跳过本次刷新
@@ -537,7 +524,6 @@ class ProviderOpsService:
             await asyncio.wait_for(semaphore.acquire(), timeout=5.0)
         except asyncio.TimeoutError:
             logger.debug("异步刷新余额跳过（并发限制）: provider_id={}", provider_id)
-            _refreshing_providers.discard(provider_id)
             return
 
         db = None
@@ -555,9 +541,8 @@ class ProviderOpsService:
                     db.close()
                 except Exception:
                     pass
-            # 释放信号量并移除防重入标记
+            # 释放信号量
             semaphore.release()
-            _refreshing_providers.discard(provider_id)
 
     async def _clear_balance_cache(self, provider_id: str) -> None:
         """清除余额缓存"""
@@ -716,6 +701,29 @@ class ProviderOpsService:
     def _get_provider(self, provider_id: str) -> Provider | None:
         """获取 Provider"""
         return self.db.query(Provider).filter(Provider.id == provider_id).first()
+
+    def _build_execution_target(
+        self,
+        *,
+        provider_id: str,
+        config: ProviderOpsConfig,
+        credentials: dict[str, Any],
+        provider: Provider | None = None,
+        base_url: str | None = None,
+    ) -> OpsExecutionTarget | None:
+        resolved_provider = provider or self._get_provider(provider_id)
+        resolved_base_url = base_url or config.base_url
+        if not resolved_base_url and resolved_provider:
+            resolved_base_url = self._get_provider_base_url(resolved_provider)
+        if not resolved_base_url:
+            return None
+
+        return OpsExecutionTarget.from_provider_config(
+            target_id=provider_id,
+            base_url=resolved_base_url,
+            config=config,
+            credentials=credentials,
+        )
 
     def _get_provider_base_url(self, provider: Provider) -> str | None:
         """从 Provider 获取 base_url"""

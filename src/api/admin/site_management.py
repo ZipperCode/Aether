@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -9,17 +10,43 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from src.core.crypto import CryptoService
 from src.database import get_db
-from src.models.database import Provider, SiteCheckinItem, SiteCheckinRun, SiteSyncItem, SiteSyncRun, User
+from src.models.database import (
+    Provider,
+    SiteAccount,
+    SiteCheckinItem,
+    SiteCheckinRun,
+    SiteSyncItem,
+    SiteSyncRun,
+    User,
+)
 from src.services.provider_sync import AllApiHubSyncService
 from src.services.provider_sync.all_api_hub_backup import parse_all_api_hub_accounts
 from src.services.provider_sync.webdav_client import download_backup
-from src.services.site_management import SiteManagementLogService
+from src.services.site_management import (
+    SiteAccountOpsService,
+    SiteAccountSyncService,
+    SiteManagementLogService,
+    SiteSnapshotService,
+)
 from src.services.system.config import SystemConfigService
 from src.services.system.maintenance_scheduler import get_maintenance_scheduler
 from src.utils.auth_utils import require_admin
 
 router = APIRouter(prefix="/api/admin/site-management", tags=["Site Management"])
+
+_SENSITIVE_CREDENTIAL_FIELDS = {
+    "api_key",
+    "password",
+    "refresh_token",
+    "session_token",
+    "session_cookie",
+    "token_cookie",
+    "auth_cookie",
+    "cookie_string",
+    "cookie",
+}
 
 
 def _checkin_message_requires_manual_verification(message: str | None) -> bool:
@@ -28,6 +55,40 @@ def _checkin_message_requires_manual_verification(message: str | None) -> bool:
         return False
     indicators = ("turnstile", "captcha", "验证码", "需手动核验", "manual verification")
     return any(ind in text for ind in indicators)
+
+
+def _serialize_data(data: Any) -> Any:
+    if data is None:
+        return None
+    if is_dataclass(data) and not isinstance(data, type):
+        return asdict(data)
+    return data
+
+
+def _serialize_action_result(result: Any) -> dict[str, Any]:
+    return {
+        "status": result.status.value,
+        "action_type": result.action_type.value,
+        "data": _serialize_data(result.data),
+        "message": result.message,
+        "executed_at": result.executed_at.isoformat(),
+        "response_time_ms": result.response_time_ms,
+        "cache_ttl_seconds": result.cache_ttl_seconds,
+    }
+
+
+def _decrypt_site_account_credentials(credentials: dict[str, Any]) -> dict[str, Any]:
+    crypto = CryptoService()
+    decrypted: dict[str, Any] = {}
+    for key, value in credentials.items():
+        if key in _SENSITIVE_CREDENTIAL_FIELDS and isinstance(value, str) and value:
+            try:
+                decrypted[key] = crypto.decrypt(value)
+            except Exception:
+                decrypted[key] = value
+        else:
+            decrypted[key] = value
+    return decrypted
 
 
 class TriggerSiteSyncRequest(BaseModel):
@@ -57,6 +118,17 @@ class ApplySiteAccountsSyncRequest(BaseModel):
 
 class SiteAccountsCheckinStatusRequest(BaseModel):
     provider_ids: list[str] = Field(default_factory=list)
+
+
+class SyncSiteAccountsRequest(BaseModel):
+    force_refresh: bool = Field(False, description="是否强制刷新 WebDAV 快照")
+    cache_ttl_seconds: int | None = Field(
+        None, ge=0, le=86400, description="快照缓存 TTL（秒），为空时读取系统配置"
+    )
+    apply_policy: str | None = Field(
+        None,
+        description="同步策略：matched_only 或 matched_and_unmatched",
+    )
 
 
 def _build_backup_from_accounts(accounts: list[SiteManagementAccount]) -> dict[str, Any]:
@@ -177,6 +249,141 @@ def _apply_account_checkin_preference(db: Session, accounts: list[SiteManagement
     return changed
 
 
+def _serialize_site_accounts(db: Session, accounts: list[SiteAccount]) -> list[dict[str, Any]]:
+    provider_name_by_id = {
+        str(pid): str(name or "")
+        for pid, name in db.query(Provider.id, Provider.name).all()
+    }
+
+    rows: list[dict[str, Any]] = []
+    for account in accounts:
+        raw_credentials = account.credentials if isinstance(account.credentials, dict) else {}
+        credentials = _decrypt_site_account_credentials(raw_credentials)
+        rows.append(
+            {
+                "id": str(account.id),
+                "site_url": account.site_url,
+                "domain": account.domain,
+                "provider_id": str(account.provider_id) if account.provider_id else None,
+                "provider_name": provider_name_by_id.get(str(account.provider_id or "")) or None,
+                "checkin_enabled": bool(account.checkin_enabled),
+                "balance_sync_enabled": bool(account.balance_sync_enabled),
+                "is_active": bool(account.is_active),
+                "auth_type": account.auth_type or "cookie",
+                "architecture_id": account.architecture_id,
+                "user_id": credentials.get("user_id"),
+                "access_token": credentials.get("api_key"),
+                "cookie": credentials.get("cookie") or credentials.get("session_cookie"),
+                "last_checkin_status": account.last_checkin_status,
+                "last_checkin_message": account.last_checkin_message,
+                "last_checkin_at": account.last_checkin_at.isoformat()
+                if account.last_checkin_at
+                else None,
+                "last_balance_status": account.last_balance_status,
+                "last_balance_message": account.last_balance_message,
+                "last_balance_total": account.last_balance_total,
+                "last_balance_currency": account.last_balance_currency,
+                "last_balance_at": account.last_balance_at.isoformat()
+                if account.last_balance_at
+                else None,
+                "updated_at": account.updated_at.isoformat() if account.updated_at else None,
+            }
+        )
+    rows.sort(key=lambda x: ((x.get("domain") or ""), (x.get("site_url") or "")))
+    return rows
+
+
+async def _sync_site_accounts_from_webdav(
+    db: Session,
+    *,
+    force_refresh: bool = False,
+    cache_ttl_seconds: int | None = None,
+    apply_policy: str | None = None,
+) -> dict[str, Any]:
+    url = SystemConfigService.get_config(db, "all_api_hub_webdav_url")
+    username = SystemConfigService.get_config(db, "all_api_hub_webdav_username")
+    password_raw = SystemConfigService.get_config(db, "all_api_hub_webdav_password")
+    if not url or not username or not password_raw:
+        raise HTTPException(status_code=400, detail="WebDAV 配置不完整，请先在系统设置中完成配置")
+
+    try:
+        password = SiteManagementLogService.resolve_system_password(password_raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="WebDAV 密码解密失败，请在系统设置中重新保存密码") from exc
+
+    ttl = cache_ttl_seconds
+    if ttl is None:
+        ttl = int(SystemConfigService.get_config(db, "site_account_snapshot_cache_ttl_seconds", 300))
+    ttl = max(0, int(ttl))
+
+    policy = (apply_policy or "").strip() or str(
+        SystemConfigService.get_config(db, "site_account_sync_apply_policy", "matched_and_unmatched")
+    )
+    if policy not in {"matched_only", "matched_and_unmatched"}:
+        raise HTTPException(status_code=400, detail="无效的同步策略，仅支持 matched_only/matched_and_unmatched")
+
+    snapshot_service = SiteSnapshotService()
+    snapshot = await snapshot_service.get_webdav_snapshot(
+        db,
+        url=str(url),
+        username=str(username),
+        password=password,
+        cache_ttl_seconds=ttl,
+        force_refresh=force_refresh,
+    )
+
+    sync_result = SiteAccountSyncService().apply_snapshot(
+        db,
+        snapshot=snapshot.payload,
+        apply_policy=policy,
+        source_snapshot_id=snapshot.snapshot_id,
+    )
+    sync_to_provider = bool(
+        SystemConfigService.get_config(db, "enable_site_account_sync_to_provider", True)
+    )
+    provider_sync = None
+    if sync_to_provider:
+        auto_create_provider_ops = bool(
+            SystemConfigService.get_config(
+                db,
+                "enable_all_api_hub_auto_create_provider_ops",
+                True,
+            )
+        )
+        provider_result = AllApiHubSyncService().sync_from_backup_object(
+            db,
+            snapshot.payload,
+            dry_run=False,
+            auto_create_provider_ops=auto_create_provider_ops,
+        )
+        provider_sync = {
+            "total_accounts": provider_result.total_accounts,
+            "total_providers": provider_result.total_providers,
+            "matched_providers": provider_result.matched_providers,
+            "updated_providers": provider_result.updated_providers,
+            "skipped_no_provider_ops": provider_result.skipped_no_provider_ops,
+            "skipped_no_cookie": provider_result.skipped_no_cookie,
+            "skipped_not_changed": provider_result.skipped_not_changed,
+        }
+
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "source_url": snapshot.source_url,
+        "payload_hash": snapshot.payload_hash,
+        "from_cache": snapshot.from_cache,
+        "fetched_at": snapshot.fetched_at.isoformat(),
+        "apply_policy": policy,
+        "total_accounts": sync_result.total_accounts,
+        "matched_accounts": sync_result.matched_accounts,
+        "unmatched_accounts": sync_result.unmatched_accounts,
+        "created_accounts": sync_result.created_accounts,
+        "updated_accounts": sync_result.updated_accounts,
+        "skipped_by_policy": sync_result.skipped_by_policy,
+        "sync_to_provider": sync_to_provider,
+        "provider_sync": provider_sync,
+    }
+
+
 @router.post("/sync/trigger")
 async def trigger_site_sync(
     payload: TriggerSiteSyncRequest,
@@ -254,10 +461,23 @@ async def trigger_site_sync(
 
 @router.get("/accounts")
 async def list_site_accounts(
+    refresh: bool = Query(False, description="是否强制刷新并同步 WebDAV 快照"),
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ) -> Any:
-    backup = await _load_webdav_backup_payload(db)
+    if refresh:
+        await _sync_site_accounts_from_webdav(db, force_refresh=True)
+
+    site_accounts = db.query(SiteAccount).order_by(SiteAccount.updated_at.desc()).all()
+    if site_accounts:
+        return _serialize_site_accounts(db, site_accounts)
+
+    # 兼容历史行为：当站点账号缓存为空时回退读取 WebDAV 原始列表
+    try:
+        backup = await _load_webdav_backup_payload(db)
+    except HTTPException:
+        return []
+
     accounts = parse_all_api_hub_accounts(backup)
     providers = db.query(Provider.id, Provider.name, Provider.website, Provider.config).all()
     provider_by_domain: dict[str, dict[str, Any]] = {}
@@ -290,6 +510,20 @@ async def list_site_accounts(
     ]
     normalized.sort(key=lambda x: ((x.get("domain") or ""), (x.get("site_url") or "")))
     return normalized
+
+
+@router.post("/accounts/sync")
+async def sync_site_accounts(
+    payload: SyncSiteAccountsRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Any:
+    return await _sync_site_accounts_from_webdav(
+        db,
+        force_refresh=payload.force_refresh,
+        cache_ttl_seconds=payload.cache_ttl_seconds,
+        apply_policy=payload.apply_policy,
+    )
 
 
 @router.post("/accounts/apply-sync")
@@ -389,6 +623,26 @@ async def get_accounts_checkin_statuses(
     return latest_by_provider
 
 
+@router.post("/accounts/{account_id}/checkin")
+async def checkin_site_account(
+    account_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Any:
+    result = await SiteAccountOpsService(db).checkin(account_id)
+    return _serialize_action_result(result)
+
+
+@router.post("/accounts/{account_id}/balance")
+async def balance_site_account(
+    account_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Any:
+    result = await SiteAccountOpsService(db).query_balance(account_id)
+    return _serialize_action_result(result)
+
+
 @router.post("/checkin/trigger")
 async def trigger_site_checkin(
     db: Session = Depends(get_db),
@@ -396,11 +650,13 @@ async def trigger_site_checkin(
 ) -> Any:
     scheduler = get_maintenance_scheduler()
     await scheduler._perform_provider_checkin(trigger_source="manual", ignore_enabled=True)
+    await scheduler._perform_site_account_checkin(ignore_enabled=True)
 
     latest_run = db.query(SiteCheckinRun.id).order_by(SiteCheckinRun.created_at.desc()).first()
     return {
         "ok": True,
         "latest_run_id": latest_run[0] if latest_run else None,
+        "site_account_triggered": True,
     }
 
 

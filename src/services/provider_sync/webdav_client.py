@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import httpx
@@ -31,7 +32,15 @@ def _build_candidate_urls(url: str) -> list[str]:
     return deduped
 
 
-async def download_backup(url: str, username: str, password: str) -> str:
+@dataclass
+class WebDavDownloadResult:
+    text: str
+    resolved_url: str
+    etag: str | None = None
+    last_modified: str | None = None
+
+
+async def download_backup_with_meta(url: str, username: str, password: str) -> WebDavDownloadResult:
     headers = {
         "Authorization": _build_basic_auth(username, password),
         "Accept": "application/json",
@@ -45,7 +54,13 @@ async def download_backup(url: str, username: str, password: str) -> str:
             is_last = idx == len(candidate_urls) - 1
 
             if response.status_code == 200:
-                return response.text
+                response_headers = getattr(response, "headers", {}) or {}
+                return WebDavDownloadResult(
+                    text=response.text,
+                    resolved_url=candidate_url,
+                    etag=response_headers.get("etag"),
+                    last_modified=response_headers.get("last-modified"),
+                )
             if response.status_code == 401:
                 raise ValueError("webdav auth failed")
             if response.status_code == 404:
@@ -64,3 +79,8 @@ async def download_backup(url: str, username: str, password: str) -> str:
                 raise ValueError(f"webdav request failed: status={response.status_code}")
 
     raise ValueError("webdav request failed: no candidate URL succeeded")
+
+
+async def download_backup(url: str, username: str, password: str) -> str:
+    result = await download_backup_with_meta(url, username, password)
+    return result.text

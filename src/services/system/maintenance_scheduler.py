@@ -25,11 +25,16 @@ from sqlalchemy import delete, text
 
 from src.core.logger import logger
 from src.database import create_session
-from src.models.database import ApiKey, AuditLog, Provider, RequestCandidate, Usage
+from src.models.database import ApiKey, AuditLog, Provider, RequestCandidate, SiteAccount, Usage
 from src.services.provider_ops.service import ProviderOpsService
 from src.services.provider_ops.types import ActionStatus, ProviderActionType
 from src.services.provider_sync import AllApiHubSyncService
-from src.services.site_management import SiteManagementLogService
+from src.services.site_management import (
+    SiteAccountOpsService,
+    SiteAccountSyncService,
+    SiteManagementLogService,
+    SiteSnapshotService,
+)
 from src.services.site_management.log_service import CheckinItemLog
 from src.services.system.config import SystemConfigService
 from src.services.system.scheduler import get_scheduler
@@ -49,6 +54,12 @@ class MaintenanceScheduler:
     STANDALONE_KEY_QUOTA_RESET_JOB_ID = "standalone_key_quota_reset"
     # all-api-hub 同步任务的 job_id
     ALL_API_HUB_SYNC_JOB_ID = "all_api_hub_sync"
+    # 站点账号同步任务的 job_id
+    SITE_ACCOUNT_SYNC_JOB_ID = "site_account_sync"
+    # 站点账号签到任务的 job_id
+    SITE_ACCOUNT_CHECKIN_JOB_ID = "site_account_checkin"
+    # 站点账号余额同步任务的 job_id
+    SITE_ACCOUNT_BALANCE_SYNC_JOB_ID = "site_account_balance_sync"
 
     def __init__(self) -> None:
         self.running = False
@@ -87,6 +98,33 @@ class MaintenanceScheduler:
         try:
             time_str = SystemConfigService.get_config(db, "all_api_hub_sync_time", "01:35")
             return self._parse_all_api_hub_sync_time_string(time_str)
+        finally:
+            db.close()
+
+    def _get_site_account_sync_time(self) -> tuple[int, int]:
+        """获取站点账号同步任务的执行时间"""
+        db = create_session()
+        try:
+            time_str = SystemConfigService.get_config(db, "site_account_sync_time", "01:45")
+            return self._parse_all_api_hub_sync_time_string(time_str)
+        finally:
+            db.close()
+
+    def _get_site_account_checkin_time(self) -> tuple[int, int]:
+        """获取站点账号签到任务的执行时间"""
+        db = create_session()
+        try:
+            time_str = SystemConfigService.get_config(db, "site_account_checkin_time", "02:05")
+            return self._parse_time_string(time_str)
+        finally:
+            db.close()
+
+    def _get_site_account_balance_sync_time(self) -> tuple[int, int]:
+        """获取站点账号余额同步任务的执行时间"""
+        db = create_session()
+        try:
+            time_str = SystemConfigService.get_config(db, "site_account_balance_sync_time", "02:20")
+            return self._parse_time_string(time_str)
         finally:
             db.close()
 
@@ -235,6 +273,45 @@ class MaintenanceScheduler:
             logger.info("all-api-hub 同步任务时间已更新为: {:02d}:{:02d}", hour, minute)
         return success
 
+    def update_site_account_sync_time(self, time_str: str) -> bool:
+        """更新站点账号同步任务时间"""
+        hour, minute = self._parse_all_api_hub_sync_time_string(time_str)
+        scheduler = get_scheduler()
+        success = scheduler.reschedule_cron_job(
+            self.SITE_ACCOUNT_SYNC_JOB_ID,
+            hour=hour,
+            minute=minute,
+        )
+        if success:
+            logger.info("站点账号同步任务时间已更新为: {:02d}:{:02d}", hour, minute)
+        return success
+
+    def update_site_account_checkin_time(self, time_str: str) -> bool:
+        """更新站点账号签到任务时间"""
+        hour, minute = self._parse_time_string(time_str)
+        scheduler = get_scheduler()
+        success = scheduler.reschedule_cron_job(
+            self.SITE_ACCOUNT_CHECKIN_JOB_ID,
+            hour=hour,
+            minute=minute,
+        )
+        if success:
+            logger.info("站点账号签到任务时间已更新为: {:02d}:{:02d}", hour, minute)
+        return success
+
+    def update_site_account_balance_sync_time(self, time_str: str) -> bool:
+        """更新站点账号余额同步任务时间"""
+        hour, minute = self._parse_time_string(time_str)
+        scheduler = get_scheduler()
+        success = scheduler.reschedule_cron_job(
+            self.SITE_ACCOUNT_BALANCE_SYNC_JOB_ID,
+            hour=hour,
+            minute=minute,
+        )
+        if success:
+            logger.info("站点账号余额同步任务时间已更新为: {:02d}:{:02d}", hour, minute)
+        return success
+
     def get_checkin_job_info(self) -> dict | None:
         """获取签到任务的信息
 
@@ -372,6 +449,38 @@ class MaintenanceScheduler:
             name="all-api-hub Cookie同步",
         )
 
+        # 站点账号同步任务 - 根据配置时间执行
+        site_account_sync_hour, site_account_sync_minute = self._get_site_account_sync_time()
+        scheduler.add_cron_job(
+            self._scheduled_site_account_sync,
+            hour=site_account_sync_hour,
+            minute=site_account_sync_minute,
+            job_id=self.SITE_ACCOUNT_SYNC_JOB_ID,
+            name="站点账号同步",
+        )
+
+        # 站点账号签到任务 - 根据配置时间执行
+        site_account_checkin_hour, site_account_checkin_minute = self._get_site_account_checkin_time()
+        scheduler.add_cron_job(
+            self._scheduled_site_account_checkin,
+            hour=site_account_checkin_hour,
+            minute=site_account_checkin_minute,
+            job_id=self.SITE_ACCOUNT_CHECKIN_JOB_ID,
+            name="站点账号签到",
+        )
+
+        # 站点账号余额同步任务 - 根据配置时间执行
+        site_account_balance_hour, site_account_balance_minute = (
+            self._get_site_account_balance_sync_time()
+        )
+        scheduler.add_cron_job(
+            self._scheduled_site_account_balance_sync,
+            hour=site_account_balance_hour,
+            minute=site_account_balance_minute,
+            job_id=self.SITE_ACCOUNT_BALANCE_SYNC_JOB_ID,
+            name="站点账号余额同步",
+        )
+
         # 用户配额重置任务 - 根据配置时间执行（按周期配置决定是否执行）
         quota_reset_hour, quota_reset_minute = self._get_user_quota_reset_time()
         scheduler.add_cron_job(
@@ -499,6 +608,18 @@ class MaintenanceScheduler:
     async def _scheduled_all_api_hub_sync(self) -> None:
         """all-api-hub Cookie 同步任务（定时调用）"""
         await self._perform_all_api_hub_sync(trigger_source="scheduled")
+
+    async def _scheduled_site_account_sync(self) -> None:
+        """站点账号同步任务（定时调用）"""
+        await self._perform_site_account_sync()
+
+    async def _scheduled_site_account_checkin(self) -> None:
+        """站点账号签到任务（定时调用）"""
+        await self._perform_site_account_checkin()
+
+    async def _scheduled_site_account_balance_sync(self) -> None:
+        """站点账号余额同步任务（定时调用）"""
+        await self._perform_site_account_balance_sync()
 
     # ========== 实际任务实现 ==========
 
@@ -1366,6 +1487,193 @@ class MaintenanceScheduler:
                 pass
         finally:
             db.close()
+
+    async def _perform_site_account_sync(self) -> None:
+        """执行站点账号同步任务（快照缓存 + 策略应用）。"""
+        db = create_session()
+        try:
+            if not SystemConfigService.get_config(db, "enable_site_account_sync", False):
+                logger.info("站点账号同步任务未启用，跳过")
+                return
+
+            url = SystemConfigService.get_config(db, "all_api_hub_webdav_url")
+            username = SystemConfigService.get_config(db, "all_api_hub_webdav_username")
+            password_raw = SystemConfigService.get_config(db, "all_api_hub_webdav_password")
+            if not url or not username or not password_raw:
+                logger.warning("站点账号同步配置不完整，需配置 url/username/password")
+                return
+
+            try:
+                password = SiteManagementLogService.resolve_system_password(password_raw)
+            except Exception:
+                logger.warning("站点账号同步密码解密失败，请重新保存配置")
+                return
+
+            cache_ttl = int(SystemConfigService.get_config(db, "site_account_snapshot_cache_ttl_seconds", 300))
+            apply_policy = str(
+                SystemConfigService.get_config(
+                    db,
+                    "site_account_sync_apply_policy",
+                    "matched_and_unmatched",
+                )
+            )
+            if apply_policy not in {"matched_only", "matched_and_unmatched"}:
+                apply_policy = "matched_and_unmatched"
+
+            snapshot = await SiteSnapshotService().get_webdav_snapshot(
+                db,
+                url=str(url),
+                username=str(username),
+                password=password,
+                cache_ttl_seconds=max(0, cache_ttl),
+                force_refresh=False,
+            )
+            result = SiteAccountSyncService().apply_snapshot(
+                db,
+                snapshot=snapshot.payload,
+                apply_policy=apply_policy,
+                source_snapshot_id=snapshot.snapshot_id,
+            )
+            sync_to_provider = bool(
+                SystemConfigService.get_config(db, "enable_site_account_sync_to_provider", True)
+            )
+            provider_updated = None
+            if sync_to_provider:
+                auto_create_provider_ops = bool(
+                    SystemConfigService.get_config(
+                        db,
+                        "enable_all_api_hub_auto_create_provider_ops",
+                        True,
+                    )
+                )
+                provider_result = AllApiHubSyncService().sync_from_backup_object(
+                    db,
+                    snapshot.payload,
+                    dry_run=False,
+                    auto_create_provider_ops=auto_create_provider_ops,
+                )
+                provider_updated = provider_result.updated_providers
+            logger.info(
+                "站点账号同步完成: total={}, matched={}, unmatched={}, created={}, updated={}, skipped={}, from_cache={}, provider_sync={}, provider_updated={}",
+                result.total_accounts,
+                result.matched_accounts,
+                result.unmatched_accounts,
+                result.created_accounts,
+                result.updated_accounts,
+                result.skipped_by_policy,
+                snapshot.from_cache,
+                sync_to_provider,
+                provider_updated,
+            )
+        except Exception as e:
+            logger.exception("站点账号同步任务执行失败: {}", e)
+        finally:
+            db.close()
+
+    async def _perform_site_account_checkin(self, ignore_enabled: bool = False) -> None:
+        """执行站点账号签到任务。"""
+        db = create_session()
+        try:
+            if (
+                not ignore_enabled
+                and not SystemConfigService.get_config(db, "enable_site_account_checkin", False)
+            ):
+                logger.info("站点账号签到任务未启用，跳过")
+                return
+
+            account_ids = [
+                account_id
+                for (account_id,) in (
+                    db.query(SiteAccount.id)
+                    .filter(
+                        SiteAccount.is_active.is_(True),
+                        SiteAccount.checkin_enabled.is_(True),
+                    )
+                    .all()
+                )
+            ]
+            if not account_ids:
+                logger.info("无可签到的站点账号，跳过")
+                return
+        finally:
+            db.close()
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def _run(account_id: str) -> None:
+            async with semaphore:
+                task_db = create_session()
+                try:
+                    service = SiteAccountOpsService(task_db)
+                    result = await service.checkin(account_id)
+                    if result.status != ActionStatus.SUCCESS:
+                        logger.debug(
+                            "站点账号签到结果: account_id={}, status={}, message={}",
+                            account_id,
+                            result.status.value,
+                            result.message,
+                        )
+                except Exception as exc:
+                    logger.warning("站点账号签到失败: account_id={}, error={}", account_id, exc)
+                finally:
+                    try:
+                        task_db.close()
+                    except Exception:
+                        pass
+
+        await asyncio.gather(*[_run(account_id) for account_id in account_ids])
+        logger.info("站点账号签到任务完成: total={}", len(account_ids))
+
+    async def _perform_site_account_balance_sync(self) -> None:
+        """执行站点账号余额同步任务。"""
+        db = create_session()
+        try:
+            if not SystemConfigService.get_config(db, "enable_site_account_balance_sync", False):
+                logger.info("站点账号余额同步任务未启用，跳过")
+                return
+
+            account_ids = [
+                account_id
+                for (account_id,) in (
+                    db.query(SiteAccount.id)
+                    .filter(
+                        SiteAccount.is_active.is_(True),
+                        SiteAccount.balance_sync_enabled.is_(True),
+                    )
+                    .all()
+                )
+            ]
+            if not account_ids:
+                logger.info("无可同步余额的站点账号，跳过")
+                return
+        finally:
+            db.close()
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def _run(account_id: str) -> None:
+            async with semaphore:
+                task_db = create_session()
+                try:
+                    service = SiteAccountOpsService(task_db)
+                    result = await service.query_balance(account_id)
+                    if result.status != ActionStatus.SUCCESS:
+                        logger.debug(
+                            "站点账号余额同步结果: account_id={}, status={}, message={}",
+                            account_id,
+                            result.status.value,
+                            result.message,
+                        )
+                except Exception as exc:
+                    logger.warning("站点账号余额同步失败: account_id={}, error={}", account_id, exc)
+                finally:
+                    try:
+                        task_db.close()
+                    except Exception:
+                        pass
+
+        await asyncio.gather(*[_run(account_id) for account_id in account_ids])
+        logger.info("站点账号余额同步任务完成: total={}", len(account_ids))
 
     async def _perform_candidate_cleanup(self) -> None:
         """清理过期的 request_candidates 记录"""

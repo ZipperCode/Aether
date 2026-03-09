@@ -6,6 +6,7 @@
 .serena/
 .gemini*/
 .plans
+.ace-tool
 
 ### Python ###
 *.db

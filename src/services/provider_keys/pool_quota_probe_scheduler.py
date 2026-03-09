@@ -254,9 +254,6 @@ class PoolQuotaProbeScheduler:
         db = create_session()
         try:
             providers = db.query(Provider).filter(Provider.is_active == True).all()  # noqa: E712
-
-            # 先筛选出符合条件的 provider，收集其 ID 和配置
-            eligible_providers: list[tuple[str, str, int]] = []  # (id, type, interval_seconds)
             for provider in providers:
                 provider_id = str(getattr(provider, "id", "") or "")
                 provider_type = normalize_provider_type(getattr(provider, "provider_type", ""))
@@ -270,29 +267,16 @@ class PoolQuotaProbeScheduler:
                 interval_minutes = _normalize_probe_interval_minutes(
                     pool_cfg.probing_interval_minutes
                 )
-                eligible_providers.append((provider_id, provider_type, interval_minutes * 60))
+                interval_seconds = interval_minutes * 60
 
-            # 批量查询所有符合条件的 provider 的活跃 keys，避免 N+1
-            eligible_ids = [p[0] for p in eligible_providers]
-            all_keys: list[ProviderAPIKey] = []
-            if eligible_ids:
-                all_keys = (
+                keys = (
                     db.query(ProviderAPIKey)
                     .filter(
-                        ProviderAPIKey.provider_id.in_(eligible_ids),
+                        ProviderAPIKey.provider_id == provider_id,
                         ProviderAPIKey.is_active == True,  # noqa: E712
                     )
                     .all()
                 )
-
-            # 按 provider_id 分组
-            keys_by_provider: dict[str, list[ProviderAPIKey]] = {}
-            for key in all_keys:
-                pid = str(key.provider_id)
-                keys_by_provider.setdefault(pid, []).append(key)
-
-            for provider_id, provider_type, interval_seconds in eligible_providers:
-                keys = keys_by_provider.get(provider_id, [])
                 if not keys:
                     continue
 

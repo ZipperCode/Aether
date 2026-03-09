@@ -53,7 +53,9 @@
       <Card class="overflow-hidden">
         <div class="px-4 py-3 border-b border-border/60 flex items-center justify-between gap-3">
           <div>
-            <div class="text-sm font-medium">账号管理（WebDAV）</div>
+            <div class="text-sm font-medium">
+              账号管理（WebDAV）
+            </div>
             <div class="text-xs text-muted-foreground mt-1">
               查看并编辑从 all-api-hub 备份解析的账号，然后应用到当前 Provider
             </div>
@@ -63,7 +65,7 @@
               size="sm"
               variant="outline"
               :disabled="accountsLoading"
-              @click="loadAccounts"
+              @click="loadAccounts(true)"
             >
               <Loader2
                 v-if="accountsLoading"
@@ -167,11 +169,14 @@
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead class="w-[56px]">选择</TableHead>
+                <TableHead class="w-[56px]">
+                  选择
+                </TableHead>
                 <TableHead>站点</TableHead>
                 <TableHead>认证方式</TableHead>
                 <TableHead>签到开关</TableHead>
                 <TableHead>最近签到</TableHead>
+                <TableHead>余额状态</TableHead>
                 <TableHead>用户ID</TableHead>
                 <TableHead>Token</TableHead>
                 <TableHead>Cookie</TableHead>
@@ -191,8 +196,12 @@
                 </TableCell>
                 <TableCell>
                   <div class="space-y-1">
-                    <div class="font-medium">{{ item.account.domain }}</div>
-                    <div class="text-xs text-muted-foreground">{{ item.account.site_url || '-' }}</div>
+                    <div class="font-medium">
+                      {{ item.account.domain }}
+                    </div>
+                    <div class="text-xs text-muted-foreground">
+                      {{ item.account.site_url || '-' }}
+                    </div>
                   </div>
                 </TableCell>
                 <TableCell>{{ item.account.auth_type || 'cookie' }}</TableCell>
@@ -202,33 +211,36 @@
                   </Badge>
                 </TableCell>
                 <TableCell>
-                  <div
-                    v-if="item.account.provider_id && checkinStatusByProvider[item.account.provider_id]"
-                    class="space-y-1"
-                  >
+                  <div class="space-y-1">
                     <Badge
-                      :variant="checkinStatusVariant(checkinStatusByProvider[item.account.provider_id].status)"
+                      :variant="checkinStatusVariant(item.account.last_checkin_status)"
                     >
-                      {{ checkinStatusLabel(checkinStatusByProvider[item.account.provider_id].status) }}
+                      {{ checkinStatusLabel(item.account.last_checkin_status) }}
                     </Badge>
                     <div class="text-xs text-muted-foreground truncate max-w-[220px]">
-                      {{ checkinStatusByProvider[item.account.provider_id].message || '-' }}
+                      {{ item.account.last_checkin_message || '-' }}
                     </div>
                     <div class="text-xs text-muted-foreground">
-                      {{ formatDate(checkinStatusByProvider[item.account.provider_id].created_at) }}
+                      {{ formatDate(item.account.last_checkin_at) }}
                     </div>
                   </div>
-                  <div
-                    v-else-if="item.account.provider_id"
-                    class="text-xs text-muted-foreground"
-                  >
-                    未签到
-                  </div>
-                  <div
-                    v-else
-                    class="text-xs text-muted-foreground"
-                  >
-                    未匹配Provider
+                </TableCell>
+                <TableCell>
+                  <div class="space-y-1">
+                    <Badge
+                      :variant="balanceStatusVariant(item.account.last_balance_status)"
+                    >
+                      {{ balanceStatusLabel(item.account.last_balance_status) }}
+                    </Badge>
+                    <div class="text-xs text-muted-foreground truncate max-w-[220px]">
+                      {{ item.account.last_balance_message || '-' }}
+                    </div>
+                    <div class="text-xs text-muted-foreground">
+                      {{ formatBalance(item.account.last_balance_total, item.account.last_balance_currency) }}
+                    </div>
+                    <div class="text-xs text-muted-foreground">
+                      {{ formatDate(item.account.last_balance_at) }}
+                    </div>
                   </div>
                 </TableCell>
                 <TableCell>{{ item.account.user_id || '-' }}</TableCell>
@@ -239,14 +251,26 @@
                     <Button
                       size="sm"
                       variant="outline"
-                      :disabled="!item.account.provider_id || manualCheckinLoading[item.account.provider_id]"
+                      :disabled="!item.account.id || manualCheckinLoading[item.account.id]"
                       @click="manualCheckin(item.index)"
                     >
                       <Loader2
-                        v-if="item.account.provider_id && manualCheckinLoading[item.account.provider_id]"
+                        v-if="item.account.id && manualCheckinLoading[item.account.id]"
                         class="w-3 h-3 mr-1 animate-spin"
                       />
-                      {{ item.account.provider_id ? '手动签到' : '未匹配' }}
+                      手动签到
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      :disabled="!item.account.id || manualBalanceLoading[item.account.id]"
+                      @click="manualBalance(item.index)"
+                    >
+                      <Loader2
+                        v-if="item.account.id && manualBalanceLoading[item.account.id]"
+                        class="w-3 h-3 mr-1 animate-spin"
+                      />
+                      刷新余额
                     </Button>
                     <Button
                       size="sm"
@@ -271,7 +295,9 @@
 
       <Card class="overflow-hidden">
         <div class="px-4 py-3 border-b border-border/60 flex items-center justify-between gap-3">
-          <div class="text-sm font-medium">手动签到日志（当前会话）</div>
+          <div class="text-sm font-medium">
+            手动签到日志（当前会话）
+          </div>
           <Button
             size="sm"
             variant="outline"
@@ -306,7 +332,9 @@
               </TableCell>
               <TableCell>{{ logItem.message || '-' }}</TableCell>
               <TableCell>{{ logItem.responseTimeMs != null ? `${logItem.responseTimeMs}ms` : '-' }}</TableCell>
-              <TableCell class="max-w-[520px] truncate">{{ logItem.dataSummary || '-' }}</TableCell>
+              <TableCell class="max-w-[520px] truncate">
+                {{ logItem.dataSummary || '-' }}
+              </TableCell>
             </TableRow>
           </TableBody>
         </Table>
@@ -684,7 +712,6 @@ import {
   type SiteCheckinRun,
   type SiteManualCheckinResponse,
   type SiteManagementAccount,
-  type SiteProviderCheckinStatus,
   type SiteSyncItem,
   type SiteSyncRun,
 } from '@/api/admin'
@@ -711,12 +738,12 @@ const checkinItemFilter = ref<'all' | 'failed' | 'skipped'>('all')
 const accountsLoading = ref(false)
 const accountsSyncLoading = ref(false)
 const manualCheckinLoading = ref<Record<string, boolean>>({})
-const checkinStatusByProvider = ref<Record<string, SiteProviderCheckinStatus>>({})
+const manualBalanceLoading = ref<Record<string, boolean>>({})
 const manualCheckinLogs = ref<Array<{
   id: string
   executedAt: string
   domain: string
-  providerId: string
+  targetId: string
   status: string
   message: string
   manualVerificationRequired: boolean
@@ -858,15 +885,43 @@ function formatBalance(total?: number | null, currency?: string | null): string 
 
 function checkinStatusVariant(status?: string): 'default' | 'destructive' | 'outline' {
   if (status === 'success') return 'default'
-  if (status === 'failed') return 'destructive'
+  if (status === 'already_done' || status === 'skipped') return 'outline'
+  if (status === 'failed' || status === 'auth_failed' || status === 'unknown_error') return 'destructive'
   return 'outline'
 }
 
 function checkinStatusLabel(status?: string): string {
   if (status === 'success') return '成功'
+  if (status === 'already_done') return '已签到'
+  if (status === 'auth_failed') return '认证失败'
+  if (status === 'auth_expired') return '认证过期'
+  if (status === 'not_configured') return '未配置'
+  if (status === 'not_supported') return '不支持'
   if (status === 'failed') return '失败'
   if (status === 'skipped') return '已跳过'
-  return status || '未知'
+  if (status === 'unknown_error') return '执行失败'
+  return status || '未执行'
+}
+
+function balanceStatusVariant(status?: string): 'default' | 'destructive' | 'outline' {
+  if (status === 'success') return 'default'
+  if (status === 'pending' || status === 'already_done' || status === 'skipped') return 'outline'
+  if (status === 'auth_failed' || status === 'auth_expired' || status === 'unknown_error') {
+    return 'destructive'
+  }
+  return 'outline'
+}
+
+function balanceStatusLabel(status?: string): string {
+  if (status === 'success') return '成功'
+  if (status === 'pending') return '处理中'
+  if (status === 'auth_failed') return '认证失败'
+  if (status === 'auth_expired') return '认证过期'
+  if (status === 'not_configured') return '未配置'
+  if (status === 'not_supported') return '不支持'
+  if (status === 'unknown_error') return '查询失败'
+  if (status === 'skipped') return '已跳过'
+  return status || '未同步'
 }
 
 function summarizeManualCheckinData(data: SiteManualCheckinResponse['data']): string {
@@ -901,36 +956,22 @@ async function loadData() {
   }
 }
 
-async function loadAccounts() {
+async function loadAccounts(refresh = false) {
   accountsLoading.value = true
   try {
-    accounts.value = await adminApi.getSiteAccounts()
+    const rows = await adminApi.getSiteAccounts(refresh)
+    // 首次仅返回 WebDAV 原始列表时，自动触发一次 refresh 生成可执行账号记录（含 account id）。
+    if (!refresh && rows.length > 0 && rows.every(item => !item.id)) {
+      accounts.value = await adminApi.getSiteAccounts(true)
+    } else {
+      accounts.value = rows
+    }
     selectedAccountIndices.value = []
-    await loadAccountCheckinStatuses()
   } catch (err) {
     error('加载账号列表失败')
     log.error('load site accounts failed', err)
   } finally {
     accountsLoading.value = false
-  }
-}
-
-async function loadAccountCheckinStatuses() {
-  const providerIds = Array.from(
-    new Set(
-      accounts.value
-        .map(account => (account.provider_id || '').trim())
-        .filter(Boolean)
-    )
-  )
-  if (providerIds.length === 0) {
-    checkinStatusByProvider.value = {}
-    return
-  }
-  try {
-    checkinStatusByProvider.value = await adminApi.getSiteAccountsCheckinStatuses(providerIds)
-  } catch (err) {
-    log.warn('load site account checkin statuses failed', err)
   }
 }
 
@@ -1056,6 +1097,9 @@ async function applyAccountsSync(dryRun: boolean, selectedOnly: boolean) {
     }
     activeTab.value = 'sync'
     await loadData()
+    if (!dryRun) {
+      await loadAccounts(false)
+    }
     if (result.run_id) {
       await showSyncItems(result.run_id)
     }
@@ -1069,14 +1113,14 @@ async function applyAccountsSync(dryRun: boolean, selectedOnly: boolean) {
 
 async function manualCheckin(index: number) {
   const target = accounts.value[index]
-  const providerId = target?.provider_id
-  if (!providerId) {
-    error('该账号未匹配到 Provider，无法手动签到')
+  const accountId = target?.id
+  if (!accountId) {
+    error('该账号未生成记录 ID，无法手动签到')
     return
   }
-  manualCheckinLoading.value = { ...manualCheckinLoading.value, [providerId]: true }
+  manualCheckinLoading.value = { ...manualCheckinLoading.value, [accountId]: true }
   try {
-    const result = await adminApi.checkinProvider(providerId)
+    const result = await adminApi.checkinSiteAccount(accountId)
     const manualVerificationRequired = extractManualVerificationFromData(result.data)
     const message = normalizeCheckinItemMessage(
       result.message || (result.status === 'success' ? '签到成功' : '签到已执行'),
@@ -1084,10 +1128,10 @@ async function manualCheckin(index: number) {
     )
     manualCheckinLogs.value = [
       {
-        id: `${Date.now()}-${providerId}`,
+        id: `${Date.now()}-${accountId}`,
         executedAt: result.executed_at,
         domain: target.domain || '-',
-        providerId,
+        targetId: accountId,
         status: result.status,
         message,
         manualVerificationRequired,
@@ -1097,7 +1141,7 @@ async function manualCheckin(index: number) {
       ...manualCheckinLogs.value,
     ].slice(0, 50)
     log.info('manual checkin result', {
-      providerId,
+      accountId,
       domain: target.domain,
       status: result.status,
       message: result.message,
@@ -1105,17 +1149,21 @@ async function manualCheckin(index: number) {
       responseTimeMs: result.response_time_ms,
       data: result.data,
     })
-    success(`[${target.domain}] ${message}`)
-    await loadAccountCheckinStatuses()
+    if (result.status === 'success' || result.status === 'already_done') {
+      success(`[${target.domain}] ${message}`)
+    } else {
+      error(`[${target.domain}] ${message}`)
+    }
+    await loadAccounts(false)
     await loadData()
   } catch (err) {
     const errMsg = parseApiError(err)
     manualCheckinLogs.value = [
       {
-        id: `${Date.now()}-${providerId}-error`,
+        id: `${Date.now()}-${accountId}-error`,
         executedAt: new Date().toISOString(),
         domain: target.domain || '-',
-        providerId,
+        targetId: accountId,
         status: 'failed',
         message: errMsg,
         manualVerificationRequired: false,
@@ -1125,14 +1173,37 @@ async function manualCheckin(index: number) {
       ...manualCheckinLogs.value,
     ].slice(0, 50)
     error(`手动签到失败: ${errMsg}`)
-    log.error('manual checkin failed', { providerId, domain: target.domain, error: err })
+    log.error('manual checkin failed', { accountId, domain: target.domain, error: err })
   } finally {
-    manualCheckinLoading.value = { ...manualCheckinLoading.value, [providerId]: false }
+    manualCheckinLoading.value = { ...manualCheckinLoading.value, [accountId]: false }
+  }
+}
+
+async function manualBalance(index: number) {
+  const target = accounts.value[index]
+  const accountId = target?.id
+  if (!accountId) {
+    error('该账号未生成记录 ID，无法刷新余额')
+    return
+  }
+  manualBalanceLoading.value = { ...manualBalanceLoading.value, [accountId]: true }
+  try {
+    const result = await adminApi.balanceSiteAccount(accountId)
+    const message = result.message || (result.status === 'success' ? '余额刷新成功' : '余额刷新已执行')
+    success(`[${target.domain}] ${message}`)
+    await loadAccounts(false)
+    await loadData()
+  } catch (err) {
+    const errMsg = parseApiError(err)
+    error(`刷新余额失败: ${errMsg}`)
+    log.error('manual balance failed', { accountId, domain: target.domain, error: err })
+  } finally {
+    manualBalanceLoading.value = { ...manualBalanceLoading.value, [accountId]: false }
   }
 }
 
 async function reloadAll() {
-  await Promise.all([loadData(), loadAccounts()])
+  await Promise.all([loadData(), loadAccounts(false)])
 }
 
 async function showSyncItems(runId: string) {

@@ -113,21 +113,24 @@ if not DISABLE_FILE_LOG:
         file_log_config["backtrace"] = False
         file_log_config["diagnose"] = False
 
-    # 主日志文件 - 所有级别
-    logger.add(  # type: ignore[call-overload]
-        log_dir / "app.log",
-        level="DEBUG",
-        **file_log_config,
-    )
+    try:
+        # 主日志文件 - 所有级别
+        logger.add(  # type: ignore[call-overload]
+            log_dir / "app.log",
+            level="DEBUG",
+            **file_log_config,
+        )
 
-    # 错误日志文件 - 仅 ERROR 及以上
-    error_log_config = file_log_config.copy()
-    error_log_config["rotation"] = "50 MB"
-    logger.add(  # type: ignore[call-overload]
-        log_dir / "error.log",
-        level="ERROR",
-        **error_log_config,
-    )
+        # 错误日志文件 - 仅 ERROR 及以上
+        error_log_config = file_log_config.copy()
+        error_log_config["rotation"] = "50 MB"
+        logger.add(  # type: ignore[call-overload]
+            log_dir / "error.log",
+            level="ERROR",
+            **error_log_config,
+        )
+    except (PermissionError, OSError) as exc:
+        logger.warning("文件日志初始化失败，已降级为仅控制台日志: {}", exc)
 
 # ============================================================================
 # 禁用第三方库噪音日志
