@@ -16,9 +16,9 @@ from src.models.database import RequestCandidate
 from src.services.orchestration.error_classifier import ErrorAction, ErrorClassifier
 from src.services.request.candidate import RequestCandidateService
 from src.services.scheduling.schemas import PoolCandidate, ProviderCandidate
-from src.services.task.exceptions import StreamProbeError
-from src.services.task.protocol import AttemptFunc, AttemptKind, AttemptResult
-from src.services.task.schema import ExecutionResult
+from src.services.task.core.exceptions import StreamProbeError
+from src.services.task.core.protocol import AttemptFunc, AttemptKind, AttemptResult
+from src.services.task.core.schema import ExecutionResult
 
 from .policy import FailoverAction, RetryMode, RetryPolicy, SkipPolicy
 from .recorder import CandidateRecorder
@@ -49,6 +49,11 @@ class FailoverEngine:
 
     # Hard constraint: streaming first chunk probe timeout
     STREAM_FIRST_CHUNK_TIMEOUT_SECONDS: int = 30
+    RETRY_BACKOFF_EVERY_FAILURES: int = 10
+    RETRY_ROTATE_CLIENT_EVERY_FAILURES: int = 40
+    RETRY_BACKOFF_BASE_SECONDS: float = 0.025
+    RETRY_BACKOFF_MAX_SECONDS: float = 0.15
+    STREAM_CAPACITY_BACKOFF_SECONDS: float = 0.3
 
     def __init__(
         self,
@@ -61,6 +66,262 @@ class FailoverEngine:
         self._error_classifier = error_classifier or ErrorClassifier(db=db)
         self._recorder = recorder or CandidateRecorder(db)
 
+    @staticmethod
+    def _collect_error_messages(error: Exception | None) -> str:
+        if error is None:
+            return ""
+
+        parts: list[str] = []
+        for item in (
+            getattr(error, "message", None),
+            getattr(error, "upstream_response", None),
+            str(error),
+        ):
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+
+        cause = getattr(error, "cause", None)
+        if cause is not None and cause is not error:
+            for item in (
+                getattr(cause, "message", None),
+                getattr(cause, "upstream_response", None),
+                str(cause),
+            ):
+                if isinstance(item, str) and item.strip():
+                    parts.append(item.strip())
+
+        return " | ".join(parts)
+
+    @classmethod
+    def _is_stream_capacity_error(cls, error: Exception | None) -> bool:
+        lowered = cls._collect_error_messages(error).lower()
+        return (
+            "max outbound streams" in lowered
+            or "too many concurrent streams" in lowered
+            or "max concurrent streams" in lowered
+        )
+
+    @classmethod
+    def _compute_retry_backoff_seconds(
+        cls,
+        *,
+        consecutive_failures: int,
+        error: Exception | None,
+    ) -> float:
+        if consecutive_failures <= 0:
+            return 0.0
+        if cls._is_stream_capacity_error(error):
+            return cls.STREAM_CAPACITY_BACKOFF_SECONDS
+        if consecutive_failures % cls.RETRY_BACKOFF_EVERY_FAILURES != 0:
+            return 0.0
+        step = max(1, consecutive_failures // cls.RETRY_BACKOFF_EVERY_FAILURES)
+        return min(cls.RETRY_BACKOFF_BASE_SECONDS * step, cls.RETRY_BACKOFF_MAX_SECONDS)
+
+    @classmethod
+    def _should_rotate_upstream_client(
+        cls,
+        *,
+        consecutive_failures: int,
+        error: Exception | None,
+    ) -> bool:
+        if cls._is_stream_capacity_error(error):
+            return True
+        return (
+            consecutive_failures >= cls.RETRY_ROTATE_CLIENT_EVERY_FAILURES
+            and consecutive_failures % cls.RETRY_ROTATE_CLIENT_EVERY_FAILURES == 0
+        )
+
+    async def _rotate_upstream_client(self, candidate: ProviderCandidate) -> bool:
+        from src.clients.http_client import HTTPClientPool
+        from src.services.proxy_node.resolver import (
+            resolve_delegate_config,
+            resolve_effective_proxy,
+        )
+
+        effective_proxy = resolve_effective_proxy(
+            getattr(candidate.provider, "proxy", None),
+            getattr(candidate.key, "proxy", None),
+        )
+        delegate_cfg = resolve_delegate_config(effective_proxy)
+        return await HTTPClientPool.reset_upstream_client(
+            delegate_cfg, proxy_config=effective_proxy
+        )
+
+    async def _apply_retry_pacing(
+        self,
+        *,
+        candidate: ProviderCandidate,
+        consecutive_failures: int,
+        error: Exception | None,
+        request_id: str | None,
+    ) -> None:
+        should_rotate = self._should_rotate_upstream_client(
+            consecutive_failures=consecutive_failures,
+            error=error,
+        )
+        if should_rotate:
+            rotated = await self._rotate_upstream_client(candidate)
+            if rotated:
+                logger.warning(
+                    "  [{}] 连续失败 {} 次，已重建上游客户端复用",
+                    request_id,
+                    consecutive_failures,
+                )
+
+        backoff_seconds = self._compute_retry_backoff_seconds(
+            consecutive_failures=consecutive_failures,
+            error=error,
+        )
+        if backoff_seconds > 0:
+            logger.warning(
+                "  [{}] 连续失败 {} 次，退避 {:.0f}ms 后继续尝试",
+                request_id,
+                consecutive_failures,
+                backoff_seconds * 1000,
+            )
+            await asyncio.sleep(backoff_seconds)
+
+    async def _check_cancellation(
+        self,
+        is_cancelled: Callable[[], Awaitable[bool]] | None,
+    ) -> bool:
+        if is_cancelled is None:
+            return False
+        try:
+            return bool(await is_cancelled())
+        except Exception:
+            return False
+
+    def _mark_remaining_cancelled(
+        self,
+        *,
+        candidate_record_map: dict[tuple[int, int], str] | None,
+        candidates: list[ProviderCandidate],
+        from_candidate_idx: int,
+        from_retry_idx: int,
+        retry_policy: RetryPolicy,
+    ) -> None:
+        if not candidate_record_map:
+            return
+
+        now = datetime.now(timezone.utc)
+        updated = False
+        for candidate_idx, cand in enumerate(candidates):
+            if candidate_idx < from_candidate_idx:
+                continue
+            max_retries = self._get_max_retries(cand, retry_policy)
+            for retry_idx in range(max_retries):
+                if candidate_idx == from_candidate_idx and retry_idx < from_retry_idx:
+                    continue
+                record_id = candidate_record_map.get((candidate_idx, retry_idx))
+                if not record_id:
+                    continue
+                self.db.execute(
+                    update(RequestCandidate)
+                    .where(RequestCandidate.id == record_id)
+                    .where(RequestCandidate.status.in_(["available", "pending"]))
+                    .values(
+                        status="cancelled",
+                        status_code=499,
+                        error_message="cancelled_by_client",
+                        finished_at=now,
+                    )
+                )
+                updated = True
+
+        if updated:
+            self.db.commit()
+
+    def _append_cancelled_fallback_candidate_keys(
+        self,
+        *,
+        fallback: list[CandidateKey],
+        candidates: list[ProviderCandidate],
+        from_candidate_idx: int,
+        from_retry_idx: int,
+        retry_policy: RetryPolicy,
+    ) -> None:
+        existing = {(item.candidate_index, item.retry_index) for item in fallback}
+        for candidate_idx, cand in enumerate(candidates):
+            if candidate_idx < from_candidate_idx:
+                continue
+            max_retries = self._get_max_retries(cand, retry_policy)
+            for retry_idx in range(max_retries):
+                if candidate_idx == from_candidate_idx and retry_idx < from_retry_idx:
+                    continue
+                key = (candidate_idx, retry_idx)
+                if key in existing:
+                    continue
+                original_key = getattr(cand, "key", None)
+                original_pool_key_index = getattr(cand, "_pool_key_index", 0)
+                if isinstance(cand, PoolCandidate) and cand.pool_keys:
+                    retry_slots_per_key = self._get_pool_key_max_retries(cand, retry_policy)
+                    pool_key_index = min(retry_idx // retry_slots_per_key, len(cand.pool_keys) - 1)
+                    cand.key = cand.pool_keys[pool_key_index]
+                    cand._pool_key_index = pool_key_index
+                fallback.append(
+                    self._make_candidate_key(
+                        candidate=cand,
+                        candidate_index=candidate_idx,
+                        retry_index=retry_idx,
+                        status="cancelled",
+                        error_message="cancelled_by_client",
+                        status_code=499,
+                    )
+                )
+                if isinstance(cand, PoolCandidate):
+                    cand.key = original_key
+                    cand._pool_key_index = original_pool_key_index
+                existing.add(key)
+
+    async def _maybe_cancel_execution(
+        self,
+        *,
+        is_cancelled: Callable[[], Awaitable[bool]] | None,
+        candidate_record_map: dict[tuple[int, int], str] | None,
+        candidate_keys_fallback: list[CandidateKey],
+        candidates: list[ProviderCandidate],
+        from_candidate_idx: int,
+        from_retry_idx: int,
+        retry_policy: RetryPolicy,
+        request_id: str | None,
+        attempt_count: int,
+    ) -> ExecutionResult | None:
+        if not await self._check_cancellation(is_cancelled):
+            return None
+
+        logger.info(
+            "[FailoverEngine] Request cancelled by client at candidate_index={}, retry_index={}",
+            from_candidate_idx,
+            from_retry_idx,
+        )
+        self._mark_remaining_cancelled(
+            candidate_record_map=candidate_record_map,
+            candidates=candidates,
+            from_candidate_idx=from_candidate_idx,
+            from_retry_idx=from_retry_idx,
+            retry_policy=retry_policy,
+        )
+        self._append_cancelled_fallback_candidate_keys(
+            fallback=candidate_keys_fallback,
+            candidates=candidates,
+            from_candidate_idx=from_candidate_idx,
+            from_retry_idx=from_retry_idx,
+            retry_policy=retry_policy,
+        )
+        return ExecutionResult(
+            success=False,
+            error_type="cancelled",
+            error_message="cancelled_by_client",
+            last_status_code=499,
+            candidate_keys=self._get_candidate_keys(
+                request_id=request_id,
+                fallback=candidate_keys_fallback,
+                candidates=candidates,
+            ),
+            attempt_count=attempt_count,
+        )
+
     async def execute(
         self,
         *,
@@ -71,6 +332,8 @@ class FailoverEngine:
         request_id: str | None = None,
         user_id: str | None = None,
         api_key_id: str | None = None,
+        username: str | None = None,
+        api_key_name: str | None = None,
         candidate_record_map: dict[tuple[int, int], str] | None = None,
         max_candidates: int | None = None,
         max_attempts: int | None = None,
@@ -81,6 +344,7 @@ class FailoverEngine:
             ]
             | None
         ) = None,
+        is_cancelled: Callable[[], Awaitable[bool]] | None = None,
     ) -> ExecutionResult:
         """
         Execute candidate traversal + retry + failover.
@@ -95,6 +359,7 @@ class FailoverEngine:
             candidates = candidates[:max_candidates]
 
         attempt_count = 0
+        consecutive_failures = 0
         last_status_code: int | None = None
 
         # For logging / dispatcher parity only; callers may pass an exact value.
@@ -108,6 +373,20 @@ class FailoverEngine:
             max_attempts = computed
 
         for candidate_index, candidate in enumerate(candidates):
+            cancelled_result = await self._maybe_cancel_execution(
+                is_cancelled=is_cancelled,
+                candidate_record_map=candidate_record_map,
+                candidate_keys_fallback=candidate_keys_fallback,
+                candidates=candidates,
+                from_candidate_idx=candidate_index,
+                from_retry_idx=0,
+                retry_policy=retry_policy,
+                request_id=request_id,
+                attempt_count=attempt_count,
+            )
+            if cancelled_result is not None:
+                return cancelled_result
+
             should_skip, skip_reason = self._should_skip(candidate, skip_policy)
             if should_skip:
                 # PRE_EXPAND: mark all retry slots skipped.
@@ -128,6 +407,8 @@ class FailoverEngine:
                             candidate_index=candidate_index,
                             user_id=user_id,
                             api_key_id=api_key_id,
+                            username=username,
+                            api_key_name=api_key_name,
                             skip_reason=skip_reason,
                         )
                 candidate_keys_fallback.append(
@@ -142,20 +423,26 @@ class FailoverEngine:
                 continue
 
             if isinstance(candidate, PoolCandidate):
-                pool_result, attempt_count, last_status_code = await self._execute_pool_candidate(
-                    candidate=candidate,
-                    candidate_index=candidate_index,
-                    attempt_func=attempt_func,
-                    retry_policy=retry_policy,
-                    request_id=request_id,
-                    user_id=user_id,
-                    api_key_id=api_key_id,
-                    candidate_record_map=candidate_record_map,
-                    candidate_keys_fallback=candidate_keys_fallback,
-                    candidates=candidates,
-                    attempt_count=attempt_count,
-                    max_attempts=max_attempts,
-                    execution_error_handler=execution_error_handler,
+                pool_result, attempt_count, consecutive_failures, last_status_code = (
+                    await self._execute_pool_candidate(
+                        candidate=candidate,
+                        candidate_index=candidate_index,
+                        attempt_func=attempt_func,
+                        retry_policy=retry_policy,
+                        request_id=request_id,
+                        user_id=user_id,
+                        api_key_id=api_key_id,
+                        username=username,
+                        api_key_name=api_key_name,
+                        candidate_record_map=candidate_record_map,
+                        candidate_keys_fallback=candidate_keys_fallback,
+                        candidates=candidates,
+                        attempt_count=attempt_count,
+                        max_attempts=max_attempts,
+                        execution_error_handler=execution_error_handler,
+                        consecutive_failures=consecutive_failures,
+                        is_cancelled=is_cancelled,
+                    )
                 )
                 if pool_result is not None:
                     return pool_result
@@ -164,6 +451,20 @@ class FailoverEngine:
             max_retries = self._get_max_retries(candidate, retry_policy)
             retry_index = 0
             while retry_index < max_retries:
+                cancelled_result = await self._maybe_cancel_execution(
+                    is_cancelled=is_cancelled,
+                    candidate_record_map=candidate_record_map,
+                    candidate_keys_fallback=candidate_keys_fallback,
+                    candidates=candidates,
+                    from_candidate_idx=candidate_index,
+                    from_retry_idx=retry_index,
+                    retry_policy=retry_policy,
+                    request_id=request_id,
+                    attempt_count=attempt_count,
+                )
+                if cancelled_result is not None:
+                    return cancelled_result
+
                 attempt_count += 1
 
                 # Resolve/create record_id
@@ -181,6 +482,8 @@ class FailoverEngine:
                         retry_index=retry_index,
                         user_id=user_id,
                         api_key_id=api_key_id,
+                        username=username,
+                        api_key_name=api_key_name,
                     )
 
                 self._attach_attempt_context(
@@ -217,6 +520,7 @@ class FailoverEngine:
                             retry_policy=retry_policy,
                         )
 
+                    consecutive_failures = 0
                     return ExecutionResult(
                         success=True,
                         attempt_result=attempt_result,
@@ -240,6 +544,13 @@ class FailoverEngine:
                     last_status_code = exc.http_status
                     self._record_attempt_failure(record_id, exc, exc.http_status)
                     action = FailoverAction.CONTINUE
+                    consecutive_failures += 1
+                    await self._apply_retry_pacing(
+                        candidate=candidate,
+                        consecutive_failures=consecutive_failures,
+                        error=exc,
+                        request_id=request_id,
+                    )
 
                 except Exception as exc:
                     outcome = await self._handle_attempt_error(
@@ -263,6 +574,14 @@ class FailoverEngine:
                     max_retries = outcome.max_retries
                     if outcome.stop_result is not None:
                         return outcome.stop_result
+                    if action in {FailoverAction.CONTINUE, FailoverAction.RETRY}:
+                        consecutive_failures += 1
+                        await self._apply_retry_pacing(
+                            candidate=candidate,
+                            consecutive_failures=consecutive_failures,
+                            error=exc,
+                            request_id=request_id,
+                        )
 
                 # action switch: continue/ retry
                 if action == FailoverAction.CONTINUE:
@@ -309,19 +628,37 @@ class FailoverEngine:
         request_id: str | None,
         user_id: str | None,
         api_key_id: str | None,
+        username: str | None,
+        api_key_name: str | None,
         candidate_record_map: dict[tuple[int, int], str] | None,
         candidate_keys_fallback: list[CandidateKey],
         candidates: list[ProviderCandidate],
         attempt_count: int,
+        consecutive_failures: int,
         max_attempts: int | None,
         execution_error_handler: Any,
-    ) -> tuple[ExecutionResult | None, int, int | None]:
+        is_cancelled: Callable[[], Awaitable[bool]] | None,
+    ) -> tuple[ExecutionResult | None, int, int, int | None]:
         """Execute a PoolCandidate with in-pool key failover."""
         last_status_code: int | None = None
         retry_slots_per_key = self._get_pool_key_max_retries(candidate, retry_policy)
 
         for key_index, pool_key in enumerate(candidate.pool_keys or []):
             base_retry_index = key_index * retry_slots_per_key
+            cancelled_result = await self._maybe_cancel_execution(
+                is_cancelled=is_cancelled,
+                candidate_record_map=candidate_record_map,
+                candidate_keys_fallback=candidate_keys_fallback,
+                candidates=candidates,
+                from_candidate_idx=candidate_index,
+                from_retry_idx=base_retry_index,
+                retry_policy=retry_policy,
+                request_id=request_id,
+                attempt_count=attempt_count,
+            )
+            if cancelled_result is not None:
+                return cancelled_result, attempt_count, consecutive_failures, last_status_code
+
             candidate.key = pool_key
             candidate._pool_key_index = key_index
             candidate.mapping_matched_model = getattr(pool_key, "_pool_mapping_matched_model", None)
@@ -350,6 +687,8 @@ class FailoverEngine:
                         retry_index=base_retry_index,
                         user_id=user_id,
                         api_key_id=api_key_id,
+                        username=username,
+                        api_key_name=api_key_name,
                         skip_reason=skip_reason,
                     )
                 candidate_keys_fallback.append(
@@ -366,8 +705,22 @@ class FailoverEngine:
             max_retries_for_key = retry_slots_per_key
             retry_index = 0
             while retry_index < max_retries_for_key:
-                attempt_count += 1
                 composite_retry_index = base_retry_index + retry_index
+                cancelled_result = await self._maybe_cancel_execution(
+                    is_cancelled=is_cancelled,
+                    candidate_record_map=candidate_record_map,
+                    candidate_keys_fallback=candidate_keys_fallback,
+                    candidates=candidates,
+                    from_candidate_idx=candidate_index,
+                    from_retry_idx=composite_retry_index,
+                    retry_policy=retry_policy,
+                    request_id=request_id,
+                    attempt_count=attempt_count,
+                )
+                if cancelled_result is not None:
+                    return cancelled_result, attempt_count, consecutive_failures, last_status_code
+
+                attempt_count += 1
 
                 record_id = None
                 if candidate_record_map:
@@ -383,6 +736,8 @@ class FailoverEngine:
                         retry_index=composite_retry_index,
                         user_id=user_id,
                         api_key_id=api_key_id,
+                        username=username,
+                        api_key_name=api_key_name,
                     )
 
                 self._attach_attempt_context(
@@ -421,6 +776,7 @@ class FailoverEngine:
                             retry_policy=retry_policy,
                         )
 
+                    consecutive_failures = 0
                     return (
                         ExecutionResult(
                             success=True,
@@ -441,6 +797,7 @@ class FailoverEngine:
                             request_candidate_id=record_id,
                         ),
                         attempt_count,
+                        consecutive_failures,
                         last_status_code,
                     )
 
@@ -448,6 +805,13 @@ class FailoverEngine:
                     last_status_code = exc.http_status
                     self._record_attempt_failure(record_id, exc, exc.http_status)
                     action = FailoverAction.CONTINUE
+                    consecutive_failures += 1
+                    await self._apply_retry_pacing(
+                        candidate=candidate,
+                        consecutive_failures=consecutive_failures,
+                        error=exc,
+                        request_id=request_id,
+                    )
 
                 except Exception as exc:
                     outcome = await self._handle_pool_attempt_error(
@@ -465,6 +829,14 @@ class FailoverEngine:
                     action = outcome.action
                     last_status_code = outcome.last_status_code
                     max_retries_for_key = min(outcome.max_retries, retry_slots_per_key)
+                    if action in {FailoverAction.CONTINUE, FailoverAction.RETRY}:
+                        consecutive_failures += 1
+                        await self._apply_retry_pacing(
+                            candidate=candidate,
+                            consecutive_failures=consecutive_failures,
+                            error=exc,
+                            request_id=request_id,
+                        )
 
                 if action == FailoverAction.CONTINUE:
                     if retry_policy.mode == RetryMode.PRE_EXPAND and candidate_record_map:
@@ -496,9 +868,9 @@ class FailoverEngine:
                         from_retry_idx=composite_retry_index + 1,
                         retry_policy=retry_policy,
                     )
-                return None, attempt_count, last_status_code
+                return None, attempt_count, consecutive_failures, last_status_code
 
-        return None, attempt_count, last_status_code
+        return None, attempt_count, consecutive_failures, last_status_code
 
     async def _handle_pool_attempt_error(
         self,
@@ -844,6 +1216,8 @@ class FailoverEngine:
         retry_index: int,
         user_id: str | None,
         api_key_id: str | None,
+        username: str | None,
+        api_key_name: str | None,
     ) -> str:
         # Create "available" record, then caller will mark pending.
         extra = self._build_pool_extra_data(candidate)
@@ -854,6 +1228,8 @@ class FailoverEngine:
             retry_index=retry_index,
             user_id=user_id,
             api_key_id=api_key_id,
+            username=username,
+            api_key_name=api_key_name,
             provider_id=str(candidate.provider.id),
             endpoint_id=str(candidate.endpoint.id),
             key_id=str(candidate.key.id),
@@ -872,6 +1248,8 @@ class FailoverEngine:
         retry_index: int = 0,
         user_id: str | None,
         api_key_id: str | None,
+        username: str | None,
+        api_key_name: str | None,
         skip_reason: str | None,
     ) -> str:
         extra = self._build_pool_extra_data(candidate)
@@ -882,6 +1260,8 @@ class FailoverEngine:
             retry_index=retry_index,
             user_id=user_id,
             api_key_id=api_key_id,
+            username=username,
+            api_key_name=api_key_name,
             provider_id=str(candidate.provider.id),
             endpoint_id=str(candidate.endpoint.id),
             key_id=str(candidate.key.id),

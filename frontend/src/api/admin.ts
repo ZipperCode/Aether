@@ -1,5 +1,6 @@
 import apiClient from './client'
 import { cachedRequest, buildCacheKey } from '@/utils/cache'
+import type { BillingSummary } from './auth'
 
 // LDAP 配置导出结构
 export interface LDAPConfigExport {
@@ -34,6 +35,12 @@ export interface OAuthProviderExport {
   is_enabled?: boolean
 }
 
+export interface SystemConfigExport {
+  key: string
+  value: unknown
+  description?: string | null
+}
+
 // 配置导出数据结构
 export interface ConfigExportData {
   version: string
@@ -42,6 +49,7 @@ export interface ConfigExportData {
   providers: ProviderExport[]
   ldap_config?: LDAPConfigExport | null
   oauth_providers?: OAuthProviderExport[]
+  system_configs?: SystemConfigExport[]
 }
 
 // 用户导出数据结构
@@ -54,6 +62,7 @@ export interface UsersExportData {
 
 export interface UserExport {
   email: string
+  email_verified?: boolean
   username: string
   password_hash: string
   role: string
@@ -61,20 +70,18 @@ export interface UserExport {
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
   model_capability_settings?: Record<string, Record<string, boolean>>
-  quota_usd?: number | null
-  used_usd?: number
-  total_usd?: number
+  unlimited?: boolean
+  wallet?: BillingSummary | null
   is_active: boolean
   api_keys: UserApiKeyExport[]
 }
 
 export interface UserApiKeyExport {
+  key?: string | null
   key_hash: string
   key_encrypted?: string | null
   name?: string | null
   is_standalone: boolean
-  balance_used_usd?: number
-  current_balance_usd?: number | null
   allowed_providers?: string[] | null
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
@@ -105,14 +112,18 @@ export interface ProviderExport {
   name: string
   description?: string | null
   website?: string | null
+  provider_type?: string
   billing_type?: string | null
   monthly_quota_usd?: number | null
   quota_reset_day?: number
-  rpm_limit?: number | null
   provider_priority?: number
+  keep_priority_on_conversion?: boolean
+  enable_format_conversion?: boolean
   is_active: boolean
   concurrent_limit?: number | null
   max_retries?: number | null
+  stream_first_byte_timeout?: number | null
+  request_timeout?: number | null
   proxy?: Record<string, unknown>
   config?: Record<string, unknown>
   endpoints: EndpointExport[]
@@ -123,19 +134,24 @@ export interface ProviderExport {
 export interface EndpointExport {
   api_format: string
   base_url: string
-  headers?: Record<string, unknown>
+  header_rules?: Record<string, unknown>[] | null
+  body_rules?: Record<string, unknown>[] | null
   max_retries?: number
   is_active: boolean
   custom_path?: string | null
   config?: Record<string, unknown>
+  format_acceptance_config?: Record<string, unknown> | null
   proxy?: Record<string, unknown>
 }
 
 export interface ProviderKeyExport {
   api_key: string
+  auth_type?: string
+  auth_config?: string | Record<string, unknown> | null
   name?: string | null
   note?: string | null
   api_formats: string[]
+  supported_endpoints?: string[]
   rate_multipliers?: Record<string, number> | null
   internal_priority?: number
   global_priority_by_format?: Record<string, number> | null
@@ -144,7 +160,13 @@ export interface ProviderKeyExport {
   capabilities?: Record<string, boolean>
   cache_ttl_minutes?: number
   max_probe_interval_minutes?: number
+  auto_fetch_models?: boolean
+  locked_models?: string[] | null
+  model_include_patterns?: string[] | null
+  model_exclude_patterns?: string[] | null
   is_active: boolean
+  proxy?: Record<string, unknown> | null
+  fingerprint?: Record<string, unknown> | null
 }
 
 export interface ModelExport {
@@ -406,10 +428,7 @@ export interface AdminApiKey {
   name?: string
   key_display?: string  // 脱敏后的密钥显示
   is_active: boolean
-  is_locked: boolean  // 管理员锁定标志
   is_standalone: boolean  // 是否为独立余额Key
-  balance_used_usd?: number  // 已使用余额（仅独立Key）
-  current_balance_usd?: number | null  // 当前余额（独立Key预付费模式，null表示无限制）
   total_requests?: number
   total_tokens?: number
   total_cost_usd?: number
@@ -431,7 +450,8 @@ export interface CreateStandaloneApiKeyRequest {
   allowed_models?: string[] | null
   rate_limit?: number | null  // null = 无限制
   expires_at?: string | null  // ISO 日期字符串，如 "2025-12-31"，null = 永不过期
-  initial_balance_usd: number  // 初始余额，必须设置
+  initial_balance_usd: number | null  // 初始余额，null = 无限制
+  unlimited_balance?: boolean | null  // 编辑时仅切换额度模式，不调整余额数值
   auto_delete_on_expiry?: boolean  // 过期后是否自动删除
 }
 
@@ -579,7 +599,10 @@ export const adminApi = {
   },
 
   // 更新独立余额Key
-  async updateApiKey(keyId: string, data: Partial<CreateStandaloneApiKeyRequest>): Promise<AdminApiKey & { message: string }> {
+  async updateApiKey(
+    keyId: string,
+    data: Partial<CreateStandaloneApiKeyRequest>
+  ): Promise<AdminApiKey & { message: string }> {
     const response = await apiClient.put<AdminApiKey & { message: string }>(
       `/api/admin/api-keys/${keyId}`,
       data
@@ -603,27 +626,10 @@ export const adminApi = {
     return response.data
   },
 
-  // 切换API密钥锁定状态（锁定/解锁）
-  async toggleLockApiKey(keyId: string): Promise<ApiKeyLockResponse> {
+  // 切换用户普通 API Key 锁定状态（锁定/解锁）
+  async toggleUserApiKeyLock(userId: string, keyId: string): Promise<ApiKeyLockResponse> {
     const response = await apiClient.patch<ApiKeyLockResponse>(
-      `/api/admin/api-keys/${keyId}/lock`
-    )
-    return response.data
-  },
-
-  // 为独立余额Key调整余额
-  async addApiKeyBalance(keyId: string, amountUsd: number): Promise<AdminApiKey & { message: string }> {
-    const response = await apiClient.patch<AdminApiKey & { message: string }>(
-      `/api/admin/api-keys/${keyId}/balance`,
-      { amount_usd: amountUsd }
-    )
-    return response.data
-  },
-
-  // 重置独立余额Key的已使用额度
-  async resetApiKeyUsage(keyId: string): Promise<AdminApiKey & { message: string }> {
-    const response = await apiClient.patch<AdminApiKey & { message: string }>(
-      `/api/admin/api-keys/${keyId}/reset-usage`
+      `/api/admin/users/${userId}/api-keys/${keyId}/lock`
     )
     return response.data
   },

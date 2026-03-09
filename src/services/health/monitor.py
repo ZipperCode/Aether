@@ -810,16 +810,22 @@ class HealthMonitor:
                 ),
             ).first()
 
-            # 统计 Key（需要遍历 JSON 字段计算熔断状态）
-            keys = db.query(ProviderAPIKey).all()
-            total_keys = len(keys)
-            active_keys = sum(1 for k in keys if k.is_active)
+            # 统计 Key（只加载必要列，避免全字段全表扫描）
+            key_rows = db.query(
+                ProviderAPIKey.is_active,
+                ProviderAPIKey.health_by_format,
+                ProviderAPIKey.circuit_breaker_by_format,
+            ).all()
+            total_keys = len(key_rows)
+            active_keys = 0
             unhealthy_keys = 0
             circuit_open_keys = 0
 
-            for key in keys:
-                health_by_format = key.health_by_format or {}
-                circuit_by_format = key.circuit_breaker_by_format or {}
+            for is_active, health_by_format, circuit_by_format in key_rows:
+                if is_active:
+                    active_keys += 1
+                health_by_format = health_by_format or {}
+                circuit_by_format = circuit_by_format or {}
 
                 # 检查是否有任何格式健康度低于 0.5
                 for fmt, health_data in health_by_format.items():

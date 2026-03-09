@@ -622,9 +622,9 @@ class BaseMessageHandler:
             error: 异常对象
         """
         from src.core.exceptions import (
+            BalanceInsufficientException,
             ModelNotSupportedException,
             ProviderException,
-            QuotaExceededException,
             RateLimitException,
             UpstreamClientException,
         )
@@ -633,7 +633,7 @@ class BaseMessageHandler:
             error,
             (
                 ProviderException,
-                QuotaExceededException,
+                BalanceInsufficientException,
                 RateLimitException,
                 ModelNotSupportedException,
                 UpstreamClientException,

@@ -44,6 +44,7 @@ from src.core.api_format.headers import (
     merge_headers_with_protection,
     normalize_headers,
     redact_headers_for_log,
+    resolve_header_name_case,
 )
 from src.core.api_format.metadata import (
     ENDPOINT_DEFINITIONS,
@@ -122,6 +123,7 @@ __all__ = [
     "merge_headers_with_protection",
     "filter_response_headers",
     "redact_headers_for_log",
+    "resolve_header_name_case",
     "build_adapter_base_headers_for_endpoint",
     "build_adapter_headers_for_endpoint",
     "get_adapter_protected_keys_for_endpoint",

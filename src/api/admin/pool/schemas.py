@@ -164,10 +164,20 @@ class BatchImportResponse(BaseModel):
 
 
 class BatchActionRequest(BaseModel):
-    key_ids: list[str] = Field(..., max_length=500)
-    action: str  # enable / disable / delete / clear_cooldown / reset_cost / regenerate_fingerprint
+    key_ids: list[str] = Field(..., max_length=2000)
+    action: str  # enable / disable / delete / clear_cooldown / reset_cost / regenerate_fingerprint / clear_proxy / set_proxy
+    payload: dict[str, Any] | None = None
 
 
 class BatchActionResponse(BaseModel):
     affected: int = 0
+    message: str = ""
+    task_id: str | None = None
+
+
+class BatchDeleteTaskResponse(BaseModel):
+    task_id: str
+    status: str  # pending / running / completed / failed
+    total: int = 0
+    deleted: int = 0
     message: str = ""

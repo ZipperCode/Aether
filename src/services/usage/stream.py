@@ -800,7 +800,7 @@ class StreamUsageTracker:
             if usage_record:
                 try:
                     # 在 usage_record 仍在会话中时，立即获取所需属性
-                    total_cost = usage_record.total_cost_usd or 0.0
+                    total_cost = float(usage_record.total_cost_usd or 0)
                 except Exception as e:
                     logger.warning(f"Failed to access total_cost_usd from usage_record: {e}")
                     total_cost = 0.0

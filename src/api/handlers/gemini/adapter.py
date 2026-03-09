@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 from src.api.handlers.base.chat_adapter_base import ChatAdapterBase, register_adapter
 from src.api.handlers.base.chat_handler_base import ChatHandlerBase
-from src.core.api_format import ApiFamily, get_auth_handler
+from src.core.api_format import ApiFamily, get_auth_handler, resolve_header_name_case
 from src.core.api_format.enums import AuthMethod
 from src.core.api_format.headers import BROWSER_FINGERPRINT_HEADERS
 from src.core.logger import logger
@@ -302,6 +302,7 @@ class GeminiChatAdapter(ChatAdapterBase):
         provider_api_key: Any | None = None,
         # 代理配置
         proxy_config: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """测试 Gemini API 模型连接性（非流式）"""
         from src.api.handlers.base.endpoint_checker import run_endpoint_check
@@ -382,7 +383,8 @@ class GeminiChatAdapter(ChatAdapterBase):
                 default_auth_header, _ = get_auth_config_for_endpoint(cls.FORMAT_ID)
                 if default_auth_header.lower() != "authorization":
                     headers.pop(default_auth_header, None)
-                headers["Authorization"] = f"Bearer {api_key}"
+                auth_header_name = resolve_header_name_case(extra_headers, "Authorization")
+                headers[auth_header_name] = f"Bearer {api_key}"
 
         body = cls.build_request_body(request_data)
 
@@ -432,6 +434,7 @@ class GeminiChatAdapter(ChatAdapterBase):
             api_key_id=api_key_id,
             model_name=effective_model_name,
             proxy_config=proxy_config,
+            timeout=timeout_seconds,
         )
 
 

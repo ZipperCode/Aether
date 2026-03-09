@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,7 @@ from src.models.endpoint_models import (
     EndpointAPIKeyUpdate,
 )
 from src.services.provider_keys import (
+    batch_delete_endpoint_keys_response,
     clear_oauth_invalid_response,
     create_provider_key_response,
     delete_endpoint_key_response,
@@ -172,6 +173,30 @@ async def delete_endpoint_key(
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
+@router.post("/keys/batch-delete")
+async def batch_delete_endpoint_keys(
+    request: Request,
+    ids: list[str] = Body(..., embed=True, max_length=100),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    批量删除 Provider Keys
+
+    一次性删除多个 Key，按 Provider 聚合执行副作用（缓存失效、模型关联检查），
+    避免逐个删除导致的重复 Redis 操作和性能问题。
+
+    **请求体字段**:
+    - `ids`: Key ID 列表（最多 100 个）
+
+    **返回字段**:
+    - `success_count`: 成功删除的数量
+    - `failed_count`: 失败的数量
+    - `failed`: 失败的详情列表
+    """
+    adapter = AdminBatchDeleteEndpointKeysAdapter(ids=ids)
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
 @router.post("/keys/{key_id}/clear-oauth-invalid")
 async def clear_oauth_invalid(
     key_id: str,
@@ -294,6 +319,16 @@ class AdminDeleteEndpointKeyAdapter(AdminApiAdapter):
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         return await delete_endpoint_key_response(db=context.db, key_id=self.key_id)
+
+
+@dataclass
+class AdminBatchDeleteEndpointKeysAdapter(AdminApiAdapter):
+    """批量删除多个 Provider Key"""
+
+    ids: list[str]
+
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        return await batch_delete_endpoint_keys_response(db=context.db, key_ids=self.ids)
 
 
 @dataclass

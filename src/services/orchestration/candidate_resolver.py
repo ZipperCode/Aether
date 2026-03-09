@@ -193,8 +193,8 @@ class CandidateResolver:
         self,
         all_candidates: list[ProviderCandidate],
         request_id: str | None,
-        user_id: str,
-        user_api_key: ApiKey,
+        user_id: str | None,
+        user_api_key: ApiKey | None,
         required_capabilities: dict[str, bool] | None = None,
         *,
         expand_retries: bool = True,
@@ -216,6 +216,15 @@ class CandidateResolver:
 
         candidate_records_to_insert: list[dict[str, Any]] = []
         candidate_record_map: dict[tuple[int, int], str] = {}
+        username = None
+        api_key_name = getattr(user_api_key, "name", None) if user_api_key else None
+
+        if user_api_key is not None:
+            try:
+                user = getattr(user_api_key, "user", None)
+            except Exception:
+                user = None
+            username = getattr(user, "username", None) if user is not None else None
 
         # 只保存启用的能力（值为 True 的）
         active_capabilities = None
@@ -290,6 +299,8 @@ class CandidateResolver:
                                 "retry_index": retry_index,
                                 "user_id": user_id,
                                 "api_key_id": user_api_key.id if user_api_key else None,
+                                "username": username,
+                                "api_key_name": api_key_name,
                                 "provider_id": provider.id,
                                 "endpoint_id": endpoint.id,
                                 "key_id": key_id,
@@ -314,6 +325,8 @@ class CandidateResolver:
                         "retry_index": 0,
                         "user_id": user_id,
                         "api_key_id": user_api_key.id if user_api_key else None,
+                        "username": username,
+                        "api_key_name": api_key_name,
                         "provider_id": provider.id,
                         "endpoint_id": endpoint.id,
                         "key_id": key.id,
@@ -339,6 +352,8 @@ class CandidateResolver:
                             "retry_index": retry_index,
                             "user_id": user_id,
                             "api_key_id": user_api_key.id if user_api_key else None,
+                            "username": username,
+                            "api_key_name": api_key_name,
                             "provider_id": provider.id,
                             "endpoint_id": endpoint.id,
                             "key_id": key.id,

@@ -54,6 +54,8 @@ class HTTPClientPool:
     _max_proxy_clients: int = 50
     # Tunnel 客户端缓存：{node_id: client}
     _tunnel_clients: dict[str, httpx.AsyncClient] = {}
+    # 后台清理任务引用集合（防止被 GC 回收）
+    _background_tasks: set[asyncio.Task[None]] = set()
 
     def __new__(cls) -> "HTTPClientPool":
         if cls._instance is None:
@@ -456,6 +458,114 @@ class HTTPClientPool:
 
         client_config.update(kwargs)
         return httpx.AsyncClient(**client_config)  # type: ignore[arg-type]
+
+    @classmethod
+    async def _reset_default_client(cls) -> bool:
+        """Atomically replace the shared default client with a fresh instance.
+
+        The old client is kept open briefly so that in-flight requests can
+        finish on their existing HTTP/2 streams; it is closed asynchronously
+        after a short grace period.
+        """
+        async with _default_client_lock:
+            old_client = cls._default_client
+            if old_client is None:
+                return False
+
+            # Create a new client before discarding the old one
+            cls._default_client = httpx.AsyncClient(
+                http2=config.enable_http2,
+                verify=get_ssl_context(),
+                timeout=httpx.Timeout(
+                    connect=config.http_connect_timeout,
+                    read=config.http_read_timeout,
+                    write=config.http_write_timeout,
+                    pool=config.http_pool_timeout,
+                ),
+                limits=httpx.Limits(
+                    max_connections=config.http_max_connections,
+                    max_keepalive_connections=config.http_keepalive_connections,
+                    keepalive_expiry=config.http_keepalive_expiry,
+                ),
+                follow_redirects=True,
+            )
+
+        # Close old client after a grace period so in-flight requests can drain
+        async def _close_old() -> None:
+            await asyncio.sleep(5)
+            try:
+                await old_client.aclose()
+            except Exception as exc:
+                logger.warning("关闭旧默认客户端失败: {}", exc)
+
+        task = asyncio.create_task(_close_old())
+        cls._background_tasks.add(task)
+        task.add_done_callback(cls._background_tasks.discard)
+        logger.warning("默认HTTP客户端已重建(HTTP/2 流容量恢复)")
+        return True
+
+    @classmethod
+    async def reset_upstream_client(
+        cls,
+        delegate_cfg: dict[str, Any] | None,
+        proxy_config: dict[str, Any] | None = None,
+        tls_profile: str | None = None,
+    ) -> bool:
+        """Reset cached upstream client for the given proxy/tunnel route.
+
+        Returns True when a cached client was closed and removed.
+        For the shared no-proxy default client, atomically replaces it with a
+        new instance so that subsequent requests get a fresh HTTP/2 connection
+        while in-flight requests on the old client can finish naturally.
+        """
+        if delegate_cfg and delegate_cfg.get("tunnel"):
+            node_id = str(delegate_cfg.get("node_id") or "")
+            if not node_id:
+                return False
+            lock = cls._get_proxy_clients_lock()
+            async with lock:
+                client = cls._tunnel_clients.pop(node_id, None)
+            if client is None:
+                return False
+            try:
+                await client.aclose()
+            except Exception as exc:
+                logger.warning("关闭 Tunnel 客户端失败(node_id={}): {}", node_id, exc)
+            return True
+
+        if not proxy_config:
+            proxy_config = get_system_proxy_config()
+
+        base_cache_key = compute_proxy_cache_key(proxy_config)
+        if base_cache_key == "__no_proxy__":
+            return await cls._reset_default_client()
+
+        cache_key_prefixes = [base_cache_key]
+        tls_profile_key = str(tls_profile or "").strip().lower()
+        if tls_profile_key:
+            cache_key_prefixes = [f"{base_cache_key}::tls:{tls_profile_key}"]
+
+        lock = cls._get_proxy_clients_lock()
+        async with lock:
+            keys_to_remove = [
+                key
+                for key in list(cls._proxy_clients.keys())
+                if any(
+                    key == prefix
+                    or key.startswith(f"{prefix}::")
+                    or key.startswith(f"{prefix}::tls:")
+                    for prefix in cache_key_prefixes
+                )
+            ]
+            clients = [cls._proxy_clients.pop(key)[0] for key in keys_to_remove]
+
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception as exc:
+                logger.warning("关闭上游代理客户端失败: {}", exc)
+
+        return bool(clients)
 
     @classmethod
     async def get_upstream_client(
