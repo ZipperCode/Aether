@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import update
 from sqlalchemy.orm import Session, joinedload, make_transient
 
+from src.api.handlers.base.chat_adapter_base import get_adapter_class
+from src.api.handlers.base.cli_adapter_base import get_cli_adapter_class
 from src.config.constants import TimeoutDefaults
 from src.core.api_format import get_extra_headers_from_endpoint
 from src.core.cache_service import CacheService
@@ -40,7 +42,6 @@ from src.services.model.upstream_fetcher import (
     UpstreamModelsFetcherRegistry,
     build_format_to_config,
     fetch_models_for_key,
-    get_adapter_for_format,
 )
 from src.services.provider.oauth_token import resolve_oauth_access_token
 from src.services.proxy_node.resolver import resolve_effective_proxy
@@ -75,6 +76,11 @@ async def _set_provider_upstream_models_cache(provider_id: str, models: list[dic
 
 # tier 排序权重（数值越大越优先）
 _ANTIGRAVITY_TIER_PRIORITY: dict[str, int] = {"ultra": 3, "pro": 2, "free": 1}
+
+
+def _get_adapter_for_format(api_format: str) -> Any:
+    """按 api_format 获取 Chat/CLI adapter 类。"""
+    return get_adapter_class(api_format) or get_cli_adapter_class(api_format)
 
 
 def _antigravity_sort_keys(api_keys: list[Any]) -> list[Any]:
@@ -828,7 +834,7 @@ async def test_model(
 
     try:
         # 获取对应的 Adapter 类
-        adapter_class = get_adapter_for_format(endpoint.api_format)
+        adapter_class = _get_adapter_for_format(endpoint.api_format)
         if not adapter_class:
             return {
                 "success": False,
@@ -1497,7 +1503,7 @@ async def _execute_test_check(
         if account_id:
             extra_headers["chatgpt-account-id"] = str(account_id)
 
-    adapter_class = get_adapter_for_format(endpoint.api_format)
+    adapter_class = _get_adapter_for_format(endpoint.api_format)
     if not adapter_class:
         raise ValueError(f"Unknown API format: {endpoint.api_format}")
 

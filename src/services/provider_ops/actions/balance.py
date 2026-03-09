@@ -201,7 +201,7 @@ class BalanceAction(ProviderAction):
         缓存 key 使用 host（同一站点多个 provider 只需签到一次），TTL 6 小时。
         签到失败或 cookie_expired 不写入缓存，允许下次重试。
         """
-        host = client.base_url.host or client.base_url.netloc or str(client.base_url)
+        host = str(client.base_url.host or client.base_url.netloc or client.base_url)
         cache_key = f"provider_ops:checkin:{host}"
 
         # 检查缓存
