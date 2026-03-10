@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -118,10 +119,10 @@ class HealthMonitor:
 
     # === 其他配置 ===
     ALLOW_AUTO_RECOVER = os.getenv("HEALTH_AUTO_RECOVER_ENABLED", "true").lower() == "true"
-    CIRCUIT_HISTORY_LIMIT = int(os.getenv("HEALTH_CIRCUIT_HISTORY_LIMIT", "200"))
-
     # 进程级别状态缓存
-    _circuit_history: list[dict[str, Any]] = []
+    _circuit_history: deque[dict[str, Any]] = deque(
+        maxlen=int(os.getenv("HEALTH_CIRCUIT_HISTORY_LIMIT", "200"))
+    )
     _open_circuit_keys: int = 0
 
     # ==================== 数据访问辅助方法 ====================
@@ -865,14 +866,12 @@ class HealthMonitor:
     @classmethod
     def _push_circuit_event(cls, event: dict[str, Any]) -> None:
         cls._circuit_history.append(event)
-        if len(cls._circuit_history) > cls.CIRCUIT_HISTORY_LIMIT:
-            cls._circuit_history.pop(0)
 
     @classmethod
     def get_circuit_history(cls, limit: int = 50) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
-        return cls._circuit_history[-limit:]
+        return list(cls._circuit_history)[-limit:]
 
     # ==================== 兼容旧方法 ====================
 
