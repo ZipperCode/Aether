@@ -108,6 +108,7 @@ class CacheAffinityManager:
 
         # 请求级别锁，避免同一用户+端点同时更新造成抖动
         self._request_locks: dict[str, asyncio.Lock] = {}
+        self._request_locks_max_size: int = 500  # 锁字典上限，防止无界增长
 
         # 统计信息
         self._stats = {
@@ -209,6 +210,11 @@ class CacheAffinityManager:
     async def _acquire_request_lock(self, cache_key: str) -> None:
         lock = self._request_locks.get(cache_key)
         if lock is None:
+            # 超出上限时淘汰未被持有的锁，防止无界增长
+            if len(self._request_locks) >= self._request_locks_max_size:
+                free_keys = [k for k, lk in self._request_locks.items() if not lk.locked()]
+                for k in free_keys[: len(free_keys) // 2 or 1]:  # 清理一半空闲锁
+                    del self._request_locks[k]
             lock = asyncio.Lock()
             self._request_locks[cache_key] = lock
         await lock.acquire()

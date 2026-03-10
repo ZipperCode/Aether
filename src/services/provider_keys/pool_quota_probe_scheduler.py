@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy.orm import load_only
+
 from src.clients.redis_client import get_redis_client
 from src.core.logger import logger
 from src.core.provider_types import ProviderType, normalize_provider_type
@@ -275,6 +277,14 @@ class PoolQuotaProbeScheduler:
             if eligible_ids:
                 all_keys = (
                     db.query(ProviderAPIKey)
+                    .options(
+                        load_only(
+                            ProviderAPIKey.id,
+                            ProviderAPIKey.provider_id,
+                            ProviderAPIKey.last_used_at,
+                            ProviderAPIKey.upstream_metadata,
+                        )
+                    )
                     .filter(
                         ProviderAPIKey.provider_id.in_(eligible_ids),
                         ProviderAPIKey.is_active == True,  # noqa: E712

@@ -209,7 +209,7 @@ class MonitorPlugin(BasePlugin):
     def record_token_usage(
         self,
         provider: str,
-        model: str,
+        model: str,  # noqa: ARG002 - 保留签名兼容性，不再用于 Prometheus 标签
         input_tokens: int,
         output_tokens: int,
         cost: float | None = None,
@@ -219,12 +219,12 @@ class MonitorPlugin(BasePlugin):
 
         Args:
             provider: 提供商名称
-            model: 模型名称
+            model: 模型名称（保留签名兼容性，不再作为 Prometheus 标签）
             input_tokens: 输入token数
             output_tokens: 输出token数
             cost: 费用
         """
-        labels = {"provider": provider, "model": model}
+        labels = {"provider": provider}
 
         import asyncio
 
