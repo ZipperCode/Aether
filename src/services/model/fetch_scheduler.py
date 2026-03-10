@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import joinedload
 
 from src.core.cache_service import CacheService
 from src.core.crypto import crypto_service
@@ -243,30 +243,37 @@ class ModelFetchScheduler:
 
         logger.info(f"找到 {len(key_ids)} 个启用自动获取模型的 Key")
 
-        # 逐个处理每个 Key，每个 Key 使用独立的数据库会话
-        for key_id in key_ids:
-            if not self._running:
-                logger.info("调度器已停止，中断模型获取任务")
-                break
+        # 使用 Semaphore 限制并发数，避免大号池场景下同时发起过多 HTTP 请求
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-            try:
-                # 添加超时保护
-                result = await asyncio.wait_for(
-                    self._fetch_models_for_key_by_id(key_id),
-                    timeout=KEY_FETCH_TIMEOUT_SECONDS,
-                )
-                if result == "success":
-                    success_count += 1
-                elif result == "skip":
-                    skip_count += 1
-                else:
-                    error_count += 1
-            except TimeoutError:
-                logger.error(f"处理 Key {key_id} 超时（{KEY_FETCH_TIMEOUT_SECONDS}s）")
-                self._update_key_error(key_id, f"Timeout after {KEY_FETCH_TIMEOUT_SECONDS}s")
-                error_count += 1
-            except Exception:
-                logger.exception(f"处理 Key {key_id} 时出错")
+        async def _fetch_with_limit(key_id: str) -> str:
+            if not self._running:
+                return "skip"
+            async with semaphore:
+                if not self._running:
+                    return "skip"
+                try:
+                    return await asyncio.wait_for(
+                        self._fetch_models_for_key_by_id(key_id),
+                        timeout=KEY_FETCH_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    logger.error(f"处理 Key {key_id} 超时（{KEY_FETCH_TIMEOUT_SECONDS}s）")
+                    self._update_key_error(key_id, f"Timeout after {KEY_FETCH_TIMEOUT_SECONDS}s")
+                    return "error"
+                except Exception as exc:
+                    logger.exception(f"处理 Key {key_id} 时出错")
+                    self._update_key_error(key_id, str(exc))
+                    return "error"
+
+        results = await asyncio.gather(*[_fetch_with_limit(kid) for kid in key_ids])
+
+        for result in results:
+            if result == "success":
+                success_count += 1
+            elif result == "skip":
+                skip_count += 1
+            else:
                 error_count += 1
 
         logger.info(
