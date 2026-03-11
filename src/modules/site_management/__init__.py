@@ -1,6 +1,7 @@
 """站点管理模块
 
-提供 all-api-hub 同步与 Provider 签到的运行状态、差异明细可视化。
+独立的站点管理模块，支持多 WebDav 源同步、签到、余额查询。
+与 Provider 模块完全解耦。
 """
 
 from __future__ import annotations
@@ -14,9 +15,23 @@ if TYPE_CHECKING:
 
 
 def _get_router() -> Any:
-    from src.api.admin.site_management import router
+    from src.modules.site_management.routes import router
 
     return router
+
+
+async def _on_startup() -> None:
+    from src.modules.site_management.services.scheduler import SiteManagementScheduler
+
+    scheduler = SiteManagementScheduler()
+    scheduler.start()
+
+
+async def _on_shutdown() -> None:
+    from src.modules.site_management.services.scheduler import SiteManagementScheduler
+
+    scheduler = SiteManagementScheduler()
+    scheduler.stop()
 
 
 async def _health_check() -> ModuleHealth:
@@ -32,7 +47,7 @@ site_management_module = ModuleDefinition(
     metadata=ModuleMetadata(
         name="site_management",
         display_name="站点管理",
-        description="查看 all-api-hub 同步差异、签到结果与历史记录",
+        description="多 WebDav 源站点管理，支持同步、签到、余额查询",
         category=ModuleCategory.INTEGRATION,
         env_key="SITE_MANAGEMENT_AVAILABLE",
         default_available=True,
@@ -44,6 +59,8 @@ site_management_module = ModuleDefinition(
         admin_menu_order=58,
     ),
     router_factory=_get_router,
+    on_startup=_on_startup,
+    on_shutdown=_on_shutdown,
     health_check=_health_check,
     validate_config=_validate_config,
 )
