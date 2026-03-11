@@ -15,7 +15,7 @@
           placeholder="快捷多选"
           trigger-class="h-8 w-40"
           dropdown-min-width="10rem"
-          :disabled="loading || executing || allKeys.length === 0"
+          :disabled="loading || executing"
           @update:model-value="onQuickSelectChange"
         />
         <Input
@@ -29,7 +29,7 @@
           size="icon"
           class="h-8 w-8 shrink-0"
           :disabled="loading || executing"
-          @click="loadAllKeys()"
+          @click="loadKeysPage()"
         >
           <RefreshCw
             class="h-3.5 w-3.5"
@@ -67,13 +67,13 @@
 
       <div class="flex items-center justify-between text-xs">
         <div class="text-muted-foreground">
-          共 {{ allKeys.length }} 个账号，筛选 {{ filteredKeys.length }} 个，已选 {{ selectedKeyIds.length }} 个
+          共 {{ filteredTotal }} 个匹配账号，当前页 {{ pageKeys.length }} 个，已选 {{ selectedCount }} 个
         </div>
         <div class="flex items-center gap-2">
           <Checkbox
             :checked="isAllFilteredSelected"
             :indeterminate="isPartiallyFilteredSelected"
-            :disabled="filteredKeys.length === 0 || loading || executing"
+            :disabled="filteredTotal === 0 || loading || executing"
             @update:checked="toggleSelectFiltered"
           />
           <span class="text-muted-foreground">全选筛选结果</span>
@@ -88,19 +88,19 @@
           正在加载账号列表...
         </div>
         <div
-          v-else-if="filteredKeys.length === 0"
+          v-else-if="pageKeys.length === 0"
           class="py-10 text-center text-sm text-muted-foreground"
         >
           无匹配账号
         </div>
         <label
-          v-for="key in pagedKeys"
+          v-for="key in pageKeys"
           :key="key.key_id"
           class="flex items-center gap-2.5 px-3 py-2 border-b last:border-b-0 cursor-pointer hover:bg-muted/30"
         >
           <Checkbox
-            :checked="selectedIdSet.has(key.key_id)"
-            :disabled="executing"
+            :checked="selectAllFiltered || selectedIdSet.has(key.key_id)"
+            :disabled="executing || selectAllFiltered"
             @update:checked="(checked) => toggleOne(key.key_id, checked === true)"
           />
           <div class="min-w-0 flex-1">
@@ -122,6 +122,18 @@
                 class="text-[10px] px-1 py-0 h-4 shrink-0"
               >{{ key.oauth_plan_type }}</Badge>
               <Badge
+                v-if="getPrimaryOAuthOrganizationTitle(key)"
+                variant="secondary"
+                class="text-[10px] px-1 py-0 h-4 shrink-0 max-w-[92px] truncate"
+                :title="getOAuthOrganizationsTooltip(key)"
+              >{{ getPrimaryOAuthOrganizationTitle(key) }}</Badge>
+              <Badge
+                v-if="key.oauth_account_id"
+                variant="secondary"
+                class="text-[10px] px-1 py-0 h-4 shrink-0"
+                :title="key.oauth_account_id"
+              >acct {{ formatOAuthIdentityShort(key.oauth_account_id) }}</Badge>
+              <Badge
                 v-if="isBannedKey(key)"
                 variant="destructive"
                 class="text-[10px] px-1 py-0 h-4 shrink-0"
@@ -129,6 +141,10 @@
             </div>
             <div class="flex items-center gap-1.5 mt-0.5 text-[11px] text-muted-foreground flex-wrap">
               <span :class="key.is_active ? '' : 'text-destructive'">{{ key.is_active ? '启用' : '禁用' }}</span>
+              <span
+                v-if="key.oauth_account_user_id"
+                :title="key.oauth_account_user_id"
+              >AUID {{ formatOAuthIdentityShort(key.oauth_account_user_id, 10, 8) }}</span>
               <span v-if="key.account_quota">{{ shortenQuota(key.account_quota) }}</span>
               <span v-if="key.proxy?.node_id">独立代理</span>
               <span
@@ -151,7 +167,7 @@
             size="icon"
             class="h-7 w-7"
             :disabled="currentPage <= 1"
-            @click="currentPage = 1"
+            @click="goToPage(1)"
           >
             <ChevronsLeft class="h-3.5 w-3.5" />
           </Button>
@@ -160,7 +176,7 @@
             size="icon"
             class="h-7 w-7"
             :disabled="currentPage <= 1"
-            @click="currentPage -= 1"
+            @click="goToPage(currentPage - 1)"
           >
             <ChevronLeft class="h-3.5 w-3.5" />
           </Button>
@@ -169,7 +185,7 @@
             size="icon"
             class="h-7 w-7"
             :disabled="currentPage >= totalPages"
-            @click="currentPage += 1"
+            @click="goToPage(currentPage + 1)"
           >
             <ChevronRight class="h-3.5 w-3.5" />
           </Button>
@@ -178,7 +194,7 @@
             size="icon"
             class="h-7 w-7"
             :disabled="currentPage >= totalPages"
-            @click="currentPage = totalPages"
+            @click="goToPage(totalPages)"
           >
             <ChevronsRight class="h-3.5 w-3.5" />
           </Button>
@@ -205,7 +221,7 @@
             variant="ghost"
             size="icon"
             class="h-8 w-8 shrink-0"
-            :disabled="executing || selectedKeyIds.length === 0 || loading"
+            :disabled="executing || selectedCount === 0 || loading"
             @click="executeAction"
           >
             <Play
@@ -258,7 +274,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { Dialog, Button, Input, Select, SelectTrigger, SelectValue, SelectContent, SelectItem, Checkbox, Badge } from '@/components/ui'
 import { MultiSelect } from '@/components/common'
 import ProxyNodeSelect from '@/features/providers/components/ProxyNodeSelect.vue'
@@ -266,11 +282,18 @@ import { RefreshCw, Play, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
-import { listPoolKeys, type PoolKeyDetail } from '@/api/endpoints/pool'
-import { deleteEndpointKey, refreshProviderQuota, updateProviderKey } from '@/api/endpoints/keys'
+import {
+  listPoolKeys,
+  batchActionPoolKeys,
+  getPoolBatchDeleteTask,
+  resolvePoolKeySelection,
+  type PoolKeyDetail,
+  type PoolKeySelectionItem,
+} from '@/api/endpoints/pool'
+import { exportKey, refreshProviderQuota } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
-import { hasNoFiveHourLimit as hasNoFiveHourLimitByQuota, hasNoWeeklyLimit as hasNoWeeklyLimitByQuota } from '@/features/pool/utils/quota-selectors'
+import { formatOAuthIdentityShort, getPrimaryOAuthOrganizationTitle, getOAuthOrganizationsTooltip } from '@/utils/oauthIdentity'
 
 type QuickSelectorValue =
   | 'banned'
@@ -285,6 +308,7 @@ type QuickSelectorValue =
   | 'enabled'
 
 type BatchActionValue =
+  | 'export'
   | 'delete'
   | 'refresh_oauth'
   | 'refresh_quota'
@@ -297,6 +321,7 @@ const props = defineProps<{
   modelValue: boolean
   providerId: string
   providerName?: string
+  providerType?: string
   batchConcurrency?: number | null
 }>()
 
@@ -319,6 +344,7 @@ const QUICK_SELECT_OPTIONS: Array<{ value: QuickSelectorValue; label: string }> 
 ]
 
 const ACTION_OPTIONS: Array<{ value: BatchActionValue; label: string }> = [
+  { value: 'export', label: '导出凭据' },
   { value: 'delete', label: '删除账号' },
   { value: 'refresh_oauth', label: '刷新 OAuth' },
   { value: 'refresh_quota', label: '刷新额度' },
@@ -334,8 +360,11 @@ const proxyNodesStore = useProxyNodesStore()
 
 const loading = ref(false)
 const executing = ref(false)
-const allKeys = ref<PoolKeyDetail[]>([])
+const pageKeys = ref<PoolKeyDetail[]>([])
+const filteredTotal = ref(0)
 const selectedKeyIds = ref<string[]>([])
+const knownKeysById = ref<Record<string, PoolKeyDetail>>({})
+const selectAllFiltered = ref(false)
 const searchText = ref('')
 const selectedAction = ref<BatchActionValue>('delete')
 const proxyNodeIdForAction = ref('')
@@ -345,51 +374,59 @@ const progressDone = ref(0)
 const progressLabel = ref('')
 const activeQuickSelectors = ref<QuickSelectorValue[]>([])
 const currentPage = ref(1)
+
 const PAGE_SIZE = 50
+const SEARCH_DEBOUNCE_MS = 250
+
+let loadRequestId = 0
+let searchDebounceTimer: number | null = null
+let suppressFilterWatch = false
+
 const dialogDescription = computed(() => {
   const name = (props.providerName || '').trim()
   return name ? `${name} - 选择账号并批量执行动作` : '选择账号并批量执行动作'
 })
 
 const selectedIdSet = computed(() => new Set(selectedKeyIds.value))
-
-const filteredKeys = computed(() => {
-  const keyword = normalizeText(searchText.value)
-  if (!keyword) return allKeys.value
-  return allKeys.value.filter((key) => {
-    const parts = [
-      key.key_name,
-      key.auth_type,
-      key.oauth_plan_type,
-      key.account_quota,
-      key.proxy?.node_id ? '独立代理' : '未配置代理',
-      key.is_active ? '已启用' : '已禁用',
-      key.oauth_invalid_reason,
-    ]
-    return parts.some((part) => normalizeText(part).includes(keyword))
-  })
-})
-
-const totalPages = computed(() => Math.max(1, Math.ceil(filteredKeys.value.length / PAGE_SIZE)))
-
-const pagedKeys = computed(() => {
-  const start = (currentPage.value - 1) * PAGE_SIZE
-  return filteredKeys.value.slice(start, start + PAGE_SIZE)
-})
-
-const isAllFilteredSelected = computed(() => {
-  if (filteredKeys.value.length === 0) return false
-  return filteredKeys.value.every((key) => selectedIdSet.value.has(key.key_id))
-})
-
-const isPartiallyFilteredSelected = computed(() => {
-  if (filteredKeys.value.length === 0) return false
-  const selectedCount = filteredKeys.value.filter((key) => selectedIdSet.value.has(key.key_id)).length
-  return selectedCount > 0 && selectedCount < filteredKeys.value.length
-})
+const selectedCount = computed(() => (selectAllFiltered.value ? filteredTotal.value : selectedKeyIds.value.length))
+const totalPages = computed(() => Math.max(1, Math.ceil(filteredTotal.value / PAGE_SIZE)))
+const isAllFilteredSelected = computed(() => selectAllFiltered.value && filteredTotal.value > 0)
+const isPartiallyFilteredSelected = computed(() => !selectAllFiltered.value && selectedKeyIds.value.length > 0)
 
 function normalizeText(value: unknown): string {
   return String(value || '').trim().toLowerCase()
+}
+
+function sanitizeFileNamePart(value: unknown, fallback: string): string {
+  const sanitized = String(value || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_\-@.]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  return sanitized || fallback
+}
+
+function formatExportTimestamp(date: Date = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+}
+
+function getBatchExportFilename(): string {
+  const providerType = sanitizeFileNamePart(props.providerType || 'pool', 'pool')
+  const providerName = sanitizeFileNamePart(props.providerName || props.providerId.slice(0, 8), 'provider')
+  return `aether_${providerType}_${providerName}_batch_export_${formatExportTimestamp()}.json`
+}
+
+function downloadJsonFile(data: unknown, filename: string): void {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
 }
 
 function normalizeAuthTypeLabel(authType: string): string {
@@ -411,14 +448,6 @@ function isBannedKey(key: PoolKeyDetail): boolean {
   return false
 }
 
-function hasNoFiveHourQuota(key: PoolKeyDetail): boolean {
-  return hasNoFiveHourLimitByQuota(key.account_quota)
-}
-
-function hasNoWeeklyQuota(key: PoolKeyDetail): boolean {
-  return hasNoWeeklyLimitByQuota(key.account_quota)
-}
-
 function isOAuthInvalid(key: PoolKeyDetail): boolean {
   if (normalizeText(key.auth_type) !== 'oauth') return false
   if (key.oauth_invalid_at != null || normalizeText(key.oauth_invalid_reason)) return true
@@ -426,70 +455,6 @@ function isOAuthInvalid(key: PoolKeyDetail): boolean {
     return key.oauth_expires_at * 1000 <= Date.now()
   }
   return false
-}
-
-function isFreePlan(key: PoolKeyDetail): boolean {
-  return normalizeText(key.oauth_plan_type).includes('free')
-}
-
-function isTeamPlan(key: PoolKeyDetail): boolean {
-  return normalizeText(key.oauth_plan_type).includes('team')
-}
-
-function toggleOne(keyId: string, checked: boolean): void {
-  const set = new Set(selectedKeyIds.value)
-  if (checked) set.add(keyId)
-  else set.delete(keyId)
-  selectedKeyIds.value = [...set]
-}
-
-function toggleSelectFiltered(checked: boolean | 'indeterminate'): void {
-  const shouldSelect = checked === true
-  const set = new Set(selectedKeyIds.value)
-  if (shouldSelect) {
-    for (const key of filteredKeys.value) set.add(key.key_id)
-  } else {
-    for (const key of filteredKeys.value) set.delete(key.key_id)
-  }
-  selectedKeyIds.value = [...set]
-}
-
-function matchesSelector(key: PoolKeyDetail, selector: QuickSelectorValue): boolean {
-  if (selector === 'banned') return isBannedKey(key)
-  if (selector === 'no_5h_limit') return hasNoFiveHourQuota(key)
-  if (selector === 'no_weekly_limit') return hasNoWeeklyQuota(key)
-  if (selector === 'plan_free') return isFreePlan(key)
-  if (selector === 'plan_team') return isTeamPlan(key)
-  if (selector === 'oauth_invalid') return isOAuthInvalid(key)
-  if (selector === 'proxy_unset') return !key.proxy?.node_id
-  if (selector === 'proxy_set') return Boolean(key.proxy?.node_id)
-  if (selector === 'disabled') return !key.is_active
-  if (selector === 'enabled') return key.is_active
-  return false
-}
-
-function onQuickSelectChange(values: string[]): void {
-  activeQuickSelectors.value = values as QuickSelectorValue[]
-  applyQuickSelectors()
-}
-
-function removeQuickSelector(selector: QuickSelectorValue): void {
-  const idx = activeQuickSelectors.value.indexOf(selector)
-  if (idx >= 0) {
-    activeQuickSelectors.value.splice(idx, 1)
-    applyQuickSelectors()
-  }
-}
-
-function applyQuickSelectors(): void {
-  if (activeQuickSelectors.value.length === 0) {
-    selectedKeyIds.value = []
-    return
-  }
-  const matched = allKeys.value.filter((key) =>
-    activeQuickSelectors.value.some((sel) => matchesSelector(key, sel))
-  )
-  selectedKeyIds.value = matched.map((key) => key.key_id)
 }
 
 function formatRelativeTime(value: string): string {
@@ -503,78 +468,213 @@ function formatRelativeTime(value: string): string {
 }
 
 function shortenQuota(raw: string): string {
-  // "周剩余 0.0%（5天3小时后重置）|5H剩余100.0％（5小时0分钟后重置）"
-  // -> "周0.0% 5d3h | 5H100.0% 5h"
-  return raw.split('|').map((seg) => {
-    let s = seg.trim()
-    s = s.replace(/剩余\s*/g, '')
-    s = s.replace(/％/g, '%')
-    s = s.replace(/[（(]\s*(\d+)\s*天\s*(\d+)\s*小时.*?[）)]/g, ' $1d$2h')
-    s = s.replace(/[（(]\s*(\d+)\s*小时\s*(\d+)\s*分钟.*?[）)]/g, ' $1h$2m')
-    s = s.replace(/[（(]\s*(\d+)\s*小时.*?[）)]/g, ' $1h')
-    s = s.replace(/[（(]\s*(\d+)\s*分钟.*?[）)]/g, ' $1m')
-    s = s.replace(/[（(]\s*(\d+)\s*天.*?[）)]/g, ' $1d')
-    s = s.replace(/[（(].*?[）)]/g, '')
-    return s.trim()
+  return raw.split('|').map((segment) => {
+    let value = segment.trim()
+    value = value.replace(/剩余\s*/g, '')
+    value = value.replace(/％/g, '%')
+    value = value.replace(/[（(]\s*(\d+)\s*天\s*(\d+)\s*小时.*?[）)]/g, ' $1d$2h')
+    value = value.replace(/[（(]\s*(\d+)\s*小时\s*(\d+)\s*分钟.*?[）)]/g, ' $1h$2m')
+    value = value.replace(/[（(]\s*(\d+)\s*小时.*?[）)]/g, ' $1h')
+    value = value.replace(/[（(]\s*(\d+)\s*分钟.*?[）)]/g, ' $1m')
+    value = value.replace(/[（(]\s*(\d+)\s*天.*?[）)]/g, ' $1d')
+    value = value.replace(/[（(].*?[）)]/g, '')
+    return value.trim()
   }).join(' | ')
 }
 
-async function loadAllKeys(): Promise<void> {
+function clearSearchDebounce(): void {
+  if (searchDebounceTimer !== null) {
+    clearTimeout(searchDebounceTimer)
+    searchDebounceTimer = null
+  }
+}
+
+function rememberPageKeys(keys: PoolKeyDetail[]): void {
+  if (keys.length === 0) return
+  const next = { ...knownKeysById.value }
+  for (const key of keys) {
+    next[key.key_id] = key
+  }
+  knownKeysById.value = next
+}
+
+function resetSelection(clearKnown = false): void {
+  selectAllFiltered.value = false
+  selectedKeyIds.value = []
+  if (clearKnown) knownKeysById.value = {}
+}
+
+function buildSelectionFilters(): { search?: string; quick_selectors?: string[] } {
+  const search = searchText.value.trim()
+  const quickSelectors = activeQuickSelectors.value.map((value) => String(value))
+  return {
+    ...(search ? { search } : {}),
+    ...(quickSelectors.length > 0 ? { quick_selectors: quickSelectors } : {}),
+  }
+}
+
+async function loadKeysPage(): Promise<void> {
   if (!props.providerId) {
-    allKeys.value = []
-    selectedKeyIds.value = []
+    pageKeys.value = []
+    filteredTotal.value = 0
+    resetSelection(true)
     return
   }
+
+  const requestId = ++loadRequestId
   loading.value = true
+  const startedAt = performance.now()
+  let ok = false
   try {
-    const pageSize = 200
-    let page = 1
-    let total = 0
-    const collected: PoolKeyDetail[] = []
+    const res = await listPoolKeys(props.providerId, {
+      page: currentPage.value,
+      page_size: PAGE_SIZE,
+      status: 'all',
+      search: searchText.value.trim() || undefined,
+      quick_selectors: activeQuickSelectors.value,
+      search_scope: 'full',
+    })
+    if (requestId !== loadRequestId) return
 
-    while (page <= 50) {
-      const res = await listPoolKeys(props.providerId, {
-        page,
-        page_size: pageSize,
-        status: 'all',
-      })
-      const keys = Array.isArray(res.keys) ? res.keys : []
-      collected.push(...keys)
-      total = Number(res.total || 0)
-      if (keys.length < pageSize || collected.length >= total) break
-      page += 1
-    }
-
-    allKeys.value = collected
-    const validIds = new Set(collected.map((key) => key.key_id))
-    selectedKeyIds.value = selectedKeyIds.value.filter((id) => validIds.has(id))
+    pageKeys.value = Array.isArray(res.keys) ? res.keys : []
+    filteredTotal.value = Number(res.total || 0)
+    rememberPageKeys(pageKeys.value)
+    ok = true
   } catch (err) {
+    if (requestId !== loadRequestId) return
+    pageKeys.value = []
+    filteredTotal.value = 0
     showError(parseApiError(err, '加载账号列表失败'))
-    allKeys.value = []
-    selectedKeyIds.value = []
   } finally {
-    loading.value = false
+    if (requestId === loadRequestId) {
+      loading.value = false
+      // eslint-disable-next-line no-console
+      console.info('[PoolAccountBatchDialog] loadKeysPage timing', {
+        providerId: props.providerId,
+        page: currentPage.value,
+        pageSize: PAGE_SIZE,
+        search: searchText.value.trim(),
+        quickSelectors: activeQuickSelectors.value,
+        total: filteredTotal.value,
+        count: pageKeys.value.length,
+        ok,
+        durationMs: Math.round(performance.now() - startedAt),
+      })
+    }
   }
+}
+
+function requestFilteredReload(debounceMs = 0): void {
+  if (!props.modelValue) return
+  clearSearchDebounce()
+  resetSelection()
+  lastResultMessage.value = ''
+  const run = () => {
+    searchDebounceTimer = null
+    currentPage.value = 1
+    void loadKeysPage()
+  }
+  if (debounceMs > 0) {
+    searchDebounceTimer = window.setTimeout(run, debounceMs)
+  } else {
+    run()
+  }
+}
+
+async function goToPage(page: number): Promise<void> {
+  const nextPage = Math.min(Math.max(1, page), totalPages.value)
+  currentPage.value = nextPage
+  await loadKeysPage()
+}
+
+function toggleOne(keyId: string, checked: boolean): void {
+  const set = new Set(selectedKeyIds.value)
+  if (checked) set.add(keyId)
+  else set.delete(keyId)
+  selectedKeyIds.value = [...set]
+}
+
+function toggleSelectFiltered(checked: boolean | 'indeterminate'): void {
+  selectAllFiltered.value = checked === true
+  if (selectAllFiltered.value) {
+    selectedKeyIds.value = []
+  }
+}
+
+function onQuickSelectChange(values: string[]): void {
+  activeQuickSelectors.value = values as QuickSelectorValue[]
+  requestFilteredReload()
+}
+
+function removeQuickSelector(selector: QuickSelectorValue): void {
+  const idx = activeQuickSelectors.value.indexOf(selector)
+  if (idx >= 0) {
+    activeQuickSelectors.value.splice(idx, 1)
+    requestFilteredReload()
+  }
+}
+
+const DELETE_POLL_INTERVAL_MS = 2000
+const DELETE_POLL_MAX_MS = 10 * 60 * 1000
+const DELETE_POLL_MAX_FAILURES = 3
+
+async function pollDeleteTask(
+  providerId: string,
+  taskId: string,
+  progressOffset: number,
+): Promise<{ status: string; deleted: number }> {
+  const deadline = Date.now() + DELETE_POLL_MAX_MS
+  let consecutiveFailures = 0
+  while (Date.now() < deadline) {
+    try {
+      const task = await getPoolBatchDeleteTask(providerId, taskId)
+      consecutiveFailures = 0
+      progressDone.value = progressOffset + task.deleted
+      if (task.status === 'completed' || task.status === 'failed') {
+        return { status: task.status, deleted: task.deleted }
+      }
+    } catch {
+      consecutiveFailures++
+      if (consecutiveFailures >= DELETE_POLL_MAX_FAILURES) {
+        return { status: 'failed', deleted: 0 }
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, DELETE_POLL_INTERVAL_MS))
+  }
+  return { status: 'failed', deleted: 0 }
+}
+
+async function resolveSelectedItems(): Promise<PoolKeySelectionItem[]> {
+  if (!props.providerId) return []
+
+  if (selectAllFiltered.value) {
+    progressLabel.value = '正在解析筛选结果...'
+    const result = await resolvePoolKeySelection(props.providerId, buildSelectionFilters())
+    return Array.isArray(result.items) ? result.items : []
+  }
+
+  return selectedKeyIds.value.map((keyId) => {
+    const key = knownKeysById.value[keyId]
+    return {
+      key_id: keyId,
+      key_name: key?.key_name || '',
+      auth_type: key?.auth_type || 'api_key',
+    }
+  })
 }
 
 async function executeAction(): Promise<void> {
   if (executing.value) return
-  if (selectedKeyIds.value.length === 0) {
+  if (selectedCount.value === 0) {
     warning('请先选择账号')
     return
   }
 
-  const selectedMap = new Set(selectedKeyIds.value)
-  const selectedKeys = allKeys.value.filter((key) => selectedMap.has(key.key_id))
-  if (selectedKeys.length === 0) {
-    warning('未找到可执行账号，请刷新列表重试')
-    return
-  }
-
+  const requestedCount = selectedCount.value
   if (selectedAction.value === 'delete') {
     const confirmed = await confirm({
       title: '删除账号',
-      message: `将删除 ${selectedKeys.length} 个账号，操作不可恢复，是否继续？`,
+      message: `将删除 ${requestedCount} 个账号，操作不可恢复，是否继续？`,
       confirmText: '确认删除',
       variant: 'destructive',
     })
@@ -590,60 +690,170 @@ async function executeAction(): Promise<void> {
   let successCount = 0
   let failedCount = 0
   let skippedCount = 0
+  let resolvedCount = 0
+  const actionStartedAt = performance.now()
+  let actionPhaseMs = 0
+  let reloadPhaseMs = 0
 
-  const actionLabel = ACTION_OPTIONS.find((a) => a.value === selectedAction.value)?.label || '执行'
+  const actionLabel = ACTION_OPTIONS.find((item) => item.value === selectedAction.value)?.label || '执行'
   progressDone.value = 0
-  progressTotal.value = selectedKeys.length
-  progressLabel.value = `正在${actionLabel}...`
+  progressTotal.value = 0
+  progressLabel.value = selectAllFiltered.value ? '正在解析筛选结果...' : `正在${actionLabel}...`
   lastResultMessage.value = ''
 
   try {
+    const selectedKeys = await resolveSelectedItems()
+    resolvedCount = selectedKeys.length
+    if (selectedKeys.length === 0) {
+      warning('未找到可执行账号，请刷新列表重试')
+      return
+    }
+
+    progressDone.value = 0
+    progressTotal.value = selectedKeys.length
+    progressLabel.value = `正在${actionLabel}...`
+
     if (selectedAction.value === 'refresh_quota') {
       const targetIds = selectedKeys.map((key) => key.key_id)
-      const result = await refreshProviderQuota(props.providerId, targetIds)
-      successCount = Number(result.success || 0)
-      failedCount = Number(result.failed || 0)
-      skippedCount = Math.max(0, targetIds.length - Number(result.total || 0))
-      progressDone.value = targetIds.length
-    } else {
-      const CONCURRENCY = props.batchConcurrency || 8
-      const taskForKey = (key: PoolKeyDetail): (() => Promise<'success' | 'skip'>) | null => {
-        if (selectedAction.value === 'delete') {
-          return () => deleteEndpointKey(key.key_id).then(() => 'success' as const)
+      const BATCH_SIZE = 20
+      const totalBatches = Math.ceil(targetIds.length / BATCH_SIZE)
+
+      for (let i = 0; i < targetIds.length; i += BATCH_SIZE) {
+        const batchIndex = Math.floor(i / BATCH_SIZE) + 1
+        const batch = targetIds.slice(i, i + BATCH_SIZE)
+        progressLabel.value = `正在${actionLabel}...（第 ${batchIndex}/${totalBatches} 批）`
+
+        try {
+          const result = await refreshProviderQuota(props.providerId, batch)
+          successCount += Number(result.success || 0)
+          failedCount += Number(result.failed || 0)
+          skippedCount += Math.max(0, batch.length - Number(result.total || 0))
+        } catch {
+          failedCount += batch.length
         }
-        if (selectedAction.value === 'refresh_oauth') {
-          if (normalizeText(key.auth_type) !== 'oauth') return null
-          return () => refreshProviderOAuth(key.key_id).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'clear_proxy') {
-          return () => updateProviderKey(key.key_id, { proxy: null }).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'set_proxy') {
-          return () => updateProviderKey(key.key_id, {
-            proxy: { node_id: proxyNodeIdForAction.value, enabled: true },
-          }).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'enable') {
-          return () => updateProviderKey(key.key_id, { is_active: true }).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'disable') {
-          return () => updateProviderKey(key.key_id, { is_active: false }).then(() => 'success' as const)
-        }
-        return null
+
+        progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
+      }
+    } else if (selectedAction.value === 'export') {
+      const exportableKeys = selectedKeys.filter((key) => normalizeText(key.auth_type) === 'oauth')
+      const exportedEntries: Array<Record<string, unknown> | null> = Array.from({ length: exportableKeys.length }, () => null)
+
+      skippedCount += selectedKeys.length - exportableKeys.length
+      progressDone.value = 0
+      progressTotal.value = exportableKeys.length
+      if (skippedCount > 0) {
+        progressLabel.value = `正在${actionLabel}...（跳过 ${skippedCount} 个非 OAuth 账号）`
       }
 
+      let cursor = 0
+      const CONCURRENCY = props.batchConcurrency || 8
+      const runNext = async (): Promise<void> => {
+        while (cursor < exportableKeys.length) {
+          const idx = cursor++
+          const key = exportableKeys[idx]
+          try {
+            exportedEntries[idx] = await exportKey(key.key_id)
+            successCount += 1
+          } catch (err) {
+            failedCount += 1
+            // eslint-disable-next-line no-console
+            console.error(`[PoolAccountBatchDialog] export failed (${key.key_id}):`, err)
+          } finally {
+            progressDone.value += 1
+          }
+        }
+      }
+
+      const workers = Array.from(
+        { length: Math.min(CONCURRENCY, exportableKeys.length) },
+        () => runNext(),
+      )
+      await Promise.all(workers)
+
+      const exportedData = exportedEntries.filter((item): item is Record<string, unknown> => item !== null)
+      if (exportedData.length > 0) {
+        downloadJsonFile(exportedData, getBatchExportFilename())
+      }
+    } else if (selectedAction.value === 'delete') {
+      const targetIds = selectedKeys.map((key) => key.key_id)
+      const BATCH_SIZE = 2000
+      const totalBatches = Math.ceil(targetIds.length / BATCH_SIZE)
+
+      for (let i = 0; i < targetIds.length; i += BATCH_SIZE) {
+        const batchIndex = Math.floor(i / BATCH_SIZE) + 1
+        const batch = targetIds.slice(i, i + BATCH_SIZE)
+        if (totalBatches > 1) {
+          progressLabel.value = `正在${actionLabel}...（第 ${batchIndex}/${totalBatches} 批）`
+        }
+
+        try {
+          const result = await batchActionPoolKeys(props.providerId, {
+            key_ids: batch,
+            action: 'delete',
+          })
+
+          if (result.task_id) {
+            progressLabel.value = `正在${actionLabel}...（后台执行中）`
+            const taskResult = await pollDeleteTask(props.providerId, result.task_id, i)
+            successCount += taskResult.deleted
+            if (taskResult.status === 'failed') {
+              failedCount += batch.length - taskResult.deleted
+            }
+          } else {
+            successCount += result.affected
+          }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(`batch delete failed (batch ${batchIndex}/${totalBatches}):`, err)
+          failedCount += batch.length
+        }
+
+        progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
+      }
+    } else if (['enable', 'disable', 'clear_proxy', 'set_proxy'].includes(selectedAction.value)) {
+      const targetIds = selectedKeys.map((key) => key.key_id)
+      const BATCH_SIZE = 2000
+      const totalBatches = Math.ceil(targetIds.length / BATCH_SIZE)
+
+      for (let i = 0; i < targetIds.length; i += BATCH_SIZE) {
+        const batchIndex = Math.floor(i / BATCH_SIZE) + 1
+        const batch = targetIds.slice(i, i + BATCH_SIZE)
+        if (totalBatches > 1) {
+          progressLabel.value = `正在${actionLabel}...（第 ${batchIndex}/${totalBatches} 批）`
+        }
+
+        const payload = selectedAction.value === 'set_proxy'
+          ? { node_id: proxyNodeIdForAction.value, enabled: true }
+          : undefined
+
+        try {
+          const result = await batchActionPoolKeys(props.providerId, {
+            key_ids: batch,
+            action: selectedAction.value as 'enable' | 'disable' | 'clear_proxy' | 'set_proxy',
+            ...(payload ? { payload } : {}),
+          })
+          successCount += result.affected
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(`batch ${selectedAction.value} failed (batch ${batchIndex}/${totalBatches}):`, err)
+          failedCount += batch.length
+        }
+
+        progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
+      }
+    } else {
+      const CONCURRENCY = props.batchConcurrency || 8
       const tasks: Array<() => Promise<'success' | 'skip'>> = []
       for (const key of selectedKeys) {
-        const task = taskForKey(key)
-        if (task) tasks.push(task)
-        else {
+        if (selectedAction.value === 'refresh_oauth' && normalizeText(key.auth_type) !== 'oauth') {
           skippedCount += 1
           progressDone.value += 1
+          continue
         }
+        tasks.push(() => refreshProviderOAuth(key.key_id).then(() => 'success' as const))
       }
       progressTotal.value = selectedKeys.length
 
-      // 并发执行，限制并发数
       let cursor = 0
       const runNext = async (): Promise<void> => {
         while (cursor < tasks.length) {
@@ -662,22 +872,38 @@ async function executeAction(): Promise<void> {
     }
 
     lastResultMessage.value = `执行完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}`
-    if (failedCount > 0) warning(lastResultMessage.value)
+    if (failedCount > 0 || (selectedAction.value === 'export' && successCount === 0)) warning(lastResultMessage.value)
     else success(lastResultMessage.value)
 
-    const shouldClearSelection = selectedAction.value === 'delete'
-    const previousSelection = new Set(selectedKeyIds.value)
-    await loadAllKeys()
-    if (shouldClearSelection) {
-      selectedKeyIds.value = []
-    } else {
-      const existingIds = new Set(allKeys.value.map((key) => key.key_id))
-      selectedKeyIds.value = [...previousSelection].filter((id) => existingIds.has(id))
+    actionPhaseMs = performance.now() - actionStartedAt
+    if (selectedAction.value !== 'export') {
+      const reloadStartedAt = performance.now()
+      if (selectedAction.value === 'delete' && successCount > 0) {
+        resetSelection(true)
+      }
+      await loadKeysPage()
+      if (pageKeys.value.length === 0 && filteredTotal.value > 0 && currentPage.value > totalPages.value) {
+        await goToPage(totalPages.value)
+      }
+      reloadPhaseMs = performance.now() - reloadStartedAt
+      emit('changed')
     }
-    emit('changed')
   } catch (err) {
     showError(parseApiError(err, '批量操作失败'))
   } finally {
+    // eslint-disable-next-line no-console
+    console.info('[PoolAccountBatchDialog] executeAction timing', {
+      providerId: props.providerId,
+      action: selectedAction.value,
+      requestedCount,
+      resolvedCount,
+      successCount,
+      failedCount,
+      skippedCount,
+      actionPhaseMs: Math.round(actionPhaseMs),
+      reloadPhaseMs: Math.round(reloadPhaseMs),
+      totalMs: Math.round(performance.now() - actionStartedAt),
+    })
     executing.value = false
     progressTotal.value = 0
     progressDone.value = 0
@@ -685,15 +911,29 @@ async function executeAction(): Promise<void> {
   }
 }
 
+watch(searchText, () => {
+  if (suppressFilterWatch || !props.modelValue) return
+  requestFilteredReload(SEARCH_DEBOUNCE_MS)
+})
+
 watch(
   () => props.modelValue,
   (open) => {
-    if (!open) return
+    if (!open) {
+      clearSearchDebounce()
+      return
+    }
+    suppressFilterWatch = true
     searchText.value = ''
     lastResultMessage.value = ''
     activeQuickSelectors.value = []
+    resetSelection(true)
+    filteredTotal.value = 0
+    pageKeys.value = []
+    currentPage.value = 1
+    suppressFilterWatch = false
     proxyNodesStore.ensureLoaded()
-    loadAllKeys()
+    void loadKeysPage()
   },
 )
 
@@ -701,12 +941,18 @@ watch(
   () => props.providerId,
   (newId, oldId) => {
     if (!props.modelValue || !newId || newId === oldId) return
-    selectedKeyIds.value = []
-    loadAllKeys()
+    clearSearchDebounce()
+    suppressFilterWatch = true
+    resetSelection(true)
+    filteredTotal.value = 0
+    pageKeys.value = []
+    currentPage.value = 1
+    suppressFilterWatch = false
+    void loadKeysPage()
   },
 )
 
-watch(filteredKeys, () => {
-  currentPage.value = 1
+onBeforeUnmount(() => {
+  clearSearchDebounce()
 })
 </script>

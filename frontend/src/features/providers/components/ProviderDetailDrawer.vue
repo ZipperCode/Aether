@@ -289,6 +289,22 @@
                             >
                               {{ formatOAuthPlanType(key.oauth_plan_type) }}
                             </Badge>
+                            <Badge
+                              v-if="getPrimaryOAuthOrganizationTitle(key)"
+                              variant="secondary"
+                              class="text-[10px] px-1.5 py-0 shrink-0 max-w-[120px] truncate"
+                              :title="getOAuthOrganizationsTooltip(key)"
+                            >
+                              {{ getPrimaryOAuthOrganizationTitle(key) }}
+                            </Badge>
+                            <Badge
+                              v-if="key.oauth_account_id"
+                              variant="secondary"
+                              class="text-[10px] px-1.5 py-0 shrink-0"
+                              :title="key.oauth_account_id"
+                            >
+                              acct {{ formatOAuthIdentityShort(key.oauth_account_id) }}
+                            </Badge>
                             <!-- Kiro 订阅类型标签 -->
                             <Badge
                               v-if="provider.provider_type === 'kiro' && key.upstream_metadata?.kiro?.subscription_title"
@@ -302,6 +318,13 @@
                           <div class="flex items-center gap-1">
                             <span class="text-[11px] font-mono text-muted-foreground">
                               {{ key.auth_type === 'oauth' ? '[Refresh Token]' : (key.auth_type === 'service_account' ? '[Service Account]' : key.api_key_masked) }}
+                            </span>
+                            <span
+                              v-if="key.oauth_account_user_id"
+                              class="text-[10px] text-muted-foreground"
+                              :title="key.oauth_account_user_id"
+                            >
+                              AUID {{ formatOAuthIdentityShort(key.oauth_account_user_id, 10, 8) }}
                             </span>
                             <Button
                               v-if="key.auth_type === 'oauth'"
@@ -936,7 +959,7 @@
     :editing-key="editingKey"
     :provider-id="provider ? provider.id : null"
     :provider-type="provider?.provider_type || null"
-    :available-api-formats="provider?.api_formats || []"
+    :available-api-formats="availableKeyApiFormats"
     @close="keyFormDialogOpen = false"
     @saved="handleKeyChanged"
   />
@@ -1103,6 +1126,7 @@ import type { UpstreamMetadata, AntigravityModelQuota } from '@/api/endpoints/ty
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { isOAuthAccountProviderType, isKeyManagedProviderType } from '../utils/providerTypeUtils'
 import { isAccountLevelBlockReason, cleanAccountBlockReason } from '@/utils/accountBlock'
+import { formatOAuthIdentityShort, getPrimaryOAuthOrganizationTitle, getOAuthOrganizationsTooltip } from '@/utils/oauthIdentity'
 
 // 扩展端点类型,包含密钥列表
 interface ProviderEndpointWithKeys extends ProviderEndpoint {
@@ -1136,6 +1160,7 @@ const providerModels = ref<Model[]>([])  // Provider 级别的 models
 const providerMappingPreview = ref<ProviderMappingPreviewResponse | null>(null)  // 映射预览
 let providerLoadRequestId = 0
 let endpointsLoadRequestId = 0
+let mappingPreviewLoadRequestId = 0
 
 // 系统级格式转换配置
 const systemFormatConversionEnabled = ref(false)
@@ -1258,6 +1283,65 @@ const allKeys = computed(() => {
   return result
 })
 
+const availableKeyApiFormats = computed(() => {
+  const formatSet = new Set<string>()
+
+  for (const format of provider.value?.api_formats || []) {
+    if (format) {
+      formatSet.add(format)
+    }
+  }
+
+  for (const endpoint of endpoints.value) {
+    if (endpoint.api_format) {
+      formatSet.add(endpoint.api_format)
+    }
+  }
+
+  return sortApiFormats([...formatSet])
+})
+
+function syncCurrentSelections(
+  nextEndpoints: ProviderEndpointWithKeys[] = endpoints.value,
+  nextProviderKeys: EndpointAPIKey[] = providerKeys.value
+) {
+  if (currentEndpoint.value) {
+    currentEndpoint.value = nextEndpoints.find(endpoint => endpoint.id === currentEndpoint.value?.id) ?? null
+  }
+
+  if (!editingKey.value) {
+    return
+  }
+
+  const latestKeys: EndpointAPIKey[] = []
+  const seenKeyIds = new Set<string>()
+
+  for (const key of nextProviderKeys) {
+    if (!seenKeyIds.has(key.id)) {
+      seenKeyIds.add(key.id)
+      latestKeys.push(key)
+    }
+  }
+
+  for (const endpoint of nextEndpoints) {
+    for (const key of endpoint.keys || []) {
+      if (!seenKeyIds.has(key.id)) {
+        seenKeyIds.add(key.id)
+        latestKeys.push(key)
+      }
+    }
+  }
+
+  const latestEditingKey = latestKeys.find(key => key.id === editingKey.value?.id) || null
+  editingKey.value = latestEditingKey
+
+  if (!latestEditingKey) {
+    keyFormDialogOpen.value = false
+    keyPermissionsDialogOpen.value = false
+    oauthKeyEditDialogOpen.value = false
+  }
+}
+
 // ===== 账号列表智能分页 =====
 const keysListRef = ref<HTMLElement | null>(null)
 const {
@@ -1290,6 +1374,7 @@ watch(
       // 使在途请求失效，避免关闭后旧响应回写
       providerLoadRequestId += 1
       endpointsLoadRequestId += 1
+      mappingPreviewLoadRequestId += 1
 
       // 停止倒计时定时器
       stopCountdownTimer()
@@ -1558,6 +1643,7 @@ async function handleRefreshOAuth(key: EndpointAPIKey) {
       const freshKeys = await getProviderKeys(props.providerId).catch(() => null)
       if (freshKeys) {
         providerKeys.value = freshKeys
+        syncCurrentSelections(endpoints.value, freshKeys)
       }
     }
     // Antigravity：token 刷新后可能完成了账号激活，触发配额获取
@@ -1866,7 +1952,7 @@ async function openAntigravityQuotaDialog(key: EndpointAPIKey) {
 }
 
 async function handleKeyChanged() {
-  await loadEndpoints()
+  await Promise.all([loadEndpoints(), loadMappingPreview()])
   emit('refresh')
   // 添加/修改 key 后自动获取 Antigravity 配额（新 key 的 upstream_metadata 为空）
   void autoRefreshQuotaInBackground()
@@ -1955,21 +2041,20 @@ function handleBatchAssign() {
 
 // 处理批量关联完成
 async function handleBatchAssignChanged() {
-  await loadEndpoints()
+  await Promise.all([loadEndpoints(), loadMappingPreview()])
   emit('refresh')
 }
 
 // 处理模型映射变更
 async function handleModelMappingChanged() {
-  void loadMappingPreview()
-  await loadEndpoints()
+  await Promise.all([loadEndpoints(), loadMappingPreview()])
   emit('refresh')
 }
 
 // 处理模型保存完成
 async function handleModelSaved() {
   editingModel.value = null
-  await loadEndpoints()
+  await Promise.all([loadEndpoints(), loadMappingPreview()])
   emit('refresh')
 }
 
@@ -2640,7 +2725,7 @@ async function loadEndpoints() {
     providerKeys.value = providerKeysResult
     providerModels.value = modelsResult
     // 按 API 格式排序
-    endpoints.value = endpointsList.sort((a, b) => {
+    const sortedEndpoints = endpointsList.sort((a, b) => {
       const aIdx = API_FORMAT_ORDER.indexOf(a.api_format)
       const bIdx = API_FORMAT_ORDER.indexOf(b.api_format)
       if (aIdx === -1 && bIdx === -1) return 0
@@ -2648,6 +2733,8 @@ async function loadEndpoints() {
       if (bIdx === -1) return -1
       return aIdx - bIdx
     })
+    endpoints.value = sortedEndpoints
+    syncCurrentSelections(sortedEndpoints, providerKeysResult)
   } catch (err: unknown) {
     if (requestId !== endpointsLoadRequestId) return
     showError(parseApiError(err, '加载端点失败'), '错误')
@@ -2657,9 +2744,13 @@ async function loadEndpoints() {
 // 加载映射预览（独立于 loadEndpoints，不阻塞首屏渲染）
 async function loadMappingPreview() {
   if (!props.providerId) return
+  const requestId = ++mappingPreviewLoadRequestId
   try {
-    providerMappingPreview.value = await getProviderMappingPreview(props.providerId)
+    const preview = await getProviderMappingPreview(props.providerId)
+    if (requestId !== mappingPreviewLoadRequestId) return
+    providerMappingPreview.value = preview
   } catch {
+    if (requestId !== mappingPreviewLoadRequestId) return
     providerMappingPreview.value = null
   }
 }

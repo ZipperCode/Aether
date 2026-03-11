@@ -500,6 +500,60 @@ def _normalize_codex_plan_group(plan_type: Any) -> str | None:
     return None
 
 
+def _normalize_codex_identity_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _is_codex_provider(provider_type: Any) -> bool:
+    return str(provider_type or "").strip().lower() == ProviderType.CODEX.value
+
+
+def _match_codex_identity(
+    *,
+    new_auth_config: dict[str, Any],
+    existing_auth_config: dict[str, Any],
+) -> bool | None:
+    """Codex 判重优先按 account/team 维度进行。
+
+    Returns:
+        True: 明确重复
+        False: 明确不是重复（例如同用户不同 account/team）
+        None: 信息不足，调用方应继续使用兜底规则
+    """
+    new_provider_type = new_auth_config.get("provider_type")
+    existing_provider_type = existing_auth_config.get("provider_type")
+    if not (_is_codex_provider(new_provider_type) or _is_codex_provider(existing_provider_type)):
+        return None
+
+    new_account_user_id = _normalize_codex_identity_value(new_auth_config.get("account_user_id"))
+    existing_account_user_id = _normalize_codex_identity_value(
+        existing_auth_config.get("account_user_id")
+    )
+    if new_account_user_id and existing_account_user_id:
+        return new_account_user_id == existing_account_user_id
+
+    new_account_id = _normalize_codex_identity_value(new_auth_config.get("account_id"))
+    existing_account_id = _normalize_codex_identity_value(existing_auth_config.get("account_id"))
+    new_user_id = _normalize_codex_identity_value(new_auth_config.get("user_id"))
+    existing_user_id = _normalize_codex_identity_value(existing_auth_config.get("user_id"))
+    new_email = _normalize_codex_identity_value(new_auth_config.get("email"))
+    existing_email = _normalize_codex_identity_value(existing_auth_config.get("email"))
+
+    if new_account_id and existing_account_id and new_account_id != existing_account_id:
+        return False
+
+    if new_account_id and existing_account_id and new_user_id and existing_user_id:
+        return new_account_id == existing_account_id and new_user_id == existing_user_id
+
+    if new_account_id and existing_account_id and new_email and existing_email:
+        return new_account_id == existing_account_id and new_email == existing_email
+
+    return None
+
+
 def _is_codex_cross_plan_group_non_duplicate(
     *,
     new_provider_type: Any,
@@ -528,8 +582,9 @@ def _check_duplicate_oauth_account(
     检查是否存在重复的 OAuth 账号。
 
     通过以下字段判断重复：
-    - user_id: Codex 等使用用户级别 ID（同 team 下不同成员共享 account_id 但 user_id 不同）
-      对 Codex 额外按账号类型分组：free 与 Team/Plus/Enterprise 互不判重
+    - Codex: 优先 account_user_id，其次 (user_id, account_id) / (email, account_id)
+      同一用户切换不同 Team/account_id 时不判重；free 与 Team/Plus/Enterprise 互不判重
+    - user_id: Codex 之外优先使用用户级别 ID
     - email + auth_method: Kiro 使用 email + auth_method 组合判断
       （同一邮箱可能通过 Social 和 IdC 两种方式登录，视为不同账号）
     - email: 其他 OAuth Provider 使用邮箱判断
@@ -576,8 +631,22 @@ def _check_duplicate_oauth_account(
 
             is_duplicate = False
 
+            codex_identity_match = _match_codex_identity(
+                new_auth_config=auth_config,
+                existing_auth_config=decrypted_config,
+            )
+            if codex_identity_match is True:
+                is_duplicate = True
+            elif codex_identity_match is False:
+                is_duplicate = False
+
             # user_id 相同即重复（Codex 等，同一 team 下不同成员共享 account_id 但 user_id 不同）
-            if new_user_id and existing_user_id and new_user_id == existing_user_id:
+            if (
+                codex_identity_match is None
+                and new_user_id
+                and existing_user_id
+                and new_user_id == existing_user_id
+            ):
                 if not _is_codex_cross_plan_group_non_duplicate(
                     new_provider_type=new_provider_type,
                     existing_provider_type=existing_provider_type,
@@ -587,7 +656,13 @@ def _check_duplicate_oauth_account(
                     is_duplicate = True
 
             # email 判断
-            if not is_duplicate and new_email and existing_email and new_email == existing_email:
+            if (
+                codex_identity_match is None
+                and not is_duplicate
+                and new_email
+                and existing_email
+                and new_email == existing_email
+            ):
                 is_kiro = new_provider_type == "kiro" or existing_provider_type == "kiro"
                 if is_kiro:
                     # Kiro: 只有 email + auth_method 都相同才视为重复
@@ -617,7 +692,13 @@ def _check_duplicate_oauth_account(
                     return existing_key
 
                 # 活跃的重复账号，拒绝添加
-                identifier = new_email or new_user_id or ""
+                identifier = (
+                    auth_config.get("account_user_id")
+                    or auth_config.get("account_id")
+                    or new_email
+                    or new_user_id
+                    or ""
+                )
                 raise InvalidRequestException(
                     f"该 OAuth 账号 ({identifier}) 已存在于当前 Provider 中"
                     f"（名称: {existing_key.name}）"
@@ -1318,7 +1399,7 @@ def _coerce_import_str(value: Any) -> str | None:
     return normalized or None
 
 
-def _extract_standard_oauth_import_entry(item: Any) -> dict[str, str] | None:
+def _extract_standard_oauth_import_entry(item: Any) -> dict[str, Any] | None:
     if isinstance(item, str):
         token = _coerce_import_str(item)
         if token:
@@ -1333,7 +1414,7 @@ def _extract_standard_oauth_import_entry(item: Any) -> dict[str, str] | None:
     if not refresh_token:
         return None
 
-    entry: dict[str, str] = {"refresh_token": refresh_token}
+    entry: dict[str, Any] = {"refresh_token": refresh_token}
 
     account_id = (
         _coerce_import_str(item.get("account_id"))
@@ -1343,6 +1424,15 @@ def _extract_standard_oauth_import_entry(item: Any) -> dict[str, str] | None:
     )
     if account_id:
         entry["account_id"] = account_id
+
+    account_user_id = (
+        _coerce_import_str(item.get("account_user_id"))
+        or _coerce_import_str(item.get("accountUserId"))
+        or _coerce_import_str(item.get("chatgpt_account_user_id"))
+        or _coerce_import_str(item.get("chatgptAccountUserId"))
+    )
+    if account_user_id:
+        entry["account_user_id"] = account_user_id
 
     plan_type = (
         _coerce_import_str(item.get("plan_type"))
@@ -1369,7 +1459,7 @@ def _extract_standard_oauth_import_entry(item: Any) -> dict[str, str] | None:
     return entry
 
 
-def _parse_standard_oauth_import_entries(raw_input: str) -> list[dict[str, str]]:
+def _parse_standard_oauth_import_entries(raw_input: str) -> list[dict[str, Any]]:
     """
     解析标准 OAuth 导入输入，保留 refresh_token 及可用账号提示字段。
 
@@ -1384,7 +1474,7 @@ def _parse_standard_oauth_import_entries(raw_input: str) -> list[dict[str, str]]
     if not raw:
         return []
 
-    result: list[dict[str, str]] = []
+    result: list[dict[str, Any]] = []
 
     if raw.startswith("["):
         try:
@@ -1668,9 +1758,9 @@ def _commit_batch_import_writes_if_needed(db: Session, pending_writes: int) -> i
     return 0
 
 
-def _apply_codex_import_hints(auth_config: dict[str, Any], import_entry: dict[str, str]) -> None:
+def _apply_codex_import_hints(auth_config: dict[str, Any], import_entry: dict[str, Any]) -> None:
     """将导入文件中可用的 Codex 账号信息作为兜底补全（不覆盖已有值）。"""
-    for field in ("account_id", "plan_type", "user_id", "email"):
+    for field in ("account_user_id", "account_id", "plan_type", "user_id", "email"):
         value = import_entry.get(field)
         if value and not auth_config.get(field):
             auth_config[field] = value
