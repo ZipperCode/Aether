@@ -290,20 +290,12 @@
                               {{ formatOAuthPlanType(key.oauth_plan_type) }}
                             </Badge>
                             <Badge
-                              v-if="getPrimaryOAuthOrganizationTitle(key)"
-                              variant="secondary"
-                              class="text-[10px] px-1.5 py-0 shrink-0 max-w-[120px] truncate"
-                              :title="getOAuthOrganizationsTooltip(key)"
-                            >
-                              {{ getPrimaryOAuthOrganizationTitle(key) }}
-                            </Badge>
-                            <Badge
-                              v-if="key.oauth_account_id"
+                              v-if="getOAuthOrgBadge(key)"
                               variant="secondary"
                               class="text-[10px] px-1.5 py-0 shrink-0"
-                              :title="key.oauth_account_id"
+                              :title="getOAuthOrgBadge(key)?.id"
                             >
-                              acct {{ formatOAuthIdentityShort(key.oauth_account_id) }}
+                              {{ getOAuthOrgBadge(key)?.label }}
                             </Badge>
                             <!-- Kiro 订阅类型标签 -->
                             <Badge
@@ -318,13 +310,6 @@
                           <div class="flex items-center gap-1">
                             <span class="text-[11px] font-mono text-muted-foreground">
                               {{ key.auth_type === 'oauth' ? '[Refresh Token]' : (key.auth_type === 'service_account' ? '[Service Account]' : key.api_key_masked) }}
-                            </span>
-                            <span
-                              v-if="key.oauth_account_user_id"
-                              class="text-[10px] text-muted-foreground"
-                              :title="key.oauth_account_user_id"
-                            >
-                              AUID {{ formatOAuthIdentityShort(key.oauth_account_user_id, 10, 8) }}
                             </span>
                             <Button
                               v-if="key.auth_type === 'oauth'"
@@ -1126,7 +1111,7 @@ import type { UpstreamMetadata, AntigravityModelQuota } from '@/api/endpoints/ty
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { isOAuthAccountProviderType, isKeyManagedProviderType } from '../utils/providerTypeUtils'
 import { isAccountLevelBlockReason, cleanAccountBlockReason } from '@/utils/accountBlock'
-import { formatOAuthIdentityShort, getPrimaryOAuthOrganizationTitle, getOAuthOrganizationsTooltip } from '@/utils/oauthIdentity'
+import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 
 // 扩展端点类型,包含密钥列表
 interface ProviderEndpointWithKeys extends ProviderEndpoint {

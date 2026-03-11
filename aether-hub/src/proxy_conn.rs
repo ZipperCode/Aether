@@ -99,15 +99,20 @@ async fn run_proxy_reader(
     tx: mpsc::UnboundedSender<Message>,
     idle_timeout: Duration,
 ) {
+    let idle_enabled = !idle_timeout.is_zero();
     let mut oversized_count = 0u32;
     loop {
-        let msg = tokio::select! {
-            msg = ws_rx.next() => msg,
-            _ = tokio::time::sleep(idle_timeout) => {
-                warn!(conn_id = conn_id, node_id = %node_id, "proxy idle timeout");
-                let _ = tx.send(Message::Binary(protocol::encode_goaway().into()));
-                break;
+        let msg = if idle_enabled {
+            tokio::select! {
+                msg = ws_rx.next() => msg,
+                _ = tokio::time::sleep(idle_timeout) => {
+                    warn!(conn_id = conn_id, node_id = %node_id, "proxy idle timeout");
+                    let _ = tx.send(Message::Binary(protocol::encode_goaway().into()));
+                    break;
+                }
             }
+        } else {
+            ws_rx.next().await
         };
 
         match msg {

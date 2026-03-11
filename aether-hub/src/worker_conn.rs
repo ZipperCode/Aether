@@ -86,14 +86,19 @@ async fn run_worker_reader(
     tx: mpsc::UnboundedSender<Message>,
     idle_timeout: Duration,
 ) {
+    let idle_enabled = !idle_timeout.is_zero();
     loop {
-        let msg = tokio::select! {
-            msg = ws_rx.next() => msg,
-            _ = tokio::time::sleep(idle_timeout) => {
-                warn!(worker_id = conn_id, "worker idle timeout");
-                let _ = tx.send(Message::Binary(protocol::encode_goaway().into()));
-                break;
+        let msg = if idle_enabled {
+            tokio::select! {
+                msg = ws_rx.next() => msg,
+                _ = tokio::time::sleep(idle_timeout) => {
+                    warn!(worker_id = conn_id, "worker idle timeout");
+                    let _ = tx.send(Message::Binary(protocol::encode_goaway().into()));
+                    break;
+                }
             }
+        } else {
+            ws_rx.next().await
         };
 
         match msg {

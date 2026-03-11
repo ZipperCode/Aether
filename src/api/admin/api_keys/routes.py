@@ -447,7 +447,7 @@ class AdminUpdateApiKeyAdapter(AdminApiAdapter):
         ):
             update_data["auto_delete_on_expiry"] = self.key_data.auto_delete_on_expiry
 
-        # 访问限制配置（允许设置为空数组来清除限制）
+        # 访问限制配置（NULL=不限制，空数组=[]=全部禁用）
         if hasattr(self.key_data, "allowed_providers"):
             update_data["allowed_providers"] = self.key_data.allowed_providers
         if hasattr(self.key_data, "allowed_api_formats"):
