@@ -566,7 +566,12 @@ const proxyTimingBreakdown = (proxy: Record<string, unknown>): string => {
   }
 
   const ttfbMs = t.ttfb_ms ?? t.upstream_ms
-  const processingMs = t.upstream_processing_ms ?? (
+  const responseWaitMs = t.response_wait_ms ?? (
+    t.connection_acquire_ms != null && ttfbMs != null
+      ? Math.max(0, (ttfbMs as number) - (t.connection_acquire_ms as number))
+      : null
+  )
+  const legacyWaitMs = t.upstream_processing_ms ?? (
     ttfbMs != null && t.connect_ms != null && t.tls_ms != null
       ? Math.max(0, (ttfbMs as number) - (t.connect_ms as number) - (t.tls_ms as number))
       : null
@@ -574,6 +579,9 @@ const proxyTimingBreakdown = (proxy: Record<string, unknown>): string => {
 
   if (t.dns_ms != null && (t.dns_ms as number) > 0) {
     parts.push(`DNS ${formatLatency(t.dns_ms as number)}`)
+  }
+  if (t.connection_reused === true) {
+    parts.push('复用连接')
   }
   if (t.connect_ms != null && (t.connect_ms as number) > 0) {
     parts.push(`连接 ${formatLatency(t.connect_ms as number)}`)
@@ -584,8 +592,10 @@ const proxyTimingBreakdown = (proxy: Record<string, unknown>): string => {
   if (ttfbMs != null && (ttfbMs as number) > 0) {
     parts.push(`TTFB ${formatLatency(ttfbMs as number)}`)
   }
-  if (processingMs != null && (processingMs as number) > 0) {
-    parts.push(`上游处理 ${formatLatency(Math.round(processingMs as number))}`)
+  if (responseWaitMs != null && (responseWaitMs as number) > 0) {
+    parts.push(`等待响应头 ${formatLatency(Math.round(responseWaitMs as number))}`)
+  } else if (legacyWaitMs != null && (legacyWaitMs as number) > 0) {
+    parts.push(`等待响应头(旧版估算) ${formatLatency(Math.round(legacyWaitMs as number))}`)
   }
 
   // 计算 Aether→代理 之间无法解释的耗时差
@@ -833,24 +843,15 @@ const AUTH_TYPE_PROVIDER_LABEL_MAP: Record<string, string> = {
   gemini_cli: 'Gemini CLI',
 }
 
-const normalizeProviderName = (value: string): string => {
-  const text = value.trim()
-  if (!text) return '未知'
-  // 管理后台中常见“xx反代”命名，展示时保留提供商品牌名即可
-  return text.replace(/反代$/u, '').trim() || text
-}
-
 const getProviderDisplayName = (
   attempt: CandidateRecord | null | undefined,
   options: { allowAuthTypeFallback?: boolean } = {},
 ): string => {
   const allowAuthTypeFallback = options.allowAuthTypeFallback ?? true
   if (!attempt) return '未知'
-  // 优先使用提供商名称（管理后台设置的名称）
   const providerName = String(attempt.provider_name || '').trim()
-  if (providerName) return normalizeProviderName(providerName)
+  if (providerName) return providerName
   if (allowAuthTypeFallback) {
-    // 回退：根据 auth_type 推断显示名称
     const authType = String(attempt.key_auth_type || '').trim().toLowerCase()
     if (authType && AUTH_TYPE_PROVIDER_LABEL_MAP[authType]) {
       return AUTH_TYPE_PROVIDER_LABEL_MAP[authType]
@@ -861,7 +862,7 @@ const getProviderDisplayName = (
 
 const normalizeProviderIdentity = (value: unknown): string => {
   if (typeof value !== 'string') return ''
-  return normalizeProviderName(value).trim().toLowerCase()
+  return value.trim().toLowerCase()
 }
 
 const buildProviderGroups = (items: CandidateRecord[]): NodeGroup[] => {

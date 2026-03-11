@@ -18,17 +18,16 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, text
+from sqlalchemy import delete, literal_column, text
 
+from src.config.settings import config
 from src.core.logger import logger
 from src.database import create_session
-from src.models.database import ApiKey, AuditLog, Provider, RequestCandidate, SiteAccount, Usage
+from src.models.database import AuditLog, Provider, RequestCandidate, SiteAccount, Usage
 from src.services.provider_ops.service import ProviderOpsService
-from src.services.provider_ops.types import ActionStatus, ProviderActionType
-from src.services.provider_sync import AllApiHubSyncService
 from src.services.site_management import (
     SiteAccountOpsService,
     SiteAccountSyncService,
@@ -48,10 +47,6 @@ class MaintenanceScheduler:
 
     # 签到任务的 job_id
     CHECKIN_JOB_ID = "provider_checkin"
-    # 用户配额重置任务的 job_id
-    USER_QUOTA_RESET_JOB_ID = "user_quota_reset"
-    # 独立密钥额度重置任务的 job_id
-    STANDALONE_KEY_QUOTA_RESET_JOB_ID = "standalone_key_quota_reset"
     # all-api-hub 同步任务的 job_id
     ALL_API_HUB_SYNC_JOB_ID = "all_api_hub_sync"
     # 站点账号同步任务的 job_id
@@ -79,55 +74,6 @@ class MaintenanceScheduler:
         finally:
             db.close()
 
-    def _get_user_quota_reset_time(self) -> tuple[int, int]:
-        """获取用户配额重置任务的执行时间
-
-        Returns:
-            (hour, minute) 元组
-        """
-        db = create_session()
-        try:
-            time_str = SystemConfigService.get_config(db, "user_quota_reset_time", "05:00")
-            return self._parse_user_quota_reset_time_string(time_str)
-        finally:
-            db.close()
-
-    def _get_all_api_hub_sync_time(self) -> tuple[int, int]:
-        """获取 all-api-hub 同步任务的执行时间"""
-        db = create_session()
-        try:
-            time_str = SystemConfigService.get_config(db, "all_api_hub_sync_time", "01:35")
-            return self._parse_all_api_hub_sync_time_string(time_str)
-        finally:
-            db.close()
-
-    def _get_site_account_sync_time(self) -> tuple[int, int]:
-        """获取站点账号同步任务的执行时间"""
-        db = create_session()
-        try:
-            time_str = SystemConfigService.get_config(db, "site_account_sync_time", "01:45")
-            return self._parse_all_api_hub_sync_time_string(time_str)
-        finally:
-            db.close()
-
-    def _get_site_account_checkin_time(self) -> tuple[int, int]:
-        """获取站点账号签到任务的执行时间"""
-        db = create_session()
-        try:
-            time_str = SystemConfigService.get_config(db, "site_account_checkin_time", "02:05")
-            return self._parse_time_string(time_str)
-        finally:
-            db.close()
-
-    def _get_site_account_balance_sync_time(self) -> tuple[int, int]:
-        """获取站点账号余额同步任务的执行时间"""
-        db = create_session()
-        try:
-            time_str = SystemConfigService.get_config(db, "site_account_balance_sync_time", "02:20")
-            return self._parse_time_string(time_str)
-        finally:
-            db.close()
-
     @staticmethod
     def _parse_time_string(time_str: str) -> tuple[int, int]:
         """解析时间字符串为 (hour, minute) 元组
@@ -150,41 +96,6 @@ class MaintenanceScheduler:
             return (1, 5)
         except (ValueError, IndexError):
             return (1, 5)
-
-    @staticmethod
-    def _parse_user_quota_reset_time_string(time_str: str) -> tuple[int, int]:
-        """解析用户配额重置时间字符串为 (hour, minute) 元组
-
-        Returns:
-            (hour, minute) 元组，解析失败返回默认值 (5, 0)
-        """
-        try:
-            if not time_str or ":" not in time_str:
-                return (5, 0)
-            parts = time_str.split(":")
-            hour = int(parts[0])
-            minute = int(parts[1])
-            # 验证范围
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                return (hour, minute)
-            return (5, 0)
-        except (ValueError, IndexError):
-            return (5, 0)
-
-    @staticmethod
-    def _parse_all_api_hub_sync_time_string(time_str: str) -> tuple[int, int]:
-        """解析 all-api-hub 同步时间字符串为 (hour, minute) 元组"""
-        try:
-            if not time_str or ":" not in time_str:
-                return (1, 35)
-            parts = time_str.split(":")
-            hour = int(parts[0])
-            minute = int(parts[1])
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                return (hour, minute)
-            return (1, 35)
-        except (ValueError, IndexError):
-            return (1, 35)
 
     def update_checkin_time(self, time_str: str) -> bool:
         """更新签到任务的执行时间
@@ -209,73 +120,36 @@ class MaintenanceScheduler:
 
         return success
 
-    def update_user_quota_reset_time(self, time_str: str) -> bool:
-        """更新用户配额重置任务的执行时间
-
-        Args:
-            time_str: HH:MM 格式的时间字符串
-
-        Returns:
-            是否成功更新
-        """
-        hour, minute = self._parse_user_quota_reset_time_string(time_str)
-
-        scheduler = get_scheduler()
-        success = scheduler.reschedule_cron_job(
-            self.USER_QUOTA_RESET_JOB_ID,
-            hour=hour,
-            minute=minute,
-        )
-
-        if success:
-            logger.info(f"用户配额重置任务时间已更新为: {hour:02d}:{minute:02d}")
-
-        return success
-
-    def _get_standalone_key_quota_reset_time(self) -> tuple[int, int]:
-        """获取独立密钥额度重置任务的执行时间"""
+    def _get_site_account_sync_time(self) -> tuple[int, int]:
+        """获取站点账号同步任务的执行时间"""
         db = create_session()
         try:
-            time_str = SystemConfigService.get_config(
-                db, "standalone_key_quota_reset_time", "05:00"
-            )
-            return self._parse_user_quota_reset_time_string(time_str)
+            time_str = SystemConfigService.get_config(db, "site_account_sync_time", "01:45")
+            return self._parse_time_string(time_str)
         finally:
             db.close()
 
-    def update_standalone_key_quota_reset_time(self, time_str: str) -> bool:
-        """更新独立密钥额度重置任务的执行时间"""
-        hour, minute = self._parse_user_quota_reset_time_string(time_str)
+    def _get_site_account_checkin_time(self) -> tuple[int, int]:
+        """获取站点账号签到任务的执行时间"""
+        db = create_session()
+        try:
+            time_str = SystemConfigService.get_config(db, "site_account_checkin_time", "02:05")
+            return self._parse_time_string(time_str)
+        finally:
+            db.close()
 
-        scheduler = get_scheduler()
-        success = scheduler.reschedule_cron_job(
-            self.STANDALONE_KEY_QUOTA_RESET_JOB_ID,
-            hour=hour,
-            minute=minute,
-        )
-
-        if success:
-            logger.info(f"独立密钥额度重置任务时间已更新为: {hour:02d}:{minute:02d}")
-
-        return success
-
-    def update_all_api_hub_sync_time(self, time_str: str) -> bool:
-        """更新 all-api-hub 同步任务的执行时间"""
-        hour, minute = self._parse_all_api_hub_sync_time_string(time_str)
-
-        scheduler = get_scheduler()
-        success = scheduler.reschedule_cron_job(
-            self.ALL_API_HUB_SYNC_JOB_ID,
-            hour=hour,
-            minute=minute,
-        )
-        if success:
-            logger.info("all-api-hub 同步任务时间已更新为: {:02d}:{:02d}", hour, minute)
-        return success
+    def _get_site_account_balance_sync_time(self) -> tuple[int, int]:
+        """获取站点账号余额同步任务的执行时间"""
+        db = create_session()
+        try:
+            time_str = SystemConfigService.get_config(db, "site_account_balance_sync_time", "02:20")
+            return self._parse_time_string(time_str)
+        finally:
+            db.close()
 
     def update_site_account_sync_time(self, time_str: str) -> bool:
-        """更新站点账号同步任务时间"""
-        hour, minute = self._parse_all_api_hub_sync_time_string(time_str)
+        """更新站点账号同步任务的执行时间"""
+        hour, minute = self._parse_time_string(time_str)
         scheduler = get_scheduler()
         success = scheduler.reschedule_cron_job(
             self.SITE_ACCOUNT_SYNC_JOB_ID,
@@ -283,11 +157,11 @@ class MaintenanceScheduler:
             minute=minute,
         )
         if success:
-            logger.info("站点账号同步任务时间已更新为: {:02d}:{:02d}", hour, minute)
+            logger.info(f"站点账号同步任务时间已更新为: {hour:02d}:{minute:02d}")
         return success
 
     def update_site_account_checkin_time(self, time_str: str) -> bool:
-        """更新站点账号签到任务时间"""
+        """更新站点账号签到任务的执行时间"""
         hour, minute = self._parse_time_string(time_str)
         scheduler = get_scheduler()
         success = scheduler.reschedule_cron_job(
@@ -296,11 +170,11 @@ class MaintenanceScheduler:
             minute=minute,
         )
         if success:
-            logger.info("站点账号签到任务时间已更新为: {:02d}:{:02d}", hour, minute)
+            logger.info(f"站点账号签到任务时间已更新为: {hour:02d}:{minute:02d}")
         return success
 
     def update_site_account_balance_sync_time(self, time_str: str) -> bool:
-        """更新站点账号余额同步任务时间"""
+        """更新站点账号余额同步任务的执行时间"""
         hour, minute = self._parse_time_string(time_str)
         scheduler = get_scheduler()
         success = scheduler.reschedule_cron_job(
@@ -309,7 +183,7 @@ class MaintenanceScheduler:
             minute=minute,
         )
         if success:
-            logger.info("站点账号余额同步任务时间已更新为: {:02d}:{:02d}", hour, minute)
+            logger.info(f"站点账号余额同步任务时间已更新为: {hour:02d}:{minute:02d}")
         return success
 
     def get_checkin_job_info(self) -> dict | None:
@@ -351,15 +225,6 @@ class MaintenanceScheduler:
             name="统计小时数据聚合",
             timezone="UTC",
         )
-        # 统计聚合补偿任务 - 每 30 分钟检查缺失并回填
-        scheduler.add_interval_job(
-            self._scheduled_stats_aggregation,
-            minutes=30,
-            job_id="stats_aggregation_backfill",
-            name="统计数据聚合补偿",
-            backfill=True,
-        )
-
         # 清理任务 - 凌晨 3 点执行
         scheduler.add_cron_job(
             self._scheduled_cleanup,
@@ -439,17 +304,7 @@ class MaintenanceScheduler:
             name="Provider签到",
         )
 
-        # all-api-hub Cookie 同步任务 - 根据配置时间执行
-        all_api_hub_sync_hour, all_api_hub_sync_minute = self._get_all_api_hub_sync_time()
-        scheduler.add_cron_job(
-            self._scheduled_all_api_hub_sync,
-            hour=all_api_hub_sync_hour,
-            minute=all_api_hub_sync_minute,
-            job_id=self.ALL_API_HUB_SYNC_JOB_ID,
-            name="all-api-hub Cookie同步",
-        )
-
-        # 站点账号同步任务 - 根据配置时间执行
+        # 站点账号同步任务
         site_account_sync_hour, site_account_sync_minute = self._get_site_account_sync_time()
         scheduler.add_cron_job(
             self._scheduled_site_account_sync,
@@ -459,7 +314,7 @@ class MaintenanceScheduler:
             name="站点账号同步",
         )
 
-        # 站点账号签到任务 - 根据配置时间执行
+        # 站点账号签到任务
         site_account_checkin_hour, site_account_checkin_minute = self._get_site_account_checkin_time()
         scheduler.add_cron_job(
             self._scheduled_site_account_checkin,
@@ -469,7 +324,7 @@ class MaintenanceScheduler:
             name="站点账号签到",
         )
 
-        # 站点账号余额同步任务 - 根据配置时间执行
+        # 站点账号余额同步任务
         site_account_balance_hour, site_account_balance_minute = (
             self._get_site_account_balance_sync_time()
         )
@@ -481,28 +336,13 @@ class MaintenanceScheduler:
             name="站点账号余额同步",
         )
 
-        # 用户配额重置任务 - 根据配置时间执行（按周期配置决定是否执行）
-        quota_reset_hour, quota_reset_minute = self._get_user_quota_reset_time()
-        scheduler.add_cron_job(
-            self._scheduled_user_quota_reset,
-            hour=quota_reset_hour,
-            minute=quota_reset_minute,
-            job_id=self.USER_QUOTA_RESET_JOB_ID,
-            name="用户配额自动重置",
-        )
-
-        # 独立密钥额度重置任务 - 根据配置时间执行（按周期配置决定是否执行）
-        sk_reset_hour, sk_reset_minute = self._get_standalone_key_quota_reset_time()
-        scheduler.add_cron_job(
-            self._scheduled_standalone_key_quota_reset,
-            hour=sk_reset_hour,
-            minute=sk_reset_minute,
-            job_id=self.STANDALONE_KEY_QUOTA_RESET_JOB_ID,
-            name="独立密钥额度自动重置",
-        )
-
         # 启动时执行一次初始化任务
-        asyncio.create_task(self._run_startup_tasks())
+        if config.maintenance_startup_tasks_enabled:
+            from src.utils.async_utils import safe_create_task
+
+            safe_create_task(self._run_startup_tasks())
+        else:
+            logger.info("维护调度器启动任务已禁用（MAINTENANCE_STARTUP_TASKS_ENABLED=false）")
 
     async def _run_startup_tasks(self) -> None:
         """启动时执行的初始化任务"""
@@ -519,16 +359,10 @@ class MaintenanceScheduler:
             logger.debug("启动时刷新 Antigravity UA 版本失败（不影响运行）: {}", e)
 
         try:
-            logger.info("启动时执行首次清理任务...")
-            await self._perform_cleanup()
+            logger.info("启动时清理残留的 pending/streaming 请求...")
+            await self._perform_pending_cleanup()
         except Exception as e:
-            logger.exception(f"启动时清理任务执行出错: {e}")
-
-        try:
-            logger.info("启动时检查统计数据...")
-            await self._perform_stats_aggregation(backfill=True)
-        except Exception as e:
-            logger.exception(f"启动时统计聚合任务出错: {e}")
+            logger.exception(f"启动时 pending 清理执行出错: {e}")
 
     async def stop(self) -> Any:
         """停止调度器"""
@@ -595,19 +429,7 @@ class MaintenanceScheduler:
 
     async def _scheduled_provider_checkin(self) -> None:
         """Provider 签到任务（定时调用）"""
-        await self._perform_provider_checkin(trigger_source="scheduled")
-
-    async def _scheduled_user_quota_reset(self) -> None:
-        """用户配额重置任务（定时调用）"""
-        await self._perform_user_quota_reset()
-
-    async def _scheduled_standalone_key_quota_reset(self) -> None:
-        """独立密钥额度重置任务（定时调用）"""
-        await self._perform_standalone_key_quota_reset()
-
-    async def _scheduled_all_api_hub_sync(self) -> None:
-        """all-api-hub Cookie 同步任务（定时调用）"""
-        await self._perform_all_api_hub_sync(trigger_source="scheduled")
+        await self._perform_provider_checkin()
 
     async def _scheduled_site_account_sync(self) -> None:
         """站点账号同步任务（定时调用）"""
@@ -681,40 +503,43 @@ class MaintenanceScheduler:
                         check_start_date, datetime.min.time(), tzinfo=timezone.utc
                     )
 
-                    # 获取 StatsDaily 和 StatsDailyModel 中已有数据的日期集合
-                    existing_daily_dates = set()
-                    existing_model_dates = set()
-                    existing_provider_dates = set()
+                    # 单次查询获取三张统计表中已有数据的日期（UNION ALL 合并）
+                    existing_daily_dates: set[date] = set()
+                    existing_model_dates: set[date] = set()
+                    existing_provider_dates: set[date] = set()
 
-                    daily_stats = (
-                        db.query(StatsDaily.date).filter(StatsDaily.date >= check_start_dt).all()
-                    )
-                    for (stat_date,) in daily_stats:
-                        if stat_date.tzinfo is None:
-                            stat_date = stat_date.replace(tzinfo=timezone.utc)
-                        existing_daily_dates.add(stat_date.date())
-
-                    model_stats = (
-                        db.query(StatsDailyModel.date)
+                    q_daily = db.query(
+                        StatsDaily.date.label("dt"),
+                        literal_column("'daily'").label("src"),
+                    ).filter(StatsDaily.date >= check_start_dt)
+                    q_model = (
+                        db.query(
+                            StatsDailyModel.date.label("dt"),
+                            literal_column("'model'").label("src"),
+                        )
                         .filter(StatsDailyModel.date >= check_start_dt)
                         .distinct()
-                        .all()
                     )
-                    for (stat_date,) in model_stats:
-                        if stat_date.tzinfo is None:
-                            stat_date = stat_date.replace(tzinfo=timezone.utc)
-                        existing_model_dates.add(stat_date.date())
-
-                    provider_stats = (
-                        db.query(StatsDailyProvider.date)
+                    q_provider = (
+                        db.query(
+                            StatsDailyProvider.date.label("dt"),
+                            literal_column("'provider'").label("src"),
+                        )
                         .filter(StatsDailyProvider.date >= check_start_dt)
                         .distinct()
-                        .all()
                     )
-                    for (stat_date,) in provider_stats:
+                    combined = q_daily.union_all(q_model).union_all(q_provider).all()
+
+                    for stat_date, src in combined:
                         if stat_date.tzinfo is None:
                             stat_date = stat_date.replace(tzinfo=timezone.utc)
-                        existing_provider_dates.add(stat_date.date())
+                        d = stat_date.date()
+                        if src == "daily":
+                            existing_daily_dates.add(d)
+                        elif src == "model":
+                            existing_model_dates.add(d)
+                        else:
+                            existing_provider_dates.add(d)
 
                     # 找出需要回填的日期
                     all_dates = set()
@@ -755,6 +580,7 @@ class MaintenanceScheduler:
                                 StatsAggregatorService.aggregate_daily_stats_bundle(
                                     db, current_date_utc, user_ids=user_ids
                                 )
+                                db.expunge_all()
                             except Exception as e:
                                 failed_dates += 1
                                 logger.warning(f"回填日期 {current_date} 失败: {e}")
@@ -830,8 +656,15 @@ class MaintenanceScheduler:
                 timeout_minutes = SystemConfigService.get_config(
                     db, "pending_request_timeout_minutes", 10
                 )
+                # pending 清理涉及 candidate 表关联查询，限制批次大小以控制内存
+                batch_size = min(
+                    max(SystemConfigService.get_config(db, "cleanup_batch_size", 1000), 1),
+                    200,
+                )
                 return UsageService.cleanup_stale_pending_requests(
-                    db, timeout_minutes=timeout_minutes
+                    db,
+                    timeout_minutes=timeout_minutes,
+                    batch_size=batch_size,
                 )
             except Exception as e:
                 logger.exception(f"清理 pending 请求失败: {e}")
@@ -935,83 +768,27 @@ class MaintenanceScheduler:
         finally:
             db.close()
 
-    async def _perform_provider_checkin(
-        self,
-        *,
-        trigger_source: str = "scheduled",
-        ignore_enabled: bool = False,
-    ) -> None:
+    async def _perform_provider_checkin(self) -> None:
         """执行 Provider 签到任务
 
         遍历所有已配置 provider_ops 的 Provider，触发签到。
         签到会在余额查询时一起执行（先签到再查询余额）。
         """
         db = create_session()
-        started_at = datetime.now(timezone.utc)
         try:
-            # 自动任务受配置开关控制；手动触发可忽略该开关
-            if not ignore_enabled and not SystemConfigService.get_config(
-                db, "enable_provider_checkin", True
-            ):
+            # 检查是否启用签到任务
+            if not SystemConfigService.get_config(db, "enable_provider_checkin", True):
                 logger.info("Provider 签到已禁用，跳过签到任务")
                 return
 
             # 获取所有已配置 provider_ops 的活跃 Provider（只查询需要的字段）
             providers = (
-                db.query(Provider.id, Provider.name, Provider.website, Provider.config)
-                .filter(Provider.is_active.is_(True))
-                .all()
+                db.query(Provider.id, Provider.config).filter(Provider.is_active.is_(True)).all()
             )
-            configured_providers = [p for p in providers if p.config and p.config.get("provider_ops")]
-            provider_ids = [
-                p.id
-                for p in configured_providers
-                if p.config
-                and p.config.get("provider_ops")
-                and self._is_provider_checkin_enabled(p.config)
-            ]
-            excluded_provider_items = [
-                {
-                    "provider_id": str(p.id),
-                    "provider_name": str(p.name or ""),
-                    "provider_domain": AllApiHubSyncService._normalize_domain(getattr(p, "website", None)),
-                    "status": "skipped",
-                    "message": "签到开关关闭，已跳过",
-                    "balance_total": None,
-                    "balance_currency": None,
-                }
-                for p in configured_providers
-                if not self._is_provider_checkin_enabled(p.config)
-            ]
-            provider_meta_by_id: dict[str, dict[str, str]] = {
-                str(p.id): {
-                    "name": str(p.name or ""),
-                    "domain": AllApiHubSyncService._normalize_domain(getattr(p, "website", None)),
-                }
-                for p in providers
-            }
+            provider_ids = [p.id for p in providers if p.config and p.config.get("provider_ops")]
 
-            if not configured_providers:
-                logger.info("无已配置的 Provider，跳过签到任务")
-                return
             if not provider_ids:
-                logger.info("所有已配置 Provider 均被签到开关关闭，记录跳过结果")
-                logs_db = create_session()
-                try:
-                    SiteManagementLogService.record_checkin_run(
-                        db=logs_db,
-                        trigger_source=trigger_source,
-                        status="success",
-                        total_providers=len(configured_providers),
-                        success_count=0,
-                        failed_count=0,
-                        skipped_count=len(excluded_provider_items),
-                        items=[CheckinItemLog(**item) for item in excluded_provider_items],
-                        started_at=started_at,
-                        finished_at=datetime.now(timezone.utc),
-                    )
-                finally:
-                    logs_db.close()
+                logger.info("无已配置的 Provider，跳过签到任务")
                 return
 
             logger.info(f"开始执行 Provider 签到，共 {len(provider_ids)} 个...")
@@ -1036,70 +813,30 @@ class MaintenanceScheduler:
             concurrency = 3  # 签到任务并发数
             semaphore = asyncio.Semaphore(concurrency)
 
-            async def _checkin_provider(provider_id: str) -> tuple[str, str, str, float | None, str | None]:
+            async def _checkin_provider(provider_id: str) -> tuple[str, bool, str]:
                 """执行单个 Provider 的签到"""
                 async with semaphore:
                     task_db = create_session()
                     try:
                         service = ProviderOpsService(task_db)
-                        provider_ops_cfg = service.get_config(provider_id)
-                        if provider_ops_cfg and provider_ops_cfg.architecture_id == "new_api":
-                            # new_api 支持 checkin_only 模式：只执行签到，不触发余额查询。
-                            result = await service.execute_action(
-                                provider_id,
-                                ProviderActionType.QUERY_BALANCE,
-                                {"checkin_only": True},
-                            )
-                            payload = result.data if isinstance(result.data, dict) else {}
-                            checkin_success = payload.get("checkin_success")
-                            checkin_message = result.message or ""
-                            if result.status == ActionStatus.SUCCESS:
-                                if checkin_success is True:
-                                    return provider_id, "success", checkin_message, None, None
-                                return provider_id, "skipped", checkin_message or "未执行签到", None, None
-                            return provider_id, "failed", checkin_message or "签到失败", None, None
-
-                        # 旧架构：仍通过余额查询流程触发签到
+                        # 触发余额查询（会先执行签到）
                         result = await service.query_balance(provider_id)
                         # 检查签到结果
                         checkin_success = None
                         checkin_message = ""
-                        balance_total = None
-                        balance_currency = None
-                        if result.data:
-                            balance_total = getattr(result.data, "total_available", None)
-                            balance_currency = getattr(result.data, "currency", None)
                         if result.data and hasattr(result.data, "extra") and result.data.extra:
                             checkin_success = result.data.extra.get("checkin_success")
                             checkin_message = result.data.extra.get("checkin_message", "")
                         if checkin_success is True:
-                            return (
-                                provider_id,
-                                "success",
-                                checkin_message,
-                                balance_total,
-                                balance_currency,
-                            )
+                            return provider_id, True, checkin_message
                         elif checkin_success is False:
-                            return (
-                                provider_id,
-                                "failed",
-                                checkin_message,
-                                balance_total,
-                                balance_currency,
-                            )
+                            return provider_id, False, checkin_message
                         else:
                             # None 表示未执行签到（可能没配置 Cookie）
-                            return (
-                                provider_id,
-                                "skipped",
-                                "未执行签到",
-                                balance_total,
-                                balance_currency,
-                            )
+                            return provider_id, False, "未执行签到"
                     except Exception as e:
                         logger.warning(f"Provider {provider_id} 签到失败: {e}")
-                        return provider_id, "failed", str(e), None, None
+                        return provider_id, False, str(e)
                     finally:
                         try:
                             task_db.close()
@@ -1111,382 +848,21 @@ class MaintenanceScheduler:
             results = await asyncio.gather(*tasks)
 
             # 统计结果
-            success_count = sum(1 for _, status, _, _, _ in results if status == "success")
-            failed_count = sum(1 for _, status, _, _, _ in results if status == "failed")
-            skipped_count = sum(1 for _, status, _, _, _ in results if status == "skipped")
-            skipped_count += len(excluded_provider_items)
-            logger.info(
-                "Provider 签到完成: success={}/{}, failed={}, skipped={}",
-                success_count,
-                len(provider_ids),
-                failed_count,
-                skipped_count,
-            )
+            success_count = sum(1 for _, success, _ in results if success)
+            logger.info(f"Provider 签到完成: {success_count}/{len(provider_ids)} 成功")
 
             # 记录详细结果
-            item_logs = []
-            for provider_id, status, message, balance_total, balance_currency in results:
-                if status == "success":
+            for provider_id, success, message in results:
+                if success:
                     logger.debug(f"  - {provider_id}: 签到成功 - {message}")
                 elif message != "未执行签到":
                     logger.debug(f"  - {provider_id}: 签到失败 - {message}")
-                meta = provider_meta_by_id.get(provider_id) or {"name": "", "domain": ""}
-                item_logs.append(
-                    {
-                        "provider_id": provider_id,
-                        "provider_name": meta["name"],
-                        "provider_domain": meta["domain"],
-                        "status": status,
-                        "message": message,
-                        "balance_total": balance_total,
-                        "balance_currency": balance_currency,
-                    }
-                )
-            item_logs.extend(excluded_provider_items)
-
-            logs_db = create_session()
-            try:
-                SiteManagementLogService.record_checkin_run(
-                    db=logs_db,
-                    trigger_source=trigger_source,
-                    status="success",
-                    total_providers=len(configured_providers),
-                    success_count=success_count,
-                    failed_count=failed_count,
-                    skipped_count=skipped_count,
-                    items=[CheckinItemLog(**item) for item in item_logs],
-                    started_at=started_at,
-                    finished_at=datetime.now(timezone.utc),
-                )
-            finally:
-                logs_db.close()
 
         except Exception as e:
             logger.exception(f"Provider 签到任务执行失败: {e}")
-            try:
-                logs_db = create_session()
-                try:
-                    SiteManagementLogService.record_checkin_run(
-                        db=logs_db,
-                        trigger_source=trigger_source,
-                        status="failed",
-                        total_providers=0,
-                        success_count=0,
-                        failed_count=0,
-                        skipped_count=0,
-                        items=[],
-                        error_message=str(e),
-                        started_at=started_at,
-                        finished_at=datetime.now(timezone.utc),
-                    )
-                finally:
-                    logs_db.close()
-            except Exception:
-                pass
         finally:
             if db is not None:
                 db.close()
-
-    @staticmethod
-    def _is_provider_checkin_enabled(provider_config: Any) -> bool:
-        """判断 Provider 是否启用签到任务（默认启用）。"""
-        if not isinstance(provider_config, dict):
-            return True
-        provider_ops = provider_config.get("provider_ops")
-        if not isinstance(provider_ops, dict):
-            return True
-        schedule = provider_ops.get("schedule")
-        if not isinstance(schedule, dict):
-            return True
-        value = schedule.get("checkin_enabled")
-        if isinstance(value, bool):
-            return value
-        return True
-
-    async def _perform_user_quota_reset(self) -> None:
-        """执行用户配额自动重置任务
-
-        适用范围：
-        - 未删除（is_deleted=false）
-        - 仅对 quota_usd != NULL 的用户生效
-        """
-        db = create_session()
-        try:
-            # 检查是否启用用户配额重置
-            if not SystemConfigService.get_config(db, "enable_user_quota_reset", False):
-                logger.info("用户配额自动重置已禁用，跳过任务")
-                return
-
-            # 重置周期（天数），不限制上限
-            interval_value = SystemConfigService.get_config(db, "user_quota_reset_interval_days", 1)
-            try:
-                interval_days = int(interval_value)
-            except Exception:
-                interval_days = 1
-            if interval_days < 1:
-                interval_days = 1
-
-            # 滚动计算：根据上次执行日（APP_TIMEZONE）判断是否到期
-            last_reset_at = SystemConfigService.get_config(db, "user_quota_last_reset_at")
-
-            should_run = True
-            if last_reset_at:
-                last_dt: datetime | None = None
-                try:
-                    if isinstance(last_reset_at, str):
-                        last_dt = datetime.fromisoformat(last_reset_at)
-                except Exception:
-                    last_dt = None
-
-                if last_dt is None:
-                    logger.warning("user_quota_last_reset_at 格式无效，视为需要执行一次")
-                else:
-                    if last_dt.tzinfo is None:
-                        last_dt = last_dt.replace(tzinfo=timezone.utc)
-
-                    from zoneinfo import ZoneInfo
-
-                    from src.services.system.scheduler import APP_TIMEZONE
-
-                    tz = ZoneInfo(APP_TIMEZONE)
-                    now_local = datetime.now(tz)
-                    last_local_date = last_dt.astimezone(tz).date()
-                    days_since_reset = (now_local.date() - last_local_date).days
-
-                    if days_since_reset < 0:
-                        logger.warning("user_quota_last_reset_at 在未来，跳过本次用户配额自动重置")
-                        should_run = False
-                    elif days_since_reset < interval_days:
-                        logger.info(
-                            f"用户配额自动重置未到周期，跳过任务（{days_since_reset}/{interval_days}天）"
-                        )
-                        should_run = False
-
-            if not should_run:
-                return
-
-            from src.models.database import User as DBUser
-
-            now_utc = datetime.now(timezone.utc)
-            reset_count = (
-                db.query(DBUser)
-                .filter(
-                    DBUser.is_deleted.is_(False),
-                    DBUser.quota_usd.isnot(None),
-                )
-                .update(
-                    {
-                        DBUser.used_usd: 0.0,
-                        DBUser.updated_at: now_utc,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            db.commit()
-
-            # 记录 last_reset_at（成功执行后更新，滚动计算用）
-            SystemConfigService.set_config(
-                db,
-                "user_quota_last_reset_at",
-                now_utc.isoformat(),
-                "用户配额自动重置的上次执行时间（UTC，内部使用）",
-            )
-
-            logger.info(
-                f"用户配额自动重置完成: interval_days={interval_days}, 重置用户数={reset_count}"
-            )
-
-        except Exception as e:
-            logger.exception(f"用户配额自动重置任务执行失败: {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        finally:
-            db.close()
-
-    async def _perform_standalone_key_quota_reset(self) -> None:
-        """执行独立密钥额度自动重置任务
-
-        适用范围：
-        - is_standalone=True 的密钥
-        - current_balance_usd != NULL（有限额的密钥）
-        - 支持 all（全部）和 selected（指定密钥）两种模式
-        """
-        db = create_session()
-        try:
-            if not SystemConfigService.get_config(db, "enable_standalone_key_quota_reset", False):
-                logger.info("独立密钥额度自动重置已禁用，跳过任务")
-                return
-
-            # 重置周期
-            interval_value = SystemConfigService.get_config(
-                db, "standalone_key_quota_reset_interval_days", 1
-            )
-            try:
-                interval_days = int(interval_value)
-            except Exception:
-                interval_days = 1
-            if interval_days < 1:
-                interval_days = 1
-
-            # 滚动计算
-            last_reset_at = SystemConfigService.get_config(db, "standalone_key_quota_last_reset_at")
-
-            should_run = True
-            if last_reset_at:
-                last_dt: datetime | None = None
-                try:
-                    if isinstance(last_reset_at, str):
-                        last_dt = datetime.fromisoformat(last_reset_at)
-                except Exception:
-                    last_dt = None
-
-                if last_dt is None:
-                    logger.warning("standalone_key_quota_last_reset_at 格式无效，视为需要执行一次")
-                else:
-                    if last_dt.tzinfo is None:
-                        last_dt = last_dt.replace(tzinfo=timezone.utc)
-
-                    from zoneinfo import ZoneInfo
-
-                    from src.services.system.scheduler import APP_TIMEZONE
-
-                    tz = ZoneInfo(APP_TIMEZONE)
-                    now_local = datetime.now(tz)
-                    last_local_date = last_dt.astimezone(tz).date()
-                    days_since_reset = (now_local.date() - last_local_date).days
-
-                    if days_since_reset < 0:
-                        logger.warning("standalone_key_quota_last_reset_at 在未来，跳过本次重置")
-                        should_run = False
-                    elif days_since_reset < interval_days:
-                        logger.info(
-                            f"独立密钥额度自动重置未到周期，跳过任务"
-                            f"（{days_since_reset}/{interval_days}天）"
-                        )
-                        should_run = False
-
-            if not should_run:
-                return
-
-            # 确定重置范围
-            reset_mode = SystemConfigService.get_config(
-                db, "standalone_key_quota_reset_mode", "all"
-            )
-
-            now_utc = datetime.now(timezone.utc)
-            base_filter = [
-                ApiKey.is_standalone.is_(True),
-                ApiKey.current_balance_usd.isnot(None),
-            ]
-
-            if reset_mode == "selected":
-                key_ids = SystemConfigService.get_config(
-                    db, "standalone_key_quota_reset_key_ids", []
-                )
-                if not key_ids:
-                    logger.info("独立密钥额度重置模式为 selected 但未选择任何密钥，跳过")
-                    return
-                base_filter.append(ApiKey.id.in_(key_ids))
-
-            reset_count = (
-                db.query(ApiKey)
-                .filter(*base_filter)
-                .update(
-                    {
-                        ApiKey.balance_used_usd: 0.0,
-                        ApiKey.updated_at: now_utc,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            db.commit()
-
-            SystemConfigService.set_config(
-                db,
-                "standalone_key_quota_last_reset_at",
-                now_utc.isoformat(),
-                "独立密钥额度自动重置的上次执行时间（UTC，内部使用）",
-            )
-
-            logger.info(
-                f"独立密钥额度自动重置完成: mode={reset_mode}, "
-                f"interval_days={interval_days}, 重置密钥数={reset_count}"
-            )
-
-        except Exception as e:
-            logger.exception(f"独立密钥额度自动重置任务执行失败: {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        finally:
-            db.close()
-
-    async def _perform_all_api_hub_sync(self, trigger_source: str = "scheduled") -> None:
-        """执行 all-api-hub WebDAV 同步任务"""
-        db = create_session()
-        started_at = datetime.now(timezone.utc)
-        try:
-            if not SystemConfigService.get_config(db, "enable_all_api_hub_sync", False):
-                logger.info("all-api-hub 同步任务未启用，跳过")
-                return
-
-            url = SystemConfigService.get_config(db, "all_api_hub_webdav_url")
-            username = SystemConfigService.get_config(db, "all_api_hub_webdav_username")
-            password_raw = SystemConfigService.get_config(db, "all_api_hub_webdav_password")
-            auto_create_provider_ops = SystemConfigService.get_config(
-                db,
-                "enable_all_api_hub_auto_create_provider_ops",
-                True,
-            )
-            try:
-                password = SiteManagementLogService.resolve_system_password(password_raw)
-            except Exception:
-                logger.warning("all-api-hub WebDAV 密码解密失败，请重新保存配置")
-                return
-            if not url or not username or not password:
-                logger.warning("all-api-hub 同步配置不完整，需配置 url/username/password")
-                return
-
-            result = await AllApiHubSyncService().sync_from_webdav(
-                db,
-                url=url,
-                username=username,
-                password=password,
-                dry_run=False,
-                auto_create_provider_ops=bool(auto_create_provider_ops),
-            )
-            SiteManagementLogService.record_sync_run(
-                db=db,
-                trigger_source=trigger_source,
-                status="success",
-                result=result,
-                started_at=started_at,
-                finished_at=datetime.now(timezone.utc),
-            )
-            logger.info(
-                "all-api-hub 同步完成: accounts={}, matched={}, updated={}",
-                result.total_accounts,
-                result.matched_providers,
-                result.updated_providers,
-            )
-        except Exception as e:
-            logger.exception("all-api-hub 同步任务执行失败: {}", e)
-            try:
-                SiteManagementLogService.record_sync_run(
-                    db=db,
-                    trigger_source=trigger_source,
-                    status="failed",
-                    error_message=str(e),
-                    started_at=started_at,
-                    finished_at=datetime.now(timezone.utc),
-                )
-            except Exception:
-                pass
-        finally:
-            db.close()
 
     async def _perform_site_account_sync(self) -> None:
         """执行站点账号同步任务（快照缓存 + 策略应用）。"""
@@ -1509,7 +885,9 @@ class MaintenanceScheduler:
                 logger.warning("站点账号同步密码解密失败，请重新保存配置")
                 return
 
-            cache_ttl = int(SystemConfigService.get_config(db, "site_account_snapshot_cache_ttl_seconds", 300))
+            cache_ttl = int(
+                SystemConfigService.get_config(db, "site_account_snapshot_cache_ttl_seconds", 300)
+            )
             apply_policy = str(
                 SystemConfigService.get_config(
                     db,
@@ -1554,7 +932,8 @@ class MaintenanceScheduler:
                 )
                 provider_updated = provider_result.updated_providers
             logger.info(
-                "站点账号同步完成: total={}, matched={}, unmatched={}, created={}, updated={}, skipped={}, from_cache={}, provider_sync={}, provider_updated={}",
+                "站点账号同步完成: total={}, matched={}, unmatched={}, created={}, updated={}, "
+                "skipped={}, from_cache={}, provider_sync={}, provider_updated={}",
                 result.total_accounts,
                 result.matched_accounts,
                 result.unmatched_accounts,
@@ -1872,7 +1251,7 @@ class MaintenanceScheduler:
 
         total_compressed = 0
         no_progress_count = 0
-        processed_ids: set = set()
+        memory_safe_batch_size = max(1, min(batch_size, 100))
 
         while True:
             batch_db = create_session()
@@ -1892,7 +1271,7 @@ class MaintenanceScheduler:
                         | (Usage.provider_request_body.isnot(None))
                         | (Usage.client_response_body.isnot(None))
                     )
-                    .limit(batch_size)
+                    .limit(memory_safe_batch_size)
                     .all()
                 )
 
@@ -1926,15 +1305,6 @@ class MaintenanceScheduler:
                     batch_db.commit()
                     continue
 
-                current_ids = {r.id for r in valid_records}
-                repeated_ids = current_ids & processed_ids
-                if repeated_ids:
-                    logger.error(
-                        f"检测到重复处理的记录 ID: {list(repeated_ids)[:5]}...，"
-                        "说明数据库更新未生效，终止循环"
-                    )
-                    break
-
                 batch_success = 0
 
                 for r in valid_records:
@@ -1964,10 +1334,10 @@ class MaintenanceScheduler:
                                     else None
                                 ),
                             )
+                            .execution_options(synchronize_session=False)
                         )
                         if result.rowcount > 0:
                             batch_success += 1
-                            processed_ids.add(r.id)
                     except Exception as e:
                         logger.warning(f"压缩记录 {r.id} 失败: {e}")
                         continue

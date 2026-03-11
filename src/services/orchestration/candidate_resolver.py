@@ -4,6 +4,7 @@
 负责获取和排序可用的 Provider/Endpoint/Key 组合
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -377,6 +378,28 @@ class CandidateResolver:
             )
 
         return candidate_record_map
+
+    async def create_candidate_records_async(
+        self,
+        all_candidates: list[ProviderCandidate],
+        request_id: str | None,
+        user_id: str | None,
+        user_api_key: ApiKey | None,
+        required_capabilities: dict[str, bool] | None = None,
+        *,
+        expand_retries: bool = True,
+    ) -> dict[tuple[int, int], str]:
+        """异步版本的 create_candidate_records，将同步 DB 操作放到线程池执行，
+        避免阻塞 asyncio 事件循环。"""
+        return await asyncio.to_thread(
+            self.create_candidate_records,
+            all_candidates,
+            request_id,
+            user_id,
+            user_api_key,
+            required_capabilities,
+            expand_retries=expand_retries,
+        )
 
     def get_active_candidates(
         self,

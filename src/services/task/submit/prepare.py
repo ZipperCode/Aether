@@ -87,6 +87,11 @@ class AsyncSubmitPreparationService:
                 last_status_code=None,
             )
 
+        # 号池排序涉及大量 Redis 操作，提前释放 DB 连接避免连接池压力
+        from src.services.scheduling.utils import release_db_connection_before_await
+
+        release_db_connection_before_await(self.db)
+
         # Account Pool: keep internal key failover order/skip behavior
         # consistent with the SYNC path.
         candidates, _pool_traces = await apply_pool_reorder(
@@ -103,7 +108,7 @@ class AsyncSubmitPreparationService:
         record_map: dict[tuple[int, int], str] = {}
         if request_id:
             try:
-                record_map = resolver.create_candidate_records(
+                record_map = await resolver.create_candidate_records_async(
                     all_candidates=candidates,
                     request_id=request_id,
                     user_id=str(user_api_key.user_id),

@@ -161,12 +161,17 @@ class SyncTaskExecutionService:
             request_body=request_body,
         )
 
+        # 号池排序涉及大量 Redis 操作，提前释放 DB 连接避免连接池压力
+        from src.services.scheduling.utils import release_db_connection_before_await
+
+        release_db_connection_before_await(self.db)
+
         # Account Pool: reorder candidates for claude_code providers.
         all_candidates, pool_traces = await self._pool_ops.apply_pool_reorder(
             all_candidates, request_body=request_body
         )
 
-        candidate_record_map = candidate_resolver.create_candidate_records(
+        candidate_record_map = await candidate_resolver.create_candidate_records_async(
             all_candidates=all_candidates,
             request_id=request_id,
             user_id=user_id,

@@ -14,6 +14,7 @@ import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, selectinload
 
 from src.core.api_format.conversion.compatibility import is_format_compatible
@@ -35,6 +36,9 @@ from src.models.database import (
 )
 from src.services.health.monitor import health_monitor
 from src.services.provider.format import normalize_endpoint_signature
+from src.services.provider.pool.account_state import (
+    resolve_pool_account_state as _resolve_pool_account_state,
+)
 from src.services.scheduling.quota_skipper import is_key_quota_exhausted
 from src.services.scheduling.utils import release_db_connection_before_await
 
@@ -49,7 +53,7 @@ from src.services.cache.model_cache import ModelCacheService
 
 def _get_pool_config(provider: Provider) -> "PoolConfig | None":
     """Return parsed PoolConfig if the provider has pool enabled, else None."""
-    from src.services.provider.pool.config import PoolConfig, parse_pool_config
+    from src.services.provider.pool.config import parse_pool_config
 
     return parse_pool_config(getattr(provider, "config", None))
 
@@ -76,11 +80,36 @@ class CandidateBuilder:
     def __init__(self, candidate_sorter: CandidateSorterProtocol) -> None:
         self._sorter = candidate_sorter
 
+    def _query_provider_refs(
+        self,
+        db: Session,
+        provider_offset: int = 0,
+        provider_limit: int | None = None,
+    ) -> list[tuple[str, str]]:
+        """仅查询当前分页内 Provider 的轻量引用信息。"""
+        provider_query = (
+            db.query(Provider.id, Provider.name)
+            .filter(Provider.is_active.is_(True))
+            .order_by(Provider.provider_priority.asc())
+        )
+
+        if provider_offset:
+            provider_query = provider_query.offset(provider_offset)
+        if provider_limit:
+            provider_query = provider_query.limit(provider_limit)
+
+        return [
+            (str(provider_id), str(provider_name))
+            for provider_id, provider_name in provider_query.all()
+        ]
+
     def _query_providers(
         self,
         db: Session,
         provider_offset: int = 0,
         provider_limit: int | None = None,
+        allowed_providers: list[str] | None = None,
+        provider_ids: list[str] | None = None,
     ) -> list[Provider]:
         """
         查询活跃的 Providers（带预加载）
@@ -97,8 +126,16 @@ class CandidateBuilder:
             db.query(Provider)
             .options(
                 # 预加载 Provider 级别的 api_keys
-                # defer 排除仅后台管理/模型获取用的冷字段，热路径字段全部加载
+                # defer 排除调度热路径不需要的大 JSON 字段，减少号池场景内存占用
+                # - 凭证类: api_key/auth_config 在执行阶段由 get_provider_auth() 按需加载
+                # - adjustment_history/utilization_samples: 仅 AdaptiveReservationManager
+                #   在并发检查时读取单个 key，号池/非号池均可 lazy load
+                # - upstream_metadata: 号池模式在 _build_candidates 中预计算账号封禁
+                #   状态并挂到 key._pool_account_state，排序阶段不再需要原始 JSON；
+                #   非号池模式 key 少，lazy load 可忽略
                 selectinload(Provider.api_keys)
+                .defer(ProviderAPIKey.api_key)
+                .defer(ProviderAPIKey.auth_config)
                 .defer(ProviderAPIKey.note)
                 .defer(ProviderAPIKey.last_error_msg)
                 .defer(ProviderAPIKey.auto_fetch_models)
@@ -108,7 +145,10 @@ class CandidateBuilder:
                 .defer(ProviderAPIKey.last_models_fetch_at)
                 .defer(ProviderAPIKey.last_models_fetch_error)
                 .defer(ProviderAPIKey.max_probe_interval_minutes)
-                .defer(ProviderAPIKey.expires_at),
+                .defer(ProviderAPIKey.expires_at)
+                .defer(ProviderAPIKey.adjustment_history)
+                .defer(ProviderAPIKey.utilization_samples)
+                .defer(ProviderAPIKey.upstream_metadata),
                 # 预加载 endpoints（用于按 api_format 选择请求配置）
                 selectinload(Provider.endpoints),
                 # 同时加载 models 和 global_model 关系
@@ -118,12 +158,30 @@ class CandidateBuilder:
             .order_by(Provider.provider_priority.asc())
         )
 
-        if provider_offset:
+        if allowed_providers:
+            allowed_values = [value for value in allowed_providers if value]
+            if allowed_values:
+                provider_query = provider_query.filter(
+                    or_(Provider.id.in_(allowed_values), Provider.name.in_(allowed_values))
+                )
+
+        if provider_ids is not None:
+            if not provider_ids:
+                return []
+            provider_query = provider_query.filter(Provider.id.in_(provider_ids))
+
+        if provider_ids is None and provider_offset:
             provider_query = provider_query.offset(provider_offset)
-        if provider_limit:
+        if provider_ids is None and provider_limit:
             provider_query = provider_query.limit(provider_limit)
 
-        return provider_query.all()
+        providers = provider_query.all()
+        if provider_ids is None:
+            return providers
+
+        order_map = {provider_id: index for index, provider_id in enumerate(provider_ids)}
+        providers.sort(key=lambda provider: order_map.get(str(provider.id), len(order_map)))
+        return providers
 
     async def _check_model_support(
         self,
@@ -563,36 +621,34 @@ class CandidateBuilder:
                 )
 
                 if pool_cfg is not None:
-                    # 号池 Provider 仅构建一个 PoolCandidate，内部 key 选择延迟到执行阶段。
-                    pool_keys: list[ProviderAPIKey] = []
-                    pool_miss_counts: list[int] = []
-                    pool_mapping: dict[str, str | None] = {}
-                    for key in keys_to_check:
-                        is_available, _key_skip_reason, mapping_matched_model = (
-                            self._check_key_availability(
-                                key,
-                                endpoint_format_str,
-                                model_name,
-                                capability_requirements,
-                                model_mappings=model_mappings,
-                                candidate_models=provider_model_names,
-                                provider_type=getattr(provider, "provider_type", None),
-                            )
-                        )
-                        if not is_available:
-                            continue
+                    # 号池优化：跳过逐 key 的 _check_key_availability 检查，
+                    # 直接收集全部 active key，将检查推迟到 PoolManager 排序后分页执行。
 
-                        pool_keys.append(key)
-                        pool_miss_counts.append(
-                            compute_capability_score(
-                                key.capabilities or {},
-                                capability_requirements,
-                            )
-                        )
-                        pool_mapping[str(key.id)] = mapping_matched_model
+                    pool_keys = list(keys_to_check)
 
                     if not pool_keys:
                         continue
+
+                    # 在释放 DB 连接前预计算账号封禁状态并挂到 Key 对象上。
+                    # upstream_metadata 是 deferred 字段，逐条 lazy load 会产生 N+1 查询；
+                    # 这里集中触发后，PoolManager 排序时直接读取 _pool_account_state 即可。
+                    provider_type_str = (
+                        str(getattr(provider, "provider_type", "") or "").strip().lower() or None
+                    )
+                    for pk in pool_keys:
+                        setattr(
+                            pk,
+                            "_pool_account_state",
+                            _resolve_pool_account_state(
+                                provider_type=provider_type_str,
+                                upstream_metadata=getattr(pk, "upstream_metadata", None),
+                                oauth_invalid_reason=getattr(pk, "oauth_invalid_reason", None),
+                            ),
+                        )
+
+                    # 释放 DB 连接，因为后续的 PoolManager 排序涉及大量 Redis 操作，
+                    # 避免在 Redis I/O 期间长时间占用 DB 连接池。
+                    release_db_connection_before_await(db)
 
                     provider_priority_raw = getattr(provider, "provider_priority", None)
                     try:
@@ -619,20 +675,21 @@ class CandidateBuilder:
                         pool_keys=pool_keys,
                         pool_config=pool_cfg,
                         pool_priority=pool_priority,
-                        mapping_matched_model=pool_mapping.get(str(pool_keys[0].id)),
                         needs_conversion=needs_conversion,
                         provider_api_format=str(endpoint_format_str or ""),
                         output_limit=output_limit,
-                        capability_miss_count=min(pool_miss_counts) if pool_miss_counts else 0,
+                        capability_miss_count=0,
                     )
 
-                    # 在 key 对象上附加映射结果，供 PoolCandidate 运行时切 key 后同步模型名。
-                    for pool_key in pool_keys:
-                        setattr(
-                            pool_key,
-                            "_pool_mapping_matched_model",
-                            pool_mapping.get(str(pool_key.id)),
-                        )
+                    # 打包延迟检查参数，供 PoolManager 排序后分页调用
+                    pool_candidate._deferred_check_params = {
+                        "endpoint_format": endpoint_format_str,
+                        "model_name": model_name,
+                        "capability_requirements": capability_requirements,
+                        "model_mappings": model_mappings,
+                        "candidate_models": provider_model_names,
+                        "provider_type": getattr(provider, "provider_type", None),
+                    }
 
                     if needs_conversion:
                         convertible_candidates.append(pool_candidate)

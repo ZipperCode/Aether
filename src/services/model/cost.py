@@ -4,8 +4,8 @@
 支持固定价格、按次计费和阶梯计费三种模式。
 
 计费策略：
-- 不同 API format 可以有不同的计费逻辑
-- 通过 PricingStrategy 抽象，支持自定义总输入上下文计算、缓存 TTL 差异化等
+- 价格来源仍由 ModelCostService 解析
+- 格式相关口径（计费模板、总输入上下文）统一由 core.api_format.capabilities 提供
 """
 
 from __future__ import annotations
@@ -14,8 +14,13 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
+from src.core.api_format.capabilities import (
+    compute_total_input_context_for_api_format,
+    resolve_billing_template_for_api_format,
+)
 from src.core.logger import logger
 from src.models.database import GlobalModel, Model, Provider
+from src.services.billing import calculate_request_cost
 
 ProviderRef = str | Provider | None
 
@@ -50,6 +55,7 @@ class ModelCostService:
     _price_cache: dict[str, dict[str, float]] = {}
     _cache_price_cache: dict[str, dict[str, float]] = {}
     _tiered_pricing_cache: dict[str, dict | None] = {}
+    _MAX_CACHE_SIZE: int = 500  # 每层缓存上限，防止无界增长
 
     def __init__(self, db: Session):
         self.db = db
@@ -195,6 +201,7 @@ class ModelCostService:
                             "source": "global",
                         }
 
+        self._evict_if_full(self._tiered_pricing_cache)
         self._tiered_pricing_cache[cache_key] = result
         return result
 
@@ -253,6 +260,7 @@ class ModelCostService:
                             "source": "global",
                         }
 
+        self._evict_if_full(self._tiered_pricing_cache)
         self._tiered_pricing_cache[cache_key] = result
         return result.get("pricing") if result else None
 
@@ -354,6 +362,7 @@ class ModelCostService:
                     f"未找到模型价格配置: {provider_name}/{model}，请在 GlobalModel 中配置价格"
                 )
 
+        self._evict_if_full(self._price_cache)
         self._price_cache[cache_key] = {"input": input_price, "output": output_price}
         return input_price, output_price
 
@@ -435,6 +444,7 @@ class ModelCostService:
                     model,
                 )
 
+        self._evict_if_full(self._price_cache)
         self._price_cache[cache_key] = {"input": input_price, "output": output_price}
         return input_price, output_price
 
@@ -516,6 +526,7 @@ class ModelCostService:
             if cache_read_price is None:
                 cache_read_price = input_price * 0.1
 
+        self._evict_if_full(self._cache_price_cache)
         self._cache_price_cache[cache_key] = {
             "creation": cache_creation_price,
             "read": cache_read_price,
@@ -682,6 +693,7 @@ class ModelCostService:
         if cache_read_price is None:
             cache_read_price = input_price * 0.1
 
+        self._evict_if_full(self._cache_price_cache)
         self._cache_price_cache[cache_key] = {
             "creation": cache_creation_price,
             "read": cache_read_price,
@@ -868,6 +880,12 @@ class ModelCostService:
         cls._cache_price_cache.clear()
         cls._tiered_pricing_cache.clear()
 
+    @classmethod
+    def _evict_if_full(cls, cache: dict) -> None:
+        """缓存超出上限时清空，防止无界增长。"""
+        if len(cache) >= cls._MAX_CACHE_SIZE:
+            cache.clear()
+
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
@@ -902,7 +920,7 @@ class ModelCostService:
         """
         使用计费策略计算成本（异步版本）
 
-        根据 api_format 选择对应的 Adapter 计费逻辑，支持阶梯计费和 TTL 差异化。
+        根据 core.api_format.capabilities 解析计费模板与总输入上下文，支持阶梯计费和 TTL 差异化。
 
         Args:
             provider: Provider 对象或提供商名称
@@ -911,7 +929,7 @@ class ModelCostService:
             output_tokens: 输出 token 数
             cache_creation_input_tokens: 缓存创建 token 数
             cache_read_input_tokens: 缓存读取 token 数
-            api_format: API 格式（用于选择计费策略）
+            api_format: API 格式（用于解析格式相关计费口径）
             cache_ttl_minutes: 缓存时长（分钟），用于 TTL 差异化定价
 
         Returns:
@@ -926,21 +944,17 @@ class ModelCostService:
         request_price = await self.get_request_price_async(provider, model)
         tiered_pricing = await self.get_tiered_pricing_async(provider, model)
 
-        # 获取对应 API 格式的 Adapter 实例来计算成本
-        # 优先检查 Chat Adapter，然后检查 CLI Adapter
-        # TODO(arch): 引入 adapter 能力注册表，消除 services->api 依赖
-        from src.api.handlers.base.chat_adapter_base import get_adapter_instance
-        from src.api.handlers.base.cli_adapter_base import get_cli_adapter_instance
+        billing_template = resolve_billing_template_for_api_format(api_format) or ""
 
-        adapter = None
-        if api_format:
-            adapter = get_adapter_instance(api_format)
-            if adapter is None:
-                adapter = get_cli_adapter_instance(api_format)
+        if billing_template:
+            total_input_context = compute_total_input_context_for_api_format(
+                api_format,
+                input_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            )
 
-        if adapter:
-            # 使用 Adapter 的计费方法
-            result = adapter.compute_cost(
+            result = calculate_request_cost(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
@@ -952,6 +966,8 @@ class ModelCostService:
                 price_per_request=request_price,
                 tiered_pricing=tiered_pricing,
                 cache_ttl_minutes=cache_ttl_minutes,
+                total_input_context=total_input_context,
+                billing_template=billing_template,
             )
             return (
                 result["input_cost"],
@@ -964,7 +980,7 @@ class ModelCostService:
                 result["tier_index"],
             )
         else:
-            # 回退到默认计算逻辑（无 Adapter 时使用静态方法）
+            # 回退到默认计算逻辑（无显式格式能力时使用静态方法）
             return self.compute_cost_with_tiered_pricing(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,

@@ -429,7 +429,7 @@ def _extract_tokens_from_response(
 
             # 尝试提取cache creation tokens
             try:
-                from src.api.handlers.base.utils import extract_cache_creation_tokens
+                from src.core.usage_tokens import extract_cache_creation_tokens
 
                 cache_creation_input_tokens = extract_cache_creation_tokens(usage_info)
             except Exception as e:
@@ -460,7 +460,7 @@ def _extract_tokens_from_response(
             output_tokens = usage_info.get("output_tokens", 0)
             cache_read_input_tokens = usage_info.get("cache_read_input_tokens", 0)
             try:
-                from src.api.handlers.base.utils import extract_cache_creation_tokens
+                from src.core.usage_tokens import extract_cache_creation_tokens
 
                 cache_creation_input_tokens = extract_cache_creation_tokens(usage_info)
             except Exception as e:
@@ -593,6 +593,16 @@ class HttpRequestExecutor:
     def __init__(self, timeout: float = 30.0):
         self.timeout = timeout
 
+    @staticmethod
+    def _unwrap_gemini_cli_response_wrapper(data: Any) -> Any:
+        """对齐 gcli2api：Gemini CLI v1internal 响应可能多一层 `response` 包装。"""
+        if not isinstance(data, dict):
+            return data
+        response_obj = data.get("response")
+        if "candidates" not in data and isinstance(response_obj, dict):
+            return response_obj
+        return data
+
     async def execute(self, request: EndpointCheckRequest) -> EndpointCheckResult:
         """执行HTTP请求（支持流式和非流式响应）"""
         start_time = time.time()
@@ -661,6 +671,10 @@ class HttpRequestExecutor:
                     if response.status_code == 200:
                         try:
                             response_data = response.json()
+                            if "/v1internal:" in (request.url or ""):
+                                response_data = self._unwrap_gemini_cli_response_wrapper(
+                                    response_data
+                                )
                             logger.debug(
                                 f"[{request.api_format}] check_endpoint | response | json={_truncate_repr(response_data)}"
                             )
@@ -690,6 +704,17 @@ class HttpRequestExecutor:
                         return await ErrorHandler.handle_error(http_error, request)
 
         except Exception as e:
+            logger.warning(
+                "[{}] endpoint check exception | provider={} provider_id={} api_key_id={} model={} stream={} local_protocol_error={} error={}",
+                request.api_format,
+                request.provider_name,
+                request.provider_id,
+                request.api_key_id,
+                request.model_name,
+                is_stream,
+                isinstance(e, httpx.LocalProtocolError) or "LocalProtocolError" in type(e).__name__,
+                e,
+            )
             return await ErrorHandler.handle_error(e, request)
 
     async def _execute_stream_request(
@@ -733,6 +758,8 @@ class HttpRequestExecutor:
 
                     try:
                         event = json.loads(data_str)
+                        if "/v1internal:" in (request.url or ""):
+                            event = self._unwrap_gemini_cli_response_wrapper(event)
                         event_type = event.get("type", "")
 
                         # OpenAI Responses API 事件
@@ -1476,7 +1503,9 @@ class EndpointCheckOrchestrator:
         """执行端点检查的完整流程"""
         logger.info(
             f"[{request.api_format}] Starting endpoint check | "
-            f"provider={request.provider_name}, model={request.model_name}"
+            f"provider={request.provider_name}, model={request.model_name}, "
+            f"api_key_id={request.api_key_id}, provider_id={request.provider_id}, "
+            f"stream={request.is_stream if request.is_stream is not None else request.json_body.get('stream', False)}"
         )
 
         # 1. 执行HTTP请求

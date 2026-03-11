@@ -6,6 +6,8 @@ Create Date: 2026-03-09 01:00:00.000000+00:00
 
 """
 
+from __future__ import annotations
+
 import sqlalchemy as sa
 
 from alembic import op
@@ -20,23 +22,58 @@ _TABLE = "video_tasks"
 _FK_NAME = "video_tasks_key_id_fkey"
 
 
-def _fk_ondelete(table_name: str, constraint_name: str) -> str | None:
+# ---------------------------------------------------------------------------
+# Inline helpers
+# ---------------------------------------------------------------------------
+
+
+class _SchemaCache:
+    def __init__(self) -> None:
+        self._fk_rules: dict[tuple[str, str], str] = {}
+        self._fk_loaded_tables: set[str] = set()
+
+    def load_fk_rules(self, tables: list[str]) -> None:
+        need = [t for t in tables if t not in self._fk_loaded_tables]
+        if not need:
+            return
+        bind = op.get_bind()
+        rows = bind.execute(
+            sa.text(
+                "SELECT tc.table_name, tc.constraint_name, rc.delete_rule "
+                "FROM information_schema.referential_constraints rc "
+                "JOIN information_schema.table_constraints tc "
+                "  ON rc.constraint_name = tc.constraint_name "
+                " AND rc.constraint_schema = tc.constraint_schema "
+                "WHERE tc.table_name = ANY(:tables) "
+                "  AND tc.table_schema = current_schema()"
+            ),
+            {"tables": need},
+        ).fetchall()
+        for table, name, rule in rows:
+            self._fk_rules[(table, name)] = rule
+        self._fk_loaded_tables.update(need)
+
+    def fk_ondelete(self, table: str, constraint: str) -> str | None:
+        return self._fk_rules.get((table, constraint))
+
+
+def _fk_exists(constraint_name: str, table_name: str) -> bool:
     bind = op.get_bind()
     result = bind.execute(
         sa.text(
-            "SELECT rc.delete_rule "
-            "FROM information_schema.referential_constraints rc "
-            "JOIN information_schema.table_constraints tc "
-            "  ON rc.constraint_name = tc.constraint_name "
-            "WHERE tc.table_name = :table AND tc.constraint_name = :name"
+            "SELECT 1 FROM pg_constraint c "
+            "JOIN pg_class r ON c.conrelid = r.oid "
+            "JOIN pg_namespace n ON r.relnamespace = n.oid "
+            "WHERE c.conname = :name AND r.relname = :table "
+            "  AND n.nspname = current_schema() AND c.contype = 'f'"
         ),
-        {"table": table_name, "name": constraint_name},
+        {"name": constraint_name, "table": table_name},
     )
-    row = result.first()
-    return row[0] if row else None
+    return result.scalar() is not None
 
 
 def _replace_fk_if_needed(
+    cache: _SchemaCache,
     constraint_name: str,
     table_name: str,
     ref_table: str,
@@ -44,10 +81,10 @@ def _replace_fk_if_needed(
     remote_cols: list[str],
     desired_ondelete: str,
 ) -> None:
-    current = _fk_ondelete(table_name, constraint_name)
+    current = cache.fk_ondelete(table_name, constraint_name)
     if current and current.upper() == desired_ondelete.upper():
         return
-    if current:
+    if current or _fk_exists(constraint_name, table_name):
         op.drop_constraint(constraint_name, table_name, type_="foreignkey")
     op.create_foreign_key(
         constraint_name,
@@ -59,8 +96,14 @@ def _replace_fk_if_needed(
     )
 
 
+# ---------------------------------------------------------------------------
+
+
 def upgrade() -> None:
+    c = _SchemaCache()
+    c.load_fk_rules([_TABLE])
     _replace_fk_if_needed(
+        c,
         _FK_NAME,
         _TABLE,
         "provider_api_keys",
@@ -71,7 +114,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    c = _SchemaCache()
+    c.load_fk_rules([_TABLE])
     _replace_fk_if_needed(
+        c,
         _FK_NAME,
         _TABLE,
         "provider_api_keys",

@@ -6,6 +6,12 @@ Create Date: 2026-03-08 15:30:00.000000+00:00
 
 """
 
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+from collections.abc import Callable
+
 import sqlalchemy as sa
 
 from alembic import op
@@ -77,44 +83,100 @@ _COST_COLUMNS: list[tuple[str, str, bool, str | None]] = [
     ("stats_user_daily", "total_cost", False, "0.0"),
 ]
 
-# rate_multiplier uses a smaller precision
-_RATE_MULTIPLIER_TYPE = sa.Numeric(10, 6)
-_COST_TYPE = sa.Numeric(20, 8)
+_ALL_TABLES = list({t for t, *_ in _COST_COLUMNS})
 
 
-def _column_exists(table_name: str, column_name: str) -> bool:
-    bind = op.get_bind()
-    result = bind.execute(
-        sa.text(
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = :table AND column_name = :col"
-        ),
-        {"table": table_name, "col": column_name},
-    )
-    return result.scalar() is not None
+# ---------------------------------------------------------------------------
+# Inline helpers
+# ---------------------------------------------------------------------------
+
+
+class _SchemaCache:
+    def __init__(self) -> None:
+        self._columns: dict[str, dict[str, str]] = {}
+
+    def load_columns(self, tables: list[str]) -> None:
+        need = [t for t in tables if t not in self._columns]
+        if not need:
+            return
+        bind = op.get_bind()
+        rows = bind.execute(
+            sa.text(
+                "SELECT table_name, column_name, data_type "
+                "FROM information_schema.columns "
+                "WHERE table_name = ANY(:tables) "
+                "  AND table_schema = current_schema()"
+            ),
+            {"tables": need},
+        ).fetchall()
+        for t in need:
+            self._columns.setdefault(t, {})
+        for table, col, dtype in rows:
+            self._columns[table][col] = dtype
+
+    def column_exists(self, table: str, column: str) -> bool:
+        return column in self._columns.get(table, {})
+
+    def column_type(self, table: str, column: str) -> str | None:
+        return self._columns.get(table, {}).get(column)
+
+    def is_numeric(self, table: str, column: str) -> bool:
+        return self.column_type(table, column) == "numeric"
 
 
 def _index_exists(index_name: str) -> bool:
     bind = op.get_bind()
     result = bind.execute(
-        sa.text("SELECT 1 FROM pg_indexes WHERE indexname = :name"),
+        sa.text(
+            "SELECT 1 FROM pg_indexes "
+            "WHERE indexname = :name AND schemaname = current_schema()::text"
+        ),
         {"name": index_name},
     )
     return result.scalar() is not None
 
 
-def _is_numeric_type(table_name: str, column_name: str) -> bool:
-    """Check if a column is already numeric type (not float/double precision)."""
+def _numeric_max(type_spec: str) -> float | None:
+    m = re.match(r"NUMERIC\((\d+),(\d+)\)", type_spec, re.IGNORECASE)
+    if not m:
+        return None
+    precision, scale = int(m.group(1)), int(m.group(2))
+    return 10 ** (precision - scale) - 10 ** (-scale)
+
+
+def _batch_alter_type(
+    cache: _SchemaCache,
+    columns: list[tuple[str, str, bool, str | None]],
+    cast_suffix: str,
+    type_fn: Callable[[str], str],
+) -> None:
+    by_table: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for table, col, _nullable, _default in columns:
+        if not cache.column_exists(table, col):
+            continue
+        by_table[table].append((col, type_fn(col)))
+
     bind = op.get_bind()
-    result = bind.execute(
-        sa.text(
-            "SELECT data_type FROM information_schema.columns "
-            "WHERE table_name = :table AND column_name = :col"
-        ),
-        {"table": table_name, "col": column_name},
-    )
-    data_type = result.scalar()
-    return data_type == "numeric"
+    for table, col_types in by_table.items():
+        for col, target in col_types:
+            cap = _numeric_max(target)
+            if cap is not None:
+                bind.execute(
+                    sa.text(
+                        f"UPDATE {table} SET {col} = :cap "
+                        f"WHERE {col} IS NOT NULL AND abs({col}) > :cap"
+                    ),
+                    {"cap": cap},
+                )
+        parts = [
+            f"ALTER COLUMN {col} TYPE {target} USING {col}::{cast_suffix}"
+            for col, target in col_types
+        ]
+        if parts:
+            bind.execute(sa.text(f"ALTER TABLE {table} " + ", ".join(parts)))
+
+
+# ---------------------------------------------------------------------------
 
 
 def _type_spec(col: str) -> str:
@@ -122,47 +184,17 @@ def _type_spec(col: str) -> str:
     return "NUMERIC(10,6)" if col == "rate_multiplier" else "NUMERIC(20,8)"
 
 
-def _batch_alter_type(
-    columns: list[tuple[str, str, bool, str | None]],
-    cast_suffix: str,
-    type_fn=None,
-) -> None:
-    """Group columns by table and issue ONE ALTER TABLE per table.
-
-    This avoids rewriting the same table N times (once per column).
-    """
-    from collections import defaultdict
-
-    by_table: dict[str, list[tuple[str, str, bool, str | None]]] = defaultdict(list)
-    for table, col, nullable, default in columns:
-        if not _column_exists(table, col):
-            continue
-        by_table[table].append((table, col, nullable, default))
-
-    bind = op.get_bind()
-    for table, cols in by_table.items():
-        # Build a single ALTER TABLE with multiple ALTER COLUMN clauses
-        parts: list[str] = []
-        for _t, col, _nullable, _default in cols:
-            target_type = type_fn(col) if type_fn else _type_spec(col)
-            parts.append(
-                f"ALTER COLUMN {col} TYPE {target_type} USING {col}::{cast_suffix}"
-            )
-        if not parts:
-            continue
-        sql = f"ALTER TABLE {table} " + ", ".join(parts)
-        bind.execute(sa.text(sql))
-
-
 def upgrade() -> None:
+    c = _SchemaCache()
+    c.load_columns(_ALL_TABLES)
+
     # -- 1. cost fields: Float -> Numeric  (batched per table)
-    # Filter out columns that are already numeric
     cols_to_convert = [
-        (t, c, n, d)
-        for t, c, n, d in _COST_COLUMNS
-        if _column_exists(t, c) and not _is_numeric_type(t, c)
+        (t, col, n, d)
+        for t, col, n, d in _COST_COLUMNS
+        if c.column_exists(t, col) and not c.is_numeric(t, col)
     ]
-    _batch_alter_type(cols_to_convert, cast_suffix="numeric", type_fn=_type_spec)
+    _batch_alter_type(c, cols_to_convert, cast_suffix="numeric", type_fn=_type_spec)
 
     # -- 2. provider_api_keys composite index
     if not _index_exists("idx_provider_api_keys_provider_active"):
@@ -182,12 +214,16 @@ def downgrade() -> None:
         )
 
     # -- 1. Numeric -> Float  (batched per table)
+    c = _SchemaCache()
+    c.load_columns(_ALL_TABLES)
+
     cols_to_revert = [
-        (t, c, n, d)
-        for t, c, n, d in _COST_COLUMNS
-        if _column_exists(t, c) and _is_numeric_type(t, c)
+        (t, col, n, d)
+        for t, col, n, d in _COST_COLUMNS
+        if c.column_exists(t, col) and c.is_numeric(t, col)
     ]
     _batch_alter_type(
+        c,
         cols_to_revert,
         cast_suffix="double precision",
         type_fn=lambda _col: "DOUBLE PRECISION",

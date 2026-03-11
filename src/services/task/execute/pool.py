@@ -63,12 +63,25 @@ class TaskPoolOperationsService:
                 if not candidate_keys and getattr(candidate, "key", None) is not None:
                     candidate_keys = [candidate.key]
 
-                ordered_keys, trace = await manager.select_pool_keys(session_uuid, candidate_keys)
-                candidate.pool_keys = ordered_keys
+                # 构造延迟可用性检查回调（从 CandidateBuilder 打包的参数）
+                checker = None
+                deferred_params = candidate._deferred_check_params
+                if deferred_params is not None:
+                    checker = self._build_availability_checker(deferred_params)
+
+                ordered_keys, trace = await manager.select_pool_keys(
+                    session_uuid,
+                    candidate_keys,
+                    availability_checker=checker,
+                )
+                # 移除 deferred key（未检查的），避免为其创建 DB 记录
+                candidate.pool_keys = [
+                    k for k in ordered_keys if getattr(k, "_pool_skip_reason", None) != "deferred"
+                ]
 
                 selected_key_index = 0
                 selected_key = None
-                for idx, pool_key in enumerate(ordered_keys):
+                for idx, pool_key in enumerate(candidate.pool_keys):
                     if not bool(getattr(pool_key, "_pool_skipped", False)):
                         selected_key = pool_key
                         selected_key_index = idx
@@ -220,3 +233,33 @@ class TaskPoolOperationsService:
             )
         except Exception:
             pass
+
+    @staticmethod
+    def _build_availability_checker(
+        params: dict[str, Any],
+    ) -> Any:
+        """Construct a key availability checker from deferred check params."""
+        from src.services.scheduling.candidate_builder import CandidateBuilder
+
+        endpoint_format = params.get("endpoint_format")
+        model_name = params.get("model_name", "")
+        capability_requirements = params.get("capability_requirements")
+        model_mappings = params.get("model_mappings")
+        candidate_models = params.get("candidate_models")
+        provider_type = params.get("provider_type")
+
+        # _check_key_availability 不依赖 _sorter，传 None 安全
+        builder = CandidateBuilder(candidate_sorter=None)  # type: ignore[arg-type]
+
+        def _checker(key: Any) -> tuple[bool, str | None, str | None]:
+            return builder._check_key_availability(
+                key,
+                endpoint_format,
+                model_name,
+                capability_requirements,
+                model_mappings=model_mappings,
+                candidate_models=candidate_models,
+                provider_type=provider_type,
+            )
+
+        return _checker

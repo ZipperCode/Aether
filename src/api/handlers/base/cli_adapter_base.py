@@ -7,12 +7,12 @@ CLI Adapter 通用基类
 - Handler 创建和调用
 
 公共逻辑（异常处理、计费、头部构建等）继承自 HandlerAdapterBase。
+计费策略、模型抓取与 provider 格式能力由 `core.api_format` 注册表统一提供。
 
 子类只需提供：
 - FORMAT_ID: API 格式标识
 - HANDLER_CLASS: 对应的 MessageHandler 类
 - 可选覆盖 _extract_message_count() 自定义消息计数逻辑
-- 可选覆盖 compute_total_input_context() 自定义总输入上下文计算
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import HTTPException
-from fastapi.responses import JSONResponse
 
 from src.api.base.adapter import ApiMode
 from src.api.base.context import ApiRequestContext
@@ -58,6 +57,7 @@ class CliAdapterBase(HandlerAdapterBase):
     # 适配器配置
     name: str = "cli.base"
     mode = ApiMode.PROXY
+    eager_request_body = False
 
     async def handle(self, context: ApiRequestContext) -> Any:
         """处理 CLI API 请求"""
@@ -82,7 +82,7 @@ class CliAdapterBase(HandlerAdapterBase):
 
             set_original_request_headers(original_headers)
 
-        original_request_body = context.ensure_json_body()
+        original_request_body = await context.ensure_json_body_async()
 
         # 合并 path_params 到请求体（如 Gemini API 的 model 在 URL 路径中）
         if context.path_params:
