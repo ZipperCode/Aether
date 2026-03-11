@@ -31,7 +31,7 @@ from src.modules.site_management.services.snapshot_service import SiteSnapshotSe
 from src.modules.site_management.services.webdav_source_service import WebDavSourceService
 from src.utils.auth_utils import require_admin
 
-router = APIRouter()
+router = APIRouter(prefix="/api/admin/site-management", tags=["Admin - Site Management"])
 
 
 # ---------------------------------------------------------------------------
