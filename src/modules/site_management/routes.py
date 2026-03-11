@@ -173,11 +173,13 @@ async def test_source_connection(
 @router.post("/sources/{source_id}/sync")
 async def trigger_source_sync(
     source_id: str,
-    payload: TriggerSyncRequest,
+    payload: TriggerSyncRequest | None = None,
     db: Session = Depends(get_db),
     _: Any = Depends(require_admin),
 ) -> Any:
     """Manually trigger sync for a specific WebDav source."""
+    if payload is None:
+        payload = TriggerSyncRequest()
     source_service = WebDavSourceService(db)
     source = source_service.get(source_id)
     if not source:
