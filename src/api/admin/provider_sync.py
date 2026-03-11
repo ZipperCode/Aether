@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from src.database import get_db
 from src.models.database import User
 from src.services.provider_sync import AllApiHubSyncService
-from src.services.site_management import SiteManagementLogService
+from src.modules.site_management.services.log_service import SiteManagementLogService
 from src.services.system.config import SystemConfigService
 from src.utils.auth_utils import require_admin
 
@@ -62,7 +62,9 @@ async def trigger_sync(
             db=db,
             trigger_source="manual",
             status="success",
-            result=result,
+            total_accounts=result.total_accounts,
+            updated_accounts=result.updated_providers,
+            dry_run=result.dry_run,
             started_at=started_at,
             finished_at=datetime.now(timezone.utc),
         )

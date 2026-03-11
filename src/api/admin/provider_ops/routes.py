@@ -28,8 +28,7 @@ from src.services.provider_ops import (
     get_registry,
 )
 from src.services.provider_sync import AllApiHubSyncService
-from src.services.site_management import SiteManagementLogService
-from src.services.site_management.log_service import CheckinItemLog
+from src.modules.site_management.services.log_service import CheckinItemLog, SiteManagementLogService
 from src.utils.auth_utils import require_admin
 
 router = APIRouter(prefix="/api/admin/provider-ops", tags=["Provider Operations"])

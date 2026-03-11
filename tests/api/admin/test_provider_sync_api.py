@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 from src.api.admin.provider_sync import router
 from src.database import get_db
 from src.models.database import Provider
-from src.services.site_management import SiteManagementLogService
+from src.modules.site_management.services.log_service import SiteManagementLogService
 from src.services.system.config import SystemConfigService
 from src.utils.auth_utils import require_admin
 
