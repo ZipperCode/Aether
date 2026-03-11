@@ -65,11 +65,13 @@ class AccountSyncService:
 
         existing_by_identity: dict[str, SiteAccount] = {}
         existing_by_domain_auth: dict[tuple[str, str], list[SiteAccount]] = {}
+        existing_by_domain: dict[str, SiteAccount] = {}  # 新增：跟踪 (webdav_source_id, domain) 唯一性
         for account in existing_accounts:
             domain = str(getattr(account, "domain", "") or "").strip().lower()
             auth_type = str(getattr(account, "auth_type", "") or "cookie").strip().lower()
             if domain:
                 existing_by_domain_auth.setdefault((domain, auth_type), []).append(account)
+                existing_by_domain[domain] = account  # 新增：记录域名
             identity = self._build_existing_identity(account)
             if identity and identity not in existing_by_identity:
                 existing_by_identity[identity] = account
@@ -80,6 +82,11 @@ class AccountSyncService:
             site_account = existing_by_identity.get(imported_identity)
             imported_user_id = str(imported.user_id or "").strip()
             imported_auth_type = str(imported.auth_type or "cookie").strip().lower()
+            imported_domain = str(imported.domain or "").strip().lower()
+
+            # 新增：如果通过 identity 没找到，尝试通过 domain 查找（避免违反唯一约束）
+            if site_account is None and imported_domain:
+                site_account = existing_by_domain.get(imported_domain)
 
             if site_account is None and not imported_user_id:
                 candidates = existing_by_domain_auth.get((imported.domain, imported_auth_type), [])
@@ -101,6 +108,8 @@ class AccountSyncService:
                 existing_by_domain_auth.setdefault(
                     (imported.domain, imported_auth_type), []
                 ).append(site_account)
+                if imported_domain:  # 新增：记录新创建的域名
+                    existing_by_domain[imported_domain] = site_account
                 created = True
                 result.created_accounts += 1
 
