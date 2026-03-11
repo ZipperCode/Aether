@@ -91,7 +91,7 @@ class SiteAccount(Base):
     webdav_source_id = Column(
         String(36),
         ForeignKey("webdav_sources.id", ondelete="CASCADE"),
-        nullable=True,
+        nullable=False,
         index=True,
     )
     site_url = Column(String(500), nullable=True)
