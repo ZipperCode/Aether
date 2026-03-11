@@ -271,7 +271,25 @@ const routes: RouteRecordRaw[] = [
       {
         path: 'site-management',
         name: 'SiteManagement',
-        component: () => importWithRetry(() => import('@/views/admin/SiteManagement.vue')),
+        component: () => importWithRetry(() => import('@/views/admin/SiteSourceList.vue')),
+        meta: { module: 'site_management' }
+      },
+      {
+        path: 'site-management/history/sync',
+        name: 'SiteSyncHistory',
+        component: () => importWithRetry(() => import('@/views/admin/SiteSyncHistory.vue')),
+        meta: { module: 'site_management' }
+      },
+      {
+        path: 'site-management/history/checkin',
+        name: 'SiteCheckinHistory',
+        component: () => importWithRetry(() => import('@/views/admin/SiteCheckinHistory.vue')),
+        meta: { module: 'site_management' }
+      },
+      {
+        path: 'site-management/:sourceId',
+        name: 'SiteSourceDetail',
+        component: () => importWithRetry(() => import('@/views/admin/SiteSourceDetail.vue')),
         meta: { module: 'site_management' }
       },
       {
