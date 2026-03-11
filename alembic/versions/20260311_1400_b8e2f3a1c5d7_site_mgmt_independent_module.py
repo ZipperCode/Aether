@@ -128,6 +128,9 @@ def upgrade() -> None:
         ondelete="CASCADE",
     )
 
+    # 12b. Make source_url nullable (no longer required, URL comes from WebDavSource)
+    op.alter_column("site_source_snapshots", "source_url", nullable=True)
+
     # 13. Add webdav_source_id to site_sync_runs
     op.add_column("site_sync_runs", sa.Column("webdav_source_id", sa.String(36), nullable=True))
 
@@ -137,6 +140,8 @@ def downgrade() -> None:
     op.drop_column("site_sync_runs", "webdav_source_id")
 
     # 2. Drop FK and webdav_source_id from site_source_snapshots
+    # 2a. Restore source_url NOT NULL
+    op.alter_column("site_source_snapshots", "source_url", nullable=False)
     try:
         op.drop_constraint(
             "fk_site_source_snapshots_webdav_source_id",
