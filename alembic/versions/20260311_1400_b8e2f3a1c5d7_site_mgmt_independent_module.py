@@ -4,7 +4,7 @@ Adds webdav_sources table, refactors site_accounts to use webdav_source_id
 instead of provider_id, and adds webdav_source_id to related tables.
 
 Revision ID: b8e2f3a1c5d7
-Revises: a3f1b7c9d2e4
+Revises: e4f8d1c2b3a4, a3f1b7c9d2e4
 Create Date: 2026-03-11 14:00:00.000000+00:00
 """
 
@@ -17,7 +17,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "b8e2f3a1c5d7"
-down_revision = "a3f1b7c9d2e4"
+down_revision = ("e4f8d1c2b3a4", "a3f1b7c9d2e4")
 branch_labels = None
 depends_on = None
 
