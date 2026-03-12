@@ -43,6 +43,8 @@ class WebDavSource(Base):
     password = Column(Text, nullable=False)  # Encrypted via CryptoService
     is_active = Column(Boolean, nullable=False, default=True)
     sync_enabled = Column(Boolean, nullable=False, default=True)
+    checkin_enabled = Column(Boolean, nullable=False, default=True)
+    checkin_time = Column(String(5), nullable=False, default="04:00")
     last_sync_at = Column(DateTime(timezone=True), nullable=True)
     last_sync_status = Column(String(20), nullable=True)  # success/failed
     created_at = Column(
@@ -272,9 +274,13 @@ class SiteCheckinRun(Base):
     """站点签到运行记录（provider_ops balance/checkin）"""
 
     __tablename__ = "site_checkin_runs"
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = (
+        Index("idx_site_checkin_runs_source_created", "webdav_source_id", "created_at"),
+        {"extend_existing": True},
+    )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    webdav_source_id = Column(String(36), nullable=True)
     trigger_source = Column(String(20), nullable=False, default="scheduled")  # scheduled/manual
     status = Column(String(20), nullable=False, default="success")  # success/failed/partial
     error_message = Column(Text, nullable=True)
@@ -313,6 +319,7 @@ class SiteCheckinItem(Base):
     __table_args__ = (
         Index("idx_site_checkin_items_run_status", "run_id", "status"),
         Index("idx_site_checkin_items_provider", "provider_id"),
+        Index("idx_site_checkin_items_run_account", "run_id", "account_id"),
         {"extend_existing": True},
     )
 
@@ -326,6 +333,9 @@ class SiteCheckinItem(Base):
     provider_id = Column(String(36), nullable=True)
     provider_name = Column(String(100), nullable=True)
     provider_domain = Column(String(255), nullable=True)
+    account_id = Column(String(36), nullable=True)
+    account_domain = Column(String(255), nullable=True)
+    account_site_url = Column(String(500), nullable=True)
 
     status = Column(String(20), nullable=False)  # success/failed/skipped
     message = Column(Text, nullable=True)
