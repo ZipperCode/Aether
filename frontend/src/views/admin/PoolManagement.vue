@@ -493,28 +493,13 @@
                         {{ formatOAuthPlanType(key.oauth_plan_type) }}
                       </Badge>
                       <Badge
-                        v-if="getPrimaryOAuthOrganizationTitle(key)"
-                        variant="secondary"
-                        class="text-[9px] px-1 py-0 h-4 shrink-0 max-w-[92px] truncate"
-                        :title="getOAuthOrganizationsTooltip(key)"
-                      >
-                        {{ getPrimaryOAuthOrganizationTitle(key) }}
-                      </Badge>
-                      <Badge
-                        v-if="key.oauth_account_id"
+                        v-if="getOAuthOrgBadge(key)"
                         variant="secondary"
                         class="text-[9px] px-1 py-0 h-4 shrink-0"
-                        :title="key.oauth_account_id"
+                        :title="getOAuthOrgBadge(key)?.id"
                       >
-                        acct {{ formatOAuthIdentityShort(key.oauth_account_id) }}
+                        {{ getOAuthOrgBadge(key)?.label }}
                       </Badge>
-                      <span
-                        v-if="key.oauth_account_user_id"
-                        class="text-[10px] text-muted-foreground shrink-0"
-                        :title="key.oauth_account_user_id"
-                      >
-                        AUID {{ formatOAuthIdentityShort(key.oauth_account_user_id, 10, 8) }}
-                      </span>
                     </div>
                   </div>
                 </TableCell>
@@ -818,28 +803,13 @@
                     {{ formatOAuthPlanType(key.oauth_plan_type) }}
                   </Badge>
                   <Badge
-                    v-if="getPrimaryOAuthOrganizationTitle(key)"
-                    variant="secondary"
-                    class="text-[9px] px-1 py-0 h-4 shrink-0 max-w-[92px] truncate"
-                    :title="getOAuthOrganizationsTooltip(key)"
-                  >
-                    {{ getPrimaryOAuthOrganizationTitle(key) }}
-                  </Badge>
-                  <Badge
-                    v-if="key.oauth_account_id"
+                    v-if="getOAuthOrgBadge(key)"
                     variant="secondary"
                     class="text-[9px] px-1 py-0 h-4 shrink-0"
-                    :title="key.oauth_account_id"
+                    :title="getOAuthOrgBadge(key)?.id"
                   >
-                    acct {{ formatOAuthIdentityShort(key.oauth_account_id) }}
+                    {{ getOAuthOrgBadge(key)?.label }}
                   </Badge>
-                  <span
-                    v-if="key.oauth_account_user_id"
-                    class="text-[10px] text-muted-foreground shrink-0"
-                    :title="key.oauth_account_user_id"
-                  >
-                    AUID {{ formatOAuthIdentityShort(key.oauth_account_user_id, 10, 8) }}
-                  </span>
                 </div>
               </div>
               <div class="flex items-center gap-0.5 shrink-0 flex-wrap justify-end max-w-[210px]">
@@ -1225,7 +1195,7 @@ import OAuthKeyEditDialog from '@/features/providers/components/OAuthKeyEditDial
 import OAuthAccountDialog from '@/features/providers/components/OAuthAccountDialog.vue'
 import ProxyNodeSelect from '@/features/providers/components/ProxyNodeSelect.vue'
 import { isAccountLevelBlockReason, classifyAccountBlockLabel, cleanAccountBlockReason } from '@/utils/accountBlock'
-import { formatOAuthIdentityShort, getPrimaryOAuthOrganizationTitle, getOAuthOrganizationsTooltip } from '@/utils/oauthIdentity'
+import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 
 const { success, error: showError, warning: showWarning } = useToast()
 const { confirm } = useConfirm()

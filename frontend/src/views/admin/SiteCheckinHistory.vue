@@ -2,7 +2,7 @@
   <PageContainer>
     <PageHeader
       title="签到记录"
-      description="站点签到任务的历史记录"
+      description="按 WebDav 源查看站点签到任务历史与账号明细"
     >
       <template #actions>
         <Button

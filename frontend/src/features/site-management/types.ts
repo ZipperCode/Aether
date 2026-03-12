@@ -5,6 +5,8 @@ export interface WebDavSource {
   username: string
   is_active: boolean
   sync_enabled: boolean
+  checkin_enabled: boolean
+  checkin_time: string
   last_sync_at: string | null
   last_sync_status: string | null
   created_at: string
@@ -17,6 +19,8 @@ export interface CreateWebDavSourceRequest {
   url: string
   username: string
   password: string
+  checkin_enabled: boolean
+  checkin_time: string
 }
 
 export interface UpdateWebDavSourceRequest {
@@ -26,6 +30,8 @@ export interface UpdateWebDavSourceRequest {
   password?: string
   is_active?: boolean
   sync_enabled?: boolean
+  checkin_enabled?: boolean
+  checkin_time?: string
 }
 
 export interface SiteAccount {
@@ -76,6 +82,7 @@ export interface SyncItem {
 
 export interface CheckinRun {
   id: string
+  webdav_source_id: string | null
   trigger_source: string
   status: string
   error_message: string | null
@@ -94,6 +101,9 @@ export interface CheckinItem {
   provider_id: string | null
   provider_name: string | null
   provider_domain: string | null
+  account_id: string | null
+  account_domain: string | null
+  account_site_url: string | null
   status: string
   message: string | null
   balance_total: number | null

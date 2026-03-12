@@ -41,8 +41,6 @@ class MaintenanceScheduler:
 
     # 签到任务的 job_id
     CHECKIN_JOB_ID = "provider_checkin"
-    # all-api-hub 同步任务的 job_id
-    ALL_API_HUB_SYNC_JOB_ID = "all_api_hub_sync"
 
     def __init__(self) -> None:
         self.running = False

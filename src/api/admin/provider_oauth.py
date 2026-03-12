@@ -953,6 +953,8 @@ async def refresh_oauth(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ) -> CompleteOAuthResponse:
+    from src.services.provider.auth import _acquire_refresh_lock, _release_refresh_lock
+
     key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
     if not key:
         raise NotFoundException("Key 不存在", "key")
@@ -964,12 +966,57 @@ async def refresh_oauth(
         raise NotFoundException("Provider 不存在", "provider")
     provider_type = _require_fixed_provider(provider)
 
-    # Kiro 使用自定义 token refresh 机制
-    if provider_type == ProviderType.KIRO.value:
-        from datetime import datetime, timezone
+    redis, got_lock = await _acquire_refresh_lock(key_id)
+    if redis is not None and not got_lock:
+        raise InvalidRequestException("该 Key 正在续期，请稍后重试")
 
-        from src.services.provider.adapters.kiro.models.credentials import KiroAuthConfig
-        from src.services.provider.adapters.kiro.token_manager import refresh_access_token
+    try:
+        # Kiro 使用自定义 token refresh 机制
+        if provider_type == ProviderType.KIRO.value:
+            from datetime import datetime, timezone
+
+            from src.services.provider.adapters.kiro.models.credentials import KiroAuthConfig
+            from src.services.provider.adapters.kiro.token_manager import refresh_access_token
+
+            encrypted_auth_config = getattr(key, "auth_config", None)
+            if not encrypted_auth_config:
+                raise InvalidRequestException("缺少 auth_config，无法 refresh")
+
+            decrypted = crypto_service.decrypt(encrypted_auth_config)
+            parsed = json.loads(decrypted)
+
+            cfg = KiroAuthConfig.from_dict(parsed)
+            cfg.provider_type = ProviderType.KIRO.value
+
+            from src.services.proxy_node.resolver import resolve_effective_proxy
+
+            proxy_config = resolve_effective_proxy(
+                getattr(provider, "proxy", None), getattr(key, "proxy", None)
+            )
+            try:
+                access_token, new_cfg = await refresh_access_token(cfg, proxy_config=proxy_config)
+            except Exception as e:
+                key.oauth_invalid_at = datetime.now(timezone.utc)
+                key.oauth_invalid_reason = f"[REFRESH_FAILED] Token 续期失败: {e}"
+                db.commit()
+                logger.warning("Kiro Key {} token 刷新失败，已标记为刷新失效: {}", key_id, e)
+                raise InvalidRequestException("Kiro token refresh 失败，请检查凭据是否有效")
+
+            key.api_key = crypto_service.encrypt(access_token)
+            key.auth_config = crypto_service.encrypt(json.dumps(new_cfg.to_dict()))
+            key.oauth_invalid_at = None
+            key.oauth_invalid_reason = None
+            key.is_active = True
+            db.commit()
+
+            return CompleteOAuthResponse(
+                provider_type=provider_type,
+                expires_at=new_cfg.expires_at or None,
+                has_refresh_token=bool(new_cfg.refresh_token),
+                email=None,
+            )
+
+        template = _require_oauth_template(provider_type)
 
         encrypted_auth_config = getattr(key, "auth_config", None)
         if not encrypted_auth_config:
@@ -977,181 +1024,138 @@ async def refresh_oauth(
 
         decrypted = crypto_service.decrypt(encrypted_auth_config)
         parsed = json.loads(decrypted)
+        refresh_token = str(parsed.get("refresh_token") or "")
+        if not refresh_token:
+            raise InvalidRequestException("缺少 refresh_token，需要重新授权")
 
-        cfg = KiroAuthConfig.from_dict(parsed)
-        cfg.provider_type = ProviderType.KIRO.value
+        token_url = template.oauth.token_url
+        is_json = "anthropic.com" in token_url
+        scope_str = " ".join(template.oauth.scopes) if template.oauth.scopes else ""
+
+        if is_json:
+            body: dict[str, Any] = {
+                "grant_type": "refresh_token",
+                "client_id": template.oauth.client_id,
+                "refresh_token": refresh_token,
+            }
+            if scope_str:
+                body["scope"] = scope_str
+            headers = {"Content-Type": "application/json", "Accept": "application/json"}
+            data = None
+            json_body = body
+        else:
+            form: dict[str, str] = {
+                "grant_type": "refresh_token",
+                "client_id": template.oauth.client_id,
+                "refresh_token": refresh_token,
+            }
+            if scope_str:
+                form["scope"] = scope_str
+            if template.oauth.client_secret:
+                form["client_secret"] = template.oauth.client_secret
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            }
+            data = form
+            json_body = None
 
         from src.services.proxy_node.resolver import resolve_effective_proxy
 
         proxy_config = resolve_effective_proxy(
             getattr(provider, "proxy", None), getattr(key, "proxy", None)
         )
-        try:
-            access_token, new_cfg = await refresh_access_token(cfg, proxy_config=proxy_config)
-        except Exception as e:
-            # 标记为失效
-            key.oauth_invalid_at = datetime.now(timezone.utc)
-            key.oauth_invalid_reason = f"[REFRESH_FAILED] Token 续期失败: {e}"
-            db.commit()
-            logger.warning("Kiro Key {} token 刷新失败，已标记为刷新失效: {}", key_id, e)
-            raise InvalidRequestException("Kiro token refresh 失败，请检查凭据是否有效")
 
-        # 更新 key
+        resp = await post_oauth_token(
+            provider_type=provider_type,
+            token_url=token_url,
+            headers=headers,
+            data=data,
+            json_body=json_body,
+            proxy_config=proxy_config,
+            timeout_seconds=30.0,
+        )
+
+        if resp.status_code < 200 or resp.status_code >= 300:
+            error_reason = f"HTTP {resp.status_code}"
+            try:
+                error_body = resp.json()
+                if "error" in error_body:
+                    error_reason = str(
+                        error_body.get("error_description") or error_body.get("error")
+                    )
+            except Exception:
+                error_reason = resp.text[:100] if resp.text else f"HTTP {resp.status_code}"
+
+            if resp.status_code in (400, 401, 403):
+                from datetime import datetime, timezone
+
+                key.oauth_invalid_at = datetime.now(timezone.utc)
+                key.oauth_invalid_reason = (
+                    f"[REFRESH_FAILED] Token 续期失败 ({resp.status_code}): {error_reason}"
+                )
+                db.commit()
+                logger.warning(
+                    "Key {} OAuth token 刷新失败，已标记为刷新失效: {}", key_id, error_reason
+                )
+
+            raise InvalidRequestException(f"token refresh 失败: {error_reason}")
+
+        token = resp.json()
+        access_token = str(token.get("access_token") or "")
+        new_refresh_token = str(token.get("refresh_token") or "")
+        expires_in = token.get("expires_in")
+        expires_at: int | None = None
+        try:
+            if expires_in is not None:
+                expires_at = int(time.time()) + int(expires_in)
+        except Exception:
+            expires_at = None
+
+        if not access_token:
+            raise InvalidRequestException("token refresh 返回缺少 access_token")
+
         key.api_key = crypto_service.encrypt(access_token)
-        key.auth_config = crypto_service.encrypt(json.dumps(new_cfg.to_dict()))
-        key.oauth_invalid_at = None
-        key.oauth_invalid_reason = None
-        key.is_active = True
+        parsed["token_type"] = token.get("token_type")
+        if new_refresh_token:
+            parsed["refresh_token"] = new_refresh_token
+        parsed["expires_at"] = expires_at
+        parsed["scope"] = token.get("scope")
+        parsed["updated_at"] = int(time.time())
+
+        parsed = await enrich_auth_config(
+            provider_type=provider_type,
+            auth_config=parsed,
+            token_response=token,
+            access_token=access_token,
+            proxy_config=proxy_config,
+        )
+
+        if provider_type == ProviderType.ANTIGRAVITY and not parsed.get("project_id"):
+            logger.warning(
+                "[OAUTH_REFRESH] Antigravity key {} 刷新成功但 project_id 仍缺失，"
+                "下次刷新将继续尝试获取",
+                key_id,
+            )
+
+        key.auth_config = crypto_service.encrypt(json.dumps(parsed))
+        from src.services.provider.oauth_token import is_account_level_block
+
+        if not is_account_level_block(getattr(key, "oauth_invalid_reason", None)):
+            key.oauth_invalid_at = None
+            key.oauth_invalid_reason = None
+            key.is_active = True
         db.commit()
 
         return CompleteOAuthResponse(
             provider_type=provider_type,
-            expires_at=new_cfg.expires_at or None,
-            has_refresh_token=bool(new_cfg.refresh_token),
-            email=None,
+            expires_at=expires_at,
+            has_refresh_token=bool(parsed.get("refresh_token")),
+            email=parsed.get("email"),
         )
-
-    template = _require_oauth_template(provider_type)
-
-    encrypted_auth_config = getattr(key, "auth_config", None)
-    if not encrypted_auth_config:
-        raise InvalidRequestException("缺少 auth_config，无法 refresh")
-
-    decrypted = crypto_service.decrypt(encrypted_auth_config)
-    parsed = json.loads(decrypted)
-    refresh_token = str(parsed.get("refresh_token") or "")
-    if not refresh_token:
-        raise InvalidRequestException("缺少 refresh_token，需要重新授权")
-
-    token_url = template.oauth.token_url
-    is_json = "anthropic.com" in token_url
-    scope_str = " ".join(template.oauth.scopes) if template.oauth.scopes else ""
-
-    if is_json:
-        body: dict[str, Any] = {
-            "grant_type": "refresh_token",
-            "client_id": template.oauth.client_id,
-            "refresh_token": refresh_token,
-        }
-        if scope_str:
-            body["scope"] = scope_str
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        data = None
-        json_body = body
-    else:
-        form: dict[str, str] = {
-            "grant_type": "refresh_token",
-            "client_id": template.oauth.client_id,
-            "refresh_token": refresh_token,
-        }
-        if template.oauth.client_secret:
-            form["client_secret"] = template.oauth.client_secret
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        }
-        data = form
-        json_body = None
-
-    from src.services.proxy_node.resolver import resolve_effective_proxy
-
-    proxy_config = resolve_effective_proxy(
-        getattr(provider, "proxy", None), getattr(key, "proxy", None)
-    )
-
-    resp = await post_oauth_token(
-        provider_type=provider_type,
-        token_url=token_url,
-        headers=headers,
-        data=data,
-        json_body=json_body,
-        proxy_config=proxy_config,
-        timeout_seconds=30.0,
-    )
-
-    if resp.status_code < 200 or resp.status_code >= 300:
-        # 解析错误原因
-        error_reason = f"HTTP {resp.status_code}"
-        try:
-            error_body = resp.json()
-            if "error" in error_body:
-                error_reason = str(error_body.get("error_description") or error_body.get("error"))
-        except Exception:
-            error_reason = resp.text[:100] if resp.text else f"HTTP {resp.status_code}"
-
-        # 标记为失效（400/401/403 通常表示永久性错误）
-        if resp.status_code in (400, 401, 403):
-            from datetime import datetime, timezone
-
-            key.oauth_invalid_at = datetime.now(timezone.utc)
-            key.oauth_invalid_reason = (
-                f"[REFRESH_FAILED] Token 续期失败 ({resp.status_code}): {error_reason}"
-            )
-            db.commit()
-            logger.warning(
-                "Key {} OAuth token 刷新失败，已标记为刷新失效: {}", key_id, error_reason
-            )
-
-        raise InvalidRequestException(f"token refresh 失败: {error_reason}")
-
-    token = resp.json()
-    access_token = str(token.get("access_token") or "")
-    new_refresh_token = str(token.get("refresh_token") or "")
-    expires_in = token.get("expires_in")
-    expires_at: int | None = None
-    try:
-        if expires_in is not None:
-            expires_at = int(time.time()) + int(expires_in)
-    except Exception:
-        expires_at = None
-
-    if not access_token:
-        raise InvalidRequestException("token refresh 返回缺少 access_token")
-
-    # store
-    key.api_key = crypto_service.encrypt(access_token)
-    parsed["token_type"] = token.get("token_type")
-    if new_refresh_token:
-        parsed["refresh_token"] = new_refresh_token
-    parsed["expires_at"] = expires_at
-    parsed["scope"] = token.get("scope")
-    parsed["updated_at"] = int(time.time())
-
-    parsed = await enrich_auth_config(
-        provider_type=provider_type,
-        auth_config=parsed,
-        token_response=token,
-        access_token=access_token,
-        proxy_config=proxy_config,
-    )
-
-    # Antigravity：enrich_auth_config 会自动尝试补 project_id，
-    # 即使本次仍未获取到也不阻断刷新（token 已成功更新），下次刷新会继续重试
-    if provider_type == ProviderType.ANTIGRAVITY and not parsed.get("project_id"):
-        logger.warning(
-            "[OAUTH_REFRESH] Antigravity key {} 刷新成功但 project_id 仍缺失，"
-            "下次刷新将继续尝试获取",
-            key_id,
-        )
-
-    key.auth_config = crypto_service.encrypt(json.dumps(parsed))
-    # 刷新成功，清除 token 级别的失效标记
-    # 但保留账号级别的失效标记（以 OAUTH_ACCOUNT_BLOCK_PREFIX 开头），
-    # 这种不是 token 问题，刷新 token 解决不了
-    from src.services.provider.oauth_token import is_account_level_block
-
-    if not is_account_level_block(getattr(key, "oauth_invalid_reason", None)):
-        key.oauth_invalid_at = None
-        key.oauth_invalid_reason = None
-        key.is_active = True
-    db.commit()
-
-    return CompleteOAuthResponse(
-        provider_type=provider_type,
-        expires_at=expires_at,
-        has_refresh_token=bool(parsed.get("refresh_token")),
-        email=parsed.get("email"),
-    )
+    finally:
+        if got_lock:
+            await _release_refresh_lock(redis, key_id)
 
 
 # ==============================================================================

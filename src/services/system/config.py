@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from src.core.logger import logger
+from src.core.validators import PasswordPolicyLevel
 from src.models.database import Provider, SystemConfig
 
 REQUEST_RECORD_LEVEL_KEY = "request_record_level"
@@ -94,6 +95,14 @@ class SystemConfigService:
             "value": "AI Gateway",
             "description": "站点副标题，显示在导航栏品牌名称下方",
         },
+        "default_user_initial_gift_usd": {
+            "value": 10.0,
+            "description": "新用户默认初始赠款（美元）",
+        },
+        "password_policy_level": {
+            "value": PasswordPolicyLevel.WEAK.value,
+            "description": "密码策略等级：weak(弱密码), medium(中等强度), strong(强密码)",
+        },
         REQUEST_RECORD_LEVEL_KEY: {
             "value": RequestRecordLevel.BASIC.value,
             "description": "请求记录级别：basic(基本信息), headers(含请求/响应头), full(完整请求/响应)",
@@ -142,30 +151,6 @@ class SystemConfigService:
         "provider_checkin_time": {
             "value": "01:05",
             "description": "Provider 自动签到执行时间（HH:MM 格式，24小时制）",
-        },
-        "enable_all_api_hub_sync": {
-            "value": False,
-            "description": "是否启用 all-api-hub WebDAV Cookie 自动同步任务",
-        },
-        "all_api_hub_sync_time": {
-            "value": "01:35",
-            "description": "all-api-hub WebDAV Cookie 自动同步执行时间（HH:MM 格式，24小时制）",
-        },
-        "all_api_hub_webdav_url": {
-            "value": None,
-            "description": "all-api-hub WebDAV 备份文件 URL",
-        },
-        "all_api_hub_webdav_username": {
-            "value": None,
-            "description": "all-api-hub WebDAV 用户名",
-        },
-        "all_api_hub_webdav_password": {
-            "value": None,
-            "description": "all-api-hub WebDAV 密码（加密存储）",
-        },
-        "enable_all_api_hub_auto_create_provider_ops": {
-            "value": True,
-            "description": "all-api-hub 同步时是否自动为匹配域名但未配置 provider_ops 的 Provider 创建最小配置",
         },
         "enable_site_account_sync": {
             "value": False,
@@ -384,6 +369,13 @@ class SystemConfigService:
         db: Session, key: str, value: Any, description: str | None = None
     ) -> SystemConfig:
         """设置系统配置值"""
+        if key == "password_policy_level":
+            normalized = str(value).strip().lower() if value is not None else ""
+            value = (
+                PasswordPolicyLevel(normalized).value
+                if normalized
+                else PasswordPolicyLevel.WEAK.value
+            )
         # Backward-compatible alias: request_log_level -> request_record_level
         if key in {REQUEST_RECORD_LEVEL_KEY, _LEGACY_REQUEST_LOG_LEVEL_KEY}:
             config = (
@@ -443,6 +435,18 @@ class SystemConfigService:
         return config
 
     @staticmethod
+    def get_password_policy_level(db: Session) -> str:
+        """获取密码策略等级，异常值自动回退为弱策略。"""
+        value = SystemConfigService.get_config(
+            db, "password_policy_level", PasswordPolicyLevel.WEAK.value
+        )
+        return (
+            PasswordPolicyLevel(value).value
+            if value in PasswordPolicyLevel._value2member_map_
+            else PasswordPolicyLevel.WEAK.value
+        )
+
+    @staticmethod
     def get_default_provider(db: Session) -> str | None:
         """
         获取系统默认提供商
@@ -469,7 +473,7 @@ class SystemConfigService:
         )
 
     # 敏感配置项，不返回实际值
-    SENSITIVE_KEYS = {"smtp_password", "all_api_hub_webdav_password"}
+    SENSITIVE_KEYS = {"smtp_password"}
 
     @classmethod
     def get_all_configs(cls, db: Session) -> list:

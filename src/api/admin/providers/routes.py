@@ -29,6 +29,7 @@ from src.models.database import GlobalModel, Provider, ProviderAPIKey, ProviderE
 from src.models.endpoint_models import ProviderWithEndpointsSummary
 from src.services.cache.model_cache import ModelCacheService
 from src.services.cache.provider_cache import ProviderCacheService
+from src.services.provider.delete_task import get_provider_delete_task, submit_provider_delete
 from src.utils.cache_decorator import cache_result
 
 from .summary import _build_provider_summary
@@ -232,6 +233,24 @@ class ProviderMappingPreviewResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ProviderDeleteSubmitResponse(BaseModel):
+    task_id: str
+    status: str = "pending"
+    message: str = ""
+
+
+class ProviderDeleteTaskResponse(BaseModel):
+    task_id: str
+    provider_id: str
+    status: str
+    stage: str = "queued"
+    total_keys: int = 0
+    deleted_keys: int = 0
+    total_endpoints: int = 0
+    deleted_endpoints: int = 0
+    message: str = ""
+
+
 @router.get("/")
 async def list_providers(
     request: Request,
@@ -335,10 +354,10 @@ async def update_provider(
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
-@router.delete("/{provider_id}")
+@router.delete("/{provider_id}", response_model=ProviderDeleteSubmitResponse)
 async def delete_provider(
     provider_id: str, request: Request, db: Session = Depends(get_db)
-) -> None:
+) -> ProviderDeleteSubmitResponse:
     """
     删除提供商
 
@@ -348,9 +367,23 @@ async def delete_provider(
     - `provider_id`: 提供商 ID
 
     **返回字段**:
-    - `message`: 删除成功提示信息
+    - `task_id`: 后台删除任务 ID
+    - `status`: 任务状态
+    - `message`: 提交结果提示
     """
     adapter = AdminDeleteProviderAdapter(provider_id=provider_id)
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
+@router.get("/{provider_id}/delete-task/{task_id}", response_model=ProviderDeleteTaskResponse)
+async def get_delete_provider_task_status(
+    provider_id: str,
+    task_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> ProviderDeleteTaskResponse:
+    """查询 Provider 删除任务状态。"""
+    adapter = AdminProviderDeleteTaskStatusAdapter(provider_id=provider_id, task_id=task_id)
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
@@ -722,16 +755,50 @@ class AdminDeleteProviderAdapter(AdminApiAdapter):
             provider_id=provider.id,
             provider_name=provider.name,
         )
-        db.delete(provider)
-        db.commit()
 
-        # 清除 /v1/models 列表缓存
-        await invalidate_models_list_cache()
+        task_id = await submit_provider_delete(provider.id)
 
-        # 清除 GlobalModel 解析缓存（删除 Provider 会影响模型解析结果）
-        await ModelCacheService.invalidate_all_resolve_cache()
+        provider_was_active = bool(provider.is_active)
+        if provider_was_active:
+            provider.is_active = False
+            db.commit()
+            await invalidate_models_list_cache()
+            await ModelCacheService.invalidate_all_resolve_cache()
+            await ProviderCacheService.invalidate_provider_cache(provider.id)
 
-        return {"message": "提供商已删除"}
+        context.add_audit_metadata(
+            task_id=task_id,
+            provider_deactivated=provider_was_active,
+        )
+        return {
+            "task_id": task_id,
+            "status": "pending",
+            "message": "删除任务已提交，提供商已进入后台删除队列",
+        }
+
+
+class AdminProviderDeleteTaskStatusAdapter(AdminApiAdapter):
+    def __init__(self, provider_id: str, task_id: str):
+        self.provider_id = provider_id
+        self.task_id = task_id
+
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        from fastapi import HTTPException
+
+        task = await get_provider_delete_task(self.task_id)
+        if task is None or task.provider_id != self.provider_id:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return ProviderDeleteTaskResponse(
+            task_id=task.task_id,
+            provider_id=task.provider_id,
+            status=task.status,
+            stage=task.stage,
+            total_keys=task.total_keys,
+            deleted_keys=task.deleted_keys,
+            total_endpoints=task.total_endpoints,
+            deleted_endpoints=task.deleted_endpoints,
+            message=task.message,
+        )
 
 
 @router.get(

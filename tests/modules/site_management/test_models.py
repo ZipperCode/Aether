@@ -14,7 +14,8 @@ def test_webdav_source_table_and_fields() -> None:
     """WebDavSource has correct table name and all required fields."""
     assert WebDavSource.__tablename__ == "webdav_sources"
     for field in ("id", "name", "url", "username", "password", "is_active",
-                  "sync_enabled", "last_sync_at", "last_sync_status",
+                  "sync_enabled", "checkin_enabled", "checkin_time",
+                  "last_sync_at", "last_sync_status",
                   "created_at", "updated_at"):
         assert hasattr(WebDavSource, field), f"Missing field: {field}"
 
@@ -74,6 +75,17 @@ def test_site_source_snapshot_has_webdav_source_id() -> None:
 def test_site_sync_run_has_webdav_source_id() -> None:
     """SiteSyncRun has webdav_source_id."""
     assert hasattr(SiteSyncRun, "webdav_source_id")
+
+
+def test_site_checkin_run_has_webdav_source_id() -> None:
+    """SiteCheckinRun has webdav_source_id for source-level log filtering."""
+    assert hasattr(SiteCheckinRun, "webdav_source_id")
+
+
+def test_site_checkin_item_has_account_fields() -> None:
+    """SiteCheckinItem has account-level fields for per-source detail logs."""
+    for field in ("account_id", "account_domain", "account_site_url"):
+        assert hasattr(SiteCheckinItem, field), f"Missing field: {field}"
 
 
 def test_unchanged_models_fields() -> None:

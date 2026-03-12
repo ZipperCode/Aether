@@ -14,6 +14,7 @@ export interface SystemConfig {
   default_user_quota_usd: number
   rate_limit_per_minute: number
   enable_registration: boolean
+  password_policy_level: string
   // 独立余额 Key 过期管理
   auto_delete_expired_keys: boolean
   // 格式转换
@@ -34,12 +35,6 @@ export interface SystemConfig {
   // 定时任务
   enable_provider_checkin: boolean
   provider_checkin_time: string
-  enable_all_api_hub_sync: boolean
-  enable_all_api_hub_auto_create_provider_ops: boolean
-  all_api_hub_sync_time: string
-  all_api_hub_webdav_url: string
-  all_api_hub_webdav_username: string
-  all_api_hub_webdav_password: string
   enable_user_quota_reset: boolean
   user_quota_reset_time: string
   user_quota_reset_interval_days: number
@@ -62,6 +57,7 @@ const CONFIG_KEYS = [
   'default_user_quota_usd',
   'rate_limit_per_minute',
   'enable_registration',
+  'password_policy_level',
   // 独立余额 Key 过期管理
   'auto_delete_expired_keys',
   // 格式转换
@@ -82,12 +78,6 @@ const CONFIG_KEYS = [
   // 定时任务
   'enable_provider_checkin',
   'provider_checkin_time',
-  'enable_all_api_hub_sync',
-  'enable_all_api_hub_auto_create_provider_ops',
-  'all_api_hub_sync_time',
-  'all_api_hub_webdav_url',
-  'all_api_hub_webdav_username',
-  'all_api_hub_webdav_password',
   'enable_user_quota_reset',
   'user_quota_reset_time',
   'user_quota_reset_interval_days',
@@ -111,6 +101,7 @@ function createDefaultConfig(): SystemConfig {
     default_user_quota_usd: 10.0,
     rate_limit_per_minute: 0,
     enable_registration: false,
+    password_policy_level: 'weak',
     // 独立余额 Key 过期管理
     auto_delete_expired_keys: false,
     // 格式转换
@@ -131,12 +122,6 @@ function createDefaultConfig(): SystemConfig {
     // 定时任务
     enable_provider_checkin: true,
     provider_checkin_time: '01:05',
-    enable_all_api_hub_sync: false,
-    enable_all_api_hub_auto_create_provider_ops: true,
-    all_api_hub_sync_time: '01:35',
-    all_api_hub_webdav_url: '',
-    all_api_hub_webdav_username: '',
-    all_api_hub_webdav_password: '',
     enable_user_quota_reset: false,
     user_quota_reset_time: '05:00',
     user_quota_reset_interval_days: 1,
@@ -185,6 +170,7 @@ export function useSystemConfig() {
       systemConfig.value.default_user_quota_usd !== originalConfig.value.default_user_quota_usd ||
       systemConfig.value.rate_limit_per_minute !== originalConfig.value.rate_limit_per_minute ||
       systemConfig.value.enable_registration !== originalConfig.value.enable_registration ||
+      systemConfig.value.password_policy_level !== originalConfig.value.password_policy_level ||
       systemConfig.value.auto_delete_expired_keys !== originalConfig.value.auto_delete_expired_keys ||
       systemConfig.value.enable_format_conversion !== originalConfig.value.enable_format_conversion
     )
@@ -342,6 +328,11 @@ export function useSystemConfig() {
           description: '是否开放用户注册',
         },
         {
+          key: 'password_policy_level',
+          value: systemConfig.value.password_policy_level,
+          description: '密码策略等级',
+        },
+        {
           key: 'auto_delete_expired_keys',
           value: systemConfig.value.auto_delete_expired_keys,
           description: '是否自动删除过期的API Key',
@@ -362,6 +353,7 @@ export function useSystemConfig() {
         originalConfig.value.default_user_quota_usd = systemConfig.value.default_user_quota_usd
         originalConfig.value.rate_limit_per_minute = systemConfig.value.rate_limit_per_minute
         originalConfig.value.enable_registration = systemConfig.value.enable_registration
+        originalConfig.value.password_policy_level = systemConfig.value.password_policy_level
         originalConfig.value.auto_delete_expired_keys =
           systemConfig.value.auto_delete_expired_keys
         originalConfig.value.enable_format_conversion =

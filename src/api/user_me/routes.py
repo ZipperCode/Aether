@@ -24,6 +24,7 @@ from src.core.exceptions import (
     translate_pydantic_error,
 )
 from src.core.logger import logger
+from src.core.validators import PasswordValidator
 from src.database import get_db
 from src.models.api import (
     ChangePasswordRequest,
@@ -43,6 +44,7 @@ from src.models.database import (
     User,
     UserModelUsageCount,
 )
+from src.services.system.config import SystemConfigService
 from src.services.system.time_range import TimeRangeParams
 from src.services.usage.service import UsageService
 from src.services.user.apikey import ApiKeyService
@@ -539,8 +541,10 @@ class ChangePasswordAdapter(AuthenticatedApiAdapter):
                 raise InvalidRequestException("旧密码错误")
         # 无密码（如 OAuth 用户首次设置）：无需旧密码
 
-        if len(request.new_password) < 6:
-            raise InvalidRequestException("密码长度至少6位")
+        policy_level = SystemConfigService.get_password_policy_level(db)
+        valid, error_msg = PasswordValidator.validate(request.new_password, policy=policy_level)
+        if not valid:
+            raise InvalidRequestException(error_msg or "密码格式无效")
 
         user.set_password(request.new_password)
         user.updated_at = datetime.now(timezone.utc)
@@ -1480,7 +1484,7 @@ class UpdateApiKeyProvidersAdapter(AuthenticatedApiAdapter):
         # 因为 allowed_providers 字段设计为存储 provider ID 字符串列表
         api_key.allowed_providers = (
             [cfg.provider_id for cfg in request.allowed_providers]
-            if request.allowed_providers
+            if request.allowed_providers is not None
             else None
         )
         api_key.updated_at = datetime.now(timezone.utc)

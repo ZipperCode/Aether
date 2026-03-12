@@ -122,17 +122,11 @@
                 class="text-[10px] px-1 py-0 h-4 shrink-0"
               >{{ key.oauth_plan_type }}</Badge>
               <Badge
-                v-if="getPrimaryOAuthOrganizationTitle(key)"
-                variant="secondary"
-                class="text-[10px] px-1 py-0 h-4 shrink-0 max-w-[92px] truncate"
-                :title="getOAuthOrganizationsTooltip(key)"
-              >{{ getPrimaryOAuthOrganizationTitle(key) }}</Badge>
-              <Badge
-                v-if="key.oauth_account_id"
+                v-if="getOAuthOrgBadge(key)"
                 variant="secondary"
                 class="text-[10px] px-1 py-0 h-4 shrink-0"
-                :title="key.oauth_account_id"
-              >acct {{ formatOAuthIdentityShort(key.oauth_account_id) }}</Badge>
+                :title="getOAuthOrgBadge(key)?.id"
+              >{{ getOAuthOrgBadge(key)?.label }}</Badge>
               <Badge
                 v-if="isBannedKey(key)"
                 variant="destructive"
@@ -141,10 +135,6 @@
             </div>
             <div class="flex items-center gap-1.5 mt-0.5 text-[11px] text-muted-foreground flex-wrap">
               <span :class="key.is_active ? '' : 'text-destructive'">{{ key.is_active ? '启用' : '禁用' }}</span>
-              <span
-                v-if="key.oauth_account_user_id"
-                :title="key.oauth_account_user_id"
-              >AUID {{ formatOAuthIdentityShort(key.oauth_account_user_id, 10, 8) }}</span>
               <span v-if="key.account_quota">{{ shortenQuota(key.account_quota) }}</span>
               <span v-if="key.proxy?.node_id">独立代理</span>
               <span
@@ -293,7 +283,7 @@ import {
 import { exportKey, refreshProviderQuota } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
-import { formatOAuthIdentityShort, getPrimaryOAuthOrganizationTitle, getOAuthOrganizationsTooltip } from '@/utils/oauthIdentity'
+import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 
 type QuickSelectorValue =
   | 'banned'

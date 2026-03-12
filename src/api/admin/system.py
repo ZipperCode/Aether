@@ -571,6 +571,7 @@ class AdminGetSystemSettingsAdapter(AdminApiAdapter):
             default_provider=default_provider,
             default_model=default_model,
             enable_usage_tracking=enable_usage_tracking,
+            password_policy_level=SystemConfigService.get_password_policy_level(db),
         )
 
 
@@ -620,6 +621,13 @@ class AdminUpdateSystemSettingsAdapter(AdminApiAdapter):
                 str(settings_request.enable_usage_tracking).lower(),
             )
 
+        if settings_request.password_policy_level is not None:
+            SystemConfigService.set_config(
+                db,
+                "password_policy_level",
+                settings_request.password_policy_level,
+            )
+
         return {"message": "系统设置更新成功"}
 
 
@@ -662,12 +670,15 @@ class AdminSetSystemConfigAdapter(AdminApiAdapter):
 
             value = crypto_service.encrypt(value)
 
-        config = SystemConfigService.set_config(
-            context.db,
-            self.key,
-            value,
-            payload.get("description"),
-        )
+        try:
+            config = SystemConfigService.set_config(
+                context.db,
+                self.key,
+                value,
+                payload.get("description"),
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc))
 
         # 如果更新的是签到任务时间，动态更新调度器
         if self.key == "provider_checkin_time" and value:

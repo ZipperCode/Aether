@@ -30,11 +30,14 @@ class SyncItemLog:
 
 @dataclass
 class CheckinItemLog:
-    provider_id: str
-    provider_name: str | None
-    provider_domain: str | None
     status: str
     message: str
+    provider_id: str | None = None
+    provider_name: str | None = None
+    provider_domain: str | None = None
+    account_id: str | None = None
+    account_domain: str | None = None
+    account_site_url: str | None = None
     balance_total: float | None = None
     balance_currency: str | None = None
 
@@ -105,11 +108,13 @@ class SiteManagementLogService:
         failed_count: int,
         skipped_count: int,
         items: list[CheckinItemLog],
+        webdav_source_id: str | None = None,
         error_message: str | None = None,
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
     ) -> SiteCheckinRun:
         run = SiteCheckinRun(
+            webdav_source_id=webdav_source_id,
             trigger_source=trigger_source,
             status=status,
             error_message=error_message,
@@ -130,6 +135,9 @@ class SiteManagementLogService:
                     provider_id=item.provider_id,
                     provider_name=item.provider_name,
                     provider_domain=item.provider_domain,
+                    account_id=item.account_id,
+                    account_domain=item.account_domain,
+                    account_site_url=item.account_site_url,
                     status=item.status,
                     message=item.message,
                     balance_total=item.balance_total,
