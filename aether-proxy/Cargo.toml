@@ -8,6 +8,11 @@ description = "Tunnel proxy for Aether"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+tokio-rustls = "0.26"
+tower-service = "0.3"
 futures-util = "0.3"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }

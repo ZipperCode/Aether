@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
+use http_body_util::{BodyExt, Full};
+use hyper::{Method, Request};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -203,49 +205,61 @@ async fn handle_stream_inner(
     let dns_ms = connect_start.elapsed().as_millis() as u64;
 
     // Execute upstream request
-    let client = &state.reqwest_client;
+    let client = &state.upstream_client;
     let timeout = Duration::from_secs(meta.timeout.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS));
 
-    let method: reqwest::Method = meta.method.parse().unwrap_or(reqwest::Method::GET);
+    let method: Method = meta.method.parse().unwrap_or(Method::GET);
     // Build a complete HeaderMap from tunnel headers, then set it all at once
     // via .headers() which *replaces* reqwest defaults (e.g. Accept: */*),
     // ensuring upstream sees exactly what Aether server intended.
-    let mut header_map = reqwest::header::HeaderMap::with_capacity(meta.headers.len());
-    for (k, v) in &meta.headers {
-        let k_lower = k.to_ascii_lowercase();
-        if BLOCKED_HEADERS.contains(&k_lower.as_str()) {
-            continue;
+    let mut builder = Request::builder().method(method).uri(&meta.url);
+    if let Some(headers) = builder.headers_mut() {
+        for (k, v) in &meta.headers {
+            let k_lower = k.to_ascii_lowercase();
+            if BLOCKED_HEADERS.contains(&k_lower.as_str()) {
+                continue;
+            }
+            if let (Ok(name), Ok(value)) = (
+                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                hyper::header::HeaderValue::from_str(v),
+            ) {
+                headers.insert(name, value);
+            }
         }
-        if let (Ok(name), Ok(value)) = (
-            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-            reqwest::header::HeaderValue::from_str(v),
-        ) {
-            header_map.insert(name, value);
-        }
+    } else {
+        send_error(frame_tx, stream_id, "failed to build request headers").await;
+        return None;
     }
-    let mut req = client.request(method, &meta.url).headers(header_map);
     let body_size = body.len();
-    if !body.is_empty() {
-        req = req.body(body);
-    }
-    req = req.timeout(timeout);
-
-    let upstream_start = Instant::now();
-    let response = match req.send().await {
-        Ok(r) => r,
+    let request = match builder.body(Full::new(body)) {
+        Ok(req) => req,
         Err(e) => {
+            send_error(frame_tx, stream_id, &format!("build request failed: {e}")).await;
+            return None;
+        }
+    };
+    let upstream_start = Instant::now();
+    let response = match tokio::time::timeout(timeout, client.request(request)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             server
                 .metrics
                 .failed_requests
                 .fetch_add(1, Ordering::Release);
-            let msg = if e.is_timeout() {
-                "upstream timeout".to_string()
-            } else if e.is_connect() {
+            let msg = if e.is_connect() {
                 format!("upstream connect error: {e}")
             } else {
                 format!("upstream error: {e}")
             };
             send_error(frame_tx, stream_id, &msg).await;
+            return None;
+        }
+        Err(_) => {
+            server
+                .metrics
+                .failed_requests
+                .fetch_add(1, Ordering::Release);
+            send_error(frame_tx, stream_id, "upstream timeout").await;
             return None;
         }
     };
@@ -298,7 +312,7 @@ async fn handle_stream_inner(
     // (e.g. uncompressed SSE text). Already-compressed data (gzip/br from
     // upstream Content-Encoding) won't shrink further and will be sent as-is
     // thanks to the size check in compress_payload().
-    let mut stream = response.bytes_stream();
+    let mut stream = response.into_body().into_data_stream();
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {

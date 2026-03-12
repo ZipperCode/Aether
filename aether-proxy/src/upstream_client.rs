@@ -11,7 +11,6 @@ use http_body_util::Full;
 use hyper::rt;
 use hyper::Response;
 use hyper::Uri;
-pub use hyper_util::client::legacy::connect::capture_connection;
 use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::client::legacy::Client;
