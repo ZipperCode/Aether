@@ -396,6 +396,21 @@ Expected: 均成功，无异常。
 - 系统设置不再显示 all-api-hub WebDAV 配置
 ```
 
+**Execution Record (2026-03-12)**
+
+- Backend:
+  - `uv run pytest tests/modules/site_management -q` -> `78 passed, 1 warning`
+  - `uv run pytest tests/services/test_system_config.py -q` -> `2 passed`
+- Frontend:
+  - `cd frontend && npm run type-check` -> PASS
+  - `cd frontend && npm run test:run -- src/features/site-management src/views/admin/system-settings` -> `2 passed`
+- Migration:
+  - 使用 docker 容器 `aether-postgres` 的 `POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB` 组装 `DATABASE_URL=postgresql://postgres:***@localhost:5432/aether`
+  - 在 feature worktree 下执行 `uv run alembic current && uv run alembic upgrade head && uv run alembic downgrade -1 && uv run alembic upgrade head && uv run alembic current`
+  - 结果：初始 revision 为 `a9b1c2d3e4f5 (head)`，成功回滚到 `f6a7b8c9d0e1` 后重新升级回 `a9b1c2d3e4f5 (head)`
+- Manual smoke:
+  - 本轮未执行 UI 手工冒烟；仅完成自动化验证与迁移链路验证
+
 **Step 5: Commit**
 
 ```bash

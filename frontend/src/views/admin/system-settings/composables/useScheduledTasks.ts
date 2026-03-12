@@ -1,5 +1,5 @@
 import { ref, computed, type Ref } from 'vue'
-import { CalendarCheck, RotateCcw, RefreshCw, KeyRound, Cloud } from 'lucide-vue-next'
+import { CalendarCheck, RotateCcw, RefreshCw, KeyRound } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
 import { adminApi } from '@/api/admin'
 import { log } from '@/utils/logger'
@@ -9,16 +9,11 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
   const { success, error } = useToast()
 
   const checkinConfigLoading = ref(false)
-  const allApiHubSyncConfigLoading = ref(false)
   const quotaResetConfigLoading = ref(false)
   const standaloneKeyResetConfigLoading = ref(false)
 
   // 签到时间的原始值（用于回滚）
   const previousCheckinTime = ref('')
-  const previousAllApiHubSyncTime = ref('')
-  const previousAllApiHubWebdavUrl = ref('')
-  const previousAllApiHubWebdavUsername = ref('')
-  const previousAllApiHubAutoCreateProviderOps = ref(true)
   // 用户配额重置时间的原始值
   const previousUserQuotaResetTime = ref('')
   const previousUserQuotaResetIntervalDays = ref(1)
@@ -29,11 +24,6 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
   // 初始化原始值（在配置加载完成后调用）
   function initPreviousValues() {
     previousCheckinTime.value = systemConfig.value.provider_checkin_time
-    previousAllApiHubSyncTime.value = systemConfig.value.all_api_hub_sync_time
-    previousAllApiHubWebdavUrl.value = systemConfig.value.all_api_hub_webdav_url
-    previousAllApiHubWebdavUsername.value = systemConfig.value.all_api_hub_webdav_username
-    previousAllApiHubAutoCreateProviderOps.value =
-      systemConfig.value.enable_all_api_hub_auto_create_provider_ops
     previousUserQuotaResetTime.value = systemConfig.value.user_quota_reset_time
     previousUserQuotaResetIntervalDays.value = systemConfig.value.user_quota_reset_interval_days
     previousStandaloneKeyResetTime.value = systemConfig.value.standalone_key_quota_reset_time
@@ -59,34 +49,6 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
 
   const hasCheckinTimeChanged = computed(() => {
     return systemConfig.value.provider_checkin_time !== previousCheckinTime.value
-  })
-
-  // all-api-hub 同步时间
-  const allApiHubSyncHour = computed(() => {
-    const time = systemConfig.value.all_api_hub_sync_time
-    if (!time || !time.includes(':')) return '01'
-    return time.split(':')[0]
-  })
-
-  const allApiHubSyncMinute = computed(() => {
-    const time = systemConfig.value.all_api_hub_sync_time
-    if (!time || !time.includes(':')) return '35'
-    return time.split(':')[1]
-  })
-
-  function updateAllApiHubSyncTime(hour: string, minute: string) {
-    systemConfig.value.all_api_hub_sync_time = `${hour}:${minute}`
-  }
-
-  const hasAllApiHubSyncConfigChanged = computed(() => {
-    return (
-      systemConfig.value.all_api_hub_sync_time !== previousAllApiHubSyncTime.value ||
-      systemConfig.value.all_api_hub_webdav_url !== previousAllApiHubWebdavUrl.value ||
-      systemConfig.value.all_api_hub_webdav_username !== previousAllApiHubWebdavUsername.value ||
-      systemConfig.value.enable_all_api_hub_auto_create_provider_ops !==
-      previousAllApiHubAutoCreateProviderOps.value ||
-      !!systemConfig.value.all_api_hub_webdav_password
-    )
   })
 
   // 用户配额重置时间
@@ -188,23 +150,6 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
     }
   }
 
-  async function handleAllApiHubSyncToggle(enabled: boolean) {
-    const previousValue = systemConfig.value.enable_all_api_hub_sync
-    systemConfig.value.enable_all_api_hub_sync = enabled
-    try {
-      await adminApi.updateSystemConfig(
-        'enable_all_api_hub_sync',
-        enabled,
-        '是否启用 all-api-hub WebDAV Cookie 自动同步任务'
-      )
-      success(enabled ? '已启用 all-api-hub 自动同步' : '已禁用 all-api-hub 自动同步')
-    } catch (err) {
-      error('保存配置失败')
-      log.error('保存 all-api-hub 自动同步配置失败:', err)
-      systemConfig.value.enable_all_api_hub_sync = previousValue
-    }
-  }
-
   async function handleOAuthTokenRefreshToggle(enabled: boolean) {
     const previousValue = systemConfig.value.enable_oauth_token_refresh
     systemConfig.value.enable_oauth_token_refresh = enabled
@@ -247,15 +192,6 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
   function handleQuotaResetConfigCancel() {
     systemConfig.value.user_quota_reset_time = previousUserQuotaResetTime.value
     systemConfig.value.user_quota_reset_interval_days = previousUserQuotaResetIntervalDays.value
-  }
-
-  function handleAllApiHubSyncConfigCancel() {
-    systemConfig.value.all_api_hub_sync_time = previousAllApiHubSyncTime.value
-    systemConfig.value.all_api_hub_webdav_url = previousAllApiHubWebdavUrl.value
-    systemConfig.value.all_api_hub_webdav_username = previousAllApiHubWebdavUsername.value
-    systemConfig.value.enable_all_api_hub_auto_create_provider_ops =
-      previousAllApiHubAutoCreateProviderOps.value
-    systemConfig.value.all_api_hub_webdav_password = ''
   }
 
   function handleStandaloneKeyResetConfigCancel() {
@@ -353,111 +289,6 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
       success('配额重置配置已保存')
     } finally {
       quotaResetConfigLoading.value = false
-    }
-  }
-
-  async function handleAllApiHubSyncConfigSave() {
-    const configItems: Array<{
-      key: string
-      value: unknown
-      description: string
-      onSuccess: () => void
-    }> = []
-
-    if (systemConfig.value.all_api_hub_sync_time !== previousAllApiHubSyncTime.value) {
-      const newTime = systemConfig.value.all_api_hub_sync_time
-      if (!newTime || !/^\d{2}:\d{2}$/.test(newTime)) {
-        error('请输入有效的时间格式 (HH:MM)')
-        return
-      }
-      configItems.push({
-        key: 'all_api_hub_sync_time',
-        value: newTime,
-        description: 'all-api-hub WebDAV Cookie 自动同步执行时间（HH:MM 格式）',
-        onSuccess: () => {
-          previousAllApiHubSyncTime.value = newTime
-        },
-      })
-    }
-
-    if (systemConfig.value.all_api_hub_webdav_url !== previousAllApiHubWebdavUrl.value) {
-      const url = systemConfig.value.all_api_hub_webdav_url.trim()
-      systemConfig.value.all_api_hub_webdav_url = url
-      configItems.push({
-        key: 'all_api_hub_webdav_url',
-        value: url || null,
-        description: 'all-api-hub WebDAV 备份文件 URL',
-        onSuccess: () => {
-          previousAllApiHubWebdavUrl.value = url
-        },
-      })
-    }
-
-    if (
-      systemConfig.value.all_api_hub_webdav_username !== previousAllApiHubWebdavUsername.value
-    ) {
-      const username = systemConfig.value.all_api_hub_webdav_username.trim()
-      systemConfig.value.all_api_hub_webdav_username = username
-      configItems.push({
-        key: 'all_api_hub_webdav_username',
-        value: username || null,
-        description: 'all-api-hub WebDAV 用户名',
-        onSuccess: () => {
-          previousAllApiHubWebdavUsername.value = username
-        },
-      })
-    }
-
-    if (systemConfig.value.all_api_hub_webdav_password) {
-      configItems.push({
-        key: 'all_api_hub_webdav_password',
-        value: systemConfig.value.all_api_hub_webdav_password,
-        description: 'all-api-hub WebDAV 密码（加密存储）',
-        onSuccess: () => {
-          systemConfig.value.all_api_hub_webdav_password = ''
-        },
-      })
-    }
-
-    if (
-      systemConfig.value.enable_all_api_hub_auto_create_provider_ops !==
-      previousAllApiHubAutoCreateProviderOps.value
-    ) {
-      const enabled = systemConfig.value.enable_all_api_hub_auto_create_provider_ops
-      configItems.push({
-        key: 'enable_all_api_hub_auto_create_provider_ops',
-        value: enabled,
-        description: 'all-api-hub 同步时是否自动创建缺失 provider_ops 配置',
-        onSuccess: () => {
-          previousAllApiHubAutoCreateProviderOps.value = enabled
-        },
-      })
-    }
-
-    if (configItems.length === 0) return
-
-    allApiHubSyncConfigLoading.value = true
-    const failedKeys: string[] = []
-
-    try {
-      for (const item of configItems) {
-        try {
-          await adminApi.updateSystemConfig(item.key, item.value, item.description)
-          item.onSuccess()
-        } catch (err) {
-          failedKeys.push(item.key)
-          log.error(`保存 all-api-hub 同步配置失败: ${item.key}`, err)
-        }
-      }
-
-      if (failedKeys.length > 0) {
-        error(`部分配置保存失败: ${failedKeys.join(', ')}`)
-        return
-      }
-
-      success('all-api-hub 同步配置已保存')
-    } finally {
-      allApiHubSyncConfigLoading.value = false
     }
   }
 
@@ -577,22 +408,6 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
       onCancel: handleCheckinTimeCancel,
     },
     {
-      id: 'all-api-hub-sync',
-      icon: Cloud,
-      title: 'all-api-hub Cookie 自动同步',
-      description: '定时从 WebDAV 拉取备份并按域名匹配更新 Cookie',
-      enabled: systemConfig.value.enable_all_api_hub_sync,
-      hasTimeConfig: true,
-      hour: allApiHubSyncHour.value,
-      minute: allApiHubSyncMinute.value,
-      updateTime: updateAllApiHubSyncTime,
-      hasChanges: hasAllApiHubSyncConfigChanged.value,
-      loading: allApiHubSyncConfigLoading.value,
-      onToggle: handleAllApiHubSyncToggle,
-      onSave: handleAllApiHubSyncConfigSave,
-      onCancel: handleAllApiHubSyncConfigCancel,
-    },
-    {
       id: 'user-quota-reset',
       icon: RotateCcw,
       title: '用户配额自动重置',
@@ -644,7 +459,6 @@ export function useScheduledTasks(systemConfig: Ref<SystemConfig>) {
 
   return {
     checkinConfigLoading,
-    allApiHubSyncConfigLoading,
     quotaResetConfigLoading,
     standaloneKeyResetConfigLoading,
     scheduledTasks,

@@ -5,7 +5,6 @@ from src.api.admin.provider_sync import router
 from src.database import get_db
 from src.models.database import Provider
 from src.modules.site_management.services.log_service import SiteManagementLogService
-from src.services.system.config import SystemConfigService
 from src.utils.auth_utils import require_admin
 
 
@@ -40,64 +39,120 @@ def _provider(provider_id: str, website: str, config: dict | None) -> Provider:
     )
 
 
-def test_trigger_sync_returns_summary() -> None:
-    provider = _provider(
-        "p1",
-        "https://anyrouter.top",
-        {
-            "provider_ops": {
-                "architecture_id": "anyrouter",
-                "connector": {
-                    "auth_type": "cookie",
-                    "config": {},
-                    "credentials": {"session_cookie": "old"},
-                },
-            }
-        },
-    )
-    db = _FakeSession([provider])
-
+def _build_test_client(db: _FakeSession) -> TestClient:
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[require_admin] = lambda: object()
     app.dependency_overrides[get_db] = lambda: db
-    original_record = SiteManagementLogService.record_sync_run
-    original_get_config = SystemConfigService.get_config
-    SiteManagementLogService.record_sync_run = staticmethod(  # type: ignore[assignment]
-        lambda **kwargs: type("Run", (), {"id": "run-1"})()
+    return TestClient(app)
+
+
+def _sync_result(**overrides: int | bool):
+    return type(
+        "Result",
+        (),
+        {
+            "total_accounts": 1,
+            "total_providers": 1,
+            "matched_providers": 1,
+            "updated_providers": 1,
+            "skipped_no_provider_ops": 0,
+            "skipped_no_cookie": 0,
+            "skipped_not_changed": 0,
+            "dry_run": False,
+            **overrides,
+        },
+    )()
+
+
+def test_trigger_sync_defaults_auto_create_provider_ops_to_true(monkeypatch) -> None:
+    provider = _provider("p1", "https://anyrouter.top", None)
+    db = _FakeSession([provider])
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        SiteManagementLogService,
+        "record_sync_run",
+        staticmethod(lambda **kwargs: type("Run", (), {"id": "run-1"})()),
     )
-    SystemConfigService.get_config = classmethod(  # type: ignore[assignment]
-        lambda cls, _db, key, default=None: (
-            True if key == "enable_all_api_hub_auto_create_provider_ops" else default
-        )
+    monkeypatch.setattr(
+        "src.services.system.config.SystemConfigService.get_config",
+        classmethod(
+            lambda cls, *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("should not read legacy system config")
+            )
+        ),
     )
 
-    try:
-        client = TestClient(app)
-        resp = client.post(
-            "/api/admin/provider-sync/trigger",
-            json={
-                "url": "https://dav.example.com/backup.json",
-                "username": "u",
-                "password": "p",
-                "backup": {
-                    "version": "2.0",
-                    "accounts": {
-                        "accounts": [
-                            {
-                                "site_url": "https://anyrouter.top/path",
-                                "cookieAuth": {"sessionCookie": "session=new"},
-                            }
-                        ]
-                    },
-                },
-            },
-        )
+    def fake_sync_from_backup_object(self, session, backup, dry_run, auto_create_provider_ops):
+        captured["auto_create_provider_ops"] = auto_create_provider_ops
+        captured["dry_run"] = dry_run
+        return _sync_result()
 
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["matched_providers"] == 1
-        assert data["updated_providers"] == 1
-    finally:
-        SiteManagementLogService.record_sync_run = original_record  # type: ignore[assignment]
-        SystemConfigService.get_config = original_get_config  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "src.api.admin.provider_sync.AllApiHubSyncService.sync_from_backup_object",
+        fake_sync_from_backup_object,
+    )
+
+    client = _build_test_client(db)
+    resp = client.post(
+        "/api/admin/provider-sync/trigger",
+        json={
+            "url": "https://dav.example.com/backup.json",
+            "username": "u",
+            "password": "p",
+            "backup": {"version": "2.0", "accounts": {"accounts": []}},
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["run_id"] == "run-1"
+    assert captured["auto_create_provider_ops"] is True
+    assert captured["dry_run"] is False
+
+
+def test_trigger_sync_honors_auto_create_provider_ops_override(monkeypatch) -> None:
+    provider = _provider("p1", "https://anyrouter.top", None)
+    db = _FakeSession([provider])
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        SiteManagementLogService,
+        "record_sync_run",
+        staticmethod(lambda **kwargs: type("Run", (), {"id": "run-1"})()),
+    )
+    monkeypatch.setattr(
+        "src.services.system.config.SystemConfigService.get_config",
+        classmethod(
+            lambda cls, *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("should not read legacy system config")
+            )
+        ),
+    )
+
+    def fake_sync_from_backup_object(self, session, backup, dry_run, auto_create_provider_ops):
+        captured["auto_create_provider_ops"] = auto_create_provider_ops
+        return _sync_result(updated_providers=0, skipped_no_provider_ops=1)
+
+    monkeypatch.setattr(
+        "src.api.admin.provider_sync.AllApiHubSyncService.sync_from_backup_object",
+        fake_sync_from_backup_object,
+    )
+
+    client = _build_test_client(db)
+    resp = client.post(
+        "/api/admin/provider-sync/trigger",
+        json={
+            "url": "https://dav.example.com/backup.json",
+            "username": "u",
+            "password": "p",
+            "auto_create_provider_ops": False,
+            "backup": {"version": "2.0", "accounts": {"accounts": []}},
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["updated_providers"] == 0
+    assert data["skipped_no_provider_ops"] == 1
+    assert captured["auto_create_provider_ops"] is False

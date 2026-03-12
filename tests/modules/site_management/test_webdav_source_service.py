@@ -51,6 +51,26 @@ def test_create_source_encrypts_password(service, mock_db):
         assert result is mock_instance
 
 
+def test_create_source_with_checkin_config(service, mock_db):
+    with patch(
+        "src.modules.site_management.services.webdav_source_service.WebDavSource"
+    ) as MockModel:
+        MockModel.return_value = MagicMock()
+
+        service.create(
+            name="Test",
+            url="https://dav.example.com",
+            username="user",
+            password="secret",
+            checkin_enabled=False,
+            checkin_time="08:30",
+        )
+
+        kwargs = MockModel.call_args[1]
+        assert kwargs["checkin_enabled"] is False
+        assert kwargs["checkin_time"] == "08:30"
+
+
 def test_create_source_generates_uuid(service, mock_db):
     with patch(
         "src.modules.site_management.services.webdav_source_service.WebDavSource"
@@ -62,6 +82,18 @@ def test_create_source_generates_uuid(service, mock_db):
         kwargs = MockModel.call_args[1]
         assert kwargs["id"] is not None
         assert len(kwargs["id"]) == 36  # UUID format
+
+
+def test_create_source_invalid_checkin_time_raises(service):
+    with pytest.raises(ValueError, match="checkin_time"):
+        service.create(
+            name="Test",
+            url="https://dav.example.com",
+            username="user",
+            password="secret",
+            checkin_enabled=True,
+            checkin_time="25:99",
+        )
 
 
 def test_get_source(service, mock_db):
@@ -97,6 +129,25 @@ def test_update_source_reencrypts_password(service, mock_db):
     # Check password was encrypted
     service.crypto.encrypt.assert_called_with("newsecret")
     mock_db.flush.assert_called()
+
+
+def test_update_source_supports_checkin_config(service, mock_db):
+    fake_source = MagicMock()
+    mock_db.query.return_value.filter.return_value.first.return_value = fake_source
+
+    service.update("source-1", checkin_enabled=False, checkin_time="07:45")
+
+    assert fake_source.checkin_enabled is False
+    assert fake_source.checkin_time == "07:45"
+    mock_db.flush.assert_called()
+
+
+def test_update_source_invalid_checkin_time_raises(service, mock_db):
+    fake_source = MagicMock()
+    mock_db.query.return_value.filter.return_value.first.return_value = fake_source
+
+    with pytest.raises(ValueError, match="checkin_time"):
+        service.update("source-1", checkin_time="99:99")
 
 
 def test_update_source_without_password(service, mock_db):
