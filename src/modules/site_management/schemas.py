@@ -124,6 +124,7 @@ class CheckinRunResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    webdav_source_id: str | None
     trigger_source: str
     status: str
     error_message: str | None
@@ -144,6 +145,9 @@ class CheckinItemResponse(BaseModel):
     provider_id: str | None
     provider_name: str | None
     provider_domain: str | None
+    account_id: str | None
+    account_domain: str | None
+    account_site_url: str | None
     status: str
     message: str | None
     balance_total: float | None

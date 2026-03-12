@@ -20,6 +20,7 @@
 
       <div class="flex items-center gap-3 text-xs text-muted-foreground">
         <span>{{ source.account_count }} 个账号</span>
+        <span>{{ source.checkin_enabled ? `签到 ${source.checkin_time}` : '签到已关闭' }}</span>
         <span v-if="source.last_sync_at">
           上次同步: {{ formatDate(source.last_sync_at) }}
         </span>

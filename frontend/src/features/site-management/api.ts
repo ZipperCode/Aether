@@ -71,7 +71,7 @@ export const siteManagementApi = {
     const { data } = await apiClient.get<PaginatedResponse<SyncItem>>(`${BASE}/sync-runs/${runId}/items`, { params })
     return data
   },
-  async listCheckinRuns(params?: { page?: number; page_size?: number }): Promise<PaginatedResponse<CheckinRun>> {
+  async listCheckinRuns(params?: { page?: number; page_size?: number; source_id?: string }): Promise<PaginatedResponse<CheckinRun>> {
     const { data } = await apiClient.get<PaginatedResponse<CheckinRun>>(`${BASE}/checkin-runs`, { params })
     return data
   },

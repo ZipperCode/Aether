@@ -119,52 +119,6 @@
             </div>
           </div>
 
-          <!-- all-api-hub 同步额外配置 -->
-          <div
-            v-if="task.id === 'all-api-hub-sync' && task.enabled"
-            class="px-4 pb-4 pt-0 space-y-3"
-          >
-            <div class="p-3 rounded-lg bg-muted/30 border border-border/50 space-y-2">
-              <div class="text-xs text-muted-foreground">
-                WebDAV 配置
-              </div>
-              <label class="flex items-center justify-between gap-3 rounded-md border border-border/60 bg-background/70 px-3 py-2">
-                <div class="space-y-0.5">
-                  <div class="text-xs font-medium">自动补全 provider_ops</div>
-                  <div class="text-[11px] text-muted-foreground">
-                    域名匹配成功但未配置 provider_ops 时，自动创建最小可用配置
-                  </div>
-                </div>
-                <Switch
-                  :model-value="allApiHubAutoCreateProviderOps"
-                  @update:model-value="$emit('update:allApiHubAutoCreateProviderOps', Boolean($event))"
-                />
-              </label>
-              <Input
-                :model-value="allApiHubWebdavUrl"
-                placeholder="WebDAV 备份 URL，例如 https://dav.example.com/backup.json"
-                class="h-8 text-xs"
-                @update:model-value="$emit('update:allApiHubWebdavUrl', String($event || ''))"
-              />
-              <Input
-                :model-value="allApiHubWebdavUsername"
-                placeholder="WebDAV 用户名"
-                class="h-8 text-xs"
-                @update:model-value="$emit('update:allApiHubWebdavUsername', String($event || ''))"
-              />
-              <Input
-                :model-value="allApiHubWebdavPassword"
-                type="password"
-                placeholder="WebDAV 密码（留空表示不修改）"
-                class="h-8 text-xs"
-                @update:model-value="$emit('update:allApiHubWebdavPassword', String($event || ''))"
-              />
-            </div>
-            <p class="text-[11px] text-muted-foreground ml-1">
-              同步时按站点域名匹配提供商（网站名称可不同）
-            </p>
-          </div>
-
           <!-- 额外配置区域（仅用户配额重置任务有） -->
           <div
             v-if="task.id === 'user-quota-reset' && task.enabled"
@@ -327,10 +281,6 @@ interface StandaloneKeyOption {
 
 defineProps<{
   scheduledTasks: ScheduledTask[]
-  allApiHubAutoCreateProviderOps: boolean
-  allApiHubWebdavUrl: string
-  allApiHubWebdavUsername: string
-  allApiHubWebdavPassword: string
   quotaResetIntervalDays: number
   standaloneKeyResetIntervalDays: number
   standaloneKeyResetMode: string
@@ -339,10 +289,6 @@ defineProps<{
 }>()
 
 defineEmits<{
-  'update:allApiHubAutoCreateProviderOps': [value: boolean]
-  'update:allApiHubWebdavUrl': [value: string]
-  'update:allApiHubWebdavUsername': [value: string]
-  'update:allApiHubWebdavPassword': [value: string]
   'update:quotaResetIntervalDays': [value: number]
   'update:standaloneKeyResetIntervalDays': [value: number]
   'update:standaloneKeyResetMode': [value: string]

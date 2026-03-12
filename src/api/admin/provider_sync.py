@@ -11,7 +11,6 @@ from src.database import get_db
 from src.models.database import User
 from src.services.provider_sync import AllApiHubSyncService
 from src.modules.site_management.services.log_service import SiteManagementLogService
-from src.services.system.config import SystemConfigService
 from src.utils.auth_utils import require_admin
 
 router = APIRouter(prefix="/api/admin/provider-sync", tags=["Provider Sync"])
@@ -22,6 +21,10 @@ class SyncTriggerRequest(BaseModel):
     username: str = Field(..., description="WebDAV username")
     password: str = Field(..., description="WebDAV password")
     dry_run: bool = Field(False, description="Preview mode, do not persist")
+    auto_create_provider_ops: bool = Field(
+        True,
+        description="Whether to auto-create provider_ops for matched providers missing a config",
+    )
     backup: dict[str, Any] | None = Field(
         None, description="Optional inline backup payload (for testing/manual import)"
     )
@@ -34,11 +37,6 @@ async def trigger_sync(
     _: User = Depends(require_admin),
 ) -> Any:
     service = AllApiHubSyncService()
-    auto_create_provider_ops = SystemConfigService.get_config(
-        db,
-        "enable_all_api_hub_auto_create_provider_ops",
-        True,
-    )
     started_at = datetime.now(timezone.utc)
     run_id: str | None = None
     try:
@@ -47,7 +45,7 @@ async def trigger_sync(
                 db,
                 payload.backup,
                 dry_run=payload.dry_run,
-                auto_create_provider_ops=bool(auto_create_provider_ops),
+                auto_create_provider_ops=payload.auto_create_provider_ops,
             )
         else:
             result = await service.sync_from_webdav(
@@ -56,7 +54,7 @@ async def trigger_sync(
                 username=payload.username,
                 password=payload.password,
                 dry_run=payload.dry_run,
-                auto_create_provider_ops=bool(auto_create_provider_ops),
+                auto_create_provider_ops=payload.auto_create_provider_ops,
             )
         run = SiteManagementLogService.record_sync_run(
             db=db,

@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from src.core.logger import logger
 from src.database import get_db
 from src.modules.site_management.models import (
     SiteAccount,
@@ -27,6 +28,7 @@ from src.modules.site_management.schemas import (
 from src.modules.site_management.services.account_ops_service import AccountOpsService
 from src.modules.site_management.services.account_sync_service import AccountSyncService
 from src.modules.site_management.services.log_service import SiteManagementLogService
+from src.modules.site_management.services.scheduler import SiteManagementScheduler
 from src.modules.site_management.services.snapshot_service import SiteSnapshotService
 from src.modules.site_management.services.webdav_source_service import WebDavSourceService
 from src.utils.auth_utils import require_admin
@@ -89,6 +91,13 @@ def _account_count_for_source(db: Session, source_id: str) -> int:
     )
 
 
+def _refresh_source_checkin_job(source_id: str) -> None:
+    try:
+        SiteManagementScheduler().refresh_source_checkin_job(source_id)
+    except Exception as exc:
+        logger.warning("刷新站点签到任务失败: source_id={}, error={}", source_id, exc)
+
+
 # ===================================================================
 # Source CRUD
 # ===================================================================
@@ -116,15 +125,20 @@ async def create_source(
 ) -> Any:
     """Create a new WebDav source."""
     service = WebDavSourceService(db)
-    source = service.create(
-        name=payload.name,
-        url=payload.url,
-        username=payload.username,
-        password=payload.password,
-        checkin_enabled=payload.checkin_enabled,
-        checkin_time=payload.checkin_time,
-    )
+    try:
+        source = service.create(
+            name=payload.name,
+            url=payload.url,
+            username=payload.username,
+            password=payload.password,
+            checkin_enabled=payload.checkin_enabled,
+            checkin_time=payload.checkin_time,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     db.commit()
+    _refresh_source_checkin_job(str(source.id))
     return _source_to_dict(source, 0)
 
 
@@ -138,10 +152,15 @@ async def update_source(
     """Update an existing WebDav source."""
     service = WebDavSourceService(db)
     update_data = payload.model_dump(exclude_unset=True)
-    source = service.update(source_id, **update_data)
+    try:
+        source = service.update(source_id, **update_data)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not source:
         raise HTTPException(status_code=404, detail="WebDav 源不存在")
     db.commit()
+    _refresh_source_checkin_job(source_id)
     return _source_to_dict(source, _account_count_for_source(db, source_id))
 
 
@@ -157,6 +176,7 @@ async def delete_source(
     if not deleted:
         raise HTTPException(status_code=404, detail="WebDav 源不存在")
     db.commit()
+    _refresh_source_checkin_job(source_id)
     return {"ok": True}
 
 
@@ -511,11 +531,15 @@ async def get_sync_run_items(
 async def list_checkin_runs(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
+    source_id: str | None = Query(None),
     db: Session = Depends(get_db),
     _: Any = Depends(require_admin),
 ) -> Any:
     """List checkin runs (paginated)."""
-    query = db.query(SiteCheckinRun).order_by(SiteCheckinRun.created_at.desc())
+    query = db.query(SiteCheckinRun)
+    if source_id:
+        query = query.filter(SiteCheckinRun.webdav_source_id == source_id)
+    query = query.order_by(SiteCheckinRun.created_at.desc())
     total = query.count()
     runs = query.offset((page - 1) * page_size).limit(page_size).all()
 
@@ -523,6 +547,7 @@ async def list_checkin_runs(
         "items": [
             {
                 "id": str(run.id),
+                "webdav_source_id": run.webdav_source_id,
                 "trigger_source": run.trigger_source,
                 "status": run.status,
                 "error_message": run.error_message,
@@ -571,6 +596,9 @@ async def get_checkin_run_items(
                 "provider_id": item.provider_id,
                 "provider_name": item.provider_name,
                 "provider_domain": item.provider_domain,
+                "account_id": item.account_id,
+                "account_domain": item.account_domain,
+                "account_site_url": item.account_site_url,
                 "status": item.status,
                 "message": item.message,
                 "balance_total": item.balance_total,

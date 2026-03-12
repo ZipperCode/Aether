@@ -41,6 +41,26 @@
             :placeholder="isEdit ? '留空表示不修改' : 'WebDav 密码'"
           />
         </div>
+        <div class="rounded-lg border border-border/60 p-3 space-y-3">
+          <div class="flex items-start justify-between gap-3">
+            <div class="space-y-1">
+              <Label>独立签到</Label>
+              <p class="text-xs text-muted-foreground">
+                为当前 WebDav 源单独启用每日签到调度
+              </p>
+            </div>
+            <Switch v-model="form.checkin_enabled" />
+          </div>
+          <div class="space-y-2">
+            <Label>签到时间</Label>
+            <Input
+              v-model="form.checkin_time"
+              type="time"
+              step="60"
+              :disabled="!form.checkin_enabled"
+            />
+          </div>
+        </div>
       </div>
 
       <DialogFooter class="flex-col sm:flex-row gap-2">
@@ -83,7 +103,7 @@ import { ref, watch } from 'vue'
 import { Loader2 } from 'lucide-vue-next'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
-  Button, Input, Label,
+  Button, Input, Label, Switch,
 } from '@/components/ui'
 import { siteManagementApi } from '../api'
 import { useToast } from '@/composables/useToast'
@@ -110,6 +130,8 @@ const form = ref({
   url: '',
   username: '',
   password: '',
+  checkin_enabled: true,
+  checkin_time: '04:00',
 })
 
 watch(() => props.open, (val) => {
@@ -121,10 +143,19 @@ watch(() => props.open, (val) => {
         url: props.source.url,
         username: props.source.username,
         password: '',
+        checkin_enabled: props.source.checkin_enabled,
+        checkin_time: props.source.checkin_time,
       }
     } else {
       isEdit.value = false
-      form.value = { name: '', url: '', username: '', password: '' }
+      form.value = {
+        name: '',
+        url: '',
+        username: '',
+        password: '',
+        checkin_enabled: true,
+        checkin_time: '04:00',
+      }
     }
   }
 })
@@ -172,6 +203,8 @@ async function handleSubmit() {
         name: form.value.name.trim(),
         url: form.value.url.trim(),
         username: form.value.username.trim(),
+        checkin_enabled: form.value.checkin_enabled,
+        checkin_time: form.value.checkin_time,
       }
       if (form.value.password) {
         payload.password = form.value.password
@@ -184,6 +217,8 @@ async function handleSubmit() {
         url: form.value.url.trim(),
         username: form.value.username.trim(),
         password: form.value.password,
+        checkin_enabled: form.value.checkin_enabled,
+        checkin_time: form.value.checkin_time,
       }
       result = await siteManagementApi.createSource(payload)
       success('WebDav 源已添加')
