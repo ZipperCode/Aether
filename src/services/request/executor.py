@@ -203,7 +203,7 @@ class RequestExecutor:
                     # 非流式请求：标记为 success 状态
                     from src.services.proxy_node.resolver import (
                         resolve_effective_proxy,
-                        resolve_proxy_info,
+                        resolve_proxy_info_async,
                     )
 
                     _eff_proxy = resolve_effective_proxy(
@@ -214,7 +214,7 @@ class RequestExecutor:
                         "model_name": model_name,
                         "api_format": api_format,
                     }
-                    _pi = resolve_proxy_info(_eff_proxy)
+                    _pi = await resolve_proxy_info_async(_eff_proxy)
                     if _pi:
                         _extra["proxy"] = _pi
                     RequestCandidateService.mark_candidate_success(

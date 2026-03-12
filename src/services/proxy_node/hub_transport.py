@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 
 _TUNNEL_COMPRESS_MIN_SIZE = 512
+_TUNNEL_ASYNC_COMPRESS_THRESHOLD = 64 * 1024
 _RECONNECT_DELAYS_SECONDS: tuple[float, ...] = (0.0, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0)
 _HEARTBEAT_DEDUP_TTL_SECONDS = 600
 _LOOP_WATCHDOG_INTERVAL_SECONDS = 1.0
@@ -619,7 +620,7 @@ class HubConnectionManager:
 
             body_data = body or b""
             if body_data:
-                body_payload, body_flags = _compress_frame_payload(body_data)
+                body_payload, body_flags = await _compress_frame_payload_async(body_data)
             else:
                 body_payload, body_flags = body_data, 0
             body_flags |= FrameFlags.END_STREAM
@@ -781,6 +782,12 @@ def _compress_frame_payload(data: bytes) -> tuple[bytes, int]:
         if len(compressed) < len(data):
             return compressed, FrameFlags.GZIP_COMPRESSED
     return data, 0
+
+
+async def _compress_frame_payload_async(data: bytes) -> tuple[bytes, int]:
+    if len(data) < _TUNNEL_ASYNC_COMPRESS_THRESHOLD:
+        return _compress_frame_payload(data)
+    return await asyncio.to_thread(_compress_frame_payload, data)
 
 
 def _decompress_frame_payload(frame: Frame) -> bytes:
