@@ -1,6 +1,7 @@
 """WebDav source CRUD service."""
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 
@@ -11,11 +12,35 @@ from src.modules.site_management.models import WebDavSource
 
 
 class WebDavSourceService:
+    _TIME_PATTERN = re.compile(r"^\d{2}:\d{2}$")
+
     def __init__(self, db: Session):
         self.db = db
         self.crypto = CryptoService()
 
-    def create(self, *, name: str, url: str, username: str, password: str) -> WebDavSource:
+    @classmethod
+    def _normalize_checkin_time(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("checkin_time must be HH:MM")
+        raw = value.strip()
+        if not cls._TIME_PATTERN.match(raw):
+            raise ValueError("checkin_time must be HH:MM")
+        hour = int(raw[:2])
+        minute = int(raw[3:5])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("checkin_time must be HH:MM")
+        return f"{hour:02d}:{minute:02d}"
+
+    def create(
+        self,
+        *,
+        name: str,
+        url: str,
+        username: str,
+        password: str,
+        checkin_enabled: bool = True,
+        checkin_time: str = "04:00",
+    ) -> WebDavSource:
         """Create a new WebDav source with encrypted password."""
         source = WebDavSource(
             id=str(uuid.uuid4()),
@@ -23,6 +48,8 @@ class WebDavSourceService:
             url=url,
             username=username,
             password=self.crypto.encrypt(password),
+            checkin_enabled=bool(checkin_enabled),
+            checkin_time=self._normalize_checkin_time(checkin_time),
         )
         self.db.add(source)
         self.db.flush()
@@ -36,6 +63,10 @@ class WebDavSourceService:
         for key, value in kwargs.items():
             if key == "password" and value:
                 value = self.crypto.encrypt(value)
+            if key == "checkin_time" and value is not None:
+                value = self._normalize_checkin_time(value)
+            if key == "checkin_enabled" and value is not None:
+                value = bool(value)
             if hasattr(source, key):
                 setattr(source, key, value)
         self.db.flush()

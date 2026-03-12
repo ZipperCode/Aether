@@ -19,6 +19,8 @@ class CreateWebDavSourceRequest(BaseModel):
     url: str = Field(..., max_length=500)
     username: str = Field(..., max_length=200)
     password: str
+    checkin_enabled: bool = True
+    checkin_time: str = "04:00"
 
 
 class UpdateWebDavSourceRequest(BaseModel):
@@ -28,6 +30,8 @@ class UpdateWebDavSourceRequest(BaseModel):
     password: str | None = None
     is_active: bool | None = None
     sync_enabled: bool | None = None
+    checkin_enabled: bool | None = None
+    checkin_time: str | None = None
 
 
 class TriggerSyncRequest(BaseModel):
@@ -55,6 +59,8 @@ class WebDavSourceResponse(BaseModel):
     username: str
     is_active: bool
     sync_enabled: bool
+    checkin_enabled: bool
+    checkin_time: str
     last_sync_at: datetime | None
     last_sync_status: str | None
     created_at: datetime

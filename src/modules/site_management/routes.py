@@ -70,6 +70,8 @@ def _source_to_dict(source: WebDavSource, account_count: int) -> dict[str, Any]:
         "username": source.username,
         "is_active": bool(source.is_active),
         "sync_enabled": bool(source.sync_enabled),
+        "checkin_enabled": bool(source.checkin_enabled),
+        "checkin_time": source.checkin_time,
         "last_sync_at": source.last_sync_at.isoformat() if source.last_sync_at else None,
         "last_sync_status": source.last_sync_status,
         "created_at": source.created_at.isoformat() if source.created_at else None,
@@ -119,6 +121,8 @@ async def create_source(
         url=payload.url,
         username=payload.username,
         password=payload.password,
+        checkin_enabled=payload.checkin_enabled,
+        checkin_time=payload.checkin_time,
     )
     db.commit()
     return _source_to_dict(source, 0)
