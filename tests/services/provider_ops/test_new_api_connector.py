@@ -6,11 +6,9 @@ import types
 import httpx
 import pytest
 
-_service_stub = types.ModuleType("src.services.provider_ops.service")
-_service_stub.ProviderOpsService = object  # type: ignore[attr-defined]
-sys.modules.setdefault("src.services.provider_ops.service", _service_stub)
 
-_cache_stub = types.ModuleType("src.core.cache_service")
+def _resolve_ops_proxy_config_stub(_config):
+    return None, None
 
 
 class _CacheServiceStub:
@@ -23,39 +21,41 @@ class _CacheServiceStub:
         return True
 
 
-_cache_stub.CacheService = _CacheServiceStub  # type: ignore[attr-defined]
-sys.modules.setdefault("src.core.cache_service", _cache_stub)
+@pytest.fixture()
+def _install_new_api_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
+    service_stub = types.ModuleType("src.services.provider_ops.service")
+    service_stub.ProviderOpsService = object  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "src.services.provider_ops.service", service_stub)
 
-_proxy_pkg_stub = types.ModuleType("src.services.proxy_node")
-_proxy_pkg_stub.__path__ = []  # type: ignore[attr-defined]
-sys.modules["src.services.proxy_node"] = _proxy_pkg_stub
+    cache_stub = types.ModuleType("src.core.cache_service")
+    cache_stub.CacheService = _CacheServiceStub  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "src.core.cache_service", cache_stub)
 
-_proxy_resolver_stub = types.ModuleType("src.services.proxy_node.resolver")
+    proxy_pkg_stub = types.ModuleType("src.services.proxy_node")
+    proxy_pkg_stub.__path__ = []  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "src.services.proxy_node", proxy_pkg_stub)
 
+    proxy_resolver_stub = types.ModuleType("src.services.proxy_node.resolver")
+    proxy_resolver_stub.resolve_ops_proxy_config = _resolve_ops_proxy_config_stub  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "src.services.proxy_node.resolver", proxy_resolver_stub)
 
-def _resolve_ops_proxy_config_stub(_config):
-    return None, None
+@pytest.fixture()
+def new_api_connector(_install_new_api_stubs):
+    from src.services.provider_ops.architectures.new_api import NewApiConnector
 
-
-_proxy_resolver_stub.resolve_ops_proxy_config = _resolve_ops_proxy_config_stub  # type: ignore[attr-defined]
-sys.modules["src.services.proxy_node.resolver"] = _proxy_resolver_stub
-
-from src.services.provider_ops.architectures.new_api import NewApiConnector
-from src.services.provider_ops.architectures import base as _arch_base
-
-_arch_base.resolve_ops_proxy_config = _resolve_ops_proxy_config_stub  # type: ignore[assignment]
+    return NewApiConnector
 
 
 @pytest.mark.asyncio
-async def test_new_api_connector_allows_api_key_without_user_id() -> None:
-    connector = NewApiConnector("https://example.com")
+async def test_new_api_connector_allows_api_key_without_user_id(new_api_connector) -> None:
+    connector = new_api_connector("https://example.com")
     ok = await connector.connect({"api_key": "token-1"})
     assert ok is True
     assert await connector.is_authenticated() is True
 
 
-def test_new_api_connector_does_not_send_user_header_when_missing_user_id() -> None:
-    connector = NewApiConnector("https://example.com")
+def test_new_api_connector_does_not_send_user_header_when_missing_user_id(new_api_connector) -> None:
+    connector = new_api_connector("https://example.com")
     # Directly set connected auth state; header behavior is what we care about.
     connector._api_key = "token-1"  # type: ignore[attr-defined]
     connector._user_id = None  # type: ignore[attr-defined]
@@ -66,8 +66,8 @@ def test_new_api_connector_does_not_send_user_header_when_missing_user_id() -> N
     assert "New-API-User" not in req.headers
 
 
-def test_new_api_connector_sends_compat_user_headers_when_user_id_present() -> None:
-    connector = NewApiConnector("https://example.com")
+def test_new_api_connector_sends_compat_user_headers_when_user_id_present(new_api_connector) -> None:
+    connector = new_api_connector("https://example.com")
     connector._api_key = "token-1"  # type: ignore[attr-defined]
     connector._user_id = "1001"  # type: ignore[attr-defined]
     req = httpx.Request("GET", "https://example.com/api/user/checkin")

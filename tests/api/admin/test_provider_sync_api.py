@@ -1,11 +1,8 @@
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+import asyncio
 
-from src.api.admin.provider_sync import router
-from src.database import get_db
+from src.api.admin.provider_sync import SyncTriggerRequest, trigger_sync
 from src.models.database import Provider
 from src.modules.site_management.services.log_service import SiteManagementLogService
-from src.utils.auth_utils import require_admin
 
 
 class _FakeQuery:
@@ -39,12 +36,8 @@ def _provider(provider_id: str, website: str, config: dict | None) -> Provider:
     )
 
 
-def _build_test_client(db: _FakeSession) -> TestClient:
-    app = FastAPI()
-    app.include_router(router)
-    app.dependency_overrides[require_admin] = lambda: object()
-    app.dependency_overrides[get_db] = lambda: db
-    return TestClient(app)
+def _run_trigger_sync(db: _FakeSession, payload: SyncTriggerRequest) -> dict:
+    return asyncio.run(trigger_sync(payload, db=db, _=object()))
 
 
 def _sync_result(**overrides: int | bool):
@@ -94,19 +87,15 @@ def test_trigger_sync_defaults_auto_create_provider_ops_to_true(monkeypatch) -> 
         fake_sync_from_backup_object,
     )
 
-    client = _build_test_client(db)
-    resp = client.post(
-        "/api/admin/provider-sync/trigger",
-        json={
-            "url": "https://dav.example.com/backup.json",
-            "username": "u",
-            "password": "p",
-            "backup": {"version": "2.0", "accounts": {"accounts": []}},
-        },
+    payload = SyncTriggerRequest(
+        url="https://dav.example.com/backup.json",
+        username="u",
+        password="p",
+        backup={"version": "2.0", "accounts": {"accounts": []}},
     )
+    data = _run_trigger_sync(db, payload)
 
-    assert resp.status_code == 200
-    assert resp.json()["run_id"] == "run-1"
+    assert data["run_id"] == "run-1"
     assert captured["auto_create_provider_ops"] is True
     assert captured["dry_run"] is False
 
@@ -139,20 +128,15 @@ def test_trigger_sync_honors_auto_create_provider_ops_override(monkeypatch) -> N
         fake_sync_from_backup_object,
     )
 
-    client = _build_test_client(db)
-    resp = client.post(
-        "/api/admin/provider-sync/trigger",
-        json={
-            "url": "https://dav.example.com/backup.json",
-            "username": "u",
-            "password": "p",
-            "auto_create_provider_ops": False,
-            "backup": {"version": "2.0", "accounts": {"accounts": []}},
-        },
+    payload = SyncTriggerRequest(
+        url="https://dav.example.com/backup.json",
+        username="u",
+        password="p",
+        auto_create_provider_ops=False,
+        backup={"version": "2.0", "accounts": {"accounts": []}},
     )
+    data = _run_trigger_sync(db, payload)
 
-    assert resp.status_code == 200
-    data = resp.json()
     assert data["updated_providers"] == 0
     assert data["skipped_no_provider_ops"] == 1
     assert captured["auto_create_provider_ops"] is False
