@@ -160,4 +160,3 @@ class PaginatedResponse(BaseModel, Generic[T]):
     total: int
     page: int
     page_size: int
- 2d718fc2cf303947ca9af72163f5b5f34211c722

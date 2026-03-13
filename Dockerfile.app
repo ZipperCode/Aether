@@ -5,6 +5,9 @@
 
 FROM aether-base:latest AS builder
 WORKDIR /app
+# 复制前端依赖清单并安装，再构建（避免 node_modules 缺失）
+COPY frontend/package*.json ./frontend/
+RUN cd frontend && npm ci
 # 复制前端源码并构建（CI 通过 no-cache-filters=builder 确保每次重建）
 COPY frontend/ ./frontend/
 RUN cd frontend && npm run build
