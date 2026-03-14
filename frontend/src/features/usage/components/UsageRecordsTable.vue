@@ -3,172 +3,167 @@
     <template #actions>
       <!-- 时间范围筛选 -->
       <TimeRangePicker
-        v-model="timeRangeModel"
-        :show-granularity="false"
-      />
+            v-model="timeRangeModel"
+            :show-granularity="false"
+          />
 
-      <!-- 分隔线 -->
-      <div class="hidden sm:block h-4 w-px bg-border" />
+          <!-- 分隔线 -->
+          <div class="hidden sm:block h-4 w-px bg-border" />
 
-      <!-- 通用搜索 -->
-      <div class="relative">
-        <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground z-10 pointer-events-none" />
-        <Input
-          id="usage-records-search"
-          v-model="localSearch"
-          :placeholder="isAdmin ? '搜索用户/密钥' : '搜索密钥/模型'"
-          class="w-[7.5rem] sm:w-48 h-8 text-xs border-border/60 pl-8"
-        />
-      </div>
+          <!-- 通用搜索 -->
+          <div class="relative">
+            <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground z-10 pointer-events-none" />
+            <Input
+              id="usage-records-search"
+              v-model="localSearch"
+              :placeholder="isAdmin ? '搜索用户/密钥' : '搜索密钥/模型'"
+              class="w-[7.5rem] sm:w-48 h-8 text-xs border-border/60 pl-8"
+            />
+          </div>
 
-      <!-- 用户筛选（仅管理员可见） -->
-      <Select
-        v-if="isAdmin && availableUsers.length > 0"
-
-        :model-value="filterUser"
-        @update:model-value="$emit('update:filterUser', $event)"
-      >
-        <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-36 h-8 text-xs border-border/60">
-          <SelectValue placeholder="用户" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="__all__">
-            全部用户
-          </SelectItem>
-          <SelectItem
-            v-for="user in availableUsers"
-            :key="user.id"
-            :value="user.id"
+          <!-- 用户筛选（仅管理员可见） -->
+          <Select
+            v-if="isAdmin && availableUsers.length > 0"
+            :model-value="filterUser"
+            @update:model-value="$emit('update:filterUser', $event)"
           >
-            {{ user.username || user.email }}
-          </SelectItem>
-        </SelectContent>
-      </Select>
+            <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-36 h-8 text-xs border-border/60">
+              <SelectValue placeholder="用户" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">
+                全部用户
+              </SelectItem>
+              <SelectItem
+                v-for="user in availableUsers"
+                :key="user.id"
+                :value="user.id"
+              >
+                {{ user.username || user.email }}
+              </SelectItem>
+            </SelectContent>
+          </Select>
 
-      <!-- 模型筛选 -->
-      <Select
-
-        :model-value="filterModel"
-        @update:model-value="$emit('update:filterModel', $event)"
-      >
-        <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-40 h-8 text-xs border-border/60">
-          <SelectValue placeholder="模型" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="__all__">
-            全部模型
-          </SelectItem>
-          <SelectItem
-            v-for="model in availableModels"
-            :key="model"
-            :value="model"
+          <!-- 模型筛选 -->
+          <Select
+            :model-value="filterModel"
+            @update:model-value="$emit('update:filterModel', $event)"
           >
-            {{ model.replace('claude-', '') }}
-          </SelectItem>
-        </SelectContent>
-      </Select>
+            <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-40 h-8 text-xs border-border/60">
+              <SelectValue placeholder="模型" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">
+                全部模型
+              </SelectItem>
+              <SelectItem
+                v-for="model in availableModels"
+                :key="model"
+                :value="model"
+              >
+                {{ model.replace('claude-', '') }}
+              </SelectItem>
+            </SelectContent>
+          </Select>
 
-      <!-- 提供商筛选（仅管理员可见） -->
-      <Select
-        v-if="isAdmin"
-
-        :model-value="filterProvider"
-        @update:model-value="$emit('update:filterProvider', $event)"
-      >
-        <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-32 h-8 text-xs border-border/60">
-          <SelectValue placeholder="提供商" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="__all__">
-            全部提供商
-          </SelectItem>
-          <SelectItem
-            v-for="provider in availableProviders"
-            :key="provider"
-            :value="provider"
+          <!-- 提供商筛选（仅管理员可见） -->
+          <Select
+            v-if="isAdmin"
+            :model-value="filterProvider"
+            @update:model-value="$emit('update:filterProvider', $event)"
           >
-            {{ provider }}
-          </SelectItem>
-        </SelectContent>
-      </Select>
+            <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-32 h-8 text-xs border-border/60">
+              <SelectValue placeholder="提供商" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">
+                全部提供商
+              </SelectItem>
+              <SelectItem
+                v-for="provider in availableProviders"
+                :key="provider"
+                :value="provider"
+              >
+                {{ provider }}
+              </SelectItem>
+            </SelectContent>
+          </Select>
 
-      <!-- API格式筛选 -->
-      <Select
-
-        :model-value="filterApiFormat"
-        @update:model-value="$emit('update:filterApiFormat', $event)"
-      >
-        <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-32 h-8 text-xs border-border/60">
-          <SelectValue placeholder="格式" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="__all__">
-            全部格式
-          </SelectItem>
-          <SelectItem
-            v-for="format in availableApiFormats"
-            :key="format.value"
-            :value="format.value"
+          <!-- API格式筛选 -->
+          <Select
+            :model-value="filterApiFormat"
+            @update:model-value="$emit('update:filterApiFormat', $event)"
           >
-            {{ format.label }}
-          </SelectItem>
-        </SelectContent>
-      </Select>
+            <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-32 h-8 text-xs border-border/60">
+              <SelectValue placeholder="格式" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">
+                全部格式
+              </SelectItem>
+              <SelectItem
+                v-for="format in availableApiFormats"
+                :key="format.value"
+                :value="format.value"
+              >
+                {{ format.label }}
+              </SelectItem>
+            </SelectContent>
+          </Select>
 
-      <!-- 状态筛选 -->
-      <Select
+          <!-- 状态筛选 -->
+          <Select
+            :model-value="filterStatus"
+            @update:model-value="$emit('update:filterStatus', $event)"
+          >
+            <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-28 h-8 text-xs border-border/60">
+              <SelectValue placeholder="状态" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">
+                全部状态
+              </SelectItem>
+              <SelectItem value="stream">
+                流式
+              </SelectItem>
+              <SelectItem value="standard">
+                标准
+              </SelectItem>
+              <SelectItem value="active">
+                活跃
+              </SelectItem>
+              <SelectItem value="failed">
+                失败
+              </SelectItem>
+              <SelectItem value="cancelled">
+                已取消
+              </SelectItem>
+              <SelectItem value="has_retry">
+                发生重试
+              </SelectItem>
+              <SelectItem value="has_fallback">
+                发生转移
+              </SelectItem>
+            </SelectContent>
+          </Select>
 
-        :model-value="filterStatus"
-        @update:model-value="$emit('update:filterStatus', $event)"
-      >
-        <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-28 h-8 text-xs border-border/60">
-          <SelectValue placeholder="状态" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="__all__">
-            全部状态
-          </SelectItem>
-          <SelectItem value="stream">
-            流式
-          </SelectItem>
-          <SelectItem value="standard">
-            标准
-          </SelectItem>
-          <SelectItem value="active">
-            活跃
-          </SelectItem>
-          <SelectItem value="failed">
-            失败
-          </SelectItem>
-          <SelectItem value="cancelled">
-            已取消
-          </SelectItem>
-          <SelectItem value="has_retry">
-            发生重试
-          </SelectItem>
-          <SelectItem value="has_fallback">
-            发生转移
-          </SelectItem>
-        </SelectContent>
-      </Select>
+          <!-- 分隔线 -->
+          <div class="hidden sm:block h-4 w-px bg-border" />
 
-      <!-- 分隔线 -->
-      <div class="hidden sm:block h-4 w-px bg-border" />
-
-      <!-- 自动刷新按钮 -->
-      <Button
-        variant="ghost"
-        size="icon"
-        class="h-8 w-8"
-        :class="autoRefresh ? 'text-primary' : ''"
-        :title="autoRefresh ? '点击关闭自动刷新' : '点击开启自动刷新（每3秒刷新）'"
-        @click="$emit('update:autoRefresh', !autoRefresh)"
-      >
-        <RefreshCcw
-          class="w-3.5 h-3.5"
-          :class="autoRefresh ? 'animate-spin' : ''"
-        />
-      </Button>
+          <!-- 自动刷新按钮 -->
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-8 w-8"
+            :class="autoRefresh ? 'text-primary' : ''"
+            :title="autoRefresh ? '点击关闭自动刷新' : '点击开启自动刷新（每3秒刷新）'"
+            @click="$emit('update:autoRefresh', !autoRefresh)"
+          >
+            <RefreshCcw
+              class="w-3.5 h-3.5"
+              :class="autoRefresh ? 'animate-spin' : ''"
+            />
+          </Button>
     </template>
 
     <!-- 移动端卡片视图 -->
@@ -288,43 +283,43 @@
     <Table class="hidden md:table">
       <TableHeader>
         <TableRow class="border-b border-border/60 hover:bg-transparent">
-          <TableHead class="h-12 font-semibold w-[70px]">
+          <TableHead class="h-12 font-semibold w-[68px]">
             时间
           </TableHead>
           <TableHead
             v-if="isAdmin"
-            class="h-12 font-semibold w-[100px]"
+            class="h-12 font-semibold"
           >
             用户
           </TableHead>
           <TableHead
             v-if="!isAdmin"
-            class="h-12 font-semibold w-[100px]"
+            class="h-12 font-semibold"
           >
             密钥
           </TableHead>
-          <TableHead class="h-12 font-semibold w-[140px]">
+          <TableHead class="h-12 font-semibold">
             模型
           </TableHead>
           <TableHead
             v-if="isAdmin"
-            class="h-12 font-semibold w-[100px]"
+            class="h-12 font-semibold"
           >
             提供商
           </TableHead>
           <TableHead class="h-12 font-semibold w-[120px]">
-            API格式
+            <div class="flex flex-col text-xs gap-0.5">
+              <span>格式</span>
+              <span class="text-muted-foreground font-normal">类型</span>
+            </div>
           </TableHead>
-          <TableHead class="h-12 font-semibold w-[70px] text-center">
-            类型
-          </TableHead>
-          <TableHead class="h-12 font-semibold w-[140px] text-right">
+          <TableHead class="h-12 font-semibold w-[110px] text-right">
             Tokens
           </TableHead>
-          <TableHead class="h-12 font-semibold w-[100px] text-right">
+          <TableHead class="h-12 font-semibold w-[72px] text-right">
             费用
           </TableHead>
-          <TableHead class="h-12 font-semibold w-[70px] text-right">
+          <TableHead class="h-12 font-semibold w-[68px] text-right">
             <div class="flex flex-col items-end text-xs gap-0.5">
               <span>首字</span>
               <span class="text-muted-foreground font-normal">总耗时</span>
@@ -335,7 +330,7 @@
       <TableBody>
         <TableRow v-if="records.length === 0">
           <TableCell
-            :colspan="isAdmin ? 9 : 8"
+            :colspan="isAdmin ? 8 : 7"
             class="text-center py-12 text-muted-foreground"
           >
             暂无请求记录
@@ -349,12 +344,12 @@
           @mousedown="handleMouseDown"
           @click="handleRowClick($event, record.id)"
         >
-          <TableCell class="text-xs py-4 w-[70px]">
+          <TableCell class="text-xs py-4 w-[68px]">
             {{ formatDateTime(record.created_at) }}
           </TableCell>
           <TableCell
             v-if="isAdmin"
-            class="py-4 w-[100px] truncate"
+            class="py-4 truncate"
             :title="record.username || record.user_email || (record.user_id ? `User ${record.user_id}` : '已删除用户')"
           >
             <div class="flex flex-col text-xs gap-0.5">
@@ -373,7 +368,7 @@
           <!-- 用户页面的密钥列 -->
           <TableCell
             v-if="!isAdmin"
-            class="py-4 w-[100px]"
+            class="py-4"
             :title="record.api_key?.name || '-'"
           >
             <div class="flex flex-col text-xs gap-0.5">
@@ -387,7 +382,7 @@
             </div>
           </TableCell>
           <TableCell
-            class="font-medium py-4 w-[140px]"
+            class="font-medium py-4"
             :title="getModelTooltip(record)"
           >
             <div
@@ -413,12 +408,12 @@
             </div>
             <span
               v-else
-              class="truncate block"
+              class="truncate block text-xs"
             >{{ record.model }}</span>
           </TableCell>
           <TableCell
             v-if="isAdmin"
-            class="py-4 w-[60px]"
+            class="py-4"
           >
             <div class="flex items-center gap-1">
               <div class="flex flex-col text-xs gap-0.5">
@@ -473,16 +468,17 @@
               </svg>
             </div>
           </TableCell>
+          <!-- 格式 + 类型（合并列） -->
           <TableCell
             class="py-4 w-[120px]"
             :title="getApiFormatTooltip(record)"
           >
-            <!-- 有格式转换或同族格式差异：两行显示 -->
-            <div
-              v-if="shouldShowFormatConversion(record)"
-              class="flex flex-col text-xs gap-0.5"
-            >
-              <div class="flex items-center gap-1 whitespace-nowrap">
+            <div class="flex flex-col text-xs gap-0.5">
+              <!-- 格式信息 -->
+              <div
+                v-if="shouldShowFormatConversion(record)"
+                class="flex items-center gap-1 whitespace-nowrap"
+              >
                 <span>{{ formatApiFormat(record.api_format!) }}</span>
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
@@ -496,65 +492,64 @@
                     clip-rule="evenodd"
                   />
                 </svg>
+                <span class="text-muted-foreground">{{ formatApiFormat(record.endpoint_api_format!) }}</span>
               </div>
-              <span class="text-muted-foreground whitespace-nowrap">{{ formatApiFormat(record.endpoint_api_format!) }}</span>
+              <span
+                v-else-if="record.api_format"
+                class="whitespace-nowrap"
+              >{{ formatApiFormat(record.api_format) }}</span>
+              <span
+                v-else
+                class="text-muted-foreground"
+              >-</span>
+              <!-- 类型 badge -->
+              <div>
+                <Badge
+                  v-if="record.status === 'pending'"
+                  variant="outline"
+                  class="whitespace-nowrap animate-pulse border-muted-foreground/30 text-muted-foreground text-[10px] px-1.5 h-4"
+                >
+                  等待中
+                </Badge>
+                <Badge
+                  v-else-if="record.status === 'streaming'"
+                  variant="outline"
+                  class="whitespace-nowrap animate-pulse border-primary/50 text-primary text-[10px] px-1.5 h-4"
+                >
+                  传输中
+                </Badge>
+                <Badge
+                  v-else-if="record.status === 'failed' || (record.status_code && record.status_code >= 400) || record.error_message"
+                  variant="destructive"
+                  class="whitespace-nowrap text-[10px] px-1.5 h-4"
+                >
+                  失败
+                </Badge>
+                <Badge
+                  v-else-if="record.status === 'cancelled'"
+                  variant="outline"
+                  class="whitespace-nowrap border-amber-500/50 text-amber-600 dark:text-amber-400 text-[10px] px-1.5 h-4"
+                >
+                  已取消
+                </Badge>
+                <Badge
+                  v-else-if="record.is_stream"
+                  variant="secondary"
+                  class="whitespace-nowrap text-[10px] px-1.5 h-4"
+                >
+                  流式
+                </Badge>
+                <Badge
+                  v-else
+                  variant="outline"
+                  class="whitespace-nowrap border-border/60 text-muted-foreground text-[10px] px-1.5 h-4"
+                >
+                  标准
+                </Badge>
+              </div>
             </div>
-            <!-- 无格式转换：单行显示 -->
-            <span
-              v-else-if="record.api_format"
-              class="text-xs whitespace-nowrap"
-            >{{ formatApiFormat(record.api_format) }}</span>
-            <span
-              v-else
-              class="text-muted-foreground text-xs"
-            >-</span>
           </TableCell>
-          <TableCell class="text-center py-4 w-[70px]">
-            <!-- 优先显示请求状态 -->
-            <Badge
-              v-if="record.status === 'pending'"
-              variant="outline"
-              class="whitespace-nowrap animate-pulse border-muted-foreground/30 text-muted-foreground"
-            >
-              等待中
-            </Badge>
-            <Badge
-              v-else-if="record.status === 'streaming'"
-              variant="outline"
-              class="whitespace-nowrap animate-pulse border-primary/50 text-primary"
-            >
-              传输中
-            </Badge>
-            <Badge
-              v-else-if="record.status === 'failed' || (record.status_code && record.status_code >= 400) || record.error_message"
-              variant="destructive"
-              class="whitespace-nowrap"
-            >
-              失败
-            </Badge>
-            <Badge
-              v-else-if="record.status === 'cancelled'"
-              variant="outline"
-              class="whitespace-nowrap border-amber-500/50 text-amber-600 dark:text-amber-400"
-            >
-              已取消
-            </Badge>
-            <Badge
-              v-else-if="record.is_stream"
-              variant="secondary"
-              class="whitespace-nowrap"
-            >
-              流式
-            </Badge>
-            <Badge
-              v-else
-              variant="outline"
-              class="whitespace-nowrap border-border/60 text-muted-foreground"
-            >
-              标准
-            </Badge>
-          </TableCell>
-          <TableCell class="text-right py-4 w-[140px]">
+          <TableCell class="text-right py-4 w-[110px]">
             <div class="flex flex-col items-end text-xs gap-0.5">
               <div class="flex items-center gap-1">
                 <span>{{ formatTokens(record.input_tokens || 0) }}</span>
@@ -568,7 +563,7 @@
               </div>
             </div>
           </TableCell>
-          <TableCell class="text-right py-4 w-[100px]">
+          <TableCell class="text-right py-4 w-[72px]">
             <div class="flex flex-col items-end text-xs gap-0.5">
               <span class="text-primary font-medium">{{ formatCurrency(record.cost || 0) }}</span>
               <span
@@ -579,7 +574,7 @@
               </span>
             </div>
           </TableCell>
-          <TableCell class="text-right py-4 w-[70px]">
+          <TableCell class="text-right py-4 w-[68px]">
             <!-- pending 状态：只显示增长的总时间 -->
             <div
               v-if="record.status === 'pending'"
