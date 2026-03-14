@@ -60,6 +60,7 @@ class RequestDispatcher:
         attempt_counter: int,
         max_attempts: int,
         is_stream: bool = False,
+        user_id: str | None = None,
     ) -> tuple[Any, str, str, str, str, str, int | None]:
         """
         执行请求并返回结果
@@ -79,6 +80,7 @@ class RequestDispatcher:
             attempt_counter: 尝试计数
             max_attempts: 最大尝试次数
             is_stream: 是否为流式请求
+            user_id: 用户 ID（可选）
 
         Returns:
             (response, provider_name, candidate_record_id, provider_id, endpoint_id, key_id, ttfb_ms)
@@ -112,6 +114,7 @@ class RequestDispatcher:
             candidate_id=candidate_record_id,
             candidate_index=candidate_index,
             user_api_key=user_api_key,
+            user_id=user_id,
             request_func=request_func,
             request_id=request_id,
             api_format=api_format,
