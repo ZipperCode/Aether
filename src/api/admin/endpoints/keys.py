@@ -27,6 +27,7 @@ from src.services.provider_keys import (
     create_provider_key_response,
     delete_endpoint_key_response,
     export_oauth_key_data,
+    sync_key_models,
 )
 from src.services.provider_keys import get_keys_grouped_by_format as query_keys_grouped_by_format
 from src.services.provider_keys import (
@@ -342,6 +343,37 @@ class AdminClearOAuthInvalidAdapter(AdminApiAdapter):
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         return clear_oauth_invalid_response(context.db, self.key_id)
+
+
+class SyncKeyModelsResponse(BaseModel):
+    success: bool
+    models_count: int
+    error: str | None = None
+
+
+@router.post("/keys/{key_id}/sync-models", response_model=SyncKeyModelsResponse)
+async def sync_key_models_route(
+    key_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> SyncKeyModelsResponse:
+    """
+    强制同步 Key 的上游模型
+
+    从上游 API 获取模型列表，并覆盖 Key 的 allowed_models。
+    """
+    adapter = AdminSyncKeyModelsAdapter(key_id=key_id)
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
+@dataclass
+class AdminSyncKeyModelsAdapter(AdminApiAdapter):
+    """强制同步 Key 的上游模型。"""
+
+    key_id: str
+
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        return await sync_key_models(context.db, self.key_id)
 
 
 class AdminGetKeysGroupedByFormatAdapter(AdminApiAdapter):
