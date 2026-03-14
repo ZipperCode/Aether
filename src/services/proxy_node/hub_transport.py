@@ -665,8 +665,11 @@ class HubResponseStream(httpx.AsyncByteStream):
         self._timeout = timeout
 
     async def __aiter__(self) -> AsyncGenerator[bytes, None]:
-        async for chunk in self._stream_state.iter_body(chunk_timeout=self._timeout):
-            yield chunk
+        try:
+            async for chunk in self._stream_state.iter_body(chunk_timeout=self._timeout):
+                yield chunk
+        finally:
+            self._manager.remove_stream(self._stream_state.stream_id)
 
     async def aclose(self) -> None:
         self._manager.remove_stream(self._stream_state.stream_id)

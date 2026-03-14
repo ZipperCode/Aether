@@ -32,6 +32,7 @@ from src.core.exceptions import ExceptionHandlers, ProxyException
 from src.core.logger import logger
 from src.core.modules import get_module_registry
 from src.database import init_db
+from src.database.database import create_session
 from src.middleware.plugin_middleware import PluginMiddleware
 from src.plugins.manager import get_plugin_manager
 
@@ -106,6 +107,26 @@ class LifecycleState:
     pool_quota_probe_scheduler: PoolQuotaProbeScheduler | None = None
     task_poller: TaskPollerService | None = None
     task_scheduler: TaskScheduler | None = None
+
+
+async def _run_module_lifecycle_hooks(
+    modules: list[ModuleDefinition],
+    registry: Any,
+    *,
+    phase: str,
+) -> None:
+    """根据模块启用状态执行生命周期钩子。"""
+    db = create_session()
+    try:
+        for module in modules:
+            name = getattr(module.metadata, "name", None)
+            if not name or not registry.is_enabled(name, db):
+                continue
+            hook = module.on_startup if phase == "startup" else module.on_shutdown
+            if hook:
+                await hook()
+    finally:
+        db.close()
 
 
 def _configure_uvicorn_access_log() -> None:
@@ -250,9 +271,8 @@ async def _initialize_plugins_and_modules(app: FastAPI, state: LifecycleState) -
             prefix = module.metadata.api_prefix or "(default)"
             logger.info(f"模块 [{module.metadata.name}] 路由已注册: {prefix}")
 
-        # 执行启动钩子
-        if module.on_startup:
-            await module.on_startup()
+    # 执行启动钩子（仅对启用模块）
+    await _run_module_lifecycle_hooks(state.available_modules, module_registry, phase="startup")
 
     logger.info(f"功能模块初始化完成: {len(state.available_modules)}/{len(ALL_MODULES)} 个模块可用")
 
@@ -430,9 +450,8 @@ async def _run_shutdown(state: LifecycleState) -> None:
 
     # 关闭功能模块
     logger.info("关闭功能模块...")
-    for module in state.available_modules:
-        if module.on_shutdown:
-            await module.on_shutdown()
+    module_registry = get_module_registry()
+    await _run_module_lifecycle_hooks(state.available_modules, module_registry, phase="shutdown")
 
     # 关闭并发管理器
     logger.info("关闭并发管理器...")

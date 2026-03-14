@@ -364,17 +364,17 @@ class Config:
         3. 需要为数据库连接、Redis 连接等预留资源
 
         公式: base_connections / workers
-        - 单 Worker: 100 连接
+        - 单 Worker: 200 连接
         - 多 Worker: 按比例分配，确保总数不超过系统限制
 
-        范围: 30 - 100
+        范围: 30 - 200
         """
-        base_connections = 100
+        base_connections = 200
         workers = max(self.worker_processes, 1)
 
         per_worker = base_connections // workers
 
-        return max(30, min(per_worker, 100))
+        return max(30, min(per_worker, 200))
 
     def _auto_http_keepalive_connections(self) -> int:
         """

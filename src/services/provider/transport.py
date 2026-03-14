@@ -185,6 +185,16 @@ def build_provider_url(
     endpoint_sig = normalize_endpoint_signature(endpoint_sig) if endpoint_sig else ""
 
     provider_type = _get_provider_type(endpoint, key, decrypted_auth_config)
+    if provider_type == ProviderType.GEMINI_CLI:
+        base_url = str(getattr(endpoint, "base_url", "") or "").rstrip("/")
+        try:
+            from src.services.provider.adapters.gemini_cli.constants import (
+                PROD_BASE_URL as _GEMINI_CLI_BASE_URL,
+            )
+        except Exception:
+            _GEMINI_CLI_BASE_URL = ""
+        if base_url and _GEMINI_CLI_BASE_URL and base_url != _GEMINI_CLI_BASE_URL.rstrip("/"):
+            provider_type = None
 
     # 合并查询参数（部分逻辑需要先拿到 query_params）
     effective_query_params = dict(query_params) if query_params else {}

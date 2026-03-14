@@ -35,6 +35,15 @@ class AccountOpsService:
     )
 
     def __init__(self, db: Any):
+        import asyncio
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                asyncio.set_event_loop(asyncio.new_event_loop())
         self.db = db
         self.crypto = CryptoService()
         self.execution_engine = OpsExecutionEngine()

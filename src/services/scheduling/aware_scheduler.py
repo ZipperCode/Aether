@@ -679,6 +679,11 @@ class CacheAwareScheduler:
                     candidate.is_cached = True
                     matched_candidate = candidate
                     matched = True
+                    provider_name = getattr(provider, "name", None) or getattr(
+                        provider, "id", "unknown"
+                    )
+                    endpoint_id = getattr(endpoint, "id", "unknown")
+                    key_name = getattr(key, "name", None) or getattr(key, "id", "unknown")
                     logger.debug(
                         "检测到缓存亲和性: affinity_key={}..., "
                         "api_format={}, global_model_id={}..., "
@@ -687,9 +692,9 @@ class CacheAwareScheduler:
                         affinity_key[:8],
                         api_format_str,
                         global_model_id[:8],
-                        provider.name,
-                        endpoint.id[:8],
-                        key.name,
+                        provider_name,
+                        str(endpoint_id)[:8],
+                        key_name,
                         affinity.request_count,
                     )
                 else:

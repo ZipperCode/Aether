@@ -1250,7 +1250,13 @@ class PassthroughRequestBuilder(RequestBuilder):
             builder.add_many(effective_extra_headers)
 
         # 5. 设置认证头（最高优先级，上游始终使用 header 认证）
-        builder.add(auth_header, auth_value)
+        # 优先保留原始头部的大小写（仅用于 key 的大小写，不复用原值）
+        auth_header_key = auth_header
+        for name in original_headers:
+            if name.lower() == auth_header.lower():
+                auth_header_key = name
+                break
+        builder.add(auth_header_key, auth_value)
 
         # 6. 确保有 Content-Type
         headers = builder.build()
