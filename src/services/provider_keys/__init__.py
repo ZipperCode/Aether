@@ -21,6 +21,7 @@ __all__ = [
     "create_provider_key_response",
     "delete_endpoint_key_response",
     "update_endpoint_key_response",
+    "sync_key_models",
     "reveal_endpoint_key_payload",
     "export_oauth_key_data",
     "get_keys_grouped_by_format",
@@ -72,6 +73,13 @@ async def update_endpoint_key_response(
     from src.services.provider_keys.key_command_service import update_endpoint_key_response as _impl
 
     return await _impl(db=db, key_id=key_id, key_data=key_data)
+
+
+async def sync_key_models(db: Session, key_id: str) -> dict[str, Any]:
+    """强制同步 Key 的上游模型并覆盖 allowed_models（惰性导入实现）。"""
+    from src.services.provider_keys.key_model_sync_service import sync_key_models as _impl
+
+    return await _impl(db=db, key_id=key_id)
 
 
 def reveal_endpoint_key_payload(db: Session, key_id: str) -> dict[str, Any]:
