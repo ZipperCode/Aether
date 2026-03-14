@@ -1,7 +1,10 @@
 <template>
   <div class="space-y-6 pb-8">
     <!-- 面包屑旁的折叠按钮 -->
-    <Teleport to="#header-actions-right" defer>
+    <Teleport
+      to="#header-actions-right"
+      defer
+    >
       <button
         class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition"
         :title="statsExpanded ? '收起用量分析' : '展开用量分析'"

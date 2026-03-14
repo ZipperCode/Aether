@@ -16,16 +16,16 @@
               请求数
             </TableHead>
             <TableHead class="h-8 px-2 text-right">
-              Tokens
+              <div class="flex flex-col text-xs gap-0.5">
+                <span>输入/输出</span>
+                <span class="text-muted-foreground font-normal">缓存</span>
+              </div>
             </TableHead>
             <TableHead class="h-8 px-2 text-right">
               费用
             </TableHead>
             <TableHead class="h-8 px-2 text-right">
-              缓存Token
-            </TableHead>
-            <TableHead class="h-8 px-2 text-right">
-              缓存命中率
+              命中率
             </TableHead>
             <TableHead class="h-8 px-2 text-right">
               成功率
@@ -38,7 +38,7 @@
         <TableBody>
           <TableRow v-if="data.length === 0">
             <TableCell
-              :colspan="8"
+              :colspan="7"
               class="text-center py-6 text-muted-foreground px-2"
             >
               暂无提供商统计数据
@@ -55,7 +55,10 @@
               {{ provider.requests }}
             </TableCell>
             <TableCell class="text-right py-2 px-2">
-              <span>{{ formatTokens(provider.totalTokens) }}</span>
+              <div class="flex flex-col items-end text-xs gap-0.5">
+                <span>{{ formatTokens(provider.totalInputContext || 0) }} / {{ formatTokens(provider.outputTokens || 0) }}</span>
+                <span class="text-muted-foreground">{{ formatTokens(provider.cacheReadTokens || 0) }} / {{ formatTokens(provider.cacheCreationTokens || 0) }}</span>
+              </div>
             </TableCell>
             <TableCell class="text-right py-2 px-2">
               <div class="flex flex-col items-end text-xs gap-0.5">
@@ -69,10 +72,7 @@
               </div>
             </TableCell>
             <TableCell class="text-right py-2 px-2">
-              {{ formatTokens(provider.cacheReadTokens || 0) }}
-            </TableCell>
-            <TableCell class="text-right py-2 px-2 text-muted-foreground">
-              {{ formatHitRate(provider.cacheHitRate) }}
+              <span>{{ formatHitRate(provider.cacheHitRate) }}</span>
             </TableCell>
             <TableCell class="text-right py-2 px-2">
               <span :class="getSuccessRateClass(provider.successRate)">{{ provider.successRate }}%</span>
@@ -108,5 +108,4 @@ function getSuccessRateClass(rate: number): string {
   if (rate < 90) return 'text-destructive'
   return ''  // 默认颜色
 }
-
 </script>

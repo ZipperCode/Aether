@@ -1061,6 +1061,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 "output_tokens": 0,
                 "total_tokens": 0,
                 "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
                 "total_input_context": 0,
                 "cache_hit_rate": 0.0,
                 "total_cost_usd": 0.0,
@@ -1075,6 +1076,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             stats["output_tokens"] += item["output_tokens"]
             stats["total_tokens"] += item["total_tokens"]
             stats["cache_read_tokens"] += int(item.get("cache_read_tokens", 0) or 0)
+            stats["cache_creation_tokens"] += int(item.get("cache_creation_tokens", 0) or 0)
             stats["total_input_context"] += int(item.get("total_input_context", 0) or 0)
             stats["total_cost_usd"] += item["total_cost_usd"]
             # 管理员可以看到真实成本
@@ -1086,7 +1088,9 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 "provider": provider_name,
                 "requests": 0,
                 "total_tokens": 0,
+                "output_tokens": 0,
                 "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
                 "total_input_context": 0,
                 "total_cost_usd": 0.0,
                 "success_count": 0,
@@ -1096,7 +1100,11 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             provider_stats = provider_summary.setdefault(provider_name, provider_base_stats)
             provider_stats["requests"] += item["requests"]
             provider_stats["total_tokens"] += item["total_tokens"]
+            provider_stats["output_tokens"] += item.get("output_tokens", 0) or 0
             provider_stats["cache_read_tokens"] += int(item.get("cache_read_tokens", 0) or 0)
+            provider_stats["cache_creation_tokens"] += int(
+                item.get("cache_creation_tokens", 0) or 0
+            )
             provider_stats["total_input_context"] += int(item.get("total_input_context", 0) or 0)
             provider_stats["total_cost_usd"] += item["total_cost_usd"]
             provider_stats["success_count"] += int(item.get("success_count", 0) or 0)
@@ -1112,7 +1120,6 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 total_input_context=int(model_stats.get("total_input_context", 0) or 0),
                 cache_read_tokens=int(model_stats.get("cache_read_tokens", 0) or 0),
             )
-            model_stats.pop("total_input_context", None)
 
         summary_by_model = sorted(model_summary.values(), key=lambda x: x["requests"], reverse=True)
         summary_by_provider = []
@@ -1132,7 +1139,10 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                     "provider": provider_stats["provider"],
                     "requests": provider_stats["requests"],
                     "total_tokens": provider_stats["total_tokens"],
+                    "total_input_context": provider_stats["total_input_context"],
+                    "output_tokens": provider_stats["output_tokens"],
                     "cache_read_tokens": provider_stats["cache_read_tokens"],
+                    "cache_creation_tokens": provider_stats["cache_creation_tokens"],
                     "cache_hit_rate": _calculate_token_cache_hit_rate(
                         total_input_context=int(provider_stats.get("total_input_context", 0) or 0),
                         cache_read_tokens=int(provider_stats.get("cache_read_tokens", 0) or 0),
@@ -1151,6 +1161,8 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             func.sum(Usage.total_tokens).label("total_tokens"),
             func.sum(Usage.cache_read_input_tokens).label("cache_read_tokens"),
             func.sum(input_context_expr()).label("total_input_context"),
+            func.sum(Usage.output_tokens).label("output_tokens"),
+            func.sum(Usage.cache_creation_input_tokens).label("cache_creation_tokens"),
             func.sum(Usage.total_cost_usd).label("total_cost_usd"),
             func.avg(Usage.response_time_ms).label("avg_response_time_ms"),
         ).filter(
@@ -1171,7 +1183,10 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 "api_format": api_format or "unknown",
                 "request_count": count,
                 "total_tokens": int(total_tokens or 0),
+                "total_input_context": int(total_input_context or 0),
+                "output_tokens": int(output_tokens or 0),
                 "cache_read_tokens": int(cache_read_tokens or 0),
+                "cache_creation_tokens": int(cache_creation_tokens or 0),
                 "cache_hit_rate": _calculate_token_cache_hit_rate(
                     total_input_context=total_input_context,
                     cache_read_tokens=cache_read_tokens,
@@ -1185,6 +1200,8 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 total_tokens,
                 cache_read_tokens,
                 total_input_context,
+                output_tokens,
+                cache_creation_tokens,
                 total_cost_usd,
                 avg_response_time_ms,
             ) in api_format_stats

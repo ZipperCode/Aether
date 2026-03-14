@@ -3,167 +3,167 @@
     <template #actions>
       <!-- 时间范围筛选 -->
       <TimeRangePicker
-            v-model="timeRangeModel"
-            :show-granularity="false"
-          />
+        v-model="timeRangeModel"
+        :show-granularity="false"
+      />
 
-          <!-- 分隔线 -->
-          <div class="hidden sm:block h-4 w-px bg-border" />
+      <!-- 分隔线 -->
+      <div class="hidden sm:block h-4 w-px bg-border" />
 
-          <!-- 通用搜索 -->
-          <div class="relative">
-            <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground z-10 pointer-events-none" />
-            <Input
-              id="usage-records-search"
-              v-model="localSearch"
-              :placeholder="isAdmin ? '搜索用户/密钥' : '搜索密钥/模型'"
-              class="w-[7.5rem] sm:w-48 h-8 text-xs border-border/60 pl-8"
-            />
-          </div>
+      <!-- 通用搜索 -->
+      <div class="relative">
+        <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground z-10 pointer-events-none" />
+        <Input
+          id="usage-records-search"
+          v-model="localSearch"
+          :placeholder="isAdmin ? '搜索用户/密钥' : '搜索密钥/模型'"
+          class="w-[7.5rem] sm:w-48 h-8 text-xs border-border/60 pl-8"
+        />
+      </div>
 
-          <!-- 用户筛选（仅管理员可见） -->
-          <Select
-            v-if="isAdmin && availableUsers.length > 0"
-            :model-value="filterUser"
-            @update:model-value="$emit('update:filterUser', $event)"
+      <!-- 用户筛选（仅管理员可见） -->
+      <Select
+        v-if="isAdmin && availableUsers.length > 0"
+        :model-value="filterUser"
+        @update:model-value="$emit('update:filterUser', $event)"
+      >
+        <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-36 h-8 text-xs border-border/60">
+          <SelectValue placeholder="用户" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="__all__">
+            全部用户
+          </SelectItem>
+          <SelectItem
+            v-for="user in availableUsers"
+            :key="user.id"
+            :value="user.id"
           >
-            <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-36 h-8 text-xs border-border/60">
-              <SelectValue placeholder="用户" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__all__">
-                全部用户
-              </SelectItem>
-              <SelectItem
-                v-for="user in availableUsers"
-                :key="user.id"
-                :value="user.id"
-              >
-                {{ user.username || user.email }}
-              </SelectItem>
-            </SelectContent>
-          </Select>
+            {{ user.username || user.email }}
+          </SelectItem>
+        </SelectContent>
+      </Select>
 
-          <!-- 模型筛选 -->
-          <Select
-            :model-value="filterModel"
-            @update:model-value="$emit('update:filterModel', $event)"
+      <!-- 模型筛选 -->
+      <Select
+        :model-value="filterModel"
+        @update:model-value="$emit('update:filterModel', $event)"
+      >
+        <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-40 h-8 text-xs border-border/60">
+          <SelectValue placeholder="模型" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="__all__">
+            全部模型
+          </SelectItem>
+          <SelectItem
+            v-for="model in availableModels"
+            :key="model"
+            :value="model"
           >
-            <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-40 h-8 text-xs border-border/60">
-              <SelectValue placeholder="模型" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__all__">
-                全部模型
-              </SelectItem>
-              <SelectItem
-                v-for="model in availableModels"
-                :key="model"
-                :value="model"
-              >
-                {{ model.replace('claude-', '') }}
-              </SelectItem>
-            </SelectContent>
-          </Select>
+            {{ model.replace('claude-', '') }}
+          </SelectItem>
+        </SelectContent>
+      </Select>
 
-          <!-- 提供商筛选（仅管理员可见） -->
-          <Select
-            v-if="isAdmin"
-            :model-value="filterProvider"
-            @update:model-value="$emit('update:filterProvider', $event)"
+      <!-- 提供商筛选（仅管理员可见） -->
+      <Select
+        v-if="isAdmin"
+        :model-value="filterProvider"
+        @update:model-value="$emit('update:filterProvider', $event)"
+      >
+        <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-32 h-8 text-xs border-border/60">
+          <SelectValue placeholder="提供商" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="__all__">
+            全部提供商
+          </SelectItem>
+          <SelectItem
+            v-for="provider in availableProviders"
+            :key="provider"
+            :value="provider"
           >
-            <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-32 h-8 text-xs border-border/60">
-              <SelectValue placeholder="提供商" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__all__">
-                全部提供商
-              </SelectItem>
-              <SelectItem
-                v-for="provider in availableProviders"
-                :key="provider"
-                :value="provider"
-              >
-                {{ provider }}
-              </SelectItem>
-            </SelectContent>
-          </Select>
+            {{ provider }}
+          </SelectItem>
+        </SelectContent>
+      </Select>
 
-          <!-- API格式筛选 -->
-          <Select
-            :model-value="filterApiFormat"
-            @update:model-value="$emit('update:filterApiFormat', $event)"
+      <!-- API格式筛选 -->
+      <Select
+        :model-value="filterApiFormat"
+        @update:model-value="$emit('update:filterApiFormat', $event)"
+      >
+        <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-32 h-8 text-xs border-border/60">
+          <SelectValue placeholder="格式" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="__all__">
+            全部格式
+          </SelectItem>
+          <SelectItem
+            v-for="format in availableApiFormats"
+            :key="format.value"
+            :value="format.value"
           >
-            <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-32 h-8 text-xs border-border/60">
-              <SelectValue placeholder="格式" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__all__">
-                全部格式
-              </SelectItem>
-              <SelectItem
-                v-for="format in availableApiFormats"
-                :key="format.value"
-                :value="format.value"
-              >
-                {{ format.label }}
-              </SelectItem>
-            </SelectContent>
-          </Select>
+            {{ format.label }}
+          </SelectItem>
+        </SelectContent>
+      </Select>
 
-          <!-- 状态筛选 -->
-          <Select
-            :model-value="filterStatus"
-            @update:model-value="$emit('update:filterStatus', $event)"
-          >
-            <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-28 h-8 text-xs border-border/60">
-              <SelectValue placeholder="状态" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__all__">
-                全部状态
-              </SelectItem>
-              <SelectItem value="stream">
-                流式
-              </SelectItem>
-              <SelectItem value="standard">
-                标准
-              </SelectItem>
-              <SelectItem value="active">
-                活跃
-              </SelectItem>
-              <SelectItem value="failed">
-                失败
-              </SelectItem>
-              <SelectItem value="cancelled">
-                已取消
-              </SelectItem>
-              <SelectItem value="has_retry">
-                发生重试
-              </SelectItem>
-              <SelectItem value="has_fallback">
-                发生转移
-              </SelectItem>
-            </SelectContent>
-          </Select>
+      <!-- 状态筛选 -->
+      <Select
+        :model-value="filterStatus"
+        @update:model-value="$emit('update:filterStatus', $event)"
+      >
+        <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-28 h-8 text-xs border-border/60">
+          <SelectValue placeholder="状态" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="__all__">
+            全部状态
+          </SelectItem>
+          <SelectItem value="stream">
+            流式
+          </SelectItem>
+          <SelectItem value="standard">
+            标准
+          </SelectItem>
+          <SelectItem value="active">
+            活跃
+          </SelectItem>
+          <SelectItem value="failed">
+            失败
+          </SelectItem>
+          <SelectItem value="cancelled">
+            已取消
+          </SelectItem>
+          <SelectItem value="has_retry">
+            发生重试
+          </SelectItem>
+          <SelectItem value="has_fallback">
+            发生转移
+          </SelectItem>
+        </SelectContent>
+      </Select>
 
-          <!-- 分隔线 -->
-          <div class="hidden sm:block h-4 w-px bg-border" />
+      <!-- 分隔线 -->
+      <div class="hidden sm:block h-4 w-px bg-border" />
 
-          <!-- 自动刷新按钮 -->
-          <Button
-            variant="ghost"
-            size="icon"
-            class="h-8 w-8"
-            :class="autoRefresh ? 'text-primary' : ''"
-            :title="autoRefresh ? '点击关闭自动刷新' : '点击开启自动刷新（每3秒刷新）'"
-            @click="$emit('update:autoRefresh', !autoRefresh)"
-          >
-            <RefreshCcw
-              class="w-3.5 h-3.5"
-              :class="autoRefresh ? 'animate-spin' : ''"
-            />
-          </Button>
+      <!-- 自动刷新按钮 -->
+      <Button
+        variant="ghost"
+        size="icon"
+        class="h-8 w-8"
+        :class="autoRefresh ? 'text-primary' : ''"
+        :title="autoRefresh ? '点击关闭自动刷新' : '点击开启自动刷新（每3秒刷新）'"
+        @click="$emit('update:autoRefresh', !autoRefresh)"
+      >
+        <RefreshCcw
+          class="w-3.5 h-3.5"
+          :class="autoRefresh ? 'animate-spin' : ''"
+        />
+      </Button>
     </template>
 
     <!-- 移动端卡片视图 -->
