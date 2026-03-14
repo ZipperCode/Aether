@@ -444,6 +444,19 @@
                         >
                           <Shield class="w-3.5 h-3.5" />
                         </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          class="h-7 w-7"
+                          :disabled="syncingKeyId === key.id"
+                          title="同步模型"
+                          @click="handleSyncKeyModels(key)"
+                        >
+                          <RefreshCw
+                            class="w-3.5 h-3.5"
+                            :class="{ 'animate-spin': syncingKeyId === key.id }"
+                          />
+                        </Button>
                         <!-- 代理节点配置 -->
                         <Popover
                           :open="proxyPopoverOpenKeyId === key.id"
@@ -1163,6 +1176,7 @@ const editingKey = ref<EndpointAPIKey | null>(null)
 const deleteKeyConfirmOpen = ref(false)
 const keyToDelete = ref<EndpointAPIKey | null>(null)
 const togglingKeyId = ref<string | null>(null)
+const syncingKeyId = ref<string | null>(null)
 
 // 密钥显示状态：key_id -> 完整密钥
 const revealedKeys = ref<Map<string, string>>(new Map())
@@ -1524,6 +1538,32 @@ function handleEditKey(endpoint: ProviderEndpoint | undefined, key: EndpointAPIK
 function handleKeyPermissions(key: EndpointAPIKey) {
   editingKey.value = key
   keyPermissionsDialogOpen.value = true
+}
+
+async function handleSyncKeyModels(key: EndpointAPIKey) {
+  if (syncingKeyId.value) return
+
+  const confirmed = await confirm({
+    title: '同步上游模型',
+    message: '将从上游获取模型并覆盖当前模型权限，是否继续？',
+    confirmText: '确认同步',
+  })
+  if (!confirmed) return
+
+  syncingKeyId.value = key.id
+  try {
+    const result = await adminApi.syncProviderKeyModels(key.id)
+    if (result.success) {
+      showSuccess(`已同步 ${result.models_count} 个模型`)
+    } else {
+      showError(result.error || '同步失败', '错误')
+    }
+    await handleKeyChanged()
+  } catch (err: unknown) {
+    showError(parseApiError(err, '同步失败'), '错误')
+  } finally {
+    syncingKeyId.value = null
+  }
 }
 
 // 复制完整密钥或认证配置

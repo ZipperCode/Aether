@@ -303,6 +303,12 @@ export interface ProviderModelsQueryResponse {
   }
 }
 
+export interface ProviderKeySyncModelsResponse {
+  success: boolean
+  models_count: number
+  error?: string
+}
+
 export interface ConfigImportRequest extends ConfigExportData {
   merge_mode: 'skip' | 'overwrite' | 'error'
 }
@@ -654,6 +660,14 @@ export const adminApi = {
     const response = await apiClient.post<ProviderModelsQueryResponse>(
       '/api/admin/provider-query/models',
       { provider_id: providerId, api_key_id: apiKeyId, force_refresh: forceRefresh }
+    )
+    return response.data
+  },
+
+  // 强制同步 Provider Key 的上游模型（覆盖 allowed_models）
+  async syncProviderKeyModels(keyId: string): Promise<ProviderKeySyncModelsResponse> {
+    const response = await apiClient.post<ProviderKeySyncModelsResponse>(
+      `/api/admin/endpoints/keys/${keyId}/sync-models`
     )
     return response.data
   },
