@@ -36,9 +36,16 @@ class TavilyTokenService:
     def activate_token(self, token_id: str) -> TavilyTokenRead:
         token = self.repo.get(token_id)
         if token is None:
-            raise ValueError("Token not found")
+            raise ValueError("API key not found")
         self.repo.deactivate_account_tokens(token.account_id)
         token.is_active = True
         self.db.commit()
         self.db.refresh(token)
         return TavilyTokenRead.model_validate(token, from_attributes=True)
+
+    def delete_token(self, token_id: str) -> None:
+        token = self.repo.get(token_id)
+        if token is None:
+            raise ValueError("API key not found")
+        self.db.delete(token)
+        self.db.commit()

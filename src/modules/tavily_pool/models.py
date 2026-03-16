@@ -23,15 +23,50 @@ class TavilyAccount(TavilyPoolBase):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     password_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class TavilyAccountRuntimeState(TavilyPoolBase):
+    __tablename__ = "tavily_account_runtime_states"
+
+    account_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tavily_accounts.id", ondelete="CASCADE"), primary_key=True
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     daily_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     daily_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     health_status: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
     fail_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
-    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    usage_plan: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    usage_account_used: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_account_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_account_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    usage_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class TavilyBlacklistState(TavilyPoolBase):
+    __tablename__ = "tavily_blacklist_states"
+
+    account_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tavily_accounts.id", ondelete="CASCADE"), primary_key=True
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
+    blacklisted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    fail_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
@@ -48,6 +83,10 @@ class TavilyToken(TavilyPoolBase):
     token_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     token_masked: Mapped[str] = mapped_column(String(128), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    consecutive_fail_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_response_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -103,4 +142,21 @@ class TavilyMaintenanceItem(TavilyPoolBase):
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class TavilyUsageLog(TavilyPoolBase):
+    __tablename__ = "tavily_usage_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    account_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("tavily_accounts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    token_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("tavily_tokens.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    endpoint: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)

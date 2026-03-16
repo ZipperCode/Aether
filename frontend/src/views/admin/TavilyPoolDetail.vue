@@ -19,10 +19,10 @@
         <input
           v-model="newToken"
           class="w-full max-w-md rounded border px-3 py-2"
-          placeholder="输入新 token"
+          placeholder="输入新 API Key"
         >
         <Button @click="handleCreateToken">
-          新增 Token
+          新增 API Key
         </Button>
       </div>
 
@@ -31,10 +31,16 @@
           <thead class="bg-muted/50">
             <tr class="text-left">
               <th class="px-4 py-2">
-                Token
+                API Key
               </th>
               <th class="px-4 py-2">
                 状态
+              </th>
+              <th class="px-4 py-2">
+                连续失败
+              </th>
+              <th class="px-4 py-2">
+                最近检查
               </th>
               <th class="px-4 py-2">
                 创建时间
@@ -57,6 +63,12 @@
                 {{ item.is_active ? 'active' : 'inactive' }}
               </td>
               <td class="px-4 py-2">
+                {{ item.consecutive_fail_count }}
+              </td>
+              <td class="px-4 py-2">
+                {{ item.last_checked_at || '-' }}
+              </td>
+              <td class="px-4 py-2">
                 {{ item.created_at }}
               </td>
               <td class="px-4 py-2">
@@ -66,6 +78,13 @@
                   @click="handleActivate(item.id)"
                 >
                   激活
+                </Button>
+                <Button
+                  variant="ghost"
+                  class="ml-2"
+                  @click="handleDelete(item.id)"
+                >
+                  删除
                 </Button>
               </td>
             </tr>
@@ -97,7 +116,7 @@ async function loadTokens() {
   try {
     tokens.value = await tavilyPoolApi.listTokens(accountId)
   } catch (err) {
-    error(parseApiError(err, '加载 Token 失败'))
+    error(parseApiError(err, '加载 API Key 失败'))
   }
 }
 
@@ -105,21 +124,31 @@ async function handleCreateToken() {
   if (!newToken.value) return
   try {
     await tavilyPoolApi.createToken(accountId, newToken.value)
-    success('Token 创建成功')
+    success('API Key 创建成功')
     newToken.value = ''
     await loadTokens()
   } catch (err) {
-    error(parseApiError(err, '创建 Token 失败'))
+    error(parseApiError(err, '创建 API Key 失败'))
   }
 }
 
 async function handleActivate(tokenId: string) {
   try {
     await tavilyPoolApi.activateToken(tokenId)
-    success('Token 已激活')
+    success('API Key 已激活')
     await loadTokens()
   } catch (err) {
     error(parseApiError(err, '激活失败'))
+  }
+}
+
+async function handleDelete(tokenId: string) {
+  try {
+    await tavilyPoolApi.deleteToken(tokenId)
+    success('API Key 已删除')
+    await loadTokens()
+  } catch (err) {
+    error(parseApiError(err, '删除失败'))
   }
 }
 

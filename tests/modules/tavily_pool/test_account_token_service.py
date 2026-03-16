@@ -77,3 +77,34 @@ def test_activate_token_deactivates_other_active_tokens(tmp_path, monkeypatch):
             assert token1.id in inactive_ids
     finally:
         reset_engine()
+
+
+def test_create_account_with_api_key_creates_active_token(tmp_path, monkeypatch):
+    _setup_sqlite_env(tmp_path, monkeypatch)
+
+    from src.modules.tavily_pool.services.account_service import TavilyAccountService
+    from src.modules.tavily_pool.services.token_service import TavilyTokenService
+    from src.modules.tavily_pool.sqlite import get_session_factory
+
+    from src.modules.tavily_pool.sqlite import reset_engine
+
+    try:
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            account_service = TavilyAccountService(session)
+            token_service = TavilyTokenService(session)
+
+            account = account_service.create_account(
+                email="with-key@example.com",
+                password="pass-123",
+                api_key="tvly-create-with-key-0001",
+                source="manual",
+            )
+
+            tokens = token_service.list_tokens(account.id)
+            assert len(tokens) == 1
+            assert tokens[0].is_active is True
+            assert tokens[0].token_masked.startswith("tvly")
+            assert tokens[0].token_masked.endswith("0001")
+    finally:
+        reset_engine()

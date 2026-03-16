@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from src.modules.tavily_pool.models import TavilyAccount, TavilyMaintenanceItem, TavilyMaintenanceRun
+from src.modules.tavily_pool.models import TavilyAccount, TavilyBlacklistState, TavilyMaintenanceItem, TavilyMaintenanceRun
 
 
 class TavilyMaintenanceService:
@@ -23,14 +23,21 @@ class TavilyMaintenanceService:
         self.db.flush()
 
         accounts = self.db.query(TavilyAccount).all()
+        blacklisted_account_ids = {
+            row[0]
+            for row in (
+                self.db.query(TavilyBlacklistState.account_id)
+                .filter(TavilyBlacklistState.status == "active")
+                .all()
+            )
+        }
         run.total = len(accounts)
 
         for account in accounts:
-            # 简化策略：连续失败 >=3 标记为 disabled
-            if int(account.fail_count or 0) >= 3:
-                account.status = "disabled"
+            # 当前维护阶段不再按连续失败直接禁用账号，交由黑名单策略处理。
+            if account.id in blacklisted_account_ids:
                 item_status = "success"
-                message = "account disabled due to continuous health check failures"
+                message = "account is in blacklist and managed by blacklist scanner"
                 run.success += 1
             else:
                 item_status = "skipped"
