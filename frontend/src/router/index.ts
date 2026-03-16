@@ -293,6 +293,30 @@ const routes: RouteRecordRaw[] = [
         meta: { module: 'site_management' }
       },
       {
+        path: 'tavily-pool',
+        name: 'TavilyPool',
+        component: () => importWithRetry(() => import('@/views/admin/TavilyPoolList.vue')),
+        meta: { module: 'tavily_pool' }
+      },
+      {
+        path: 'tavily-pool/health-history',
+        name: 'TavilyHealthHistory',
+        component: () => importWithRetry(() => import('@/views/admin/TavilyHealthHistory.vue')),
+        meta: { module: 'tavily_pool' }
+      },
+      {
+        path: 'tavily-pool/maintenance-history',
+        name: 'TavilyMaintenanceHistory',
+        component: () => importWithRetry(() => import('@/views/admin/TavilyMaintenanceHistory.vue')),
+        meta: { module: 'tavily_pool' }
+      },
+      {
+        path: 'tavily-pool/:accountId',
+        name: 'TavilyPoolDetail',
+        component: () => importWithRetry(() => import('@/views/admin/TavilyPoolDetail.vue')),
+        meta: { module: 'tavily_pool' }
+      },
+      {
         path: 'gemini-files',
         name: 'GeminiFilesManagement',
         component: () => importWithRetry(() => import('@/views/admin/GeminiFilesManagement.vue'))

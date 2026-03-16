@@ -66,6 +66,7 @@ services:
       - "${APP_PORT:-8084}:80"
     volumes:
       - ./logs:/app/logs
+      - ${HOME}/share_sqlites:/sqlites
     restart: unless-stopped
 
 volumes:
