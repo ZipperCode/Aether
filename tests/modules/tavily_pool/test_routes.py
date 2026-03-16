@@ -11,10 +11,9 @@ def _build_client(tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setenv("TAVILY_POOL_DB_PATH", str(db_path))
     monkeypatch.setenv("TAVILY_POOL_CRYPTO_KEY", "tavily-route-key")
 
-    from src.modules.tavily_pool.sqlite import get_engine, init_schema
+    from src.modules.tavily_pool.sqlite import get_engine
 
-    engine = get_engine(reset=True)
-    init_schema(engine)
+    get_engine(reset=True)
 
     from src.modules.tavily_pool.routes import router
 
