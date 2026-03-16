@@ -16,6 +16,20 @@ def _get_router():
     return router
 
 
+async def _on_startup() -> None:
+    from src.modules.tavily_pool.services.scheduler import TavilyPoolScheduler
+    from src.modules.tavily_pool.sqlite import get_engine, init_schema
+
+    init_schema(get_engine())
+    TavilyPoolScheduler().start()
+
+
+async def _on_shutdown() -> None:
+    from src.modules.tavily_pool.services.scheduler import TavilyPoolScheduler
+
+    TavilyPoolScheduler().stop()
+
+
 async def _health_check() -> ModuleHealth:
     return ModuleHealth.HEALTHY
 
@@ -41,6 +55,8 @@ tavily_pool_module = ModuleDefinition(
         admin_menu_order=59,
     ),
     router_factory=_get_router,
+    on_startup=_on_startup,
+    on_shutdown=_on_shutdown,
     health_check=_health_check,
     validate_config=_validate_config,
 )

@@ -52,5 +52,17 @@ def test_admin_can_crud_account_and_manage_tokens(tmp_path, monkeypatch):
         assert list_resp.status_code == 200
         assert len(list_resp.json()) == 1
         assert list_resp.json()[0]["is_active"] is True
+
+        health_resp = client.post("/api/admin/tavily-pool/health-check/run")
+        assert health_resp.status_code == 200
+        assert health_resp.json()["total"] >= 1
+
+        maintenance_resp = client.post("/api/admin/tavily-pool/maintenance/run")
+        assert maintenance_resp.status_code == 200
+        assert maintenance_resp.json()["total"] >= 1
+
+        history_resp = client.get("/api/admin/tavily-pool/maintenance/runs")
+        assert history_resp.status_code == 200
+        assert len(history_resp.json()) >= 1
     finally:
         reset_engine()
