@@ -27,6 +27,8 @@ def get_engine(*, reset: bool = False) -> Engine:
     global _session_factory
 
     if reset:
+        if _engine is not None:
+            _engine.dispose()
         _engine = None
         _session_factory = None
 
