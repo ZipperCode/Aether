@@ -79,6 +79,10 @@ uv sync
 uv run alembic upgrade head
 ./dev.sh
 
+# Tavily 账号池脚本导入（可选）
+# 输入 JSON 结构: [{ "email": "...", "password": "...", "token": "...", "source": "script" }]
+uv run python scripts/tavily/create_accounts.py --input /path/to/accounts.json
+
 # 前端
 cd frontend && npm install && npm run dev
 ```
