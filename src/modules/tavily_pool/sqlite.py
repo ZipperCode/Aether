@@ -16,6 +16,16 @@ _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
 
 
+def reset_engine() -> None:
+    global _engine
+    global _session_factory
+
+    if _engine is not None:
+        _engine.dispose()
+    _engine = None
+    _session_factory = None
+
+
 def _build_db_url() -> str:
     db_path = Path(os.getenv("TAVILY_POOL_DB_PATH", DEFAULT_DB_PATH))
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -27,10 +37,7 @@ def get_engine(*, reset: bool = False) -> Engine:
     global _session_factory
 
     if reset:
-        if _engine is not None:
-            _engine.dispose()
-        _engine = None
-        _session_factory = None
+        reset_engine()
 
     if _engine is None:
         _engine = create_engine(

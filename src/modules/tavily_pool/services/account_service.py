@@ -34,3 +34,9 @@ class TavilyAccountService:
         self.db.commit()
         self.db.refresh(created)
         return TavilyAccountRead.model_validate(created, from_attributes=True)
+
+    def list_accounts(self) -> list[TavilyAccountRead]:
+        return [
+            TavilyAccountRead.model_validate(item, from_attributes=True)
+            for item in self.repo.list_all()
+        ]

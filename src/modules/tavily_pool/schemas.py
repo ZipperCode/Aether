@@ -7,6 +7,17 @@ from datetime import datetime
 from pydantic import BaseModel
 
 
+class CreateAccountRequest(BaseModel):
+    email: str
+    password: str
+    source: str = "manual"
+    notes: str | None = None
+
+
+class CreateTokenRequest(BaseModel):
+    token: str
+
+
 class TavilyAccountRead(BaseModel):
     id: str
     email: str

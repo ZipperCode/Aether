@@ -10,6 +10,12 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
 
+def _get_router():
+    from src.modules.tavily_pool.routes import router
+
+    return router
+
+
 async def _health_check() -> ModuleHealth:
     return ModuleHealth.HEALTHY
 
@@ -34,6 +40,7 @@ tavily_pool_module = ModuleDefinition(
         admin_menu_group="system",
         admin_menu_order=59,
     ),
+    router_factory=_get_router,
     health_check=_health_check,
     validate_config=_validate_config,
 )
