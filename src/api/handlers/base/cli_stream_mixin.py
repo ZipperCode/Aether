@@ -442,7 +442,10 @@ class CliStreamMixin:
             extra_headers=extra_headers if extra_headers else None,
             pre_computed_auth=auth_info.as_tuple() if auth_info else None,
             envelope=envelope,
-            protected_body_keys=get_cache_sensitive_protected_body_keys(provider_api_format),
+            protected_body_keys=get_cache_sensitive_protected_body_keys(
+                provider_api_format,
+                provider_type=provider_type,
+            ),
             provider_api_format=provider_api_format,
         )
         if upstream_is_stream:

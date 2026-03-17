@@ -846,7 +846,10 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             mapped_model=mapped_model,
             envelope=envelope,
             extra_headers=extra_headers,
-            protected_body_keys=get_cache_sensitive_protected_body_keys(provider_api_format),
+            protected_body_keys=get_cache_sensitive_protected_body_keys(
+                provider_api_format,
+                provider_type=provider_type,
+            ),
             upstream_is_stream=upstream_is_stream,
             needs_conversion=needs_conversion,
             provider_api_format=provider_api_format,
