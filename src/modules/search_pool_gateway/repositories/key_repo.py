@@ -11,10 +11,10 @@ class GatewayKeyRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def create(self, *, service: str, key_encrypted: str, key_masked: str, email: str = "") -> GatewayApiKey:
+    def create(self, *, service: str, raw_key: str, key_masked: str, email: str = "") -> GatewayApiKey:
         row = GatewayApiKey(
             service=service,
-            key_encrypted=key_encrypted,
+            raw_key=raw_key,
             key_masked=key_masked,
             email=email,
             active=True,

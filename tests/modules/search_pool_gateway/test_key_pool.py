@@ -4,7 +4,6 @@ from __future__ import annotations
 def _session_factory(tmp_path, monkeypatch):
     db_path = tmp_path / "search_pool_gateway.db"
     monkeypatch.setenv("SEARCH_POOL_GATEWAY_DB_PATH", str(db_path))
-    monkeypatch.setenv("SEARCH_POOL_GATEWAY_CRYPTO_KEY", "search-pool-gateway-test-key")
 
     from src.modules.search_pool_gateway.sqlite import get_engine, get_session_factory
 

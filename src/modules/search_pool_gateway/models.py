@@ -22,7 +22,7 @@ class GatewayApiKey(SearchPoolGatewayBase):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     service: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    key_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_key: Mapped[str] = mapped_column(Text, nullable=False)
     key_masked: Mapped[str] = mapped_column(String(128), nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

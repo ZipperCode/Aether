@@ -9,7 +9,6 @@ from src.utils.auth_utils import require_admin
 def _build_client(tmp_path, monkeypatch) -> TestClient:
     db_path = tmp_path / "search_pool_gateway.db"
     monkeypatch.setenv("SEARCH_POOL_GATEWAY_DB_PATH", str(db_path))
-    monkeypatch.setenv("SEARCH_POOL_GATEWAY_CRYPTO_KEY", "search-pool-gateway-test-key")
 
     from src.modules.search_pool_gateway.sqlite import get_engine
 
