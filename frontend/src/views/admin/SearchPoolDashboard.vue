@@ -25,12 +25,12 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
 import { searchPoolApi } from '@/features/search-pool/api'
 import type { SearchPoolStatsOverview, SearchService } from '@/features/search-pool/types'
 
 const service = ref<SearchService>('tavily')
 const stats = ref<SearchPoolStatsOverview | null>(null)
+const { success } = useToast()
 
 const successRate = computed(() => {
   if (!stats.value) return '-'
@@ -43,7 +43,7 @@ const loadStats = async () => {
 
 const runSync = async () => {
   await searchPoolApi.syncUsage(service.value, true)
-  ElMessage.success('同步完成')
+  success('同步完成')
   await loadStats()
 }
 

@@ -38,13 +38,13 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
 import { searchPoolApi } from '@/features/search-pool/api'
 import type { SearchPoolKey, SearchService } from '@/features/search-pool/types'
 
 const service = ref<SearchService>('tavily')
 const newKey = ref('')
 const keys = ref<SearchPoolKey[]>([])
+const { success } = useToast()
 
 const loadKeys = async () => {
   keys.value = await searchPoolApi.listKeys(service.value)
@@ -54,7 +54,7 @@ const createKey = async () => {
   if (!newKey.value.trim()) return
   await searchPoolApi.createKey({ service: service.value, key: newKey.value.trim() })
   newKey.value = ''
-  ElMessage.success('新增成功')
+  success('新增成功')
   await loadKeys()
 }
 
@@ -65,7 +65,7 @@ const toggle = async (row: SearchPoolKey) => {
 
 const removeKey = async (id: string) => {
   await searchPoolApi.deleteKey(id)
-  ElMessage.success('已删除')
+  success('已删除')
   await loadKeys()
 }
 

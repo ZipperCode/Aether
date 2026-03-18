@@ -35,13 +35,13 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
 import { searchPoolApi } from '@/features/search-pool/api'
 import type { SearchPoolToken, SearchService } from '@/features/search-pool/types'
 
 const service = ref<SearchService>('tavily')
 const name = ref('')
 const tokens = ref<SearchPoolToken[]>([])
+const { success } = useToast()
 
 const loadTokens = async () => {
   tokens.value = await searchPoolApi.listTokens(service.value)
@@ -50,13 +50,13 @@ const loadTokens = async () => {
 const createToken = async () => {
   await searchPoolApi.createToken({ service: service.value, name: name.value.trim() || 'default' })
   name.value = ''
-  ElMessage.success('新增成功')
+  success('新增成功')
   await loadTokens()
 }
 
 const removeToken = async (tokenId: string) => {
   await searchPoolApi.deleteToken(tokenId)
-  ElMessage.success('已删除')
+  success('已删除')
   await loadTokens()
 }
 
