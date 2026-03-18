@@ -10,6 +10,8 @@ import {
   Check,
   Copy,
   Zap,
+  Search,
+  Workflow,
 } from 'lucide-vue-next'
 import { panelClasses } from './guide-config'
 
@@ -380,12 +382,75 @@ function copyStep(stepId: string, code: string) {
       </div>
     </section>
 
-    <!-- 3. 反向代理 -->
+    <!-- 3. 统一搜索入口 -->
+    <section
+      id="unified-search"
+      class="scroll-mt-24 lg:scroll-mt-20"
+    >
+      <h2>3. 统一搜索入口</h2>
+      <p>如果你希望把 Tavily 和 Firecrawl 作为一个团队统一入口暴露出去，而不是让接入方分别对接多个 provider，那么应该启用搜索池网关。</p>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-6">
+        <div :class="[panelClasses.card]" class="p-5">
+          <div class="w-10 h-10 rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center mb-3">
+            <Search class="h-5 w-5" />
+          </div>
+          <h3 class="text-lg font-semibold text-[#262624] dark:text-[#f1ead8] m-0">
+            统一入口
+          </h3>
+          <p class="mt-2 text-sm text-[#666663] dark:text-[#a3a094]">
+            Tavily 负责搜索与提取，Firecrawl 负责抓取。上层应用只需要记住一组网关入口和一个 Bearer Token。
+          </p>
+        </div>
+        <div :class="[panelClasses.card]" class="p-5">
+          <div class="w-10 h-10 rounded-xl bg-orange-500/10 text-orange-600 dark:text-orange-400 flex items-center justify-center mb-3">
+            <Workflow class="h-5 w-5" />
+          </div>
+          <h3 class="text-lg font-semibold text-[#262624] dark:text-[#f1ead8] m-0">
+            统一运维
+          </h3>
+          <p class="mt-2 text-sm text-[#666663] dark:text-[#a3a094]">
+            管理端提供服务总览和单服务工作台，用同一套界面管理真实 Key、网关 Token 与额度同步。
+          </p>
+        </div>
+        <div :class="[panelClasses.card]" class="p-5">
+          <div class="w-10 h-10 rounded-xl bg-purple-500/10 text-purple-600 dark:text-purple-400 flex items-center justify-center mb-3">
+            <Key class="h-5 w-5" />
+          </div>
+          <h3 class="text-lg font-semibold text-[#262624] dark:text-[#f1ead8] m-0">
+            独立鉴权
+          </h3>
+          <p class="mt-2 text-sm text-[#666663] dark:text-[#a3a094]">
+            接入方不直接持有上游真实 Key，而是使用独立生成的网关 Token。这样更适合团队共享和权限隔离。
+          </p>
+        </div>
+      </div>
+
+      <div :class="[panelClasses.card]" class="mt-6 p-6">
+        <h3 class="m-0 text-lg font-semibold text-[#262624] dark:text-[#f1ead8]">
+          最短接入路径
+        </h3>
+        <ol class="list-decimal pl-5 mt-4 space-y-3 text-[#666663] dark:text-[#a3a094]">
+          <li>进入后台的“搜索池网关”，在总览页选择 Tavily 或 Firecrawl 工作台。</li>
+          <li>在工作台里导入真实 Key，必要时点击“同步额度”刷新可用额度。</li>
+          <li>创建一个网关 Token，分配给你的脚本、Agent 或内部服务。</li>
+          <li>按场景调用统一入口：
+            <div class="mt-2 space-y-2 text-sm">
+              <div><span class="font-medium text-[#262624] dark:text-[#f1ead8]">POST /api/search</span>：统一搜索</div>
+              <div><span class="font-medium text-[#262624] dark:text-[#f1ead8]">POST /api/extract</span>：统一网页提取</div>
+              <div><span class="font-medium text-[#262624] dark:text-[#f1ead8]">ANY /firecrawl/*</span>：兼容 Firecrawl 抓取接口</div>
+            </div>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- 4. 反向代理 -->
     <section
       id="reverse-proxy"
       class="scroll-mt-24 lg:scroll-mt-20"
     >
-      <h2>3. 反向代理</h2>
+      <h2>4. 反向代理</h2>
       <p>添加提供商时, 提供商类型选择对应类型即可, 反向代理默认开启提供商级格式转换。</p>
 
       <ul class="list-decimal pl-5 space-y-4 mt-4 text-[#666663] dark:text-[#a3a094]">
@@ -448,12 +513,12 @@ function copyStep(stepId: string, code: string) {
       >
     </section>
 
-    <!-- 4. 异步任务 -->
+    <!-- 5. 异步任务 -->
     <section
       id="async-tasks"
       class="scroll-mt-24 lg:scroll-mt-20"
     >
-      <h2>4. 异步任务</h2>
+      <h2>5. 异步任务</h2>
       <p>需要有提供商端点支持。</p>
       
       <ul class="list-decimal pl-5 mt-4 text-[#666663] dark:text-[#a3a094] space-y-1">
@@ -462,12 +527,12 @@ function copyStep(stepId: string, code: string) {
       </ul>
     </section>
 
-    <!-- 5. 代理配置 -->
+    <!-- 6. 代理配置 -->
     <section
       id="proxy-config"
       class="scroll-mt-24 lg:scroll-mt-20"
     >
-      <h2>5. 代理配置</h2>
+      <h2>6. 代理配置</h2>
 
       <div class="space-y-6 mt-6">
         <div>

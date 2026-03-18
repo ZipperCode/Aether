@@ -1,62 +1,62 @@
 <template>
-  <div class="search-pool-dashboard">
-    <h1>搜索池网关</h1>
-    <el-space>
-      <el-select v-model="service" style="width: 180px">
-        <el-option label="Tavily" value="tavily" />
-        <el-option label="Firecrawl" value="firecrawl" />
-      </el-select>
-      <el-button type="primary" @click="loadStats">刷新统计</el-button>
-      <el-button @click="runSync">同步额度</el-button>
-    </el-space>
+  <PageContainer>
+    <PageHeader title="搜索池网关" description="统一管理 Tavily 与 Firecrawl 的真实 Key、代理 Token 与工作台状态。" />
 
-    <el-card class="stats-card">
-      <el-descriptions :column="2" border>
-        <el-descriptions-item label="服务">{{ stats?.service || '-' }}</el-descriptions-item>
-        <el-descriptions-item label="可用密钥">{{ stats?.keys_active ?? '-' }}</el-descriptions-item>
-        <el-descriptions-item label="密钥总数">{{ stats?.keys_total ?? '-' }}</el-descriptions-item>
-        <el-descriptions-item label="网关令牌">{{ stats?.tokens_total ?? '-' }}</el-descriptions-item>
-        <el-descriptions-item label="请求总数">{{ stats?.requests_total ?? '-' }}</el-descriptions-item>
-        <el-descriptions-item label="成功率">{{ successRate }}</el-descriptions-item>
-      </el-descriptions>
-    </el-card>
-  </div>
+    <Card class="mt-6 overflow-hidden border-border/60 bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 p-8 text-slate-50 shadow-xl">
+      <div class="max-w-4xl">
+        <div class="flex flex-wrap gap-2 text-xs uppercase tracking-[0.18em] text-slate-300">
+          <span class="rounded-full border border-white/10 bg-white/5 px-3 py-1">统一搜索入口</span>
+          <span class="rounded-full border border-white/10 bg-white/5 px-3 py-1">Key + Token + Sync</span>
+          <span class="rounded-full border border-white/10 bg-white/5 px-3 py-1">Search Workspace</span>
+        </div>
+        <h2 class="mt-6 text-4xl font-semibold tracking-tight text-white sm:text-5xl">
+          把搜索池运维收敛到一个真正可用的工作台
+        </h2>
+        <p class="mt-5 max-w-3xl text-base leading-7 text-slate-300">
+          先看服务分类面板，再进入单服务工作台处理真实额度、调用示例、Token 池和 Key 池。交互方式对齐参考项目，但视觉系统保持当前 Aether 管理端风格。
+        </p>
+      </div>
+    </Card>
+
+    <div class="mt-8 grid gap-6 xl:grid-cols-2">
+      <SearchPoolServiceCard
+        v-for="summary in services"
+        :key="summary.service"
+        :summary="summary"
+        @select="goToWorkspace(summary.service)"
+      />
+    </div>
+  </PageContainer>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { PageContainer, PageHeader } from '@/components/layout'
+import { Card } from '@/components/ui'
+import { useToast } from '@/composables/useToast'
 import { searchPoolApi } from '@/features/search-pool/api'
-import type { SearchPoolStatsOverview, SearchService } from '@/features/search-pool/types'
+import SearchPoolServiceCard from '@/features/search-pool/components/SearchPoolServiceCard.vue'
+import type { SearchPoolServiceSummary, SearchService } from '@/features/search-pool/types'
+import { parseApiError } from '@/utils/errorParser'
 
-const service = ref<SearchService>('tavily')
-const stats = ref<SearchPoolStatsOverview | null>(null)
-const { success } = useToast()
+const router = useRouter()
+const services = ref<SearchPoolServiceSummary[]>([])
+const { error } = useToast()
 
-const successRate = computed(() => {
-  if (!stats.value) return '-'
-  return `${(stats.value.success_rate * 100).toFixed(2)}%`
+async function loadServices() {
+  try {
+    services.value = await searchPoolApi.listServiceSummaries()
+  } catch (err) {
+    error(parseApiError(err, '加载服务工作台失败'))
+  }
+}
+
+function goToWorkspace(service: SearchService) {
+  void router.push({ name: 'SearchPoolServiceWorkspace', params: { service } })
+}
+
+onMounted(() => {
+  void loadServices()
 })
-
-const loadStats = async () => {
-  stats.value = await searchPoolApi.getStatsOverview(service.value)
-}
-
-const runSync = async () => {
-  await searchPoolApi.syncUsage(service.value, true)
-  success('同步完成')
-  await loadStats()
-}
-
-onMounted(loadStats)
 </script>
-
-<style scoped>
-.search-pool-dashboard {
-  display: grid;
-  gap: 16px;
-}
-
-.stats-card {
-  max-width: 960px;
-}
-</style>

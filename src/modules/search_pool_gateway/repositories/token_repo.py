@@ -47,6 +47,27 @@ class GatewayTokenRepository:
     def get_by_token(self, raw_token: str) -> GatewayToken | None:
         return self.db.query(GatewayToken).filter(GatewayToken.token == raw_token).first()
 
+    def update_limits(
+        self,
+        token_id: str,
+        *,
+        name: str,
+        hourly_limit: int,
+        daily_limit: int,
+        monthly_limit: int,
+    ) -> GatewayToken | None:
+        row = self.get(token_id)
+        if row is None:
+            return None
+        row.name = name
+        row.hourly_limit = hourly_limit
+        row.daily_limit = daily_limit
+        row.monthly_limit = monthly_limit
+        self.db.flush()
+        self.db.commit()
+        self.db.refresh(row)
+        return row
+
     def delete(self, token_id: str) -> bool:
         row = self.get(token_id)
         if row is None:

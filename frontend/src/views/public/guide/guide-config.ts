@@ -6,7 +6,8 @@ import {
   Target,
   Settings,
   Blocks,
-  HelpCircle
+  HelpCircle,
+  Search
 } from 'lucide-vue-next'
 
 // 导航配置
@@ -29,6 +30,7 @@ export const guideNavItems: GuideNavItem[] = [
     subItems: [
       { name: '部署', hash: '#production' },
       { name: '配置流程', hash: '#config-steps' },
+      { name: '统一搜索入口', hash: '#unified-search' },
       { name: '反向代理', hash: '#reverse-proxy' },
       { name: '异步任务', hash: '#async-tasks' },
       { name: '代理配置', hash: '#proxy-config' }
@@ -92,12 +94,26 @@ export const guideNavItems: GuideNavItem[] = [
     ]
   },
   {
+    id: 'search-gateway',
+    name: '统一搜索',
+    path: '/guide/search-gateway',
+    icon: Search,
+    description: '统一搜索入口',
+    subItems: [
+      { name: '为什么使用', hash: '#why-search-gateway' },
+      { name: '管理端配置', hash: '#workspace-setup' },
+      { name: '接入方式', hash: '#access-patterns' },
+      { name: '常见问题', hash: '#troubleshooting' }
+    ]
+  },
+  {
     id: 'modules',
     name: '模块管理',
     path: '/guide/modules',
     icon: Blocks,
     description: '模块管理',
     subItems: [
+      { name: '搜索池网关', hash: '#search-pool-gateway' },
       { name: '访问令牌', hash: '#management-tokens' },
       { name: '邮件配置', hash: '#email-config' },
       { name: 'OAuth登录', hash: '#oauth-login' },

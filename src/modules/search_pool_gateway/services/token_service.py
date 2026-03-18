@@ -41,6 +41,26 @@ class GatewayTokenService:
     def list_tokens(self, service: str | None = None):
         return self.repo.list_tokens(service.strip().lower() if service else None)
 
+    def update_token(
+        self,
+        token_id: str,
+        *,
+        name: str,
+        hourly_limit: int,
+        daily_limit: int,
+        monthly_limit: int,
+    ):
+        row = self.repo.update_limits(
+            token_id,
+            name=name.strip(),
+            hourly_limit=max(0, int(hourly_limit)),
+            daily_limit=max(0, int(daily_limit)),
+            monthly_limit=max(0, int(monthly_limit)),
+        )
+        if row is None:
+            raise ValueError("token not found")
+        return row
+
     def delete(self, token_id: str) -> None:
         if not self.repo.delete(token_id):
             raise ValueError("token not found")

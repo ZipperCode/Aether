@@ -6,7 +6,14 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from src.modules.search_pool_gateway.schemas import CreateKeyRequest, CreateTokenRequest, ToggleKeyRequest, UsageSyncRequest
+from src.modules.search_pool_gateway.schemas import (
+    CreateKeyRequest,
+    CreateTokenRequest,
+    ImportKeysRequest,
+    ToggleKeyRequest,
+    UpdateTokenRequest,
+    UsageSyncRequest,
+)
 from src.modules.search_pool_gateway.services.key_service import GatewayKeyService
 from src.modules.search_pool_gateway.services.token_service import GatewayTokenService
 from src.modules.search_pool_gateway.services.usage_service import GatewayUsageService
@@ -21,18 +28,8 @@ async def list_keys(service: str | None = None, _: Any = Depends(require_admin))
     session_factory = get_session_factory()
     with session_factory() as db:
         rows = GatewayKeyService(db).list_keys(service)
-        return {
-            "keys": [
-                {
-                    "id": row.id,
-                    "service": row.service,
-                    "key_masked": row.key_masked,
-                    "email": row.email,
-                    "active": row.active,
-                }
-                for row in rows
-            ]
-        }
+        usage_service = GatewayUsageService(db)
+        return {"keys": [usage_service.serialize_key(row) for row in rows]}
 
 
 @router.post("/keys")
@@ -43,12 +40,22 @@ async def create_key(payload: CreateKeyRequest, _: Any = Depends(require_admin))
             row = GatewayKeyService(db).create_key(service=payload.service, raw_key=payload.key, email=payload.email)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return GatewayUsageService(db).serialize_key(row)
+
+
+@router.post("/keys/import")
+async def import_keys(payload: ImportKeysRequest, _: Any = Depends(require_admin)) -> dict[str, Any]:
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        try:
+            rows = GatewayKeyService(db).import_keys(service=payload.service, content=payload.content, keys=payload.keys)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        usage_service = GatewayUsageService(db)
         return {
-            "id": row.id,
-            "service": row.service,
-            "key_masked": row.key_masked,
-            "email": row.email,
-            "active": row.active,
+            "service": payload.service.strip().lower(),
+            "created": len(rows),
+            "keys": [usage_service.serialize_key(row) for row in rows],
         }
 
 
@@ -82,16 +89,12 @@ async def list_tokens(service: str | None = None, _: Any = Depends(require_admin
     session_factory = get_session_factory()
     with session_factory() as db:
         rows = GatewayTokenService(db).list_tokens(service)
+        usage = GatewayUsageService(db).build_token_usage_summary(service)
         return {
             "tokens": [
                 {
-                    "id": row.id,
-                    "service": row.service,
-                    "token": row.token,
-                    "name": row.name,
-                    "hourly_limit": row.hourly_limit,
-                    "daily_limit": row.daily_limit,
-                    "monthly_limit": row.monthly_limit,
+                    **GatewayUsageService(db).serialize_token(row),
+                    **usage.get(row.id, {"usage_success": 0, "usage_failed": 0, "usage_this_month": 0}),
                 }
                 for row in rows
             ]
@@ -112,15 +115,28 @@ async def create_token(payload: CreateTokenRequest, _: Any = Depends(require_adm
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {
-            "id": row.id,
-            "service": row.service,
-            "token": row.token,
-            "name": row.name,
-            "hourly_limit": row.hourly_limit,
-            "daily_limit": row.daily_limit,
-            "monthly_limit": row.monthly_limit,
-        }
+        payload_out = GatewayUsageService(db).serialize_token(row)
+        payload_out.update({"usage_success": 0, "usage_failed": 0, "usage_this_month": 0})
+        return payload_out
+
+
+@router.put("/tokens/{token_id}")
+async def update_token(token_id: str, payload: UpdateTokenRequest, _: Any = Depends(require_admin)) -> dict[str, Any]:
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        try:
+            row = GatewayTokenService(db).update_token(
+                token_id,
+                name=payload.name,
+                hourly_limit=payload.hourly_limit,
+                daily_limit=payload.daily_limit,
+                monthly_limit=payload.monthly_limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        payload_out = GatewayUsageService(db).serialize_token(row)
+        payload_out.update({"usage_success": 0, "usage_failed": 0, "usage_this_month": 0})
+        return payload_out
 
 
 @router.delete("/tokens/{token_id}")
@@ -147,3 +163,20 @@ async def stats_overview(service: str | None = None, _: Any = Depends(require_ad
     session_factory = get_session_factory()
     with session_factory() as db:
         return GatewayUsageService(db).stats_overview(service=service)
+
+
+@router.get("/services/summary")
+async def services_summary(_: Any = Depends(require_admin)) -> dict[str, Any]:
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        return GatewayUsageService(db).list_service_summaries()
+
+
+@router.get("/services/{service}/workspace")
+async def service_workspace(service: str, _: Any = Depends(require_admin)) -> dict[str, Any]:
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        usage_service = GatewayUsageService(db)
+        workspace = usage_service.build_workspace(service)
+        workspace["keys"] = [usage_service.serialize_key(row) for row in workspace["keys"]]
+        return workspace

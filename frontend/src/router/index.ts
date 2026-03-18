@@ -55,6 +55,12 @@ const routes: RouteRecordRaw[] = [
         meta: { requiresAuth: false }
       },
       {
+        path: 'search-gateway',
+        name: 'GuideSearchGateway',
+        component: () => importWithRetry(() => import('@/views/public/guide/SearchGatewayGuide.vue')),
+        meta: { requiresAuth: false }
+      },
+      {
         path: 'faq',
         name: 'GuideFaq',
         component: () => importWithRetry(() => import('@/views/public/guide/GuideFaq.vue')),
@@ -299,15 +305,9 @@ const routes: RouteRecordRaw[] = [
         meta: { module: 'search_pool_gateway' }
       },
       {
-        path: 'search-pool/keys',
-        name: 'SearchPoolKeys',
-        component: () => importWithRetry(() => import('@/views/admin/SearchPoolKeys.vue')),
-        meta: { module: 'search_pool_gateway' }
-      },
-      {
-        path: 'search-pool/tokens',
-        name: 'SearchPoolTokens',
-        component: () => importWithRetry(() => import('@/views/admin/SearchPoolTokens.vue')),
+        path: 'search-pool/:service',
+        name: 'SearchPoolServiceWorkspace',
+        component: () => importWithRetry(() => import('@/views/admin/SearchPoolServiceWorkspace.vue')),
         meta: { module: 'search_pool_gateway' }
       },
       {

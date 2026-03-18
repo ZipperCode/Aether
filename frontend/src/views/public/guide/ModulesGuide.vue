@@ -20,6 +20,73 @@ import { panelClasses } from './guide-config'
     </div>
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-8">
+      <!-- 0. 搜索池网关 -->
+      <section
+        id="search-pool-gateway"
+        :class="[panelClasses.card]"
+        class="p-6 scroll-mt-24 lg:scroll-mt-20 flex flex-col md:col-span-2"
+      >
+        <div class="w-12 h-12 rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center mb-4">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="lucide lucide-search"
+          ><circle
+            cx="11"
+            cy="11"
+            r="8"
+          /><path d="m21 21-4.3-4.3" /></svg>
+        </div>
+        <h3 class="text-xl font-bold text-[#262624] dark:text-[#f1ead8] mb-2 m-0 mt-0 pt-0 border-0">
+          搜索池网关
+        </h3>
+        <p class="text-sm text-[#666663] dark:text-[#a3a094] leading-relaxed">
+          将 Tavily 与 Firecrawl 收敛成统一搜索入口。后台提供总览页和单服务工作台，分别管理真实 Key 池、网关 Token 池与额度同步。适合团队内部统一接入搜索、提取与抓取能力，而不是分别维护多个 provider 接口。
+        </p>
+        <div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div class="rounded-xl border border-[#e5e4df] dark:border-[rgba(227,224,211,0.12)] p-4">
+            <div class="text-xs uppercase tracking-[0.14em] text-[#91918d] dark:text-[#a3a094]/80">
+              总览页
+            </div>
+            <div class="mt-2 text-sm font-medium text-[#262624] dark:text-[#f1ead8]">
+              先看服务面板
+            </div>
+            <div class="mt-1 text-sm text-[#666663] dark:text-[#a3a094]">
+              快速确认 Tavily / Firecrawl 的活跃 Key、Token 数、今日调用和剩余额度。
+            </div>
+          </div>
+          <div class="rounded-xl border border-[#e5e4df] dark:border-[rgba(227,224,211,0.12)] p-4">
+            <div class="text-xs uppercase tracking-[0.14em] text-[#91918d] dark:text-[#a3a094]/80">
+              工作台
+            </div>
+            <div class="mt-2 text-sm font-medium text-[#262624] dark:text-[#f1ead8]">
+              再进单服务管理
+            </div>
+            <div class="mt-1 text-sm text-[#666663] dark:text-[#a3a094]">
+              在同一页里完成统计查看、调用方式复制、Token 管理、Key 管理和额度同步。
+            </div>
+          </div>
+          <div class="rounded-xl border border-[#e5e4df] dark:border-[rgba(227,224,211,0.12)] p-4">
+            <div class="text-xs uppercase tracking-[0.14em] text-[#91918d] dark:text-[#a3a094]/80">
+              接入方式
+            </div>
+            <div class="mt-2 text-sm font-medium text-[#262624] dark:text-[#f1ead8]">
+              使用独立 Bearer Token
+            </div>
+            <div class="mt-1 text-sm text-[#666663] dark:text-[#a3a094]">
+              创建网关 Token 后即可通过 `/api/search`、`/api/extract` 和 `/firecrawl/*` 统一访问搜索能力。
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- 1. 访问令牌 -->
       <section
         id="management-tokens"
