@@ -293,28 +293,38 @@ const routes: RouteRecordRaw[] = [
         meta: { module: 'site_management' }
       },
       {
+        path: 'search-pool',
+        name: 'SearchPoolDashboard',
+        component: () => importWithRetry(() => import('@/views/admin/SearchPoolDashboard.vue')),
+        meta: { module: 'search_pool_gateway' }
+      },
+      {
+        path: 'search-pool/keys',
+        name: 'SearchPoolKeys',
+        component: () => importWithRetry(() => import('@/views/admin/SearchPoolKeys.vue')),
+        meta: { module: 'search_pool_gateway' }
+      },
+      {
+        path: 'search-pool/tokens',
+        name: 'SearchPoolTokens',
+        component: () => importWithRetry(() => import('@/views/admin/SearchPoolTokens.vue')),
+        meta: { module: 'search_pool_gateway' }
+      },
+      {
         path: 'tavily-pool',
-        name: 'TavilyPool',
-        component: () => importWithRetry(() => import('@/views/admin/TavilyPoolList.vue')),
-        meta: { module: 'tavily_pool' }
+        redirect: '/admin/search-pool'
       },
       {
         path: 'tavily-pool/health-history',
-        name: 'TavilyHealthHistory',
-        component: () => importWithRetry(() => import('@/views/admin/TavilyHealthHistory.vue')),
-        meta: { module: 'tavily_pool' }
+        redirect: '/admin/search-pool'
       },
       {
         path: 'tavily-pool/maintenance-history',
-        name: 'TavilyMaintenanceHistory',
-        component: () => importWithRetry(() => import('@/views/admin/TavilyMaintenanceHistory.vue')),
-        meta: { module: 'tavily_pool' }
+        redirect: '/admin/search-pool'
       },
       {
         path: 'tavily-pool/:accountId',
-        name: 'TavilyPoolDetail',
-        component: () => importWithRetry(() => import('@/views/admin/TavilyPoolDetail.vue')),
-        meta: { module: 'tavily_pool' }
+        redirect: '/admin/search-pool'
       },
       {
         path: 'gemini-files',
