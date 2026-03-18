@@ -280,18 +280,8 @@ async def test_admin_usage_detail_defers_large_body_columns_when_bodies_excluded
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("same_provider", "same_endpoint"),
-    [
-        (True, False),
-        (False, False),
-    ],
-    ids=["same-provider-cross-endpoint", "cross-provider"],
-)
 async def test_resolve_replay_model_name_falls_back_to_source_model_when_mapping_missing(
     monkeypatch: pytest.MonkeyPatch,
-    same_provider: bool,
-    same_endpoint: bool,
 ) -> None:
     class _FakeMapper:
         def __init__(self, db: Any) -> None:
@@ -305,14 +295,45 @@ async def test_resolve_replay_model_name_falls_back_to_source_model_when_mapping
     resolved_model, mapping_source = await _resolve_replay_model_name(
         SimpleNamespace(),
         source_model="gpt-4o-mini",
-        original_target_model="provider-specific-model",
         target_provider=SimpleNamespace(id="provider-2", name="OpenAI Compatible"),
         target_endpoint=SimpleNamespace(id="endpoint-2", api_format="openai:responses"),
         target_api_key=None,
-        same_provider=same_provider,
-        same_endpoint=same_endpoint,
-        force_remap=False,
     )
 
     assert resolved_model == "gpt-4o-mini"
     assert mapping_source == "none"
+
+
+@pytest.mark.asyncio
+async def test_resolve_replay_model_name_reruns_mapping_for_same_endpoint_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeModel:
+        def select_provider_model_name(
+            self, affinity_key: str | None = None, api_format: str | None = None
+        ) -> str:
+            assert affinity_key == "key-2"
+            assert api_format == "openai:responses"
+            return "provider-model-for-key-2"
+
+    class _FakeMapper:
+        def __init__(self, db: Any) -> None:
+            self.db = db
+
+        async def get_mapping(self, source_model: str, provider_id: str) -> Any:
+            assert source_model == "gpt-4o-mini"
+            assert provider_id == "provider-2"
+            return SimpleNamespace(model=_FakeModel())
+
+    monkeypatch.setattr("src.services.model.mapper.ModelMapperMiddleware", _FakeMapper)
+
+    resolved_model, mapping_source = await _resolve_replay_model_name(
+        SimpleNamespace(),
+        source_model="gpt-4o-mini",
+        target_provider=SimpleNamespace(id="provider-2", name="OpenAI Compatible"),
+        target_endpoint=SimpleNamespace(id="endpoint-2", api_format="openai:responses"),
+        target_api_key=SimpleNamespace(id="key-2"),
+    )
+
+    assert resolved_model == "provider-model-for-key-2"
+    assert mapping_source == "model_mapping"

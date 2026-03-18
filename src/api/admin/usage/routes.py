@@ -1920,21 +1920,14 @@ async def _resolve_replay_model_name(
     db: Session,
     *,
     source_model: str,
-    original_target_model: str | None,
     target_provider: Provider,
     target_endpoint: ProviderEndpoint,
     target_api_key: ProviderAPIKey | None,
-    same_provider: bool,
-    same_endpoint: bool,
-    force_remap: bool,
 ) -> tuple[str, str]:
-    """解析 replay 的最终模型名，并返回 mapping_source。"""
+    """按当前 replay 目标重新解析模型名，并返回 mapping_source。"""
     from src.services.model.mapper import ModelMapperMiddleware
 
     target_api_format = (getattr(target_endpoint, "api_format", "") or "").strip().lower()
-
-    if same_provider and same_endpoint and original_target_model and not force_remap:
-        return original_target_model, "original_target_model"
 
     mapper = ModelMapperMiddleware(db)
     mapping = await mapper.get_mapping(source_model, str(target_provider.id))
@@ -1946,15 +1939,14 @@ async def _resolve_replay_model_name(
         )
         return mapped_name, "model_mapping"
 
-    if not (same_provider and same_endpoint):
-        logger.debug(
-            "[replay] No explicit model mapping for '{}' on provider '{}' (endpoint={}, api_format={}); "
-            "forwarding original source model",
-            source_model,
-            target_provider.name or str(target_provider.id),
-            str(getattr(target_endpoint, "id", "") or "unknown"),
-            target_api_format or "unknown",
-        )
+    logger.debug(
+        "[replay] No explicit model mapping for '{}' on provider '{}' (endpoint={}, api_format={}); "
+        "forwarding original source model",
+        source_model,
+        target_provider.name or str(target_provider.id),
+        str(getattr(target_endpoint, "id", "") or "unknown"),
+        target_api_format or "unknown",
+    )
 
     # Keep replay aligned with the normal request path: if no global-model mapping exists,
     # forward the original source model name and let the target provider validate it.
@@ -2161,13 +2153,9 @@ class AdminUsageReplayAdapter(AdminApiAdapter):
         resolved_model_name, mapping_source = await _resolve_replay_model_name(
             db,
             source_model=source_model,
-            original_target_model=original_target_model,
             target_provider=target_provider_obj,
             target_endpoint=endpoint,
             target_api_key=provider_key,
-            same_provider=same_provider,
-            same_endpoint=same_endpoint,
-            force_remap=bool(override_model),
         )
         mapping_applied = mapping_source != "none"
 
