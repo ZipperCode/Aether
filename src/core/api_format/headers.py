@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Set as AbstractSet
-from typing import Any
+from typing import Any, Callable
 
 from src.core.api_format.enums import ApiFamily
 from src.core.api_format.metadata import (
@@ -342,6 +342,12 @@ class HeaderBuilder:
         self,
         rules: list[dict[str, Any]],
         protected_keys: AbstractSet[str] | None = None,
+        *,
+        body: dict[str, Any] | None = None,
+        original_body: dict[str, Any] | None = None,
+        condition_evaluator: (
+            Callable[[dict[str, Any], dict[str, Any], dict[str, Any] | None], bool] | None
+        ) = None,
     ) -> HeaderBuilder:
         """
         应用请求头规则
@@ -354,10 +360,23 @@ class HeaderBuilder:
         Args:
             rules: 规则列表
             protected_keys: 受保护的 key（不能被 set/drop/rename 修改）
+            body: 条件规则评估用的当前请求体
+            original_body: 条件规则评估用的原始请求体
+            condition_evaluator: 条件评估函数；未提供时带 condition 的规则 fail-closed
         """
         protected_lower = {k.lower() for k in protected_keys} if protected_keys else set()
 
         for rule in rules:
+            condition = rule.get("condition")
+            if condition is not None:
+                if (
+                    not isinstance(condition, dict)
+                    or body is None
+                    or condition_evaluator is None
+                    or not condition_evaluator(body, condition, original_body)
+                ):
+                    continue
+
             action = rule.get("action")
 
             if action == "set":
@@ -436,6 +455,11 @@ def build_upstream_headers_for_endpoint(
     extra_headers: dict[str, str] | None = None,
     drop_headers: frozenset[str] | None = None,
     header_rules: list[dict[str, Any]] | None = None,
+    body: dict[str, Any] | None = None,
+    original_body: dict[str, Any] | None = None,
+    condition_evaluator: (
+        Callable[[dict[str, Any], dict[str, Any], dict[str, Any] | None], bool] | None
+    ) = None,
 ) -> dict[str, str]:
     """
     新模式：构建发送给上游 Provider 的请求头（基于 endpoint signature）。
@@ -466,7 +490,13 @@ def build_upstream_headers_for_endpoint(
 
     # 应用用户自定义的请求头规则（认证头受保护）
     if header_rules:
-        builder.apply_rules(header_rules, protected_keys)
+        builder.apply_rules(
+            header_rules,
+            protected_keys,
+            body=body,
+            original_body=original_body,
+            condition_evaluator=condition_evaluator,
+        )
 
     if extra_headers:
         builder.add_many(extra_headers)

@@ -228,105 +228,126 @@
                       <span>拖拽左侧手柄可调整规则执行顺序</span>
                     </div>
                     <!-- 请求头规则列表 - 主题色边框 -->
-                    <div
+                    <template
                       v-for="(rule, index) in getEndpointEditRules(endpoint.id)"
                       :key="`header-${index}`"
-                      class="flex items-center gap-1.5 px-2 py-1.5 rounded-md border-l-4 border-primary/60 bg-muted/30"
-                      :class="[
-                        isHeaderRuleDragging(endpoint.id, index) ? 'opacity-60 border-primary bg-primary/5' : '',
-                        isHeaderRuleDragOver(endpoint.id, index) ? 'ring-1 ring-primary/40 bg-primary/10' : ''
-                      ]"
-                      @dragover.prevent="handleHeaderRuleDragOver(endpoint.id, index)"
-                      @dragleave="handleHeaderRuleDragLeave(endpoint.id, index)"
-                      @drop.prevent="handleHeaderRuleDrop(endpoint.id, index)"
                     >
-                      <button
-                        type="button"
-                        class="h-7 w-6 shrink-0 inline-flex items-center justify-center rounded-sm text-muted-foreground/60 hover:text-muted-foreground hover:bg-muted cursor-grab active:cursor-grabbing"
-                        title="拖拽排序"
-                        draggable="true"
-                        @dragstart="(e) => handleHeaderRuleDragStart(endpoint.id, index, e)"
-                        @dragend="() => handleHeaderRuleDragEnd(endpoint.id)"
+                      <div
+                        class="flex items-center gap-1.5 px-2 py-1.5 rounded-md border-l-4 border-primary/60 bg-muted/30"
+                        :class="[
+                          isHeaderRuleDragging(endpoint.id, index) ? 'opacity-60 border-primary bg-primary/5' : '',
+                          isHeaderRuleDragOver(endpoint.id, index) ? 'ring-1 ring-primary/40 bg-primary/10' : ''
+                        ]"
+                        @dragover.prevent="handleHeaderRuleDragOver(endpoint.id, index)"
+                        @dragleave="handleHeaderRuleDragLeave(endpoint.id, index)"
+                        @drop.prevent="handleHeaderRuleDrop(endpoint.id, index)"
                       >
-                        <GripVertical class="w-3.5 h-3.5" />
-                      </button>
-                      <span
-                        class="text-[10px] font-semibold text-primary shrink-0"
-                        title="请求头"
-                      >H</span>
-                      <Select
-                        :model-value="rule.action"
-                        :open="ruleSelectOpen[`${endpoint.id}-${index}`]"
-                        @update:model-value="(v) => updateEndpointRuleAction(endpoint.id, index, v as 'set' | 'drop' | 'rename')"
-                        @update:open="(v) => handleRuleSelectOpen(endpoint.id, index, v)"
-                      >
-                        <SelectTrigger class="w-[88px] h-7 text-xs shrink-0">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="set">
-                            覆写
-                          </SelectItem>
-                          <SelectItem value="drop">
-                            删除
-                          </SelectItem>
-                          <SelectItem value="rename">
-                            重命名
-                          </SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <template v-if="rule.action === 'set'">
-                        <Input
-                          :model-value="rule.key"
-                          placeholder="名称"
-                          size="sm"
-                          class="flex-1 min-w-0 h-7 text-xs"
-                          @update:model-value="(v) => updateEndpointRuleField(endpoint.id, index, 'key', v)"
-                        />
-                        <span class="text-muted-foreground text-xs">=</span>
-                        <Input
-                          :model-value="rule.value"
-                          placeholder="值"
-                          size="sm"
-                          class="flex-1 min-w-0 h-7 text-xs"
-                          @update:model-value="(v) => updateEndpointRuleField(endpoint.id, index, 'value', v)"
-                        />
-                      </template>
-                      <template v-else-if="rule.action === 'drop'">
-                        <Input
-                          :model-value="rule.key"
-                          placeholder="要删除的名称"
-                          size="sm"
-                          class="flex-1 min-w-0 h-7 text-xs"
-                          @update:model-value="(v) => updateEndpointRuleField(endpoint.id, index, 'key', v)"
-                        />
-                      </template>
-                      <template v-else-if="rule.action === 'rename'">
-                        <Input
-                          :model-value="rule.from"
-                          placeholder="原名"
-                          size="sm"
-                          class="flex-1 min-w-0 h-7 text-xs"
-                          @update:model-value="(v) => updateEndpointRuleField(endpoint.id, index, 'from', v)"
-                        />
-                        <span class="text-muted-foreground text-xs">→</span>
-                        <Input
-                          :model-value="rule.to"
-                          placeholder="新名"
-                          size="sm"
-                          class="flex-1 min-w-0 h-7 text-xs"
-                          @update:model-value="(v) => updateEndpointRuleField(endpoint.id, index, 'to', v)"
-                        />
-                      </template>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        class="h-7 w-7 shrink-0"
-                        @click="removeEndpointRule(endpoint.id, index)"
-                      >
-                        <X class="w-3 h-3" />
-                      </Button>
-                    </div>
+                        <button
+                          type="button"
+                          class="h-7 w-6 shrink-0 inline-flex items-center justify-center rounded-sm text-muted-foreground/60 hover:text-muted-foreground hover:bg-muted cursor-grab active:cursor-grabbing"
+                          title="拖拽排序"
+                          draggable="true"
+                          @dragstart="(e) => handleHeaderRuleDragStart(endpoint.id, index, e)"
+                          @dragend="() => handleHeaderRuleDragEnd(endpoint.id)"
+                        >
+                          <GripVertical class="w-3.5 h-3.5" />
+                        </button>
+                        <span
+                          class="text-[10px] font-semibold text-primary shrink-0"
+                          title="请求头"
+                        >H</span>
+                        <Select
+                          :model-value="rule.action"
+                          :open="ruleSelectOpen[`${endpoint.id}-${index}`]"
+                          @update:model-value="(v) => updateEndpointRuleAction(endpoint.id, index, v as 'set' | 'drop' | 'rename')"
+                          @update:open="(v) => handleRuleSelectOpen(endpoint.id, index, v)"
+                        >
+                          <SelectTrigger class="w-[88px] h-7 text-xs shrink-0">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="set">
+                              覆写
+                            </SelectItem>
+                            <SelectItem value="drop">
+                              删除
+                            </SelectItem>
+                            <SelectItem value="rename">
+                              重命名
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          class="h-7 w-7 shrink-0"
+                          :class="rule.condition ? 'text-primary' : ''"
+                          title="条件触发"
+                          @click="toggleEndpointRuleCondition(endpoint.id, index)"
+                        >
+                          <Filter class="w-3 h-3" />
+                        </Button>
+                        <template v-if="rule.action === 'set'">
+                          <Input
+                            :model-value="rule.key"
+                            placeholder="名称"
+                            size="sm"
+                            class="flex-1 min-w-0 h-7 text-xs"
+                            @update:model-value="(v) => updateEndpointRuleField(endpoint.id, index, 'key', v)"
+                          />
+                          <span class="text-muted-foreground text-xs">=</span>
+                          <Input
+                            :model-value="rule.value"
+                            placeholder="值"
+                            size="sm"
+                            class="flex-1 min-w-0 h-7 text-xs"
+                            @update:model-value="(v) => updateEndpointRuleField(endpoint.id, index, 'value', v)"
+                          />
+                        </template>
+                        <template v-else-if="rule.action === 'drop'">
+                          <Input
+                            :model-value="rule.key"
+                            placeholder="要删除的名称"
+                            size="sm"
+                            class="flex-1 min-w-0 h-7 text-xs"
+                            @update:model-value="(v) => updateEndpointRuleField(endpoint.id, index, 'key', v)"
+                          />
+                        </template>
+                        <template v-else-if="rule.action === 'rename'">
+                          <Input
+                            :model-value="rule.from"
+                            placeholder="原名"
+                            size="sm"
+                            class="flex-1 min-w-0 h-7 text-xs"
+                            @update:model-value="(v) => updateEndpointRuleField(endpoint.id, index, 'from', v)"
+                          />
+                          <span class="text-muted-foreground text-xs">→</span>
+                          <Input
+                            :model-value="rule.to"
+                            placeholder="新名"
+                            size="sm"
+                            class="flex-1 min-w-0 h-7 text-xs"
+                            @update:model-value="(v) => updateEndpointRuleField(endpoint.id, index, 'to', v)"
+                          />
+                        </template>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          class="h-7 w-7 shrink-0"
+                          @click="removeEndpointRule(endpoint.id, index)"
+                        >
+                          <X class="w-3 h-3" />
+                        </Button>
+                      </div>
+                      <EndpointConditionEditor
+                        v-if="rule.condition"
+                        :model-value="rule.condition"
+                        path-hint="请求体字段路径"
+                        removable
+                        @update:model-value="(condition) => updateEndpointRuleCondition(endpoint.id, index, condition)"
+                        @remove="clearEndpointRuleCondition(endpoint.id, index)"
+                      />
+                    </template>
 
                     <div
                       v-if="getEndpointEditBodyRules(endpoint.id).length > 0"
@@ -397,14 +418,15 @@
                                 <code>exists</code> <code>not_exists</code> 字段存在性<br>
                                 <code>in</code> 在列表中（值填 <code>["a","b"]</code>）<br>
                                 <code>type_is</code> 类型判断（string/number/boolean/array/object/null）<br>
-                                条件路径支持 <code>$item.xxx</code> 引用通配符当前元素
+                                条件路径支持 <code>$item.xxx</code> 引用通配符当前元素<br>
+                                可切换 <code>Current</code>/<code>Original</code> 数据源，并支持 <code>ALL</code>/<code>ANY</code> 组合条件
                               </div>
                             </div>
                             <div class="text-muted-foreground">
                               规则按顺序执行，前面的修改对后续规则可见。
                             </div>
                             <div class="text-muted-foreground">
-                              规则在格式转换之后执行，路径需按目标提供商的请求体结构填写。
+                              规则默认在格式转换后按目标提供商结构匹配；条件切到 <code>Original</code> 时则按客户端原始请求体匹配。
                             </div>
                           </div>
                         </PopoverContent>
@@ -474,7 +496,7 @@
                           variant="ghost"
                           size="icon"
                           class="h-7 w-7 shrink-0"
-                          :class="rule.conditionEnabled ? 'text-primary' : ''"
+                          :class="rule.condition ? 'text-primary' : ''"
                           title="条件触发"
                           @click="toggleBodyRuleCondition(endpoint.id, index)"
                         >
@@ -638,80 +660,14 @@
                           <X class="w-3 h-3" />
                         </Button>
                       </div>
-                      <!-- 条件编辑行 -->
-                      <div
-                        v-if="rule.conditionEnabled"
-                        class="flex items-center gap-1.5 px-2 py-1 ml-6 rounded-md bg-muted/20"
-                      >
-                        <span class="text-[10px] font-semibold text-muted-foreground shrink-0">IF</span>
-                        <Input
-                          :model-value="rule.conditionPath"
-                          :placeholder="rule.path?.includes('[*]') || rule.path?.match(/\[\d+-\d+\]/) ? '$item.字段名' : '字段路径'"
-                          size="sm"
-                          class="flex-1 min-w-0 h-7 text-xs"
-                          @update:model-value="(v) => updateEndpointBodyRuleField(endpoint.id, index, 'conditionPath', v)"
-                        />
-                        <Select
-                          :model-value="rule.conditionOp"
-                          @update:model-value="(v: string) => updateEndpointBodyRuleField(endpoint.id, index, 'conditionOp', v)"
-                        >
-                          <SelectTrigger class="w-[100px] h-7 text-xs shrink-0">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="eq">
-                              等于
-                            </SelectItem>
-                            <SelectItem value="neq">
-                              不等于
-                            </SelectItem>
-                            <SelectItem value="gt">
-                              大于
-                            </SelectItem>
-                            <SelectItem value="lt">
-                              小于
-                            </SelectItem>
-                            <SelectItem value="gte">
-                              大于等于
-                            </SelectItem>
-                            <SelectItem value="lte">
-                              小于等于
-                            </SelectItem>
-                            <SelectItem value="starts_with">
-                              开头匹配
-                            </SelectItem>
-                            <SelectItem value="ends_with">
-                              结尾匹配
-                            </SelectItem>
-                            <SelectItem value="contains">
-                              包含
-                            </SelectItem>
-                            <SelectItem value="matches">
-                              正则匹配
-                            </SelectItem>
-                            <SelectItem value="exists">
-                              存在
-                            </SelectItem>
-                            <SelectItem value="not_exists">
-                              不存在
-                            </SelectItem>
-                            <SelectItem value="in">
-                              在列表中
-                            </SelectItem>
-                            <SelectItem value="type_is">
-                              类型是
-                            </SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <Input
-                          v-if="rule.conditionOp !== 'exists' && rule.conditionOp !== 'not_exists'"
-                          :model-value="rule.conditionValue"
-                          :placeholder="rule.conditionOp === 'in' ? '[&quot;a&quot;, &quot;b&quot;]' : rule.conditionOp === 'type_is' ? 'string/number/boolean/...' : '值'"
-                          size="sm"
-                          class="flex-1 min-w-0 h-7 text-xs"
-                          @update:model-value="(v) => updateEndpointBodyRuleField(endpoint.id, index, 'conditionValue', v)"
-                        />
-                      </div>
+                      <EndpointConditionEditor
+                        v-if="rule.condition"
+                        :model-value="rule.condition"
+                        :path-hint="getBodyRuleConditionPathPlaceholder(rule.path)"
+                        removable
+                        @update:model-value="(condition) => updateEndpointBodyRuleCondition(endpoint.id, index, condition)"
+                        @remove="clearEndpointBodyRuleCondition(endpoint.id, index)"
+                      />
                     </template>
                   </div>
                 </CollapsibleContent>
@@ -839,6 +795,7 @@ import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
 import { log } from '@/utils/logger'
 import AlertDialog from '@/components/common/AlertDialog.vue'
+import EndpointConditionEditor from './EndpointConditionEditor.vue'
 import {
   createEndpoint,
   getDefaultBodyRules,
@@ -850,11 +807,18 @@ import {
   type BodyRule,
   type BodyRuleRegexReplace,
   type BodyRuleNameStyle,
-  type BodyRuleCondition,
-  type BodyRuleConditionOp,
 } from '@/api/endpoints'
 import { adminApi } from '@/api/admin'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
+import {
+  conditionEquals,
+  conditionToEditable,
+  createEmptyConditionLeaf,
+  editableConditionToApi,
+  getBodyRuleConditionPathPlaceholder,
+  type EditableConditionNode,
+  validateEditableCondition,
+} from './endpoint-rule-condition'
 
 // 编辑用的规则类型（统一的可编辑结构）
 interface EditableRule {
@@ -863,6 +827,7 @@ interface EditableRule {
   value: string    // set 用
   from: string     // rename 用
   to: string       // rename 用
+  condition: EditableConditionNode | null
 }
 
 // 编辑用的请求体规则类型
@@ -879,10 +844,7 @@ interface EditableBodyRule {
   replacement: string // regex_replace 用
   flags: string    // regex_replace 用（i/m/s）
   style: string    // name_style 用（snake_case/camelCase/PascalCase/kebab-case/capitalize）
-  conditionEnabled: boolean  // 是否启用条件
-  conditionPath: string
-  conditionOp: string
-  conditionValue: string     // JSON 格式字符串（保存时 parse）
+  condition: EditableConditionNode | null
 }
 
 // 端点编辑状态（仅 URL、路径、规则，格式转换是直接保存的）
@@ -1346,57 +1308,62 @@ function getEndpointUpstreamStreamPolicy(endpoint: ProviderEndpoint): string {
   return 'auto'
 }
 
+function emptyHeaderRule(): EditableRule {
+  return { action: 'set', key: '', value: '', from: '', to: '', condition: null }
+}
+
+function emptyBodyRule(action: BodyRuleAction = 'set'): EditableBodyRule {
+  return {
+    action,
+    path: '',
+    value: '',
+    from: '',
+    to: '',
+    index: '',
+    pattern: '',
+    replacement: '',
+    flags: '',
+    style: '',
+    condition: null,
+  }
+}
+
 // 初始化端点的编辑状态
 function initEndpointEditState(endpoint: ProviderEndpoint): EndpointEditState {
   const rules: EditableRule[] = []
   if (endpoint.header_rules && endpoint.header_rules.length > 0) {
     for (const rule of endpoint.header_rules) {
       if (rule.action === 'set') {
-        rules.push({ action: 'set', key: rule.key, value: rule.value || '', from: '', to: '' })
+        rules.push({ ...emptyHeaderRule(), action: 'set', key: rule.key, value: rule.value || '', condition: conditionToEditable(rule.condition) })
       } else if (rule.action === 'drop') {
-        rules.push({ action: 'drop', key: rule.key, value: '', from: '', to: '' })
+        rules.push({ ...emptyHeaderRule(), action: 'drop', key: rule.key, condition: conditionToEditable(rule.condition) })
       } else if (rule.action === 'rename') {
-        rules.push({ action: 'rename', key: '', value: '', from: rule.from, to: rule.to })
+        rules.push({ ...emptyHeaderRule(), action: 'rename', from: rule.from, to: rule.to, condition: conditionToEditable(rule.condition) })
       }
     }
   }
 
-  const emptyBodyRule = (): Omit<EditableBodyRule, 'action'> => ({
-    path: '', value: '', from: '', to: '', index: '', pattern: '', replacement: '', flags: '', style: '',
-    conditionEnabled: false, conditionPath: '', conditionOp: 'eq', conditionValue: '',
-  })
-
   const bodyRules: EditableBodyRule[] = []
   if (endpoint.body_rules && endpoint.body_rules.length > 0) {
     for (const rule of endpoint.body_rules) {
-      // 提取 condition 信息
-      const conditionFields = rule.condition ? {
-        conditionEnabled: true,
-        conditionPath: rule.condition.path || '',
-        conditionOp: rule.condition.op || 'eq',
-        conditionValue: rule.condition.value !== undefined
-          ? (typeof rule.condition.value === 'string' ? rule.condition.value : JSON.stringify(rule.condition.value))
-          : '',
-      } : {}
-
       if (rule.action === 'set') {
         const { value } = initBodyRuleSetValueForEditor(rule.value)
-        bodyRules.push({ ...emptyBodyRule(), action: 'set', path: rule.path, value, ...conditionFields })
+        bodyRules.push({ ...emptyBodyRule('set'), path: rule.path, value, condition: conditionToEditable(rule.condition) })
       } else if (rule.action === 'drop') {
-        bodyRules.push({ ...emptyBodyRule(), action: 'drop', path: rule.path, ...conditionFields })
+        bodyRules.push({ ...emptyBodyRule('drop'), path: rule.path, condition: conditionToEditable(rule.condition) })
       } else if (rule.action === 'rename') {
-        bodyRules.push({ ...emptyBodyRule(), action: 'rename', from: rule.from, to: rule.to, ...conditionFields })
+        bodyRules.push({ ...emptyBodyRule('rename'), from: rule.from, to: rule.to, condition: conditionToEditable(rule.condition) })
       } else if (rule.action === 'append') {
         // 前端将 append 统一展示为 insert（index 留空），保存时再根据 index 是否为空转回 append
         const { value } = initBodyRuleSetValueForEditor(rule.value)
-        bodyRules.push({ ...emptyBodyRule(), action: 'insert', path: rule.path || '', value, index: '', ...conditionFields })
+        bodyRules.push({ ...emptyBodyRule('insert'), path: rule.path || '', value, index: '', condition: conditionToEditable(rule.condition) })
       } else if (rule.action === 'insert') {
         const { value } = initBodyRuleSetValueForEditor(rule.value)
-        bodyRules.push({ ...emptyBodyRule(), action: 'insert', path: rule.path || '', value, index: String(rule.index ?? ''), ...conditionFields })
+        bodyRules.push({ ...emptyBodyRule('insert'), path: rule.path || '', value, index: String(rule.index ?? ''), condition: conditionToEditable(rule.condition) })
       } else if (rule.action === 'regex_replace') {
-        bodyRules.push({ ...emptyBodyRule(), action: 'regex_replace', path: rule.path || '', pattern: rule.pattern || '', replacement: rule.replacement || '', flags: rule.flags || '', ...conditionFields })
+        bodyRules.push({ ...emptyBodyRule('regex_replace'), path: rule.path || '', pattern: rule.pattern || '', replacement: rule.replacement || '', flags: rule.flags || '', condition: conditionToEditable(rule.condition) })
       } else if (rule.action === 'name_style') {
-        bodyRules.push({ ...emptyBodyRule(), action: 'name_style', path: rule.path || '', style: rule.style || 'capitalize', ...conditionFields })
+        bodyRules.push({ ...emptyBodyRule('name_style'), path: rule.path || '', style: rule.style || 'capitalize', condition: conditionToEditable(rule.condition) })
       }
     }
   }
@@ -1447,7 +1414,7 @@ function getEndpointEditRules(endpointId: string): EditableRule[] {
 // 添加规则（同时自动展开折叠）
 function handleAddEndpointRule(endpointId: string) {
   const rules = getEndpointEditRules(endpointId)
-  rules.push({ action: 'set', key: '', value: '', from: '', to: '' })
+  rules.push(emptyHeaderRule())
   // 自动展开折叠
   endpointRulesExpanded.value[endpointId] = true
 }
@@ -1464,11 +1431,8 @@ function removeEndpointRule(endpointId: string, index: number) {
 function updateEndpointRuleAction(endpointId: string, index: number, action: 'set' | 'drop' | 'rename') {
   const rules = getEndpointEditRules(endpointId)
   if (rules[index]) {
-    rules[index].action = action
-    rules[index].key = ''
-    rules[index].value = ''
-    rules[index].from = ''
-    rules[index].to = ''
+    const currentCondition = rules[index].condition
+    rules[index] = { ...emptyHeaderRule(), action, condition: currentCondition }
   }
 }
 
@@ -1477,6 +1441,27 @@ function updateEndpointRuleField(endpointId: string, index: number, field: 'key'
   const rules = getEndpointEditRules(endpointId)
   if (rules[index]) {
     rules[index][field] = value
+  }
+}
+
+function toggleEndpointRuleCondition(endpointId: string, index: number) {
+  const rules = getEndpointEditRules(endpointId)
+  if (rules[index]) {
+    rules[index].condition = rules[index].condition ? null : createEmptyConditionLeaf()
+  }
+}
+
+function updateEndpointRuleCondition(endpointId: string, index: number, condition: EditableConditionNode) {
+  const rules = getEndpointEditRules(endpointId)
+  if (rules[index]) {
+    rules[index].condition = condition
+  }
+}
+
+function clearEndpointRuleCondition(endpointId: string, index: number) {
+  const rules = getEndpointEditRules(endpointId)
+  if (rules[index]) {
+    rules[index].condition = null
   }
 }
 
@@ -1587,7 +1572,7 @@ function getEndpointEditBodyRules(endpointId: string): EditableBodyRule[] {
 // 添加请求体规则（同时自动展开折叠）
 function handleAddEndpointBodyRule(endpointId: string) {
   const rules = getEndpointEditBodyRules(endpointId)
-  rules.push({ action: 'set', path: '', value: '', from: '', to: '', index: '', pattern: '', replacement: '', flags: '', style: '', conditionEnabled: false, conditionPath: '', conditionOp: 'eq', conditionValue: '' })
+  rules.push(emptyBodyRule('set'))
   // 自动展开折叠
   endpointRulesExpanded.value[endpointId] = true
 }
@@ -1604,32 +1589,37 @@ function removeEndpointBodyRule(endpointId: string, index: number) {
 function updateEndpointBodyRuleAction(endpointId: string, index: number, action: BodyRuleAction) {
   const rules = getEndpointEditBodyRules(endpointId)
   if (rules[index]) {
-    rules[index].action = action
-    rules[index].path = ''
-    rules[index].value = ''
-    rules[index].from = ''
-    rules[index].to = ''
-    rules[index].index = ''
-    rules[index].pattern = ''
-    rules[index].replacement = ''
-    rules[index].flags = ''
-    rules[index].style = ''
+    const currentCondition = rules[index].condition
+    rules[index] = { ...emptyBodyRule(action), condition: currentCondition }
   }
 }
 
 // 更新请求体规则字段
-function updateEndpointBodyRuleField(endpointId: string, index: number, field: 'path' | 'value' | 'from' | 'to' | 'index' | 'pattern' | 'replacement' | 'flags' | 'style' | 'conditionPath' | 'conditionOp' | 'conditionValue', value: string) {
+function updateEndpointBodyRuleField(endpointId: string, index: number, field: 'path' | 'value' | 'from' | 'to' | 'index' | 'pattern' | 'replacement' | 'flags' | 'style', value: string) {
   const rules = getEndpointEditBodyRules(endpointId)
   if (rules[index]) {
     rules[index][field] = value
   }
 }
 
-// 切换请求体规则的条件启用状态
 function toggleBodyRuleCondition(endpointId: string, index: number) {
   const rules = getEndpointEditBodyRules(endpointId)
   if (rules[index]) {
-    rules[index].conditionEnabled = !rules[index].conditionEnabled
+    rules[index].condition = rules[index].condition ? null : createEmptyConditionLeaf()
+  }
+}
+
+function updateEndpointBodyRuleCondition(endpointId: string, index: number, condition: EditableConditionNode) {
+  const rules = getEndpointEditBodyRules(endpointId)
+  if (rules[index]) {
+    rules[index].condition = condition
+  }
+}
+
+function clearEndpointBodyRuleCondition(endpointId: string, index: number) {
+  const rules = getEndpointEditBodyRules(endpointId)
+  if (rules[index]) {
+    rules[index].condition = null
   }
 }
 
@@ -1657,7 +1647,7 @@ function validateBodyRulePathForEndpoint(endpointId: string, path: string, index
   const currentRule = rules[index]
   // 任意一方启用了条件，则不视为冲突（条件可能互斥，真正冲突在运行时处理）
   const duplicate = rules.findIndex(
-    (r, i) => i !== index && !currentRule.conditionEnabled && !r.conditionEnabled && (
+    (r, i) => i !== index && !currentRule.condition && !r.condition && (
       ((r.action === 'set' || r.action === 'drop') && r.path.trim().toLowerCase() === normalizedPath) ||
       (r.action === 'rename' && r.to.trim().toLowerCase() === normalizedPath)
     )
@@ -1689,7 +1679,7 @@ function validateBodyRenameFromForEndpoint(endpointId: string, from: string, ind
   const rules = getEndpointEditBodyRules(endpointId)
   const currentRule = rules[index]
   const duplicate = rules.findIndex(
-    (r, i) => i !== index && !currentRule.conditionEnabled && !r.conditionEnabled &&
+    (r, i) => i !== index && !currentRule.condition && !r.condition &&
       ((r.action === 'set' && r.path.trim().toLowerCase() === normalizedFrom) ||
        (r.action === 'drop' && r.path.trim().toLowerCase() === normalizedFrom) ||
        (r.action === 'rename' && r.from.trim().toLowerCase() === normalizedFrom))
@@ -1721,7 +1711,7 @@ function validateBodyRenameToForEndpoint(endpointId: string, to: string, index: 
   const rules = getEndpointEditBodyRules(endpointId)
   const currentRule = rules[index]
   const duplicate = rules.findIndex(
-    (r, i) => i !== index && !currentRule.conditionEnabled && !r.conditionEnabled &&
+    (r, i) => i !== index && !currentRule.condition && !r.condition &&
       ((r.action === 'set' && r.path.trim().toLowerCase() === normalizedTo) ||
        (r.action === 'rename' && r.to.trim().toLowerCase() === normalizedTo))
   )
@@ -1932,17 +1922,7 @@ function hasBodyRulesChanges(endpoint: ProviderEndpoint): boolean {
       if (edited.path !== (original.path ?? '')) return true
       if (edited.style !== (original.style ?? '')) return true
     }
-    // 条件变更检测
-    const origCond = original.condition
-    if (edited.conditionEnabled !== !!origCond) return true
-    if (edited.conditionEnabled && origCond) {
-      if (edited.conditionPath !== origCond.path) return true
-      if (edited.conditionOp !== origCond.op) return true
-      const origVal = origCond.value !== undefined
-        ? (typeof origCond.value === 'string' ? origCond.value : JSON.stringify(origCond.value))
-        : ''
-      if (edited.conditionValue !== origVal) return true
-    }
+    if (!conditionEquals(edited.condition, conditionToEditable(original.condition))) return true
   }
   return false
 }
@@ -1951,21 +1931,8 @@ function hasBodyRulesChanges(endpoint: ProviderEndpoint): boolean {
 function rulesToBodyRules(rules: EditableBodyRule[]): BodyRule[] | null {
   const result: BodyRule[] = []
 
-  // 构建 condition 对象（如果启用且有效）
-  function buildCondition(rule: EditableBodyRule): BodyRuleCondition | undefined {
-    if (!rule.conditionEnabled || !rule.conditionPath.trim() || !rule.conditionOp.trim()) return undefined
-    const op = rule.conditionOp as BodyRuleConditionOp
-    if (op === 'exists' || op === 'not_exists') {
-      return { path: rule.conditionPath.trim(), op }
-    }
-    const raw = rule.conditionValue.trim()
-    let val: unknown = raw
-    try { val = JSON.parse(raw) } catch { /* 保留原字符串 */ }
-    return { path: rule.conditionPath.trim(), op, value: val }
-  }
-
   for (const rule of rules) {
-    const condition = buildCondition(rule)
+    const condition = editableConditionToApi(rule.condition)
     if (rule.action === 'set' && rule.path.trim()) {
       let value: unknown = rule.value
       try { value = restoreOriginalPlaceholder(JSON.parse(prepareValueForJsonParse(rule.value.trim()))) } catch { value = rule.value }
@@ -2049,6 +2016,9 @@ function getBodyValidationErrorForEndpoint(endpointId: string): string | null {
       const validStyles = new Set(['snake_case', 'camelCase', 'PascalCase', 'kebab-case', 'capitalize'])
       if (!rule.style.trim() || !validStyles.has(rule.style.trim())) return `${prefix}请选择有效的命名风格`
     }
+
+    const conditionErr = validateEditableCondition(rule.condition)
+    if (conditionErr) return `${prefix}${conditionErr}`
   }
   return null
 }
@@ -2092,6 +2062,7 @@ function hasRulesChanges(endpoint: ProviderEndpoint): boolean {
     } else if (edited.action === 'rename' && original.action === 'rename') {
       if (edited.from !== original.from || edited.to !== original.to) return true
     }
+    if (!conditionEquals(edited.condition, conditionToEditable(original.condition))) return true
   }
   return false
 }
@@ -2143,31 +2114,37 @@ function rulesToHeaderRules(rules: EditableRule[]): HeaderRule[] | null {
   const result: HeaderRule[] = []
 
   for (const rule of rules) {
+    const condition = editableConditionToApi(rule.condition)
     if (rule.action === 'set' && rule.key.trim()) {
-      result.push({ action: 'set', key: rule.key.trim(), value: rule.value })
+      result.push({ action: 'set', key: rule.key.trim(), value: rule.value, ...(condition ? { condition } : {}) })
     } else if (rule.action === 'drop' && rule.key.trim()) {
-      result.push({ action: 'drop', key: rule.key.trim() })
+      result.push({ action: 'drop', key: rule.key.trim(), ...(condition ? { condition } : {}) })
     } else if (rule.action === 'rename' && rule.from.trim() && rule.to.trim()) {
-      result.push({ action: 'rename', from: rule.from.trim(), to: rule.to.trim() })
+      result.push({ action: 'rename', from: rule.from.trim(), to: rule.to.trim(), ...(condition ? { condition } : {}) })
     }
   }
 
   return result.length > 0 ? result : null
 }
 
-// 检查规则是否有验证错误
-function hasValidationErrorsForEndpoint(endpointId: string): boolean {
+function getHeaderValidationErrorForEndpoint(endpointId: string): string | null {
   const rules = getEndpointEditRules(endpointId)
   for (let i = 0; i < rules.length; i++) {
     const rule = rules[i]
+    const prefix = `第 ${i + 1} 条请求头规则：`
     if (rule.action === 'set' || rule.action === 'drop') {
-      if (validateRuleKeyForEndpoint(endpointId, rule.key, i)) return true
+      const err = validateRuleKeyForEndpoint(endpointId, rule.key, i)
+      if (err) return `${prefix}${err}`
     } else if (rule.action === 'rename') {
-      if (validateRenameFromForEndpoint(endpointId, rule.from, i)) return true
-      if (validateRenameToForEndpoint(endpointId, rule.to, i)) return true
+      const fromErr = validateRenameFromForEndpoint(endpointId, rule.from, i)
+      if (fromErr) return `${prefix}${fromErr}`
+      const toErr = validateRenameToForEndpoint(endpointId, rule.to, i)
+      if (toErr) return `${prefix}${toErr}`
     }
+    const conditionErr = validateEditableCondition(rule.condition)
+    if (conditionErr) return `${prefix}${conditionErr}`
   }
-  return false
+  return null
 }
 
 // 新端点选择的格式的默认路径
@@ -2243,8 +2220,9 @@ async function saveEndpoint(endpoint: ProviderEndpoint) {
   if (!state || !state.url) return
 
   // 检查规则是否有验证错误
-  if (hasValidationErrorsForEndpoint(endpoint.id)) {
-    showError('请修正请求头规则中的错误')
+  const headerErr = getHeaderValidationErrorForEndpoint(endpoint.id)
+  if (headerErr) {
+    showError(headerErr)
     return
   }
 

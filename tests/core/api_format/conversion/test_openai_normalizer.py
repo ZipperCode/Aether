@@ -15,7 +15,6 @@ import json
 from typing import Any, cast
 
 from src.core.api_format.conversion.internal import (
-    ContentType,
     ErrorType,
     ImageBlock,
     StopReason,
@@ -184,6 +183,101 @@ def test_openai_request_tool_calls_and_tool_role_roundtrip() -> None:
     assert json.loads(tool_out["content"]) == {"temp_c": 20, "unit": "C"}
 
 
+def test_openai_request_preserves_empty_string_tool_call_arguments() -> None:
+    n = OpenAINormalizer()
+
+    req = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "user", "content": "ping"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_empty",
+                        "type": "function",
+                        "function": {"name": "noop", "arguments": ""},
+                    }
+                ],
+            },
+        ],
+    }
+
+    internal = n.request_to_internal(req)
+    tool_use = next(b for b in internal.messages[1].content if isinstance(b, ToolUseBlock))
+    assert tool_use.tool_input == {}
+    assert tool_use.extra["raw"]["arguments"] == ""
+
+    out = n.request_from_internal(internal)
+    assert out["messages"][1]["tool_calls"][0]["function"]["arguments"] == ""
+
+
+def test_openai_request_preserves_empty_string_legacy_function_call_arguments() -> None:
+    n = OpenAINormalizer()
+
+    req = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "user", "content": "ping"},
+            {
+                "role": "assistant",
+                "content": "",
+                "function_call": {"name": "noop", "arguments": ""},
+            },
+        ],
+    }
+
+    internal = n.request_to_internal(req)
+    tool_use = next(b for b in internal.messages[1].content if isinstance(b, ToolUseBlock))
+    assert tool_use.tool_input == {}
+    assert tool_use.extra["raw"]["arguments"] == ""
+
+    out = n.request_from_internal(internal)
+    assert out["messages"][1]["tool_calls"][0]["function"]["arguments"] == ""
+
+
+def test_openai_request_from_internal_keeps_natural_insertion_order() -> None:
+    n = OpenAINormalizer()
+
+    req = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "max_tokens": 12,
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }
+        ],
+    }
+
+    internal = n.request_to_internal(req)
+    out = n.request_from_internal(internal)
+
+    assert list(out.keys())[:4] == ["model", "messages", "max_tokens", "tools"]
+
+
+def test_openai_request_from_internal_fixes_empty_object_tool_parameters() -> None:
+    n = OpenAINormalizer()
+
+    req = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "ping"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "noop", "parameters": {"type": "object"}},
+            }
+        ],
+    }
+
+    internal = n.request_to_internal(req)
+    out = n.request_from_internal(internal)
+
+    assert out["tools"][0]["function"]["parameters"] == {"type": "object", "properties": {}}
+
+
 def test_openai_request_content_image_and_unknown_drop() -> None:
     n = OpenAINormalizer()
 
@@ -332,6 +426,7 @@ def test_openai_stream_chunk_and_event_roundtrip_basic() -> None:
     )
     assert tool_delta["choices"][0]["delta"]["tool_calls"][0]["id"] == "call_1"
     assert tool_delta["choices"][0]["delta"]["tool_calls"][0]["index"] == 0
+    assert tool_delta["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "get_weather"
 
     # 最终 stop chunk finish_reason=tool_calls
     assert out_chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"

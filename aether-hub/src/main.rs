@@ -1,20 +1,23 @@
+mod control_plane;
 mod hub;
+mod local_relay;
 mod protocol;
 mod proxy_conn;
-mod worker_conn;
 
-use std::sync::Arc;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
 use axum::response::{IntoResponse, Json};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
 use tracing::{info, warn};
 
-use crate::hub::HubRouter;
+use crate::control_plane::ControlPlaneClient;
+use crate::hub::{ConnConfig, HubRouter};
+use crate::local_relay::relay_request;
 
 #[derive(Parser, Debug)]
 #[command(name = "aether-hub", about = "Tunnel Hub for Aether")]
@@ -23,13 +26,9 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:8085", env = "TUNNEL_HUB_BIND")]
     bind: String,
 
-    /// Proxy-side idle timeout in seconds
-    #[arg(long, default_value_t = 90, env = "TUNNEL_HUB_PROXY_IDLE_TIMEOUT")]
+    /// Proxy-side idle timeout in seconds (0 to disable)
+    #[arg(long, default_value_t = 0, env = "TUNNEL_HUB_PROXY_IDLE_TIMEOUT")]
     proxy_idle_timeout: u64,
-
-    /// Worker-side idle timeout in seconds (0 to disable)
-    #[arg(long, default_value_t = 120, env = "TUNNEL_HUB_WORKER_IDLE_TIMEOUT")]
-    worker_idle_timeout: u64,
 
     /// Ping interval in seconds (for both sides)
     #[arg(long, default_value_t = 15, env = "TUNNEL_HUB_PING_INTERVAL")]
@@ -38,15 +37,29 @@ struct Args {
     /// Max concurrent streams per proxy connection
     #[arg(long, default_value_t = 2048, env = "TUNNEL_HUB_MAX_STREAMS")]
     max_streams: usize,
+
+    /// Per-connection outbound queue capacity before treating the socket as congested
+    #[arg(
+        long,
+        default_value_t = 128,
+        env = "TUNNEL_HUB_OUTBOUND_QUEUE_CAPACITY"
+    )]
+    outbound_queue_capacity: usize,
+
+    /// Local Aether app base URL for control-plane callbacks
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:8084",
+        env = "TUNNEL_HUB_APP_BASE_URL"
+    )]
+    app_base_url: String,
 }
 
 #[derive(Clone)]
-struct AppState {
-    hub: Arc<HubRouter>,
-    proxy_idle_timeout: Duration,
-    worker_idle_timeout: Duration,
-    ping_interval: Duration,
-    max_streams: usize,
+pub struct AppState {
+    pub hub: std::sync::Arc<HubRouter>,
+    pub proxy_conn_cfg: ConnConfig,
+    pub max_streams: usize,
 }
 
 #[tokio::main]
@@ -61,12 +74,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let hub = HubRouter::new();
+    let hub = HubRouter::new(ControlPlaneClient::new(args.app_base_url));
+    let outbound_queue_capacity = args.outbound_queue_capacity.clamp(8, 4096);
+    let ping_interval = Duration::from_secs(args.ping_interval);
     let state = AppState {
         hub,
-        proxy_idle_timeout: Duration::from_secs(args.proxy_idle_timeout),
-        worker_idle_timeout: Duration::from_secs(args.worker_idle_timeout),
-        ping_interval: Duration::from_secs(args.ping_interval),
+        proxy_conn_cfg: ConnConfig {
+            ping_interval,
+            idle_timeout: Duration::from_secs(args.proxy_idle_timeout),
+            outbound_queue_capacity,
+        },
         max_streams: args.max_streams,
     };
 
@@ -74,13 +91,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health))
         .route("/stats", get(stats))
         .route("/proxy", get(ws_proxy))
-        .route("/worker", get(ws_worker))
+        .route("/local/relay/{node_id}", post(relay_request))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     info!(bind = %args.bind, "aether-hub started");
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -139,21 +160,8 @@ async fn ws_proxy(
                 node_id,
                 node_name,
                 max_streams,
-                state.ping_interval,
-                state.proxy_idle_timeout,
+                state.proxy_conn_cfg,
             )
         })
         .into_response()
-}
-
-async fn ws_worker(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.max_frame_size(64 * 1024 * 1024)
-        .on_upgrade(move |socket| {
-            worker_conn::handle_worker_connection(
-                socket,
-                state.hub,
-                state.ping_interval,
-                state.worker_idle_timeout,
-            )
-        })
 }

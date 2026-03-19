@@ -321,6 +321,17 @@ class HandlerAdapterBase(ApiAdapter):
         _ = base_url, provider_type
         return build_test_request_body(cls.FORMAT_ID, request_data)
 
+    @staticmethod
+    def _validate_test_base_url(base_url: Any) -> str:
+        """校验 test-model 场景传入的 base_url。"""
+        if not isinstance(base_url, str):
+            raise TypeError(f"base_url must be a non-empty string, got {type(base_url).__name__}")
+
+        normalized = base_url.strip()
+        if not normalized:
+            raise ValueError("base_url must be a non-empty string")
+        return normalized
+
     @classmethod
     async def check_endpoint(
         cls,
@@ -355,30 +366,35 @@ class HandlerAdapterBase(ApiAdapter):
         统一的 endpoint 测试方法，支持 OAuth/Antigravity/Kiro 等特殊路由。
         """
         from src.api.handlers.base.endpoint_checker import run_endpoint_check
-        from src.api.handlers.base.request_builder import apply_body_rules
+        from src.api.handlers.base.request_builder import (
+            apply_body_rules,
+            evaluate_condition,
+        )
         from src.core.api_format.headers import HeaderBuilder
         from src.core.provider_types import ProviderType
 
+        validated_base_url = cls._validate_test_base_url(base_url)
         is_antigravity = provider_type == ProviderType.ANTIGRAVITY
         is_gemini_cli = provider_type == ProviderType.GEMINI_CLI
         is_vertex = provider_type == ProviderType.VERTEX_AI
         is_kiro = provider_type == ProviderType.KIRO
         is_oauth = auth_type == "oauth"
         vertex_auth_info: Any | None = None
+        kiro_cfg: Any | None = None
+
+        if is_kiro:
+            from src.services.provider.adapters.kiro.models.credentials import KiroAuthConfig
+
+            kiro_cfg = KiroAuthConfig.from_dict(decrypted_auth_config or {})
 
         # ---- URL ----
         if is_kiro:
-            from src.services.provider.adapters.kiro.constants import (
-                KIRO_GENERATE_ASSISTANT_PATH,
+            from src.services.provider.adapters.kiro.request import (
+                build_kiro_generate_assistant_url,
             )
-            from src.services.provider.adapters.kiro.models.credentials import KiroAuthConfig
 
-            _kiro_cfg = KiroAuthConfig.from_dict(decrypted_auth_config or {})
-            region = _kiro_cfg.effective_api_region()
-            effective_base_url = (
-                base_url.replace("{region}", region) if "{region}" in base_url else base_url
-            )
-            url = f"{str(effective_base_url).rstrip('/')}{KIRO_GENERATE_ASSISTANT_PATH}"
+            assert kiro_cfg is not None
+            url = build_kiro_generate_assistant_url(validated_base_url, cfg=kiro_cfg)
         elif is_antigravity:
             from src.services.provider.adapters.antigravity.constants import (
                 V1INTERNAL_PATH_TEMPLATE,
@@ -389,13 +405,13 @@ class HandlerAdapterBase(ApiAdapter):
             )
 
             ordered_urls = url_availability.get_ordered_urls(prefer_daily=True)
-            effective_base_url = ordered_urls[0] if ordered_urls else base_url
+            effective_base_url = ordered_urls[0] if ordered_urls else validated_base_url
             path = V1INTERNAL_PATH_TEMPLATE.format(action="generateContent")
             url = f"{str(effective_base_url).rstrip('/')}{path}"
         elif is_gemini_cli:
             from src.services.provider.adapters.gemini_cli.constants import V1INTERNAL_PATH_TEMPLATE
 
-            effective_base_url = base_url
+            effective_base_url = validated_base_url
             path = V1INTERNAL_PATH_TEMPLATE.format(action="generateContent")
             url = f"{str(effective_base_url).rstrip('/')}{path}"
         elif is_vertex and provider_endpoint is not None and provider_api_key is not None:
@@ -422,11 +438,17 @@ class HandlerAdapterBase(ApiAdapter):
             )
         else:
             url = cls.build_endpoint_url(
-                base_url, request_data, model_name, provider_type=provider_type
+                validated_base_url,
+                request_data,
+                model_name,
+                provider_type=provider_type,
             )
 
         # ---- Headers ----
-        cli_extra = cls.get_cli_extra_headers(base_url=base_url, provider_type=provider_type)
+        cli_extra = cls.get_cli_extra_headers(
+            base_url=validated_base_url,
+            provider_type=provider_type,
+        )
         merged_extra = dict(extra_headers) if extra_headers else {}
         merged_extra.update(cli_extra)
 
@@ -440,22 +462,14 @@ class HandlerAdapterBase(ApiAdapter):
             merged_extra.update(get_v1internal_extra_headers())
 
         if is_kiro:
-            from src.services.provider.adapters.kiro.headers import (
-                build_generate_assistant_headers,
+            from src.services.provider.adapters.kiro.request import (
+                build_kiro_request_headers,
             )
-            from src.services.provider.adapters.kiro.models.credentials import KiroAuthConfig
-            from src.services.provider.adapters.kiro.token_manager import generate_machine_id
 
-            kiro_cfg = KiroAuthConfig.from_dict(decrypted_auth_config or {})
-            region = kiro_cfg.effective_api_region()
-            machine_id = generate_machine_id(kiro_cfg)
-            kiro_headers = build_generate_assistant_headers(
-                host=f"q.{region}.amazonaws.com",
+            assert kiro_cfg is not None
+            kiro_headers = build_kiro_request_headers(
+                kiro_cfg,
                 access_token=api_key,
-                machine_id=machine_id,
-                kiro_version=kiro_cfg.kiro_version,
-                system_version=kiro_cfg.system_version,
-                node_version=kiro_cfg.node_version,
             )
             merged_extra.update(kiro_headers)
 
@@ -480,10 +494,18 @@ class HandlerAdapterBase(ApiAdapter):
                 headers[auth_header_name] = f"Bearer {api_key}"
 
         # ---- Body ----
-        body = cls.build_request_body(request_data, base_url=base_url, provider_type=provider_type)
+        body = cls.build_request_body(
+            request_data,
+            base_url=validated_base_url,
+            provider_type=provider_type,
+        )
 
         if body_rules:
-            body = apply_body_rules(body, body_rules)
+            body = apply_body_rules(
+                body,
+                body_rules,
+                original_body=body,
+            )
 
         if is_antigravity:
             from src.services.provider.adapters.antigravity.envelope import (
@@ -509,18 +531,17 @@ class HandlerAdapterBase(ApiAdapter):
             )
 
         if is_kiro:
-            from src.services.provider.adapters.kiro.converter import (
-                convert_claude_messages_to_conversation_state,
+            from src.services.provider.adapters.kiro.request import (
+                build_kiro_request_payload,
             )
 
+            assert kiro_cfg is not None
             effective_model = model_name or request_data.get("model", "")
-            conversation_state = convert_claude_messages_to_conversation_state(
+            body = build_kiro_request_payload(
                 body,
                 model=effective_model,
+                cfg=kiro_cfg,
             )
-            body = {"conversationState": conversation_state}
-            if isinstance(kiro_cfg.profile_arn, str) and kiro_cfg.profile_arn.strip():
-                body["profileArn"] = kiro_cfg.profile_arn.strip()
 
         # ---- Header Rules ----
         if header_rules:
@@ -536,7 +557,13 @@ class HandlerAdapterBase(ApiAdapter):
 
             header_builder = HeaderBuilder()
             header_builder.add_many(headers)
-            header_builder.apply_rules(header_rules, protected_keys)
+            header_builder.apply_rules(
+                header_rules,
+                protected_keys,
+                body=body,
+                original_body=body,
+                condition_evaluator=evaluate_condition,
+            )
             headers = header_builder.build()
 
         # ---- Execute ----

@@ -42,8 +42,6 @@ export interface HeaderRuleRename {
   to: string
 }
 
-export type HeaderRule = HeaderRuleSet | HeaderRuleDrop | HeaderRuleRename
-
 /**
  * 请求体规则类型
  * - set: 设置/覆盖字段
@@ -136,10 +134,28 @@ export type BodyRuleConditionOp =
   | 'exists' | 'not_exists'
   | 'in' | 'type_is'
 
-export interface BodyRuleCondition {
+export interface BodyRuleConditionLeaf {
   path: string
   op: BodyRuleConditionOp
   value?: unknown  // exists / not_exists 不需要 value
+  source?: 'original' | 'current'
+}
+
+export interface BodyRuleConditionAll {
+  all: BodyRuleCondition[]
+}
+
+export interface BodyRuleConditionAny {
+  any: BodyRuleCondition[]
+}
+
+export type BodyRuleCondition =
+  | BodyRuleConditionLeaf
+  | BodyRuleConditionAll
+  | BodyRuleConditionAny
+
+export type HeaderRule = (HeaderRuleSet | HeaderRuleDrop | HeaderRuleRename) & {
+  condition?: BodyRuleCondition
 }
 
 /**
@@ -272,6 +288,7 @@ export interface EndpointAPIKey {
   oauth_plan_type?: string | null  // Codex 订阅类型: plus/free/team/enterprise
   oauth_account_id?: string | null  // Codex ChatGPT 账号 ID
   oauth_account_user_id?: string | null  // Codex ChatGPT account-user 联合 ID
+  oauth_account_name?: string | null
   oauth_organizations?: OAuthOrganizationInfo[] | null  // OAuth 关联组织/工作区摘要
   oauth_invalid_at?: number | null  // OAuth Token 失效时间（Unix 时间戳）
   oauth_invalid_reason?: string | null  // OAuth Token 失效原因

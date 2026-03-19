@@ -137,3 +137,21 @@ def test_resolve_from_structured_oauth_reason_token_invalidated() -> None:
     assert state.blocked is True
     assert state.code == "oauth_expired"
     assert state.label == "Token 失效"
+
+
+def test_refresh_failed_prefix_does_not_block_even_with_scary_keywords() -> None:
+    state = resolve_pool_account_state(
+        provider_type="codex",
+        upstream_metadata=None,
+        oauth_invalid_reason="[REFRESH_FAILED] Token 续期失败 (401): account_deactivated",
+    )
+    assert state.blocked is False
+
+
+def test_request_failed_prefix_does_not_block() -> None:
+    state = resolve_pool_account_state(
+        provider_type="codex",
+        upstream_metadata=None,
+        oauth_invalid_reason="[REQUEST_FAILED] Codex 账户访问受限 (403)",
+    )
+    assert state.blocked is False

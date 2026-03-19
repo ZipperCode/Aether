@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Generator
 from unittest.mock import MagicMock
 
 import pytest
-import asyncio
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from src.api.admin.api_keys.routes import (
     AdminCreateStandaloneKeyAdapter,
     AdminGetFullKeyAdapter,
-    AdminGetKeyDetailAdapter,
-    AdminListStandaloneKeysAdapter,
     AdminToggleApiKeyAdapter,
     AdminUpdateApiKeyAdapter,
 )
@@ -20,10 +20,21 @@ from src.api.admin.api_keys.routes import router as admin_api_keys_router
 from src.api.admin.users.routes import (
     AdminGetUserKeyFullKeyAdapter,
     AdminToggleUserKeyLockAdapter,
+    AdminUpdateUserKeyAdapter,
 )
 from src.api.admin.users.routes import router as admin_users_router
 from src.core.exceptions import InvalidRequestException, NotFoundException
+from src.database import get_db
 from src.models.api import CreateApiKeyRequest
+
+
+def _patch_get_db_context(monkeypatch: pytest.MonkeyPatch, db: MagicMock) -> None:
+    @contextmanager
+    def _fake_ctx() -> Generator[MagicMock, None, None]:
+        yield db
+
+    monkeypatch.setattr("src.api.admin.users.routes.get_db_context", _fake_ctx)
+    monkeypatch.setattr("src.api.admin.api_keys.routes.get_db_context", _fake_ctx)
 
 
 def _build_context(db: MagicMock) -> SimpleNamespace:
@@ -38,29 +49,60 @@ def _mock_query_first(db: MagicMock, value: object | None) -> None:
     db.query.return_value.filter.return_value.first.return_value = value
 
 
-def _run_adapter(adapter: object, db: MagicMock, *, user_id: str = "admin-1") -> dict:
-    context = SimpleNamespace(
-        db=db,
-        request=SimpleNamespace(state=SimpleNamespace()),
-        user=SimpleNamespace(id=user_id),
-        ensure_json_body=lambda: {},
-        add_audit_metadata=lambda **_: None,
-    )
-    return asyncio.run(adapter.handle(context))  # type: ignore[no-any-return]
+def _build_admin_users_app(db: MagicMock, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    app = FastAPI()
+    app.include_router(admin_users_router)
+    app.dependency_overrides[get_db] = lambda: db
+
+    async def _fake_pipeline_run(
+        *, adapter: object, http_request: object, db: MagicMock, mode: object
+    ) -> object:
+        _ = http_request, mode
+        try:
+            payload = await http_request.json()
+        except Exception:
+            payload = {}
+        context = SimpleNamespace(
+            db=db,
+            request=SimpleNamespace(state=SimpleNamespace()),
+            user=SimpleNamespace(id="admin-1"),
+            ensure_json_body=lambda: payload,
+            add_audit_metadata=lambda **_: None,
+        )
+        return await adapter.handle(context)
+
+    monkeypatch.setattr("src.api.admin.users.routes.pipeline.run", _fake_pipeline_run)
+    return TestClient(app)
 
 
-def _has_route(router, path: str, method: str) -> bool:
-    return any(
-        getattr(route, "path", None) == path and method in getattr(route, "methods", set())
-        for route in router.routes
-    )
+def _build_admin_api_keys_app(db: MagicMock, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    app = FastAPI()
+    app.include_router(admin_api_keys_router)
+    app.dependency_overrides[get_db] = lambda: db
+
+    async def _fake_pipeline_run(
+        *, adapter: object, http_request: object, db: MagicMock, mode: object
+    ) -> object:
+        _ = http_request, mode
+        context = SimpleNamespace(
+            db=db,
+            request=SimpleNamespace(state=SimpleNamespace()),
+            user=SimpleNamespace(id="admin-1"),
+            ensure_json_body=lambda: {},
+            add_audit_metadata=lambda **_: None,
+        )
+        return await adapter.handle(context)
+
+    monkeypatch.setattr("src.api.admin.api_keys.routes.pipeline.run", _fake_pipeline_run)
+    return TestClient(app)
 
 
 @pytest.mark.asyncio
-async def test_toggle_user_key_lock_adapter_success() -> None:
+async def test_toggle_user_key_lock_adapter_success(monkeypatch: pytest.MonkeyPatch) -> None:
     db = MagicMock()
     api_key = SimpleNamespace(id="key-1", user_id="user-1", is_standalone=False, is_locked=False)
     _mock_query_first(db, api_key)
+    _patch_get_db_context(monkeypatch, db)
 
     adapter = AdminToggleUserKeyLockAdapter(user_id="user-1", key_id="key-1")
     result = await adapter.handle(_build_context(db))
@@ -73,9 +115,12 @@ async def test_toggle_user_key_lock_adapter_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_toggle_user_key_lock_adapter_not_found_for_standalone_or_wrong_owner() -> None:
+async def test_toggle_user_key_lock_adapter_not_found_for_standalone_or_wrong_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     db = MagicMock()
     _mock_query_first(db, None)
+    _patch_get_db_context(monkeypatch, db)
 
     adapter = AdminToggleUserKeyLockAdapter(user_id="user-1", key_id="key-standalone")
     with pytest.raises(NotFoundException):
@@ -145,7 +190,9 @@ async def test_get_user_key_full_key_adapter_returns_500_on_decrypt_error(
 
 
 @pytest.mark.asyncio
-async def test_standalone_toggle_adapters_reject_normal_user_key() -> None:
+async def test_standalone_toggle_adapters_reject_normal_user_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     db = MagicMock()
     normal_key = SimpleNamespace(
         id="key-user",
@@ -157,6 +204,7 @@ async def test_standalone_toggle_adapters_reject_normal_user_key() -> None:
         updated_at=datetime.now(timezone.utc),
     )
     _mock_query_first(db, normal_key)
+    _patch_get_db_context(monkeypatch, db)
     context = _build_context(db)
 
     with pytest.raises(InvalidRequestException):
@@ -167,27 +215,110 @@ async def test_standalone_toggle_adapters_reject_normal_user_key() -> None:
 
 
 def test_user_key_lock_route_path_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert _has_route(
-        admin_users_router,
-        "/api/admin/users/{user_id}/api-keys/{key_id}/lock",
-        "PATCH",
-    )
+    db = MagicMock()
+    api_key = SimpleNamespace(id="key-5", user_id="user-2", is_standalone=False, is_locked=False)
+    _mock_query_first(db, api_key)
+    _patch_get_db_context(monkeypatch, db)
+    client = _build_admin_users_app(db, monkeypatch)
+
+    response = client.patch("/api/admin/users/user-2/api-keys/key-5/lock")
+    assert response.status_code == 200
+    assert response.json()["id"] == "key-5"
+    assert response.json()["is_locked"] is True
 
 
 def test_user_key_full_key_route_path_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert _has_route(
-        admin_users_router,
-        "/api/admin/users/{user_id}/api-keys/{key_id}/full-key",
-        "GET",
+    db = MagicMock()
+    api_key = SimpleNamespace(
+        id="key-6",
+        user_id="user-2",
+        is_standalone=False,
+        key_encrypted="enc",
     )
+    _mock_query_first(db, api_key)
+    monkeypatch.setattr("src.core.crypto.crypto_service.decrypt", lambda _v: "sk-user-route-key")
+    client = _build_admin_users_app(db, monkeypatch)
+
+    response = client.get("/api/admin/users/user-2/api-keys/key-6/full-key")
+    assert response.status_code == 200
+    assert response.json() == {"key": "sk-user-route-key"}
+
+
+@pytest.mark.asyncio
+async def test_update_user_key_adapter_passes_rate_limit_and_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _update_user_key_sync(
+        user_id: str, key_id: str, request: object
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        captured["user_id"] = user_id
+        captured["key_id"] = key_id
+        captured["name"] = getattr(request, "name", None)
+        captured["rate_limit"] = getattr(request, "rate_limit", None)
+        return {"id": key_id, "name": captured["name"], "rate_limit": captured["rate_limit"]}, {}
+
+    monkeypatch.setattr("src.api.admin.users.routes._update_user_key_sync", _update_user_key_sync)
+
+    adapter = AdminUpdateUserKeyAdapter(user_id="user-1", key_id="key-7")
+    context = SimpleNamespace(
+        db=MagicMock(),
+        request=SimpleNamespace(state=SimpleNamespace()),
+        ensure_json_body=lambda: {"name": "Renamed Key", "rate_limit": 12},
+        add_audit_metadata=lambda **_: None,
+    )
+
+    result = await adapter.handle(context)
+
+    assert result["id"] == "key-7"
+    assert captured == {
+        "user_id": "user-1",
+        "key_id": "key-7",
+        "name": "Renamed Key",
+        "rate_limit": 12,
+    }
+
+
+def test_update_user_key_route_path_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _update_user_key_sync(
+        user_id: str, key_id: str, request: object
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        captured["user_id"] = user_id
+        captured["key_id"] = key_id
+        captured["name"] = getattr(request, "name", None)
+        captured["rate_limit"] = getattr(request, "rate_limit", None)
+        return {"id": key_id, "name": captured["name"], "rate_limit": captured["rate_limit"]}, {}
+
+    monkeypatch.setattr("src.api.admin.users.routes._update_user_key_sync", _update_user_key_sync)
+    client = _build_admin_users_app(MagicMock(), monkeypatch)
+
+    response = client.put(
+        "/api/admin/users/user-2/api-keys/key-8",
+        json={"name": "Updated", "rate_limit": 9},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["rate_limit"] == 9
+    assert captured == {
+        "user_id": "user-2",
+        "key_id": "key-8",
+        "name": "Updated",
+        "rate_limit": 9,
+    }
 
 
 def test_standalone_lock_route_removed(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert not _has_route(admin_api_keys_router, "/api/admin/api-keys/{key_id}/lock", "PATCH")
+    client = _build_admin_api_keys_app(MagicMock(), monkeypatch)
+    response = client.patch("/api/admin/api-keys/key-1/lock")
+    assert response.status_code == 404
 
 
 def test_standalone_list_route_does_not_expose_is_locked(monkeypatch: pytest.MonkeyPatch) -> None:
     db = MagicMock()
+    _patch_get_db_context(monkeypatch, db)
     api_key = SimpleNamespace(
         id="sa-key-1",
         user_id="admin-1",
@@ -217,8 +348,11 @@ def test_standalone_list_route_does_not_expose_is_locked(monkeypatch: pytest.Mon
             id="w-1"
         ),
     )
-    adapter = AdminListStandaloneKeysAdapter(skip=0, limit=100, is_active=None)
-    payload = _run_adapter(adapter, db)
+    client = _build_admin_api_keys_app(db, monkeypatch)
+
+    response = client.get("/api/admin/api-keys")
+    assert response.status_code == 200
+    payload = response.json()
     assert len(payload["api_keys"]) == 1
     assert "is_locked" not in payload["api_keys"][0]
 
@@ -249,8 +383,11 @@ def test_standalone_detail_route_does_not_expose_is_locked(monkeypatch: pytest.M
         "src.api.admin.api_keys.routes.WalletService.get_wallet",
         lambda _db, user_id=None, api_key_id=None, user=None, api_key=None: None,
     )
-    adapter = AdminGetKeyDetailAdapter(key_id="sa-key-2")
-    payload = _run_adapter(adapter, db)
+    client = _build_admin_api_keys_app(db, monkeypatch)
+
+    response = client.get("/api/admin/api-keys/sa-key-2")
+    assert response.status_code == 200
+    payload = response.json()
     assert payload["id"] == "sa-key-2"
     assert "is_locked" not in payload
 
@@ -260,6 +397,7 @@ async def test_create_standalone_key_adapter_preserves_empty_restriction_lists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = MagicMock()
+    _patch_get_db_context(monkeypatch, db)
     captured: dict[str, object] = {}
     created_key = SimpleNamespace(
         id="sa-key-3",
@@ -319,6 +457,7 @@ async def test_update_standalone_key_adapter_preserves_empty_restriction_lists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = MagicMock()
+    _patch_get_db_context(monkeypatch, db)
     existing_key = SimpleNamespace(id="sa-key-4", is_standalone=True)
     _mock_query_first(db, existing_key)
 

@@ -15,6 +15,7 @@ from src.services.task.execute.error_handler import TaskErrorOperationsService
 from src.services.task.execute.failure import TaskFailureOperationsService
 from src.services.task.execute.pool import TaskPoolOperationsService
 from src.services.task.execute.sync_execute import SyncTaskExecutionService
+from src.services.task.request_state import RequestBodyState
 from src.services.task.submit.submit_service import AsyncTaskSubmitService
 from src.services.task.video.facade import TaskVideoFacadeService
 from src.services.task.video.operations import VideoTaskOperationsService
@@ -117,7 +118,7 @@ class TaskService:
         is_stream: bool = False,
         capability_requirements: dict[str, bool] | None = None,
         preferred_key_ids: list[str] | None = None,
-        request_body_ref: dict[str, Any] | None = None,
+        request_body_state: RequestBodyState | None = None,
         request_headers: dict[str, Any] | None = None,
         request_body: dict[str, Any] | None = None,
         # ASYNC-only (video submit)
@@ -125,6 +126,7 @@ class TaskService:
         supported_auth_types: set[str] | None = None,
         allow_format_conversion: bool = False,
         max_candidates: int | None = None,
+        create_pending_usage: bool = True,
     ) -> ExecutionResult:
         """兼容入口：默认绑定到 TaskService 内部执行路由。"""
         return await self._execute_facade_ops.execute(
@@ -138,13 +140,14 @@ class TaskService:
             is_stream=is_stream,
             capability_requirements=capability_requirements,
             preferred_key_ids=preferred_key_ids,
-            request_body_ref=request_body_ref,
+            request_body_state=request_body_state,
             request_headers=request_headers,
             request_body=request_body,
             extract_external_task_id=extract_external_task_id,
             supported_auth_types=supported_auth_types,
             allow_format_conversion=allow_format_conversion,
             max_candidates=max_candidates,
+            create_pending_usage=create_pending_usage,
         )
 
     async def _execute_internal(
@@ -160,13 +163,14 @@ class TaskService:
         is_stream: bool = False,
         capability_requirements: dict[str, bool] | None = None,
         preferred_key_ids: list[str] | None = None,
-        request_body_ref: dict[str, Any] | None = None,
+        request_body_state: RequestBodyState | None = None,
         request_headers: dict[str, Any] | None = None,
         request_body: dict[str, Any] | None = None,
         extract_external_task_id: Any | None = None,
         supported_auth_types: set[str] | None = None,
         allow_format_conversion: bool = False,
         max_candidates: int | None = None,
+        create_pending_usage: bool = True,
     ) -> ExecutionResult:
         if task_mode == TaskMode.ASYNC:
             if extract_external_task_id is None:
@@ -246,9 +250,10 @@ class TaskService:
             is_stream=is_stream,
             capability_requirements=capability_requirements,
             preferred_key_ids=preferred_key_ids,
-            request_body_ref=request_body_ref,
+            request_body_state=request_body_state,
             request_headers=request_headers,
             request_body=request_body,
+            create_pending_usage=create_pending_usage,
         )
 
     async def execute_sync_candidates(
@@ -263,7 +268,7 @@ class TaskService:
         user_api_key: ApiKey | None = None,
         is_stream: bool = False,
         capability_requirements: dict[str, bool] | None = None,
-        request_body_ref: dict[str, Any] | None = None,
+        request_body_state: RequestBodyState | None = None,
         request_headers: dict[str, Any] | None = None,
         request_body: dict[str, Any] | None = None,
         affinity_key: str | None = None,
@@ -411,7 +416,7 @@ class TaskService:
         max_attempts = candidate_resolver.count_total_attempts(all_candidates)
         execution_state = SyncExecutionState(
             candidate_record_map=candidate_record_map,
-            request_body_ref=request_body_ref,
+            request_body_state=request_body_state,
             last_candidate=all_candidates[-1] if all_candidates else None,
         )
 
@@ -540,7 +545,7 @@ class TaskService:
                 request_id=request_id,
                 attempt=attempt_count,
                 max_attempts=int(max_attempts or 0),
-                request_body_ref=request_body_ref,
+                request_body_state=request_body_state,
                 error_classifier=error_classifier,
             )
             action = classify_candidate_error_action(raw_action)

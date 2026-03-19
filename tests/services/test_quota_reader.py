@@ -36,6 +36,22 @@ def test_codex_reader_preserves_summary_formats() -> None:
     assert credits_reader.display_summary() == "积分 12.35"
 
 
+def test_codex_reader_hides_reset_countdown_when_remaining_is_full() -> None:
+    reader = get_quota_reader(
+        "codex",
+        {
+            "codex": {
+                "primary_used_percent": 0.0,
+                "primary_reset_seconds": 266400,
+                "secondary_used_percent": 0.0,
+                "secondary_reset_seconds": 3600,
+            }
+        },
+    )
+
+    assert reader.display_summary() == "周剩余 100.0% | 5H剩余 100.0%"
+
+
 def test_antigravity_reader_keeps_used_percent_fallbacks() -> None:
     reader = get_quota_reader(
         "antigravity",
@@ -86,6 +102,86 @@ def test_extract_reset_seconds_uses_codex_weekly_reset_for_codex_provider() -> N
     )
 
     assert extract_reset_seconds(key_obj) == pytest.approx(1800.0)
+
+
+def test_extract_reset_seconds_codex_weekly_full_quota_returns_none() -> None:
+    key_obj = SimpleNamespace(
+        provider_type="codex",
+        upstream_metadata={
+            "codex": {
+                "primary_used_percent": 0.0,
+                "primary_reset_seconds": 1800.0,
+            }
+        },
+    )
+
+    assert extract_reset_seconds(key_obj) is None
+
+
+def test_extract_reset_seconds_prefers_codex_reset_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.services.provider.pool.dimensions._helpers.time.time", lambda: 1000.0)
+    key_obj = SimpleNamespace(
+        provider_type="codex",
+        upstream_metadata={
+            "codex": {
+                "primary_reset_at": 1200.0,
+                "primary_reset_seconds": 9999.0,
+            }
+        },
+    )
+
+    assert extract_reset_seconds(key_obj) == pytest.approx(200.0)
+
+
+def test_extract_reset_seconds_codex_fallback_corrects_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.services.provider.pool.dimensions._helpers.time.time", lambda: 2000.0)
+    key_obj = SimpleNamespace(
+        provider_type="codex",
+        upstream_metadata={
+            "codex": {
+                "primary_reset_seconds": 180.0,
+                "updated_at": 1900.0,
+            }
+        },
+    )
+
+    assert extract_reset_seconds(key_obj) == pytest.approx(80.0)
+
+
+def test_extract_reset_seconds_codex_fallback_clamps_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.services.provider.pool.dimensions._helpers.time.time", lambda: 2000.0)
+    key_obj = SimpleNamespace(
+        provider_type="codex",
+        upstream_metadata={
+            "codex": {
+                "primary_reset_seconds": 120.0,
+                "updated_at": 1500.0,
+            }
+        },
+    )
+
+    assert extract_reset_seconds(key_obj) == pytest.approx(0.0)
+
+
+def test_extract_reset_seconds_codex_fallback_future_updated_at_no_inflation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.services.provider.pool.dimensions._helpers.time.time", lambda: 2000.0)
+    key_obj = SimpleNamespace(
+        provider_type="codex",
+        upstream_metadata={
+            "codex": {
+                "primary_reset_seconds": 120.0,
+                "updated_at": 2600.0,
+            }
+        },
+    )
+
+    assert extract_reset_seconds(key_obj) == pytest.approx(120.0)
 
 
 def test_resolve_pool_account_state_keeps_codex_metadata_block() -> None:

@@ -7,11 +7,14 @@ Claude Messages API Normalizer
 - 可选：Claude error <-> InternalError
 """
 
+import copy
 import json
 from typing import Any
 
 from src.core.api_format.conversion.field_mappings import (
+    CLAUDE_EFFORT_TO_REASONING_EFFORT,
     ERROR_TYPE_MAPPINGS,
+    REASONING_EFFORT_TO_CLAUDE_EFFORT,
     RETRYABLE_ERROR_TYPES,
     STOP_REASON_MAPPINGS,
     THINKING_BUDGET_TOKENS_MIN,
@@ -58,10 +61,12 @@ from src.core.api_format.conversion.stream_events import (
     ToolCallDeltaEvent,
 )
 from src.core.api_format.conversion.stream_state import StreamState
+from src.core.logger import logger
 
 
 class ClaudeNormalizer(FormatNormalizer):
     FORMAT_ID = "claude:chat"
+    _ANTHROPIC_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
     capabilities = FormatCapabilities(
         supports_stream=True,
         supports_error_conversion=True,
@@ -187,10 +192,18 @@ class ClaudeNormalizer(FormatNormalizer):
                         "tools",
                         "tool_choice",
                         "thinking",
+                        "output_config",
                     },
                 )
             },
         )
+
+        # output_config.effort -> reasoning_effort (独立于 thinking)
+        output_config = request.get("output_config")
+        if isinstance(output_config, dict):
+            effort = output_config.get("effort")
+            if isinstance(effort, str) and effort in CLAUDE_EFFORT_TO_REASONING_EFFORT:
+                internal.extra["reasoning_effort"] = CLAUDE_EFFORT_TO_REASONING_EFFORT[effort]
 
         if dropped:
             internal.extra.setdefault("raw", {})["dropped_blocks"] = dropped
@@ -203,6 +216,9 @@ class ClaudeNormalizer(FormatNormalizer):
         *,
         target_variant: str | None = None,
     ) -> dict[str, Any]:
+        target_variant_norm = str(target_variant or "").strip().lower()
+        system_shape = "none"
+
         # system: 如果任一 InstructionSegment 有 cache_control，输出数组格式
         has_cache_control = any(seg.extra.get("cache_control") for seg in internal.instructions)
         if has_cache_control and internal.instructions:
@@ -221,15 +237,42 @@ class ClaudeNormalizer(FormatNormalizer):
             ]
             if not system_value:
                 system_value = None
+            else:
+                system_shape = "blocks"
         else:
             system_value = internal.system or self._join_instructions(internal.instructions)
+            if system_value:
+                system_shape = "string"
 
         # Claude Messages API: messages[] 仅允许 user/assistant，且需要交替；这里做最小修复
-        fixed_messages = self._coerce_claude_message_sequence(internal.messages)
+        fixed_messages, coerce_diagnostics = self._coerce_claude_message_sequence(internal.messages)
 
         out_messages: list[dict[str, Any]] = [
             self._internal_message_to_claude(m) for m in fixed_messages
         ]
+
+        if coerce_diagnostics["changed"]:
+            logger.debug(
+                "[ClaudeNormalizer] normalized message sequence: variant={}, input_count={}, output_count={}, prepended_empty_user={}, merged_adjacent={}, coerced_roles={}",
+                target_variant_norm or "default",
+                len(internal.messages),
+                len(fixed_messages),
+                coerce_diagnostics["prepended_empty_user"],
+                coerce_diagnostics["merged_adjacent"],
+                coerce_diagnostics["coerced_roles"],
+            )
+        if system_shape == "blocks":
+            logger.debug(
+                "[ClaudeNormalizer] emitted block system payload for cache_control instructions: variant={}, segment_count={}",
+                target_variant_norm or "default",
+                len(internal.instructions),
+            )
+        elif system_shape == "string" and internal.instructions:
+            logger.debug(
+                "[ClaudeNormalizer] emitted string system payload: variant={}, segment_count={}",
+                target_variant_norm or "default",
+                len(internal.instructions),
+            )
 
         # max_tokens: 优先使用请求中的值, 其次 GlobalModel.output_limit, 最后硬编码默认值
         effective_max_tokens: int
@@ -278,11 +321,18 @@ class ClaudeNormalizer(FormatNormalizer):
                 result["tools"] = claude_tools
 
         if internal.tool_choice:
+            reused_raw_tool_choice = isinstance(internal.tool_choice.extra.get("claude"), dict)
             tc = self._tool_choice_to_claude(internal.tool_choice)
             # parallel_tool_calls=False -> disable_parallel_tool_use=True
             if internal.parallel_tool_calls is False and tc.get("type") != "none":
                 tc["disable_parallel_tool_use"] = True
             result["tool_choice"] = tc
+            logger.debug(
+                "[ClaudeNormalizer] {} Claude tool_choice: variant={}, type={}",
+                "reused raw" if reused_raw_tool_choice else "rebuilt",
+                target_variant_norm or "default",
+                tc.get("type"),
+            )
 
         # thinking 配置
         if internal.thinking and internal.thinking.enabled:
@@ -313,6 +363,11 @@ class ClaudeNormalizer(FormatNormalizer):
                 if max_t is not None and bt >= max_t:
                     result["max_tokens"] = bt + 1
                 result["thinking"] = thinking_out
+
+        # reasoning_effort -> output_config.effort (独立于 thinking)
+        effort = internal.extra.get("reasoning_effort") if internal.extra else None
+        if isinstance(effort, str) and effort in REASONING_EFFORT_TO_CLAUDE_EFFORT:
+            result["output_config"] = {"effort": REASONING_EFFORT_TO_CLAUDE_EFFORT[effort]}
 
         # web_search_options -> Claude web_search tool
         web_search_opts = internal.extra.get("web_search_options") if internal.extra else None
@@ -1074,7 +1129,12 @@ class ClaudeNormalizer(FormatNormalizer):
         if system_value is None:
             return None, dropped, None
         if isinstance(system_value, str):
-            return (system_value or None), dropped, None
+            sanitized_text, removed_header_count = self._strip_anthropic_billing_headers(
+                system_value
+            )
+            if removed_header_count:
+                dropped["claude_system_billing_header_removed"] = removed_header_count
+            return sanitized_text, dropped, None
 
         if isinstance(system_value, list):
             texts: list[str] = []
@@ -1089,14 +1149,26 @@ class ClaudeNormalizer(FormatNormalizer):
                 if item.get("type") == "text":
                     text = item.get("text")
                     if text:
-                        texts.append(str(text))
+                        normalized_text, removed_header_count = (
+                            self._strip_anthropic_billing_headers(text)
+                        )
+                        if removed_header_count:
+                            dropped["claude_system_billing_header_removed"] = (
+                                dropped.get("claude_system_billing_header_removed", 0)
+                                + removed_header_count
+                            )
+                        if not normalized_text:
+                            continue
+                        texts.append(normalized_text)
                         seg_extra: dict[str, Any] = {}
                         cc = item.get("cache_control")
                         if isinstance(cc, dict):
                             seg_extra["cache_control"] = cc
                             has_cache_control = True
                         segments.append(
-                            InstructionSegment(role=Role.SYSTEM, text=str(text), extra=seg_extra)
+                            InstructionSegment(
+                                role=Role.SYSTEM, text=normalized_text, extra=seg_extra
+                            )
                         )
                 else:
                     dropped_key = f"claude_system_item:{item.get('type')}"
@@ -1110,6 +1182,28 @@ class ClaudeNormalizer(FormatNormalizer):
 
         dropped["claude_system_unsupported"] = dropped.get("claude_system_unsupported", 0) + 1
         return None, dropped, None
+
+    def _strip_anthropic_billing_headers(self, text: Any) -> tuple[str | None, int]:
+        normalized_text = str(text)
+        stripped_leading = normalized_text.lstrip()
+        if not stripped_leading.lower().startswith(self._ANTHROPIC_BILLING_HEADER_PREFIX):
+            return normalized_text, 0
+
+        lines = stripped_leading.splitlines(keepends=True)
+        idx = 0
+        removed_header_count = 0
+        while idx < len(lines) and lines[idx].strip().lower().startswith(
+            self._ANTHROPIC_BILLING_HEADER_PREFIX
+        ):
+            removed_header_count += 1
+            idx += 1
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+
+        sanitized_text = "".join(lines[idx:])
+        if not sanitized_text.strip():
+            return None, removed_header_count
+        return sanitized_text, removed_header_count
 
     def _join_instructions(self, instructions: list[InstructionSegment]) -> str | None:
         parts = [seg.text for seg in instructions if seg.text]
@@ -1165,6 +1259,11 @@ class ClaudeNormalizer(FormatNormalizer):
         return ToolChoice(type=ToolChoiceType.AUTO, extra={"claude": tool_choice})
 
     def _tool_choice_to_claude(self, tool_choice: ToolChoice) -> dict[str, Any]:
+        raw_choice = (
+            tool_choice.extra.get("claude") if isinstance(tool_choice.extra, dict) else None
+        )
+        if isinstance(raw_choice, dict):
+            return copy.deepcopy(raw_choice)
         if tool_choice.type == ToolChoiceType.NONE:
             return {"type": "none"}
         if tool_choice.type == ToolChoiceType.AUTO:
@@ -1186,6 +1285,13 @@ class ClaudeNormalizer(FormatNormalizer):
         blocks: list[dict[str, Any]] = []
         text_parts: list[str] = []
 
+        def flush_text_parts() -> None:
+            nonlocal text_parts
+            if not text_parts:
+                return
+            blocks.append({"type": "text", "text": "\n".join(text_parts)})
+            text_parts = []
+
         for b in msg.content:
             if isinstance(b, UnknownBlock):
                 continue
@@ -1193,6 +1299,7 @@ class ClaudeNormalizer(FormatNormalizer):
             if isinstance(b, TextBlock):
                 if b.text:
                     if force_structured_text:
+                        flush_text_parts()
                         text_block: dict[str, Any] = {"type": "text", "text": b.text}
                         cc = b.extra.get("cache_control") if b.extra else None
                         if isinstance(cc, dict):
@@ -1210,6 +1317,7 @@ class ClaudeNormalizer(FormatNormalizer):
                         text_parts.append("[Image]")
                     continue
 
+                flush_text_parts()
                 if b.data and b.media_type:
                     blocks.append(
                         {
@@ -1232,6 +1340,7 @@ class ClaudeNormalizer(FormatNormalizer):
 
             if isinstance(b, FileBlock):
                 if b.data and b.media_type:
+                    flush_text_parts()
                     blocks.append(
                         {
                             "type": "document",
@@ -1243,6 +1352,7 @@ class ClaudeNormalizer(FormatNormalizer):
                         }
                     )
                 elif b.file_url:
+                    flush_text_parts()
                     blocks.append(
                         {
                             "type": "document",
@@ -1258,6 +1368,7 @@ class ClaudeNormalizer(FormatNormalizer):
 
             if isinstance(b, AudioBlock):
                 if b.data and b.media_type:
+                    flush_text_parts()
                     blocks.append(
                         {
                             "type": "document",
@@ -1271,6 +1382,7 @@ class ClaudeNormalizer(FormatNormalizer):
                 continue
 
             if isinstance(b, ToolUseBlock) and role == "assistant":
+                flush_text_parts()
                 blocks.append(
                     {
                         "type": "tool_use",
@@ -1282,6 +1394,7 @@ class ClaudeNormalizer(FormatNormalizer):
                 continue
 
             if isinstance(b, ToolResultBlock) and role == "user":
+                flush_text_parts()
                 if b.content_text is not None:
                     content: Any = b.content_text
                 elif b.output is None:
@@ -1301,38 +1414,50 @@ class ClaudeNormalizer(FormatNormalizer):
                 )
                 continue
 
-        if text_parts:
-            if blocks:
-                blocks = [{"type": "text", "text": "\n".join(text_parts)}] + blocks
-            else:
-                return {"role": role, "content": "\n".join(text_parts)}
+        if text_parts and not blocks:
+            return {"role": role, "content": "\n".join(text_parts)}
 
+        flush_text_parts()
         return {"role": role, "content": blocks}
 
     def _coerce_claude_message_sequence(
         self, messages: list[InternalMessage]
-    ) -> list[InternalMessage]:
+    ) -> tuple[list[InternalMessage], dict[str, Any]]:
+        diagnostics: dict[str, Any] = {
+            "changed": False,
+            "prepended_empty_user": False,
+            "merged_adjacent": 0,
+            "coerced_roles": 0,
+        }
         normalized: list[InternalMessage] = []
         for m in messages:
             role = m.role
             if role not in (Role.USER, Role.ASSISTANT):
+                diagnostics["coerced_roles"] += 1
                 role = Role.USER
-            normalized.append(InternalMessage(role=role, content=m.content, extra=m.extra))
+            normalized.append(InternalMessage(role=role, content=list(m.content), extra=m.extra))
 
         if not normalized:
-            return []
+            return [], diagnostics
 
         if normalized[0].role != Role.USER:
             normalized = [InternalMessage(role=Role.USER, content=[])] + normalized
+            diagnostics["prepended_empty_user"] = True
 
         merged: list[InternalMessage] = []
         for m in normalized:
             if merged and merged[-1].role == m.role:
                 merged[-1].content.extend(m.content)
+                diagnostics["merged_adjacent"] += 1
                 continue
             merged.append(m)
 
-        return merged
+        diagnostics["changed"] = bool(
+            diagnostics["prepended_empty_user"]
+            or diagnostics["merged_adjacent"]
+            or diagnostics["coerced_roles"]
+        )
+        return merged, diagnostics
 
     def _claude_usage_to_internal(self, usage: Any) -> UsageInfo | None:
         if not isinstance(usage, dict):

@@ -4,7 +4,7 @@ Provider 摘要与健康监控 API
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Protocol
 
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import case, func
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, load_only
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
 from src.api.base.models_service import invalidate_models_list_cache
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.config.constants import CacheTTL
 from src.core.enums import ProviderBillingType
 from src.core.exceptions import InvalidRequestException, NotFoundException
@@ -43,8 +43,24 @@ from src.services.cache.model_cache import ModelCacheService
 from src.services.cache.provider_cache import ProviderCacheService
 from src.utils.cache_decorator import cache_result
 
+
+class _HasProviderSortFields(Protocol):
+    is_active: Any
+    provider_priority: Any
+    created_at: Any
+
+
 router = APIRouter(tags=["Provider Summary"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
+
+
+def _provider_summary_ordering(provider_model: _HasProviderSortFields) -> tuple[Any, Any, Any]:
+    """Provider 摘要列表排序：启用在前，其次按优先级与创建时间。"""
+    return (
+        case((provider_model.is_active == True, 0), else_=1).asc(),
+        provider_model.provider_priority.asc(),
+        provider_model.created_at.asc(),
+    )
 
 
 @router.get("/summary", response_model=ProviderSummaryPageResponse)
@@ -821,7 +837,7 @@ class AdminProviderSummaryAdapter(AdminApiAdapter):
         total = query.count()
 
         providers = (
-            query.order_by(Provider.provider_priority.asc(), Provider.created_at.asc())
+            query.order_by(*_provider_summary_ordering(Provider))
             .offset((self.page - 1) * self.page_size)
             .limit(self.page_size)
             .all()

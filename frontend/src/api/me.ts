@@ -3,6 +3,9 @@ import type { ActivityHeatmap } from '@/types/activity'
 import type { TieredPricingConfig } from './endpoints/types'
 import { cachedRequest, buildCacheKey } from '@/utils/cache'
 import type { BillingSummary } from './auth'
+import type { UserSession } from '@/types/session'
+
+export type { UserSession }
 
 export interface Profile {
   id: string // UUID
@@ -79,6 +82,8 @@ export interface ModelSummary {
   input_tokens: number
   output_tokens: number
   total_tokens: number
+  cache_read_tokens?: number
+  cache_hit_rate?: number
   total_cost_usd: number
   actual_total_cost_usd?: number  // 倍率消耗（仅管理员可见）
 }
@@ -88,9 +93,22 @@ export interface ProviderSummary {
   provider: string
   requests: number
   total_tokens: number
+  cache_read_tokens?: number
+  cache_hit_rate?: number
   total_cost_usd: number
   success_rate: number | null
   avg_response_time_ms: number | null
+}
+
+// API 格式统计接口
+export interface ApiFormatSummary {
+  api_format: string
+  request_count: number
+  total_tokens: number
+  cache_read_tokens: number
+  cache_hit_rate: number
+  total_cost_usd: number
+  avg_response_time_ms: number
 }
 
 // 使用统计响应接口
@@ -105,6 +123,7 @@ export interface UsageResponse {
   billing: BillingSummary
   summary_by_model: ModelSummary[]
   summary_by_provider?: ProviderSummary[]
+  summary_by_api_format?: ApiFormatSummary[]
   pagination?: {
     total: number
     limit: number
@@ -126,6 +145,7 @@ export interface ApiKey {
   created_at: string
   total_requests?: number
   total_cost_usd?: number
+  rate_limit?: number | null
   allowed_providers?: ProviderConfig[]
   force_capabilities?: Record<string, boolean> | null  // 强制能力配置
 }
@@ -159,14 +179,36 @@ export const meApi = {
     return response.data
   },
 
+  async listSessions(): Promise<UserSession[]> {
+    const response = await apiClient.get<UserSession[]>('/api/users/me/sessions')
+    return response.data
+  },
+
+  async updateSessionLabel(sessionId: string, deviceLabel: string): Promise<UserSession> {
+    const response = await apiClient.patch<UserSession>(`/api/users/me/sessions/${sessionId}`, {
+      device_label: deviceLabel,
+    })
+    return response.data
+  },
+
+  async revokeSession(sessionId: string): Promise<{ message: string }> {
+    const response = await apiClient.delete(`/api/users/me/sessions/${sessionId}`)
+    return response.data
+  },
+
+  async revokeOtherSessions(): Promise<{ message: string; revoked_count: number }> {
+    const response = await apiClient.delete('/api/users/me/sessions/others')
+    return response.data
+  },
+
   // API密钥管理
   async getApiKeys(): Promise<ApiKey[]> {
     const response = await apiClient.get<ApiKey[]>('/api/users/me/api-keys')
     return response.data
   },
 
-  async createApiKey(name: string): Promise<ApiKey> {
-    const response = await apiClient.post<ApiKey>('/api/users/me/api-keys', { name })
+  async createApiKey(data: { name: string; rate_limit?: number }): Promise<ApiKey> {
+    const response = await apiClient.post<ApiKey>('/api/users/me/api-keys', data)
     return response.data
   },
 
@@ -193,6 +235,17 @@ export const meApi = {
 
   async toggleApiKey(keyId: string): Promise<ApiKey> {
     const response = await apiClient.patch<ApiKey>(`/api/users/me/api-keys/${keyId}`)
+    return response.data
+  },
+
+  async updateApiKey(
+    keyId: string,
+    data: { name?: string; rate_limit?: number | null }
+  ): Promise<ApiKey & { message: string }> {
+    const response = await apiClient.put<ApiKey & { message: string }>(
+      `/api/users/me/api-keys/${keyId}`,
+      data
+    )
     return response.data
   },
 

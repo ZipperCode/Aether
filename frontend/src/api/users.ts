@@ -10,6 +10,7 @@ export interface User {
   allowed_providers: string[] | null  // 允许使用的提供商 ID 列表
   allowed_api_formats: string[] | null  // 允许使用的 API 格式列表
   allowed_models: string[] | null  // 允许使用的模型名称列表
+  rate_limit?: number | null  // null = 跟随系统默认，0 = 不限制
   created_at: string
   updated_at?: string
   last_login_at?: string | null
@@ -25,6 +26,7 @@ export interface CreateUserRequest {
   allowed_providers?: string[] | null
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
+  rate_limit?: number | null
 }
 
 export interface UpdateUserRequest {
@@ -36,6 +38,7 @@ export interface UpdateUserRequest {
   allowed_providers?: string[] | null
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
+  rate_limit?: number | null
 }
 
 export interface ApiKey {
@@ -49,10 +52,17 @@ export interface ApiKey {
   is_active: boolean
   is_locked: boolean  // 管理员锁定标志
   is_standalone: boolean  // 是否为独立余额Key
-  rate_limit?: number  // 速率限制（请求/分钟）
+  rate_limit?: number | null  // 普通Key: 0 = 不限制，历史 null 视为跟随系统默认
   total_requests?: number  // 总请求数
   total_cost_usd?: number  // 总费用
 }
+
+export interface UpsertUserApiKeyRequest {
+  name?: string
+  rate_limit?: number | null
+}
+
+export type { UserSession } from '@/types/session'
 
 export const usersApi = {
   async getAllUsers(): Promise<User[]> {
@@ -84,8 +94,41 @@ export const usersApi = {
     return response.data.api_keys
   },
 
-  async createApiKey(userId: string, name?: string): Promise<ApiKey & { key: string }> {
-    const response = await apiClient.post<ApiKey & { key: string }>(`/api/admin/users/${userId}/api-keys`, { name })
+  async getUserSessions(userId: string): Promise<UserSession[]> {
+    const response = await apiClient.get<UserSession[]>(`/api/admin/users/${userId}/sessions`)
+    return response.data
+  },
+
+  async revokeUserSession(userId: string, sessionId: string): Promise<{ message: string }> {
+    const response = await apiClient.delete(`/api/admin/users/${userId}/sessions/${sessionId}`)
+    return response.data
+  },
+
+  async revokeAllUserSessions(userId: string): Promise<{ message: string; revoked_count: number }> {
+    const response = await apiClient.delete(`/api/admin/users/${userId}/sessions`)
+    return response.data
+  },
+
+  async createApiKey(
+    userId: string,
+    data: UpsertUserApiKeyRequest
+  ): Promise<ApiKey & { key: string }> {
+    const response = await apiClient.post<ApiKey & { key: string }>(
+      `/api/admin/users/${userId}/api-keys`,
+      data
+    )
+    return response.data
+  },
+
+  async updateApiKey(
+    userId: string,
+    keyId: string,
+    data: UpsertUserApiKeyRequest
+  ): Promise<ApiKey & { message: string }> {
+    const response = await apiClient.put<ApiKey & { message: string }>(
+      `/api/admin/users/${userId}/api-keys/${keyId}`,
+      data
+    )
     return response.data
   },
 

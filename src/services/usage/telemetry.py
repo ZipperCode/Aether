@@ -30,6 +30,23 @@ class MessageTelemetry:
         self.request_id = request_id
         self.client_ip = client_ip
 
+    def _build_usage_metadata(
+        self,
+        *,
+        request_metadata: dict[str, Any] | None = None,
+        response_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        metadata: dict[str, Any] | None = None
+
+        if request_metadata:
+            metadata = dict(request_metadata)
+            if response_metadata:
+                metadata.setdefault("response", response_metadata)
+        elif response_metadata:
+            metadata = dict(response_metadata)
+
+        return metadata
+
     async def calculate_cost(
         self,
         provider: str,
@@ -96,12 +113,10 @@ class MessageTelemetry:
         # 请求元数据（用于性能与调试记录）
         request_metadata: dict[str, Any] | None = None,
     ) -> float:
-        metadata = response_metadata
-        if request_metadata:
-            merged = dict(request_metadata)
-            if response_metadata:
-                merged.setdefault("response", response_metadata)
-            metadata = merged
+        metadata = self._build_usage_metadata(
+            request_metadata=request_metadata,
+            response_metadata=response_metadata,
+        )
 
         usage = await UsageService.record_usage(
             db=self.db,
@@ -223,6 +238,10 @@ class MessageTelemetry:
                 self.request_id,
             )
 
+        metadata = self._build_usage_metadata(
+            request_metadata=request_metadata,
+        )
+
         await UsageService.record_usage(
             db=self.db,
             user=self.user,
@@ -261,7 +280,7 @@ class MessageTelemetry:
             # 模型映射信息
             target_model=target_model,
             # 请求元数据
-            metadata=request_metadata,
+            metadata=metadata,
         )
 
     async def record_cancelled(
@@ -307,6 +326,9 @@ class MessageTelemetry:
         客户端主动断开连接不算系统失败，使用 cancelled 状态。
         """
         provider_name = provider or "unknown"
+        metadata = self._build_usage_metadata(
+            request_metadata=request_metadata,
+        )
 
         await UsageService.record_usage(
             db=self.db,
@@ -345,5 +367,5 @@ class MessageTelemetry:
             provider_endpoint_id=provider_endpoint_id,
             provider_api_key_id=provider_api_key_id,
             target_model=target_model,
-            metadata=request_metadata,
+            metadata=metadata,
         )

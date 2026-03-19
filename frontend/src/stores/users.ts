@@ -1,6 +1,14 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { usersApi, type User, type CreateUserRequest, type UpdateUserRequest, type ApiKey } from '@/api/users'
+import {
+  usersApi,
+  type User,
+  type CreateUserRequest,
+  type UpdateUserRequest,
+  type ApiKey,
+  type UpsertUserApiKeyRequest,
+  type UserSession,
+} from '@/api/users'
 import { parseApiError } from '@/utils/errorParser'
 
 export const useUsersStore = defineStore('users', () => {
@@ -84,11 +92,24 @@ export const useUsersStore = defineStore('users', () => {
     }
   }
 
-  async function createApiKey(userId: string, name?: string): Promise<ApiKey> {
+  async function createApiKey(userId: string, data: UpsertUserApiKeyRequest): Promise<ApiKey> {
     try {
-      return await usersApi.createApiKey(userId, name)
+      return await usersApi.createApiKey(userId, data)
     } catch (err: unknown) {
       error.value = parseApiError(err, '创建 API Key 失败')
+      throw err
+    }
+  }
+
+  async function updateApiKey(
+    userId: string,
+    keyId: string,
+    data: UpsertUserApiKeyRequest
+  ): Promise<ApiKey> {
+    try {
+      return await usersApi.updateApiKey(userId, keyId, data)
+    } catch (err: unknown) {
+      error.value = parseApiError(err, '更新 API Key 失败')
       throw err
     }
   }
@@ -111,6 +132,35 @@ export const useUsersStore = defineStore('users', () => {
     }
   }
 
+  async function getUserSessions(userId: string): Promise<UserSession[]> {
+    try {
+      return await usersApi.getUserSessions(userId)
+    } catch (err: unknown) {
+      error.value = parseApiError(err, '获取用户设备会话失败')
+      throw err
+    }
+  }
+
+  async function revokeUserSession(userId: string, sessionId: string): Promise<{ message: string }> {
+    try {
+      return await usersApi.revokeUserSession(userId, sessionId)
+    } catch (err: unknown) {
+      error.value = parseApiError(err, '强制下线设备失败')
+      throw err
+    }
+  }
+
+  async function revokeAllUserSessions(
+    userId: string,
+  ): Promise<{ message: string; revoked_count: number }> {
+    try {
+      return await usersApi.revokeAllUserSessions(userId)
+    } catch (err: unknown) {
+      error.value = parseApiError(err, '强制下线全部设备失败')
+      throw err
+    }
+  }
+
   return {
     users,
     loading,
@@ -121,7 +171,11 @@ export const useUsersStore = defineStore('users', () => {
     deleteUser,
     getUserApiKeys,
     createApiKey,
+    updateApiKey,
     deleteApiKey,
-    getFullApiKey
+    getFullApiKey,
+    getUserSessions,
+    revokeUserSession,
+    revokeAllUserSessions,
   }
 })

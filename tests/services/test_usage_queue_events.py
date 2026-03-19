@@ -1,7 +1,6 @@
-import asyncio
 import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from redis.exceptions import ResponseError
@@ -26,13 +25,13 @@ from src.services.usage.telemetry_writer import (
 
 class DummyRedis:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, str], int | None, bool | None]] = []
+        self.calls: list[tuple[str, dict[str, bytes], int | None, bool | None]] = []
         self.xadd_error: Exception | None = None
 
     async def xadd(
         self,
         key: str,
-        fields: dict[str, str],
+        fields: dict[str, bytes],
         maxlen: int | None = None,
         approximate: bool | None = None,
     ) -> str:
@@ -118,18 +117,65 @@ async def test_usage_event_all_types() -> None:
 
 
 @pytest.mark.asyncio
-async def test_usage_event_bytes_payload() -> None:
-    """测试 bytes 类型 payload 的反序列化"""
+async def test_usage_event_to_stream_fields_sanitizes_non_json_value() -> None:
+    event = build_usage_event(
+        event_type=UsageEventType.COMPLETED,
+        request_id="req-non-json",
+        data={"meta": {"obj": object()}},
+    )
+    fields = event.to_stream_fields()
+    restored = UsageEvent.from_stream_fields(fields)
+    assert isinstance(restored.data["meta"]["obj"], str)
+
+
+def test_usage_event_bytes_payload() -> None:
+    """测试 surrogateescape 字符串 payload 的反序列化（msgpack）"""
     event = build_usage_event(
         event_type=UsageEventType.COMPLETED,
         request_id="req-bytes",
         data={"key": "value"},
     )
     fields = event.to_stream_fields()
-    # 模拟 Redis 返回 bytes
-    fields["payload"] = fields["payload"].encode("utf-8")  # type: ignore[assignment]
+    # 模拟 decode_responses=True + surrogateescape 返回的 str
+    fields["payload"] = fields["payload"].decode("utf-8", errors="surrogateescape")  # type: ignore[assignment]
     restored = UsageEvent.from_stream_fields(fields)
     assert restored.request_id == "req-bytes"
+
+
+def test_usage_event_legacy_json_payload_string() -> None:
+    """兼容旧格式：payload 为 JSON 字符串"""
+    fields = {
+        "payload": json.dumps(
+            {
+                "v": 1,
+                "type": UsageEventType.COMPLETED.value,
+                "request_id": "req-legacy-json",
+                "timestamp_ms": 123,
+                "data": {"foo": "bar"},
+            }
+        )
+    }
+    restored = UsageEvent.from_stream_fields(fields)
+    assert restored.request_id == "req-legacy-json"
+    assert restored.data["foo"] == "bar"
+
+
+def test_usage_event_legacy_json_payload_bytes() -> None:
+    """兼容旧格式：payload 为 bytes(JSON)"""
+    fields = {
+        "payload": json.dumps(
+            {
+                "v": 1,
+                "type": UsageEventType.COMPLETED.value,
+                "request_id": "req-legacy-json-bytes",
+                "timestamp_ms": 123,
+                "data": {"foo": "bar"},
+            }
+        ).encode("utf-8")
+    }
+    restored = UsageEvent.from_stream_fields(fields)
+    assert restored.request_id == "req-legacy-json-bytes"
+    assert restored.data["foo"] == "bar"
 
 
 @pytest.mark.asyncio
@@ -159,14 +205,13 @@ def test_sanitize_payload_nested() -> None:
 
 
 def test_parse_body_json_string() -> None:
-    """测试 _parse_body 正确反序列化 JSON 字符串"""
+    """测试 _parse_body 在消费阶段不反序列化 JSON 字符串"""
     from src.services.usage.consumer_streams import _parse_body
 
-    # JSON 字符串应被解析为 dict
+    # JSON 字符串应保持原样，反序列化延迟到写库前
     json_str = '{"messages": [{"role": "user", "content": "hello"}]}'
     result = _parse_body(json_str)
-    assert isinstance(result, dict)
-    assert result["messages"][0]["content"] == "hello"
+    assert result == json_str
 
 
 def test_parse_body_dict_passthrough() -> None:
@@ -370,8 +415,8 @@ async def test_queue_writer_failure_preserves_empty_request_headers(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_event_to_record_body_deserialization(monkeypatch: Any) -> None:
-    """测试 _event_to_record 正确反序列化 body 字符串为 dict"""
+async def test_event_to_record_body_passthrough() -> None:
+    """测试 _event_to_record 保留 body 字符串，交由写库阶段再解析"""
     from src.services.usage.consumer_streams import _event_to_record
 
     # 模拟 QueueTelemetryWriter 产生的事件（body 被序列化为 JSON 字符串）
@@ -392,11 +437,9 @@ async def test_event_to_record_body_deserialization(monkeypatch: Any) -> None:
 
     record = _event_to_record(event)
 
-    # 验证 body 被正确反序列化为 dict
-    assert isinstance(record["request_body"], dict)
-    assert record["request_body"]["messages"][0]["content"] == "hello"
-    assert isinstance(record["response_body"], dict)
-    assert record["response_body"]["choices"][0]["message"]["content"] == "hi"
+    # 消费阶段不做 json.loads，保留原字符串
+    assert record["request_body"] == event.data["request_body"]
+    assert record["response_body"] == event.data["response_body"]
     assert record["finalized_at"] is not None
 
 
@@ -484,12 +527,20 @@ class MockRedisPipeline:
         self._commands.append(("xack", key, group, message_id))
         return self
 
+    def xdel(self, key: str, message_id: str) -> Any:
+        self._commands.append(("xdel", key, message_id))
+        return self
+
     async def execute(self) -> Any:
         results = []
         for cmd in self._commands:
             if cmd[0] == "xack":
                 _, key, group, message_id = cmd
                 self._parent.xack_calls.append((key, group, message_id))
+                results.append(1)
+            elif cmd[0] == "xdel":
+                _, key, message_id = cmd
+                self._parent.xdel_calls.append((key, message_id))
                 results.append(1)
         return results
 
@@ -499,9 +550,12 @@ class MockRedisForConsumer:
 
     def __init__(self) -> None:
         self.xgroup_create_calls: list[tuple[str, str, str, bool]] = []
+        self.xgroup_delconsumer_calls: list[tuple[str, str, str]] = []
+        self.xinfo_consumers_result: list[dict[str, Any]] = []
         self.xreadgroup_results: list[Any] = []
         self.xautoclaim_results: list[Any] = []
         self.xack_calls: list[tuple[str, str, str]] = []
+        self.xdel_calls: list[tuple[str, str]] = []
         self.xadd_calls: list[tuple[str, dict[str, str], int | None, bool | None]] = []
         self.xpending_range_results: list[Any] = []
         self.xlen_result: int = 0
@@ -512,6 +566,13 @@ class MockRedisForConsumer:
         self.xgroup_create_calls.append((key, group, id, mkstream))
         if self.xgroup_create_error:
             raise self.xgroup_create_error
+
+    async def xgroup_delconsumer(self, key: str, group: str, consumer: str) -> int:
+        self.xgroup_delconsumer_calls.append((key, group, consumer))
+        return 1
+
+    async def xinfo_consumers(self, key: str, group: str) -> list[dict[str, Any]]:
+        return list(self.xinfo_consumers_result)
 
     async def xreadgroup(
         self,
@@ -534,6 +595,9 @@ class MockRedisForConsumer:
 
     async def xack(self, key: str, group: str, message_id: str) -> Any:
         self.xack_calls.append((key, group, message_id))
+
+    async def xdel(self, key: str, message_id: str) -> Any:
+        self.xdel_calls.append((key, message_id))
 
     async def xadd(
         self,
@@ -658,6 +722,57 @@ async def test_consumer_start_stop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_consumer_start_cleans_stale_consumers(monkeypatch: Any) -> None:
+    """启动时应清理 pending=0 且长期闲置的旧 consumer。"""
+    mock_redis = MockRedisForConsumer()
+    current_consumer = _consumer_name()
+    mock_redis.xinfo_consumers_result = [
+        {"name": current_consumer, "pending": 0, "idle": 999999999},
+        {"name": "stale:1", "pending": 0, "idle": 999999999},
+        {"name": "busy:1", "pending": 1, "idle": 999999999},
+        {"name": "fresh:1", "pending": 0, "idle": 1000},
+    ]
+
+    async def _get_redis_client(require_redis: bool = False) -> Any:
+        return mock_redis
+
+    monkeypatch.setattr("src.services.usage.consumer_streams.get_redis_client", _get_redis_client)
+
+    consumer = UsageQueueConsumer()
+    consumer._run = AsyncMock()  # type: ignore[method-assign]
+
+    await consumer.start()
+    await consumer.stop()
+
+    assert ("usage:events", "usage_consumers", "stale:1") in mock_redis.xgroup_delconsumer_calls
+    assert ("usage:events", "usage_consumers", "busy:1") not in mock_redis.xgroup_delconsumer_calls
+    assert ("usage:events", "usage_consumers", "fresh:1") not in mock_redis.xgroup_delconsumer_calls
+
+
+@pytest.mark.asyncio
+async def test_consumer_stop_removes_self_from_group(monkeypatch: Any) -> None:
+    """停机时应主动删除自身 consumer，避免 group 元数据累积。"""
+    mock_redis = MockRedisForConsumer()
+
+    async def _get_redis_client(require_redis: bool = False) -> Any:
+        return mock_redis
+
+    monkeypatch.setattr("src.services.usage.consumer_streams.get_redis_client", _get_redis_client)
+
+    consumer = UsageQueueConsumer()
+    consumer._run = AsyncMock()  # type: ignore[method-assign]
+
+    await consumer.start()
+    await consumer.stop()
+
+    assert (
+        config.usage_queue_stream_key,
+        config.usage_queue_stream_group,
+        consumer._consumer,
+    ) in mock_redis.xgroup_delconsumer_calls
+
+
+@pytest.mark.asyncio
 async def test_consumer_process_messages_success(monkeypatch: Any) -> None:
     """测试成功处理消息"""
     mock_redis = MockRedisForConsumer()
@@ -690,6 +805,27 @@ async def test_consumer_process_messages_success(monkeypatch: Any) -> None:
     call_messages = consumer._process_record_batch.call_args[0][1]
     assert len(call_messages) == 1
     assert call_messages[0][2].request_id == "req-test-1"
+
+
+@pytest.mark.asyncio
+async def test_consumer_process_streaming_batch_deletes_messages() -> None:
+    """STREAMING 事件处理成功后应立即从主队列删除。"""
+    mock_redis = MockRedisForConsumer()
+    consumer = UsageQueueConsumer()
+    consumer._apply_streaming_event = AsyncMock()  # type: ignore[method-assign]
+
+    event = build_usage_event(
+        event_type=UsageEventType.STREAMING,
+        request_id="req-stream-ok",
+        data={"provider": "test"},
+    )
+
+    await consumer._process_streaming_batch(mock_redis, [("stream-1", event)])
+
+    assert mock_redis.xack_calls == [
+        (config.usage_queue_stream_key, config.usage_queue_stream_group, "stream-1")
+    ]
+    assert mock_redis.xdel_calls == [(config.usage_queue_stream_key, "stream-1")]
 
 
 @pytest.mark.asyncio
@@ -761,6 +897,7 @@ async def test_consumer_process_messages_move_to_dlq(monkeypatch: Any) -> None:
 
         # 消息应该被 ack
         assert len(mock_redis.xack_calls) == 1
+        assert mock_redis.xdel_calls == [(config.usage_queue_stream_key, message_id)]
     finally:
         config.usage_queue_max_retries = old_max_retries
         config.usage_queue_dlq_maxlen = old_dlq_maxlen
@@ -942,17 +1079,16 @@ async def test_consumer_apply_event_streaming(monkeypatch: Any) -> None:
 async def test_consumer_apply_event_completed(monkeypatch: Any) -> None:
     """测试处理 COMPLETED 事件"""
     mock_db = MagicMock()
-    mock_db.query.return_value.filter.return_value.first.return_value = None
 
     def mock_create_session() -> Any:
         return mock_db
 
     monkeypatch.setattr("src.services.usage.consumer_streams.create_session", mock_create_session)
 
-    mock_record_usage = AsyncMock()
+    mock_record_batch = AsyncMock(return_value=[])
     monkeypatch.setattr(
-        "src.services.usage.consumer_streams.UsageService.record_usage",
-        mock_record_usage,
+        "src.services.usage.consumer_streams.UsageService.record_usage_batch",
+        mock_record_batch,
     )
 
     consumer = UsageQueueConsumer()
@@ -971,29 +1107,29 @@ async def test_consumer_apply_event_completed(monkeypatch: Any) -> None:
 
     await consumer._apply_event(event)
 
-    mock_record_usage.assert_called_once()
-    call_kwargs = mock_record_usage.call_args.kwargs
-    assert call_kwargs["request_id"] == "req-done"
-    assert call_kwargs["status"] == "completed"
-    assert call_kwargs["provider"] == "openai"
-    assert call_kwargs["input_tokens"] == 100
+    mock_record_batch.assert_awaited_once()
+    records = mock_record_batch.call_args[0][1]
+    assert len(records) == 1
+    assert records[0]["request_id"] == "req-done"
+    assert records[0]["status"] == "completed"
+    assert records[0]["provider"] == "openai"
+    assert records[0]["input_tokens"] == 100
 
 
 @pytest.mark.asyncio
 async def test_consumer_apply_event_failed(monkeypatch: Any) -> None:
     """测试处理 FAILED 事件"""
     mock_db = MagicMock()
-    mock_db.query.return_value.filter.return_value.first.return_value = None
 
     def mock_create_session() -> Any:
         return mock_db
 
     monkeypatch.setattr("src.services.usage.consumer_streams.create_session", mock_create_session)
 
-    mock_record_usage = AsyncMock()
+    mock_record_batch = AsyncMock(return_value=[])
     monkeypatch.setattr(
-        "src.services.usage.consumer_streams.UsageService.record_usage",
-        mock_record_usage,
+        "src.services.usage.consumer_streams.UsageService.record_usage_batch",
+        mock_record_batch,
     )
 
     consumer = UsageQueueConsumer()
@@ -1011,26 +1147,25 @@ async def test_consumer_apply_event_failed(monkeypatch: Any) -> None:
 
     await consumer._apply_event(event)
 
-    call_kwargs = mock_record_usage.call_args.kwargs
-    assert call_kwargs["status"] == "failed"
-    assert call_kwargs["error_message"] == "Rate limited"
+    records = mock_record_batch.call_args[0][1]
+    assert records[0]["status"] == "failed"
+    assert records[0]["error_message"] == "Rate limited"
 
 
 @pytest.mark.asyncio
 async def test_consumer_apply_event_cancelled(monkeypatch: Any) -> None:
     """测试处理 CANCELLED 事件"""
     mock_db = MagicMock()
-    mock_db.query.return_value.filter.return_value.first.return_value = None
 
     def mock_create_session() -> Any:
         return mock_db
 
     monkeypatch.setattr("src.services.usage.consumer_streams.create_session", mock_create_session)
 
-    mock_record_usage = AsyncMock()
+    mock_record_batch = AsyncMock(return_value=[])
     monkeypatch.setattr(
-        "src.services.usage.consumer_streams.UsageService.record_usage",
-        mock_record_usage,
+        "src.services.usage.consumer_streams.UsageService.record_usage_batch",
+        mock_record_batch,
     )
 
     consumer = UsageQueueConsumer()
@@ -1044,8 +1179,8 @@ async def test_consumer_apply_event_cancelled(monkeypatch: Any) -> None:
 
     await consumer._apply_event(event)
 
-    call_kwargs = mock_record_usage.call_args.kwargs
-    assert call_kwargs["status"] == "cancelled"
+    records = mock_record_batch.call_args[0][1]
+    assert records[0]["status"] == "cancelled"
 
 
 # ============ 批量处理测试 ============
@@ -1162,8 +1297,14 @@ async def test_consumer_process_record_batch_success(monkeypatch: Any) -> None:
     records = mock_record_batch.call_args[0][1]
     assert len(records) == 3
 
-    # 验证所有消息被 ACK
+    # 验证所有消息被 ACK 并从主队列删除
     assert len(mock_redis.xack_calls) == 3
+    assert len(mock_redis.xdel_calls) == 3
+    assert mock_redis.xdel_calls == [
+        (config.usage_queue_stream_key, "msg-0"),
+        (config.usage_queue_stream_key, "msg-1"),
+        (config.usage_queue_stream_key, "msg-2"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1171,25 +1312,17 @@ async def test_consumer_process_record_batch_fallback(monkeypatch: Any) -> None:
     """测试批量处理失败时回退到逐条处理"""
     mock_redis = MockRedisForConsumer()
     mock_db = MagicMock()
-    mock_db.query.return_value.filter.return_value.first.return_value = None
 
     def mock_create_session() -> Any:
         return mock_db
 
     monkeypatch.setattr("src.services.usage.consumer_streams.create_session", mock_create_session)
 
-    # 批量处理失败
-    mock_record_batch = AsyncMock(side_effect=Exception("Batch failed"))
+    # 首次批量处理失败，回退到单条 batch 成功
+    mock_record_batch = AsyncMock(side_effect=[Exception("Batch failed"), []])
     monkeypatch.setattr(
         "src.services.usage.consumer_streams.UsageService.record_usage_batch",
         mock_record_batch,
-    )
-
-    # 单条处理成功
-    mock_record_usage = AsyncMock()
-    monkeypatch.setattr(
-        "src.services.usage.consumer_streams.UsageService.record_usage",
-        mock_record_usage,
     )
 
     consumer = UsageQueueConsumer()
@@ -1205,10 +1338,14 @@ async def test_consumer_process_record_batch_fallback(monkeypatch: Any) -> None:
         [("msg-1", event.to_stream_fields(), event)],
     )
 
-    # 验证回退到单条处理
-    mock_record_usage.assert_called_once()
-    # 消息被 ACK
+    # 验证回退到单条 batch 处理
+    assert mock_record_batch.await_count == 2
+    fallback_records = mock_record_batch.call_args_list[1][0][1]
+    assert len(fallback_records) == 1
+    assert fallback_records[0]["request_id"] == "req-fallback"
+    # 消息被 ACK 并从主队列删除
     assert len(mock_redis.xack_calls) == 1
+    assert mock_redis.xdel_calls == [(config.usage_queue_stream_key, "msg-1")]
 
 
 @pytest.mark.asyncio
@@ -1253,17 +1390,16 @@ async def test_consumer_apply_streaming_event(monkeypatch: Any) -> None:
 async def test_consumer_apply_record_event(monkeypatch: Any) -> None:
     """测试记录事件单独处理"""
     mock_db = MagicMock()
-    mock_db.query.return_value.filter.return_value.first.return_value = None
 
     def mock_create_session() -> Any:
         return mock_db
 
     monkeypatch.setattr("src.services.usage.consumer_streams.create_session", mock_create_session)
 
-    mock_record_usage = AsyncMock()
+    mock_record_batch = AsyncMock(return_value=[])
     monkeypatch.setattr(
-        "src.services.usage.consumer_streams.UsageService.record_usage",
-        mock_record_usage,
+        "src.services.usage.consumer_streams.UsageService.record_usage_batch",
+        mock_record_batch,
     )
 
     consumer = UsageQueueConsumer()
@@ -1277,10 +1413,11 @@ async def test_consumer_apply_record_event(monkeypatch: Any) -> None:
 
     await consumer._apply_record_event(event)
 
-    mock_record_usage.assert_called_once()
-    call_kwargs = mock_record_usage.call_args.kwargs
-    assert call_kwargs["request_id"] == "req-record"
-    assert call_kwargs["input_tokens"] == 100
+    mock_record_batch.assert_awaited_once()
+    records = mock_record_batch.call_args[0][1]
+    assert len(records) == 1
+    assert records[0]["request_id"] == "req-record"
+    assert records[0]["input_tokens"] == 100
 
 
 @pytest.mark.asyncio

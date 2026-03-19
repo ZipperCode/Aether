@@ -1,129 +1,98 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import jwt
 import pytest
 
 from src.api.handlers.base.request_builder import PassthroughRequestBuilder
-from src.services.provider.adapters.codex.request_patching import (
-    maybe_patch_request_for_codex,
-    patch_openai_cli_request_for_codex,
-)
+from src.services.provider.behavior import get_provider_behavior
 
 
-def test_patch_openai_cli_request_for_codex_is_passthrough_except_internal_sentinel() -> None:
-    req = {
-        "model": "gpt-test",
-        "input": [
-            {
-                "type": "message",
-                "role": "system",
-                "content": [{"type": "input_text", "text": "Hello"}],
-            }
-        ],
-        "store": True,
-        "stream": False,
-        "instructions": "keep",
-        "include": ["foo"],
-        "parallel_tool_calls": False,
-        "temperature": 0.7,
-        "context_management": {"compaction": {"type": "summary"}},
-        "user": "u_123",
-        "_aether_compact": True,
-    }
-    out = patch_openai_cli_request_for_codex(req)
+def test_codex_provider_behavior_has_no_runtime_envelope_or_variants() -> None:
+    behavior = get_provider_behavior(provider_type="codex", endpoint_sig="openai:cli")
 
-    assert out is not req
-    assert "_aether_compact" not in out
-    assert out["store"] is True
-    assert out["stream"] is False
-    assert out["instructions"] == "keep"
-    assert out["include"] == ["foo"]
-    assert out["parallel_tool_calls"] is False
-    assert out["temperature"] == 0.7
-    assert out["context_management"] == {"compaction": {"type": "summary"}}
-    assert out["user"] == "u_123"
-    assert out["input"][0]["role"] == "system"
+    assert behavior.envelope is None
+    assert behavior.same_format_variant is None
+    assert behavior.cross_format_variant is None
 
 
-def test_maybe_patch_request_for_codex_is_noop_for_non_codex() -> None:
-    req = {"model": "gpt-test", "input": []}
-    out = maybe_patch_request_for_codex(
-        provider_type="custom",
-        provider_api_format="openai:cli",
-        request_body=req,
+def test_openai_cli_normalizer_request_from_internal_codex_variant_preserves_store() -> (
+    None
+):
+    from src.core.api_format.conversion.normalizers.openai_cli import (
+        OpenAICliNormalizer,
     )
-    assert out is req
-
-
-def test_maybe_patch_request_for_codex_is_noop_for_non_openai_cli() -> None:
-    req = {"model": "gpt-test", "input": []}
-    out = maybe_patch_request_for_codex(
-        provider_type="codex",
-        provider_api_format="openai:chat",
-        request_body=req,
-    )
-    assert out is req
-
-
-def test_maybe_patch_request_for_codex_patches_for_codex_openai_cli() -> None:
-    req = {"model": "gpt-test", "input": [], "_aether_compact": True, "store": True}
-    out = maybe_patch_request_for_codex(
-        provider_type="codex",
-        provider_api_format="openai:cli",
-        request_body=req,
-    )
-
-    assert out is not req
-    assert out["store"] is True
-    assert "_aether_compact" not in out
-
-
-def test_maybe_patch_request_for_codex_patches_for_codex_openai_compact() -> None:
-    req = {"model": "gpt-test", "input": [], "_aether_compact": True, "store": True}
-    out = maybe_patch_request_for_codex(
-        provider_type="codex",
-        provider_api_format="openai:compact",
-        request_body=req,
-    )
-
-    assert out is not req
-    assert out["store"] is True
-    assert "_aether_compact" not in out
-
-
-def test_openai_cli_normalizer_request_from_internal_codex_variant_preserves_store() -> None:
-    from src.core.api_format.conversion.normalizers.openai_cli import OpenAICliNormalizer
 
     normalizer = OpenAICliNormalizer()
-    internal = normalizer.request_to_internal({"model": "gpt-test", "input": [], "store": True})
+    internal = normalizer.request_to_internal(
+        {"model": "gpt-test", "input": [], "store": True}
+    )
     out = normalizer.request_from_internal(internal, target_variant="codex")
 
     assert out["store"] is True
 
 
-def test_openai_cli_normalizer_request_from_internal_codex_variant_defaults_store_false() -> None:
-    from src.core.api_format.conversion.normalizers.openai_cli import OpenAICliNormalizer
+def test_openai_cli_normalizer_request_from_internal_codex_variant_does_not_inject_store() -> (
+    None
+):
+    from src.core.api_format.conversion.normalizers.openai_cli import (
+        OpenAICliNormalizer,
+    )
 
     normalizer = OpenAICliNormalizer()
     internal = normalizer.request_to_internal({"model": "gpt-test", "input": []})
     out = normalizer.request_from_internal(internal, target_variant="codex")
 
-    assert out["store"] is False
+    assert "store" not in out
 
 
-def test_codex_envelope_extra_headers_does_not_inject_synthetic_headers() -> None:
-    from src.services.provider.adapters.codex.envelope import codex_oauth_envelope
+def test_openai_cli_normalizer_codex_variant_keeps_instructions_missing_for_default_rule() -> (
+    None
+):
+    from src.api.handlers.base.request_builder import apply_body_rules
+    from src.core.api_format.conversion.normalizers.openai_cli import (
+        OpenAICliNormalizer,
+    )
+    from src.core.api_format.metadata import CODEX_DEFAULT_BODY_RULES
 
-    assert codex_oauth_envelope.extra_headers() is None
+    normalizer = OpenAICliNormalizer()
+    internal = normalizer.request_to_internal({"model": "gpt-test", "input": []})
+    out = normalizer.request_from_internal(internal, target_variant="codex")
+
+    assert "instructions" not in out
+
+    patched = apply_body_rules(out, list(CODEX_DEFAULT_BODY_RULES))
+    assert patched["instructions"] == "You are GPT-5."
+
+
+def test_openai_cli_normalizer_patch_for_codex_is_noop() -> None:
+    from src.core.api_format.conversion.normalizers.openai_cli import (
+        OpenAICliNormalizer,
+    )
+
+    normalizer = OpenAICliNormalizer()
+    out = normalizer.patch_for_variant(
+        {
+            "temperature": 0.7,
+            "input": [],
+            "metadata": {"request_id": "abc"},
+            "model": "gpt-test",
+            "tools": [{"type": "function", "name": "demo"}],
+            "instructions": "keep",
+        },
+        "codex",
+    )
+
+    assert out is None
 
 
 def test_codex_passthrough_builder_preserves_real_codex_headers() -> None:
-    from src.services.provider.adapters.codex.envelope import codex_oauth_envelope
-
     builder = PassthroughRequestBuilder()
-    endpoint = SimpleNamespace(api_family="openai", endpoint_kind="cli", header_rules=None)
+    endpoint = SimpleNamespace(
+        api_family="openai", endpoint_kind="cli", header_rules=None
+    )
     key = SimpleNamespace(api_key="unused")
 
     headers = builder.build_headers(
@@ -140,7 +109,6 @@ def test_codex_passthrough_builder_preserves_real_codex_headers() -> None:
         endpoint=endpoint,
         key=key,
         pre_computed_auth=("Authorization", "Bearer upstream-token"),
-        envelope=codex_oauth_envelope,
     )
 
     assert headers["accept"] == "text/event-stream"
@@ -158,13 +126,41 @@ def test_codex_passthrough_builder_preserves_real_codex_headers() -> None:
     assert "x-forwarded-scheme" not in headers
 
 
+def test_codex_passthrough_builder_applies_prompt_body_rules() -> None:
+    from src.core.api_format.metadata import CODEX_DEFAULT_BODY_RULES
+
+    builder = PassthroughRequestBuilder()
+    endpoint = SimpleNamespace(
+        api_family="openai",
+        endpoint_kind="cli",
+        header_rules=None,
+        body_rules=list(CODEX_DEFAULT_BODY_RULES),
+    )
+    key = SimpleNamespace(api_key="unused")
+
+    payload, _headers = builder.build(
+        {"model": "gpt-test", "input": []},
+        {"content-type": "application/json"},
+        endpoint,
+        key,
+        pre_computed_auth=("Authorization", "Bearer upstream-token"),
+        provider_api_format="openai:cli",
+    )
+
+    assert payload["instructions"] == "You are GPT-5."
+    assert payload["store"] is False
+    assert "max_output_tokens" not in payload
+
+
 def _encode_unsigned_jwt(payload: dict[str, object]) -> str:
     token = jwt.encode(payload, key="", algorithm="none")
     return token.decode("utf-8") if isinstance(token, bytes) else token
 
 
 @pytest.mark.asyncio
-async def test_enrich_codex_uses_access_token_when_id_token_missing() -> None:
+async def test_enrich_codex_uses_access_token_when_id_token_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from src.services.provider.adapters.codex.plugin import enrich_codex
 
     access_token = _encode_unsigned_jwt(
@@ -179,6 +175,10 @@ async def test_enrich_codex_uses_access_token_when_id_token_missing() -> None:
     )
 
     auth_config: dict[str, object] = {}
+    monkeypatch.setattr(
+        "src.core.provider_oauth_utils.fetch_openai_account_name",
+        AsyncMock(return_value="Workspace Alpha"),
+    )
     out = await enrich_codex(
         auth_config=auth_config,
         token_response={"access_token": access_token},
@@ -188,5 +188,6 @@ async def test_enrich_codex_uses_access_token_when_id_token_missing() -> None:
 
     assert out["email"] == "u@example.com"
     assert out["account_id"] == "acc-access"
+    assert out["account_name"] == "Workspace Alpha"
     assert out["plan_type"] == "team"
     assert out["user_id"] == "user-access"

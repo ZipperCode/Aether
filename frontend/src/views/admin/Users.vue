@@ -180,7 +180,7 @@
                 钱包
               </TableHead>
               <TableHead class="w-[170px] h-12 font-semibold">
-                使用统计
+                统计/限速
               </TableHead>
               <TableHead class="w-[110px] h-12 font-semibold">
                 创建时间
@@ -258,25 +258,41 @@
                 </div>
               </TableCell>
               <TableCell class="py-4">
-                <div
-                  v-if="userStats[user.id]"
-                  class="space-y-1 text-xs"
-                >
-                  <div class="flex items-center text-muted-foreground">
-                    <span class="w-14">请求:</span>
-                    <span class="font-medium text-foreground">{{ formatNumber(userStats[user.id]?.request_count) }}</span>
+                <div class="space-y-1 text-xs">
+                  <template v-if="userStats[user.id]">
+                    <div class="flex items-center text-muted-foreground">
+                      <span class="w-14">请求:</span>
+                      <span class="font-medium text-foreground">{{ formatNumber(userStats[user.id]?.request_count) }}</span>
+                    </div>
+                    <div class="flex items-center text-muted-foreground">
+                      <span class="w-14">Tokens:</span>
+                      <span class="font-medium text-foreground">{{ formatTokens(userStats[user.id]?.total_tokens ?? 0) }}</span>
+                    </div>
+                  </template>
+                  <div
+                    v-else
+                    class="flex items-center text-muted-foreground"
+                  >
+                    <span class="w-14">统计:</span>
+                    <span v-if="loadingStats">加载中...</span>
+                    <span v-else>无数据</span>
                   </div>
                   <div class="flex items-center text-muted-foreground">
-                    <span class="w-14">Tokens:</span>
-                    <span class="font-medium text-foreground">{{ formatTokens(userStats[user.id]?.total_tokens ?? 0) }}</span>
+                    <span class="w-14">限速:</span>
+                    <Badge
+                      v-if="isRateLimitInherited(user.rate_limit) || isRateLimitUnlimited(user.rate_limit)"
+                      variant="secondary"
+                      class="h-5 px-1.5 py-0 text-[10px] font-medium"
+                    >
+                      {{ formatRateLimitInheritable(user.rate_limit) }}
+                    </Badge>
+                    <span
+                      v-else
+                      class="font-medium text-foreground"
+                    >
+                      {{ formatRateLimitInheritable(user.rate_limit) }}
+                    </span>
                   </div>
-                </div>
-                <div
-                  v-else
-                  class="text-xs text-muted-foreground"
-                >
-                  <span v-if="loadingStats">加载中...</span>
-                  <span v-else>无数据</span>
                 </div>
               </TableCell>
               <TableCell class="py-4 text-xs text-muted-foreground">
@@ -327,6 +343,15 @@
                     @click="manageApiKeys(user)"
                   >
                     <Key class="h-4 w-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    class="h-8 w-8"
+                    title="登录设备"
+                    @click="manageUserSessions(user)"
+                  >
+                    <MonitorSmartphone class="h-4 w-4" />
                   </Button>
                   <Button
                     variant="ghost"
@@ -436,6 +461,12 @@
                 >
                   {{ walletStatusLabel(getUserWalletStatus(user.id)) }}
                 </Badge>
+                <Badge
+                  variant="secondary"
+                  class="h-5 px-1.5 py-0 text-[10px] font-medium"
+                >
+                  {{ formatRateLimitInheritable(user.rate_limit) }}
+                </Badge>
               </div>
 
               <div class="rounded-xl border border-border/60 bg-muted/40 p-3.5">
@@ -523,6 +554,15 @@
                 >
                   <Key class="mr-1.5 h-3.5 w-3.5" />
                   API Keys
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  class="h-8 text-xs"
+                  @click="manageUserSessions(user)"
+                >
+                  <MonitorSmartphone class="mr-1.5 h-3.5 w-3.5" />
+                  设备
                 </Button>
                 <Button
                   variant="outline"
@@ -633,6 +673,12 @@
                     >
                       独立余额
                     </Badge>
+                    <Badge
+                      variant="secondary"
+                      class="text-xs"
+                    >
+                      {{ formatRateLimitSimple(apiKey.rate_limit) }}
+                    </Badge>
                   </div>
                   <div class="flex items-center gap-1 mt-0.5">
                     <code class="text-xs font-mono text-muted-foreground">
@@ -658,6 +704,15 @@
                     ${{ (apiKey.total_cost_usd || 0).toFixed(4) }}
                   </div>
                 </div>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  class="h-8 w-8"
+                  title="编辑"
+                  @click="openEditUserApiKeyDialog(apiKey)"
+                >
+                  <SquarePen class="h-4 w-4" />
+                </Button>
                 <Button
                   variant="ghost"
                   size="icon"
@@ -718,9 +773,171 @@
         <Button
           class="h-10 px-5"
           :disabled="creatingApiKey"
-          @click="createApiKey"
+          @click="openCreateUserApiKeyDialog"
         >
           {{ creatingApiKey ? '创建中...' : '创建' }}
+        </Button>
+      </template>
+    </Dialog>
+
+    <Dialog
+      v-model="showUserApiKeyFormDialog"
+      size="lg"
+    >
+      <template #header>
+        <div class="border-b border-border px-6 py-4">
+          <div class="flex items-center gap-3">
+            <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-kraft/10 flex-shrink-0">
+              <Key class="h-5 w-5 text-kraft" />
+            </div>
+            <div class="flex-1 min-w-0">
+              <h3 class="text-lg font-semibold text-foreground leading-tight">
+                {{ editingUserApiKey ? '编辑 API Key' : '创建 API Key' }}
+              </h3>
+              <p class="text-xs text-muted-foreground">
+                {{ editingUserApiKey ? '更新用户 API Key 的名称和速率限制' : '为用户创建新的 API Key' }}
+              </p>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <div class="space-y-4">
+        <div class="space-y-2">
+          <Label
+            for="admin-user-key-name"
+            class="text-sm font-medium"
+          >密钥名称</Label>
+          <Input
+            id="admin-user-key-name"
+            v-model="userApiKeyForm.name"
+            class="h-10"
+            placeholder="例如：生产环境 Key"
+          />
+        </div>
+        <div class="space-y-2">
+          <Label
+            for="admin-user-key-rate-limit"
+            class="text-sm font-medium"
+          >速率限制 (请求/分钟)</Label>
+          <Input
+            id="admin-user-key-rate-limit"
+            :model-value="userApiKeyForm.rate_limit ?? ''"
+            type="number"
+            min="0"
+            max="10000"
+            class="h-10"
+            placeholder="留空不限"
+            @update:model-value="(v) => userApiKeyForm.rate_limit = parseNumberInput(v, { min: 0, max: 10000 })"
+          />
+          <p class="text-xs text-muted-foreground">
+            留空表示不限制
+          </p>
+        </div>
+      </div>
+
+      <template #footer>
+        <Button
+          variant="outline"
+          class="h-10 px-5"
+          @click="closeUserApiKeyFormDialog"
+        >
+          取消
+        </Button>
+        <Button
+          class="h-10 px-5"
+          :disabled="creatingApiKey"
+          @click="submitUserApiKeyForm"
+        >
+          {{ creatingApiKey ? (editingUserApiKey ? '保存中...' : '创建中...') : (editingUserApiKey ? '保存' : '创建') }}
+        </Button>
+      </template>
+    </Dialog>
+
+    <Dialog
+      v-model="showUserSessionsDialog"
+      size="xl"
+    >
+      <template #header>
+        <div class="border-b border-border px-6 py-4">
+          <div class="flex items-center gap-3">
+            <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 flex-shrink-0">
+              <MonitorSmartphone class="h-5 w-5 text-primary" />
+            </div>
+            <div class="flex-1 min-w-0">
+              <h3 class="text-lg font-semibold text-foreground leading-tight">
+                登录设备
+              </h3>
+              <p class="text-xs text-muted-foreground">
+                查看并强制下线该用户的设备会话
+              </p>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <div class="max-h-[60vh] overflow-y-auto space-y-3">
+        <div
+          v-if="loadingUserSessions"
+          class="rounded-lg border border-dashed border-border/60 bg-muted/20 px-4 py-10 text-center text-sm text-muted-foreground"
+        >
+          正在加载设备会话...
+        </div>
+        <div
+          v-else-if="userSessions.length === 0"
+          class="rounded-lg border border-dashed border-border/60 bg-muted/20 px-4 py-10 text-center text-sm text-muted-foreground"
+        >
+          暂无在线设备
+        </div>
+        <div
+          v-else
+          class="space-y-3"
+        >
+          <div
+            v-for="session in userSessions"
+            :key="session.id"
+            class="rounded-lg border border-border bg-card p-4 hover:border-primary/30 transition-colors"
+          >
+            <div class="flex items-center justify-between gap-3">
+              <div class="min-w-0 flex-1">
+                <div class="font-semibold text-foreground">
+                  {{ session.device_label }}
+                </div>
+                <div class="mt-1 text-xs text-muted-foreground">
+                  {{ formatSessionMeta(session) }}
+                </div>
+                <div class="mt-1 text-xs text-muted-foreground">
+                  最近活跃 {{ formatDate(session.last_seen_at || session.created_at) }}
+                  <span v-if="session.ip_address"> · IP {{ session.ip_address }}</span>
+                </div>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                :disabled="sessionDialogActionLoading === session.id"
+                @click="revokeSelectedUserSession(session.id)"
+              >
+                {{ sessionDialogActionLoading === session.id ? '处理中...' : '强制下线' }}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <template #footer>
+        <Button
+          variant="outline"
+          class="h-10 px-5"
+          @click="showUserSessionsDialog = false"
+        >
+          关闭
+        </Button>
+        <Button
+          class="h-10 px-5"
+          :disabled="loadingUserSessions || userSessions.length === 0 || sessionDialogActionLoading === 'all'"
+          @click="revokeAllSelectedUserSessions"
+        >
+          {{ sessionDialogActionLoading === 'all' ? '处理中...' : '全部下线' }}
         </Button>
       </template>
     </Dialog>
@@ -796,7 +1013,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { useUsersStore } from '@/stores/users'
-import type { User, ApiKey } from '@/api/users'
+import type { User, ApiKey, UserSession } from '@/api/users'
+import { formatSessionMeta } from '@/types/session'
 import { adminWalletApi, type AdminWallet } from '@/api/admin-wallets'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
@@ -842,13 +1060,16 @@ import {
   Search,
   CheckCircle,
   Lock,
-  LockOpen
+  LockOpen,
+  MonitorSmartphone
 } from 'lucide-vue-next'
 
 // 功能组件
 import UserFormDialog, { type UserFormData } from '@/features/users/components/UserFormDialog.vue'
 import WalletOpsDrawer from '@/features/wallet/components/WalletOpsDrawer.vue'
 import { parseApiError } from '@/utils/errorParser'
+import { formatTokens, formatRateLimitInheritable, formatRateLimitSimple, isRateLimitInherited, isRateLimitUnlimited } from '@/utils/format'
+import { parseNumberInput } from '@/utils/form'
 import { log } from '@/utils/logger'
 
 const { success, error } = useToast()
@@ -863,12 +1084,22 @@ const userFormDialogRef = ref<InstanceType<typeof UserFormDialog>>()
 
 // API Keys 对话框状态
 const showApiKeysDialog = ref(false)
+const showUserSessionsDialog = ref(false)
 const showNewApiKeyDialog = ref(false)
+const showUserApiKeyFormDialog = ref(false)
 const selectedUser = ref<User | null>(null)
 const userApiKeys = ref<ApiKey[]>([])
+const userSessions = ref<UserSession[]>([])
 const newApiKey = ref('')
 const creatingApiKey = ref(false)
+const loadingUserSessions = ref(false)
+const sessionDialogActionLoading = ref<string | null>(null)
 const apiKeyInput = ref<HTMLInputElement>()
+const editingUserApiKey = ref<ApiKey | null>(null)
+const userApiKeyForm = ref({
+  name: '',
+  rate_limit: undefined as number | undefined,
+})
 
 // 用户统计
 const userStats = ref<Record<string, UsageByUser>>({})
@@ -979,15 +1210,6 @@ async function loadUserWallets() {
   }
 }
 
-function formatTokens(tokens: number): string {
-  if (tokens >= 1000000) {
-    return `${(tokens / 1000000).toFixed(1)}M`
-  } else if (tokens >= 1000) {
-    return `${(tokens / 1000).toFixed(1)}K`
-  }
-  return tokens.toString()
-}
-
 function formatNumber(value?: number | null): string {
   const numericValue = typeof value === 'number' && Number.isFinite(value) ? value : 0
   return numericValue.toLocaleString()
@@ -1071,7 +1293,8 @@ function editUser(user: User) {
     is_active: user.is_active,
     allowed_providers: user.allowed_providers == null ? null : [...user.allowed_providers],
     allowed_api_formats: user.allowed_api_formats == null ? null : [...user.allowed_api_formats],
-    allowed_models: user.allowed_models == null ? null : [...user.allowed_models]
+    allowed_models: user.allowed_models == null ? null : [...user.allowed_models],
+    rate_limit: user.rate_limit ?? null
   }
   showUserFormDialog.value = true
 }
@@ -1093,7 +1316,8 @@ async function handleUserFormSubmit(data: UserFormData & { password?: string; un
         role: data.role,
         allowed_providers: data.allowed_providers,
         allowed_api_formats: data.allowed_api_formats,
-        allowed_models: data.allowed_models
+        allowed_models: data.allowed_models,
+        rate_limit: data.rate_limit ?? null
       }
       if (data.password) {
         updateData.password = data.password
@@ -1112,7 +1336,8 @@ async function handleUserFormSubmit(data: UserFormData & { password?: string; un
         role: data.role,
         allowed_providers: data.allowed_providers,
         allowed_api_formats: data.allowed_api_formats,
-        allowed_models: data.allowed_models
+        allowed_models: data.allowed_models,
+        rate_limit: data.rate_limit ?? null
       })
       // 如果创建时指定为禁用，则更新状态
       if (data.is_active === false && newUser) {
@@ -1136,6 +1361,19 @@ async function manageApiKeys(user: User) {
   await loadUserApiKeys(user.id)
 }
 
+async function manageUserSessions(user: User) {
+  selectedUser.value = user
+  showUserSessionsDialog.value = true
+  loadingUserSessions.value = true
+  try {
+    userSessions.value = await usersStore.getUserSessions(user.id)
+  } catch (err) {
+    error(parseApiError(err, '加载用户设备会话失败'))
+  } finally {
+    loadingUserSessions.value = false
+  }
+}
+
 async function loadUserApiKeys(userId: string) {
   try {
     userApiKeys.value = await usersStore.getUserApiKeys(userId)
@@ -1145,22 +1383,91 @@ async function loadUserApiKeys(userId: string) {
   }
 }
 
-async function createApiKey() {
+function openCreateUserApiKeyDialog() {
+  userApiKeyForm.value = {
+    name: `Key-${new Date().toISOString().split('T')[0]}`,
+    rate_limit: undefined,
+  }
+  editingUserApiKey.value = null
+  showUserApiKeyFormDialog.value = true
+}
+
+function openEditUserApiKeyDialog(apiKey: ApiKey) {
+  editingUserApiKey.value = apiKey
+  userApiKeyForm.value = {
+    name: apiKey.name || '',
+    rate_limit: apiKey.rate_limit ?? undefined,
+  }
+  showUserApiKeyFormDialog.value = true
+}
+
+function closeUserApiKeyFormDialog() {
+  showUserApiKeyFormDialog.value = false
+  editingUserApiKey.value = null
+  userApiKeyForm.value = {
+    name: '',
+    rate_limit: undefined,
+  }
+}
+
+async function submitUserApiKeyForm() {
   if (!selectedUser.value) return
+  if (!userApiKeyForm.value.name.trim()) {
+    error('请输入密钥名称', editingUserApiKey.value ? '更新 API Key 失败' : '创建 API Key 失败')
+    return
+  }
 
   creatingApiKey.value = true
   try {
-    const response = await usersStore.createApiKey(
-      selectedUser.value.id,
-      `Key-${new Date().toISOString().split('T')[0]}`
-    )
-    newApiKey.value = response.key || ''
-    showNewApiKeyDialog.value = true
+    if (editingUserApiKey.value) {
+      await usersStore.updateApiKey(selectedUser.value.id, editingUserApiKey.value.id, {
+        name: userApiKeyForm.value.name,
+        rate_limit: userApiKeyForm.value.rate_limit ?? 0,
+      })
+      success('API Key已更新')
+    } else {
+      const response = await usersStore.createApiKey(selectedUser.value.id, {
+        name: userApiKeyForm.value.name,
+        rate_limit: userApiKeyForm.value.rate_limit ?? 0,
+      })
+      newApiKey.value = response.key || ''
+      showNewApiKeyDialog.value = true
+      success('API Key创建成功')
+    }
     await loadUserApiKeys(selectedUser.value.id)
+    closeUserApiKeyFormDialog()
   } catch (err: unknown) {
-    error(parseApiError(err, '未知错误'), '创建 API Key 失败')
+    error(parseApiError(err, '未知错误'), editingUserApiKey.value ? '更新 API Key 失败' : '创建 API Key 失败')
   } finally {
     creatingApiKey.value = false
+  }
+}
+
+async function revokeSelectedUserSession(sessionId: string) {
+  if (!selectedUser.value) return
+  sessionDialogActionLoading.value = sessionId
+  try {
+    await usersStore.revokeUserSession(selectedUser.value.id, sessionId)
+    userSessions.value = userSessions.value.filter((session) => session.id !== sessionId)
+    success('设备已强制下线')
+  } catch (err) {
+    error(parseApiError(err, '强制下线失败'))
+  } finally {
+    sessionDialogActionLoading.value = null
+  }
+}
+
+async function revokeAllSelectedUserSessions() {
+  if (!selectedUser.value) return
+  sessionDialogActionLoading.value = 'all'
+  try {
+    const result = await usersStore.revokeAllUserSessions(selectedUser.value.id)
+    userSessions.value = []
+    success(result.revoked_count > 0 ? `已强制下线 ${result.revoked_count} 个设备` : '没有可下线的设备')
+  } catch (err) {
+    error(parseApiError(err, '强制下线全部设备失败'))
+  } finally {
+    sessionDialogActionLoading.value = null
   }
 }
 

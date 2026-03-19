@@ -5,9 +5,6 @@
 
 FROM aether-base:latest AS builder
 WORKDIR /app
-# 复制前端依赖清单并安装，再构建（避免 node_modules 缺失）
-COPY frontend/package*.json ./frontend/
-RUN cd frontend && npm ci
 # 复制前端源码并构建（CI 通过 no-cache-filters=builder 确保每次重建）
 COPY frontend/ ./frontend/
 RUN cd frontend && npm run build
@@ -19,6 +16,7 @@ WORKDIR /app
 ARG HUB_RELEASE_REPO=ZipperCode/Aether
 ARG HUB_TAG
 ARG TARGETARCH
+ARG GITHUB_TOKEN
 
 # 运行时依赖（无 gcc/nodejs/npm，使用 BuildKit 缓存加速）
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -27,7 +25,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     nginx \
     supervisor \
     libpq5 \
-    curl
+    curl \
+    libjemalloc2
+RUN set -eux; \
+    jemalloc_path="$(find /usr/lib -type f -name 'libjemalloc.so.2' | head -n1)"; \
+    [ -n "$jemalloc_path" ]; \
+    ln -sf "$jemalloc_path" /usr/local/lib/libjemalloc.so.2
 # 从 base 镜像复制 Python 包
 COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 # 只复制需要的 Python 可执行文件
@@ -35,10 +38,15 @@ COPY --from=builder /usr/local/bin/gunicorn /usr/local/bin/
 COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/
 COPY --from=builder /usr/local/bin/alembic /usr/local/bin/
 # Hub 预编译二进制（构建时从 GitHub Release 下载）
+# GITHUB_TOKEN 可选：未认证 API 限流 60 次/小时，认证后 5000 次/小时
 RUN set -eux; \
+    auth_header=""; \
+    if [ -n "${GITHUB_TOKEN:-}" ]; then \
+        auth_header="Authorization: token ${GITHUB_TOKEN}"; \
+    fi; \
     tag="${HUB_TAG:-}"; \
     if [ -z "$tag" ]; then \
-        tag="$(curl -sL "https://api.github.com/repos/${HUB_RELEASE_REPO}/releases" | python3 -c "import json,sys;print(next((r['tag_name'] for r in json.load(sys.stdin) if r.get('tag_name','').startswith('hub-v') and not r.get('draft') and not r.get('prerelease')),''))")"; \
+        tag="$(curl -sL ${auth_header:+-H "$auth_header"} "https://api.github.com/repos/${HUB_RELEASE_REPO}/releases" | python3 -c "import json,sys;print(next((r['tag_name'] for r in json.load(sys.stdin) if r.get('tag_name','').startswith('hub-v') and not r.get('draft') and not r.get('prerelease')),''))")"; \
     fi; \
     if [ -z "$tag" ]; then \
         echo "Failed to resolve hub release tag"; \
@@ -121,6 +129,25 @@ RUN printf '%s\n' \
     '        proxy_set_header X-Forwarded-Proto $scheme;' \
     '        proxy_set_header Upgrade $http_upgrade;' \
     '        proxy_set_header Connection "upgrade";' \
+    '        # 剥离 CF 头，防止泄露给上游或返回给客户端' \
+    '        proxy_hide_header CF-Connecting-IP;' \
+    '        proxy_hide_header CF-IPCountry;' \
+    '        proxy_hide_header CF-Ray;' \
+    '        proxy_hide_header CF-Visitor;' \
+    '        proxy_hide_header CDN-Loop;' \
+    '        proxy_hide_header True-Client-IP;' \
+    '        proxy_hide_header CF-Worker;' \
+    '        proxy_hide_header CF-EW-Via;' \
+    '        proxy_hide_header CF-Warp-Tag-ID;' \
+    '        proxy_set_header CF-Connecting-IP "";' \
+    '        proxy_set_header CF-IPCountry "";' \
+    '        proxy_set_header CF-Ray "";' \
+    '        proxy_set_header CF-Visitor "";' \
+    '        proxy_set_header CDN-Loop "";' \
+    '        proxy_set_header True-Client-IP "";' \
+    '        proxy_set_header CF-Worker "";' \
+    '        proxy_set_header CF-EW-Via "";' \
+    '        proxy_set_header CF-Warp-Tag-ID "";' \
     '        proxy_read_timeout 86400s;' \
     '        proxy_send_timeout 86400s;' \
     '    }' \
@@ -138,7 +165,16 @@ RUN printf '%s\n' \
     '        proxy_set_header Content-Type $content_type;' \
     '        proxy_set_header Authorization $http_authorization;' \
     '        proxy_set_header X-Api-Key $http_x_api_key;' \
-    '        # 剥离 CF 头，防止泄露给上游 AI 提供商' \
+    '        # 剥离 CF 头，防止泄露给上游或返回给客户端' \
+    '        proxy_hide_header CF-Connecting-IP;' \
+    '        proxy_hide_header CF-IPCountry;' \
+    '        proxy_hide_header CF-Ray;' \
+    '        proxy_hide_header CF-Visitor;' \
+    '        proxy_hide_header CDN-Loop;' \
+    '        proxy_hide_header True-Client-IP;' \
+    '        proxy_hide_header CF-Worker;' \
+    '        proxy_hide_header CF-EW-Via;' \
+    '        proxy_hide_header CF-Warp-Tag-ID;' \
     '        proxy_set_header CF-Connecting-IP "";' \
     '        proxy_set_header CF-IPCountry "";' \
     '        proxy_set_header CF-Ray "";' \
@@ -147,6 +183,7 @@ RUN printf '%s\n' \
     '        proxy_set_header True-Client-IP "";' \
     '        proxy_set_header CF-Worker "";' \
     '        proxy_set_header CF-EW-Via "";' \
+    '        proxy_set_header CF-Warp-Tag-ID "";' \
     '        proxy_buffering off;' \
     '        proxy_cache off;' \
     '        proxy_request_buffering off;' \
@@ -166,6 +203,25 @@ RUN printf '%s\n' \
     '        proxy_set_header X-Real-IP $real_ip;' \
     '        proxy_set_header X-Forwarded-For $forwarded_for;' \
     '        proxy_set_header X-Forwarded-Proto $scheme;' \
+    '        # 剥离 CF 头，防止泄露给上游或返回给客户端' \
+    '        proxy_hide_header CF-Connecting-IP;' \
+    '        proxy_hide_header CF-IPCountry;' \
+    '        proxy_hide_header CF-Ray;' \
+    '        proxy_hide_header CF-Visitor;' \
+    '        proxy_hide_header CDN-Loop;' \
+    '        proxy_hide_header True-Client-IP;' \
+    '        proxy_hide_header CF-Worker;' \
+    '        proxy_hide_header CF-EW-Via;' \
+    '        proxy_hide_header CF-Warp-Tag-ID;' \
+    '        proxy_set_header CF-Connecting-IP "";' \
+    '        proxy_set_header CF-IPCountry "";' \
+    '        proxy_set_header CF-Ray "";' \
+    '        proxy_set_header CF-Visitor "";' \
+    '        proxy_set_header CDN-Loop "";' \
+    '        proxy_set_header True-Client-IP "";' \
+    '        proxy_set_header CF-Worker "";' \
+    '        proxy_set_header CF-EW-Via "";' \
+    '        proxy_set_header CF-Warp-Tag-ID "";' \
     '    }' \
     '' \
     '    # 所有其他路由 → 前端 SPA（先尝试静态文件，再回退到 index.html）' \
@@ -188,7 +244,7 @@ RUN printf '%s\n' \
     'stderr_logfile=/var/log/nginx/error.log' \
     '' \
     '[program:app]' \
-    'command=/bin/bash -c "MAX_REQUESTS_JITTER=$((${MAX_REQUESTS:-50000}/20)); exec gunicorn src.main:app -c gunicorn_conf.py --preload -w %(ENV_GUNICORN_WORKERS)s -k uvicorn.workers.UvicornWorker --bind 127.0.0.1:8084 --timeout 120 --max-requests ${MAX_REQUESTS:-50000} --max-requests-jitter $MAX_REQUESTS_JITTER --access-logfile - --error-logfile - --log-level info"' \
+    'command=/bin/bash -c "MAX_REQUESTS_JITTER=$((${MAX_REQUESTS:-50000}/20)); exec gunicorn src.main:app -c gunicorn_conf.py --preload -w %(ENV_GUNICORN_WORKERS)s -k uvicorn.workers.UvicornWorker --bind 127.0.0.1:8084 --max-requests ${MAX_REQUESTS:-50000} --max-requests-jitter $MAX_REQUESTS_JITTER --access-logfile - --error-logfile - --log-level info"' \
     'directory=/app' \
     'autostart=true' \
     'autorestart=true' \
@@ -196,7 +252,7 @@ RUN printf '%s\n' \
     'stdout_logfile_maxbytes=0' \
     'stderr_logfile=/dev/stderr' \
     'stderr_logfile_maxbytes=0' \
-    'environment=PYTHONUNBUFFERED=1,PYTHONIOENCODING=utf-8,LANG=C.UTF-8,LC_ALL=C.UTF-8,DOCKER_CONTAINER=true' \
+    'environment=PYTHONUNBUFFERED=1,PYTHONIOENCODING=utf-8,LANG=C.UTF-8,LC_ALL=C.UTF-8,DOCKER_CONTAINER=true,LD_PRELOAD=/usr/local/lib/libjemalloc.so.2,MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"' \
     '' \
     '[program:tunnel-hub]' \
     'command=/usr/local/bin/aether-hub --bind 0.0.0.0:8085' \
@@ -217,6 +273,8 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
+    LD_PRELOAD=/usr/local/lib/libjemalloc.so.2 \
+    MALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000 \
     PORT=8084 \
     GUNICORN_WORKERS=2 \
     MAX_REQUESTS=4000

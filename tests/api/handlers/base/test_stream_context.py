@@ -1,3 +1,9 @@
+import os
+
+import pytest
+
+os.environ.setdefault("JWT_SECRET_KEY", "test-secret-key")
+
 from src.api.handlers.base import stream_context
 from src.api.handlers.base.stream_context import StreamContext
 
@@ -50,7 +56,36 @@ def test_reset_for_retry_clears_state() -> None:
     assert ctx.error_message is None
 
 
-def test_record_first_byte_time(monkeypatch) -> None:
+def test_release_recorded_chunks_clears_both_chunk_lists() -> None:
+    ctx = StreamContext(model="test-model", api_format="openai:chat")
+    ctx.parsed_chunks.append({"type": "client"})
+    ctx.provider_parsed_chunks.append({"type": "provider"})
+
+    ctx.release_recorded_chunks()
+
+    assert ctx.parsed_chunks == []
+    assert ctx.provider_parsed_chunks == []
+
+
+def test_managed_recorded_bodies_builds_then_releases_chunks() -> None:
+    ctx = StreamContext(model="test-model", api_format="openai:chat")
+    ctx.parsed_chunks.append({"type": "client"})
+    ctx.provider_parsed_chunks.append({"type": "provider"})
+    ctx.data_count = 1
+
+    with ctx.managed_recorded_bodies(123) as recorded_bodies:
+        assert recorded_bodies.response_body is not None
+        assert recorded_bodies.response_body["chunks"] == [{"type": "provider"}]
+        assert recorded_bodies.client_response_body is not None
+        assert recorded_bodies.client_response_body["chunks"] == [{"type": "client"}]
+
+    assert ctx.parsed_chunks == []
+    assert ctx.provider_parsed_chunks == []
+    assert recorded_bodies.response_body is None
+    assert recorded_bodies.client_response_body is None
+
+
+def test_record_first_byte_time(monkeypatch: pytest.MonkeyPatch) -> None:
     """测试记录首字时间"""
     ctx = StreamContext(model="claude-3", api_format="claude_messages")
     start_time = 100.0
@@ -63,7 +98,7 @@ def test_record_first_byte_time(monkeypatch) -> None:
     assert ctx.first_byte_time_ms == 12
 
 
-def test_record_first_byte_time_idempotent(monkeypatch) -> None:
+def test_record_first_byte_time_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     """测试首字时间只记录一次"""
     ctx = StreamContext(model="claude-3", api_format="claude_messages")
     start_time = 100.0
@@ -82,7 +117,7 @@ def test_record_first_byte_time_idempotent(monkeypatch) -> None:
     assert first_value == second_value
 
 
-def test_reset_for_retry_clears_first_byte_time(monkeypatch) -> None:
+def test_reset_for_retry_clears_first_byte_time(monkeypatch: pytest.MonkeyPatch) -> None:
     """测试重试时清除首字时间"""
     ctx = StreamContext(model="claude-3", api_format="claude_messages")
     start_time = 100.0
@@ -129,3 +164,34 @@ def test_get_log_summary_without_first_byte_time() -> None:
     assert "TTFB:" not in summary
     assert "Total: 456ms" in summary
     assert "in:100 out:50" in summary
+
+
+def test_ensure_estimated_output_tokens_uses_collected_text() -> None:
+    ctx = StreamContext(model="test-model", api_format="openai:chat")
+    ctx.append_text("partial output")
+
+    changed = ctx.ensure_estimated_output_tokens()
+
+    assert changed is True
+    assert ctx.output_tokens == max(1, len("partial output") // 4)
+
+
+def test_should_estimate_incomplete_tokens_for_interrupted_partial_stream() -> None:
+    ctx = StreamContext(model="test-model", api_format="openai:chat")
+    ctx.status_code = 503
+    ctx.chunk_count = 3
+
+    assert ctx.should_estimate_incomplete_tokens() is True
+
+
+def test_should_estimate_incomplete_tokens_when_output_already_estimated() -> None:
+    """ensure_estimated_output_tokens 已补了 output，但 input 仍为 0 时仍需估算。"""
+    ctx = StreamContext(model="test-model", api_format="openai:chat")
+    ctx.status_code = 503
+    ctx.chunk_count = 3
+    ctx.append_text("partial")
+    ctx.ensure_estimated_output_tokens()
+
+    assert ctx.output_tokens > 0
+    assert ctx.input_tokens == 0
+    assert ctx.should_estimate_incomplete_tokens() is True

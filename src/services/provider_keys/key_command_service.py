@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.orm import Session
 
@@ -18,6 +19,7 @@ from src.core.crypto import crypto_service
 from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.core.logger import logger
 from src.core.provider_types import ProviderType
+from src.database import get_db_context
 from src.models.database import (
     Provider,
     ProviderAPIKey,
@@ -88,6 +90,96 @@ class _DeleteKeyResult:
 
     provider_id: str | None
     deleted_key_allowed_models: list[str] | None
+
+
+def _update_endpoint_key_core_sync(
+    key_id: str,
+    key_data: EndpointAPIKeyUpdate,
+) -> _UpdateKeyPreparation:
+    with get_db_context() as db:
+        key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
+        if not key:
+            raise NotFoundException(f"Key {key_id} 不存在")
+
+        prepared = _prepare_update_key_payload(
+            db=db,
+            key=key,
+            key_id=key_id,
+            key_data=key_data,
+        )
+
+        for field, value in prepared.update_data.items():
+            setattr(key, field, value)
+        key.updated_at = datetime.now(timezone.utc)
+
+        return prepared
+
+
+def _create_provider_key_core_sync(
+    provider_id: str,
+    key_data: EndpointAPIKeyCreate,
+) -> str:
+    with get_db_context() as db:
+        provider = db.query(Provider).filter(Provider.id == provider_id).first()
+        if not provider:
+            raise NotFoundException(f"Provider {provider_id} 不存在")
+
+        if not key_data.api_formats:
+            raise InvalidRequestException("api_formats 为必填字段")
+
+        auth_type, new_key = _prepare_create_key_payload(
+            db=db,
+            provider_id=provider_id,
+            key_data=key_data,
+        )
+
+        _validate_vertex_api_formats(
+            getattr(provider, "provider_type", None),
+            auth_type,
+            key_data.api_formats,
+        )
+
+        db.add(new_key)
+        db.flush()
+        return str(new_key.id)
+
+
+def _delete_endpoint_key_core_sync(key_id: str) -> _DeleteKeyResult:
+    with get_db_context() as db:
+        return _delete_endpoint_key(db, key_id)
+
+
+def _batch_delete_endpoint_keys_core_sync(key_ids: list[str]) -> dict[str, Any]:
+    with get_db_context() as db:
+        keys = db.query(ProviderAPIKey).filter(ProviderAPIKey.id.in_(key_ids)).all()
+        found_ids = {key.id for key in keys}
+        not_found_ids = [kid for kid in key_ids if kid not in found_ids]
+
+        failed: list[dict[str, str]] = [{"id": kid, "error": "not found"} for kid in not_found_ids]
+        affected_provider_ids = {key.provider_id for key in keys if key.provider_id}
+
+        success_count = 0
+        try:
+            found_id_list = list(found_ids)
+            cleanup_key_references(db, found_id_list)
+            db.execute(sa_delete(ProviderAPIKey).where(ProviderAPIKey.id.in_(found_id_list)))
+            db.commit()
+            success_count = len(found_ids)
+        except Exception as exc:
+            db.rollback()
+            logger.error("批量删除 Key 提交失败: {}", exc)
+            failed.extend({"id": kid, "error": str(exc)} for kid in found_ids)
+            return {
+                "success_count": 0,
+                "failed": failed,
+                "affected_provider_ids": set(),
+            }
+
+        return {
+            "success_count": success_count,
+            "failed": failed,
+            "affected_provider_ids": affected_provider_ids,
+        }
 
 
 def _run_async_with_fallback(coro: Any) -> None:
@@ -388,23 +480,12 @@ async def update_endpoint_key_response(
     key_data: EndpointAPIKeyUpdate,
 ) -> EndpointAPIKeyResponse:
     """更新 Key 并返回响应对象。"""
+    prepared = await run_in_threadpool(_update_endpoint_key_core_sync, key_id, key_data)
+
+    db.expire_all()
     key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
     if not key:
         raise NotFoundException(f"Key {key_id} 不存在")
-
-    prepared = _prepare_update_key_payload(
-        db=db,
-        key=key,
-        key_id=key_id,
-        key_data=key_data,
-    )
-
-    for field, value in prepared.update_data.items():
-        setattr(key, field, value)
-    key.updated_at = datetime.now(timezone.utc)
-
-    db.commit()
-    db.refresh(key)
 
     await run_update_key_side_effects(
         db=db,
@@ -427,29 +508,12 @@ async def create_provider_key_response(
     key_data: EndpointAPIKeyCreate,
 ) -> EndpointAPIKeyResponse:
     """创建 Provider Key 并返回响应对象。"""
-    provider = db.query(Provider).filter(Provider.id == provider_id).first()
-    if not provider:
-        raise NotFoundException(f"Provider {provider_id} 不存在")
+    key_id = await run_in_threadpool(_create_provider_key_core_sync, provider_id, key_data)
 
-    if not key_data.api_formats:
-        raise InvalidRequestException("api_formats 为必填字段")
-
-    auth_type, new_key = _prepare_create_key_payload(
-        db=db,
-        provider_id=provider_id,
-        key_data=key_data,
-    )
-
-    # Vertex Provider: auth_type 与 api_formats 的组合必须合法
-    _validate_vertex_api_formats(
-        getattr(provider, "provider_type", None),
-        auth_type,
-        key_data.api_formats,
-    )
-
-    db.add(new_key)
-    db.commit()
-    db.refresh(new_key)
+    db.expire_all()
+    new_key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
+    if not new_key:
+        raise NotFoundException(f"Key {key_id} 不存在")
 
     key_tail = (key_data.api_key or "")[-4:]
     logger.info(
@@ -489,7 +553,8 @@ def _delete_endpoint_key(db: Session, key_id: str) -> _DeleteKeyResult:
 
 async def delete_endpoint_key_response(db: Session, key_id: str) -> dict[str, str]:
     """删除 Key，执行副作用并返回统一响应。"""
-    delete_result = _delete_endpoint_key(db, key_id)
+    delete_result = await run_in_threadpool(_delete_endpoint_key_core_sync, key_id)
+
     await run_delete_key_side_effects(
         db=db,
         provider_id=delete_result.provider_id,
@@ -504,31 +569,11 @@ async def batch_delete_endpoint_keys_response(db: Session, key_ids: list[str]) -
     if not key_ids:
         return {"success_count": 0, "failed_count": 0, "failed": []}
 
-    # 一次查询所有 Key
-    keys = db.query(ProviderAPIKey).filter(ProviderAPIKey.id.in_(key_ids)).all()
-    found_ids = {key.id for key in keys}
-    not_found_ids = [kid for kid in key_ids if kid not in found_ids]
+    result = await run_in_threadpool(_batch_delete_endpoint_keys_core_sync, key_ids)
+    affected_provider_ids = result["affected_provider_ids"]
+    failed = result["failed"]
+    success_count = result["success_count"]
 
-    failed: list[dict[str, str]] = [{"id": kid, "error": "not found"} for kid in not_found_ids]
-
-    # 收集受影响的 provider_id
-    affected_provider_ids = {key.provider_id for key in keys if key.provider_id}
-
-    # 批量 SQL DELETE 前先显式处理关联表，降低大批量删除时的级联成本
-    success_count = 0
-    try:
-        found_id_list = list(found_ids)
-        cleanup_key_references(db, found_id_list)
-        db.execute(sa_delete(ProviderAPIKey).where(ProviderAPIKey.id.in_(found_id_list)))
-        db.commit()
-        success_count = len(found_ids)
-    except Exception as exc:
-        db.rollback()
-        logger.error("批量删除 Key 提交失败: {}", exc)
-        failed.extend({"id": kid, "error": str(exc)} for kid in found_ids)
-        return {"success_count": 0, "failed_count": len(failed), "failed": failed}
-
-    # 按 provider_id 聚合，每个 provider 仅执行一次副作用
     for provider_id in affected_provider_ids:
         try:
             await run_delete_key_side_effects(

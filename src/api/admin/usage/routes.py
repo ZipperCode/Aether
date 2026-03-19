@@ -9,11 +9,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import case, func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.config.constants import CacheTTL
 from src.config.settings import config
 from src.core.logger import logger
@@ -29,11 +29,12 @@ from src.models.database import (
 )
 from src.services.system.stats_aggregator import AggregatedStats, StatsFilter, query_stats_hybrid
 from src.services.system.time_range import TimeRangeParams
+from src.services.usage.query import input_context_expr
 from src.services.usage.service import UsageService
 from src.utils.cache_decorator import cache_result
 
 router = APIRouter(prefix="/api/admin/usage", tags=["Admin - Usage"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 def _apply_admin_default_range(
@@ -78,6 +79,25 @@ def _build_time_range_params(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _calculate_token_cache_hit_rate(
+    total_input_context: int | None,
+    cache_read_tokens: int | None,
+) -> float:
+    """计算缓存命中率。
+
+    Args:
+        total_input_context: 已归一化的总输入上下文 token 数。
+            由 query.py 的 input_context_expr() 统一计算，固定为
+            input_tokens + cache_read_input_tokens。
+        cache_read_tokens: 缓存读取 token 数
+    """
+    context = int(total_input_context or 0)
+    cached = int(cache_read_tokens or 0)
+    if context <= 0:
+        return 0.0
+    return round(cached / context * 100, 2)
+
+
 # ==================== RESTful Routes ====================
 
 
@@ -107,10 +127,10 @@ async def get_usage_aggregation(
     - `limit`: 返回数量限制，默认 20，最大 100
 
     **返回字段**:
-    - 按模型聚合时：model, request_count, total_tokens, total_cost, actual_cost
+    - 按模型聚合时：model, request_count, total_tokens, total_cost, actual_cost, cache_read_tokens, cache_hit_rate
     - 按用户聚合时：user_id, email, username, request_count, total_tokens, total_cost
-    - 按提供商聚合时：provider_id, provider, request_count, total_tokens, total_cost, actual_cost, avg_response_time_ms, success_rate, error_count
-    - 按 API 格式聚合时：api_format, request_count, total_tokens, total_cost, actual_cost, avg_response_time_ms
+    - 按提供商聚合时：provider_id, provider, request_count, total_tokens, total_cost, actual_cost, avg_response_time_ms, success_rate, error_count, cache_read_tokens, cache_hit_rate
+    - 按 API 格式聚合时：api_format, request_count, total_tokens, total_cost, actual_cost, avg_response_time_ms, cache_read_tokens, cache_hit_rate
     """
     time_range = _apply_admin_default_range(
         _build_time_range_params(start_date, end_date, preset, timezone_name, tz_offset_minutes)
@@ -524,6 +544,10 @@ class AdminUsageByModelAdapter(AdminApiAdapter):
             func.sum(Usage.total_tokens).label("total_tokens"),
             func.sum(Usage.total_cost_usd).label("total_cost"),
             func.sum(Usage.actual_total_cost_usd).label("actual_cost"),
+            func.sum(Usage.cache_read_input_tokens).label("cache_read_tokens"),
+            func.sum(input_context_expr()).label("total_input_context"),
+            func.sum(Usage.output_tokens).label("output_tokens"),
+            func.sum(Usage.cache_creation_input_tokens).label("cache_creation_tokens"),
         )
         # 过滤掉 pending/streaming 状态的请求（尚未完成的请求不应计入统计）
         query = query.filter(Usage.status.notin_(["pending", "streaming"]))
@@ -551,10 +575,28 @@ class AdminUsageByModelAdapter(AdminApiAdapter):
                 "model": model,
                 "request_count": count,
                 "total_tokens": int(tokens or 0),
+                "total_input_context": int(total_input_context or 0),
+                "output_tokens": int(output_tokens or 0),
                 "total_cost": float(cost or 0),
                 "actual_cost": float(actual_cost or 0),
+                "cache_read_tokens": int(cache_read_tokens or 0),
+                "cache_creation_tokens": int(cache_creation_tokens or 0),
+                "cache_hit_rate": _calculate_token_cache_hit_rate(
+                    total_input_context=total_input_context,
+                    cache_read_tokens=cache_read_tokens,
+                ),
             }
-            for model, count, tokens, cost, actual_cost in stats
+            for (
+                model,
+                count,
+                tokens,
+                cost,
+                actual_cost,
+                cache_read_tokens,
+                total_input_context,
+                output_tokens,
+                cache_creation_tokens,
+            ) in stats
         ]
 
 
@@ -678,6 +720,10 @@ class AdminUsageByProviderAdapter(AdminApiAdapter):
             func.sum(Usage.total_cost_usd).label("total_cost"),
             func.sum(Usage.actual_total_cost_usd).label("actual_cost"),
             func.avg(Usage.response_time_ms).label("avg_response_time_ms"),
+            func.sum(Usage.cache_read_input_tokens).label("cache_read_tokens"),
+            func.sum(input_context_expr()).label("total_input_context"),
+            func.sum(Usage.output_tokens).label("output_tokens"),
+            func.sum(Usage.cache_creation_input_tokens).label("cache_creation_tokens"),
         ).filter(
             Usage.provider_id.isnot(None),
             # 过滤掉 pending/streaming 状态的请求
@@ -737,11 +783,25 @@ class AdminUsageByProviderAdapter(AdminApiAdapter):
                     "provider": provider_map.get(provider_id_str, "Unknown"),
                     "request_count": attempt_count,  # 尝试次数
                     "total_tokens": int(usage_stat.total_tokens or 0) if usage_stat else 0,
+                    "total_input_context": (
+                        int(usage_stat.total_input_context or 0) if usage_stat else 0
+                    ),
+                    "output_tokens": int(usage_stat.output_tokens or 0) if usage_stat else 0,
                     "total_cost": float(usage_stat.total_cost or 0) if usage_stat else 0,
                     "actual_cost": float(usage_stat.actual_cost or 0) if usage_stat else 0,
                     "avg_response_time_ms": float(stat.avg_latency_ms or 0),
                     "success_rate": round(success_rate, 2),
                     "error_count": failed_count,
+                    "cache_read_tokens": (
+                        int(usage_stat.cache_read_tokens or 0) if usage_stat else 0
+                    ),
+                    "cache_creation_tokens": (
+                        int(usage_stat.cache_creation_tokens or 0) if usage_stat else 0
+                    ),
+                    "cache_hit_rate": _calculate_token_cache_hit_rate(
+                        total_input_context=(usage_stat.total_input_context if usage_stat else 0),
+                        cache_read_tokens=(usage_stat.cache_read_tokens if usage_stat else 0),
+                    ),
                 }
             )
 
@@ -773,6 +833,10 @@ class AdminUsageByApiFormatAdapter(AdminApiAdapter):
             func.sum(Usage.total_cost_usd).label("total_cost"),
             func.sum(Usage.actual_total_cost_usd).label("actual_cost"),
             func.avg(Usage.response_time_ms).label("avg_response_time_ms"),
+            func.sum(Usage.cache_read_input_tokens).label("cache_read_tokens"),
+            func.sum(input_context_expr()).label("total_input_context"),
+            func.sum(Usage.output_tokens).label("output_tokens"),
+            func.sum(Usage.cache_creation_input_tokens).label("cache_creation_tokens"),
         )
         # 过滤掉 pending/streaming 状态的请求
         query = query.filter(Usage.status.notin_(["pending", "streaming"]))
@@ -805,11 +869,30 @@ class AdminUsageByApiFormatAdapter(AdminApiAdapter):
                 "api_format": api_format or "unknown",
                 "request_count": count,
                 "total_tokens": int(tokens or 0),
+                "total_input_context": int(total_input_context or 0),
+                "output_tokens": int(output_tokens or 0),
                 "total_cost": float(cost or 0),
                 "actual_cost": float(actual_cost or 0),
                 "avg_response_time_ms": float(avg_response_time or 0),
+                "cache_read_tokens": int(cache_read_tokens or 0),
+                "cache_creation_tokens": int(cache_creation_tokens or 0),
+                "cache_hit_rate": _calculate_token_cache_hit_rate(
+                    total_input_context=total_input_context,
+                    cache_read_tokens=cache_read_tokens,
+                ),
             }
-            for api_format, count, tokens, cost, actual_cost, avg_response_time in stats
+            for (
+                api_format,
+                count,
+                tokens,
+                cost,
+                actual_cost,
+                avg_response_time,
+                cache_read_tokens,
+                total_input_context,
+                output_tokens,
+                cache_creation_tokens,
+            ) in stats
         ]
 
 
@@ -886,8 +969,8 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
             count_query = count_query.outerjoin(ApiKey, Usage.api_key_id == ApiKey.id)
 
         # -- 构建数据查询（完整 JOIN） --
-        usage_model_version = Usage.request_metadata["model_version"].as_string().label(
-            "model_version"
+        usage_model_version = (
+            Usage.request_metadata["model_version"].as_string().label("model_version")
         )
 
         query = (
@@ -1246,15 +1329,76 @@ class AdminUsageDetailAdapter(AdminApiAdapter):
     usage_id: str
     include_bodies: bool = True
 
+    def _build_usage_detail_query(self, db: Session) -> Any:
+        query = db.query(
+            Usage,
+            case(
+                (
+                    (Usage.request_body.isnot(None)) | (Usage.request_body_compressed.isnot(None)),
+                    True,
+                ),
+                else_=False,
+            ).label("has_request_body"),
+            case(
+                (
+                    (Usage.provider_request_body.isnot(None))
+                    | (Usage.provider_request_body_compressed.isnot(None)),
+                    True,
+                ),
+                else_=False,
+            ).label("has_provider_request_body"),
+            case(
+                (
+                    (Usage.response_body.isnot(None))
+                    | (Usage.response_body_compressed.isnot(None)),
+                    True,
+                ),
+                else_=False,
+            ).label("has_response_body"),
+            case(
+                (
+                    (Usage.client_response_body.isnot(None))
+                    | (Usage.client_response_body_compressed.isnot(None)),
+                    True,
+                ),
+                else_=False,
+            ).label("has_client_response_body"),
+        )
+
+        if not self.include_bodies:
+            query = query.options(
+                defer(Usage.request_body),
+                defer(Usage.provider_request_body),
+                defer(Usage.response_body),
+                defer(Usage.client_response_body),
+                defer(Usage.request_body_compressed),
+                defer(Usage.provider_request_body_compressed),
+                defer(Usage.response_body_compressed),
+                defer(Usage.client_response_body_compressed),
+            )
+
+        return query
+
+    def _load_usage_detail_row(self, db: Session) -> Any:
+        usage_row = self._build_usage_detail_query(db).filter(Usage.id == self.usage_id).first()
+        if usage_row:
+            return usage_row
+        return self._build_usage_detail_query(db).filter(Usage.request_id == self.usage_id).first()
+
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         db = context.db
         # 先通过主键 id 查找，如果找不到再尝试通过 request_id 查找
-        usage_record = db.query(Usage).filter(Usage.id == self.usage_id).first()
-        if not usage_record:
-            # 兼容通过 request_id 查找（用于异步任务等场景）
-            usage_record = db.query(Usage).filter(Usage.request_id == self.usage_id).first()
-        if not usage_record:
+        usage_row = self._load_usage_detail_row(db)
+        if not usage_row:
             raise HTTPException(status_code=404, detail="Usage record not found")
+
+        (
+            usage_record,
+            has_request_body,
+            has_provider_request_body,
+            has_response_body,
+            has_client_response_body,
+        ) = usage_row
 
         user = db.query(User).filter(User.id == usage_record.user_id).first()
         api_key = db.query(ApiKey).filter(ApiKey.id == usage_record.api_key_id).first()
@@ -1269,23 +1413,6 @@ class AdminUsageDetailAdapter(AdminApiAdapter):
 
         # 提取视频/图像/音频计费信息
         video_billing_info = self._extract_video_billing_info(usage_record)
-
-        has_request_body = bool(
-            usage_record.request_body is not None
-            or usage_record.request_body_compressed is not None
-        )
-        has_provider_request_body = bool(
-            usage_record.provider_request_body is not None
-            or usage_record.provider_request_body_compressed is not None
-        )
-        has_response_body = bool(
-            usage_record.response_body is not None
-            or usage_record.response_body_compressed is not None
-        )
-        has_client_response_body = bool(
-            usage_record.client_response_body is not None
-            or usage_record.client_response_body_compressed is not None
-        )
 
         request_body = usage_record.get_request_body() if self.include_bodies else None
         provider_request_body = (
@@ -1781,6 +1908,67 @@ class AdminUsageCurlAdapter(AdminApiAdapter):
         }
 
 
+def _resolve_replay_mode(same_provider: bool, same_endpoint: bool) -> str:
+    if same_provider and same_endpoint:
+        return "same_endpoint_reuse"
+    if same_provider:
+        return "same_provider_remap"
+    return "cross_provider_remap"
+
+
+async def _resolve_replay_model_name(
+    db: Session,
+    *,
+    source_model: str,
+    target_provider: Provider,
+    target_endpoint: ProviderEndpoint,
+    target_api_key: ProviderAPIKey | None,
+) -> tuple[str, str]:
+    """按当前 replay 目标重新解析模型名，并返回 mapping_source。"""
+    from src.services.model.mapper import ModelMapperMiddleware
+
+    target_api_format = (getattr(target_endpoint, "api_format", "") or "").strip().lower()
+
+    mapper = ModelMapperMiddleware(db)
+    mapping = await mapper.get_mapping(source_model, str(target_provider.id))
+
+    if mapping and mapping.model:
+        affinity_key = target_api_key.id if target_api_key else None
+        mapped_name = mapping.model.select_provider_model_name(
+            affinity_key, api_format=target_api_format
+        )
+        return mapped_name, "model_mapping"
+
+    logger.debug(
+        "[replay] No explicit model mapping for '{}' on provider '{}' (endpoint={}, api_format={}); "
+        "forwarding original source model",
+        source_model,
+        target_provider.name or str(target_provider.id),
+        str(getattr(target_endpoint, "id", "") or "unknown"),
+        target_api_format or "unknown",
+    )
+
+    # Keep replay aligned with the normal request path: if no global-model mapping exists,
+    # forward the original source model name and let the target provider validate it.
+    return source_model, "none"
+
+
+def _apply_replay_model_to_body(
+    body: dict[str, Any],
+    resolved_model: str,
+    target_api_format: str | None,
+) -> None:
+    """根据目标格式决定是否写入 body.model。"""
+    from src.core.api_format.metadata import resolve_endpoint_definition
+
+    target_meta = resolve_endpoint_definition(target_api_format) if target_api_format else None
+    if target_meta is not None and not target_meta.model_in_body:
+        body.pop("model", None)
+        return
+
+    body["model"] = resolved_model
+
+
 @dataclass
 class AdminUsageReplayAdapter(AdminApiAdapter):
     """Replay a usage record request to the same or a different provider."""
@@ -1806,8 +1994,26 @@ class AdminUsageReplayAdapter(AdminApiAdapter):
         original_api_family = (
             original_api_format.split(":")[0] if ":" in original_api_format else ""
         )
+        original_request_body = usage_record.get_request_body()
+        body_override_payload = self.body_override if isinstance(self.body_override, dict) else None
+        override_model: str | None = None
+        if isinstance(body_override_payload, dict):
+            override_val = body_override_payload.get("model")
+            if isinstance(override_val, str) and override_val.strip():
+                override_model = override_val.strip()
 
-        # 确定目标端点和密钥
+        # 解析源模型名：优先 request_body.model，缺失时回退 usage_record.model
+        source_model = usage_record.model
+        if override_model:
+            source_model = override_model
+        elif isinstance(original_request_body, dict):
+            raw_model = original_request_body.get("model")
+            if isinstance(raw_model, str) and raw_model.strip():
+                source_model = raw_model.strip()
+
+        original_target_model = usage_record.target_model
+
+        # 确定目标端点
         target_pid = self.target_provider_id
         target_provider_obj: Provider | None = None
         if self.target_endpoint_id:
@@ -1867,6 +2073,16 @@ class AdminUsageReplayAdapter(AdminApiAdapter):
                     detail="Original endpoint not found, specify target_endpoint_id",
                 )
 
+        if not target_provider_obj:
+            target_provider_obj = (
+                db.query(Provider).filter(Provider.id == endpoint.provider_id).first()
+            )
+            if not target_provider_obj:
+                raise HTTPException(status_code=404, detail="Target provider not found")
+
+        if not target_pid:
+            target_pid = str(target_provider_obj.id)
+
         # 确定 API Key
         target_ep_format = (getattr(endpoint, "api_format", "") or "").strip().lower()
         provider_key = None
@@ -1909,6 +2125,49 @@ class AdminUsageReplayAdapter(AdminApiAdapter):
         if not provider_key:
             raise HTTPException(status_code=404, detail="No API key available for replay")
 
+        # 判定 replay 模式
+        original_provider_id = usage_record.provider_id
+        if not original_provider_id and usage_record.provider_endpoint_id:
+            original_endpoint = (
+                db.query(ProviderEndpoint)
+                .filter(ProviderEndpoint.id == usage_record.provider_endpoint_id)
+                .first()
+            )
+            if original_endpoint:
+                original_provider_id = str(original_endpoint.provider_id)
+
+        same_provider = bool(
+            original_provider_id and target_pid and str(original_provider_id) == str(target_pid)
+        )
+        same_endpoint = bool(
+            usage_record.provider_endpoint_id
+            and str(usage_record.provider_endpoint_id) == str(endpoint.id)
+        )
+        replay_mode = _resolve_replay_mode(same_provider, same_endpoint)
+
+        # 解析目标模型
+        resolved_model_name, mapping_source = await _resolve_replay_model_name(
+            db,
+            source_model=source_model,
+            target_provider=target_provider_obj,
+            target_endpoint=endpoint,
+            target_api_key=provider_key,
+        )
+        mapping_applied = mapping_source != "none"
+
+        mapping_info = {
+            "source_model": source_model,
+            "original_target_model": original_target_model,
+            "resolved_model": resolved_model_name,
+            "target_provider_id": str(target_provider_obj.id),
+            "target_provider": target_provider_obj.name,
+            "target_endpoint_id": str(endpoint.id),
+            "target_api_format": target_ep_format,
+            "replay_mode": replay_mode,
+            "mapping_applied": mapping_applied,
+            "mapping_source": mapping_source,
+        }
+
         # 根据 auth_type 正确解析认证（支持 OAuth / Vertex AI / API Key）
         try:
             auth_headers, decrypted_auth_config = await _resolve_provider_auth(
@@ -1919,16 +2178,15 @@ class AdminUsageReplayAdapter(AdminApiAdapter):
             raise HTTPException(status_code=500, detail="Failed to resolve provider authentication")
 
         # 构建 URL
-        model_name = usage_record.target_model or usage_record.model
         url = _build_provider_url_safe(
-            endpoint, model_name, False, provider_key, decrypted_auth_config
+            endpoint, resolved_model_name, False, provider_key, decrypted_auth_config
         )
 
         # 构建请求头（Content-Type + 认证头 + 端点额外头）
         headers = _build_fresh_headers(auth_headers, endpoint)
 
         # 使用覆盖体或原始请求体
-        body = self.body_override or usage_record.get_request_body() or {}
+        body = body_override_payload or original_request_body or {}
 
         # 格式转换：如果存储的请求体格式与目标端点格式不同，需要转换
         if isinstance(body, dict):
@@ -1951,6 +2209,8 @@ class AdminUsageReplayAdapter(AdminApiAdapter):
                         conv_err,
                     )
                     # 转换失败仍发送原始体，让用户看到上游的实际报错
+
+            _apply_replay_model_to_body(body, resolved_model_name, target_format)
 
         # 强制非流式以获取完整响应
         # Gemini 格式通过 URL 控制流式（streamGenerateContent vs generateContent），
@@ -1985,8 +2245,8 @@ class AdminUsageReplayAdapter(AdminApiAdapter):
                 if envelope:
                     body, _ = envelope.wrap_request(
                         body,
-                        model=model_name or "",
-                        url_model=model_name,
+                        model=resolved_model_name or "",
+                        url_model=resolved_model_name,
                         decrypted_auth_config=decrypted_auth_config,
                     )
                     # envelope 可能注入额外请求头（如 Kiro 的 AWS 签名头、Codex 的 OAuth 头）
@@ -1998,9 +2258,9 @@ class AdminUsageReplayAdapter(AdminApiAdapter):
                 # envelope 失败仍发送原始体
 
         # 获取提供商名称
-        provider_name = usage_record.provider_name
-        if target_provider_obj:
-            provider_name = target_provider_obj.name
+        provider_name = (
+            target_provider_obj.name if target_provider_obj else usage_record.provider_name
+        )
 
         # 发送请求
         try:
@@ -2045,6 +2305,15 @@ class AdminUsageReplayAdapter(AdminApiAdapter):
             usage_id=self.usage_id,
             target_provider=provider_name,
             target_url=url,
+            source_model=source_model,
+            original_target_model=original_target_model,
+            resolved_model=resolved_model_name,
+            target_provider_id=str(target_provider_obj.id),
+            target_endpoint_id=str(endpoint.id),
+            target_api_format=target_ep_format,
+            replay_mode=replay_mode,
+            mapping_applied=mapping_applied,
+            mapping_source=mapping_source,
         )
 
         return {
@@ -2054,6 +2323,7 @@ class AdminUsageReplayAdapter(AdminApiAdapter):
             "response_headers": response_headers,
             "response_body": response_body,
             "response_time_ms": elapsed_ms,
+            "mapping": mapping_info,
         }
 
 

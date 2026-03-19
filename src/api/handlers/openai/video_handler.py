@@ -16,7 +16,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.api.handlers.base.request_builder import apply_body_rules, get_provider_auth
+from src.api.handlers.base.request_builder import (
+    apply_body_rules,
+    evaluate_condition,
+    get_provider_auth,
+)
 from src.api.handlers.base.video_handler_base import VideoHandlerBase, sanitize_error_message
 from src.clients.http_client import HTTPClientPool
 from src.config.settings import config
@@ -154,7 +158,11 @@ class OpenAIVideoHandler(VideoHandlerBase):
                     converted_body["model"] = internal_request.model
 
                 if endpoint_body_rules:
-                    converted_body = apply_body_rules(converted_body, endpoint_body_rules)
+                    converted_body = apply_body_rules(
+                        converted_body,
+                        endpoint_body_rules,
+                        original_body=original_request_body,
+                    )
 
                 # 构建 Gemini 风格的 URL
                 upstream_url = self._build_gemini_upstream_url(
@@ -164,7 +172,12 @@ class OpenAIVideoHandler(VideoHandlerBase):
                 # 构建 Gemini 风格的请求头
                 auth_info = await get_provider_auth(endpoint, _provider_key)
                 headers = self._build_gemini_upstream_headers(
-                    original_headers, upstream_key, endpoint, auth_info
+                    original_headers,
+                    upstream_key,
+                    endpoint,
+                    auth_info,
+                    body=converted_body,
+                    original_body=original_request_body,
                 )
 
                 client = await HTTPClientPool.get_default_client_async()
@@ -172,10 +185,20 @@ class OpenAIVideoHandler(VideoHandlerBase):
             else:
                 # 原始 OpenAI 格式
                 if endpoint_body_rules:
-                    request_body = apply_body_rules(request_body, endpoint_body_rules)
+                    request_body = apply_body_rules(
+                        request_body,
+                        endpoint_body_rules,
+                        original_body=original_request_body,
+                    )
 
                 upstream_url = self._build_upstream_url(endpoint.base_url)
-                headers = self._build_upstream_headers(original_headers, upstream_key, endpoint)
+                headers = self._build_upstream_headers(
+                    original_headers,
+                    upstream_key,
+                    endpoint,
+                    body=request_body,
+                    original_body=original_request_body,
+                )
                 client = await HTTPClientPool.get_default_client_async()
                 return await client.post(upstream_url, headers=headers, json=request_body)
 
@@ -297,6 +320,8 @@ class OpenAIVideoHandler(VideoHandlerBase):
                 original_headers,
                 "",  # key 不重要，只是用于记录
                 outcome.candidate.endpoint,
+                body=converted_request_body,
+                original_body=original_request_body,
             )
 
             UsageService.finalize_submitted(
@@ -502,8 +527,6 @@ class OpenAIVideoHandler(VideoHandlerBase):
         upstream_url = self._build_upstream_url(
             endpoint.base_url, f"{original_task.external_task_id}/remix"
         )
-        headers = self._build_upstream_headers(original_headers, upstream_key, endpoint)
-
         # 确保 seconds 字段为字符串类型（上游 Go 服务要求 string）
         request_body = original_request_body.copy()
         if "seconds" in request_body and request_body["seconds"] is not None:
@@ -512,7 +535,19 @@ class OpenAIVideoHandler(VideoHandlerBase):
         # 应用端点的请求体规则
         endpoint_body_rules = getattr(endpoint, "body_rules", None)
         if endpoint_body_rules:
-            request_body = apply_body_rules(request_body, endpoint_body_rules)
+            request_body = apply_body_rules(
+                request_body,
+                endpoint_body_rules,
+                original_body=original_request_body,
+            )
+
+        headers = self._build_upstream_headers(
+            original_headers,
+            upstream_key,
+            endpoint,
+            body=request_body,
+            original_body=original_request_body,
+        )
 
         client = await HTTPClientPool.get_default_client_async()
         response = await client.post(upstream_url, headers=headers, json=request_body)
@@ -787,7 +822,13 @@ class OpenAIVideoHandler(VideoHandlerBase):
         return url
 
     def _build_upstream_headers(
-        self, original_headers: dict[str, str], upstream_key: str, endpoint: ProviderEndpoint
+        self,
+        original_headers: dict[str, str],
+        upstream_key: str,
+        endpoint: ProviderEndpoint,
+        *,
+        body: dict[str, Any] | None = None,
+        original_body: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         extra_headers = get_extra_headers_from_endpoint(endpoint)
         endpoint_sig = make_signature_key(
@@ -800,6 +841,9 @@ class OpenAIVideoHandler(VideoHandlerBase):
             upstream_key,
             endpoint_headers=extra_headers,
             header_rules=getattr(endpoint, "header_rules", None),
+            body=body,
+            original_body=original_body,
+            condition_evaluator=evaluate_condition,
         )
 
     # ------------------------------------------------------------------
@@ -819,6 +863,9 @@ class OpenAIVideoHandler(VideoHandlerBase):
         upstream_key: str,
         endpoint: ProviderEndpoint,
         auth_info: Any | None,
+        *,
+        body: dict[str, Any] | None = None,
+        original_body: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         """构建 Gemini 格式的请求头"""
         extra_headers = get_extra_headers_from_endpoint(endpoint)
@@ -832,6 +879,9 @@ class OpenAIVideoHandler(VideoHandlerBase):
             upstream_key,
             endpoint_headers=extra_headers,
             header_rules=getattr(endpoint, "header_rules", None),
+            body=body,
+            original_body=original_body,
+            condition_evaluator=evaluate_condition,
         )
         if auth_info:
             # 覆盖为 OAuth2 Bearer（Vertex AI）

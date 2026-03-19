@@ -77,13 +77,8 @@ export function useUsageData(options: UseUsageDataOptions) {
 
     try {
       if (isAdminPage.value) {
-        // 管理员页面，并行加载统计数据
-        const [statsData, modelData, providerData, apiFormatData] = await Promise.all([
-          usageApi.getUsageStats(dateRange),
-          usageApi.getUsageByModel(dateRange),
-          usageApi.getUsageByProvider(dateRange),
-          usageApi.getUsageByApiFormat(dateRange)
-        ])
+        // 管理员页面顺序加载统计数据，避免刷新使用记录时瞬时打满后端 worker。
+        const statsData = await usageApi.getUsageStats(dateRange)
 
         if (requestId !== loadStatsRequestId) {
           return
@@ -104,21 +99,41 @@ export function useUsageData(options: UseUsageDataOptions) {
           period_end: '',
         }
 
+        const modelData = await usageApi.getUsageByModel(dateRange)
+        if (requestId !== loadStatsRequestId) {
+          return
+        }
+
         modelStats.value = modelData.map(item => {
           const raw = item as Record<string, unknown>
           return {
             model: item.model,
             request_count: item.request_count || 0,
             total_tokens: item.total_tokens || 0,
+            total_input_context: typeof raw.total_input_context === 'number' ? raw.total_input_context : 0,
+            output_tokens: typeof raw.output_tokens === 'number' ? raw.output_tokens : 0,
+            cache_read_tokens: typeof raw.cache_read_tokens === 'number' ? raw.cache_read_tokens : 0,
+            cache_creation_tokens: typeof raw.cache_creation_tokens === 'number' ? raw.cache_creation_tokens : 0,
+            cache_hit_rate: typeof raw.cache_hit_rate === 'number' ? raw.cache_hit_rate : 0,
             total_cost: item.total_cost || 0,
             actual_cost: typeof raw.actual_cost === 'number' ? raw.actual_cost : undefined
           }
         })
 
+        const providerData = await usageApi.getUsageByProvider(dateRange)
+        if (requestId !== loadStatsRequestId) {
+          return
+        }
+
         providerStats.value = providerData.map(item => ({
           provider: item.provider,
           requests: item.request_count,
           totalTokens: item.total_tokens || 0,
+          totalInputContext: item.total_input_context || 0,
+          outputTokens: item.output_tokens || 0,
+          cacheReadTokens: item.cache_read_tokens || 0,
+          cacheCreationTokens: item.cache_creation_tokens || 0,
+          cacheHitRate: item.cache_hit_rate || 0,
           totalCost: item.total_cost,
           actualCost: item.actual_cost,
           successRate: item.success_rate,
@@ -127,10 +142,20 @@ export function useUsageData(options: UseUsageDataOptions) {
             : '-'
         }))
 
+        const apiFormatData = await usageApi.getUsageByApiFormat(dateRange)
+        if (requestId !== loadStatsRequestId) {
+          return
+        }
+
         apiFormatStats.value = apiFormatData.map(item => ({
           api_format: item.api_format,
           request_count: item.request_count || 0,
           total_tokens: item.total_tokens || 0,
+          total_input_context: item.total_input_context || 0,
+          output_tokens: item.output_tokens || 0,
+          cache_read_tokens: item.cache_read_tokens || 0,
+          cache_creation_tokens: item.cache_creation_tokens || 0,
+          cache_hit_rate: item.cache_hit_rate || 0,
           total_cost: item.total_cost || 0,
           actual_cost: item.actual_cost,
           avgResponseTime: item.avg_response_time_ms > 0
@@ -163,6 +188,11 @@ export function useUsageData(options: UseUsageDataOptions) {
           model: item.model,
           request_count: item.requests || 0,
           total_tokens: item.total_tokens || 0,
+          total_input_context: item.total_input_context || 0,
+          output_tokens: item.output_tokens || 0,
+          cache_read_tokens: item.cache_read_tokens || 0,
+          cache_creation_tokens: item.cache_creation_tokens || 0,
+          cache_hit_rate: item.cache_hit_rate || 0,
           total_cost: item.total_cost_usd || 0,
           actual_cost: item.actual_total_cost_usd
         }))
@@ -170,7 +200,12 @@ export function useUsageData(options: UseUsageDataOptions) {
         providerStats.value = (userData.summary_by_provider || []).map((item) => ({
           provider: item.provider,
           requests: item.requests || 0,
-          totalTokens: 0,
+          totalTokens: item.total_tokens || 0,
+          totalInputContext: item.total_input_context || 0,
+          outputTokens: item.output_tokens || 0,
+          cacheReadTokens: item.cache_read_tokens || 0,
+          cacheCreationTokens: item.cache_creation_tokens || 0,
+          cacheHitRate: item.cache_hit_rate || 0,
           totalCost: item.total_cost_usd || 0,
           successRate: item.success_rate || 0,
           avgResponseTime: (item.avg_response_time_ms ?? 0) > 0
@@ -184,57 +219,31 @@ export function useUsageData(options: UseUsageDataOptions) {
         currentRecords.value = mergeRecordStatus(currentRecords.value, nextRecords)
         totalRecords.value = userData.pagination?.total ?? currentRecords.value.length
 
-        // 从记录中提取筛选选项和 API 格式统计
+        // 从记录中提取筛选选项
         const models = new Set<string>()
         const providers = new Set<string>()
-        const apiFormatMap = new Map<string, {
-          count: number
-          tokens: number
-          cost: number
-          totalResponseTime: number
-          responseTimeCount: number
-        }>()
-
         currentRecords.value.forEach(record => {
           if (record.model) models.add(record.model)
           if (record.provider) providers.add(record.provider)
-          if (record.api_format) {
-            const existing = apiFormatMap.get(record.api_format) || {
-              count: 0,
-              tokens: 0,
-              cost: 0,
-              totalResponseTime: 0,
-              responseTimeCount: 0
-            }
-            existing.count++
-            existing.tokens += record.total_tokens || 0
-            existing.cost += record.cost || 0
-            if (record.response_time_ms) {
-              existing.totalResponseTime += record.response_time_ms
-              existing.responseTimeCount++
-            }
-            apiFormatMap.set(record.api_format, existing)
-          }
         })
-
         availableModels.value = Array.from(models).sort()
         availableProviders.value = Array.from(providers).sort()
 
-        // 构建 API 格式统计数据
-        apiFormatStats.value = Array.from(apiFormatMap.entries())
-          .map(([format, data]) => {
-            const avgMs = data.responseTimeCount > 0
-              ? data.totalResponseTime / data.responseTimeCount
-              : 0
-            return {
-              api_format: format,
-              request_count: data.count,
-              total_tokens: data.tokens,
-              total_cost: data.cost,
-              avgResponseTime: avgMs > 0 ? `${(avgMs / 1000).toFixed(2)}s` : '-'
-            }
-          })
-          .sort((a, b) => b.request_count - a.request_count)
+        // API 格式统计直接使用后端聚合数据
+        apiFormatStats.value = (userData.summary_by_api_format || []).map(item => ({
+          api_format: item.api_format,
+          request_count: item.request_count || 0,
+          total_tokens: item.total_tokens || 0,
+          total_input_context: item.total_input_context || 0,
+          output_tokens: item.output_tokens || 0,
+          cache_read_tokens: item.cache_read_tokens || 0,
+          cache_creation_tokens: item.cache_creation_tokens || 0,
+          cache_hit_rate: item.cache_hit_rate || 0,
+          total_cost: item.total_cost_usd || 0,
+          avgResponseTime: (item.avg_response_time_ms ?? 0) > 0
+            ? `${((item.avg_response_time_ms ?? 0) / 1000).toFixed(2)}s`
+            : '-'
+        }))
       }
     } catch (error: unknown) {
       if (requestId !== loadStatsRequestId) {
@@ -256,19 +265,24 @@ export function useUsageData(options: UseUsageDataOptions) {
   // 加载记录（真正的后端分页）
   async function loadRecords(
     pagination: PaginationParams,
-    filters?: FilterParams
+    filters?: FilterParams,
+    dateRange?: DateRangeParams
   ): Promise<void> {
     const requestId = ++loadRecordsRequestId
     isLoadingRecords.value = true
 
     try {
       const offset = (pagination.page - 1) * pagination.pageSize
+      const effectiveDateRange = dateRange ?? currentDateRange.value
+      if (dateRange) {
+        currentDateRange.value = dateRange
+      }
 
       // 构建请求参数
       const params: Record<string, unknown> = {
         limit: pagination.pageSize,
         offset,
-        ...currentDateRange.value
+        ...effectiveDateRange
       }
 
       // 添加筛选条件

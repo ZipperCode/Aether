@@ -46,6 +46,7 @@ from src.core.exceptions import (
     UpstreamClientException,
 )
 from src.core.logger import logger
+from src.services.task.request_state import MutableRequestBodyState
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -112,7 +113,7 @@ class ChatSyncExecutor:
         api_format = handler.allowed_api_formats[0]
 
         # 提前创建 pending 记录，让前端可以立即看到"处理中"
-        handler._create_pending_usage(
+        pending_usage_created = handler._create_pending_usage(
             model=model,
             is_stream=False,
             request_type="chat",
@@ -121,9 +122,7 @@ class ChatSyncExecutor:
             request_body=original_request_body,
         )
 
-        # 可变请求体容器：允许 TaskService 在遇到 Thinking 签名错误时整流请求体后重试
-        # 结构: {"body": 实际请求体, "_rectified": 是否已整流, "_rectified_this_turn": 本轮是否整流}
-        request_body_ref: dict[str, Any] = {"body": original_request_body}
+        request_state = MutableRequestBodyState(original_request_body)
 
         # 捕获的上下文变量
         ctx = self._ctx
@@ -142,7 +141,7 @@ class ChatSyncExecutor:
                 model=model,
                 api_format=api_format,
                 original_headers=original_headers,
-                request_body_ref=request_body_ref,
+                request_state=request_state,
                 query_params=query_params,
                 client_content_encoding=effective_client_content_encoding,
             )
@@ -174,9 +173,11 @@ class ChatSyncExecutor:
                 is_stream=False,
                 capability_requirements=capability_requirements or None,
                 preferred_key_ids=preferred_key_ids or None,
-                request_body_ref=request_body_ref,
+                request_body_state=request_state,
                 request_headers=original_headers,
                 request_body=original_request_body,
+                # 预创建失败时，回退到 TaskService 侧创建，避免丢失 pending 状态。
+                create_pending_usage=not pending_usage_created,
             )
             actual_provider_name = exec_result.provider_name or "unknown"
             ctx.provider_id = exec_result.provider_id
@@ -436,7 +437,7 @@ class ChatSyncExecutor:
         model: str,
         api_format: Any,
         original_headers: dict[str, Any],
-        request_body_ref: dict[str, Any],
+        request_state: MutableRequestBodyState,
         query_params: dict[str, str] | None = None,
         client_content_encoding: str | None = None,
     ) -> dict[str, Any]:
@@ -457,7 +458,8 @@ class ChatSyncExecutor:
             provider=provider,
             endpoint=endpoint,
             key=key,
-            original_request_body=request_body_ref["body"],
+            working_request_body=request_state.build_attempt_body(),
+            original_headers=original_headers,
             client_api_format=client_api_format,
             provider_api_format=provider_api_format,
             candidate=candidate,
@@ -488,6 +490,7 @@ class ChatSyncExecutor:
             extra_headers=prep.extra_headers if prep.extra_headers else None,
             pre_computed_auth=auth_info.as_tuple() if auth_info else None,
             envelope=envelope,
+            provider_api_format=prep.provider_api_format,
         )
         if upstream_is_stream:
             from src.core.api_format.headers import set_accept_if_absent
@@ -517,11 +520,11 @@ class ChatSyncExecutor:
         from src.services.proxy_node.resolver import (
             get_proxy_label,
             resolve_effective_proxy,
-            resolve_proxy_info,
+            resolve_proxy_info_async,
         )
 
         _effective_proxy = resolve_effective_proxy(provider.proxy, getattr(key, "proxy", None))
-        ctx.sync_proxy_info = resolve_proxy_info(_effective_proxy)
+        ctx.sync_proxy_info = await resolve_proxy_info_async(_effective_proxy)
         _proxy_label = get_proxy_label(ctx.sync_proxy_info)
         provider_type = str(getattr(provider, "provider_type", "") or "").lower()
 
@@ -538,16 +541,16 @@ class ChatSyncExecutor:
         from src.clients.http_client import HTTPClientPool
         from src.config.settings import config
         from src.services.proxy_node.resolver import (
-            build_post_kwargs,
-            build_stream_kwargs,
-            resolve_delegate_config,
+            build_post_kwargs_async,
+            build_stream_kwargs_async,
+            resolve_delegate_config_async,
         )
 
         # 非流式请求使用 http_request_timeout 作为整体超时
         # 优先使用 Provider 配置，否则使用全局配置
         request_timeout = provider.request_timeout or config.http_request_timeout
 
-        delegate_cfg = resolve_delegate_config(_effective_proxy)
+        delegate_cfg = await resolve_delegate_config_async(_effective_proxy)
         http_client = await HTTPClientPool.get_upstream_client(
             delegate_cfg,
             proxy_config=_effective_proxy,
@@ -559,7 +562,7 @@ class ChatSyncExecutor:
         resp: httpx.Response | None = None
         if not upstream_is_stream:
             try:
-                _pkw = build_post_kwargs(
+                _pkw = await build_post_kwargs_async(
                     delegate_cfg,
                     url=url,
                     headers=provider_hdrs,
@@ -584,7 +587,7 @@ class ChatSyncExecutor:
             )
 
             try:
-                _stream_args = build_stream_kwargs(
+                _stream_args = await build_stream_kwargs_async(
                     delegate_cfg,
                     url=url,
                     headers=provider_hdrs,
@@ -672,7 +675,10 @@ class ChatSyncExecutor:
         except httpx.HTTPStatusError as e:
             error_body = ""
             try:
-                error_body = resp.text[:4000] if resp.text else ""
+                if envelope and hasattr(envelope, "extract_error_text"):
+                    error_body = await envelope.extract_error_text(resp)
+                else:
+                    error_body = resp.text[:4000] if resp.text else ""
             except Exception:
                 error_body = ""
             # 供 ErrorClassifier 优先读取
@@ -805,8 +811,15 @@ class ChatSyncExecutor:
             request_metadata=stream_fail_metadata,
         )
 
-    async def _extract_error_text(self, e: httpx.HTTPStatusError) -> str:
+    async def _extract_error_text(
+        self,
+        e: httpx.HTTPStatusError,
+        *,
+        envelope: Any = None,
+    ) -> str:
         """从 HTTP 错误中提取错误文本"""
+        if envelope and hasattr(envelope, "extract_error_text"):
+            return await envelope.extract_error_text(e)
         try:
             if hasattr(e.response, "is_stream_consumed") and not e.response.is_stream_consumed:
                 error_bytes = await e.response.aread()

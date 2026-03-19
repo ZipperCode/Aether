@@ -44,7 +44,10 @@ from src.api.handlers.base.chat_error_utils import (
     _resolve_dynamic_format,
 )
 from src.api.handlers.base.parsers import get_parser_for_format
-from src.api.handlers.base.request_builder import PassthroughRequestBuilder, get_provider_auth
+from src.api.handlers.base.request_builder import (
+    PassthroughRequestBuilder,
+    get_provider_auth,
+)
 from src.api.handlers.base.response_parser import ResponseParser
 from src.api.handlers.base.stream_context import (
     StreamContext,
@@ -77,6 +80,9 @@ from src.models.database import (
     User,
 )
 from src.services.provider.behavior import get_provider_behavior
+from src.services.provider.prompt_cache import (
+    maybe_patch_request_with_prompt_cache_key,
+)
 from src.services.provider.stream_policy import (
     enforce_stream_mode_for_upstream,
     get_upstream_stream_policy,
@@ -85,8 +91,10 @@ from src.services.provider.stream_policy import (
 from src.services.provider.transport import (
     build_provider_url,
 )
+from src.services.provider.upstream_headers import build_upstream_extra_headers
 from src.services.scheduling.aware_scheduler import ProviderCandidate
 from src.services.system.config import SystemConfigService
+from src.services.task.request_state import MutableRequestBodyState
 
 
 @dataclass
@@ -479,7 +487,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         model = getattr(converted_request, "model", original_request_body.get("model", "unknown"))
 
         # 提前创建 pending 记录，让前端可以立即看到"处理中"
-        self._create_pending_usage(
+        pending_usage_created = self._create_pending_usage(
             model=model,
             is_stream=True,
             request_type="chat",
@@ -489,9 +497,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         )
         api_format = self.allowed_api_formats[0]
 
-        # 可变请求体容器：允许 TaskService 在遇到 Thinking 签名错误时整流请求体后重试
-        # 结构: {"body": 实际请求体, "_rectified": 是否已整流, "_rectified_this_turn": 本轮是否整流}
-        request_body_ref: dict[str, Any] = {"body": original_request_body}
+        request_state = MutableRequestBodyState(original_request_body)
 
         # 创建类型安全的流式上下文
         ctx = StreamContext(
@@ -535,7 +541,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 provider,
                 endpoint,
                 key,
-                request_body_ref["body"],  # 使用容器中的请求体
+                request_state.build_attempt_body(),
                 original_headers,
                 query_params,
                 candidate,
@@ -570,9 +576,11 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 is_stream=True,
                 capability_requirements=capability_requirements or None,
                 preferred_key_ids=preferred_key_ids or None,
-                request_body_ref=request_body_ref,
+                request_body_state=request_state,
                 request_headers=original_headers,
                 request_body=original_request_body,
+                # 预创建失败时，回退到 TaskService 侧创建，避免丢失 pending 状态。
+                create_pending_usage=not pending_usage_created,
             )
             stream_generator = exec_result.response
             provider_name = exec_result.provider_name or "unknown"
@@ -605,7 +613,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             if isinstance(scheduling_audit, dict):
                 ctx.scheduling_audit = scheduling_audit
             # 同步整流状态（如果请求体被整流过）
-            ctx.rectified = request_body_ref.get("_rectified", False)
+            ctx.rectified = request_state.is_rectified()
 
             # 创建遥测记录器
             telemetry_recorder = StreamTelemetryRecorder(
@@ -685,7 +693,8 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         provider: Provider,
         endpoint: ProviderEndpoint,
         key: ProviderAPIKey,
-        original_request_body: dict[str, Any],
+        working_request_body: dict[str, Any],
+        original_headers: dict[str, str],
         client_api_format: str,
         provider_api_format: str,
         candidate: ProviderCandidate | None,
@@ -713,11 +722,10 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 api_format=provider_api_format,
             )
 
-        # 应用模型映射到请求体
+        # `working_request_body` is already isolated per attempt.
+        request_body = working_request_body
         if mapped_model:
-            request_body = self.apply_mapped_model(original_request_body, mapped_model)
-        else:
-            request_body = dict(original_request_body)
+            request_body = self.apply_mapped_model(request_body, mapped_model)
 
         provider_type = str(getattr(provider, "provider_type", "") or "").lower()
         behavior = get_provider_behavior(
@@ -745,6 +753,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             envelope_tls_profile = envelope.prepare_context(
                 provider_config=getattr(provider, "config", None),
                 key_id=str(getattr(key, "id", "") or ""),
+                user_api_key_id=str(getattr(self.api_key, "id", "") or ""),
                 is_stream=upstream_is_stream,
                 provider_id=str(getattr(provider, "id", "") or ""),
                 key=key,
@@ -777,7 +786,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         else:
             # 同格式：按原逻辑做轻量清理（子类可覆盖以移除不需要的字段）
             request_body = self.prepare_provider_request_body(request_body)
-            # 同格式时也需要应用 target_variant 转换（如 Codex）
+            # 同格式 Provider 仍可能声明 target_variant
             if same_format_variant:
                 request_body = registry.convert_request(
                     request_body,
@@ -801,6 +810,15 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 upstream_is_stream=upstream_is_stream,
             )
 
+        request_body = maybe_patch_request_with_prompt_cache_key(
+            request_body,
+            provider_api_format=str(provider_api_format) if provider_api_format else None,
+            provider_type=provider_type,
+            base_url=getattr(endpoint, "base_url", None),
+            user_api_key_id=str(getattr(self.api_key, "id", "") or ""),
+            request_headers=original_headers,
+        )
+
         # 获取 URL 模型名
         url_model = self.get_model_for_url(request_body, mapped_model) or model
 
@@ -820,6 +838,16 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         extra_headers: dict[str, str] = {}
         if envelope:
             extra_headers.update(envelope.extra_headers() or {})
+
+        hook_headers = build_upstream_extra_headers(
+            provider_type=provider_type,
+            endpoint_sig=str(provider_api_format) if provider_api_format else None,
+            request_body=request_body,
+            original_headers=original_headers,
+            decrypted_auth_config=auth_info.decrypted_auth_config if auth_info else None,
+        )
+        if hook_headers:
+            extra_headers.update(hook_headers)
 
         return ProviderRequestResult(
             request_body=request_body,
@@ -842,7 +870,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         provider: Provider,
         endpoint: ProviderEndpoint,
         key: ProviderAPIKey,
-        original_request_body: dict[str, Any],
+        working_request_body: dict[str, Any],
         original_headers: dict[str, str],
         query_params: dict[str, str] | None = None,
         candidate: ProviderCandidate | None = None,
@@ -876,7 +904,8 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             provider=provider,
             endpoint=endpoint,
             key=key,
-            original_request_body=original_request_body,
+            working_request_body=working_request_body,
+            original_headers=original_headers,
             client_api_format=client_api_format,
             provider_api_format=provider_api_format,
             candidate=candidate,
@@ -906,6 +935,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             extra_headers=prep.extra_headers if prep.extra_headers else None,
             pre_computed_auth=auth_info.as_tuple() if auth_info else None,
             envelope=envelope,
+            provider_api_format=prep.provider_api_format,
         )
         if upstream_is_stream:
             from src.core.api_format.headers import set_accept_if_absent
@@ -930,11 +960,11 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         from src.services.proxy_node.resolver import (
             get_proxy_label,
             resolve_effective_proxy,
-            resolve_proxy_info,
+            resolve_proxy_info_async,
         )
 
         effective_proxy = resolve_effective_proxy(provider.proxy, getattr(key, "proxy", None))
-        ctx.proxy_info = resolve_proxy_info(effective_proxy)
+        ctx.proxy_info = await resolve_proxy_info_async(effective_proxy)
         proxy_label = get_proxy_label(ctx.proxy_info)
 
         logger.debug(
@@ -946,10 +976,13 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         # simulate streaming to the client (sync -> stream bridge).
         if not upstream_is_stream:
             from src.clients.http_client import HTTPClientPool
-            from src.services.proxy_node.resolver import build_post_kwargs, resolve_delegate_config
+            from src.services.proxy_node.resolver import (
+                build_post_kwargs_async,
+                resolve_delegate_config_async,
+            )
 
             request_timeout_sync = provider.request_timeout or config.http_request_timeout
-            delegate_cfg = resolve_delegate_config(effective_proxy)
+            delegate_cfg = await resolve_delegate_config_async(effective_proxy)
             http_client = await HTTPClientPool.get_upstream_client(
                 delegate_cfg,
                 proxy_config=effective_proxy,
@@ -957,7 +990,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             )
 
             try:
-                _pkw = build_post_kwargs(
+                _pkw = await build_post_kwargs_async(
                     delegate_cfg,
                     url=url,
                     headers=provider_headers,
@@ -997,7 +1030,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                         ctx.provider_request_headers = provider_headers
 
                     # retry once
-                    _pkw = build_post_kwargs(
+                    _pkw = await build_post_kwargs_async(
                         delegate_cfg,
                         url=url,
                         headers=provider_headers,
@@ -1019,7 +1052,10 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                     except httpx.HTTPStatusError as e2:
                         error_body = ""
                         try:
-                            error_body = resp.text[:4000] if resp.text else ""
+                            if envelope and hasattr(envelope, "extract_error_text"):
+                                error_body = await envelope.extract_error_text(resp)
+                            else:
+                                error_body = resp.text[:4000] if resp.text else ""
                         except Exception:
                             error_body = ""
                         e2.upstream_response = error_body  # type: ignore[attr-defined]
@@ -1027,7 +1063,10 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 else:
                     error_body = ""
                     try:
-                        error_body = resp.text[:4000] if resp.text else ""
+                        if envelope and hasattr(envelope, "extract_error_text"):
+                            error_body = await envelope.extract_error_text(resp)
+                        else:
+                            error_body = resp.text[:4000] if resp.text else ""
                     except Exception:
                         error_body = ""
                     e.upstream_response = error_body  # type: ignore[attr-defined]
@@ -1147,9 +1186,12 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         # 获取 HTTP 客户端（支持代理配置，Key 级别优先于 Provider 级别）
         # 使用连接池复用客户端，避免每次流式请求都新建 TCP/TLS 连接
         from src.clients.http_client import HTTPClientPool
-        from src.services.proxy_node.resolver import build_stream_kwargs, resolve_delegate_config
+        from src.services.proxy_node.resolver import (
+            build_stream_kwargs_async,
+            resolve_delegate_config_async,
+        )
 
-        delegate_cfg = resolve_delegate_config(effective_proxy)
+        delegate_cfg = await resolve_delegate_config_async(effective_proxy)
         http_client = await HTTPClientPool.get_upstream_client(
             delegate_cfg,
             proxy_config=effective_proxy,
@@ -1164,7 +1206,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         async def _connect_and_prefetch() -> None:
             """建立连接并预读首字节（受整体超时控制）"""
             nonlocal byte_iterator, prefetched_chunks, response_ctx
-            _skw = build_stream_kwargs(
+            _skw = await build_stream_kwargs_async(
                 delegate_cfg,
                 url=url,
                 headers=provider_headers,
@@ -1289,7 +1331,18 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
 
                 from src.api.handlers.base.chat_sync_executor import ChatSyncExecutor
 
-                error_text = await ChatSyncExecutor(self)._extract_error_text(e)
+                error_text = await ChatSyncExecutor(self)._extract_error_text(
+                    e,
+                    envelope=envelope,
+                )
+
+                try:
+                    if response_ctx is not None:
+                        await response_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                finally:
+                    response_ctx = None
                 logger.error(
                     f"Provider 返回错误: {e.response.status_code}\n  Response: {error_text}"
                 )
@@ -1306,6 +1359,13 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 raise
 
             except Exception:
+                try:
+                    if response_ctx is not None:
+                        await response_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                finally:
+                    response_ctx = None
                 raise
 
         # 类型断言：成功执行后这些变量不会为 None

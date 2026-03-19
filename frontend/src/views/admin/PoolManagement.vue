@@ -496,7 +496,7 @@
                         v-if="getOAuthOrgBadge(key)"
                         variant="secondary"
                         class="text-[9px] px-1 py-0 h-4 shrink-0"
-                        :title="getOAuthOrgBadge(key)?.id"
+                        :title="getOAuthOrgBadge(key)?.title"
                       >
                         {{ getOAuthOrgBadge(key)?.label }}
                       </Badge>
@@ -509,33 +509,33 @@
                 >
                   <div
                     v-if="quotaProgressMap[key.key_id]?.length"
-                    class="space-y-1 max-w-[220px]"
+                    class="max-w-[208px] space-y-2"
                   >
                     <div
                       v-for="(item, idx) in quotaProgressMap[key.key_id].slice(0, 2)"
                       :key="`${key.key_id}-quota-${idx}`"
-                      class="w-full"
+                      class="flex flex-col gap-1 min-w-[140px] max-w-[208px]"
                     >
-                      <div class="h-4 grid grid-cols-[20px_minmax(0,1fr)_42px] items-center gap-1 text-[10px] leading-tight">
+                      <div class="flex items-center justify-between text-[10px] leading-none">
+                        <span class="text-muted-foreground font-medium shrink-0">{{ getQuotaProgressLabel(item.label) }}</span>
                         <span
-                          class="text-muted-foreground whitespace-nowrap text-right tabular-nums"
-                          :title="getQuotaProgressTooltip(item)"
-                        >
-                          {{ getQuotaProgressLabel(item.label) }}
-                        </span>
-                        <div class="relative flex-1 h-1.5 bg-border rounded-full overflow-hidden">
+                          v-if="getQuotaProgressDisplayText(item)"
+                          class="text-muted-foreground/80 tabular-nums truncate"
+                          :title="item.detail"
+                        >{{ getQuotaProgressDisplayText(item) }}</span>
+                      </div>
+                      <div class="flex items-center gap-1.5">
+                        <div class="relative flex-1 h-1.5 rounded-full bg-border overflow-hidden">
                           <div
-                            class="absolute left-0 top-0 h-full transition-all duration-300"
+                            class="absolute left-0 top-0 h-full rounded-full transition-all duration-300"
                             :class="getQuotaRemainingBarColorByRemaining(item.remainingPercent)"
                             :style="{ width: `${item.remainingPercent}%` }"
                           />
                         </div>
                         <span
-                          class="tabular-nums text-right whitespace-nowrap"
+                          class="shrink-0 text-[10px] font-medium tabular-nums leading-none"
                           :class="getQuotaRemainingClassByRemaining(item.remainingPercent)"
-                        >
-                          {{ item.remainingPercent.toFixed(1) }}%
-                        </span>
+                        >{{ item.remainingPercent.toFixed(1) }}%</span>
                       </div>
                     </div>
                   </div>
@@ -806,7 +806,7 @@
                     v-if="getOAuthOrgBadge(key)"
                     variant="secondary"
                     class="text-[9px] px-1 py-0 h-4 shrink-0"
-                    :title="getOAuthOrgBadge(key)?.id"
+                    :title="getOAuthOrgBadge(key)?.title"
                   >
                     {{ getOAuthOrgBadge(key)?.label }}
                   </Badge>
@@ -964,33 +964,33 @@
                 </div>
                 <div
                   v-if="quotaProgressMap[key.key_id]?.length"
-                  class="space-y-1"
+                  class="space-y-2"
                 >
                   <div
                     v-for="(item, idx) in quotaProgressMap[key.key_id]"
                     :key="`${key.key_id}-quota-mobile-${idx}`"
-                    class="w-full"
+                    class="flex flex-col gap-1 min-w-0"
                   >
-                    <div class="grid grid-cols-[20px_minmax(0,1fr)_42px] items-center gap-1 text-[10px] leading-tight">
+                    <div class="flex items-center justify-between text-[10px] leading-none">
+                      <span class="text-muted-foreground font-medium shrink-0">{{ getQuotaProgressLabel(item.label) }}</span>
                       <span
-                        class="text-muted-foreground whitespace-nowrap text-right tabular-nums"
-                        :title="getQuotaProgressTooltip(item)"
-                      >
-                        {{ getQuotaProgressLabel(item.label) }}
-                      </span>
-                      <div class="relative flex-1 h-1.5 bg-border rounded-full overflow-hidden">
+                        v-if="getQuotaProgressDisplayText(item)"
+                        class="text-muted-foreground/80 tabular-nums truncate"
+                        :title="item.detail"
+                      >{{ getQuotaProgressDisplayText(item) }}</span>
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                      <div class="relative flex-1 h-1.5 rounded-full bg-border overflow-hidden">
                         <div
-                          class="absolute left-0 top-0 h-full transition-all duration-300"
+                          class="absolute left-0 top-0 h-full rounded-full transition-all duration-300"
                           :class="getQuotaRemainingBarColorByRemaining(item.remainingPercent)"
                           :style="{ width: `${item.remainingPercent}%` }"
                         />
                       </div>
                       <span
-                        class="tabular-nums text-right whitespace-nowrap"
+                        class="shrink-0 text-[10px] font-medium tabular-nums leading-none"
                         :class="getQuotaRemainingClassByRemaining(item.remainingPercent)"
-                      >
-                        {{ item.remainingPercent.toFixed(1) }}%
-                      </span>
+                      >{{ item.remainingPercent.toFixed(1) }}%</span>
                     </div>
                   </div>
                 </div>
@@ -1153,7 +1153,7 @@ import {
 import RefreshButton from '@/components/ui/refresh-button.vue'
 import { useToast } from '@/composables/useToast'
 import { useClipboard } from '@/composables/useClipboard'
-import { useCountdownTimer, getOAuthExpiresCountdown } from '@/composables/useCountdownTimer'
+import { useCountdownTimer, getOAuthExpiresCountdown, getCodexResetCountdown } from '@/composables/useCountdownTimer'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
 import {
@@ -1743,6 +1743,7 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     oauth_plan_type: key.oauth_plan_type ?? null,
     oauth_account_id: key.oauth_account_id ?? null,
     oauth_account_user_id: key.oauth_account_user_id ?? null,
+    oauth_account_name: key.oauth_account_name ?? null,
     oauth_organizations: key.oauth_organizations ?? [],
     oauth_invalid_at: key.oauth_invalid_at ?? null,
     oauth_invalid_reason: key.oauth_invalid_reason ?? null,
@@ -2426,13 +2427,33 @@ function getQuotaProgressLabel(label: string): string {
   return label
 }
 
-function getQuotaProgressTooltip(item: QuotaProgressItem): string {
-  const detail = item.detail?.trim() || ''
-  if ((item.label === '5H' || item.label === '周') && item.resetAtSeconds != null) {
-    return `${formatQuotaInlineCountdown(item.resetAtSeconds)} 后重置`
-  }
-  return detail
+function getQuotaProgressCountdown(item: QuotaProgressItem) {
+  if ((item.label !== '5H' && item.label !== '周') || item.resetAtSeconds == null) return null
+  return getCodexResetCountdown(item.resetAtSeconds, null, null, countdownTick.value, item.remainingPercent)
 }
+
+function getQuotaProgressCountdownText(item: QuotaProgressItem): string {
+  const status = getQuotaProgressCountdown(item)
+  if (!status) return ''
+  return status.isExpired ? status.text : `${status.text} 后重置`
+}
+
+function formatCompactQuotaCountdownText(text: string): string {
+  const normalized = text.trim()
+  const dayMatch = normalized.match(/^(\d+)天\s+(.+?)(?:\s+后重置)?$/)
+  if (dayMatch) {
+    return `${dayMatch[1]}天 ${dayMatch[2]}`
+  }
+  return normalized.replace(/\s+后重置$/, '')
+}
+
+function getQuotaProgressDisplayText(item: QuotaProgressItem): string {
+  const countdownText = getQuotaProgressCountdownText(item)
+  if (countdownText) return formatCompactQuotaCountdownText(countdownText)
+  return item.detail?.trim() || ''
+}
+
+
 
 function getQuotaLabelOrder(label: string): number {
   if (label === '5H') return 0
@@ -2470,26 +2491,6 @@ function parseQuotaResetRemainingSeconds(detail: string | undefined): number | n
 
   if (total <= 0) return 1
   return total
-}
-
-function formatQuotaInlineCountdown(resetAtSeconds: number): string {
-  // 触发响应式更新，保持倒计时每秒刷新
-  void countdownTick.value
-
-  const now = Math.floor(Date.now() / 1000)
-  const remain = Math.max(0, Math.floor(resetAtSeconds - now))
-  const days = Math.floor(remain / 86400)
-  const hours = Math.floor((remain % 86400) / 3600)
-  const minutes = Math.floor((remain % 3600) / 60)
-  const seconds = remain % 60
-
-  if (days > 0) {
-    return `${days}d${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`
-  }
-  if (hours > 0) {
-    return `${hours}:${String(minutes).padStart(2, '0')}`
-  }
-  return `${minutes}:${String(seconds).padStart(2, '0')}`
 }
 
 function parseQuotaProgressItems(quotaText: string | null | undefined): QuotaProgressItem[] {

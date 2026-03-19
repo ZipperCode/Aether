@@ -293,7 +293,7 @@
                               v-if="getOAuthOrgBadge(key)"
                               variant="secondary"
                               class="text-[10px] px-1.5 py-0 shrink-0"
-                              :title="getOAuthOrgBadge(key)?.id"
+                              :title="getOAuthOrgBadge(key)?.title"
                             >
                               {{ getOAuthOrgBadge(key)?.label }}
                             </Badge>
@@ -586,10 +586,21 @@
                             />
                           </div>
                           <div
-                            v-if="key.upstream_metadata.codex.primary_reset_seconds"
-                            class="text-[9px] text-muted-foreground/70 mt-0.5"
+                            v-if="(key.upstream_metadata.codex.primary_reset_at || key.upstream_metadata.codex.primary_reset_seconds) && shouldStartCodexResetCountdown(key.upstream_metadata.codex.primary_used_percent)"
+                            class="text-[9px] mt-0.5 tabular-nums"
+                            :class="getResetCountdownClass(
+                              key.upstream_metadata.codex.primary_reset_at,
+                              key.upstream_metadata.codex.primary_reset_seconds,
+                              key.upstream_metadata.codex.updated_at,
+                              key.upstream_metadata.codex.primary_used_percent
+                            )"
                           >
-                            {{ formatResetTime(key.upstream_metadata.codex.primary_reset_seconds) }}后重置
+                            {{ getResetCountdownText(
+                              key.upstream_metadata.codex.primary_reset_at,
+                              key.upstream_metadata.codex.primary_reset_seconds,
+                              key.upstream_metadata.codex.updated_at,
+                              key.upstream_metadata.codex.primary_used_percent
+                            ) }}
                           </div>
                         </div>
                         <!-- 5H限额（仅 Team/Plus/Enterprise 显示） -->
@@ -607,9 +618,23 @@
                               :style="{ width: `${Math.max(100 - key.upstream_metadata.codex.secondary_used_percent, 0)}%` }"
                             />
                           </div>
-                          <div class="text-[9px] text-muted-foreground/70 mt-0.5">
-                            <template v-if="key.upstream_metadata.codex.secondary_reset_seconds">
-                              {{ formatResetTime(key.upstream_metadata.codex.secondary_reset_seconds) }}后重置
+                          <div
+                            v-if="shouldStartCodexResetCountdown(key.upstream_metadata.codex.secondary_used_percent)"
+                            class="text-[9px] mt-0.5 tabular-nums"
+                            :class="getResetCountdownClass(
+                              key.upstream_metadata.codex.secondary_reset_at,
+                              key.upstream_metadata.codex.secondary_reset_seconds,
+                              key.upstream_metadata.codex.updated_at,
+                              key.upstream_metadata.codex.secondary_used_percent
+                            )"
+                          >
+                            <template v-if="key.upstream_metadata.codex.secondary_reset_at || key.upstream_metadata.codex.secondary_reset_seconds">
+                              {{ getResetCountdownText(
+                                key.upstream_metadata.codex.secondary_reset_at,
+                                key.upstream_metadata.codex.secondary_reset_seconds,
+                                key.upstream_metadata.codex.updated_at,
+                                key.upstream_metadata.codex.secondary_used_percent
+                              ) }}
                             </template>
                             <template v-else>
                               已重置
@@ -1076,7 +1101,7 @@ import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { useClipboard } from '@/composables/useClipboard'
-import { useCountdownTimer, formatCountdown, getOAuthExpiresCountdown } from '@/composables/useCountdownTimer'
+import { useCountdownTimer, formatCountdown, getOAuthExpiresCountdown, getCodexResetCountdown } from '@/composables/useCountdownTimer'
 import {
   getProvider,
   getProviderEndpoints,
@@ -2564,6 +2589,55 @@ function getAntigravityQuotaSummary(metadata: UpstreamMetadata | null | undefine
     })
   }
   return result
+}
+
+function getResetCountdownText(
+  resetAt: number | null | undefined,
+  resetSecs: number | null | undefined,
+  updatedAt: number | null | undefined,
+  usedPercent: number | null | undefined
+): string {
+  const status = getCodexResetCountdown(
+    resetAt,
+    resetSecs,
+    updatedAt,
+    countdownTick.value,
+    toCodexRemainingPercent(usedPercent)
+  )
+  if (!status) return ''
+  return status.isExpired ? status.text : `${status.text} 后重置`
+}
+
+function getResetCountdownClass(
+  resetAt: number | null | undefined,
+  resetSecs: number | null | undefined,
+  updatedAt: number | null | undefined,
+  usedPercent: number | null | undefined
+): string {
+  const status = getCodexResetCountdown(
+    resetAt,
+    resetSecs,
+    updatedAt,
+    countdownTick.value,
+    toCodexRemainingPercent(usedPercent)
+  )
+  if (!status || status.isExpired) return 'text-muted-foreground/70'
+  if (status.isCritical) return 'text-destructive font-medium animate-pulse'
+  if (status.isUrgent) return 'text-amber-500 dark:text-amber-400'
+  return 'text-muted-foreground/70'
+}
+
+function toCodexRemainingPercent(usedPercent: number | null | undefined): number | null {
+  const normalizedUsed = Number(usedPercent)
+  if (!Number.isFinite(normalizedUsed)) return null
+  const clampedUsed = Math.min(Math.max(normalizedUsed, 0), 100)
+  return Math.max(100 - clampedUsed, 0)
+}
+
+function shouldStartCodexResetCountdown(usedPercent: number | null | undefined): boolean {
+  const remainingPercent = toCodexRemainingPercent(usedPercent)
+  if (remainingPercent == null) return true
+  return remainingPercent < 100
 }
 
 // 格式化重置时间

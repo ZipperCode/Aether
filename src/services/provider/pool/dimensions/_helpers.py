@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Any
 
 from src.core.provider_types import ProviderType, normalize_provider_type
@@ -139,10 +140,32 @@ def _extract_codex_weekly_reset_seconds(metadata: dict[str, Any]) -> float | Non
     if not isinstance(codex, dict):
         return None
 
-    parsed = safe_float(codex.get("primary_reset_seconds"))
-    if parsed is None or parsed < 0:
+    weekly_used_percent = safe_float(codex.get("primary_used_percent"))
+    if weekly_used_percent is not None:
+        clamped_used = max(0.0, min(weekly_used_percent, 100.0))
+        if clamped_used <= 1e-6:
+            # 周额度仍为满额时，不启用周窗口重置倒计时。
+            return None
+
+    now = time.time()
+
+    # 优先绝对时间戳，避免 reset_seconds 快照随时间漂移。
+    reset_at = safe_float(codex.get("primary_reset_at"))
+    if reset_at is not None and reset_at > 0:
+        remaining = reset_at - now
+        return remaining if remaining > 0 else 0.0
+
+    reset_seconds = safe_float(codex.get("primary_reset_seconds"))
+    if reset_seconds is None or reset_seconds < 0:
         return None
-    return parsed
+
+    updated_at = safe_float(codex.get("updated_at"))
+    if updated_at is not None and updated_at > 0:
+        # 时钟偏移下 updated_at 可能晚于当前时间，elapsed 需要下限钳制到 0。
+        elapsed = max(now - updated_at, 0.0)
+        return max(reset_seconds - elapsed, 0.0)
+
+    return reset_seconds
 
 
 def extract_reset_seconds(key_obj: Any, provider_type: str | None = None) -> float | None:

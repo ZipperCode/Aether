@@ -82,22 +82,18 @@
             <Input
               :id="`pwd-${formNonce}`"
               v-model="form.password"
-              :type="passwordFocused ? 'password' : 'text'"
+              type="text"
+              masked
               autocomplete="new-password"
-              data-form-type="other"
-              data-lpignore="true"
+              disable-autofill
               :name="`field-${formNonce}`"
               :required="!isEditMode"
               minlength="6"
               :placeholder="isEditMode ? '留空保持原密码' : getPasswordPolicyPlaceholder(passwordPolicyLevel)"
+              class="h-10"
               :class="[
-                !passwordFocused && form.password.length === 0
-                  ? 'h-10 text-transparent'
-                  : 'h-10',
                 passwordError ? 'border-destructive' : '',
               ]"
-              @focus="passwordFocused = true"
-              @blur="passwordFocused = form.password.length > 0"
             />
             <p
               v-if="passwordError"
@@ -123,7 +119,8 @@
             <Input
               :id="`pwd-confirm-${formNonce}`"
               v-model="form.confirmPassword"
-              type="password"
+              type="text"
+              masked
               autocomplete="new-password"
               data-form-type="other"
               data-lpignore="true"
@@ -260,6 +257,36 @@
             </div>
           </div>
 
+          <div class="space-y-2">
+            <Label
+              for="form-rate-limit"
+              class="text-sm font-medium"
+            >速率限制 (请求/分钟)</Label>
+            <div class="flex items-center gap-3">
+              <div class="flex-1 min-w-0">
+                <Input
+                  v-if="!form.rate_limit_inherited"
+                  id="form-rate-limit"
+                  :model-value="form.rate_limit ?? ''"
+                  type="number"
+                  min="0"
+                  max="10000"
+                  placeholder="0 = 不限速"
+                  class="h-10"
+                  @update:model-value="(v) => form.rate_limit = parseNumberInput(v, { min: 0, max: 10000 })"
+                />
+                <span
+                  v-else
+                  class="flex h-10 w-full items-center rounded-lg border bg-background px-3 text-sm text-muted-foreground opacity-60"
+                >跟随系统默认</span>
+              </div>
+              <Switch
+                v-model="form.rate_limit_inherited"
+                class="shrink-0"
+              />
+            </div>
+          </div>
+
           <!-- 额度 -->
           <div class="space-y-2">
             <Label class="text-sm font-medium">额度</Label>
@@ -277,9 +304,9 @@
                   @update:model-value="(v) => form.initial_gift_usd = parseNumberInput(v, { allowFloat: true, min: 0.01 })"
                 />
                 <span
-                  v-else-if="form.unlimited"
+                  v-else
                   class="flex h-10 w-full items-center rounded-lg border bg-background px-3 text-sm text-muted-foreground opacity-60"
-                >无限制</span>
+                >{{ form.unlimited ? '无限制' : '按钱包余额限制' }}</span>
               </div>
               <Switch
                 v-model="form.unlimited"
@@ -356,6 +383,7 @@ export interface UserFormData {
   allowed_providers?: string[] | null
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
+  rate_limit?: number | null
 }
 
 const props = defineProps<{
@@ -371,7 +399,6 @@ const emit = defineEmits<{
 const isOpen = computed(() => props.open)
 const saving = ref(false)
 const formNonce = ref(createFieldNonce())
-const passwordFocused = ref(false)
 const passwordPolicyLevel = ref<PasswordPolicyLevel>('weak')
 
 // 选项数据
@@ -411,9 +438,11 @@ const form = ref({
   provider_unrestricted: true,
   api_format_unrestricted: true,
   model_unrestricted: true,
+  rate_limit_inherited: true,
   allowed_providers: [] as string[],
   allowed_api_formats: [] as string[],
   allowed_models: [] as string[],
+  rate_limit: undefined as number | undefined,
 })
 
 function createFieldNonce(): string {
@@ -422,7 +451,6 @@ function createFieldNonce(): string {
 
 function resetForm() {
   formNonce.value = createFieldNonce()
-  passwordFocused.value = false
   form.value = {
     username: '',
     password: '',
@@ -435,16 +463,17 @@ function resetForm() {
     provider_unrestricted: true,
     api_format_unrestricted: true,
     model_unrestricted: true,
+    rate_limit_inherited: true,
     allowed_providers: [],
     allowed_api_formats: [],
     allowed_models: [],
+    rate_limit: undefined,
   }
 }
 
 function loadUserData() {
   if (!props.user) return
   formNonce.value = createFieldNonce()
-  passwordFocused.value = false
   // 创建数组副本，避免与 props 数据共享引用
   form.value = {
     username: props.user.username,
@@ -458,9 +487,11 @@ function loadUserData() {
     provider_unrestricted: props.user.allowed_providers == null,
     api_format_unrestricted: props.user.allowed_api_formats == null,
     model_unrestricted: props.user.allowed_models == null,
+    rate_limit_inherited: props.user.rate_limit == null,
     allowed_providers: props.user.allowed_providers ? [...props.user.allowed_providers] : [],
     allowed_api_formats: props.user.allowed_api_formats ? [...props.user.allowed_api_formats] : [],
     allowed_models: props.user.allowed_models ? [...props.user.allowed_models] : [],
+    rate_limit: props.user.rate_limit ?? undefined,
   }
 }
 
@@ -550,6 +581,7 @@ async function handleSubmit() {
       allowed_models: form.value.model_unrestricted
         ? null
         : [...form.value.allowed_models],
+      rate_limit: form.value.rate_limit_inherited ? null : (form.value.rate_limit ?? 0),
     }
 
     if (isEditMode.value && props.user?.id) {

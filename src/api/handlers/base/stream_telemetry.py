@@ -99,17 +99,11 @@ class StreamTelemetryRecorder:
             try:
                 writer = await self._get_telemetry_writer(bg_db, ctx, response_time_ms)
                 if writer is None:
+                    ctx.release_recorded_chunks()
                     return
-                # 兜底估算：流未正常完成且 token 均为 0 时，从请求体粗略估算
-                # 覆盖 Chat Handler 路径（CLI Handler 在更早的位置已做估算，
-                # 若已估算过则 token > 0，此处条件不会触发）
-                if (
-                    ctx.is_success()
-                    and not ctx.has_completion
-                    and ctx.data_count > 0
-                    and ctx.input_tokens == 0
-                    and ctx.output_tokens == 0
-                ):
+                # 兜底估算：流未正常完成且 token 均为 0 时，从请求体粗略估算。
+                # 覆盖成功但缺少 completion，以及已传出部分数据后被中断的场景。
+                if ctx.should_estimate_incomplete_tokens():
                     # 用实际发给 Provider 的请求体估算 token（格式转换时与客户端请求体不同）
                     self._estimate_tokens_for_incomplete_stream(
                         ctx, ctx.provider_request_body or original_request_body
@@ -121,53 +115,47 @@ class StreamTelemetryRecorder:
                     if isinstance(writer, QueueTelemetryWriter)
                     else should_log_body
                 )
-                response_body = (
-                    ctx.build_response_body(response_time_ms) if include_bodies else None
-                )
-                client_response_body = (
-                    ctx.build_client_response_body(response_time_ms) if include_bodies else None
-                )
-
-                try:
-                    await self._dispatch_record(
-                        bg_db,
-                        writer,
-                        ctx,
-                        original_headers,
-                        original_request_body,
-                        response_body,
-                        response_time_ms,
-                        client_response_body=client_response_body,
-                    )
-                except Exception as writer_error:
-                    if not isinstance(writer, QueueTelemetryWriter):
-                        raise
-                    logger.warning(
-                        f"[{self.request_id}] Queue writer failed, falling back to DB: {writer_error}"
-                    )
-                    db_writer = self._build_db_writer(bg_db)
-                    if db_writer is None:
-                        await self._update_usage_status_directly(
+                with ctx.managed_recorded_bodies(
+                    response_time_ms, include_bodies=include_bodies
+                ) as recorded_bodies:
+                    try:
+                        await self._dispatch_record(
                             bg_db,
-                            status=self._get_status_from_ctx(ctx),
-                            response_time_ms=response_time_ms,
-                            status_code=ctx.status_code,
+                            writer,
+                            ctx,
+                            original_headers,
+                            original_request_body,
+                            recorded_bodies.response_body,
+                            response_time_ms,
+                            client_response_body=recorded_bodies.client_response_body,
                         )
-                        return
-                    if response_body is None and should_log_body:
-                        response_body = ctx.build_response_body(response_time_ms)
-                    if client_response_body is None and should_log_body:
-                        client_response_body = ctx.build_client_response_body(response_time_ms)
-                    await self._dispatch_record(
-                        bg_db,
-                        db_writer,
-                        ctx,
-                        original_headers,
-                        original_request_body,
-                        response_body,
-                        response_time_ms,
-                        client_response_body=client_response_body,
-                    )
+                    except Exception as writer_error:
+                        if not isinstance(writer, QueueTelemetryWriter):
+                            raise
+                        logger.warning(
+                            f"[{self.request_id}] Queue writer failed, falling back to DB: {writer_error}"
+                        )
+                        db_writer = self._build_db_writer(bg_db)
+                        if db_writer is None:
+                            await self._update_usage_status_directly(
+                                bg_db,
+                                status=self._get_status_from_ctx(ctx),
+                                response_time_ms=response_time_ms,
+                                status_code=ctx.status_code,
+                            )
+                            return
+                        if should_log_body:
+                            recorded_bodies.ensure_populated(ctx, response_time_ms)
+                        await self._dispatch_record(
+                            bg_db,
+                            db_writer,
+                            ctx,
+                            original_headers,
+                            original_request_body,
+                            recorded_bodies.response_body,
+                            response_time_ms,
+                            client_response_body=recorded_bodies.client_response_body,
+                        )
 
                 # 更新候选记录状态
                 await self._update_candidate_status(bg_db, ctx, response_time_ms, start_time)
@@ -182,6 +170,9 @@ class StreamTelemetryRecorder:
                 response_time_ms=response_time_ms,
                 error_message=f"记录统计信息失败: {str(e)[:200]}",
             )
+        finally:
+            # 遥测写入后主动释放大列表，避免长流式请求对象滞留在 worker 堆中。
+            ctx.release_recorded_chunks()
 
     async def _record_success(
         self,

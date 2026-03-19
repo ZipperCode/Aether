@@ -7,7 +7,6 @@ Usage Redis Streams consumer.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import socket
 import time
@@ -18,9 +17,8 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
 
-from src.clients.redis_client import get_redis_client
+from src.clients.redis_client import get_usage_queue_redis_client as get_redis_client
 from src.config.settings import config
 from src.core.logger import logger
 from src.database.database import create_session
@@ -34,19 +32,7 @@ def _consumer_name() -> str:
 
 
 def _parse_body(value: Any) -> Any:
-    """将 JSON 字符串 body 反序列化为 dict，否则原样返回。
-
-    QueueTelemetryWriter 会将 body 序列化为 JSON 字符串以便传输，
-    消费者需要将其反序列化回 dict 以正确存入 JSON 列。
-    """
-    if value is None or isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            # 解析失败，保留原字符串（可能已被截断）
-            return value
+    """消费者阶段保留原始 body，反序列化延迟到写库阶段。"""
     return value
 
 
@@ -115,7 +101,7 @@ async def ensure_usage_stream_group() -> None:
             id="0-0",
             mkstream=True,
         )
-        logger.info(f"[usage-queue] Created consumer group {config.usage_queue_stream_group}")
+        logger.info("[usage-queue] Created consumer group {}", config.usage_queue_stream_group)
     except ResponseError as exc:
         if "BUSYGROUP" in str(exc):
             return
@@ -148,6 +134,9 @@ class UsageQueueConsumer:
         self._dlq_key = config.usage_queue_dlq_key
         self._dlq_maxlen = config.usage_queue_dlq_maxlen
         self._metrics_interval = config.usage_queue_metrics_interval_seconds
+        # 清理长期闲置的旧 consumer，避免 Redis consumer group 元数据持续累积。
+        # 仅清理 pending=0 且空闲时间足够长的 consumer，不影响正常重投递。
+        self._stale_consumer_idle_ms = max(self._claim_idle_ms * 10, 60 * 60 * 1000)
 
     @staticmethod
     def _is_duplicate_key_error(exc: IntegrityError) -> bool:
@@ -155,12 +144,29 @@ class UsageQueueConsumer:
         err_str = str(exc).lower()
         return "unique" in err_str or "duplicate" in err_str
 
+    async def _record_usage_batch(self, records: list[dict[str, Any]]) -> None:
+        """批量写库。
+
+        record_usage_batch 内部包含 async 准备阶段（费率查询等），
+        必须在当前事件循环中 await，不能用 asyncio.run 在子线程创建新循环，
+        否则会导致 Redis 连接泄漏（每次 asyncio.run 都会在 _redis_by_loop 中
+        注册一个短命循环的连接，且永远不会被清理）。
+        """
+        db = create_session()
+        try:
+            await UsageService.record_usage_batch(db, records)
+        finally:
+            db.close()
+
     async def start(self) -> None:
         if self._running:
             return
+        redis_client = await get_redis_client(require_redis=False)
+        if redis_client:
+            await self._cleanup_stale_consumers(redis_client)
         self._running = True
         self._task = asyncio.create_task(self._run(), name="usage-queue-consumer")
-        logger.info(f"[usage-queue] Consumer started: {self._consumer}")
+        logger.info("[usage-queue] Consumer started: {}", self._consumer)
 
     async def stop(self) -> None:
         if not self._running:
@@ -172,7 +178,80 @@ class UsageQueueConsumer:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        logger.info(f"[usage-queue] Consumer stopped: {self._consumer}")
+        redis_client = await get_redis_client(require_redis=False)
+        if redis_client:
+            await self._delete_consumer(redis_client, self._consumer)
+        logger.info("[usage-queue] Consumer stopped: {}", self._consumer)
+
+    async def _delete_consumer(self, redis_client: Any, consumer_name: str) -> None:
+        try:
+            await redis_client.xgroup_delconsumer(
+                self._stream_key,
+                self._stream_group,
+                consumer_name,
+            )
+        except ResponseError as exc:
+            # Group/stream may already be gone during shutdown; ignore in that case.
+            if "NOGROUP" in str(exc) or "ERR no such key" in str(exc):
+                return
+            logger.debug("[usage-queue] DELCONSUMER failed for {}: {}", consumer_name, exc)
+        except Exception as exc:
+            logger.debug("[usage-queue] DELCONSUMER failed for {}: {}", consumer_name, exc)
+
+    async def _cleanup_stale_consumers(self, redis_client: Any) -> None:
+        try:
+            consumers = await redis_client.xinfo_consumers(
+                self._stream_key,
+                self._stream_group,
+            )
+        except ResponseError as exc:
+            if "NOGROUP" in str(exc):
+                return
+            logger.debug("[usage-queue] XINFO CONSUMERS failed: {}", exc)
+            return
+        except Exception as exc:
+            logger.debug("[usage-queue] XINFO CONSUMERS failed: {}", exc)
+            return
+
+        deleted = 0
+        for consumer in consumers or []:
+            if not isinstance(consumer, dict):
+                continue
+            consumer_name = str(consumer.get("name") or "").strip()
+            if not consumer_name or consumer_name == self._consumer:
+                continue
+
+            pending = int(consumer.get("pending", 0) or 0)
+            idle_ms = int(consumer.get("idle", 0) or 0)
+            if pending > 0 or idle_ms < self._stale_consumer_idle_ms:
+                continue
+
+            await self._delete_consumer(redis_client, consumer_name)
+            deleted += 1
+
+        if deleted:
+            logger.info(
+                "[usage-queue] Cleaned up {} stale consumers from group {}",
+                deleted,
+                self._stream_group,
+            )
+
+    async def _ack_and_delete_messages(self, redis_client: Any, message_ids: list[str]) -> None:
+        """ACK messages and immediately delete them from the main stream.
+
+        usage:events is only meant to be a short-lived buffer. Once an event is
+        successfully persisted (or moved to DLQ), keeping it in Redis only
+        retains duplicate history and inflates memory.
+        """
+        if not message_ids:
+            return
+
+        pipe = redis_client.pipeline()
+        for message_id in message_ids:
+            pipe.xack(self._stream_key, self._stream_group, message_id)
+        for message_id in message_ids:
+            pipe.xdel(self._stream_key, message_id)
+        await pipe.execute()
 
     async def _run(self) -> None:
         while self._running:
@@ -188,10 +267,10 @@ class UsageQueueConsumer:
             except asyncio.CancelledError:
                 break
             except (RedisTimeoutError, RedisConnectionError) as exc:
-                logger.warning(f"[usage-queue] Redis connection issue: {exc}")
+                logger.warning("[usage-queue] Redis connection issue: {}", exc)
                 await asyncio.sleep(1)
             except Exception as exc:
-                logger.exception(f"[usage-queue] Consumer loop error: {exc}")
+                logger.exception("[usage-queue] Consumer loop error: {}", exc)
                 await asyncio.sleep(1)
 
     async def _maybe_claim_pending(self, redis_client: Any) -> None:
@@ -209,7 +288,7 @@ class UsageQueueConsumer:
                 count=self._batch_size,
             )
         except ResponseError as exc:
-            logger.warning(f"[usage-queue] XAUTOCLAIM failed: {exc}")
+            logger.warning("[usage-queue] XAUTOCLAIM failed: {}", exc)
             return
         if not result:
             return
@@ -284,10 +363,7 @@ class UsageQueueConsumer:
 
         # 使用 pipeline 批量 ACK 成功处理的消息
         if success_ids:
-            pipe = redis_client.pipeline()
-            for message_id in success_ids:
-                pipe.xack(self._stream_key, self._stream_group, message_id)
-            await pipe.execute()
+            await self._ack_and_delete_messages(redis_client, success_ids)
 
     async def _process_record_batch(
         self,
@@ -295,8 +371,6 @@ class UsageQueueConsumer:
         messages: list[tuple[str, dict[str, Any], UsageEvent]],
     ) -> None:
         """批量处理记录类型的事件"""
-        db = create_session()
-
         try:
             # 准备批量记录数据
             records: list[dict[str, Any]] = []
@@ -307,39 +381,28 @@ class UsageQueueConsumer:
                 message_ids.append(message_id)
 
             # 批量写入
-            await UsageService.record_usage_batch(db, records)
+            await self._record_usage_batch(records)
 
-            # 使用 pipeline 批量 ACK 提升性能
-            pipe = redis_client.pipeline()
-            for message_id in message_ids:
-                pipe.xack(self._stream_key, self._stream_group, message_id)
-            await pipe.execute()
+            # 写库成功后立即从主队列删除，避免 Redis 保留已入库历史。
+            await self._ack_and_delete_messages(redis_client, message_ids)
 
-            logger.debug(f"[usage-queue] Batch processed {len(records)} records")
+            logger.debug("[usage-queue] Batch processed {} records", len(records))
 
         except Exception as exc:
-            # 批量处理失败，回退到逐条处理（复用已创建的 db session）
+            # 批量处理失败，回退到逐条处理，确保每条消息在线程内独立写库
             logger.warning(
-                f"[usage-queue] Batch processing failed, falling back to individual: {exc}"
+                "[usage-queue] Batch processing failed, falling back to individual: {}", exc
             )
-            try:
-                db.rollback()  # 清理批量失败的事务状态
-            except Exception:
-                pass
             success_ids: list[str] = []
             for message_id, fields, event in messages:
                 try:
-                    await self._apply_record_event(event, db=db)
+                    await self._apply_record_event(event)
                     success_ids.append(message_id)
                 except IntegrityError as ie:
                     # 重复 request_id 导致的唯一约束冲突，视为成功（记录已存在）
-                    try:
-                        db.rollback()
-                    except Exception:
-                        pass
                     if self._is_duplicate_key_error(ie):
                         logger.debug(
-                            f"[usage-queue] Duplicate request_id, skipping: {event.request_id}"
+                            "[usage-queue] Duplicate request_id, skipping: {}", event.request_id
                         )
                         success_ids.append(message_id)
                     else:
@@ -350,12 +413,7 @@ class UsageQueueConsumer:
                     )
             # 批量 ACK 成功处理的消息
             if success_ids:
-                pipe = redis_client.pipeline()
-                for message_id in success_ids:
-                    pipe.xack(self._stream_key, self._stream_group, message_id)
-                await pipe.execute()
-        finally:
-            db.close()
+                await self._ack_and_delete_messages(redis_client, success_ids)
 
     async def _handle_processing_error(
         self,
@@ -379,15 +437,18 @@ class UsageQueueConsumer:
                     )
                 else:
                     await redis_client.xadd(self._dlq_key, dlq_fields)
-                await redis_client.xack(self._stream_key, self._stream_group, message_id)
+                await self._ack_and_delete_messages(redis_client, [message_id])
                 logger.error(
-                    f"[usage-queue] Message moved to DLQ after {retries} attempts: {message_id}"
+                    "[usage-queue] Message moved to DLQ after {} attempts: {}", retries, message_id
                 )
             except Exception as exc:
-                logger.error(f"[usage-queue] Failed to move message to DLQ: {exc}")
+                logger.error("[usage-queue] Failed to move message to DLQ: {}", exc)
         else:
             logger.warning(
-                f"[usage-queue] Processing failed (attempt {retries}): {message_id} error={error}"
+                "[usage-queue] Processing failed (attempt {}): {} error={}",
+                retries,
+                message_id,
+                error,
             )
 
     async def _get_delivery_count(self, redis_client: Any, message_id: str) -> int:
@@ -413,99 +474,36 @@ class UsageQueueConsumer:
     async def _apply_streaming_event(self, event: UsageEvent) -> None:
         """处理 STREAMING 事件（状态更新）"""
         data = event.data
-        db = create_session()
-        try:
-            UsageService.update_usage_status(
-                db=db,
-                request_id=event.request_id,
-                status="streaming",
-                provider=data.get("provider"),
-                target_model=data.get("target_model"),
-                first_byte_time_ms=data.get("first_byte_time_ms"),
-                provider_id=data.get("provider_id"),
-                provider_endpoint_id=data.get("provider_endpoint_id"),
-                provider_api_key_id=data.get("provider_api_key_id"),
-                api_format=data.get("api_format"),
-                endpoint_api_format=data.get("endpoint_api_format"),
-                has_format_conversion=data.get("has_format_conversion"),
-                request_headers=data.get("request_headers"),
-                request_body=data.get("request_body"),
-                provider_request_headers=data.get("provider_request_headers"),
-                provider_request_body=data.get("provider_request_body"),
-            )
-        finally:
-            db.close()
 
-    async def _apply_record_event(self, event: UsageEvent, db: Session | None = None) -> None:
-        """处理记录类型事件（逐条写入，用于 fallback）
-
-        Args:
-            event: 使用事件
-            db: 可选的数据库会话。如果提供，复用该会话；否则创建新会话
-        """
-        from src.models.database import ApiKey, User
-
-        data = event.data
-        own_session = db is None
-        if own_session:
+        def _run_update() -> None:
             db = create_session()
-        try:
-            status = "completed"
-            if event.event_type == UsageEventType.FAILED:
-                status = "failed"
-            elif event.event_type == UsageEventType.CANCELLED:
-                status = "cancelled"
-
-            user = None
-            api_key = None
-            if data.get("user_id"):
-                user = db.query(User).filter(User.id == data["user_id"]).first()
-            if data.get("api_key_id"):
-                api_key = db.query(ApiKey).filter(ApiKey.id == data["api_key_id"]).first()
-
-            await UsageService.record_usage(
-                db=db,
-                user=user,
-                api_key=api_key,
-                provider=data.get("provider") or "unknown",
-                model=data.get("model") or "unknown",
-                input_tokens=int(data.get("input_tokens") or 0),
-                output_tokens=int(data.get("output_tokens") or 0),
-                cache_creation_input_tokens=int(data.get("cache_creation_input_tokens") or 0),
-                cache_read_input_tokens=int(data.get("cache_read_input_tokens") or 0),
-                request_type=data.get("request_type") or "chat",
-                api_format=data.get("api_format"),
-                endpoint_api_format=data.get("endpoint_api_format"),
-                has_format_conversion=bool(data.get("has_format_conversion") or False),
-                is_stream=bool(data.get("is_stream", True)),
-                response_time_ms=data.get("response_time_ms"),
-                first_byte_time_ms=data.get("first_byte_time_ms"),
-                status_code=int(data.get("status_code") or 200),
-                error_message=data.get("error_message"),
-                metadata=data.get("metadata"),
-                request_headers=data.get("request_headers"),
-                request_body=_parse_body(data.get("request_body")),
-                provider_request_headers=data.get("provider_request_headers"),
-                provider_request_body=_parse_body(data.get("provider_request_body")),
-                response_headers=data.get("response_headers"),
-                client_response_headers=data.get("client_response_headers"),
-                response_body=_parse_body(data.get("response_body")),
-                client_response_body=_parse_body(data.get("client_response_body")),
-                request_id=event.request_id,
-                provider_id=data.get("provider_id"),
-                provider_endpoint_id=data.get("provider_endpoint_id"),
-                provider_api_key_id=data.get("provider_api_key_id"),
-                status=status,
-                target_model=data.get("target_model"),
-                finalized_at=(
-                    datetime.fromtimestamp(event.timestamp_ms / 1000, tz=timezone.utc)
-                    if event.timestamp_ms > 0
-                    else None
-                ),
-            )
-        finally:
-            if own_session:
+            try:
+                UsageService.update_usage_status(
+                    db=db,
+                    request_id=event.request_id,
+                    status="streaming",
+                    provider=data.get("provider"),
+                    target_model=data.get("target_model"),
+                    first_byte_time_ms=data.get("first_byte_time_ms"),
+                    provider_id=data.get("provider_id"),
+                    provider_endpoint_id=data.get("provider_endpoint_id"),
+                    provider_api_key_id=data.get("provider_api_key_id"),
+                    api_format=data.get("api_format"),
+                    endpoint_api_format=data.get("endpoint_api_format"),
+                    has_format_conversion=data.get("has_format_conversion"),
+                    request_headers=data.get("request_headers"),
+                    request_body=data.get("request_body"),
+                    provider_request_headers=data.get("provider_request_headers"),
+                    provider_request_body=data.get("provider_request_body"),
+                )
+            finally:
                 db.close()
+
+        await asyncio.to_thread(_run_update)
+
+    async def _apply_record_event(self, event: UsageEvent) -> None:
+        """处理记录类型事件（逐条写入，用于 fallback）"""
+        await self._record_usage_batch([_event_to_record(event)])
 
     async def _apply_event(self, event: UsageEvent) -> None:
         """处理单个事件（兼容旧接口，用于测试）"""
@@ -531,9 +529,9 @@ class UsageQueueConsumer:
                     break
             # lag=未读消息数, pending=已读但未ACK的消息数
             if lag > 0 or pending_count > 0:
-                logger.info(f"[usage-queue] lag={lag} pending={pending_count}")
+                logger.info("[usage-queue] lag={} pending={}", lag, pending_count)
         except Exception as exc:
-            logger.debug(f"[usage-queue] metrics log failed: {exc}")
+            logger.debug("[usage-queue] metrics log failed: {}", exc)
 
 
 _consumer_instance: UsageQueueConsumer | None = None

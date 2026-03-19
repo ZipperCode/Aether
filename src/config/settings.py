@@ -20,6 +20,8 @@ except ImportError:
 
 
 class Config:
+    _VALID_COOKIE_SAMESITE = {"lax", "strict", "none"}
+
     def __init__(self) -> None:
         # 服务器配置
         self.host = os.getenv("HOST", "0.0.0.0")
@@ -87,6 +89,36 @@ class Config:
         # 注意: allow_credentials=True 时不能使用 allow_origins=["*"]
         self.cors_allow_credentials = os.getenv("CORS_ALLOW_CREDENTIALS", "true").lower() == "true"
 
+        # 应用时区配置（用于定时任务、账单日期等业务逻辑）
+        self.app_timezone = os.getenv("APP_TIMEZONE", "Asia/Shanghai")
+
+        self.auth_refresh_cookie_name = os.getenv(
+            "AUTH_REFRESH_COOKIE_NAME", "aether_refresh_token"
+        )
+        raw_refresh_cookie_samesite = os.getenv("AUTH_REFRESH_COOKIE_SAMESITE")
+        normalized_refresh_cookie_samesite = self._normalize_cookie_samesite(
+            raw_refresh_cookie_samesite
+        )
+        self._invalid_auth_refresh_cookie_samesite = (
+            raw_refresh_cookie_samesite
+            if raw_refresh_cookie_samesite is not None
+            and normalized_refresh_cookie_samesite is None
+            else None
+        )
+        # 生产默认使用 SameSite=None，兼容前后端跨站点部署下的 refresh cookie。
+        self.auth_refresh_cookie_samesite = (
+            normalized_refresh_cookie_samesite
+            if normalized_refresh_cookie_samesite is not None
+            else ("none" if self.environment == "production" else "lax")
+        )
+        self.auth_refresh_cookie_secure = (
+            os.getenv(
+                "AUTH_REFRESH_COOKIE_SECURE",
+                "true" if self.environment == "production" else "false",
+            ).lower()
+            == "true"
+        )
+
         # 管理员账户配置（用于初始化）
         self.admin_email = os.getenv("ADMIN_EMAIL", "admin@localhost")
         self.admin_username = os.getenv("ADMIN_USERNAME", "admin")
@@ -106,8 +138,6 @@ class Config:
         # 支付回调安全配置（公开回调入口必须携带该共享密钥）
         self.payment_callback_secret = os.getenv("PAYMENT_CALLBACK_SECRET", "").strip()
 
-        # LLM API 速率限制配置（每分钟请求数）
-        self.llm_api_rate_limit = int(os.getenv("LLM_API_RATE_LIMIT", "100"))
         self.public_api_rate_limit = int(os.getenv("PUBLIC_API_RATE_LIMIT", "60"))
 
         # 异常处理配置
@@ -201,7 +231,8 @@ class Config:
         # 最终写入 DB 前仍会按 SystemConfigService 做脱敏与截断。
         self.usage_queue_stream_key = os.getenv("USAGE_QUEUE_STREAM_KEY", "usage:events")
         self.usage_queue_stream_group = os.getenv("USAGE_QUEUE_STREAM_GROUP", "usage_consumers")
-        self.usage_queue_stream_maxlen = int(os.getenv("USAGE_QUEUE_STREAM_MAXLEN", "200000"))
+        # 主队列只做短暂缓冲；成功消费后会立即删除，不应把 Redis 当历史存储。
+        self.usage_queue_stream_maxlen = int(os.getenv("USAGE_QUEUE_STREAM_MAXLEN", "2000"))
         self.usage_queue_dlq_key = os.getenv("USAGE_QUEUE_DLQ_KEY", "usage:events:dlq")
         self.usage_queue_dlq_maxlen = int(os.getenv("USAGE_QUEUE_DLQ_MAXLEN", "5000"))
         self.usage_queue_consumer_batch = int(os.getenv("USAGE_QUEUE_CONSUMER_BATCH", "200"))
@@ -319,6 +350,25 @@ class Config:
         # MAINTENANCE_STARTUP_TASKS_ENABLED: 是否在启动时执行维护调度器初始化任务（清理、统计回填等）
         self.maintenance_startup_tasks_enabled = (
             os.getenv("MAINTENANCE_STARTUP_TASKS_ENABLED", "true").lower() == "true"
+        )
+
+        # 启动预热配置（降低懒加载导致的首请求延迟）
+        # STARTUP_WARMUP_ENABLED: 是否启用启动期预热任务（默认 true）
+        # STARTUP_WARMUP_GATE_READINESS: /readyz 是否等待预热完成（默认 true）
+        # STARTUP_WARMUP_PROVIDER_TYPES: 预热时优先 bootstrap 的 provider_type 列表（逗号分隔）
+        self.startup_warmup_enabled = os.getenv("STARTUP_WARMUP_ENABLED", "true").lower() == "true"
+        self.startup_warmup_gate_readiness = (
+            os.getenv("STARTUP_WARMUP_GATE_READINESS", "true").lower() == "true"
+        )
+        warmup_provider_types_env = os.getenv("STARTUP_WARMUP_PROVIDER_TYPES", "").strip()
+        self.startup_warmup_provider_types = (
+            [
+                provider_type.strip()
+                for provider_type in warmup_provider_types_env.split(",")
+                if provider_type.strip()
+            ]
+            if warmup_provider_types_env
+            else None
         )
 
         # API 文档配置
@@ -482,6 +532,13 @@ class Config:
         """
         errors: list[str] = []
 
+        if self._invalid_auth_refresh_cookie_samesite:
+            errors.append("AUTH_REFRESH_COOKIE_SAMESITE must be one of: lax, strict, none.")
+        if self.auth_refresh_cookie_samesite == "none" and not self.auth_refresh_cookie_secure:
+            errors.append(
+                "AUTH_REFRESH_COOKIE_SECURE must be true when AUTH_REFRESH_COOKIE_SAMESITE=none."
+            )
+
         if self.environment == "production":
             # 生产环境必须设置 JWT 密钥
             if not self.jwt_secret_key:
@@ -500,6 +557,15 @@ class Config:
                 )
 
         return errors
+
+    @classmethod
+    def _normalize_cookie_samesite(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized in cls._VALID_COOKIE_SAMESITE:
+            return normalized
+        return None
 
     def __repr__(self) -> None:
         """配置信息字符串表示"""

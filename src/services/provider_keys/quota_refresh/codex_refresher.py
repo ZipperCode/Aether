@@ -15,9 +15,11 @@ from sqlalchemy.orm import Session
 from src.core.crypto import crypto_service
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
 from src.services.provider.auth import get_provider_auth
+from src.services.provider.oauth_token import looks_like_token_invalidated
 from src.services.provider.pool.account_state import (
     OAUTH_ACCOUNT_BLOCK_PREFIX,
     OAUTH_EXPIRED_PREFIX,
+    OAUTH_REQUEST_FAILED_PREFIX,
 )
 from src.services.provider_keys.auth_type import normalize_auth_type
 from src.services.provider_keys.codex_usage_parser import (
@@ -67,14 +69,6 @@ def _extract_error_message_from_response(response: httpx.Response) -> str:
     return text[:300] if text else ""
 
 
-def _looks_like_token_invalidated(message: str | None) -> bool:
-    lowered = str(message or "").strip().lower()
-    return (
-        "authentication token has been invalidated" in lowered
-        or "token has been invalidated" in lowered
-    )
-
-
 def _looks_like_account_deactivated(message: str | None) -> bool:
     lowered = str(message or "").strip().lower()
     return "account has been deactivated" in lowered or "account deactivated" in lowered
@@ -97,6 +91,12 @@ def _build_structured_invalid_reason(*, status_code: int, upstream_message: str 
         detail = message or "OpenAI 账号已停用"
         return f"{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}"
 
+    # Codex 某些场景会返回 403，但语义仍是 access token 已失效/被轮换。
+    # 这类异常可通过 refresh_token 恢复，不应落成账号级 block。
+    if looks_like_token_invalidated(message):
+        detail = message or "Codex Token 无效或已过期"
+        return f"{OAUTH_EXPIRED_PREFIX}{detail}"
+
     if status_code == 401:
         detail = message or "Codex Token 无效或已过期 (401)"
         return f"{OAUTH_EXPIRED_PREFIX}{detail}"
@@ -106,6 +106,45 @@ def _build_structured_invalid_reason(*, status_code: int, upstream_message: str 
         return f"{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}"
 
     return message
+
+
+def _build_soft_request_failure_reason(*, status_code: int, upstream_message: str | None) -> str:
+    detail = str(upstream_message or "").strip() or f"Codex 请求失败 ({status_code})"
+    return f"{OAUTH_REQUEST_FAILED_PREFIX}{detail}"
+
+
+def _get_current_invalid_reason(key: ProviderAPIKey) -> str:
+    return str(getattr(key, "oauth_invalid_reason", None) or "").strip()
+
+
+def _merge_invalid_reason(current: str, candidate_reason: str) -> str:
+    if not current:
+        return candidate_reason
+    if current.startswith(OAUTH_ACCOUNT_BLOCK_PREFIX):
+        return current
+    if current.startswith(OAUTH_EXPIRED_PREFIX) and candidate_reason.startswith(
+        OAUTH_REQUEST_FAILED_PREFIX
+    ):
+        return current
+    return candidate_reason
+
+
+def _build_invalid_state_update(
+    key: ProviderAPIKey,
+    *,
+    candidate_reason: str,
+) -> dict[str, Any]:
+    current_reason = _get_current_invalid_reason(key)
+    merged_reason = _merge_invalid_reason(current_reason, candidate_reason)
+    if merged_reason == current_reason:
+        return {
+            "oauth_invalid_at": getattr(key, "oauth_invalid_at", None),
+            "oauth_invalid_reason": merged_reason,
+        }
+    return {
+        "oauth_invalid_at": datetime.now(timezone.utc),
+        "oauth_invalid_reason": merged_reason,
+    }
 
 
 async def refresh_codex_key_quota(
@@ -188,21 +227,20 @@ async def refresh_codex_key_quota(
             metadata_updates[key.id] = {"codex": header_quota}
 
         if status_code == 401:
-            state_updates[key.id] = {
-                "is_active": False,
-                "oauth_invalid_at": datetime.now(timezone.utc),
-                "oauth_invalid_reason": _build_structured_invalid_reason(
+            state_updates[key.id] = _build_invalid_state_update(
+                key,
+                candidate_reason=_build_structured_invalid_reason(
                     status_code=401,
                     upstream_message=err_msg,
                 ),
-            }
+            )
             return {
                 "key_id": key.id,
                 "key_name": key.name,
                 "status": "auth_invalid",
                 "message": f"wham/usage API 返回状态码 401{f': {err_msg}' if err_msg else ''}",
                 "status_code": 401,
-                "auto_disabled": True,
+                "auto_disabled": False,
             }
 
         if status_code == 402:
@@ -220,13 +258,13 @@ async def refresh_codex_key_quota(
                 if oauth_plan_type and not codex_meta.get("plan_type"):
                     codex_meta["plan_type"] = oauth_plan_type
                 metadata_updates[key.id] = {"codex": codex_meta}
-                state_updates[key.id] = {
-                    "oauth_invalid_at": datetime.now(timezone.utc),
-                    "oauth_invalid_reason": _build_structured_invalid_reason(
+                state_updates[key.id] = _build_invalid_state_update(
+                    key,
+                    candidate_reason=_build_structured_invalid_reason(
                         status_code=402,
                         upstream_message=err_msg,
                     ),
-                }
+                )
                 return {
                     "key_id": key.id,
                     "key_name": key.name,
@@ -242,6 +280,7 @@ async def refresh_codex_key_quota(
             state_updates[key.id] = {
                 "oauth_invalid_at": None,
                 "oauth_invalid_reason": None,
+                "is_active": True,
             }
             return {
                 "key_id": key.id,
@@ -252,21 +291,26 @@ async def refresh_codex_key_quota(
             }
 
         if status_code == 403:
-            state_updates[key.id] = {
-                "is_active": False,
-                "oauth_invalid_at": datetime.now(timezone.utc),
-                "oauth_invalid_reason": _build_structured_invalid_reason(
+            candidate_reason = _build_structured_invalid_reason(
+                status_code=403,
+                upstream_message=err_msg,
+            )
+            if not looks_like_token_invalidated(err_msg):
+                candidate_reason = _build_soft_request_failure_reason(
                     status_code=403,
                     upstream_message=err_msg,
-                ),
-            }
+                )
+            state_updates[key.id] = _build_invalid_state_update(
+                key,
+                candidate_reason=candidate_reason,
+            )
             return {
                 "key_id": key.id,
                 "key_name": key.name,
                 "status": "forbidden",
                 "message": f"wham/usage API 返回状态码 403{f': {err_msg}' if err_msg else ''}",
                 "status_code": 403,
-                "auto_disabled": True,
+                "auto_disabled": False,
             }
 
         return {
@@ -308,6 +352,7 @@ async def refresh_codex_key_quota(
         state_updates[key.id] = {
             "oauth_invalid_at": None,
             "oauth_invalid_reason": None,
+            "is_active": True,
         }
         return {
             "key_id": key.id,

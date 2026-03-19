@@ -466,7 +466,8 @@
             <Label>密码</Label>
             <Input
               v-model="addForm.password"
-              type="password"
+              type="text"
+              masked
               placeholder="可选"
               autocomplete="new-password"
               data-form-type="other"

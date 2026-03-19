@@ -179,7 +179,8 @@
           <Input
             id="login-password"
             v-model="form.password"
-            type="password"
+            type="text"
+            masked
             required
             placeholder="输入密码"
             autocomplete="off"
@@ -247,6 +248,7 @@ import { isDemoMode, DEMO_ACCOUNTS } from '@/config/demo'
 import RegisterDialog from './RegisterDialog.vue'
 import { authApi } from '@/api/auth'
 import { oauthApi, type OAuthProviderInfo } from '@/api/oauth'
+import { getClientDeviceId } from '@/utils/deviceId'
 import { getApiUrl } from '@/utils/url'
 import { getOAuthIcon } from '@/utils/oauth-icons'
 
@@ -350,7 +352,12 @@ async function handleLogin() {
 function handleOAuthLogin(providerType: string) {
   // 如果 sessionStorage 中没有 redirectPath（用户直接点击登录而非被守卫拦截），
   // 则不设置，让 AuthCallback 使用默认跳转逻辑
-  window.location.href = getApiUrl(`/api/oauth/${providerType}/authorize`)
+  const authorizeUrl = new URL(
+    getApiUrl(`/api/oauth/${providerType}/authorize`),
+    window.location.origin,
+  )
+  authorizeUrl.searchParams.set('client_device_id', getClientDeviceId())
+  window.location.href = authorizeUrl.toString()
 }
 
 function handleSwitchToRegister() {

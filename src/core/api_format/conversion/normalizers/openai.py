@@ -12,6 +12,20 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from src.core.api_format.conversion.constants import (
+    OPENAI_CHAT_PASSTHROUGH_KEYS as _CHAT_PASSTHROUGH_KEYS,
+)
+from src.core.api_format.conversion.constants import OPENAI_HANDLED_KEYS as _HANDLED_KEYS
+from src.core.api_format.conversion.constants import (
+    responses_tool_choice_to_chat as _responses_tool_choice_to_chat,
+)
+from src.core.api_format.conversion.constants import (
+    responses_tool_to_chat_tool as _responses_tool_to_chat_tool,
+)
+from src.core.api_format.conversion.constants import (
+    responses_web_search_tool_to_chat_options as _responses_web_search_tool_to_chat_options,
+)
+from src.core.api_format.conversion.constants import stable_json_dumps as _stable_json_dumps
 from src.core.api_format.conversion.field_mappings import (
     ERROR_TYPE_MAPPINGS,
     REASONING_EFFORT_TO_THINKING_BUDGET,
@@ -63,7 +77,28 @@ from src.core.api_format.conversion.stream_events import (
     ToolCallDeltaEvent,
 )
 from src.core.api_format.conversion.stream_state import StreamState
+from src.core.api_format.schema_utils import (
+    clone_openai_tool_with_fixed_parameters as _clone_openai_tool_with_fixed_parameters,
+)
+from src.core.api_format.schema_utils import (
+    clone_schema_with_openai_object_fixes as _clone_schema_with_openai_object_fixes,
+)
 from src.core.logger import logger
+
+
+def _normalize_chat_completion_id(raw_id: str) -> str:
+    """将非 chatcmpl- 前缀的 ID 规范化为 Chat Completions 格式。
+
+    OpenAI Chat Completions 响应的 id 约定使用 chatcmpl- 前缀，
+    当上游返回 Responses API 格式（resp_ 前缀）或其他格式时需要转换。
+    """
+    if not raw_id:
+        return "chatcmpl-unknown"
+    if raw_id.startswith("chatcmpl-"):
+        return raw_id
+    if raw_id.startswith("resp_"):
+        return "chatcmpl-" + raw_id[5:]
+    return raw_id
 
 
 class OpenAINormalizer(FormatNormalizer):
@@ -182,6 +217,10 @@ class OpenAINormalizer(FormatNormalizer):
         # 构建 extra，保留未识别字段
         extra: dict[str, Any] = {"openai": self._extract_extra(request, {"messages"})}
 
+        verbosity = request.get("verbosity")
+        if isinstance(verbosity, str) and verbosity:
+            extra["verbosity"] = verbosity
+
         # 处理 extra_body.google (用于 Gemini 特定功能透传，如 thinkingConfig, responseModalities)
         extra_body = request.get("extra_body")
         if isinstance(extra_body, dict):
@@ -201,6 +240,7 @@ class OpenAINormalizer(FormatNormalizer):
                 budget_tokens=REASONING_EFFORT_TO_THINKING_BUDGET[reasoning_effort],
                 extra={"reasoning_effort": reasoning_effort},
             )
+            extra["reasoning_effort"] = reasoning_effort
 
         # web_search_options 存入 extra 供目标 normalizer 使用
         web_search_options = request.get("web_search_options")
@@ -308,13 +348,27 @@ class OpenAINormalizer(FormatNormalizer):
                 # 跳过 Gemini 内置工具（在 OpenAI 中无对应物）
                 if t.extra.get("gemini_builtin_tool"):
                     continue
+                raw_chat_tool = t.extra.get("openai_chat_raw_tool")
+                if isinstance(raw_chat_tool, dict):
+                    openai_tools.append(_clone_openai_tool_with_fixed_parameters(raw_chat_tool))
+                    continue
+                raw_responses_tool = t.extra.get("openai_cli_raw_tool")
+                if isinstance(raw_responses_tool, dict):
+                    if web_search_options := _responses_web_search_tool_to_chat_options(
+                        raw_responses_tool
+                    ):
+                        result["web_search_options"] = web_search_options
+                    if chat_tool := _responses_tool_to_chat_tool(raw_responses_tool):
+                        openai_tools.append(_clone_openai_tool_with_fixed_parameters(chat_tool))
+                    continue
                 func: dict[str, Any] = {
-                    "name": t.name,
-                    "parameters": t.parameters or {},
                     **(t.extra.get("openai_function") or {}),
+                    "name": t.name,
                 }
                 if t.description is not None:
                     func["description"] = t.description
+                if t.parameters is not None:
+                    func["parameters"] = _clone_schema_with_openai_object_fixes(t.parameters)
                 openai_tools.append(
                     {
                         "type": "function",
@@ -329,15 +383,27 @@ class OpenAINormalizer(FormatNormalizer):
             result["tool_choice"] = self._tool_choice_to_openai(internal.tool_choice)
 
         # thinking -> reasoning_effort
+        effort: str | None = None
         if internal.thinking and internal.thinking.enabled:
             effort = internal.thinking.extra.get("reasoning_effort")
-            if not effort and internal.thinking.budget_tokens is not None:
-                for threshold, level in THINKING_BUDGET_TO_REASONING_EFFORT:
-                    if internal.thinking.budget_tokens <= threshold:
-                        effort = level
-                        break
-            if effort:
-                result["reasoning_effort"] = effort
+        # 显式 reasoning_effort 应优先于 budget 反推，避免覆盖 Claude output_config.effort
+        if not effort and internal.extra:
+            effort = internal.extra.get("reasoning_effort")
+        if (
+            not effort
+            and internal.thinking
+            and internal.thinking.enabled
+            and internal.thinking.budget_tokens is not None
+        ):
+            for threshold, level in THINKING_BUDGET_TO_REASONING_EFFORT:
+                if internal.thinking.budget_tokens <= threshold:
+                    effort = level
+                    break
+        if effort:
+            # OpenAI Chat Completions 仅支持 low/medium/high，xhigh 降级为 high
+            if effort == "xhigh":
+                effort = "high"
+            result["reasoning_effort"] = effort
 
         # parallel_tool_calls
         if internal.parallel_tool_calls is not None:
@@ -363,6 +429,35 @@ class OpenAINormalizer(FormatNormalizer):
             if internal.response_format.json_schema:
                 rf["json_schema"] = internal.response_format.json_schema
             result["response_format"] = rf
+
+        verbosity = internal.extra.get("verbosity") if internal.extra else None
+        if isinstance(verbosity, str) and verbosity:
+            result["verbosity"] = verbosity
+
+        openai_extra = internal.extra.get("openai", {}) if internal.extra else {}
+        openai_cli_extra = internal.extra.get("openai_cli", {}) if internal.extra else {}
+
+        if isinstance(openai_cli_extra, dict):
+            text_config = openai_cli_extra.get("text")
+            if isinstance(text_config, dict):
+                if "response_format" not in result:
+                    text_format = text_config.get("format")
+                    if isinstance(text_format, dict) and text_format.get("type"):
+                        result["response_format"] = text_format
+                if "verbosity" not in result:
+                    text_verbosity = text_config.get("verbosity")
+                    if isinstance(text_verbosity, str) and text_verbosity:
+                        result["verbosity"] = text_verbosity
+
+        # 还原 OpenAI Chat 特有的透传字段（先到先得，与 openai_cli 一致）
+        if isinstance(openai_extra, dict):
+            for key, value in openai_extra.items():
+                if key in _CHAT_PASSTHROUGH_KEYS and key not in result and key not in _HANDLED_KEYS:
+                    result[key] = value
+        if isinstance(openai_cli_extra, dict):
+            for key, value in openai_cli_extra.items():
+                if key in _CHAT_PASSTHROUGH_KEYS and key not in result and key not in _HANDLED_KEYS:
+                    result[key] = value
 
         return result
 
@@ -450,7 +545,7 @@ class OpenAINormalizer(FormatNormalizer):
         # 优先使用用户请求的原始模型名，回退到上游返回的模型名
         model_name = requested_model if requested_model else internal.model
         out: dict[str, Any] = {
-            "id": internal.id or "chatcmpl-unknown",
+            "id": _normalize_chat_completion_id(internal.id or ""),
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model_name,
@@ -728,7 +823,7 @@ class OpenAINormalizer(FormatNormalizer):
 
         def base_chunk(delta: dict[str, Any], finish_reason: str | None = None) -> dict[str, Any]:
             return {
-                "id": state.message_id or "chatcmpl-stream",
+                "id": _normalize_chat_completion_id(state.message_id or "chatcmpl-stream"),
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": state.model or "",
@@ -772,7 +867,11 @@ class OpenAINormalizer(FormatNormalizer):
         if isinstance(event, ContentBlockStartEvent) and event.block_type == ContentType.TOOL_USE:
             tool_id = event.tool_id or ""
             tool_name = event.tool_name or ""
-            tool_index = self._ensure_tool_call_index(ss, tool_id)
+            tool_index = self._ensure_tool_call_index(ss, tool_id, event.block_index)
+            if tool_id:
+                self._ss_dict(ss, "block_to_tool_id")[int(event.block_index)] = str(tool_id)
+            if tool_name:
+                self._ss_dict(ss, "block_to_tool_name")[int(event.block_index)] = str(tool_name)
             out.append(
                 base_chunk(
                     {
@@ -803,10 +902,7 @@ class OpenAINormalizer(FormatNormalizer):
                 # 构造 data URL 格式的图片
                 data_url = f"data:{image_media_type};base64,{image_data}"
                 # 存储图片数据，在 ContentBlockStopEvent 时输出
-                image_blocks = ss.get("image_blocks")
-                if not isinstance(image_blocks, dict):
-                    image_blocks = {}
-                    ss["image_blocks"] = image_blocks
+                image_blocks = self._ss_dict(ss, "image_blocks")
                 image_blocks[int(event.block_index)] = {
                     "url": data_url,
                     "media_type": image_media_type,
@@ -839,12 +935,28 @@ class OpenAINormalizer(FormatNormalizer):
             return out
 
         if isinstance(event, ToolCallDeltaEvent):
-            tool_index = self._ensure_tool_call_index(ss, event.tool_id)
-            # 后续 delta 只需 index + function.arguments；id/type 仅在 ContentBlockStartEvent 首次发送
+            tool_id = str(event.tool_id or "")
+            block_to_tool_id = self._ss_dict(ss, "block_to_tool_id")
+            if not tool_id:
+                tool_id = str(block_to_tool_id.get(int(event.block_index)) or "")
+            else:
+                block_to_tool_id[int(event.block_index)] = tool_id
+
+            tool_name = str(
+                self._ss_dict(ss, "block_to_tool_name").get(int(event.block_index)) or ""
+            )
+
+            tool_index = self._ensure_tool_call_index(ss, tool_id, event.block_index)
+            # 对严格客户端重复携带 id/type/name，避免它们把后续 delta 视为无效 tool_call。
             tc_delta: dict[str, Any] = {
                 "index": tool_index,
+                "type": "function",
                 "function": {"arguments": event.input_delta},
             }
+            if tool_id:
+                tc_delta["id"] = tool_id
+            if tool_name:
+                tc_delta["function"]["name"] = tool_name
             out.append(base_chunk({"tool_calls": [tc_delta]}))
             return out
 
@@ -1304,6 +1416,22 @@ class OpenAINormalizer(FormatNormalizer):
             if not isinstance(tool, dict):
                 continue
             if tool.get("type") != "function":
+                if tool.get("type") == "custom" and isinstance(tool.get("custom"), dict):
+                    custom = tool["custom"]
+                    name = str(custom.get("name") or "")
+                    if not name:
+                        continue
+                    out.append(
+                        ToolDefinition(
+                            name=name,
+                            description=custom.get("description"),
+                            parameters=None,
+                            extra={
+                                "openai_chat_raw_tool": tool,
+                                "openai_tool_kind": "custom",
+                            },
+                        )
+                    )
                 continue
 
             function_raw = tool.get("function")
@@ -1319,6 +1447,7 @@ class OpenAINormalizer(FormatNormalizer):
                     description=function.get("description"),
                     parameters=params_raw if isinstance(params_raw, dict) else None,
                     extra={
+                        "openai_chat_raw_tool": tool,
                         "openai_tool": self._extract_extra(tool, {"type", "function"}),
                         "openai_function": self._extract_extra(
                             function, {"name", "description", "parameters"}
@@ -1350,10 +1479,24 @@ class OpenAINormalizer(FormatNormalizer):
             return ToolChoice(
                 type=ToolChoiceType.TOOL, tool_name=name, extra={"openai": tool_choice}
             )
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "custom":
+            custom_raw = tool_choice.get("custom")
+            custom: dict[str, Any] = custom_raw if isinstance(custom_raw, dict) else {}
+            name = str(custom.get("name") or "")
+            return ToolChoice(
+                type=ToolChoiceType.TOOL, tool_name=name, extra={"openai": tool_choice}
+            )
 
         return ToolChoice(type=ToolChoiceType.AUTO, extra={"openai": tool_choice})
 
     def _tool_choice_to_openai(self, tool_choice: ToolChoice) -> str | dict[str, Any]:
+        raw_chat_choice = tool_choice.extra.get("openai")
+        if isinstance(raw_chat_choice, dict):
+            return raw_chat_choice
+        raw_responses_choice = tool_choice.extra.get("openai_cli")
+        if isinstance(raw_responses_choice, dict) and "type" in raw_responses_choice:
+            if chat_choice := _responses_tool_choice_to_chat(raw_responses_choice):
+                return chat_choice
         if tool_choice.type == ToolChoiceType.NONE:
             return "none"
         if tool_choice.type == ToolChoiceType.AUTO:
@@ -1380,25 +1523,32 @@ class OpenAINormalizer(FormatNormalizer):
         fn_raw = tool_call.get("function")
         fn: dict[str, Any] = fn_raw if isinstance(fn_raw, dict) else {}
         name = str(fn.get("name") or "")
-        args_str = str(fn.get("arguments") or "")
+        args_raw = fn.get("arguments") if isinstance(fn, dict) else None
         tool_id = str(tool_call.get("id") or "")
 
         tool_input: dict[str, Any]
-        if args_str:
-            try:
-                parsed = json.loads(args_str)
-                tool_input = parsed if isinstance(parsed, dict) else {"raw": parsed}
-            except json.JSONDecodeError:
-                tool_input = {"raw": args_str}
+        if isinstance(args_raw, str):
+            if args_raw:
+                try:
+                    parsed = json.loads(args_raw)
+                    tool_input = parsed if isinstance(parsed, dict) else {"raw": parsed}
+                except json.JSONDecodeError:
+                    tool_input = {"raw": args_raw}
+            else:
+                tool_input = {}
         else:
             tool_input = {}
+
+        extra: dict[str, Any] = {"openai": tool_call}
+        if isinstance(args_raw, str):
+            extra["raw"] = {"arguments": args_raw}
 
         return (
             ToolUseBlock(
                 tool_id=tool_id,
                 tool_name=name,
                 tool_input=tool_input,
-                extra={"openai": tool_call},
+                extra=extra,
             ),
             dropped,
         )
@@ -1408,7 +1558,7 @@ class OpenAINormalizer(FormatNormalizer):
     ) -> tuple[ToolUseBlock | None, dict[str, int]]:
         dropped: dict[str, int] = {}
         name = str(func_call.get("name") or "")
-        args_str = str(func_call.get("arguments") or "")
+        args_raw = func_call.get("arguments")
         if not name:
             dropped["openai_function_call_missing_name"] = (
                 dropped.get("openai_function_call_missing_name", 0) + 1
@@ -1416,21 +1566,28 @@ class OpenAINormalizer(FormatNormalizer):
             return None, dropped
 
         tool_input: dict[str, Any]
-        if args_str:
-            try:
-                parsed = json.loads(args_str)
-                tool_input = parsed if isinstance(parsed, dict) else {"raw": parsed}
-            except json.JSONDecodeError:
-                tool_input = {"raw": args_str}
+        if isinstance(args_raw, str):
+            if args_raw:
+                try:
+                    parsed = json.loads(args_raw)
+                    tool_input = parsed if isinstance(parsed, dict) else {"raw": parsed}
+                except json.JSONDecodeError:
+                    tool_input = {"raw": args_raw}
+            else:
+                tool_input = {}
         else:
             tool_input = {}
+
+        extra: dict[str, Any] = {"openai": {"function_call": func_call}}
+        if isinstance(args_raw, str):
+            extra["raw"] = {"arguments": args_raw}
 
         return (
             ToolUseBlock(
                 tool_id="call_0",
                 tool_name=name,
                 tool_input=tool_input,
-                extra={"openai": {"function_call": func_call}},
+                extra=extra,
             ),
             dropped,
         )
@@ -1457,13 +1614,14 @@ class OpenAINormalizer(FormatNormalizer):
             except json.JSONDecodeError:
                 parsed = None
 
+            raw_extra = {"raw": {"content": content}, "openai": msg}
             if parsed is not None:
                 return (
                     ToolResultBlock(
                         tool_use_id=tool_call_id,
                         output=parsed,
                         content_text=None,
-                        extra={"raw": {"content": content}, "openai": msg},
+                        extra=raw_extra,
                     ),
                     dropped,
                 )
@@ -1473,11 +1631,10 @@ class OpenAINormalizer(FormatNormalizer):
                     tool_use_id=tool_call_id,
                     output=None,
                     content_text=content,
-                    extra={"openai": msg},
+                    extra=raw_extra,
                 ),
                 dropped,
             )
-
         # 非字符串：尽量保留为 output
         return (
             ToolResultBlock(
@@ -1724,14 +1881,18 @@ class OpenAINormalizer(FormatNormalizer):
 
     def _tool_result_block_to_openai_message(self, block: ToolResultBlock) -> dict[str, Any]:
         content: str
-        if block.content_text is not None:
+        raw = block.extra.get("raw") if isinstance(block.extra, dict) else None
+        raw_content = raw.get("content") if isinstance(raw, dict) else None
+        if isinstance(raw_content, str):
+            content = raw_content
+        elif block.content_text is not None:
             content = block.content_text
         elif block.output is None:
             content = ""
         elif isinstance(block.output, str):
             content = block.output
         else:
-            content = json.dumps(block.output, ensure_ascii=False)
+            content = _stable_json_dumps(block.output)
 
         return {
             "role": "tool",
@@ -1741,12 +1902,19 @@ class OpenAINormalizer(FormatNormalizer):
 
     def _tool_use_block_to_openai_call(self, block: ToolUseBlock, index: int) -> dict[str, Any]:
         # index 参数仅用于 fallback id 生成；非流式响应的 tool_calls 数组不应包含 index 字段
+        raw = block.extra.get("raw") if isinstance(block.extra, dict) else None
+        raw_arguments = raw.get("arguments") if isinstance(raw, dict) else None
+        arguments = (
+            raw_arguments
+            if isinstance(raw_arguments, str)
+            else _stable_json_dumps(block.tool_input or {})
+        )
         return {
             "id": block.tool_id or f"call_{index}",
             "type": "function",
             "function": {
                 "name": block.tool_name,
-                "arguments": json.dumps(block.tool_input or {}, ensure_ascii=False),
+                "arguments": arguments,
             },
         }
 
@@ -1769,11 +1937,17 @@ class OpenAINormalizer(FormatNormalizer):
         except ValueError:
             return ErrorType.UNKNOWN
 
+    @staticmethod
+    def _ss_dict(ss: dict[str, Any], key: str) -> dict:
+        """Get or create a dict entry in stream state."""
+        val = ss.get(key)
+        if not isinstance(val, dict):
+            val = {}
+            ss[key] = val
+        return val
+
     def _ensure_tool_block_index(self, ss: dict[str, Any], tool_key: str) -> int:
-        mapping = ss.get("tool_id_to_block_index")
-        if not isinstance(mapping, dict):
-            mapping = {}
-            ss["tool_id_to_block_index"] = mapping
+        mapping = self._ss_dict(ss, "tool_id_to_block_index")
 
         if tool_key in mapping:
             return int(mapping[tool_key])
@@ -1783,17 +1957,31 @@ class OpenAINormalizer(FormatNormalizer):
         ss["next_block_index"] = next_idx + 1
         return next_idx
 
-    def _ensure_tool_call_index(self, ss: dict[str, Any], tool_id: str) -> int:
-        mapping = ss.get("tool_id_to_index")
+    def _ensure_tool_call_index(
+        self, ss: dict[str, Any], tool_id: str, block_index: int | None = None
+    ) -> int:
+        mapping: dict[str, int] = ss.get("tool_id_to_index")  # type: ignore[assignment]
         if not isinstance(mapping, dict):
             mapping = {}
             ss["tool_id_to_index"] = mapping
             ss["next_tool_index"] = 0
 
-        if tool_id in mapping:
-            return int(mapping[tool_id])
+        # block_index -> tool_index 的辅助映射，用于 tool_id 丢失时回落
+        block_mapping: dict[int, int] = self._ss_dict(ss, "block_to_tool_index")  # type: ignore[assignment]
 
+        # 优先用 tool_id 查找
+        if tool_id and tool_id in mapping:
+            return mapping[tool_id]
+
+        # tool_id 为空时，用 block_index 回落查找
+        if not tool_id and block_index is not None and block_index in block_mapping:
+            return block_mapping[block_index]
+
+        # 首次出现：分配新 index
         next_idx = int(ss.get("next_tool_index") or 0)
-        mapping[tool_id] = next_idx
+        if tool_id:
+            mapping[tool_id] = next_idx
+        if block_index is not None:
+            block_mapping[block_index] = next_idx
         ss["next_tool_index"] = next_idx + 1
         return next_idx

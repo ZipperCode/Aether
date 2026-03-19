@@ -4,6 +4,7 @@ Endpoint 健康监控 API
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -15,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import NotFoundException
 from src.core.logger import logger
 from src.database import get_db
@@ -28,9 +29,63 @@ from src.models.endpoint_models import (
     HealthSummaryResponse,
 )
 from src.services.health.endpoint import EndpointHealthService
-from src.services.health.monitor import HealthMonitor, health_monitor
+from src.services.health.monitor import HealthMonitor, get_health_monitor
 
 router = APIRouter(tags=["Endpoint Health"])
+
+
+def _recover_key_health_sync(db: Session, key_id: str, api_format: str | None) -> dict[str, Any]:
+    key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
+    if not key:
+        raise NotFoundException(f"Key {key_id} 不存在")
+
+    success = get_health_monitor().reset_health(db, key_id=key_id, api_format=api_format)
+    if not success:
+        raise Exception("重置健康度失败")
+
+    if not key.is_active:
+        key.is_active = True  # type: ignore[assignment]
+
+    db.commit()
+    return {
+        "is_active": bool(key.is_active),
+        "api_format": api_format,
+    }
+
+
+def _recover_all_keys_health_sync(db: Session) -> list[dict[str, Any]]:
+    candidates = (
+        db.query(ProviderAPIKey)
+        .filter(
+            ProviderAPIKey.circuit_breaker_by_format.isnot(None),
+            ProviderAPIKey.circuit_breaker_by_format != "{}",
+        )
+        .all()
+    )
+
+    circuit_open_keys = [
+        key
+        for key in candidates
+        if any(cb.get("open") for cb in (key.circuit_breaker_by_format or {}).values())
+    ]
+
+    recovered_keys: list[dict[str, Any]] = []
+    for key in circuit_open_keys:
+        key.health_by_format = {}  # type: ignore[assignment]
+        key.circuit_breaker_by_format = {}  # type: ignore[assignment]
+        recovered_keys.append(
+            {
+                "key_id": key.id,
+                "key_name": key.name,
+                "provider_id": key.provider_id,
+                "api_formats": key.api_formats,
+            }
+        )
+
+    if recovered_keys:
+        db.commit()
+
+    return recovered_keys
 
 
 def _format_str(api_format_enum: Any) -> str:
@@ -38,7 +93,33 @@ def _format_str(api_format_enum: Any) -> str:
     return api_format_enum.value if hasattr(api_format_enum, "value") else str(api_format_enum)
 
 
-pipeline = ApiRequestPipeline()
+def _fetch_recent_attempts_for_api_format(
+    db: Session,
+    *,
+    api_format: str,
+    since: datetime,
+    per_format_limit: int,
+) -> list[RequestCandidate]:
+    """获取单个 API 格式最近的最终态请求，用于事件展示。"""
+    final_statuses = ["success", "failed", "skipped"]
+    return (
+        db.query(RequestCandidate)
+        .join(ProviderEndpoint, RequestCandidate.endpoint_id == ProviderEndpoint.id)
+        .join(Provider, ProviderEndpoint.provider_id == Provider.id)
+        .filter(
+            ProviderEndpoint.is_active.is_(True),
+            Provider.is_active.is_(True),
+            ProviderEndpoint.api_format == api_format,
+            RequestCandidate.created_at >= since,
+            RequestCandidate.status.in_(final_statuses),
+        )
+        .order_by(RequestCandidate.created_at.desc())
+        .limit(per_format_limit)
+        .all()
+    )
+
+
+pipeline = get_pipeline()
 
 
 @router.get("/health/summary", response_model=HealthSummaryResponse)
@@ -230,7 +311,7 @@ async def recover_all_keys_health(
 
 class AdminHealthSummaryAdapter(AdminApiAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        summary = health_monitor.get_all_health_status(context.db)
+        summary = get_health_monitor().get_all_health_status(context.db)
         return HealthSummaryResponse(**summary)
 
 
@@ -324,7 +405,10 @@ class AdminApiFormatHealthMonitorAdapter(AdminApiAdapter):
                 func.count(RequestCandidate.id).label("count"),
             )
             .join(RequestCandidate, ProviderEndpoint.id == RequestCandidate.endpoint_id)
+            .join(Provider, ProviderEndpoint.provider_id == Provider.id)
             .filter(
+                ProviderEndpoint.is_active.is_(True),
+                Provider.is_active.is_(True),
                 RequestCandidate.created_at >= since,
                 RequestCandidate.status.in_(final_statuses),
             )
@@ -340,40 +424,15 @@ class AdminApiFormatHealthMonitorAdapter(AdminApiAdapter):
                 status_counts[fmt] = {"success": 0, "failed": 0, "skipped": 0}
             status_counts[fmt][status] = count
 
-        # 3. 获取最近一段时间的 RequestCandidate（限制数量）
-        # 使用上面定义的 final_statuses，排除中间状态
-        limit_rows = max(500, self.per_format_limit * 10)
-        rows = (
-            db.query(
-                RequestCandidate,
-                ProviderEndpoint.api_format,
-                ProviderEndpoint.provider_id,
-            )
-            .join(ProviderEndpoint, RequestCandidate.endpoint_id == ProviderEndpoint.id)
-            .filter(
-                RequestCandidate.created_at >= since,
-                RequestCandidate.status.in_(final_statuses),
-            )
-            .order_by(RequestCandidate.created_at.desc())
-            .limit(limit_rows)
-            .all()
-        )
-
-        grouped_attempts: dict[str, list[RequestCandidate]] = {}
-
-        for attempt, api_format_enum, provider_id in rows:
-            fmt = _format_str(api_format_enum)
-            if fmt not in grouped_attempts:
-                grouped_attempts[fmt] = []
-
-            # 只保留每个 API 格式最近 per_format_limit 条记录
-            if len(grouped_attempts[fmt]) < self.per_format_limit:
-                grouped_attempts[fmt].append(attempt)
-
-        # 4. 为所有活跃格式生成监控数据（包括没有请求记录的）
+        # 3. 为所有活跃格式生成监控数据（包括没有请求记录的）
         monitors: list[ApiFormatHealthMonitor] = []
         for api_format in all_formats:
-            attempts = grouped_attempts.get(api_format, [])
+            attempts = _fetch_recent_attempts_for_api_format(
+                db=db,
+                api_format=api_format,
+                since=since,
+                per_format_limit=self.per_format_limit,
+            )
             # 获取窗口内的真实统计数据
             # 只统计最终状态：success, failed, skipped
             # 中间状态（available, pending, used, started）不计入统计
@@ -452,7 +511,7 @@ class AdminKeyHealthAdapter(AdminApiAdapter):
     api_format: str | None = None
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        health_data = health_monitor.get_key_health(context.db, self.key_id, self.api_format)
+        health_data = get_health_monitor().get_key_health(context.db, self.key_id, self.api_format)
         if not health_data:
             raise NotFoundException(f"Key {self.key_id} 不存在")
 
@@ -491,20 +550,7 @@ class AdminRecoverKeyHealthAdapter(AdminApiAdapter):
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         db = context.db
-        key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == self.key_id).first()
-        if not key:
-            raise NotFoundException(f"Key {self.key_id} 不存在")
-
-        # 使用 health_monitor.reset_health 重置健康度
-        success = health_monitor.reset_health(db, key_id=self.key_id, api_format=self.api_format)
-        if not success:
-            raise Exception("重置健康度失败")
-
-        # 如果 Key 被禁用，重新启用
-        if not key.is_active:
-            key.is_active = True  # type: ignore[assignment]
-
-        db.commit()
+        await asyncio.to_thread(_recover_key_health_sync, db, self.key_id, self.api_format)
 
         if self.api_format:
             logger.info(f"管理员恢复Key健康状态: {self.key_id}/{self.api_format}")
@@ -534,46 +580,14 @@ class AdminRecoverAllKeysHealthAdapter(AdminApiAdapter):
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         db = context.db
+        recovered_keys = await asyncio.to_thread(_recover_all_keys_health_sync, db)
 
-        # 粗过滤：仅加载 circuit_breaker_by_format 非空的 Key，避免全表扫描
-        candidates = (
-            db.query(ProviderAPIKey)
-            .filter(
-                ProviderAPIKey.circuit_breaker_by_format.isnot(None),
-                ProviderAPIKey.circuit_breaker_by_format != "{}",
-            )
-            .all()
-        )
-
-        # 精确筛选有任何格式熔断的 Key
-        circuit_open_keys = [
-            key
-            for key in candidates
-            if any(cb.get("open") for cb in (key.circuit_breaker_by_format or {}).values())
-        ]
-
-        if not circuit_open_keys:
+        if not recovered_keys:
             return {
                 "message": "没有需要恢复的 Key",
                 "recovered_count": 0,
                 "recovered_keys": [],
             }
-
-        recovered_keys = []
-        for key in circuit_open_keys:
-            # 重置所有格式的健康度
-            key.health_by_format = {}  # type: ignore[assignment]
-            key.circuit_breaker_by_format = {}  # type: ignore[assignment]
-            recovered_keys.append(
-                {
-                    "key_id": key.id,
-                    "key_name": key.name,
-                    "provider_id": key.provider_id,
-                    "api_formats": key.api_formats,
-                }
-            )
-
-        db.commit()
 
         # 重置健康监控器的熔断计数
         HealthMonitor.reset_open_circuit_count()

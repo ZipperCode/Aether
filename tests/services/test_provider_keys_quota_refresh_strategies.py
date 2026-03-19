@@ -150,7 +150,7 @@ async def test_codex_refresher_http_non_200_returns_error(
 
 
 @pytest.mark.asyncio
-async def test_codex_refresher_http_401_marks_auth_invalid_and_disables(
+async def test_codex_refresher_http_401_marks_auth_invalid_without_disabling_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.services.provider_keys.quota_refresh import codex_refresher as module
@@ -193,9 +193,8 @@ async def test_codex_refresher_http_401_marks_auth_invalid_and_disables(
 
     assert result["status"] == "auth_invalid"
     assert result["status_code"] == 401
-    assert result["auto_disabled"] is True
+    assert result["auto_disabled"] is False
     assert metadata_updates == {}
-    assert state_updates["k1"]["is_active"] is False
     assert str(state_updates["k1"]["oauth_invalid_reason"]).startswith("[OAUTH_EXPIRED]")
 
 
@@ -262,6 +261,108 @@ async def test_codex_refresher_http_402_sets_quota_exhausted_metadata(
     assert codex_meta["secondary_used_percent"] == 100.0
     assert state_updates["k1"]["oauth_invalid_at"] is None
     assert state_updates["k1"]["oauth_invalid_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_codex_refresher_http_403_token_invalidated_marks_oauth_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.provider_keys.quota_refresh import codex_refresher as module
+
+    key = SimpleNamespace(
+        id="k1", name="K1", api_key="enc", auth_type="api_key", auth_config=None, proxy=None
+    )
+    provider = SimpleNamespace(proxy=None)
+    endpoint = SimpleNamespace()
+    metadata_updates: dict[str, dict[str, Any]] = {}
+    state_updates: dict[str, dict[str, Any]] = {}
+
+    async def _fake_auth_info(_endpoint: Any, _key: Any) -> Any:
+        return None
+
+    _install_module(
+        monkeypatch,
+        "src.services.proxy_node.resolver",
+        {
+            "resolve_effective_proxy": lambda provider_proxy, key_proxy: None,
+            "build_proxy_client_kwargs": lambda proxy, timeout: {"timeout": timeout},
+        },
+    )
+    monkeypatch.setattr(module, "get_provider_auth", _fake_auth_info)
+    monkeypatch.setattr(module.crypto_service, "decrypt", lambda _v: "sk-test")
+    response = _FakeResponse(
+        status_code=403,
+        payload={"error": {"message": "Authentication token has been invalidated."}},
+    )
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient", lambda **kwargs: _FakeAsyncClient(response, **kwargs)
+    )
+
+    result = await refresh_codex_key_quota(
+        db=cast(Any, _FakeDB()),
+        provider=cast(Any, provider),
+        key=cast(Any, key),
+        endpoint=cast(Any, endpoint),
+        codex_wham_usage_url="https://example.test",
+        metadata_updates=metadata_updates,
+        state_updates=state_updates,
+    )
+
+    assert result["status"] == "forbidden"
+    assert result["status_code"] == 403
+    assert result["auto_disabled"] is False
+    assert str(state_updates["k1"]["oauth_invalid_reason"]).startswith("[OAUTH_EXPIRED]")
+
+
+@pytest.mark.asyncio
+async def test_codex_refresher_http_403_generic_marks_soft_request_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.provider_keys.quota_refresh import codex_refresher as module
+
+    key = SimpleNamespace(
+        id="k1", name="K1", api_key="enc", auth_type="api_key", auth_config=None, proxy=None
+    )
+    provider = SimpleNamespace(proxy=None)
+    endpoint = SimpleNamespace()
+    metadata_updates: dict[str, dict[str, Any]] = {}
+    state_updates: dict[str, dict[str, Any]] = {}
+
+    async def _fake_auth_info(_endpoint: Any, _key: Any) -> Any:
+        return None
+
+    _install_module(
+        monkeypatch,
+        "src.services.proxy_node.resolver",
+        {
+            "resolve_effective_proxy": lambda provider_proxy, key_proxy: None,
+            "build_proxy_client_kwargs": lambda proxy, timeout: {"timeout": timeout},
+        },
+    )
+    monkeypatch.setattr(module, "get_provider_auth", _fake_auth_info)
+    monkeypatch.setattr(module.crypto_service, "decrypt", lambda _v: "sk-test")
+    response = _FakeResponse(
+        status_code=403,
+        payload={"error": {"message": "Access forbidden for this account."}},
+    )
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient", lambda **kwargs: _FakeAsyncClient(response, **kwargs)
+    )
+
+    result = await refresh_codex_key_quota(
+        db=cast(Any, _FakeDB()),
+        provider=cast(Any, provider),
+        key=cast(Any, key),
+        endpoint=cast(Any, endpoint),
+        codex_wham_usage_url="https://example.test",
+        metadata_updates=metadata_updates,
+        state_updates=state_updates,
+    )
+
+    assert result["status"] == "forbidden"
+    assert result["status_code"] == 403
+    assert result["auto_disabled"] is False
+    assert str(state_updates["k1"]["oauth_invalid_reason"]).startswith("[REQUEST_FAILED]")
 
 
 @pytest.mark.asyncio
@@ -754,8 +855,6 @@ async def test_antigravity_refresher_success_resets_forbidden_flag(
 async def test_kiro_refresher_runtime_401_marks_key_invalid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.services.provider_keys.quota_refresh import kiro_refresher as module
-
     class _Banned(Exception):
         pass
 
@@ -780,7 +879,10 @@ async def test_kiro_refresher_runtime_401_marks_key_invalid(
         "src.services.proxy_node.resolver",
         {"resolve_effective_proxy": lambda provider_proxy, key_proxy: None},
     )
-    monkeypatch.setattr(module.crypto_service, "decrypt", lambda _v: "{}")
+    monkeypatch.setattr(
+        "src.services.provider_keys.quota_refresh.kiro_refresher.crypto_service.decrypt",
+        lambda _v: "{}",
+    )
 
     db = _FakeDB()
     key = SimpleNamespace(
@@ -818,8 +920,6 @@ async def test_kiro_refresher_runtime_401_marks_key_invalid(
 async def test_kiro_refresher_success_updates_metadata_and_auth_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.services.provider_keys.quota_refresh import kiro_refresher as module
-
     class _Banned(Exception):
         pass
 
@@ -844,8 +944,14 @@ async def test_kiro_refresher_success_updates_metadata_and_auth_config(
         "src.services.proxy_node.resolver",
         {"resolve_effective_proxy": lambda provider_proxy, key_proxy: None},
     )
-    monkeypatch.setattr(module.crypto_service, "decrypt", lambda _v: json.dumps({"seed": 1}))
-    monkeypatch.setattr(module.crypto_service, "encrypt", lambda raw: f"ENC:{raw}")
+    monkeypatch.setattr(
+        "src.services.provider_keys.quota_refresh.kiro_refresher.crypto_service.decrypt",
+        lambda _v: json.dumps({"seed": 1}),
+    )
+    monkeypatch.setattr(
+        "src.services.provider_keys.quota_refresh.kiro_refresher.crypto_service.encrypt",
+        lambda raw: f"ENC:{raw}",
+    )
 
     key = SimpleNamespace(
         id="k1",

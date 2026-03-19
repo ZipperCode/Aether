@@ -14,7 +14,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.api.handlers.base.request_builder import apply_body_rules, get_provider_auth
+from src.api.handlers.base.request_builder import (
+    apply_body_rules,
+    evaluate_condition,
+    get_provider_auth,
+)
 from src.api.handlers.base.video_handler_base import (
     VideoHandlerBase,
     normalize_gemini_operation_id,
@@ -160,14 +164,22 @@ class GeminiVeoHandler(VideoHandlerBase):
                     converted_body["seconds"] = str(converted_body["seconds"])
 
                 if endpoint_body_rules:
-                    converted_body = apply_body_rules(converted_body, endpoint_body_rules)
+                    converted_body = apply_body_rules(
+                        converted_body,
+                        endpoint_body_rules,
+                        original_body=original_request_body,
+                    )
 
                 # 构建 OpenAI 风格的 URL
                 upstream_url = self._build_openai_upstream_url(endpoint.base_url)
 
                 # 构建 OpenAI 风格的请求头
                 headers = self._build_openai_upstream_headers(
-                    original_headers, upstream_key, endpoint
+                    original_headers,
+                    upstream_key,
+                    endpoint,
+                    body=converted_body,
+                    original_body=original_request_body,
                 )
 
                 client = await HTTPClientPool.get_default_client_async()
@@ -178,11 +190,20 @@ class GeminiVeoHandler(VideoHandlerBase):
                     original_request_body.copy() if endpoint_body_rules else original_request_body
                 )
                 if endpoint_body_rules:
-                    request_body = apply_body_rules(request_body, endpoint_body_rules)
+                    request_body = apply_body_rules(
+                        request_body,
+                        endpoint_body_rules,
+                        original_body=original_request_body,
+                    )
 
                 upstream_url = self._build_upstream_url(endpoint.base_url, internal_request.model)
                 headers = self._build_upstream_headers(
-                    original_headers, upstream_key, endpoint, auth_info
+                    original_headers,
+                    upstream_key,
+                    endpoint,
+                    auth_info,
+                    body=request_body,
+                    original_body=original_request_body,
                 )
                 client = await HTTPClientPool.get_default_client_async()
                 return await client.post(upstream_url, headers=headers, json=request_body)
@@ -294,6 +315,8 @@ class GeminiVeoHandler(VideoHandlerBase):
                 "",  # key 不重要，只是用于记录
                 outcome.candidate.endpoint,
                 None,  # auth_info
+                body=converted_request_body,
+                original_body=original_request_body,
             )
 
             UsageService.finalize_submitted(
@@ -531,6 +554,9 @@ class GeminiVeoHandler(VideoHandlerBase):
         upstream_key: str,
         endpoint: ProviderEndpoint,
         auth_info: Any | None,
+        *,
+        body: dict[str, Any] | None = None,
+        original_body: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         extra_headers = get_extra_headers_from_endpoint(endpoint)
         endpoint_sig = make_signature_key(
@@ -543,6 +569,9 @@ class GeminiVeoHandler(VideoHandlerBase):
             upstream_key,
             endpoint_headers=extra_headers,
             header_rules=getattr(endpoint, "header_rules", None),
+            body=body,
+            original_body=original_body,
+            condition_evaluator=evaluate_condition,
         )
         if auth_info:
             # 覆盖为 OAuth2 Bearer（Vertex AI）
@@ -574,6 +603,9 @@ class GeminiVeoHandler(VideoHandlerBase):
         original_headers: dict[str, str],
         upstream_key: str,
         endpoint: ProviderEndpoint,
+        *,
+        body: dict[str, Any] | None = None,
+        original_body: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         """构建 OpenAI 格式的请求头"""
         extra_headers = get_extra_headers_from_endpoint(endpoint)
@@ -587,6 +619,9 @@ class GeminiVeoHandler(VideoHandlerBase):
             upstream_key,
             endpoint_headers=extra_headers,
             header_rules=getattr(endpoint, "header_rules", None),
+            body=body,
+            original_body=original_body,
+            condition_evaluator=evaluate_condition,
         )
 
     def _create_task_record(

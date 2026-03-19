@@ -27,6 +27,7 @@ from src.services.usage._recording_helpers import (
     METADATA_KEEP_KEYS,
     METADATA_PRUNE_KEYS,
     build_usage_params,
+    deserialize_body_if_json,
     sanitize_request_metadata,
     update_existing_usage,
 )
@@ -102,6 +103,7 @@ def _increment_provider_api_key_totals(
         return
 
     from sqlalchemy import func as sql_func
+
     token_increment = int(total_tokens or 0)
     cost_increment = to_money_decimal(total_cost)
 
@@ -329,57 +331,60 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
         usage_params, total_cost = await cls._prepare_usage_record(params)
         total_cost = to_money_decimal(total_cost)
 
-        # 创建 Usage 记录
-        usage = Usage(**usage_params)
-        db.add(usage)
+        def _sync_record() -> Usage:
+            # 创建 Usage 记录与相关统计；同步 SQLAlchemy 操作统一移到线程池，避免阻塞事件循环。
+            usage = Usage(**usage_params)
+            db.add(usage)
 
-        # 更新 GlobalModel 使用计数（原子操作）
-        from sqlalchemy import update
+            # 更新 GlobalModel 使用计数（原子操作）
+            from sqlalchemy import update
 
-        from src.models.database import GlobalModel
+            from src.models.database import GlobalModel
 
-        db.execute(
-            update(GlobalModel)
-            .where(GlobalModel.name == model)
-            .values(usage_count=GlobalModel.usage_count + 1)
-        )
-
-        # 更新用户-模型调用次数计数器
-        cls._increment_user_model_usage(db, user, model)
-
-        # 更新 Provider 月度使用量（原子操作）
-        if provider_id:
-            actual_total_cost = Decimal(str(usage_params["actual_total_cost_usd"]))
             db.execute(
-                update(Provider)
-                .where(Provider.id == provider_id)
-                .values(monthly_used_usd=Provider.monthly_used_usd + actual_total_cost)
+                update(GlobalModel)
+                .where(GlobalModel.name == model)
+                .values(usage_count=GlobalModel.usage_count + 1)
             )
 
-        accounted, _charge_applied = cls._finalize_usage_billing(
-            db,
-            usage=usage,
-            total_cost=total_cost,
-            status=status,
-            finalized_at=finalized_at,
-        )
+            # 更新用户-模型调用次数计数器
+            cls._increment_user_model_usage(db, user, model)
 
-        if accounted:
-            _increment_provider_api_key_totals(
+            # 更新 Provider 月度使用量（原子操作）
+            if provider_id:
+                actual_total_cost = Decimal(str(usage_params["actual_total_cost_usd"]))
+                db.execute(
+                    update(Provider)
+                    .where(Provider.id == provider_id)
+                    .values(monthly_used_usd=Provider.monthly_used_usd + actual_total_cost)
+                )
+
+            accounted, _charge_applied = cls._finalize_usage_billing(
                 db,
-                provider_api_key_id,
-                total_tokens=int(usage_params.get("total_tokens") or 0),
-                total_cost=_get_actual_total_cost_usd(usage_params),
+                usage=usage,
+                total_cost=total_cost,
+                status=status,
+                finalized_at=finalized_at,
             )
 
-        dispatch_codex_quota_sync_from_response_headers(
-            provider_api_key_id=provider_api_key_id,
-            response_headers=response_headers,
-            db=db,
-        )
+            if accounted:
+                _increment_provider_api_key_totals(
+                    db,
+                    provider_api_key_id,
+                    total_tokens=int(usage_params.get("total_tokens") or 0),
+                    total_cost=_get_actual_total_cost_usd(usage_params),
+                )
 
-        db.commit()  # 立即提交事务，释放数据库锁
-        return usage
+            dispatch_codex_quota_sync_from_response_headers(
+                provider_api_key_id=provider_api_key_id,
+                response_headers=response_headers,
+                db=db,
+            )
+
+            db.commit()  # 立即提交事务，释放数据库锁
+            return usage
+
+        return await asyncio.to_thread(_sync_record)
 
     @classmethod
     async def record_usage(
@@ -696,13 +701,13 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
             error_message=error_message,
             metadata=metadata,
             request_headers=request_headers,
-            request_body=request_body,
+            request_body=deserialize_body_if_json(request_body),
             provider_request_headers=provider_request_headers,
-            provider_request_body=provider_request_body,
+            provider_request_body=deserialize_body_if_json(provider_request_body),
             response_headers=response_headers,
             client_response_headers=client_response_headers,
-            response_body=response_body,
-            client_response_body=client_response_body,
+            response_body=deserialize_body_if_json(response_body),
+            client_response_body=deserialize_body_if_json(client_response_body),
             request_id=request_id,
             provider_id=provider_id,
             provider_endpoint_id=provider_endpoint_id,

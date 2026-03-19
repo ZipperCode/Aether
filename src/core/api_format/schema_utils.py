@@ -96,6 +96,35 @@ def clean_gemini_schema(schema: dict[str, Any]) -> None:
     _clean_recursive(schema, is_schema_node=True)
 
 
+def clone_schema_with_openai_object_fixes(schema: dict[str, Any]) -> dict[str, Any]:
+    """Clone a schema and add missing properties for object nodes.
+
+    OpenAI function tools reject object-typed parameter schemas when the object
+    node does not declare a ``properties`` object. Keep the schema otherwise
+    unchanged and only backfill empty ``properties`` where needed.
+    """
+    cloned = copy.deepcopy(schema)
+    _ensure_object_properties_recursive(cloned)
+    return cloned
+
+
+def clone_openai_tool_with_fixed_parameters(tool: dict[str, Any]) -> dict[str, Any]:
+    """Clone an OpenAI Chat/Responses tool and repair function parameter schemas."""
+    cloned = copy.deepcopy(tool)
+
+    function = cloned.get("function")
+    if isinstance(function, dict):
+        params = function.get("parameters")
+        if isinstance(params, dict):
+            _ensure_object_properties_recursive(params)
+
+    params = cloned.get("parameters")
+    if isinstance(params, dict):
+        _ensure_object_properties_recursive(params)
+
+    return cloned
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: $defs 收集
 # ---------------------------------------------------------------------------
@@ -393,7 +422,8 @@ def _merge_all_of(obj: dict[str, Any]) -> None:
         return
 
     merged_props: dict[str, Any] = {}
-    merged_required: set[str] = set()
+    merged_required: list[str] = []
+    merged_required_seen: set[str] = set()
     other_fields: dict[str, Any] = {}
 
     for sub in all_of:
@@ -407,8 +437,9 @@ def _merge_all_of(obj: dict[str, Any]) -> None:
         r = sub.get("required")
         if isinstance(r, list):
             for item in r:
-                if isinstance(item, str):
-                    merged_required.add(item)
+                if isinstance(item, str) and item not in merged_required_seen:
+                    merged_required_seen.add(item)
+                    merged_required.append(item)
         # 合并其余字段
         for k, v in sub.items():
             if k not in ("properties", "required", "allOf") and k not in other_fields:
@@ -502,7 +533,31 @@ def _append_hint(obj: dict[str, Any], hint: str) -> None:
         obj["description"] = f"{desc} {hint}".strip() if desc else hint
 
 
+def _schema_type_includes_object(type_value: Any) -> bool:
+    if isinstance(type_value, str):
+        return type_value.lower() == "object"
+    if isinstance(type_value, list):
+        return any(isinstance(item, str) and item.lower() == "object" for item in type_value)
+    return False
+
+
+def _ensure_object_properties_recursive(value: Any) -> None:
+    if isinstance(value, dict):
+        if _schema_type_includes_object(value.get("type")) and not isinstance(
+            value.get("properties"), dict
+        ):
+            value["properties"] = {}
+        for item in value.values():
+            _ensure_object_properties_recursive(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _ensure_object_properties_recursive(item)
+
+
 __all__ = [
     "GEMINI_FORBIDDEN_SCHEMA_FIELDS",
     "clean_gemini_schema",
+    "clone_openai_tool_with_fixed_parameters",
+    "clone_schema_with_openai_object_fixes",
 ]

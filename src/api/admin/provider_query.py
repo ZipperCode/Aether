@@ -17,7 +17,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import update
-from sqlalchemy.orm import Session, joinedload, make_transient
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from src.api.handlers.base.chat_adapter_base import get_adapter_class
 from src.api.handlers.base.cli_adapter_base import get_cli_adapter_class
@@ -81,6 +81,25 @@ _ANTIGRAVITY_TIER_PRIORITY: dict[str, int] = {"ultra": 3, "pro": 2, "free": 1}
 def _get_adapter_for_format(api_format: str) -> Any:
     """按 api_format 获取 Chat/CLI adapter 类。"""
     return get_adapter_class(api_format) or get_cli_adapter_class(api_format)
+
+
+def _require_test_endpoint_base_url(endpoint: Any) -> str:
+    """校验测试链路里的 endpoint.base_url。"""
+    base_url = getattr(endpoint, "base_url", None)
+    if not isinstance(base_url, str):
+        endpoint_id = str(getattr(endpoint, "id", "") or "unknown")
+        api_format = str(getattr(endpoint, "api_format", "") or "unknown")
+        raise ValueError(
+            f"Endpoint {endpoint_id} ({api_format}) has invalid base_url type: "
+            f"expected str, got {type(base_url).__name__}"
+        )
+
+    normalized = base_url.strip()
+    if not normalized:
+        endpoint_id = str(getattr(endpoint, "id", "") or "unknown")
+        api_format = str(getattr(endpoint, "api_format", "") or "unknown")
+        raise ValueError(f"Endpoint {endpoint_id} ({api_format}) has empty base_url")
+    return normalized
 
 
 def _antigravity_sort_keys(api_keys: list[Any]) -> list[Any]:
@@ -207,7 +226,7 @@ class TestModelRequest(BaseModel):
     api_key_id: str | None = None
     endpoint_id: str | None = None  # 指定使用的端点ID
     stream: bool = False
-    message: str | None = "你好"
+    message: str | None = None
     api_format: str | None = None  # 指定使用的API格式，如果不指定则使用端点的默认格式
 
 
@@ -219,7 +238,7 @@ class TestModelFailoverRequest(BaseModel):
     model_name: str  # global 模式传 global_model_name, direct 模式传 provider_model_name
     api_format: str | None = None  # 指定 API 格式（endpoint signature）
     endpoint_id: str | None = None  # 指定仅使用该端点测试
-    message: str | None = "Hello"
+    message: str | None = None
     request_id: str | None = None
     concurrency: int = Field(default=1, ge=1, le=20)
 
@@ -256,6 +275,14 @@ class TestModelFailoverResponse(BaseModel):
 
 
 # ============ Internal helpers ============
+
+
+DEFAULT_MODEL_TEST_MESSAGE = "Hello! This is a test message."
+
+
+def _resolve_test_message(message: str | None) -> str:
+    normalized = str(message or "").strip()
+    return normalized or DEFAULT_MODEL_TEST_MESSAGE
 
 
 def _test_check_response_has_error(resp: dict[str, Any]) -> bool:
@@ -376,7 +403,20 @@ async def query_available_models(
         db.query(Provider)
         .options(
             joinedload(Provider.endpoints),
-            joinedload(Provider.api_keys),
+            selectinload(Provider.api_keys)
+            .defer(ProviderAPIKey.note)
+            .defer(ProviderAPIKey.last_error_msg)
+            .defer(ProviderAPIKey.auto_fetch_models)
+            .defer(ProviderAPIKey.locked_models)
+            .defer(ProviderAPIKey.model_include_patterns)
+            .defer(ProviderAPIKey.model_exclude_patterns)
+            .defer(ProviderAPIKey.last_models_fetch_at)
+            .defer(ProviderAPIKey.last_models_fetch_error)
+            .defer(ProviderAPIKey.max_probe_interval_minutes)
+            .defer(ProviderAPIKey.expires_at)
+            .defer(ProviderAPIKey.adjustment_history)
+            .defer(ProviderAPIKey.utilization_samples)
+            .defer(ProviderAPIKey.upstream_metadata),
         )
         .filter(Provider.id == request.provider_id)
         .first()
@@ -393,7 +433,7 @@ async def query_available_models(
     # 延迟导入避免循环依赖（与 upstream_fetcher.fetch_models_for_key 保持一致）
     from src.services.provider.envelope import ensure_providers_bootstrapped
 
-    ensure_providers_bootstrapped()
+    ensure_providers_bootstrapped(provider_types=[provider_type] if provider_type else None)
     has_custom_fetcher = UpstreamModelsFetcherRegistry.get(provider_type) is not None
 
     if not format_to_endpoint and not has_custom_fetcher:
@@ -460,22 +500,30 @@ async def query_available_models(
         error = f"Key {api_key.name or api_key.id}: {'; '.join(errors)}" if errors else None
         return unique_models, error, False  # models, error, from_cache
 
-    # 并发执行所有 Key 的获取
-    results = await asyncio.gather(*[fetch_for_key(key) for key in active_keys])
-
     # 合并结果
     all_models: list = []
     all_errors: list[str] = []
     cache_hit_count = 0
     fetch_count = 0
-    for models, error, from_cache in results:
-        all_models.extend(models)
-        if error:
-            all_errors.append(error)
-        if from_cache:
-            cache_hit_count += 1
-        else:
-            fetch_count += 1
+
+    # 并发执行所有 Key 的获取（增量聚合，减少中间列表峰值）
+    tasks = [asyncio.create_task(fetch_for_key(key)) for key in active_keys]
+    try:
+        for completed in asyncio.as_completed(tasks):
+            models, error, from_cache = await completed
+            all_models.extend(models)
+            if error:
+                all_errors.append(error)
+            if from_cache:
+                cache_hit_count += 1
+            else:
+                fetch_count += 1
+    finally:
+        pending_tasks = [task for task in tasks if not task.done()]
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
     # 按 model id 聚合，合并所有 api_format 到 api_formats 数组
     unique_models = _aggregate_models_by_id(all_models)
@@ -917,7 +965,7 @@ async def test_model(
     endpoint_config = {
         "api_key": api_key_value,
         "api_key_id": api_key.id,  # 添加API Key ID用于用量记录
-        "base_url": endpoint.base_url,
+        "base_url": _require_test_endpoint_base_url(endpoint),
         "api_format": endpoint.api_format,
         "extra_headers": extra_headers if extra_headers else None,
         "timeout": TimeoutDefaults.HTTP_REQUEST,
@@ -944,9 +992,7 @@ async def test_model(
         # 准备测试请求数据（优先使用流式）
         check_request = {
             "model": request.model_name,
-            "messages": [
-                {"role": "user", "content": request.message or "Hello! This is a test message."}
-            ],
+            "messages": [{"role": "user", "content": _resolve_test_message(request.message)}],
             "max_tokens": 30,
             "temperature": 0.7,
             "stream": True,
@@ -1601,7 +1647,7 @@ async def _execute_test_check(
     async def _run_check(stream: bool) -> dict[str, Any]:
         return await adapter_class.check_endpoint(
             None,
-            endpoint.base_url,
+            _require_test_endpoint_base_url(endpoint),
             api_key_value,
             {
                 **request_payload,
@@ -1658,7 +1704,6 @@ async def _run_concurrent_test(
     from src.services.candidate.recorder import CandidateRecorder
     from src.services.task.service import pool_on_error
 
-    semaphore = asyncio.Semaphore(max(1, concurrency))
     record_map = _precreate_concurrent_test_records(
         db=db,
         request_id=request_id,
@@ -1666,47 +1711,85 @@ async def _run_concurrent_test(
         user=user,
     )
 
-    # 预加载所有候选的 provider/endpoint/key，避免每个 worker 重复查询
-    _preloaded: dict[int, tuple[Provider, ProviderEndpoint, ProviderAPIKey]] = {}
-    with create_session() as preload_db:
-        provider_ids = {str(getattr(c.provider, "id", "") or "") for c in candidates}
-        endpoint_ids = {str(getattr(c.endpoint, "id", "") or "") for c in candidates}
-        key_ids = {str(getattr(c.key, "id", "") or "") for c in candidates}
-        providers_by_id = {
-            str(p.id): p
-            for p in preload_db.query(Provider).filter(Provider.id.in_(provider_ids)).all()
-        }
-        endpoints_by_id = {
-            str(e.id): e
-            for e in preload_db.query(ProviderEndpoint)
-            .filter(ProviderEndpoint.id.in_(endpoint_ids))
-            .all()
-        }
-        keys_by_id = {
-            str(k.id): k
-            for k in preload_db.query(ProviderAPIKey).filter(ProviderAPIKey.id.in_(key_ids)).all()
-        }
-        _already_detached: set[int] = set()
-        for idx, cand in enumerate(candidates):
-            p = providers_by_id.get(str(getattr(cand.provider, "id", "") or ""))
-            e = endpoints_by_id.get(str(getattr(cand.endpoint, "id", "") or ""))
-            k = keys_by_id.get(str(getattr(cand.key, "id", "") or ""))
-            if p is not None and e is not None and k is not None:
-                # make_transient 将对象脱离 session 并保留已加载属性，
-                # 避免 expired 状态导致跨协程访问时触发 lazy load 报错。
-                # 同一个对象（多个 candidate 可能共享同一 provider/endpoint）
-                # 只需处理一次。
-                for obj in (p, e, k):
-                    obj_id = id(obj)
-                    if obj_id not in _already_detached:
-                        make_transient(obj)
-                        _already_detached.add(obj_id)
-                _preloaded[idx] = (p, e, k)
-
     success_payload: dict[str, Any] = {}
     success_event = asyncio.Event()
     candidate_recorder = CandidateRecorder(db)
     last_error: Exception | None = None
+
+    candidate_indexes = [
+        candidate_index
+        for candidate_index, candidate in enumerate(candidates)
+        if not bool(getattr(candidate, "is_skipped", False))
+    ]
+    candidate_identity_map: dict[int, tuple[str, str, str]] = {}
+    for candidate_index in candidate_indexes:
+        candidate = candidates[candidate_index]
+        candidate_identity_map[candidate_index] = (
+            str(getattr(candidate.provider, "id", "") or ""),
+            str(getattr(candidate.endpoint, "id", "") or ""),
+            str(getattr(candidate.key, "id", "") or ""),
+        )
+
+    preloaded_runtime_objects: dict[int, tuple[Provider, ProviderEndpoint, ProviderAPIKey]] = {}
+    providers_by_id: dict[str, Provider] = {}
+    endpoints_by_id: dict[str, ProviderEndpoint] = {}
+    keys_by_id: dict[str, ProviderAPIKey] = {}
+    provider_ids = {
+        provider_id for provider_id, _, _ in candidate_identity_map.values() if provider_id
+    }
+    endpoint_ids = {
+        endpoint_id for _, endpoint_id, _ in candidate_identity_map.values() if endpoint_id
+    }
+    key_ids = {key_id for _, _, key_id in candidate_identity_map.values() if key_id}
+
+    if candidate_identity_map:
+        with create_session() as preload_db:
+            if provider_ids:
+                providers_by_id = {
+                    str(provider.id): provider
+                    for provider in preload_db.query(Provider)
+                    .filter(Provider.id.in_(provider_ids))
+                    .all()
+                }
+            if endpoint_ids:
+                endpoints_by_id = {
+                    str(endpoint.id): endpoint
+                    for endpoint in preload_db.query(ProviderEndpoint)
+                    .filter(ProviderEndpoint.id.in_(endpoint_ids))
+                    .all()
+                }
+            if key_ids:
+                keys_by_id = {
+                    str(key.id): key
+                    for key in preload_db.query(ProviderAPIKey)
+                    .filter(ProviderAPIKey.id.in_(key_ids))
+                    .all()
+                }
+
+            for provider in providers_by_id.values():
+                preload_db.expunge(provider)
+            for endpoint in endpoints_by_id.values():
+                preload_db.expunge(endpoint)
+            for key in keys_by_id.values():
+                preload_db.expunge(key)
+
+    for candidate_index, (provider_id, endpoint_id, key_id) in candidate_identity_map.items():
+        if not provider_id or not endpoint_id or not key_id:
+            continue
+        local_provider = providers_by_id.get(provider_id)
+        local_endpoint = endpoints_by_id.get(endpoint_id)
+        local_key = keys_by_id.get(key_id)
+        if local_provider is None or local_endpoint is None or local_key is None:
+            continue
+        preloaded_runtime_objects[candidate_index] = (local_provider, local_endpoint, local_key)
+
+    def _load_candidate_runtime_objects(
+        candidate_index: int,
+    ) -> tuple[Provider, ProviderEndpoint, ProviderAPIKey]:
+        loaded = preloaded_runtime_objects.get(candidate_index)
+        if loaded is None:
+            raise RuntimeError("并发测试目标不存在或已被删除")
+        return loaded
 
     async def _worker(candidate_index: int) -> dict[str, Any]:
         nonlocal last_error
@@ -1714,75 +1797,77 @@ async def _run_concurrent_test(
 
         started = False
         started_at = 0.0
+        local_provider: Provider | None = None
+        local_endpoint: ProviderEndpoint | None = None
+        local_key: ProviderAPIKey | None = None
 
         try:
-            preloaded = _preloaded.get(candidate_index)
-            if preloaded is None:
-                raise RuntimeError("并发测试目标不存在或已被删除")
-            local_provider, local_endpoint, local_key = preloaded
             if success_event.is_set() or await is_cancelled():
                 _mark_concurrent_test_record_cancelled(record_id)
                 return {"status": "cancelled"}
 
-            async with semaphore:
-                if success_event.is_set() or await is_cancelled():
-                    _mark_concurrent_test_record_cancelled(record_id)
-                    return {"status": "cancelled"}
+            local_provider, local_endpoint, local_key = _load_candidate_runtime_objects(
+                candidate_index
+            )
 
-                with create_session() as update_db:
-                    RequestCandidateService.mark_candidate_started(update_db, record_id)
+            if success_event.is_set() or await is_cancelled():
+                _mark_concurrent_test_record_cancelled(record_id)
+                return {"status": "cancelled"}
 
-                started = True
-                started_at = time.perf_counter()
-                response, auth_type = await _execute_test_check(
-                    provider_obj=local_provider,
-                    endpoint=local_endpoint,
-                    key=local_key,
-                    effective_model=effective_model_by_candidate_index.get(
-                        candidate_index,
-                        str(request_payload.get("model", "") or ""),
-                    ),
-                    request_payload=request_payload,
-                    request_timeout=request_timeout,
-                    provider_type=provider_type,
-                    user=user,
-                    db=None,
+            with create_session() as update_db:
+                RequestCandidateService.mark_candidate_started(update_db, record_id)
+
+            started = True
+            started_at = time.perf_counter()
+            response, auth_type = await _execute_test_check(
+                provider_obj=local_provider,
+                endpoint=local_endpoint,
+                key=local_key,
+                effective_model=effective_model_by_candidate_index.get(
+                    candidate_index,
+                    str(request_payload.get("model", "") or ""),
+                ),
+                request_payload=request_payload,
+                request_timeout=request_timeout,
+                provider_type=provider_type,
+                user=user,
+                db=None,
+            )
+            elapsed_ms = max(0, int((time.perf_counter() - started_at) * 1000))
+
+            with create_session() as parse_db:
+                parse_key = (
+                    parse_db.query(ProviderAPIKey)
+                    .filter(ProviderAPIKey.id == str(getattr(local_key, "id", "") or ""))
+                    .first()
                 )
-                elapsed_ms = max(0, int((time.perf_counter() - started_at) * 1000))
+                parsed = _extract_test_response_or_raise(
+                    response=response,
+                    endpoint=local_endpoint,
+                    provider_name=str(local_provider.name),
+                    auth_type=auth_type,
+                    api_key=parse_key or local_key,
+                    db=parse_db,
+                )
 
-                with create_session() as parse_db:
-                    parse_key = (
-                        parse_db.query(ProviderAPIKey)
-                        .filter(ProviderAPIKey.id == str(getattr(local_key, "id", "") or ""))
-                        .first()
-                    )
-                    parsed = _extract_test_response_or_raise(
-                        response=response,
-                        endpoint=local_endpoint,
-                        provider_name=str(local_provider.name),
-                        auth_type=auth_type,
-                        api_key=parse_key or local_key,
-                        db=parse_db,
-                    )
+            with create_session() as update_db:
+                RequestCandidateService.mark_candidate_success(
+                    db=update_db,
+                    candidate_id=record_id,
+                    status_code=200,
+                    latency_ms=elapsed_ms,
+                )
 
-                with create_session() as update_db:
-                    RequestCandidateService.mark_candidate_success(
-                        db=update_db,
-                        candidate_id=record_id,
-                        status_code=200,
-                        latency_ms=elapsed_ms,
-                    )
-
-                if not success_event.is_set():
-                    success_payload.update(
-                        {
-                            "response": parsed,
-                            "candidate_index": candidate_index,
-                            "key_id": str(getattr(local_key, "id", "") or "") or None,
-                        }
-                    )
-                    success_event.set()
-                return {"status": "success"}
+            if not success_event.is_set():
+                success_payload.update(
+                    {
+                        "response": parsed,
+                        "candidate_index": candidate_index,
+                        "key_id": str(getattr(local_key, "id", "") or "") or None,
+                    }
+                )
+                success_event.set()
+            return {"status": "success"}
         except asyncio.CancelledError:
             if started or not success_event.is_set():
                 _mark_concurrent_test_record_cancelled(record_id)
@@ -1798,9 +1883,8 @@ async def _run_concurrent_test(
             elif isinstance(exc, EmbeddedErrorException):
                 status_code = int(exc.error_code or 200)
 
-            loaded = _preloaded.get(candidate_index)
-            if loaded is not None and status_code is not None:
-                await pool_on_error(loaded[0], loaded[2], status_code, exc)
+            if local_provider is not None and local_key is not None and status_code is not None:
+                await pool_on_error(local_provider, local_key, status_code, exc)
 
             with create_session() as update_db:
                 RequestCandidateService.mark_candidate_failed(
@@ -1824,45 +1908,70 @@ async def _run_concurrent_test(
             await asyncio.sleep(0.1)
         return False
 
-    tasks = [
-        asyncio.create_task(_worker(candidate_index))
-        for candidate_index, candidate in enumerate(candidates)
-        if not bool(getattr(candidate, "is_skipped", False))
-    ]
+    candidate_queue: asyncio.Queue[int] = asyncio.Queue()
+    for candidate_index in candidate_indexes:
+        candidate_queue.put_nowait(candidate_index)
+
+    def _drain_candidate_queue() -> None:
+        while True:
+            try:
+                candidate_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                candidate_queue.task_done()
+
+    async def _queue_worker() -> None:
+        while not success_event.is_set():
+            if await is_cancelled():
+                return
+            try:
+                candidate_index = candidate_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+            try:
+                result = await _worker(candidate_index)
+                if result.get("status") == "success":
+                    _drain_candidate_queue()
+                    return
+                if await is_cancelled():
+                    _drain_candidate_queue()
+                    return
+            finally:
+                candidate_queue.task_done()
+
+    worker_count = min(max(1, concurrency), len(candidate_indexes))
+    workers = [asyncio.create_task(_queue_worker()) for _ in range(worker_count)]
     disconnect_task = asyncio.create_task(_watch_disconnect())
-    pending: set[asyncio.Task[Any]] = set(tasks)
-    pending.add(disconnect_task)
+    queue_done_task = asyncio.create_task(candidate_queue.join())
+    success_wait_task = asyncio.create_task(success_event.wait())
 
     try:
-        while pending:
-            if pending == {disconnect_task}:
-                disconnect_task.cancel()
-                pending.clear()
-                break
-
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            if disconnect_task in done and disconnect_task.result() is True:
-                for task in pending:
-                    task.cancel()
-                break
-
-            for finished in done:
-                if finished is disconnect_task:
-                    continue
-                result = finished.result()
-                if result.get("status") == "success":
-                    for task in pending:
-                        task.cancel()
-                    pending.discard(disconnect_task)
-                    disconnect_task.cancel()
-                    break
-            if success_event.is_set():
-                break
+        done, _ = await asyncio.wait(
+            {disconnect_task, queue_done_task, success_wait_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnect_task in done and disconnect_task.result() is True:
+            _drain_candidate_queue()
+        elif success_wait_task in done and success_wait_task.result():
+            _drain_candidate_queue()
     finally:
-        await asyncio.gather(*pending, return_exceptions=True)
-        if not disconnect_task.done():
-            disconnect_task.cancel()
-        await asyncio.gather(disconnect_task, return_exceptions=True)
+        for worker in workers:
+            if not worker.done():
+                worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+
+        for task in (disconnect_task, queue_done_task, success_wait_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            disconnect_task,
+            queue_done_task,
+            success_wait_task,
+            return_exceptions=True,
+        )
 
     if success_event.is_set():
         _cancel_remaining_concurrent_test_records(request_id)
@@ -2076,6 +2185,7 @@ async def test_model_failover(
     from src.services.scheduling.scheduling_config import SchedulingConfig
     from src.services.task import TaskService
     from src.services.task.core.protocol import AttemptKind, AttemptResult
+    from src.services.task.request_state import MutableRequestBodyState
 
     provider = (
         db.query(Provider)
@@ -2177,7 +2287,7 @@ async def test_model_failover(
 
     request_payload = {
         "model": request.model_name,
-        "messages": [{"role": "user", "content": request.message or "Hello"}],
+        "messages": [{"role": "user", "content": _resolve_test_message(request.message)}],
         "max_tokens": 30,
         "temperature": 0.7,
         "stream": True,
@@ -2260,7 +2370,7 @@ async def test_model_failover(
                 user_api_key=None,
                 is_stream=False,
                 capability_requirements=None,
-                request_body_ref={"body": dict(request_payload)},
+                request_body_state=MutableRequestBodyState(dict(request_payload)),
                 request_headers=None,
                 request_body=dict(request_payload),
                 affinity_key=f"provider-test:{provider.id}",

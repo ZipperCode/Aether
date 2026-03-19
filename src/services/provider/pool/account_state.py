@@ -9,9 +9,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from src.services.provider_keys.quota_reader import get_quota_reader
+
 OAUTH_ACCOUNT_BLOCK_PREFIX = "[ACCOUNT_BLOCK] "
 OAUTH_REFRESH_FAILED_PREFIX = "[REFRESH_FAILED] "
 OAUTH_EXPIRED_PREFIX = "[OAUTH_EXPIRED] "
+OAUTH_REQUEST_FAILED_PREFIX = "[REQUEST_FAILED] "
 
 # -- 按原因细分的关键词组 --
 # 封禁类 (suspended / banned)
@@ -69,7 +72,7 @@ def _classify_block_reason(text: str) -> tuple[str, str]:
         return "oauth_expired", "Token 失效"
     if any(kw in lowered for kw in _KEYWORDS_VERIFICATION):
         return "account_verification", "需要验证"
-    if 'deactivated_workspace' in lowered:
+    if "deactivated_workspace" in lowered:
         return "workspace_deactivated", "工作区停用"
     if any(kw in lowered for kw in _KEYWORDS_DISABLED):
         return "account_disabled", "账号停用"
@@ -130,30 +133,13 @@ def _resolve_from_metadata(
         if isinstance(maybe_bucket, dict):
             provider_bucket = maybe_bucket
 
-    if (
-        normalized_provider == "kiro"
-        and provider_bucket
-        and _is_truthy_flag(provider_bucket.get("is_banned"))
-    ):
-        reason = _extract_reason(provider_bucket, "ban_reason", "reason", "message")
+    quota_block = get_quota_reader(normalized_provider, upstream_metadata).account_block()
+    if quota_block.blocked:
         return PoolAccountState(
             blocked=True,
-            code="account_banned",
-            label="账号封禁",
-            reason=reason or "Kiro 账号已封禁",
-        )
-
-    if (
-        normalized_provider == "antigravity"
-        and provider_bucket
-        and _is_truthy_flag(provider_bucket.get("is_forbidden"))
-    ):
-        reason = _extract_reason(provider_bucket, "forbidden_reason", "reason", "message")
-        return PoolAccountState(
-            blocked=True,
-            code="account_forbidden",
-            label="访问受限",
-            reason=reason or "Antigravity 账户访问受限",
+            code=quota_block.code,
+            label=quota_block.label,
+            reason=quota_block.reason,
         )
 
     for source in (provider_bucket, upstream_metadata):
@@ -207,6 +193,12 @@ def _resolve_from_oauth_invalid_reason(reason: str | None) -> PoolAccountState |
             reason=cleaned or "OAuth Token 已过期且无法续期",
         )
 
+    if text.startswith(OAUTH_REFRESH_FAILED_PREFIX) or text.startswith(OAUTH_REQUEST_FAILED_PREFIX):
+        return None
+
+    if text.startswith("["):
+        return None
+
     lowered = text.lower()
     if any(keyword in lowered for keyword in ACCOUNT_BLOCK_REASON_KEYWORDS):
         code, label = _classify_block_reason(text)
@@ -244,6 +236,7 @@ __all__ = [
     "OAUTH_ACCOUNT_BLOCK_PREFIX",
     "OAUTH_EXPIRED_PREFIX",
     "OAUTH_REFRESH_FAILED_PREFIX",
+    "OAUTH_REQUEST_FAILED_PREFIX",
     "PoolAccountState",
     "resolve_pool_account_state",
 ]

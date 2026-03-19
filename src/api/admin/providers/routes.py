@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, load_only
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
 from src.api.base.models_service import invalidate_models_list_cache
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.config.constants import CacheTTL
 from src.core.enums import ProviderBillingType
 from src.core.exceptions import InvalidRequestException, NotFoundException
@@ -35,7 +35,7 @@ from src.utils.cache_decorator import cache_result
 from .summary import _build_provider_summary
 
 router = APIRouter(tags=["Provider CRUD"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # 映射预览配置（管理后台功能，限制宽松）
@@ -76,13 +76,17 @@ def _resolve_new_provider_priority(
     """Resolve insertion priority for a newly created provider.
 
     Returns ``(priority, needs_shift)``.  When the caller explicitly specifies
-    a priority we need to shift existing rows; when auto-topping we simply pick
-    ``min - 1`` so no shift is required.
+    a priority we need to shift existing rows. For auto-top insertion we prefer
+    ``min - 1`` when that still stays non-negative; otherwise we clamp to ``0``
+    and shift existing rows down to preserve ordering.
     """
     if requested_priority is not None:
         return int(requested_priority), True
     if current_min_priority is not None:
-        return int(current_min_priority) - 1, False
+        current_min = int(current_min_priority)
+        if current_min <= 0:
+            return 0, True
+        return current_min - 1, False
     return 100, False
 
 

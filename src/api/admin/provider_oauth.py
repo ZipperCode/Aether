@@ -21,11 +21,13 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from sqlalchemy.orm import Session
@@ -37,8 +39,8 @@ from src.core.logger import logger
 from src.core.provider_oauth_utils import enrich_auth_config, post_oauth_token
 from src.core.provider_templates.fixed_providers import FIXED_PROVIDERS
 from src.core.provider_templates.types import ProviderType
-from src.database import create_session
-from src.database.database import get_db
+from src.database import get_db_context
+from src.database.database import create_session, get_db
 from src.models.database import Provider, ProviderAPIKey, User
 from src.services.provider.pool.config import parse_pool_config
 from src.services.provider_keys.auth_type import OAUTH_AUTH_TYPES
@@ -47,6 +49,49 @@ from src.utils.async_utils import safe_create_task
 from src.utils.auth_utils import require_admin
 
 router = APIRouter(prefix="/api/admin/provider-oauth", tags=["Provider OAuth"])
+
+
+def _store_completed_oauth_sync(
+    key_id: str,
+    provider_type: str,
+    access_token: str,
+    auth_config: dict[str, Any],
+) -> None:
+    with get_db_context() as db:
+        key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
+        if not key:
+            raise NotFoundException("Key 不存在", "key")
+        key.api_key = crypto_service.encrypt(access_token)
+        key.auth_config = crypto_service.encrypt(json.dumps(auth_config))
+
+
+def _mark_refresh_failed_sync(key_id: str, reason: str) -> None:
+    with get_db_context() as db:
+        key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
+        if not key:
+            raise NotFoundException("Key 不存在", "key")
+        key.oauth_invalid_at = datetime.now(timezone.utc)
+        key.oauth_invalid_reason = reason
+
+
+def _store_refreshed_oauth_sync(
+    key_id: str,
+    access_token: str,
+    parsed_auth_config: dict[str, Any],
+) -> None:
+    with get_db_context() as db:
+        key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
+        if not key:
+            raise NotFoundException("Key 不存在", "key")
+
+        key.api_key = crypto_service.encrypt(access_token)
+        key.auth_config = crypto_service.encrypt(json.dumps(parsed_auth_config))
+        # 刷新成功 => 清除所有 oauth_invalid 标记（包括 [ACCOUNT_BLOCK]）。
+        # Token 能成功刷新说明账号可用，之前的 block 标记应视为过时。
+        if getattr(key, "oauth_invalid_at", None) is not None:
+            key.oauth_invalid_at = None
+            key.oauth_invalid_reason = None
+        key.is_active = True
 
 
 # ==============================================================================
@@ -916,8 +961,6 @@ async def complete_oauth(
     if not access_token:
         raise InvalidRequestException("token exchange 返回缺少 access_token")
 
-    # store
-    key.api_key = crypto_service.encrypt(access_token)
     auth_config: dict[str, Any] = {
         "provider_type": provider_type,
         "token_type": token.get("token_type"),
@@ -935,8 +978,13 @@ async def complete_oauth(
         proxy_config=proxy_config,
     )
 
-    key.auth_config = crypto_service.encrypt(json.dumps(auth_config))
-    db.commit()
+    await run_in_threadpool(
+        _store_completed_oauth_sync,
+        key_id,
+        provider_type,
+        access_token,
+        auth_config,
+    )
 
     return CompleteOAuthResponse(
         provider_type=provider_type,
@@ -996,18 +1044,20 @@ async def refresh_oauth(
             try:
                 access_token, new_cfg = await refresh_access_token(cfg, proxy_config=proxy_config)
             except Exception as e:
-                key.oauth_invalid_at = datetime.now(timezone.utc)
-                key.oauth_invalid_reason = f"[REFRESH_FAILED] Token 续期失败: {e}"
-                db.commit()
+                await run_in_threadpool(
+                    _mark_refresh_failed_sync,
+                    key_id,
+                    f"[REFRESH_FAILED] Token 续期失败: {e}",
+                )
                 logger.warning("Kiro Key {} token 刷新失败，已标记为刷新失效: {}", key_id, e)
                 raise InvalidRequestException("Kiro token refresh 失败，请检查凭据是否有效")
 
-            key.api_key = crypto_service.encrypt(access_token)
-            key.auth_config = crypto_service.encrypt(json.dumps(new_cfg.to_dict()))
-            key.oauth_invalid_at = None
-            key.oauth_invalid_reason = None
-            key.is_active = True
-            db.commit()
+            await run_in_threadpool(
+                _store_refreshed_oauth_sync,
+                key_id,
+                access_token,
+                new_cfg.to_dict(),
+            )
 
             return CompleteOAuthResponse(
                 provider_type=provider_type,
@@ -1088,13 +1138,11 @@ async def refresh_oauth(
                 error_reason = resp.text[:100] if resp.text else f"HTTP {resp.status_code}"
 
             if resp.status_code in (400, 401, 403):
-                from datetime import datetime, timezone
-
-                key.oauth_invalid_at = datetime.now(timezone.utc)
-                key.oauth_invalid_reason = (
-                    f"[REFRESH_FAILED] Token 续期失败 ({resp.status_code}): {error_reason}"
+                await run_in_threadpool(
+                    _mark_refresh_failed_sync,
+                    key_id,
+                    f"[REFRESH_FAILED] Token 续期失败 ({resp.status_code}): {error_reason}",
                 )
-                db.commit()
                 logger.warning(
                     "Key {} OAuth token 刷新失败，已标记为刷新失效: {}", key_id, error_reason
                 )
@@ -1115,7 +1163,6 @@ async def refresh_oauth(
         if not access_token:
             raise InvalidRequestException("token refresh 返回缺少 access_token")
 
-        key.api_key = crypto_service.encrypt(access_token)
         parsed["token_type"] = token.get("token_type")
         if new_refresh_token:
             parsed["refresh_token"] = new_refresh_token
@@ -1138,14 +1185,7 @@ async def refresh_oauth(
                 key_id,
             )
 
-        key.auth_config = crypto_service.encrypt(json.dumps(parsed))
-        from src.services.provider.oauth_token import is_account_level_block
-
-        if not is_account_level_block(getattr(key, "oauth_invalid_reason", None)):
-            key.oauth_invalid_at = None
-            key.oauth_invalid_reason = None
-            key.is_active = True
-        db.commit()
+        await run_in_threadpool(_store_refreshed_oauth_sync, key_id, access_token, parsed)
 
         return CompleteOAuthResponse(
             provider_type=provider_type,

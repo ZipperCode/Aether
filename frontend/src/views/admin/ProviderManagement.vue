@@ -154,7 +154,7 @@
           </TableHeader>
           <TableBody>
             <ProviderTableRow
-              v-for="provider in providers"
+              v-for="provider in displayedProviders"
               :key="provider.id"
               :provider="provider"
               :editing-description-id="editingDescriptionId"
@@ -189,7 +189,7 @@
         class="xl:hidden divide-y divide-border/40"
       >
         <ProviderMobileCard
-          v-for="provider in providers"
+          v-for="provider in displayedProviders"
           :key="provider.id"
           :provider="provider"
           :editing-description-id="editingDescriptionId"
@@ -467,6 +467,20 @@ const opsConfigProviderWebsite = ref('')
 
 // 内联编辑备注
 const editingDescriptionId = ref<string | null>(null)
+
+function sortProvidersByActiveAndPriority(items: ProviderWithEndpointsSummary[]) {
+  return [...items].sort((a, b) => {
+    if (a.is_active !== b.is_active) {
+      return a.is_active ? -1 : 1
+    }
+    if (a.provider_priority !== b.provider_priority) {
+      return a.provider_priority - b.provider_priority
+    }
+    return new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+  })
+}
+
+const displayedProviders = computed(() => sortProvidersByActiveAndPriority(providers.value))
 
 function startEditDescription(_event: Event, provider: ProviderWithEndpointsSummary) {
   editingDescriptionId.value = provider.id

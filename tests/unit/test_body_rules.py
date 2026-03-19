@@ -1,6 +1,8 @@
 from typing import Any
 
-from src.api.handlers.base.request_builder import apply_body_rules
+from src.api.handlers.base.request_builder import (
+    apply_body_rules,
+)
 
 
 class TestApplyBodyRulesNestedPaths:
@@ -34,20 +36,20 @@ class TestApplyBodyRulesNestedPaths:
         )
         assert result == {"old": {}, "new": {"path": "value"}}
 
-    def test_protected_top_level_key(self) -> None:
+    def test_top_level_keys_can_be_updated(self) -> None:
         body = {"model": "gpt-4", "extra": {"model": "ignored"}}
         result = apply_body_rules(
             body,
             [
-                {"action": "set", "path": "model.sub", "value": "x"},  # 应被忽略
-                {"action": "set", "path": "extra.model", "value": "y"},  # 应生效
+                {"action": "set", "path": "model", "value": "gpt-4.1"},
+                {"action": "set", "path": "extra.model", "value": "y"},
             ],
         )
-        assert result["model"] == "gpt-4"  # 顶层受保护，不变
-        assert result["extra"]["model"] == "y"  # extra 不受保护
+        assert result["model"] == "gpt-4.1"
+        assert result["extra"]["model"] == "y"
 
     def test_escaped_dot(self) -> None:
-        body = {}
+        body: dict[str, Any] = {}
         result = apply_body_rules(
             body,
             [
@@ -80,7 +82,7 @@ class TestApplyBodyRulesNestedPaths:
         assert result == {"a": {"b": 2}}
 
     def test_set_complex_value(self) -> None:
-        body = {}
+        body: dict[str, Any] = {}
         result = apply_body_rules(
             body,
             [
@@ -182,14 +184,14 @@ class TestSetWithOriginalPlaceholder:
         )
         assert result == {"a": {"b": [{"content": "original"}]}}
 
-    def test_protected_field_ignored(self) -> None:
-        """受保护字段（model, stream）跳过"""
+    def test_original_placeholder_updates_top_level_field(self) -> None:
+        """顶层字段同样支持 {{$original}} 占位符更新"""
         body = {"model": "gpt-4", "other": "val"}
         result = apply_body_rules(
             body,
             [{"action": "set", "path": "model", "value": "{{$original}}_modified"}],
         )
-        assert result["model"] == "gpt-4"
+        assert result["model"] == "gpt-4_modified"
 
     def test_does_not_mutate_original(self) -> None:
         """不修改原始 body"""
@@ -976,7 +978,7 @@ class TestConditionalBodyRules:
         assert result["feature"] is True
 
     def test_condition_on_missing_nested_path(self) -> None:
-        body = {"config": {}}
+        body: dict[str, Any] = {"config": {}}
         result = apply_body_rules(
             body,
             [
@@ -1408,3 +1410,209 @@ class TestItemCondition:
         # flag=False，全局条件不满足，所有元素都不变
         assert "active" not in result["tools"][0]
         assert "active" not in result["tools"][1]
+
+    def test_nested_all_any_condition_with_item_ref(self) -> None:
+        """嵌套 all/any 中包含 $item 时，按元素递归评估。"""
+        body = {
+            "flag": True,
+            "tools": [
+                {"name": "a", "type": "read"},
+                {"name": "b", "type": "write"},
+                {"name": "c", "type": "other"},
+            ],
+        }
+        result = apply_body_rules(
+            body,
+            [
+                {
+                    "action": "set",
+                    "path": "tools[*].enabled",
+                    "value": True,
+                    "condition": {
+                        "all": [
+                            {"path": "flag", "op": "eq", "value": True},
+                            {
+                                "any": [
+                                    {"path": "$item.type", "op": "eq", "value": "read"},
+                                    {"path": "$item.type", "op": "eq", "value": "write"},
+                                ]
+                            },
+                        ]
+                    },
+                }
+            ],
+        )
+        assert result["tools"][0]["enabled"] is True
+        assert result["tools"][1]["enabled"] is True
+        assert "enabled" not in result["tools"][2]
+
+    def test_condition_source_original_uses_original_body_after_current_mutation(self) -> None:
+        """source=original 在前序规则改写 current body 后仍读取原始请求体。"""
+        original_body = {"metadata": {"mode": "prod"}}
+        result = apply_body_rules(
+            original_body,
+            [
+                {"action": "set", "path": "metadata.mode", "value": "test"},
+                {
+                    "action": "set",
+                    "path": "audit.from_original",
+                    "value": True,
+                    "condition": {
+                        "path": "metadata.mode",
+                        "op": "eq",
+                        "value": "prod",
+                        "source": "original",
+                    },
+                },
+                {
+                    "action": "set",
+                    "path": "audit.from_current",
+                    "value": True,
+                    "condition": {
+                        "path": "metadata.mode",
+                        "op": "eq",
+                        "value": "prod",
+                    },
+                },
+            ],
+            original_body=original_body,
+        )
+        assert result["metadata"]["mode"] == "test"
+        assert result["audit"]["from_original"] is True
+        assert "from_current" not in result["audit"]
+
+    def test_condition_all_any_can_mix_original_and_current_sources(self) -> None:
+        """组合条件允许 current/original 混用。"""
+        original_body = {"mode": "prod", "count": 0}
+        result = apply_body_rules(
+            original_body,
+            [
+                {"action": "set", "path": "count", "value": 3},
+                {
+                    "action": "set",
+                    "path": "matched",
+                    "value": True,
+                    "condition": {
+                        "all": [
+                            {"path": "count", "op": "gte", "value": 1},
+                            {
+                                "any": [
+                                    {
+                                        "path": "mode",
+                                        "op": "eq",
+                                        "value": "prod",
+                                        "source": "original",
+                                    },
+                                    {"path": "mode", "op": "eq", "value": "stage"},
+                                ]
+                            },
+                        ]
+                    },
+                },
+            ],
+            original_body=original_body,
+        )
+        assert result["matched"] is True
+
+
+class TestPromptFieldMutations:
+    def test_openai_cli_prompt_fields_can_be_updated(self) -> None:
+        body = {
+            "model": "gpt-5-codex",
+            "input": [{"role": "user", "content": "hi"}],
+        }
+
+        result = apply_body_rules(
+            body,
+            [
+                {"action": "set", "path": "instructions", "value": "You are GPT-5."},
+                {"action": "set", "path": "input[0].content", "value": "patched"},
+                {"action": "set", "path": "prompt_cache_key", "value": "blocked"},
+            ],
+        )
+
+        assert result["instructions"] == "You are GPT-5."
+        assert result["input"][0]["content"] == "patched"
+        assert result["prompt_cache_key"] == "blocked"
+
+    def test_gemini_camelcase_alias_prompt_fields_can_be_updated(self) -> None:
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "systemInstruction": {"parts": [{"text": "system"}]},
+            "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+            "generationConfig": {"temperature": 0.1},
+            "metadata": {"safe": True},
+        }
+
+        result = apply_body_rules(
+            body,
+            [
+                {"action": "set", "path": "systemInstruction.parts[0].text", "value": "mutated"},
+                {"action": "drop", "path": "toolConfig"},
+                {"action": "rename", "from": "generationConfig", "to": "generation_config"},
+                {"action": "append", "path": "contents", "value": {"role": "model", "parts": []}},
+                {
+                    "action": "insert",
+                    "path": "contents",
+                    "index": 0,
+                    "value": {"role": "user", "parts": [{"text": "preface"}]},
+                },
+                {"action": "set", "path": "metadata.safe", "value": False},
+            ],
+        )
+
+        assert result["contents"] == [
+            {"role": "user", "parts": [{"text": "preface"}]},
+            {"role": "user", "parts": [{"text": "hi"}]},
+            {"role": "model", "parts": []},
+        ]
+        assert result["systemInstruction"] == {"parts": [{"text": "mutated"}]}
+        assert "toolConfig" not in result
+        assert "generationConfig" not in result
+        assert result["generation_config"] == {"temperature": 0.1}
+        assert result["metadata"]["safe"] is False
+
+    def test_openai_prompt_fields_allow_all_mutating_actions(self) -> None:
+        body = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "ReadFile"}],
+            "tool_choice": {"type": "function", "function": {"name": "ReadFile"}},
+            "metadata": {"safe": True},
+        }
+
+        result = apply_body_rules(
+            body,
+            [
+                {"action": "set", "path": "messages", "value": []},
+                {"action": "drop", "path": "tools"},
+                {"action": "rename", "from": "tool_choice", "to": "choice"},
+                {
+                    "action": "append",
+                    "path": "messages",
+                    "value": {"role": "assistant", "content": "x"},
+                },
+                {
+                    "action": "insert",
+                    "path": "messages",
+                    "index": 0,
+                    "value": {"role": "system", "content": "x"},
+                },
+                {
+                    "action": "regex_replace",
+                    "path": "tools[0].name",
+                    "pattern": "Read",
+                    "replacement": "Write",
+                },
+                {"action": "name_style", "path": "tools[*].name", "style": "snake_case"},
+                {"action": "set", "path": "metadata.safe", "value": False},
+            ],
+        )
+
+        assert result["messages"] == [
+            {"role": "system", "content": "x"},
+            {"role": "assistant", "content": "x"},
+        ]
+        assert "tools" not in result
+        assert "tool_choice" not in result
+        assert result["choice"] == {"type": "function", "function": {"name": "ReadFile"}}
+        assert result["metadata"]["safe"] is False
