@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
 from sqlalchemy.orm import Session
 
-from src.core.logger import logger
 from src.modules.search_pool_gateway.models import GatewayApiKey, GatewayToken, GatewayUsageLog
 
 SERVICE_WORKSPACE_META: dict[str, dict[str, str]] = {
@@ -28,77 +25,6 @@ SERVICE_WORKSPACE_META: dict[str, dict[str, str]] = {
         "route_path": "/firecrawl/v2/scrape",
     },
 }
-
-TAVILY_SYNC_URL = "https://app.tavily.com/api/keys"
-TAVILY_SYNC_COOKIE_ENV = "SEARCH_POOL_TAVILY_SYNC_COOKIE"
-TAVILY_SYNC_USER_AGENT_ENV = "SEARCH_POOL_TAVILY_SYNC_USER_AGENT"
-TAVILY_SYNC_REFERER_ENV = "SEARCH_POOL_TAVILY_SYNC_REFERER"
-DEFAULT_TAVILY_SYNC_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-)
-DEFAULT_TAVILY_SYNC_REFERER = "https://app.tavily.com/home"
-
-
-def _format_sync_value(value: Any) -> str:
-    if value is None:
-        return "-"
-    if isinstance(value, bool):
-        return str(value).lower()
-    return str(value).replace("\n", "\\n")
-
-
-def _log_sync_event(level: str, **fields: Any) -> None:
-    ordered_fields = {
-        "service": fields.get("service"),
-        "stage": fields.get("stage"),
-        "cookie_present": fields.get("cookie_present"),
-        "fetched_keys": fields.get("fetched_keys"),
-        "matched_keys": fields.get("matched_keys"),
-        "unmatched_keys": fields.get("unmatched_keys"),
-        "synced_keys": fields.get("synced_keys"),
-        "errors": fields.get("errors"),
-        "status_code": fields.get("status_code"),
-        "error_summary": fields.get("error_summary"),
-    }
-    message = "[search-pool-sync] " + " ".join(
-        f"{key}={_format_sync_value(value)}" for key, value in ordered_fields.items()
-    )
-    getattr(logger, level)(message)
-
-
-def _coerce_int(value: Any) -> int | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            return int(float(text))
-        except ValueError:
-            return None
-    return None
-
-
-def _fetch_tavily_console_keys(cookie_header: str) -> list[dict[str, Any]]:
-    headers = {
-        "accept": "*/*",
-        "cookie": cookie_header,
-        "user-agent": os.getenv(TAVILY_SYNC_USER_AGENT_ENV, DEFAULT_TAVILY_SYNC_USER_AGENT),
-        "referer": os.getenv(TAVILY_SYNC_REFERER_ENV, DEFAULT_TAVILY_SYNC_REFERER),
-    }
-    with httpx.Client(timeout=30.0, headers=headers) as client:
-        response = client.get(TAVILY_SYNC_URL)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, list):
-        raise ValueError("Unexpected Tavily /api/keys response payload")
-    return [item for item in payload if isinstance(item, dict)]
 
 
 class GatewayUsageService:
@@ -131,184 +57,12 @@ class GatewayUsageService:
         }
 
     def _sync_tavily_usage(self) -> dict[str, Any]:
-        keys = (
-            self.db.query(GatewayApiKey)
-            .filter(GatewayApiKey.service == "tavily")
-            .order_by(GatewayApiKey.created_at.asc())
-            .all()
-        )
         now = datetime.now(timezone.utc)
-        cookie_header = (os.getenv(TAVILY_SYNC_COOKIE_ENV, "") or "").strip()
-        _log_sync_event(
-            "info",
-            service="tavily",
-            stage="sync_started",
-            cookie_present=bool(cookie_header),
-            synced_keys=len(keys),
-            errors=0,
-        )
-        if not cookie_header:
-            for row in keys:
-                row.usage_synced_at = now
-                row.usage_sync_error = "Missing Tavily sync cookie"
-            self.db.commit()
-            _log_sync_event(
-                "error",
-                service="tavily",
-                stage="sync_failed",
-                synced_keys=0,
-                errors=1,
-                error_summary="missing tavily sync cookie",
-            )
-            return {
-                "service": "tavily",
-                "synced_keys": 0,
-                "errors": 1,
-                "message": "Missing Tavily sync cookie",
-                "synced_at": now.isoformat(),
-            }
-
-        try:
-            remote_keys = _fetch_tavily_console_keys(cookie_header)
-        except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code if exc.response is not None else None
-            error_summary = f"tavily console returned HTTP {status_code or 'unknown'}"
-            for row in keys:
-                row.usage_synced_at = now
-                row.usage_sync_error = error_summary
-            self.db.commit()
-            _log_sync_event(
-                "error",
-                service="tavily",
-                stage="fetch_keys_failed",
-                status_code=status_code,
-                synced_keys=0,
-                errors=1,
-                error_summary=error_summary,
-            )
-            return {
-                "service": "tavily",
-                "synced_keys": 0,
-                "errors": 1,
-                "message": error_summary,
-                "synced_at": now.isoformat(),
-            }
-        except Exception as exc:
-            error_summary = f"failed to fetch tavily keys: {exc}"
-            for row in keys:
-                row.usage_synced_at = now
-                row.usage_sync_error = error_summary[:255]
-            self.db.commit()
-            _log_sync_event(
-                "error",
-                service="tavily",
-                stage="fetch_keys_failed",
-                synced_keys=0,
-                errors=1,
-                error_summary=error_summary,
-            )
-            return {
-                "service": "tavily",
-                "synced_keys": 0,
-                "errors": 1,
-                "message": error_summary,
-                "synced_at": now.isoformat(),
-            }
-
-        _log_sync_event(
-            "info",
-            service="tavily",
-            stage="fetch_keys_succeeded",
-            fetched_keys=len(remote_keys),
-            errors=0,
-        )
-
-        decrypted_map: dict[str, GatewayApiKey] = {}
-        for row in keys:
-            raw_key = (row.raw_key or "").strip()
-            if not raw_key:
-                row.usage_synced_at = now
-                row.usage_sync_error = "Missing raw key"[:255]
-                continue
-            decrypted_map[raw_key] = row
-
-        matched_keys = 0
-        unmatched_keys = 0
-        errors = 0
-
-        for remote_item in remote_keys:
-            raw_key = str(remote_item.get("key") or "").strip()
-            if not raw_key:
-                unmatched_keys += 1
-                continue
-            row = decrypted_map.get(raw_key)
-            if row is None:
-                unmatched_keys += 1
-                _log_sync_event(
-                    "warning",
-                    service="tavily",
-                    stage="key_unmatched",
-                    unmatched_keys=unmatched_keys,
-                    error_summary=f"unmatched key {raw_key[:12]}...",
-                )
-                continue
-
-            limit = _coerce_int(remote_item.get("limit"))
-            usage = _coerce_int(remote_item.get("usage"))
-            remaining = None
-            if limit is not None and usage is not None:
-                remaining = max(limit - usage, 0)
-
-            row.usage_key_limit = limit
-            row.usage_key_used = usage
-            row.usage_key_remaining = remaining
-            row.usage_account_plan = str(remote_item.get("key_type") or "").strip()
-            row.usage_synced_at = now
-            if limit is None or usage is None:
-                errors += 1
-                row.usage_sync_error = "Missing usage fields from Tavily payload"[:255]
-                _log_sync_event(
-                    "warning",
-                    service="tavily",
-                    stage="key_payload_incomplete",
-                    matched_keys=matched_keys + 1,
-                    synced_keys=matched_keys + 1,
-                    errors=errors,
-                    error_summary=row.usage_sync_error,
-                )
-            else:
-                row.usage_sync_error = ""
-            matched_keys += 1
-            _log_sync_event(
-                "info",
-                service="tavily",
-                stage="key_matched",
-                matched_keys=matched_keys,
-                synced_keys=matched_keys,
-                errors=errors,
-            )
-
-        self.db.commit()
-        message = f"Synced {matched_keys} Tavily keys"
-        _log_sync_event(
-            "info",
-            service="tavily",
-            stage="sync_completed",
-            fetched_keys=len(remote_keys),
-            matched_keys=matched_keys,
-            unmatched_keys=unmatched_keys,
-            synced_keys=matched_keys,
-            errors=errors,
-            error_summary=message,
-        )
         return {
             "service": "tavily",
-            "synced_keys": matched_keys,
-            "fetched_keys": len(remote_keys),
-            "matched_keys": matched_keys,
-            "unmatched_keys": unmatched_keys,
-            "errors": errors,
-            "message": message,
+            "synced_keys": 0,
+            "errors": 0,
+            "message": "Tavily 额度同步能力暂未启用",
             "synced_at": now.isoformat(),
         }
 

@@ -133,8 +133,8 @@ function goBack() {
 async function runSync() {
   syncing.value = true
   try {
-    const result = await searchPoolApi.syncUsage(currentService.value, true)
-    success(`同步完成，共处理 ${result.synced_keys} 个 Key`)
+    await searchPoolApi.syncUsage(currentService.value, true)
+    success('Tavily 同步能力暂未启用')
     await loadWorkspace()
   } catch (err) {
     error(parseApiError(err, '同步额度失败'))
