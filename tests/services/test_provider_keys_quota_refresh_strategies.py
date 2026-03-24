@@ -264,6 +264,141 @@ async def test_codex_refresher_http_402_sets_quota_exhausted_metadata(
 
 
 @pytest.mark.asyncio
+async def test_codex_refresher_success_preserves_refresh_failed_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.provider_keys.quota_refresh import codex_refresher as module
+
+    key = SimpleNamespace(
+        id="k1",
+        name="K1",
+        api_key="enc-key",
+        auth_type="oauth",
+        auth_config="enc-config",
+        proxy=None,
+        oauth_invalid_at="sentinel-invalid-at",
+        oauth_invalid_reason="[REFRESH_FAILED] Token 续期失败 (400): refresh_token_reused",
+    )
+    provider = SimpleNamespace(proxy=None)
+    endpoint = SimpleNamespace()
+    metadata_updates: dict[str, dict[str, Any]] = {}
+    state_updates: dict[str, dict[str, Any]] = {}
+
+    async def _fake_auth_info(_endpoint: Any, _key: Any) -> Any:
+        return None
+
+    _install_module(
+        monkeypatch,
+        "src.services.proxy_node.resolver",
+        {
+            "resolve_effective_proxy": lambda provider_proxy, key_proxy: None,
+            "build_proxy_client_kwargs": lambda proxy, timeout: {"timeout": timeout},
+        },
+    )
+    monkeypatch.setattr(module, "get_provider_auth", _fake_auth_info)
+    monkeypatch.setattr(
+        module.crypto_service,
+        "decrypt",
+        lambda value: (
+            "sk-test"
+            if value == "enc-key"
+            else json.dumps({"plan_type": "team", "account_id": "acc-1"})
+        ),
+    )
+    monkeypatch.setattr(
+        module, "parse_codex_wham_usage_response", lambda _data: {"used_percent": 10.0}
+    )
+    response = _FakeResponse(status_code=200, payload={"ok": True})
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient", lambda **kwargs: _FakeAsyncClient(response, **kwargs)
+    )
+
+    result = await refresh_codex_key_quota(
+        db=cast(Any, _FakeDB()),
+        provider=cast(Any, provider),
+        key=cast(Any, key),
+        endpoint=cast(Any, endpoint),
+        codex_wham_usage_url="https://example.test",
+        metadata_updates=metadata_updates,
+        state_updates=state_updates,
+    )
+
+    assert result["status"] == "success"
+    assert state_updates["k1"]["oauth_invalid_at"] == "sentinel-invalid-at"
+    assert (
+        state_updates["k1"]["oauth_invalid_reason"]
+        == "[REFRESH_FAILED] Token 续期失败 (400): refresh_token_reused"
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_refresher_quota_exhausted_preserves_refresh_failed_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.provider_keys.quota_refresh import codex_refresher as module
+
+    key = SimpleNamespace(
+        id="k1",
+        name="K1",
+        api_key="enc-key",
+        auth_type="oauth",
+        auth_config="enc-config",
+        proxy=None,
+        oauth_invalid_at="sentinel-invalid-at",
+        oauth_invalid_reason="[REFRESH_FAILED] Token 续期失败 (400): refresh_token_reused",
+    )
+    provider = SimpleNamespace(proxy=None)
+    endpoint = SimpleNamespace()
+    metadata_updates: dict[str, dict[str, Any]] = {}
+    state_updates: dict[str, dict[str, Any]] = {}
+
+    async def _fake_auth_info(_endpoint: Any, _key: Any) -> Any:
+        return None
+
+    _install_module(
+        monkeypatch,
+        "src.services.proxy_node.resolver",
+        {
+            "resolve_effective_proxy": lambda provider_proxy, key_proxy: None,
+            "build_proxy_client_kwargs": lambda proxy, timeout: {"timeout": timeout},
+        },
+    )
+    monkeypatch.setattr(module, "get_provider_auth", _fake_auth_info)
+    monkeypatch.setattr(
+        module.crypto_service,
+        "decrypt",
+        lambda value: (
+            "sk-test"
+            if value == "enc-key"
+            else json.dumps({"plan_type": "team", "account_id": "acc-1"})
+        ),
+    )
+    response = _FakeResponse(status_code=402, payload={"error": {"message": "payment required"}})
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient", lambda **kwargs: _FakeAsyncClient(response, **kwargs)
+    )
+
+    result = await refresh_codex_key_quota(
+        db=cast(Any, _FakeDB()),
+        provider=cast(Any, provider),
+        key=cast(Any, key),
+        endpoint=cast(Any, endpoint),
+        codex_wham_usage_url="https://example.test",
+        metadata_updates=metadata_updates,
+        state_updates=state_updates,
+    )
+
+    assert result["status"] == "quota_exhausted"
+    assert state_updates["k1"]["oauth_invalid_at"] == "sentinel-invalid-at"
+    assert (
+        state_updates["k1"]["oauth_invalid_reason"]
+        == "[REFRESH_FAILED] Token 续期失败 (400): refresh_token_reused"
+    )
+    codex_meta = metadata_updates["k1"]["codex"]
+    assert codex_meta["secondary_used_percent"] == 100.0
+
+
+@pytest.mark.asyncio
 async def test_codex_refresher_http_403_token_invalidated_marks_oauth_expired(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -771,10 +906,10 @@ async def test_antigravity_refresher_forbidden_collects_updates_without_commit(
     )
 
     assert result["status"] == "forbidden"
-    assert result["auto_disabled"] is True
+    assert result["auto_disabled"] is False
     assert key.is_active is True
     assert key.oauth_invalid_reason is None
-    assert state_updates["k1"]["is_active"] is False
+    assert "is_active" not in state_updates["k1"]
     assert state_updates["k1"]["oauth_invalid_reason"].startswith("账户访问被禁止")
     assert metadata_updates["k1"]["antigravity"]["is_forbidden"] is True
     assert db.commit_count == 0
@@ -911,7 +1046,7 @@ async def test_kiro_refresher_runtime_401_marks_key_invalid(
     assert "401" in result["message"]
     assert key.is_active is True
     assert key.oauth_invalid_reason is None
-    assert state_updates["k1"]["is_active"] is False
+    assert "is_active" not in state_updates["k1"]
     assert state_updates["k1"]["oauth_invalid_reason"] == "Kiro Token 无效或已过期"
     assert db.commit_count == 0
 

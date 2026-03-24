@@ -8,39 +8,9 @@ Handler 基类模块
 会形成循环导入。请直接从具体模块导入 Handler 基类。
 """
 
-# Chat Adapter 基类（不会引起循环导入）
-from src.api.handlers.base.chat_adapter_base import (
-    ChatAdapterBase,
-    get_adapter_class,
-    get_adapter_instance,
-    list_registered_formats,
-    register_adapter,
-)
+from __future__ import annotations
 
-# CLI Adapter 基类
-from src.api.handlers.base.cli_adapter_base import (
-    CliAdapterBase,
-    get_cli_adapter_class,
-    get_cli_adapter_instance,
-    list_registered_cli_formats,
-    register_cli_adapter,
-)
-
-# 请求构建器
-from src.api.handlers.base.request_builder import (
-    SENSITIVE_HEADERS,
-    PassthroughRequestBuilder,
-    RequestBuilder,
-    build_passthrough_request,
-)
-
-# 响应解析器
-from src.api.handlers.base.response_parser import (
-    ParsedChunk,
-    ParsedResponse,
-    ResponseParser,
-    StreamStats,
-)
+from typing import Any
 
 __all__ = [
     # Chat Adapter
@@ -66,3 +36,60 @@ __all__ = [
     "ParsedResponse",
     "StreamStats",
 ]
+
+_LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    # Chat Adapter
+    "ChatAdapterBase": ("src.api.handlers.base.chat_adapter_base", "ChatAdapterBase"),
+    "register_adapter": ("src.api.handlers.base.chat_adapter_base", "register_adapter"),
+    "get_adapter_class": ("src.api.handlers.base.chat_adapter_base", "get_adapter_class"),
+    "get_adapter_instance": ("src.api.handlers.base.chat_adapter_base", "get_adapter_instance"),
+    "list_registered_formats": (
+        "src.api.handlers.base.chat_adapter_base",
+        "list_registered_formats",
+    ),
+    # CLI Adapter
+    "CliAdapterBase": ("src.api.handlers.base.cli_adapter_base", "CliAdapterBase"),
+    "register_cli_adapter": (
+        "src.api.handlers.base.cli_adapter_base",
+        "register_cli_adapter",
+    ),
+    "get_cli_adapter_class": (
+        "src.api.handlers.base.cli_adapter_base",
+        "get_cli_adapter_class",
+    ),
+    "get_cli_adapter_instance": (
+        "src.api.handlers.base.cli_adapter_base",
+        "get_cli_adapter_instance",
+    ),
+    "list_registered_cli_formats": (
+        "src.api.handlers.base.cli_adapter_base",
+        "list_registered_cli_formats",
+    ),
+    # 请求构建器
+    "RequestBuilder": ("src.api.handlers.base.request_builder", "RequestBuilder"),
+    "PassthroughRequestBuilder": (
+        "src.api.handlers.base.request_builder",
+        "PassthroughRequestBuilder",
+    ),
+    "build_passthrough_request": (
+        "src.api.handlers.base.request_builder",
+        "build_passthrough_request",
+    ),
+    "SENSITIVE_HEADERS": ("src.api.handlers.base.request_builder", "SENSITIVE_HEADERS"),
+    # 响应解析器
+    "ResponseParser": ("src.api.handlers.base.response_parser", "ResponseParser"),
+    "ParsedChunk": ("src.api.handlers.base.response_parser", "ParsedChunk"),
+    "ParsedResponse": ("src.api.handlers.base.response_parser", "ParsedResponse"),
+    "StreamStats": ("src.api.handlers.base.response_parser", "StreamStats"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """延迟导入以避免不必要的依赖加载。"""
+    if name in _LAZY_IMPORTS:
+        module_path, attr_name = _LAZY_IMPORTS[name]
+        import importlib
+
+        module = importlib.import_module(module_path)
+        return getattr(module, attr_name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

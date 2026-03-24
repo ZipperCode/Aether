@@ -452,13 +452,14 @@ class ChatSyncExecutor:
         provider_api_format = str(endpoint.api_format or api_format)
         client_api_format = api_format.value if hasattr(api_format, "value") else str(api_format)
 
+        attempt_body = request_state.build_attempt_body()
         # 构建 Provider 请求（模型映射、格式转换、envelope 包装）
         prep = await handler._prepare_provider_request(
             model=model,
             provider=provider,
             endpoint=endpoint,
             key=key,
-            working_request_body=request_state.build_attempt_body(),
+            working_request_body=attempt_body,
             original_headers=original_headers,
             client_api_format=client_api_format,
             provider_api_format=provider_api_format,
@@ -487,6 +488,7 @@ class ChatSyncExecutor:
             endpoint,
             key,
             is_stream=upstream_is_stream,
+            rules_original_body=attempt_body,
             extra_headers=prep.extra_headers if prep.extra_headers else None,
             pre_computed_auth=auth_info.as_tuple() if auth_info else None,
             envelope=envelope,

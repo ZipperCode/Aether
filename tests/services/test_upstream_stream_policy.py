@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -19,6 +21,33 @@ class _DummyEndpoint:
     api_format: str
     config: dict | None = None
     provider: object | None = None
+    provider_id: str | None = None
+
+
+class _FakeQuery:
+    def __init__(self, row: object | None) -> None:
+        self._row = row
+
+    def filter(self, *_args: object, **_kwargs: object) -> "_FakeQuery":
+        return self
+
+    def first(self) -> object | None:
+        return self._row
+
+
+class _FakeSessionCtx:
+    def __init__(self, row: object | None) -> None:
+        self._row = row
+
+    def __enter__(self) -> "_FakeSessionCtx":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        _ = exc_type, exc, tb
+        return False
+
+    def query(self, _model: object) -> _FakeQuery:
+        return _FakeQuery(self._row)
 
 
 def test_get_upstream_stream_policy_defaults_to_auto() -> None:
@@ -59,6 +88,24 @@ def test_get_upstream_stream_policy_codex_compact_forces_non_stream() -> None:
         set_codex_request_context(None)
 
 
+def test_get_upstream_stream_policy_uses_explicit_provider_type_without_touching_endpoint_provider() -> (
+    None
+):
+    class _DetachedEndpoint:
+        api_format = "openai:cli"
+        config = None
+
+        @property
+        def provider(self) -> object:
+            raise RuntimeError("detached endpoint provider should not be lazy-loaded")
+
+    ep = _DetachedEndpoint()
+
+    assert (
+        get_upstream_stream_policy(ep, provider_type="codex") == UpstreamStreamPolicy.FORCE_STREAM
+    )
+
+
 def test_get_upstream_stream_policy_codex_openai_compact_defaults_to_auto() -> None:
     ep = _DummyEndpoint(
         api_format="openai:compact",
@@ -66,6 +113,30 @@ def test_get_upstream_stream_policy_codex_openai_compact_defaults_to_auto() -> N
         provider=SimpleNamespace(provider_type="codex"),
     )
     assert get_upstream_stream_policy(ep) == UpstreamStreamPolicy.AUTO
+
+
+def test_get_upstream_stream_policy_uses_provider_id_lookup_without_touching_endpoint_provider(
+    monkeypatch,
+) -> None:
+    class _DetachedEndpoint:
+        api_format = "openai:cli"
+        config = None
+        provider_id = "provider-1"
+
+        @property
+        def provider(self) -> object:
+            raise RuntimeError("detached endpoint provider should not be lazy-loaded")
+
+    fake_provider = SimpleNamespace(id="provider-1", provider_type="codex", proxy=None)
+    fake_database = types.ModuleType("src.database")
+    fake_database.create_session = lambda: _FakeSessionCtx(fake_provider)
+    fake_models = types.ModuleType("src.models.database")
+    fake_models.Provider = type("Provider", (), {"id": "id"})
+
+    monkeypatch.setitem(sys.modules, "src.database", fake_database)
+    monkeypatch.setitem(sys.modules, "src.models.database", fake_models)
+
+    assert get_upstream_stream_policy(_DetachedEndpoint()) == UpstreamStreamPolicy.FORCE_STREAM
 
 
 def test_enforce_stream_mode_for_upstream_openai_chat_sets_stream_options_usage() -> None:

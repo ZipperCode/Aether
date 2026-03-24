@@ -873,21 +873,32 @@ class StatsAggregatorService:
         db: Session, date: datetime, user_ids: list[str] | None = None
     ) -> StatsDaily:
         """聚合单日所有统计（原子提交）"""
-        stats = StatsAggregatorService.aggregate_daily_stats(db, date, commit=False)
-        StatsAggregatorService.aggregate_daily_model_stats(db, date, commit=False)
-        StatsAggregatorService.aggregate_daily_provider_stats(db, date, commit=False)
-        StatsAggregatorService.aggregate_daily_api_key_stats(db, date, commit=False)
-        StatsAggregatorService.aggregate_daily_error_stats(db, date, commit=False)
+        for attempt in range(2):
+            if attempt > 0:
+                db.rollback()
+                logger.warning("每日统计聚合冲突，重试更新: {}", date)
 
-        if user_ids:
-            StatsAggregatorService.aggregate_user_daily_stats_batch(
-                db, date, user_ids, commit=False
-            )
+            try:
+                stats = StatsAggregatorService.aggregate_daily_stats(db, date, commit=False)
+                StatsAggregatorService.aggregate_daily_model_stats(db, date, commit=False)
+                StatsAggregatorService.aggregate_daily_provider_stats(db, date, commit=False)
+                StatsAggregatorService.aggregate_daily_api_key_stats(db, date, commit=False)
+                StatsAggregatorService.aggregate_daily_error_stats(db, date, commit=False)
 
-        stats.is_complete = True
-        stats.aggregated_at = datetime.now(timezone.utc)
-        db.commit()
-        return stats
+                if user_ids:
+                    StatsAggregatorService.aggregate_user_daily_stats_batch(
+                        db, date, user_ids, commit=False
+                    )
+
+                stats.is_complete = True
+                stats.aggregated_at = datetime.now(timezone.utc)
+                db.commit()
+                return stats
+            except IntegrityError:
+                if attempt == 1:
+                    raise
+
+        raise RuntimeError("unreachable")  # type hint helper
 
     @staticmethod
     def aggregate_hourly_stats(db: Session, hour_utc: datetime, commit: bool = True) -> StatsHourly:

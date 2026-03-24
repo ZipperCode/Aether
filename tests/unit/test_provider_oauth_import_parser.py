@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -84,6 +86,30 @@ def _make_oauth_key(*, key_id: str, name: str, auth_config: dict[str, object]) -
     )
 
 
+class _SingleKeyQuery:
+    def __init__(self, key: SimpleNamespace | None) -> None:
+        self._key = key
+
+    def filter(self, *_args: object, **_kwargs: object) -> "_SingleKeyQuery":
+        return self
+
+    def first(self) -> SimpleNamespace | None:
+        return self._key
+
+
+class _SingleKeyDB:
+    def __init__(self, key: SimpleNamespace | None) -> None:
+        self._key = key
+
+    def query(self, _model: object) -> _SingleKeyQuery:
+        return _SingleKeyQuery(self._key)
+
+
+@contextmanager
+def _fake_db_context(db: _SingleKeyDB):
+    yield db
+
+
 def test_check_duplicate_oauth_account_codex_allows_same_user_different_account_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -151,3 +177,87 @@ def test_check_duplicate_oauth_account_codex_rejects_same_account_user_identity(
                 "plan_type": "team",
             },
         )
+
+
+def test_mark_refresh_failed_sync_preserves_existing_account_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = SimpleNamespace(
+        id="key-1",
+        oauth_invalid_at="old-invalid-at",
+        oauth_invalid_reason="[ACCOUNT_BLOCK] account has been deactivated",
+    )
+    db = _SingleKeyDB(key)
+    monkeypatch.setattr(module, "get_db_context", lambda: _fake_db_context(db))
+
+    module._mark_refresh_failed_sync(
+        "key-1",
+        "[REFRESH_FAILED] Token 续期失败 (400): refresh_token_reused",
+    )
+
+    assert key.oauth_invalid_at == "old-invalid-at"
+    assert key.oauth_invalid_reason == "[ACCOUNT_BLOCK] account has been deactivated"
+
+
+@pytest.mark.asyncio
+async def test_refresh_account_state_after_oauth_update_refreshes_supported_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = SimpleNamespace(close=MagicMock())
+    captured: dict[str, object] = {}
+
+    async def _fake_refresh_provider_quota_for_provider(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"success": 1}
+
+    monkeypatch.setattr(module, "create_session", lambda: fake_db)
+
+    from src.services.provider_keys import key_quota_service as quota_module
+
+    monkeypatch.setattr(
+        quota_module,
+        "refresh_provider_quota_for_provider",
+        _fake_refresh_provider_quota_for_provider,
+    )
+
+    attempted, error = await module._refresh_account_state_after_oauth_update(
+        provider_id="provider-1",
+        provider_type="codex",
+        key_ids=["key-1"],
+    )
+
+    assert attempted is True
+    assert error is None
+    assert captured["provider_id"] == "provider-1"
+    assert captured["key_ids"] == ["key-1"]
+    fake_db.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_refresh_account_state_after_oauth_update_returns_error_when_refresh_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = SimpleNamespace(close=MagicMock())
+
+    async def _fake_refresh_provider_quota_for_provider(**_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("quota refresh failed")
+
+    monkeypatch.setattr(module, "create_session", lambda: fake_db)
+
+    from src.services.provider_keys import key_quota_service as quota_module
+
+    monkeypatch.setattr(
+        quota_module,
+        "refresh_provider_quota_for_provider",
+        _fake_refresh_provider_quota_for_provider,
+    )
+
+    attempted, error = await module._refresh_account_state_after_oauth_update(
+        provider_id="provider-1",
+        provider_type="codex",
+        key_ids=["key-1"],
+    )
+
+    assert attempted is True
+    assert "quota refresh failed" in error
+    fake_db.close.assert_called_once()

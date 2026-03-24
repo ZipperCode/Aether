@@ -1,6 +1,7 @@
 import client from '../client'
 import { dedupedRequest } from '@/utils/cache'
 import type { AllowedModels, OAuthOrganizationInfo, ProxyConfig } from './types/provider'
+import type { ProviderKeyStatusSnapshot } from './types/statusSnapshot'
 
 const POOL_BATCH_ACTION_TIMEOUT_MS = 5 * 60 * 1000
 
@@ -99,13 +100,20 @@ export interface PoolKeyDetail {
   is_active: boolean
   auth_type: string
   oauth_expires_at?: number | null
-  oauth_invalid_at?: number | null
-  oauth_invalid_reason?: string | null
+  oauth_invalid_at?: number | null  // 兼容字段；优先使用 status_snapshot.oauth
+  oauth_invalid_reason?: string | null  // 兼容字段；优先使用 status_snapshot.oauth
   oauth_plan_type?: string | null
   oauth_account_id?: string | null
   oauth_account_user_id?: string | null
   oauth_account_name?: string | null
   oauth_organizations?: OAuthOrganizationInfo[] | null
+  account_status_code?: string | null  // 兼容字段；优先使用 status_snapshot.account
+  account_status_label?: string | null  // 兼容字段；优先使用 status_snapshot.account
+  account_status_reason?: string | null  // 兼容字段；优先使用 status_snapshot.account
+  account_status_blocked?: boolean  // 兼容字段；优先使用 status_snapshot.account
+  account_status_recoverable?: boolean  // 兼容字段；优先使用 status_snapshot.account
+  account_status_source?: string | null  // 兼容字段；优先使用 status_snapshot.account
+  status_snapshot?: ProviderKeyStatusSnapshot | null
   quota_updated_at?: number | null
   health_score?: number
   circuit_breaker_open?: boolean

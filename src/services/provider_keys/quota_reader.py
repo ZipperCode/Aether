@@ -50,6 +50,15 @@ def _extract_reason(source: dict[str, Any], *fields: str) -> str | None:
     return None
 
 
+def _is_workspace_deactivated_reason(reason: str | None) -> bool:
+    if not reason:
+        return False
+    lowered = reason.strip().lower()
+    if not lowered:
+        return False
+    return "deactivated_workspace" in lowered
+
+
 def _pct_is_exhausted(value: Any) -> bool:
     pct = _to_float(value)
     if pct is None:
@@ -218,6 +227,13 @@ class CodexQuotaReader(PoolQuotaReader):
         if not _is_truthy_flag(self._data.get("account_disabled")):
             return AccountBlockResult(blocked=False)
         reason = _extract_reason(self._data, "forbidden_reason", "ban_reason", "reason", "message")
+        if _is_workspace_deactivated_reason(reason):
+            return AccountBlockResult(
+                blocked=True,
+                code="workspace_deactivated",
+                label="工作区停用",
+                reason=reason or "工作区已停用",
+            )
         return AccountBlockResult(
             blocked=True,
             code="account_forbidden",

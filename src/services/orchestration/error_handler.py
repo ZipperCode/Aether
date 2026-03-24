@@ -26,6 +26,7 @@ from src.core.logger import logger
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
 from src.services.health.monitor import get_health_monitor
 from src.services.provider.format import normalize_endpoint_signature
+from src.services.provider.oauth_token import verify_oauth_before_account_block
 from src.services.provider.pool.config import parse_pool_config
 from src.services.rate_limit.adaptive_rpm import get_adaptive_rpm_manager
 from src.services.rate_limit.detector import RateLimitType, detect_rate_limit_type
@@ -171,7 +172,14 @@ class ErrorHandlerService:
                 and str(getattr(key, "auth_type", "") or "").lower() == "oauth"
                 and self._is_account_validation_required(error_response_text)
             ):
-                self._mark_oauth_key_blocked(key, request_id, provider=provider)
+                should_mark = await self._verify_oauth_before_account_block(
+                    endpoint=endpoint,
+                    key=key,
+                    request_id=request_id,
+                    candidate_reason="Google 要求验证账号",
+                )
+                if should_mark:
+                    self._mark_oauth_key_blocked(key, request_id, provider=provider)
             # 403 suspended -> 标记 OAuth key 为账号被暂停
             elif (
                 status_code == 403
@@ -179,12 +187,19 @@ class ErrorHandlerService:
                 and str(getattr(key, "auth_type", "") or "").lower() == "oauth"
                 and self._is_account_suspended(error_response_text)
             ):
-                self._mark_oauth_key_blocked(
-                    key,
-                    request_id,
-                    reason="AWS 账号被暂停",
-                    provider=provider,
+                should_mark = await self._verify_oauth_before_account_block(
+                    endpoint=endpoint,
+                    key=key,
+                    request_id=request_id,
+                    candidate_reason="AWS 账号被暂停",
                 )
+                if should_mark:
+                    self._mark_oauth_key_blocked(
+                        key,
+                        request_id,
+                        reason="AWS 账号被暂停",
+                        provider=provider,
+                    )
             # 401 account_deactivated -> 标记 OAuth key 为账号被永久停用
             elif (
                 status_code == 401
@@ -192,12 +207,19 @@ class ErrorHandlerService:
                 and str(getattr(key, "auth_type", "") or "").lower() == "oauth"
                 and self._is_account_deactivated(error_response_text)
             ):
-                self._mark_oauth_key_blocked(
-                    key,
-                    request_id,
-                    reason="账号已被停用 (account_deactivated)",
-                    provider=provider,
+                should_mark = await self._verify_oauth_before_account_block(
+                    endpoint=endpoint,
+                    key=key,
+                    request_id=request_id,
+                    candidate_reason="账号已被停用 (account_deactivated)",
                 )
+                if should_mark:
+                    self._mark_oauth_key_blocked(
+                        key,
+                        request_id,
+                        reason="账号已被停用 (account_deactivated)",
+                        provider=provider,
+                    )
             return
 
         # 限流错误
@@ -404,6 +426,10 @@ class ErrorHandlerService:
             from datetime import datetime, timezone
 
             from src.services.provider.oauth_token import OAUTH_ACCOUNT_BLOCK_PREFIX
+            from src.services.provider.pool.account_state import (
+                resolve_pool_account_state,
+                should_auto_remove_account_state,
+            )
 
             key.oauth_invalid_at = datetime.now(timezone.utc)
             key.oauth_invalid_reason = f"{OAUTH_ACCOUNT_BLOCK_PREFIX}{reason}"
@@ -412,8 +438,13 @@ class ErrorHandlerService:
 
             pool_cfg = parse_pool_config(getattr(provider, "config", None))
             auto_remove_enabled = bool(pool_cfg and pool_cfg.auto_remove_banned_keys)
+            account_state = resolve_pool_account_state(
+                provider_type=str(getattr(provider, "provider_type", "") or ""),
+                upstream_metadata=getattr(key, "upstream_metadata", None),
+                oauth_invalid_reason=getattr(key, "oauth_invalid_reason", None),
+            )
 
-            if auto_remove_enabled:
+            if auto_remove_enabled and should_auto_remove_account_state(account_state):
                 key_id = str(getattr(key, "id", "") or "")
                 provider_id = str(getattr(key, "provider_id", "") or "")
                 display = self._format_key_display(key)
@@ -431,13 +462,30 @@ class ErrorHandlerService:
 
             self.db.commit()
             logger.warning(
-                "  [{}] {} 因 {} 已标记为账号异常并自动停用",
+                "  [{}] {} 因 {} 已标记为账号异常并阻止调度",
                 request_id,
                 self._format_key_display(key),
                 reason,
             )
         except Exception as mark_exc:
             logger.debug("  [{}] 标记 oauth_invalid 失败: {}", request_id, mark_exc)
+
+    async def _verify_oauth_before_account_block(
+        self,
+        *,
+        endpoint: ProviderEndpoint,
+        key: ProviderAPIKey,
+        request_id: str | None,
+        candidate_reason: str,
+    ) -> bool:
+        """Before applying an account-level block, distinguish it from OAuth expiry."""
+        return await verify_oauth_before_account_block(
+            endpoint=endpoint,
+            key=key,
+            candidate_reason=candidate_reason,
+            request_id=request_id,
+            key_display=self._format_key_display(key),
+        )
 
     @staticmethod
     def _schedule_auto_cleanup_after_delete(*, provider_id: str, key_id: str) -> None:

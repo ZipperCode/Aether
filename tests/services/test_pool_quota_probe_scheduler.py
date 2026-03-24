@@ -25,7 +25,7 @@ def test_select_probe_key_ids_selects_silent_keys_only() -> None:
 
     keys = [
         _key("k1"),  # never used, should be probed
-        _key("k2", last_used_at=now - timedelta(minutes=2)),  # recently used, skip
+        _key("k2", last_used_at=now - timedelta(minutes=2)),  # recently used,仍可定期探测
         _key(
             "k3",
             upstream_metadata={"codex": {"updated_at": now_ts - (20 * 60)}},
@@ -40,10 +40,10 @@ def test_select_probe_key_ids_selects_silent_keys_only() -> None:
         last_probe_timestamps={},
         limit=0,
     )
-    assert selected == ["k1", "k3"]
+    assert selected == ["k1", "k2", "k3"]
 
 
-def test_select_probe_key_ids_resets_probe_window_after_key_usage() -> None:
+def test_select_probe_key_ids_keeps_periodic_probe_even_after_recent_usage() -> None:
     now = datetime(2026, 3, 5, 12, 0, 0, tzinfo=timezone.utc)
     now_ts = int(now.timestamp())
 
@@ -55,7 +55,7 @@ def test_select_probe_key_ids_resets_probe_window_after_key_usage() -> None:
         )
     ]
 
-    # 上一次主动探测非常早，但 key 刚刚被真实流量使用，应跳过本次探测
+    # 即使 key 刚刚被真实流量使用，只要上次额度刷新/主动探测已过窗口，仍应继续定期探测
     selected = _select_probe_key_ids(
         keys=keys,  # type: ignore[arg-type]
         provider_type="codex",
@@ -64,7 +64,7 @@ def test_select_probe_key_ids_resets_probe_window_after_key_usage() -> None:
         last_probe_timestamps={"k1": now_ts - (25 * 60)},
         limit=0,
     )
-    assert selected == []
+    assert selected == ["k1"]
 
 
 def test_select_probe_key_ids_applies_limit_by_oldest_anchor_first() -> None:
@@ -72,9 +72,9 @@ def test_select_probe_key_ids_applies_limit_by_oldest_anchor_first() -> None:
     now_ts = int(now.timestamp())
 
     keys = [
-        _key("k1", last_used_at=now - timedelta(minutes=60)),
-        _key("k2", last_used_at=now - timedelta(minutes=50)),
-        _key("k3", last_used_at=now - timedelta(minutes=40)),
+        _key("k1", upstream_metadata={"codex": {"updated_at": now_ts - (60 * 60)}}),
+        _key("k2", upstream_metadata={"codex": {"updated_at": now_ts - (50 * 60)}}),
+        _key("k3", upstream_metadata={"codex": {"updated_at": now_ts - (40 * 60)}}),
     ]
 
     selected = _select_probe_key_ids(

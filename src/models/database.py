@@ -30,6 +30,8 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
+    inspect,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -479,7 +481,9 @@ class Usage(Base):
     # Token统计
     input_tokens = Column(Integer, default=0)
     output_tokens = Column(Integer, default=0)
-    total_tokens = Column(Integer, default=0)
+    input_output_total_tokens = Column(Integer, default=0)  # 输入 + 输出（旧 total_tokens 语义）
+    input_context_tokens = Column(Integer, default=0)  # 输入上下文（input + cache_read）
+    total_tokens = Column(Integer, default=0)  # 真正总计 tokens（输入 + 输出 + 缓存创建 + 缓存读取）
 
     # 缓存相关 tokens (for Claude models)
     cache_creation_input_tokens = Column(Integer, default=0)
@@ -492,6 +496,8 @@ class Usage(Base):
     output_cost_usd = Column(Numeric(20, 8), default=0.0)
     cache_cost_usd = Column(Numeric(20, 8), default=0.0)  # 总缓存成本
     cache_creation_cost_usd = Column(Numeric(20, 8), default=0.0)  # 缓存创建成本
+    cache_creation_cost_usd_5m = Column(Numeric(20, 8), default=0.0)  # 5min TTL 缓存创建成本
+    cache_creation_cost_usd_1h = Column(Numeric(20, 8), default=0.0)  # 1h TTL 缓存创建成本
     cache_read_cost_usd = Column(Numeric(20, 8), default=0.0)  # 缓存读取成本
     request_cost_usd = Column(Numeric(20, 8), default=0.0)  # 按次计费成本
     total_cost_usd = Column(Numeric(20, 8), default=0.0)
@@ -500,7 +506,14 @@ class Usage(Base):
     actual_input_cost_usd = Column(Numeric(20, 8), default=0.0)  # 真实输入成本
     actual_output_cost_usd = Column(Numeric(20, 8), default=0.0)  # 真实输出成本
     actual_cache_creation_cost_usd = Column(Numeric(20, 8), default=0.0)  # 真实缓存创建成本
+    actual_cache_creation_cost_usd_5m = Column(
+        Numeric(20, 8), default=0.0
+    )  # 真实 5min TTL 缓存创建成本
+    actual_cache_creation_cost_usd_1h = Column(
+        Numeric(20, 8), default=0.0
+    )  # 真实 1h TTL 缓存创建成本
     actual_cache_read_cost_usd = Column(Numeric(20, 8), default=0.0)  # 真实缓存读取成本
+    actual_cache_cost_usd = Column(Numeric(20, 8), default=0.0)  # 真实缓存总成本
     actual_request_cost_usd = Column(Numeric(20, 8), default=0.0)  # 真实按次计费成本
     actual_total_cost_usd = Column(Numeric(20, 8), default=0.0)  # 真实总成本
     rate_multiplier = Column(Numeric(10, 6), default=1.0)  # 使用的倍率（来自 ProviderAPIKey）
@@ -509,6 +522,12 @@ class Usage(Base):
     input_price_per_1m = Column(Numeric(20, 8), nullable=True)  # 输入单价
     output_price_per_1m = Column(Numeric(20, 8), nullable=True)  # 输出单价
     cache_creation_price_per_1m = Column(Numeric(20, 8), nullable=True)  # 缓存创建单价
+    cache_creation_price_per_1m_5m = Column(
+        Numeric(20, 8), nullable=True
+    )  # 5min TTL 缓存创建单价
+    cache_creation_price_per_1m_1h = Column(
+        Numeric(20, 8), nullable=True
+    )  # 1h TTL 缓存创建单价
     cache_read_price_per_1m = Column(Numeric(20, 8), nullable=True)  # 缓存读取单价
     price_per_request = Column(Numeric(20, 8), nullable=True)  # 按次计费单价（历史记录）
 
@@ -2066,6 +2085,7 @@ class ProviderAPIKey(ExportMixin, Base):
     # OAuth 失效状态（账号被封、授权撤销、刷新失败等）
     oauth_invalid_at = Column(DateTime(timezone=True), nullable=True)  # 失效时间
     oauth_invalid_reason = Column(String(255), nullable=True)  # 失效原因
+    status_snapshot = Column(JSON, nullable=True, default=None)  # 结构化状态快照（兼容旧字段）
 
     # Key 级别的代理配置（覆盖 Provider 级别的代理设置）
     # 结构: {"node_id": "xxx", "enabled": true} 或 {"url": "socks5://...", "enabled": true}
@@ -2090,6 +2110,49 @@ class ProviderAPIKey(ExportMixin, Base):
 
     # 关系
     provider = relationship("Provider", back_populates="api_keys")
+
+
+_PROVIDER_API_KEY_STATUS_SNAPSHOT_FIELDS: tuple[str, ...] = (
+    "auth_type",
+    "auth_config",
+    "expires_at",
+    "oauth_invalid_at",
+    "oauth_invalid_reason",
+    "upstream_metadata",
+    "provider_id",
+)
+
+
+def _sync_provider_api_key_status_snapshot(
+    target: ProviderAPIKey,
+    *,
+    connection: Any | None,
+    force: bool,
+) -> None:
+    state = inspect(target)
+    if state is None:
+        return
+    if not force:
+        relevant_changed = any(
+            state.attrs[field].history.has_changes()
+            for field in _PROVIDER_API_KEY_STATUS_SNAPSHOT_FIELDS
+        )
+        if not relevant_changed and getattr(target, "status_snapshot", None) is not None:
+            return
+
+    from src.services.provider_keys.status_snapshot_store import sync_provider_key_status_snapshot
+
+    sync_provider_key_status_snapshot(target, connection=connection)
+
+
+@event.listens_for(ProviderAPIKey, "before_insert")
+def _provider_api_key_before_insert(mapper: Any, connection: Any, target: ProviderAPIKey) -> None:
+    _sync_provider_api_key_status_snapshot(target, connection=connection, force=True)
+
+
+@event.listens_for(ProviderAPIKey, "before_update")
+def _provider_api_key_before_update(mapper: Any, connection: Any, target: ProviderAPIKey) -> None:
+    _sync_provider_api_key_status_snapshot(target, connection=connection, force=False)
 
 
 def _generate_short_id(length: int = 12) -> str:

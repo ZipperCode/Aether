@@ -18,6 +18,7 @@ from typing import Any
 from src.core.api_format.metadata import resolve_endpoint_definition
 from src.core.provider_types import ProviderType
 from src.services.provider.adapters.codex.context import is_codex_compact_request
+from src.services.provider.provider_context import resolve_provider_type
 
 
 class UpstreamStreamPolicy(str, Enum):
@@ -59,8 +60,14 @@ def get_upstream_stream_policy(
     - Codex + openai:compact: follow endpoint/client policy (no hard force).
     """
 
-    provider_obj = getattr(endpoint, "provider", None)
-    pt = str(provider_type or getattr(provider_obj, "provider_type", "") or "").strip().lower()
+    # Prefer the caller-supplied provider_type; fall back to detached-safe provider lookup.
+    pt = (
+        resolve_provider_type(
+            endpoint=endpoint,
+            explicit_provider_type=provider_type,
+        )
+        or ""
+    )
     sig = str(endpoint_sig or getattr(endpoint, "api_format", "") or "").strip().lower()
     is_codex_cli = pt == ProviderType.CODEX and sig == "openai:cli"
     is_codex_compact = pt == ProviderType.CODEX and sig == "openai:compact"

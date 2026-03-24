@@ -49,6 +49,8 @@ class MaintenanceScheduler:
         self._interval_tasks = []
         self._stats_aggregation_lock = asyncio.Lock()
         self._wallet_daily_usage_lock = asyncio.Lock()
+        self._startup_task: asyncio.Task[Any] | None = None
+        self._registered_job_ids: list[str] = []
 
     @staticmethod
     def _get_http_client_idle_cleanup_interval_minutes() -> int:
@@ -139,120 +141,129 @@ class MaintenanceScheduler:
             return
 
         self.running = True
+        self._registered_job_ids.clear()
         logger.info("系统维护调度器已启动")
 
         scheduler = get_scheduler()
 
+        def _add_cron(job_id: str, **kwargs: Any) -> None:
+            scheduler.add_cron_job(job_id=job_id, **kwargs)
+            self._registered_job_ids.append(job_id)
+
+        def _add_interval(job_id: str, **kwargs: Any) -> None:
+            scheduler.add_interval_job(job_id=job_id, **kwargs)
+            self._registered_job_ids.append(job_id)
+
         # 注册定时任务
         # 统计聚合任务 - UTC 00:05 执行
-        scheduler.add_cron_job(
-            self._scheduled_stats_aggregation,
+        _add_cron(
+            "stats_aggregation",
+            func=self._scheduled_stats_aggregation,
             hour=0,
             minute=5,
-            job_id="stats_aggregation",
             name="统计数据聚合",
             timezone="UTC",
         )
         # 小时统计聚合任务 - 每小时 05 分执行（UTC）
-        scheduler.add_cron_job(
-            self._scheduled_hourly_stats_aggregation,
+        _add_cron(
+            "stats_hourly_aggregation",
+            func=self._scheduled_hourly_stats_aggregation,
             hour="*",
             minute=5,
-            job_id="stats_hourly_aggregation",
             name="统计小时数据聚合",
             timezone="UTC",
         )
-        scheduler.add_cron_job(
-            self._scheduled_wallet_daily_usage_aggregation,
+        _add_cron(
+            "wallet_daily_usage_aggregation",
+            func=self._scheduled_wallet_daily_usage_aggregation,
             hour=0,
             minute=10,
-            job_id="wallet_daily_usage_aggregation",
             name="钱包每日消费汇总",
         )
         # 清理任务 - 凌晨 3 点执行
-        scheduler.add_cron_job(
-            self._scheduled_cleanup,
+        _add_cron(
+            "usage_cleanup",
+            func=self._scheduled_cleanup,
             hour=3,
             minute=0,
-            job_id="usage_cleanup",
             name="使用记录清理",
         )
 
         # 连接池监控 - 每 5 分钟
-        scheduler.add_interval_job(
-            self._scheduled_monitor,
+        _add_interval(
+            "pool_monitor",
+            func=self._scheduled_monitor,
             minutes=5,
-            job_id="pool_monitor",
             name="连接池监控",
         )
 
         # HTTP 代理/Tunnel 客户端空闲清理 - 默认每 5 分钟
-        scheduler.add_interval_job(
-            self._scheduled_http_client_idle_cleanup,
+        _add_interval(
+            "http_client_idle_cleanup",
+            func=self._scheduled_http_client_idle_cleanup,
             minutes=self._get_http_client_idle_cleanup_interval_minutes(),
-            job_id="http_client_idle_cleanup",
             name="HTTP客户端空闲清理",
         )
 
         # Pending 状态清理 - 每 5 分钟
-        scheduler.add_interval_job(
-            self._scheduled_pending_cleanup,
+        _add_interval(
+            "pending_cleanup",
+            func=self._scheduled_pending_cleanup,
             minutes=5,
-            job_id="pending_cleanup",
             name="Pending状态清理",
         )
 
         # 审计日志清理 - 凌晨 4 点执行
-        scheduler.add_cron_job(
-            self._scheduled_audit_cleanup,
+        _add_cron(
+            "audit_cleanup",
+            func=self._scheduled_audit_cleanup,
             hour=4,
             minute=0,
-            job_id="audit_cleanup",
             name="审计日志清理",
         )
 
         # Gemini 文件映射清理 - 每小时执行
-        scheduler.add_interval_job(
-            self._scheduled_gemini_file_mapping_cleanup,
+        _add_interval(
+            "gemini_file_mapping_cleanup",
+            func=self._scheduled_gemini_file_mapping_cleanup,
             hours=1,
-            job_id="gemini_file_mapping_cleanup",
             name="Gemini文件映射清理",
         )
 
         # 请求候选记录清理 - 凌晨 3:30 执行
-        scheduler.add_cron_job(
-            self._scheduled_candidate_cleanup,
+        _add_cron(
+            "candidate_cleanup",
+            func=self._scheduled_candidate_cleanup,
             hour=3,
             minute=30,
-            job_id="candidate_cleanup",
             name="请求候选记录清理",
         )
 
         # 数据库表维护 - 每周日凌晨 5 点执行 VACUUM ANALYZE
-        scheduler.add_cron_job(
-            self._scheduled_db_maintenance,
+        _add_cron(
+            "db_maintenance",
+            func=self._scheduled_db_maintenance,
             day_of_week="sun",
             hour=5,
             minute=0,
-            job_id="db_maintenance",
             name="数据库表维护",
         )
 
         # Antigravity User-Agent 版本刷新 - 每 6 小时
-        scheduler.add_interval_job(
-            self._scheduled_antigravity_ua_refresh,
+        _add_interval(
+            "antigravity_ua_refresh",
+            func=self._scheduled_antigravity_ua_refresh,
             hours=6,
-            job_id="antigravity_ua_refresh",
             name="Antigravity UA版本刷新",
         )
 
         # Provider 签到任务 - 根据配置时间执行
         checkin_hour, checkin_minute = self._get_checkin_time()
-        scheduler.add_cron_job(
-            self._scheduled_provider_checkin,
+        _add_cron(
+            self.CHECKIN_JOB_ID,
+            func=self._scheduled_provider_checkin,
             hour=checkin_hour,
             minute=checkin_minute,
-            job_id=self.CHECKIN_JOB_ID,
             name="Provider签到",
         )
 
@@ -260,8 +271,9 @@ class MaintenanceScheduler:
         if config.maintenance_startup_tasks_enabled:
             from src.utils.async_utils import safe_create_task
 
-            safe_create_task(self._run_startup_tasks())
+            self._startup_task = safe_create_task(self._run_startup_tasks())
         else:
+            self._startup_task = None
             logger.info("维护调度器启动任务已禁用（MAINTENANCE_STARTUP_TASKS_ENABLED=false）")
 
     async def _run_startup_tasks(self) -> None:
@@ -290,8 +302,19 @@ class MaintenanceScheduler:
             return
 
         self.running = False
+
+        if self._startup_task and not self._startup_task.done():
+            self._startup_task.cancel()
+            try:
+                await self._startup_task
+            except asyncio.CancelledError:
+                pass
+        self._startup_task = None
+
         scheduler = get_scheduler()
-        scheduler.stop()
+        for job_id in self._registered_job_ids:
+            scheduler.remove_job(job_id)
+        self._registered_job_ids.clear()
 
         logger.info("系统维护调度器已停止")
 
@@ -299,22 +322,32 @@ class MaintenanceScheduler:
 
     async def _scheduled_stats_aggregation(self, backfill: bool = False) -> None:
         """统计聚合任务（定时调用）"""
+        if not self.running:
+            return
         await self._perform_stats_aggregation(backfill=backfill)
 
     async def _scheduled_wallet_daily_usage_aggregation(self) -> None:
         """钱包每日消费汇总任务（定时调用）"""
+        if not self.running:
+            return
         await self._perform_wallet_daily_usage_aggregation()
 
     async def _scheduled_hourly_stats_aggregation(self) -> None:
         """小时统计聚合任务（定时调用）"""
+        if not self.running:
+            return
         await self._perform_hourly_stats_aggregation()
 
     async def _scheduled_cleanup(self) -> None:
         """清理任务（定时调用）"""
+        if not self.running:
+            return
         await self._perform_cleanup()
 
     async def _scheduled_monitor(self) -> None:
         """监控任务（定时调用）"""
+        if not self.running:
+            return
         try:
             from src.database import log_pool_status
 
@@ -324,6 +357,8 @@ class MaintenanceScheduler:
 
     async def _scheduled_http_client_idle_cleanup(self) -> None:
         """HTTP 客户端空闲清理任务（定时调用）。"""
+        if not self.running:
+            return
         try:
             stats = await HTTPClientPool.cleanup_idle_clients()
             if stats.get("proxy_closed", 0) or stats.get("tunnel_closed", 0):
@@ -337,26 +372,38 @@ class MaintenanceScheduler:
 
     async def _scheduled_pending_cleanup(self) -> None:
         """Pending 清理任务（定时调用）"""
+        if not self.running:
+            return
         await self._perform_pending_cleanup()
 
     async def _scheduled_audit_cleanup(self) -> None:
         """审计日志清理任务（定时调用）"""
+        if not self.running:
+            return
         await self._perform_audit_cleanup()
 
     async def _scheduled_candidate_cleanup(self) -> None:
         """请求候选记录清理任务（定时调用）"""
+        if not self.running:
+            return
         await self._perform_candidate_cleanup()
 
     async def _scheduled_db_maintenance(self) -> None:
         """数据库表维护任务（定时调用）"""
+        if not self.running:
+            return
         await self._perform_db_maintenance()
 
     async def _scheduled_gemini_file_mapping_cleanup(self) -> None:
         """Gemini 文件映射清理任务（定时调用）"""
+        if not self.running:
+            return
         await self._perform_gemini_file_mapping_cleanup()
 
     async def _scheduled_antigravity_ua_refresh(self) -> None:
         """Antigravity User-Agent 版本刷新（定时调用）"""
+        if not self.running:
+            return
         try:
             from src.services.provider.adapters.antigravity.client import refresh_user_agent
 
@@ -366,6 +413,8 @@ class MaintenanceScheduler:
 
     async def _scheduled_provider_checkin(self) -> None:
         """Provider 签到任务（定时调用）"""
+        if not self.running:
+            return
         await self._perform_provider_checkin()
 
     # ========== 实际任务实现 ==========

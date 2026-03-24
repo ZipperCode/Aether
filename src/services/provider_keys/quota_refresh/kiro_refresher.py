@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from src.core.crypto import crypto_service
 from src.core.logger import logger
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
+from src.services.provider_keys.quota_refresh._helpers import build_success_state_update
 
 
 async def refresh_kiro_key_quota(
@@ -76,9 +77,8 @@ async def refresh_kiro_key_quota(
             proxy_config=proxy_config,
         )
     except KiroAccountBannedException as e:
-        # 账户被封禁，自动停用并标记
+        # 账户被封禁，记录账号状态；手动启用状态保持不变。
         state_updates[key.id] = {
-            "is_active": False,
             "oauth_invalid_at": datetime.now(timezone.utc),
             "oauth_invalid_reason": f"账户已封禁: {e.reason or e.message}",
         }
@@ -92,7 +92,7 @@ async def refresh_kiro_key_quota(
             }
         }
         logger.warning(
-            "[KIRO_QUOTA] Key {} 账户已封禁，已自动停用: {}",
+            "[KIRO_QUOTA] Key {} 账户已封禁，已更新账号状态: {}",
             key.id,
             e.reason or e.message,
         )
@@ -102,18 +102,17 @@ async def refresh_kiro_key_quota(
             "status": "banned",
             "message": f"账户已封禁: {e.reason or e.message}",
             "is_banned": True,
-            "auto_disabled": True,
+            "auto_disabled": False,
         }
     except RuntimeError as e:
         error_msg = str(e)
         # 检查是否需要标记账号异常
         if "401" in error_msg or "认证失败" in error_msg:
             state_updates[key.id] = {
-                "is_active": False,
                 "oauth_invalid_at": datetime.now(timezone.utc),
                 "oauth_invalid_reason": "Kiro Token 无效或已过期",
             }
-            logger.warning("[KIRO_QUOTA] Key {} Token 无效，已标记为异常并自动停用", key.id)
+            logger.warning("[KIRO_QUOTA] Key {} Token 无效，已标记为异常", key.id)
         return {
             "key_id": key.id,
             "key_name": key.name,
@@ -134,11 +133,7 @@ async def refresh_kiro_key_quota(
         metadata["banned_at"] = None
         # 收集元数据，稍后统一更新数据库（存储到 kiro 子对象）
         metadata_updates[key.id] = {"kiro": metadata}
-        state_updates[key.id] = {
-            "oauth_invalid_at": None,
-            "oauth_invalid_reason": None,
-            "is_active": True,
-        }
+        state_updates[key.id] = build_success_state_update(key)
 
         # 如果 auth_config 有更新（例如 token 刷新），也需要更新
         if updated_auth_config:

@@ -314,13 +314,24 @@
     :result="modelTest.testResult.value"
     mode="direct"
     :selecting-model-name="testingModelName"
+    :endpoints="activeEndpoints"
+    :selected-endpoint="selectedTestEndpoint"
     :testing="modelTest.testing.value"
     :trace="modelTest.testTrace.value"
     :request-id="modelTest.requestId.value"
-    :message-draft="testMessageDraft"
+    :request-headers-draft="testRequestHeadersDraft"
+    :request-headers-reset-value="testRequestHeadersResetValue"
+    :request-headers-error="testRequestHeadersError"
+    :request-body-draft="testRequestBodyDraft"
+    :request-body-reset-value="testRequestBodyResetValue"
+    :request-body-error="testRequestBodyError"
+    :start-disabled="!selectedTestEndpoint || !!testRequestHeadersError || !!testRequestBodyError"
     @close="handleTestDialogClose"
+    @back="handleTestDialogBack"
+    @select-endpoint="handleSelectTestEndpoint"
     @start="handleStartMappingTest"
-    @update:message-draft="testMessageDraft = $event"
+    @update:request-headers-draft="testRequestHeadersDraft = $event"
+    @update:request-body-draft="testRequestBodyDraft = $event"
   />
 </template>
 
@@ -338,6 +349,7 @@ import ModelTestDialog from './ModelTestDialog.vue'
 import { useToast } from '@/composables/useToast'
 import {
   type Model,
+  type ProviderEndpoint,
   type ProviderModelAlias,
   type ProviderMappingPreviewResponse,
 } from '@/api/endpoints'
@@ -345,6 +357,14 @@ import { type EndpointAPIKey } from '@/api/endpoints/keys'
 import { updateModel } from '@/api/endpoints/models'
 import { parseApiError } from '@/utils/errorParser'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
+import {
+  buildDefaultModelTestRequestHeaders,
+  buildDefaultModelTestRequestBody,
+  parseModelTestRequestHeadersDraft,
+  parseModelTestRequestBodyDraft,
+  POOL_TEST_CONCURRENCY,
+  SINGLE_TEST_CONCURRENCY,
+} from './model-test-request'
 
 interface MappingItem {
   name: string
@@ -372,6 +392,7 @@ interface CombinedMapping {
 
 const props = defineProps<{
   provider: ProviderWithEndpointsSummary
+  endpoints?: ProviderEndpoint[]
   providerKeys?: EndpointAPIKey[]
   models?: Model[]
   mappingPreview?: ProviderMappingPreviewResponse | null
@@ -396,7 +417,17 @@ const testingMapping = ref<string | null>(null)
 const pendingMappingKey = ref<string | null>(null)
 const testingModelName = ref<string | null>(null)
 const preselectedModelId = ref<string | null>(null)
-const testMessageDraft = ref('')
+const selectedTestEndpoint = ref<ProviderEndpoint | null>(null)
+const testRequestHeadersDraft = ref('')
+const testRequestHeadersResetValue = ref('')
+const testRequestBodyDraft = ref('')
+const testRequestBodyResetValue = ref('')
+const isPoolManagedProvider = computed(() => Boolean(props.provider.pool_advanced))
+const activeEndpoints = computed(() => (props.endpoints ?? []).filter(endpoint => endpoint.is_active))
+const parsedTestRequestHeaders = computed(() => parseModelTestRequestHeadersDraft(testRequestHeadersDraft.value))
+const testRequestHeadersError = computed(() => parsedTestRequestHeaders.value.error)
+const parsedTestRequestBody = computed(() => parseModelTestRequestBodyDraft(testRequestBodyDraft.value))
+const testRequestBodyError = computed(() => parsedTestRequestBody.value.error)
 
 // 使用 props 传入的数据
 const models = computed(() => props.models ?? [])
@@ -634,31 +665,74 @@ function handleTestDialogClose() {
   pendingMappingKey.value = null
   testingModelName.value = null
   testingMapping.value = null
+  selectedTestEndpoint.value = null
+  testRequestHeadersDraft.value = ''
+  testRequestHeadersResetValue.value = ''
+  testRequestBodyDraft.value = ''
+  testRequestBodyResetValue.value = ''
+}
+
+function handleTestDialogBack() {
+  if (modelTest.testing.value) return
+  modelTest.testResult.value = null
+  modelTest.stopPolling()
+}
+
+function handleSelectTestEndpoint(endpointId: string) {
+  const endpoint = activeEndpoints.value.find(item => item.id === endpointId)
+  if (!endpoint) return
+  selectedTestEndpoint.value = endpoint
 }
 
 // 测试映射（直连测试，带故障转移和实时进度）
 function runMappingTest(testingKey: string, modelName: string) {
+  if (activeEndpoints.value.length === 0) {
+    showError('暂无可用于测试的活跃端点')
+    return
+  }
   pendingMappingKey.value = testingKey
   modelTest.testResult.value = null
   modelTest.dialogOpen.value = true
   testingMapping.value = null
   testingModelName.value = modelName
+  selectedTestEndpoint.value = activeEndpoints.value[0] ?? null
+  testRequestHeadersResetValue.value = buildDefaultModelTestRequestHeaders()
+  testRequestHeadersDraft.value = testRequestHeadersResetValue.value
+  testRequestBodyResetValue.value = buildDefaultModelTestRequestBody(modelName)
+  testRequestBodyDraft.value = testRequestBodyResetValue.value
 }
 
 async function handleStartMappingTest() {
-  if (modelTest.testing.value || !testingModelName.value || !pendingMappingKey.value) return
+  if (modelTest.testing.value || !testingModelName.value) return
+  const endpoint = selectedTestEndpoint.value || activeEndpoints.value[0]
+  if (!endpoint) {
+    showError('请选择要测试的端点')
+    return
+  }
 
-  const currentMappingKey = pendingMappingKey.value
-  testingMapping.value = currentMappingKey
+  const { value: requestHeaders, error: requestHeadersError } = parsedTestRequestHeaders.value
+  if (!requestHeaders || requestHeadersError) {
+    showError(`测试请求头无效: ${requestHeadersError || '无效 JSON'}`)
+    return
+  }
+
+  const { value: requestBody, error } = parsedTestRequestBody.value
+  if (!requestBody || error) {
+    showError(`测试请求体无效: ${error || '无效 JSON'}`)
+    return
+  }
+
+  const currentMappingKey = pendingMappingKey.value || testingModelName.value
+  testingMapping.value = pendingMappingKey.value ? currentMappingKey : null
   await modelTest.startTest({
     mode: 'direct',
     modelName: testingModelName.value,
-    displayLabel: `映射 "${testingModelName.value}"`,
-    message: testMessageDraft.value,
-    onSuccess: () => {
-      pendingMappingKey.value = null
-      testingModelName.value = null
-    },
+    displayLabel: `[${endpoint.api_format}] 映射 "${testingModelName.value}"`,
+    apiFormat: endpoint.api_format,
+    endpointId: endpoint.id,
+    requestHeaders,
+    requestBody,
+    concurrency: isPoolManagedProvider.value ? POOL_TEST_CONCURRENCY : SINGLE_TEST_CONCURRENCY,
   })
   if (pendingMappingKey.value === currentMappingKey) {
     pendingMappingKey.value = null

@@ -26,6 +26,7 @@ from src.services.provider_keys.codex_usage_parser import (
     parse_codex_usage_headers,
     parse_codex_wham_usage_response,
 )
+from src.services.provider_keys.quota_refresh._helpers import build_success_state_update
 
 
 def _normalize_plan_type(value: Any) -> str | None:
@@ -277,11 +278,7 @@ async def refresh_codex_key_quota(
                 metadata_updates[key.id] = {
                     "codex": _build_quota_exhausted_fallback_metadata(oauth_plan_type)
                 }
-            state_updates[key.id] = {
-                "oauth_invalid_at": None,
-                "oauth_invalid_reason": None,
-                "is_active": True,
-            }
+            state_updates[key.id] = build_success_state_update(key)
             return {
                 "key_id": key.id,
                 "key_name": key.name,
@@ -349,11 +346,7 @@ async def refresh_codex_key_quota(
     if metadata:
         # 收集元数据，稍后统一更新数据库（存储到 codex 子对象）
         metadata_updates[key.id] = {"codex": metadata}
-        state_updates[key.id] = {
-            "oauth_invalid_at": None,
-            "oauth_invalid_reason": None,
-            "is_active": True,
-        }
+        state_updates[key.id] = build_success_state_update(key)
         return {
             "key_id": key.id,
             "key_name": key.name,

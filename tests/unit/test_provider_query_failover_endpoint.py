@@ -1,18 +1,23 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
 
-from src.api.admin.provider_query import TestModelFailoverRequest as FailoverRequestModel
+from src.api.admin import provider_query as provider_query_module
 from src.api.admin.provider_query import (
     DEFAULT_MODEL_TEST_MESSAGE,
+)
+from src.api.admin.provider_query import TestModelFailoverRequest as FailoverRequestModel
+from src.api.admin.provider_query import (
     _build_direct_test_candidates,
     _build_test_attempts_from_candidate_keys,
     _filter_test_candidates_by_endpoint,
     _flatten_test_candidates_for_concurrency,
+    _maybe_mark_test_oauth_key_invalid,
     _require_test_endpoint_base_url,
-    _resolve_test_message,
     _resolve_test_effective_model,
+    _resolve_test_message,
 )
 from src.services.scheduling.schemas import PoolCandidate
 
@@ -176,3 +181,68 @@ def test_require_test_endpoint_base_url_trims_whitespace() -> None:
     )
 
     assert _require_test_endpoint_base_url(endpoint) == "https://api.anthropic.com"
+
+
+@pytest.mark.asyncio
+async def test_maybe_mark_test_oauth_key_invalid_skips_account_block_when_oauth_check_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = SimpleNamespace(id="key-1", oauth_invalid_at=None, oauth_invalid_reason=None)
+    endpoint = SimpleNamespace(api_format="openai:chat")
+    db = MagicMock()
+
+    async def _fake_verify(**_: object) -> bool:
+        key.oauth_invalid_reason = "[OAUTH_EXPIRED] refresh token expired"
+        return False
+
+    monkeypatch.setattr(provider_query_module, "verify_oauth_before_account_block", _fake_verify)
+
+    await _maybe_mark_test_oauth_key_invalid(
+        db=db,
+        endpoint=endpoint,
+        key=key,
+        auth_type="oauth",
+        error_payload={
+            "error": {
+                "code": 403,
+                "message": "Please verify your account",
+                "status": "PERMISSION_DENIED",
+            }
+        },
+    )
+
+    assert key.oauth_invalid_at is None
+    assert key.oauth_invalid_reason == "[OAUTH_EXPIRED] refresh token expired"
+    db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_maybe_mark_test_oauth_key_invalid_marks_account_block_after_oauth_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = SimpleNamespace(id="key-2", oauth_invalid_at=None, oauth_invalid_reason=None)
+    endpoint = SimpleNamespace(api_format="openai:chat")
+    db = MagicMock()
+
+    async def _fake_verify(**_: object) -> bool:
+        return True
+
+    monkeypatch.setattr(provider_query_module, "verify_oauth_before_account_block", _fake_verify)
+
+    await _maybe_mark_test_oauth_key_invalid(
+        db=db,
+        endpoint=endpoint,
+        key=key,
+        auth_type="oauth",
+        error_payload={
+            "error": {
+                "code": 403,
+                "message": "verify your account",
+                "status": "PERMISSION_DENIED",
+            }
+        },
+    )
+
+    assert key.oauth_invalid_at is not None
+    assert str(key.oauth_invalid_reason).startswith("[ACCOUNT_BLOCK] ")
+    db.commit.assert_called_once()

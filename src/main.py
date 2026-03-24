@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -16,11 +17,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.admin import router as admin_router
+from src.api.analytics import router as analytics_router
 from src.api.announcements import router as announcement_router
 
 # API路由
 from src.api.auth import router as auth_router
-from src.api.dashboard import router as dashboard_router
 from src.api.internal import router as internal_router
 from src.api.monitoring import router as monitoring_router
 from src.api.payment import router as payment_router
@@ -133,6 +134,44 @@ async def _run_module_lifecycle_hooks(
                 await hook()
     finally:
         db.close()
+
+
+async def _stop_service_on_lock_lost(
+    state: LifecycleState,
+    *,
+    lock_name: str,
+    service_name: str,
+    state_attr: str,
+    stop: Callable[[], Awaitable[Any]],
+) -> None:
+    logger.warning("检测到 {} 的 leader 锁已丢失，停止本实例的 {}", lock_name, service_name)
+    try:
+        await stop()
+    except Exception:
+        logger.exception("丢失 {} leader 锁后停止 {} 失败", lock_name, service_name)
+        return
+
+    setattr(state, state_attr, None)
+
+
+def _make_lock_lost_callback(
+    state: LifecycleState,
+    *,
+    lock_name: str,
+    service_name: str,
+    state_attr: str,
+    stop: Callable[[], Awaitable[Any]],
+) -> Callable[[str], Awaitable[None]]:
+    async def _callback(_name: str) -> None:
+        await _stop_service_on_lock_lost(
+            state,
+            lock_name=lock_name,
+            service_name=service_name,
+            state_attr=state_attr,
+            stop=stop,
+        )
+
+    return _callback
 
 
 def _configure_uvicorn_access_log() -> None:
@@ -408,6 +447,16 @@ async def _start_background_services(state: LifecycleState) -> None:
     if quota_scheduler_active:
         state.quota_scheduler = get_quota_scheduler()
         await state.quota_scheduler.start()
+        state.task_coordinator.register_lock_lost_callback(
+            "quota_scheduler",
+            _make_lock_lost_callback(
+                state,
+                lock_name="quota_scheduler",
+                service_name="月卡额度重置调度器",
+                state_attr="quota_scheduler",
+                stop=state.quota_scheduler.stop,
+            ),
+        )
     else:
         logger.info("检测到其他 worker 已运行额度调度器，本实例跳过")
         state.quota_scheduler = None
@@ -418,6 +467,16 @@ async def _start_background_services(state: LifecycleState) -> None:
         state.maintenance_scheduler = get_maintenance_scheduler()
         logger.info("启动系统维护调度器...")
         await state.maintenance_scheduler.start()
+        state.task_coordinator.register_lock_lost_callback(
+            "maintenance_scheduler",
+            _make_lock_lost_callback(
+                state,
+                lock_name="maintenance_scheduler",
+                service_name="系统维护调度器",
+                state_attr="maintenance_scheduler",
+                stop=state.maintenance_scheduler.stop,
+            ),
+        )
     else:
         logger.info("检测到其他 worker 已运行维护调度器，本实例跳过")
         state.maintenance_scheduler = None
@@ -428,6 +487,16 @@ async def _start_background_services(state: LifecycleState) -> None:
         state.model_fetch_scheduler = get_model_fetch_scheduler()
         logger.info("启动模型自动获取调度器...")
         await state.model_fetch_scheduler.start()
+        state.task_coordinator.register_lock_lost_callback(
+            "model_fetch_scheduler",
+            _make_lock_lost_callback(
+                state,
+                lock_name="model_fetch_scheduler",
+                service_name="模型自动获取调度器",
+                state_attr="model_fetch_scheduler",
+                stop=state.model_fetch_scheduler.stop,
+            ),
+        )
     else:
         logger.info("检测到其他 worker 已运行模型获取调度器，本实例跳过")
         state.model_fetch_scheduler = None
@@ -440,6 +509,16 @@ async def _start_background_services(state: LifecycleState) -> None:
         state.pool_quota_probe_scheduler = get_pool_quota_probe_scheduler()
         logger.info("启动号池额度主动探测调度器...")
         await state.pool_quota_probe_scheduler.start()
+        state.task_coordinator.register_lock_lost_callback(
+            "pool_quota_probe_scheduler",
+            _make_lock_lost_callback(
+                state,
+                lock_name="pool_quota_probe_scheduler",
+                service_name="号池额度主动探测调度器",
+                state_attr="pool_quota_probe_scheduler",
+                stop=state.pool_quota_probe_scheduler.stop,
+            ),
+        )
     else:
         logger.info("检测到其他 worker 已运行号池额度主动探测调度器，本实例跳过")
         state.pool_quota_probe_scheduler = None
@@ -450,6 +529,16 @@ async def _start_background_services(state: LifecycleState) -> None:
         state.task_poller = get_task_poller()
         logger.info("启动 TaskPoller（video）...")
         await state.task_poller.start()
+        state.task_coordinator.register_lock_lost_callback(
+            "task_poller:video",
+            _make_lock_lost_callback(
+                state,
+                lock_name="task_poller:video",
+                service_name="TaskPoller（video）",
+                state_attr="task_poller",
+                stop=state.task_poller.stop,
+            ),
+        )
     else:
         logger.info("检测到其他 worker 已运行 TaskPoller（video），本实例跳过")
         state.task_poller = None
@@ -732,7 +821,7 @@ app.include_router(me_router)  # 用户个人端点
 app.include_router(wallet_router)  # 钱包端点
 app.include_router(payment_router)  # 支付回调端点
 app.include_router(announcement_router)  # 公告系统
-app.include_router(dashboard_router)  # 仪表盘端点
+app.include_router(analytics_router)  # 新分析域
 app.include_router(public_router)  # 公开API端点（用户可查看提供商和模型）
 app.include_router(monitoring_router)  # 监控端点
 app.include_router(internal_router)  # Hub 本地控制面端点

@@ -18,6 +18,8 @@ export interface ProviderOAuthCompleteResponse {
   expires_at?: number | null
   has_refresh_token: boolean
   email?: string | null
+  account_state_recheck_attempted?: boolean
+  account_state_recheck_error?: string | null
 }
 
 export interface ProviderOAuthCompleteResponseWithKey {

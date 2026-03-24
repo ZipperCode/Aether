@@ -221,13 +221,19 @@
     :testing="modelTest.testing.value"
     :trace="modelTest.testTrace.value"
     :request-id="modelTest.requestId.value"
-    :show-endpoint-selector="activeEndpoints.length > 1"
-    :message-draft="testMessageDraft"
+    :request-headers-draft="testRequestHeadersDraft"
+    :request-headers-reset-value="testRequestHeadersResetValue"
+    :request-headers-error="testRequestHeadersError"
+    :request-body-draft="testRequestBodyDraft"
+    :request-body-reset-value="testRequestBodyResetValue"
+    :request-body-error="testRequestBodyError"
+    :start-disabled="!selectedTestEndpoint || !!testRequestHeadersError || !!testRequestBodyError"
     @close="handleTestDialogClose"
     @back="handleTestDialogBack"
     @start="handleStartPendingTest"
     @select-endpoint="handleSelectTestEndpoint"
-    @update:message-draft="testMessageDraft = $event"
+    @update:request-headers-draft="testRequestHeadersDraft = $event"
+    @update:request-body-draft="testRequestBodyDraft = $event"
   />
 </template>
 
@@ -250,6 +256,14 @@ import { parseApiError } from '@/utils/errorParser'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
 import ModelTestDialog from './ModelTestDialog.vue'
+import {
+  buildDefaultModelTestRequestHeaders,
+  buildDefaultModelTestRequestBody,
+  parseModelTestRequestHeadersDraft,
+  parseModelTestRequestBodyDraft,
+  POOL_TEST_CONCURRENCY,
+  SINGLE_TEST_CONCURRENCY,
+} from './model-test-request'
 
 const props = defineProps<{
   provider: ProviderWithEndpointsSummary
@@ -275,8 +289,16 @@ const localModels = ref<Model[]>([])
 const togglingModelId = ref<string | null>(null)
 const pendingTestModel = ref<Model | null>(null)
 const selectedTestEndpoint = ref<ProviderEndpoint | null>(null)
-const testMessageDraft = ref('')
+const testRequestHeadersDraft = ref('')
+const testRequestHeadersResetValue = ref('')
+const testRequestBodyDraft = ref('')
+const testRequestBodyResetValue = ref('')
+const isPoolManagedProvider = computed(() => Boolean(props.provider.pool_advanced))
 const activeEndpoints = computed(() => (props.endpoints ?? []).filter(endpoint => endpoint.is_active))
+const parsedTestRequestHeaders = computed(() => parseModelTestRequestHeadersDraft(testRequestHeadersDraft.value))
+const testRequestHeadersError = computed(() => parsedTestRequestHeaders.value.error)
+const parsedTestRequestBody = computed(() => parseModelTestRequestBodyDraft(testRequestBodyDraft.value))
+const testRequestBodyError = computed(() => parsedTestRequestBody.value.error)
 const models = computed(() => props.models ?? localModels.value)
 // 按名称排序的模型列表
 const sortedModels = computed(() => {
@@ -442,18 +464,46 @@ function handleTestDialogClose() {
   modelTest.resetState()
   pendingTestModel.value = null
   selectedTestEndpoint.value = null
+  testRequestHeadersDraft.value = ''
+  testRequestHeadersResetValue.value = ''
+  testRequestBodyDraft.value = ''
+  testRequestBodyResetValue.value = ''
 }
 
 function handleTestDialogBack() {
   if (modelTest.testing.value) return
   modelTest.testResult.value = null
-  selectedTestEndpoint.value = null
+  modelTest.stopPolling()
 }
 
-async function handleSelectTestEndpoint(endpointId: string) {
-  if (!pendingTestModel.value) return
+function handleSelectTestEndpoint(endpointId: string) {
   const endpoint = activeEndpoints.value.find(item => item.id === endpointId)
   if (!endpoint) return
+  selectedTestEndpoint.value = endpoint
+}
+
+async function handleStartPendingTest() {
+  if (modelTest.testing.value) return
+  if (!pendingTestModel.value) return
+
+  const endpoint = selectedTestEndpoint.value || activeEndpoints.value[0]
+  if (!endpoint) {
+    showError('请选择要测试的端点')
+    return
+  }
+
+  const { value: requestHeaders, error: requestHeadersError } = parsedTestRequestHeaders.value
+  if (!requestHeaders || requestHeadersError) {
+    showError(`测试请求头无效: ${requestHeadersError || '无效 JSON'}`)
+    return
+  }
+
+  const { value: requestBody, error } = parsedTestRequestBody.value
+  if (!requestBody || error) {
+    showError(`测试请求体无效: ${error || '无效 JSON'}`)
+    return
+  }
+
   selectedTestEndpoint.value = endpoint
   const model = pendingTestModel.value
   const modelName = model.global_model_name || model.provider_model_name
@@ -464,26 +514,15 @@ async function handleSelectTestEndpoint(endpointId: string) {
     displayLabel: `${endpointPrefix}${modelName}`,
     apiFormat: endpoint.api_format,
     endpointId: endpoint.id,
-    message: testMessageDraft.value,
-    concurrency: 5,
-    onSuccess: () => {
-      pendingTestModel.value = null
-      selectedTestEndpoint.value = null
-    },
+    requestHeaders,
+    requestBody,
+    concurrency: isPoolManagedProvider.value ? POOL_TEST_CONCURRENCY : SINGLE_TEST_CONCURRENCY,
     onError: () => {
       if (activeEndpoints.value.length > 1) {
-        selectedTestEndpoint.value = null
         return true
       }
     },
   })
-}
-
-async function handleStartPendingTest() {
-  if (modelTest.testing.value) return
-  const endpoint = activeEndpoints.value[0]
-  if (!endpoint) return
-  await handleSelectTestEndpoint(endpoint.id)
 }
 
 async function testModelConnection(model: Model) {
@@ -495,7 +534,13 @@ async function testModelConnection(model: Model) {
   }
 
   pendingTestModel.value = model
-  selectedTestEndpoint.value = null
+  selectedTestEndpoint.value = activeEndpoints.value[0] ?? null
+  testRequestHeadersResetValue.value = buildDefaultModelTestRequestHeaders()
+  testRequestHeadersDraft.value = testRequestHeadersResetValue.value
+  testRequestBodyResetValue.value = buildDefaultModelTestRequestBody(
+    model.global_model_name || model.provider_model_name,
+  )
+  testRequestBodyDraft.value = testRequestBodyResetValue.value
   modelTest.testResult.value = null
   modelTest.dialogOpen.value = true
 }

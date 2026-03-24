@@ -1140,6 +1140,7 @@ class RequestBuilder(ABC):
         envelope: ProviderEnvelope | None = None,
         body: dict[str, Any] | None = None,
         original_body: dict[str, Any] | None = None,
+        rules_original_body: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         """构建请求头"""
         pass
@@ -1151,6 +1152,7 @@ class RequestBuilder(ABC):
         endpoint: Any,
         key: Any,
         *,
+        rules_original_body: dict[str, Any] | None = None,
         mapped_model: str | None = None,
         is_stream: bool = False,
         extra_headers: dict[str, str] | None = None,
@@ -1166,6 +1168,7 @@ class RequestBuilder(ABC):
             original_headers: 原始请求头
             endpoint: 端点配置
             key: Provider API Key
+            rules_original_body: 规则条件评估用的“原始请求体”（如模型映射前的请求体）；不传则使用 original_body
             mapped_model: 映射后的模型名
             is_stream: 是否为流式请求
             extra_headers: 额外请求头
@@ -1175,6 +1178,9 @@ class RequestBuilder(ABC):
         Returns:
             Tuple[payload, headers]
         """
+        effective_rules_original_body = (
+            rules_original_body if rules_original_body is not None else original_body
+        )
         payload = self.build_payload(
             original_body,
             mapped_model=mapped_model,
@@ -1187,7 +1193,7 @@ class RequestBuilder(ABC):
             payload = apply_body_rules(
                 payload,
                 body_rules,
-                original_body=original_body,
+                original_body=effective_rules_original_body,
             )
 
         effective_provider_api_format = provider_api_format or getattr(endpoint, "api_format", None)
@@ -1209,6 +1215,7 @@ class RequestBuilder(ABC):
             envelope=envelope,
             body=payload,
             original_body=original_body,
+            rules_original_body=effective_rules_original_body,
         )
         return payload, headers
 
@@ -1314,6 +1321,7 @@ class PassthroughRequestBuilder(RequestBuilder):
         envelope: ProviderEnvelope | None = None,
         body: dict[str, Any] | None = None,
         original_body: dict[str, Any] | None = None,
+        rules_original_body: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         """
         透传请求头 - 清理敏感头部（黑名单），透传其他所有头部
@@ -1325,6 +1333,8 @@ class PassthroughRequestBuilder(RequestBuilder):
             extra_headers: 额外请求头
             pre_computed_auth: 预先计算的认证信息 (auth_header, auth_value)，
                                用于 Service Account 等异步获取 token 的场景
+            original_body: 原始请求体（对应 build() 的 original_body）
+            rules_original_body: 规则条件评估用的“原始请求体”（如模型映射前的请求体）；不传则使用 original_body
         """
         raw_family = getattr(endpoint, "api_family", None)
         raw_kind = getattr(endpoint, "endpoint_kind", None)
@@ -1366,7 +1376,9 @@ class PassthroughRequestBuilder(RequestBuilder):
                 header_rules,
                 protected_keys,
                 body=body,
-                original_body=original_body,
+                original_body=rules_original_body
+                if rules_original_body is not None
+                else original_body,
                 condition_evaluator=evaluate_condition,
             )
 

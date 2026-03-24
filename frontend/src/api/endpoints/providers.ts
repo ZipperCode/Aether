@@ -194,6 +194,8 @@ export interface TestModelFailoverRequest {
   api_format?: string
   endpoint_id?: string
   message?: string
+  request_headers?: Record<string, unknown>
+  request_body?: Record<string, unknown>
   request_id?: string
   concurrency?: number
 }
@@ -212,6 +214,11 @@ export interface TestAttemptDetail {
   error_message?: string | null
   status_code?: number | null
   latency_ms?: number | null
+  request_url?: string | null
+  request_headers?: Record<string, unknown> | null
+  request_body?: unknown
+  response_headers?: Record<string, unknown> | null
+  response_body?: unknown
 }
 
 export interface TestModelFailoverResponse {

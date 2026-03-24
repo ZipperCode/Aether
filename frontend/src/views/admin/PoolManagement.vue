@@ -127,7 +127,7 @@
                   全部
                 </SelectItem>
                 <SelectItem value="active">
-                  活跃
+                  可调度
                 </SelectItem>
                 <SelectItem value="cooldown">
                   冷却中
@@ -213,7 +213,7 @@
                   全部状态
                 </SelectItem>
                 <SelectItem value="active">
-                  活跃
+                  可调度
                 </SelectItem>
                 <SelectItem value="cooldown">
                   冷却中
@@ -463,7 +463,7 @@
                           size="icon"
                           class="h-4 w-4 shrink-0"
                           :disabled="refreshingOAuthKeyId === key.key_id"
-                          :title="getKeyOAuthExpires(key)?.isInvalid ? '重新授权' : '刷新 Token'"
+                          :title="getOAuthRefreshButtonTitle(key)"
                           @click.stop="handleRefreshOAuth(key)"
                         >
                           <RefreshCw
@@ -472,16 +472,16 @@
                           />
                         </Button>
                         <span
-                          v-if="getKeyOAuthExpires(key)"
+                          v-if="getVisibleOAuthState(key)"
                           class="text-[10px]"
                           :class="{
-                            'text-destructive': getKeyOAuthExpires(key)?.isInvalid || getKeyOAuthExpires(key)?.isExpired,
-                            'text-warning': getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isInvalid,
-                            'text-muted-foreground': !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isInvalid
+                            'text-destructive': getVisibleOAuthState(key)?.isInvalid || getVisibleOAuthState(key)?.isExpired,
+                            'text-warning': getVisibleOAuthState(key)?.isExpiringSoon && !getVisibleOAuthState(key)?.isExpired && !getVisibleOAuthState(key)?.isInvalid,
+                            'text-muted-foreground': !getVisibleOAuthState(key)?.isExpired && !getVisibleOAuthState(key)?.isExpiringSoon && !getVisibleOAuthState(key)?.isInvalid
                           }"
                           :title="getOAuthStatusTitle(key)"
                         >
-                          {{ getKeyOAuthExpires(key)?.text }}
+                          {{ getVisibleOAuthState(key)?.text }}
                         </span>
                       </template>
                       <Badge
@@ -773,7 +773,7 @@
                       size="icon"
                       class="h-4 w-4 shrink-0"
                       :disabled="refreshingOAuthKeyId === key.key_id"
-                      :title="getKeyOAuthExpires(key)?.isInvalid ? '重新授权' : '刷新 Token'"
+                      :title="getOAuthRefreshButtonTitle(key)"
                       @click.stop="handleRefreshOAuth(key)"
                     >
                       <RefreshCw
@@ -782,16 +782,16 @@
                       />
                     </Button>
                     <span
-                      v-if="getKeyOAuthExpires(key)"
+                      v-if="getVisibleOAuthState(key)"
                       class="text-[10px]"
                       :class="{
-                        'text-destructive': getKeyOAuthExpires(key)?.isInvalid || getKeyOAuthExpires(key)?.isExpired,
-                        'text-warning': getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isInvalid,
-                        'text-muted-foreground': !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isInvalid
+                        'text-destructive': getVisibleOAuthState(key)?.isInvalid || getVisibleOAuthState(key)?.isExpired,
+                        'text-warning': getVisibleOAuthState(key)?.isExpiringSoon && !getVisibleOAuthState(key)?.isExpired && !getVisibleOAuthState(key)?.isInvalid,
+                        'text-muted-foreground': !getVisibleOAuthState(key)?.isExpired && !getVisibleOAuthState(key)?.isExpiringSoon && !getVisibleOAuthState(key)?.isInvalid
                       }"
                       :title="getOAuthStatusTitle(key)"
                     >
-                      {{ getKeyOAuthExpires(key)?.text }}
+                      {{ getVisibleOAuthState(key)?.text }}
                     </span>
                   </template>
                   <Badge
@@ -1153,8 +1153,9 @@ import {
 import RefreshButton from '@/components/ui/refresh-button.vue'
 import { useToast } from '@/composables/useToast'
 import { useClipboard } from '@/composables/useClipboard'
-import { useCountdownTimer, getOAuthExpiresCountdown, getCodexResetCountdown } from '@/composables/useCountdownTimer'
+import { useCountdownTimer, getCodexResetCountdown } from '@/composables/useCountdownTimer'
 import { useConfirm } from '@/composables/useConfirm'
+import { useRouteQuery } from '@/composables/useRouteQuery'
 import { parseApiError } from '@/utils/errorParser'
 import {
   getPoolOverview,
@@ -1194,14 +1195,22 @@ import KeyFormDialog from '@/features/providers/components/KeyFormDialog.vue'
 import OAuthKeyEditDialog from '@/features/providers/components/OAuthKeyEditDialog.vue'
 import OAuthAccountDialog from '@/features/providers/components/OAuthAccountDialog.vue'
 import ProxyNodeSelect from '@/features/providers/components/ProxyNodeSelect.vue'
-import { isAccountLevelBlockReason, classifyAccountBlockLabel, cleanAccountBlockReason } from '@/utils/accountBlock'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
+import { getOAuthRefreshFeedback } from '@/utils/oauthRefreshFeedback'
+import {
+  getAccountStatusDisplay,
+  getAccountStatusTitle,
+  getOAuthRefreshButtonTitle as resolveOAuthRefreshButtonTitle,
+  getOAuthStatusDisplay,
+  getOAuthStatusTitle as resolveOAuthStatusTitle,
+} from '@/utils/providerKeyStatus'
 
 const { success, error: showError, warning: showWarning } = useToast()
 const { confirm } = useConfirm()
 const { copyToClipboard } = useClipboard()
 const { tick: countdownTick, start: startCountdownTimer } = useCountdownTimer()
 const proxyNodesStore = useProxyNodesStore()
+const { getQueryValue, patchQuery } = useRouteQuery()
 
 // --- Overview ---
 const poolProviders = ref<PoolOverviewItem[]>([])
@@ -1423,7 +1432,7 @@ const desktopColumnWidths = computed(() => {
   }
 })
 
-async function selectProvider(id: string) {
+async function selectProvider(id: string, options: { preserveSearch?: boolean } = {}) {
   const requestId = ++selectProviderRequestId
   selectedProviderId.value = id
   selectedProviderData.value = null
@@ -1437,7 +1446,9 @@ async function selectProvider(id: string) {
   proxyMobilePopoverOpenKeyId.value = null
   suppressFiltersWatch = true
   currentPage.value = 1
-  searchQuery.value = ''
+  if (!options.preserveSearch) {
+    searchQuery.value = ''
+  }
   statusFilter.value = 'all'
   suppressFiltersWatch = false
   if (keysSearchDebounceTimer !== null) {
@@ -1496,6 +1507,32 @@ const keyPermissionsDialogOpen = ref(false)
 const keyFormDialogOpen = ref(false)
 const oauthKeyEditDialogOpen = ref(false)
 const editingKeyDetail = ref<PoolKeyDetail | null>(null)
+
+watch(
+  () => getQueryValue('search') ?? '',
+  (value) => {
+    if (searchQuery.value === value) return
+    searchQuery.value = value
+  },
+  { immediate: true },
+)
+
+watch(searchQuery, (value) => {
+  patchQuery({ search: value.trim() || undefined })
+})
+
+watch(
+  () => getQueryValue('providerId'),
+  (value) => {
+    if (!value || value === selectedProviderId.value) return
+    void selectProvider(value, { preserveSearch: true })
+  },
+  { immediate: true },
+)
+
+watch(selectedProviderId, (value) => {
+  patchQuery({ providerId: value || undefined })
+})
 
 interface QuotaProgressItem {
   label: string
@@ -1747,6 +1784,7 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     oauth_organizations: key.oauth_organizations ?? [],
     oauth_invalid_at: key.oauth_invalid_at ?? null,
     oauth_invalid_reason: key.oauth_invalid_reason ?? null,
+    status_snapshot: key.status_snapshot ?? null,
     proxy: key.proxy ?? null,
   }
 }
@@ -2006,11 +2044,19 @@ async function handleRefreshOAuth(key: PoolKeyDetail) {
     const target = keyPage.value.keys.find(k => k.key_id === key.key_id)
     if (target) {
       target.oauth_expires_at = result.expires_at ?? null
-      target.oauth_invalid_at = null
-      target.oauth_invalid_reason = null
     }
-    success('Token 刷新成功')
     await loadKeys()
+    const refreshedKey = keyPage.value.keys.find(k => k.key_id === key.key_id) ?? null
+    const feedback = getOAuthRefreshFeedback({
+      accountStateRecheckAttempted: result.account_state_recheck_attempted,
+      accountStateRecheckError: result.account_state_recheck_error,
+      snapshot: refreshedKey,
+    })
+    if (feedback.tone === 'warning') {
+      showWarning(feedback.message)
+    } else {
+      success(feedback.message)
+    }
   } catch (err) {
     showError(parseApiError(err, 'Token 刷新失败'))
     await loadKeys()
@@ -2344,30 +2390,16 @@ function getOAuthPlanTypeClass(planType: string): string {
   return classes[planType.toLowerCase()] || ''
 }
 
-function getKeyOAuthExpires(key: PoolKeyDetail) {
-  if (key.auth_type !== 'oauth') return null
-  if (!key.oauth_expires_at && !key.oauth_invalid_at) return null
-  return getOAuthExpiresCountdown(
-    key.oauth_expires_at,
-    countdownTick.value,
-    key.oauth_invalid_at,
-    key.oauth_invalid_reason
-  )
+function getVisibleOAuthState(key: PoolKeyDetail) {
+  return getOAuthStatusDisplay(key, countdownTick.value)
+}
+
+function getOAuthRefreshButtonTitle(key: PoolKeyDetail): string {
+  return resolveOAuthRefreshButtonTitle(key, countdownTick.value)
 }
 
 function getOAuthStatusTitle(key: PoolKeyDetail): string {
-  const status = getKeyOAuthExpires(key)
-  if (!status) return ''
-  if (status.isInvalid) {
-    const cleaned = status.invalidReason && isAccountLevelBlockReason(status.invalidReason)
-      ? cleanAccountBlockReason(status.invalidReason)
-      : status.invalidReason
-    return cleaned ? `Token 已失效: ${cleaned}` : 'Token 已失效'
-  }
-  if (status.isExpired) {
-    return 'Token 已过期，请重新授权'
-  }
-  return `Token 剩余有效期: ${status.text}`
+  return resolveOAuthStatusTitle(key, countdownTick.value)
 }
 
 const _accountAlertCache = new WeakMap<PoolKeyDetail, string | null>()
@@ -2376,16 +2408,11 @@ function getAccountAlertLabel(key: PoolKeyDetail): string | null {
   const cached = _accountAlertCache.get(key)
   if (cached !== undefined) return cached
 
-  let result: string | null = null
+  let result: string | null = getAccountStatusDisplay(key).label
   const quotaText = String(key.account_quota || '').trim()
   // 后端 _build_account_quota 返回的确切文本: "账号已封禁" / "访问受限"
-  if (quotaText === '账号已封禁' || quotaText === '封禁') result = '账号封禁'
-  else if (quotaText === '访问受限') result = '访问受限'
-  else if (isAccountLevelBlockReason(key.oauth_invalid_reason)) {
-    const reason = String(key.oauth_invalid_reason || '').trim()
-    const cleaned = cleanAccountBlockReason(reason)
-    result = classifyAccountBlockLabel(cleaned || reason)
-  }
+  if (!result && (quotaText === '账号已封禁' || quotaText === '封禁')) result = '账号封禁'
+  else if (!result && quotaText === '访问受限') result = '访问受限'
 
   _accountAlertCache.set(key, result)
   return result
@@ -2395,14 +2422,8 @@ function getAccountAlertTitle(key: PoolKeyDetail): string {
   const label = getAccountAlertLabel(key)
   if (!label) return ''
 
-  const reason = String(key.oauth_invalid_reason || '').trim()
-  if (reason) {
-    if (isAccountLevelBlockReason(reason)) {
-      const cleaned = cleanAccountBlockReason(reason)
-      return cleaned ? `${label}: ${cleaned}` : label
-    }
-    return `${label}: ${reason}`
-  }
+  const accountTitle = getAccountStatusTitle(key)
+  if (accountTitle) return accountTitle
 
   const quotaText = String(key.account_quota || '').trim()
   if (quotaText) return `${label}: ${quotaText}`

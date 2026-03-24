@@ -16,18 +16,17 @@ from __future__ import annotations
 
 import os
 import threading
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from src.config.constants import CircuitBreakerDefaults
 from src.core.batch_committer import get_batch_committer
 from src.core.logger import logger
 from src.core.metrics import health_open_circuits
-from src.models.database import ProviderAPIKey, ProviderEndpoint
+from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
 
 
 class CircuitState:
@@ -766,13 +765,46 @@ class HealthMonitor:
             if not endpoint:
                 return None
 
+            key_rows = (
+                db.query(
+                    ProviderAPIKey.api_formats,
+                    ProviderAPIKey.health_by_format,
+                )
+                .filter(ProviderAPIKey.provider_id == endpoint.provider_id)
+                .all()
+            )
+
+            health_scores: list[float] = []
+            consecutive_failures = 0
+            last_failure_at: str | None = None
+            for api_formats, health_by_format in key_rows:
+                supported_formats = set(api_formats or [])
+                key_health = (health_by_format or {}).get(endpoint.api_format)
+                if endpoint.api_format not in supported_formats and key_health is None:
+                    continue
+
+                if key_health is None:
+                    health_scores.append(1.0)
+                    continue
+
+                health_scores.append(float(key_health.get("health_score") or 1.0))
+                consecutive_failures = max(
+                    consecutive_failures,
+                    int(key_health.get("consecutive_failures") or 0),
+                )
+                candidate_last_failure = key_health.get("last_failure_at")
+                if candidate_last_failure and (last_failure_at is None or candidate_last_failure > last_failure_at):
+                    last_failure_at = candidate_last_failure
+
             return {
                 "endpoint_id": endpoint.id,
-                "health_score": float(endpoint.health_score or 1.0),
-                "consecutive_failures": int(endpoint.consecutive_failures or 0),
-                "last_failure_at": (
-                    endpoint.last_failure_at.isoformat() if endpoint.last_failure_at else None
+                "health_score": (
+                    sum(health_scores) / len(health_scores)
+                    if health_scores
+                    else 1.0
                 ),
+                "consecutive_failures": consecutive_failures,
+                "last_failure_at": last_failure_at,
                 "is_active": endpoint.is_active,
             }
 
@@ -846,30 +878,107 @@ class HealthMonitor:
     def get_all_health_status(cls, db: Session) -> dict[str, Any]:
         """获取所有健康状态摘要"""
         try:
-            endpoint_stats = db.query(
-                func.count(ProviderEndpoint.id).label("total"),
-                func.sum(case((ProviderEndpoint.is_active.is_(True), 1), else_=0)).label("active"),
-                func.sum(case((ProviderEndpoint.health_score < 0.5, 1), else_=0)).label(
-                    "unhealthy"
-                ),
-            ).first()
+            endpoint_rows = db.query(
+                ProviderEndpoint.provider_id,
+                ProviderEndpoint.api_format,
+                ProviderEndpoint.is_active,
+            ).all()
+
+            endpoint_total = len(endpoint_rows)
+            endpoint_active = sum(1 for row in endpoint_rows if row.is_active)
+
+            endpoint_key_rows = db.query(
+                ProviderAPIKey.provider_id,
+                ProviderAPIKey.api_formats,
+                ProviderAPIKey.health_by_format,
+            ).all()
+            provider_format_scores: dict[tuple[str, str], list[float]] = defaultdict(list)
+            for provider_id, api_formats, health_by_format in endpoint_key_rows:
+                supported_formats = set(api_formats or [])
+                for fmt in supported_formats.union(set((health_by_format or {}).keys())):
+                    if not fmt:
+                        continue
+                    format_health = (health_by_format or {}).get(fmt) or {}
+                    provider_format_scores[(str(provider_id), str(fmt))].append(
+                        float(format_health.get("health_score") or 1.0)
+                    )
+
+            endpoint_unhealthy = 0
+            for row in endpoint_rows:
+                scores = provider_format_scores.get((str(row.provider_id), str(row.api_format)), [])
+                endpoint_score = sum(scores) / len(scores) if scores else 1.0
+                if endpoint_score < 0.5:
+                    endpoint_unhealthy += 1
+
+            active_endpoint_rows_raw = (
+                db.query(ProviderEndpoint.provider_id, ProviderEndpoint.api_format)
+                .join(Provider, ProviderEndpoint.provider_id == Provider.id)
+                .filter(
+                    ProviderEndpoint.is_active.is_(True),
+                    Provider.is_active.is_(True),
+                )
+                .all()
+            )
+            active_endpoint_rows: list[tuple[str, str]] = []
+            active_provider_formats: set[tuple[str, str]] = set()
+            for provider_id, api_format in active_endpoint_rows_raw:
+                format_text = (
+                    api_format.value if hasattr(api_format, "value") else str(api_format or "")
+                )
+                if not format_text:
+                    continue
+                normalized = (str(provider_id), format_text)
+                active_endpoint_rows.append(normalized)
+                active_provider_formats.add(normalized)
 
             # 统计 Key（只加载必要列，避免全字段全表扫描）
-            key_rows = db.query(
-                ProviderAPIKey.is_active,
-                ProviderAPIKey.health_by_format,
-                ProviderAPIKey.circuit_breaker_by_format,
-            ).all()
+            key_rows = (
+                db.query(
+                    ProviderAPIKey.provider_id,
+                    ProviderAPIKey.is_active,
+                    ProviderAPIKey.api_formats,
+                    ProviderAPIKey.health_by_format,
+                    ProviderAPIKey.circuit_breaker_by_format,
+                    Provider.is_active,
+                )
+                .join(Provider, ProviderAPIKey.provider_id == Provider.id)
+                .all()
+            )
             total_keys = len(key_rows)
             active_keys = 0
             unhealthy_keys = 0
             circuit_open_keys = 0
+            schedulable_provider_formats: set[tuple[str, str]] = set()
 
-            for is_active, health_by_format, circuit_by_format in key_rows:
-                if is_active:
-                    active_keys += 1
+            for (
+                provider_id,
+                is_active,
+                api_formats,
+                health_by_format,
+                circuit_by_format,
+                provider_active,
+            ) in key_rows:
                 health_by_format = health_by_format or {}
                 circuit_by_format = circuit_by_format or {}
+
+                key_schedulable = False
+                if provider_active and is_active:
+                    for raw_format in api_formats or []:
+                        format_text = (
+                            raw_format.value
+                            if hasattr(raw_format, "value")
+                            else str(raw_format or "")
+                        )
+                        if not format_text:
+                            continue
+                        if (str(provider_id), format_text) not in active_provider_formats:
+                            continue
+                        format_circuit = circuit_by_format.get(format_text, {})
+                        if not format_circuit.get("open"):
+                            key_schedulable = True
+                            schedulable_provider_formats.add((str(provider_id), format_text))
+                    if key_schedulable:
+                        active_keys += 1
 
                 # 检查是否有任何格式健康度低于 0.5
                 for fmt, health_data in health_by_format.items():
@@ -883,11 +992,17 @@ class HealthMonitor:
                         circuit_open_keys += 1
                         break
 
+            unhealthy_endpoints = sum(
+                1
+                for provider_id, format_text in active_endpoint_rows
+                if (provider_id, format_text) not in schedulable_provider_formats
+            )
+
             return {
                 "endpoints": {
-                    "total": endpoint_stats.total or 0 if endpoint_stats else 0,
-                    "active": int(endpoint_stats.active or 0) if endpoint_stats else 0,
-                    "unhealthy": int(endpoint_stats.unhealthy or 0) if endpoint_stats else 0,
+                    "total": endpoint_total,
+                    "active": endpoint_active,
+                    "unhealthy": endpoint_unhealthy,
                 },
                 "keys": {
                     "total": total_keys,

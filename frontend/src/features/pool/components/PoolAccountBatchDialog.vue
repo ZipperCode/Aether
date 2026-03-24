@@ -107,15 +107,15 @@
             <div class="flex items-center gap-1.5">
               <span class="text-xs font-medium truncate">{{ key.key_name || '未命名' }}</span>
               <Badge
-                v-if="isOAuthInvalid(key)"
-                variant="destructive"
-                class="text-[10px] px-1 py-0 h-4 shrink-0"
-              >OAuth失效</Badge>
-              <Badge
-                v-else
                 variant="outline"
                 class="text-[10px] px-1 py-0 h-4 shrink-0"
               >{{ normalizeAuthTypeLabel(key.auth_type) }}</Badge>
+              <Badge
+                v-if="getStatusBadgeLabel(key)"
+                variant="destructive"
+                class="text-[10px] px-1 py-0 h-4 shrink-0"
+                :title="getStatusBadgeTitle(key)"
+              >{{ getStatusBadgeLabel(key) }}</Badge>
               <Badge
                 v-if="key.oauth_plan_type"
                 variant="outline"
@@ -127,11 +127,6 @@
                 class="text-[10px] px-1 py-0 h-4 shrink-0"
                 :title="getOAuthOrgBadge(key)?.title"
               >{{ getOAuthOrgBadge(key)?.label }}</Badge>
-              <Badge
-                v-if="isBannedKey(key)"
-                variant="destructive"
-                class="text-[10px] px-1 py-0 h-4 shrink-0"
-              >封号</Badge>
             </div>
             <div class="flex items-center gap-1.5 mt-0.5 text-[11px] text-muted-foreground flex-wrap">
               <span :class="key.is_active ? '' : 'text-destructive'">{{ key.is_active ? '启用' : '禁用' }}</span>
@@ -284,6 +279,12 @@ import { exportKey, refreshProviderQuota } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
+import {
+  getAccountStatusDisplay,
+  getAccountStatusTitle,
+  getOAuthStatusDisplay,
+  getOAuthStatusTitle,
+} from '@/utils/providerKeyStatus'
 
 type QuickSelectorValue =
   | 'banned'
@@ -321,12 +322,12 @@ const emit = defineEmits<{
 }>()
 
 const QUICK_SELECT_OPTIONS: Array<{ value: QuickSelectorValue; label: string }> = [
-  { value: 'banned', label: '已封号' },
+  { value: 'banned', label: '账号异常' },
   { value: 'no_5h_limit', label: '无5H限额' },
   { value: 'no_weekly_limit', label: '无周限额' },
   { value: 'plan_free', label: '全部 Free' },
   { value: 'plan_team', label: '全部 Team' },
-  { value: 'oauth_invalid', label: 'OAuth 失效' },
+  { value: 'oauth_invalid', label: 'Token 异常' },
   { value: 'proxy_unset', label: '未配置代理' },
   { value: 'proxy_set', label: '已配置独立代理' },
   { value: 'disabled', label: '已禁用' },
@@ -426,25 +427,25 @@ function normalizeAuthTypeLabel(authType: string): string {
   return 'API Key'
 }
 
-function isBannedKey(key: PoolKeyDetail): boolean {
-  const reason = normalizeText(key.oauth_invalid_reason)
-  if (reason && /(banned|forbidden|blocked|suspend|封|禁|受限)/.test(reason)) return true
-  if (Array.isArray(key.scheduling_reasons)) {
-    return key.scheduling_reasons.some((item) => {
-      const code = normalizeText(item.code)
-      return code === 'account_banned' || code === 'account_forbidden' || code === 'account_blocked'
-    })
-  }
-  return false
+function getStatusBadgeLabel(key: PoolKeyDetail): string | null {
+  const account = getAccountStatusDisplay(key)
+  if (account.blocked && account.label) return account.label
+
+  const oauth = getOAuthStatusDisplay(key, 0)
+  if (oauth?.isInvalid) return 'Token 失效'
+  if (oauth?.isExpired) return 'Token 过期'
+  return null
 }
 
-function isOAuthInvalid(key: PoolKeyDetail): boolean {
-  if (normalizeText(key.auth_type) !== 'oauth') return false
-  if (key.oauth_invalid_at != null || normalizeText(key.oauth_invalid_reason)) return true
-  if (typeof key.oauth_expires_at === 'number' && key.oauth_expires_at > 0) {
-    return key.oauth_expires_at * 1000 <= Date.now()
-  }
-  return false
+function getStatusBadgeTitle(key: PoolKeyDetail): string {
+  const label = getStatusBadgeLabel(key)
+  if (!label) return ''
+
+  const accountTitle = getAccountStatusTitle(key)
+  if (accountTitle) return accountTitle
+
+  const oauthTitle = getOAuthStatusTitle(key, 0)
+  return oauthTitle || label
 }
 
 function formatRelativeTime(value: string): string {

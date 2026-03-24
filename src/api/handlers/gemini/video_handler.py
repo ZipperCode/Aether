@@ -45,6 +45,7 @@ from src.core.crypto import crypto_service
 from src.core.logger import logger
 from src.models.database import ApiKey, ProviderAPIKey, ProviderEndpoint, User, VideoTask
 from src.services.billing.rule_service import BillingRuleLookupResult, BillingRuleService
+from src.services.provider.provider_context import resolve_provider_proxy
 from src.services.scheduling.aware_scheduler import ProviderCandidate
 from src.services.usage.service import UsageService
 
@@ -478,9 +479,8 @@ class GeminiVeoHandler(VideoHandlerBase):
                 resolve_effective_proxy,
             )
 
-            provider = getattr(endpoint, "provider", None) if endpoint else None
             eff_proxy = resolve_effective_proxy(
-                getattr(provider, "proxy", None) if provider else None,
+                resolve_provider_proxy(endpoint=endpoint, key=key),
                 getattr(key, "proxy", None),
             )
 

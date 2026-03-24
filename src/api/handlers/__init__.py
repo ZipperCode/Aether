@@ -14,11 +14,9 @@ API Handlers - 请求处理器
 注意：Handler 基类和具体 Handler 使用延迟导入以避免循环依赖。
 """
 
-# Adapter 基类（不会引起循环导入，可以直接导入）
-from src.api.handlers.base import (
-    ChatAdapterBase,
-    CliAdapterBase,
-)
+from __future__ import annotations
+
+from typing import Any
 
 __all__ = [
     # Adapter 基类
@@ -49,6 +47,9 @@ __all__ = [
 
 # 延迟导入映射表
 _LAZY_IMPORTS = {
+    # Adapter 基类
+    "ChatAdapterBase": ("src.api.handlers.base.chat_adapter_base", "ChatAdapterBase"),
+    "CliAdapterBase": ("src.api.handlers.base.cli_adapter_base", "CliAdapterBase"),
     # Handler 基类
     "ChatHandlerBase": ("src.api.handlers.base.chat_handler_base", "ChatHandlerBase"),
     "CliMessageHandlerBase": (
@@ -88,7 +89,7 @@ _LAZY_IMPORTS = {
 }
 
 
-def __getattr__(name: str) -> None:
+def __getattr__(name: str) -> Any:
     """延迟导入以避免循环依赖"""
     if name in _LAZY_IMPORTS:
         module_path, attr_name = _LAZY_IMPORTS[name]

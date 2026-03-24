@@ -192,8 +192,8 @@ def test_resolve_pool_account_state_keeps_codex_metadata_block() -> None:
     )
 
     assert state.blocked is True
-    assert state.code == "account_forbidden"
-    assert state.label == "访问受限"
+    assert state.code == "workspace_deactivated"
+    assert state.label == "工作区停用"
     assert state.reason == "deactivated_workspace"
 
 

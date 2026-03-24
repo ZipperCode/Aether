@@ -3,15 +3,14 @@
 
 行为：
 - 当 provider.pool_advanced.probing_enabled=true 时启用
-- Key 在静默超过 probing_interval_minutes 后，主动触发额度刷新
-- Key 一旦被实际请求使用（last_used_at 变新），探测冷却自动重置
+- Key 以固定间隔主动触发额度刷新，用于检查 OAuth / 额度状态
+- 实际请求使用不会跳过定期探测；探测节流仅由刷新时间与主动探测时间控制
 """
 
 from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import load_only
@@ -38,16 +37,6 @@ _MAX_INTERVAL_MINUTES = 1440
 
 def _probe_stamp_key(provider_id: str, key_id: str) -> str:
     return f"{_REDIS_PREFIX}:{provider_id}:{key_id}"
-
-
-def _to_unix_seconds(value: datetime | None) -> int | None:
-    if not isinstance(value, datetime):
-        return None
-    dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    try:
-        return int(dt.timestamp())
-    except Exception:
-        return None
 
 
 def _to_float(value: Any) -> float | None:
@@ -121,13 +110,12 @@ def _select_probe_key_ids(
         key_id = str(getattr(key, "id", "") or "")
         if not key_id:
             continue
-        last_used_ts = _to_unix_seconds(getattr(key, "last_used_at", None))
         quota_updated_ts = _extract_quota_updated_at(
             provider_type,
             getattr(key, "upstream_metadata", None),
         )
         last_probe_ts = last_probe_timestamps.get(key_id)
-        anchor_ts = max(last_used_ts or 0, quota_updated_ts or 0, last_probe_ts or 0)
+        anchor_ts = max(quota_updated_ts or 0, last_probe_ts or 0)
         if anchor_ts <= 0 or (now_ts - anchor_ts) >= interval_seconds:
             stale.append((anchor_ts, key_id))
 
@@ -183,6 +171,8 @@ class PoolQuotaProbeScheduler:
         if not self.running:
             return
         self.running = False
+        scheduler = get_scheduler()
+        scheduler.remove_job("pool_quota_probe_check")
         logger.info("PoolQuotaProbeScheduler stopped")
 
     async def _scheduled_probe_check(self) -> None:
@@ -336,7 +326,6 @@ class PoolQuotaProbeScheduler:
                     load_only(
                         ProviderAPIKey.id,
                         ProviderAPIKey.provider_id,
-                        ProviderAPIKey.last_used_at,
                         ProviderAPIKey.upstream_metadata,
                     )
                 )

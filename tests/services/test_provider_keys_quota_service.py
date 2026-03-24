@@ -414,3 +414,53 @@ async def test_refresh_provider_quota_auto_removes_banned_keys_when_enabled(
     assert result["results"][0]["auto_removed"] is True
     assert deleted_side_effect_calls == [("p1", ["gpt-4o"])]
     assert redis_cleared == [("p1", "k1"), ("p1", "k1")]
+
+
+@pytest.mark.asyncio
+async def test_refresh_provider_quota_does_not_auto_remove_oauth_expired_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = SimpleNamespace(
+        id="p1",
+        provider_type=ProviderType.CODEX,
+        endpoints=[SimpleNamespace(api_format="openai:cli", is_active=True)],
+        config={"pool_advanced": {"auto_remove_banned_keys": True}},
+    )
+    key = SimpleNamespace(
+        id="k1",
+        name="K1",
+        provider_id="p1",
+        allowed_models=None,
+        upstream_metadata={},
+        is_active=True,
+        oauth_invalid_at=None,
+        oauth_invalid_reason=None,
+    )
+    db = _FakeDB(provider=provider, keys=[key])
+
+    async def _fake_handler(**kwargs: Any) -> dict[str, Any]:
+        state_updates = kwargs["state_updates"]
+        state_updates["k1"] = {
+            "oauth_invalid_at": "expired-at",
+            "oauth_invalid_reason": "[OAUTH_EXPIRED] token invalidated",
+        }
+        return {"key_id": "k1", "key_name": "K1", "status": "error", "message": "expired"}
+
+    monkeypatch.setattr(
+        quota_service_module,
+        "_select_refresh_endpoint",
+        lambda provider, provider_type: provider.endpoints[0],
+    )
+    monkeypatch.setattr(
+        quota_service_module, "_resolve_quota_refresh_handler", lambda _: _fake_handler
+    )
+
+    result = await refresh_provider_quota_for_provider(
+        db=cast(Any, db),
+        provider_id="p1",
+        codex_wham_usage_url="https://example.test/wham/usage",
+    )
+
+    assert result["auto_removed"] == 0
+    assert db.deleted == []
+    assert key.oauth_invalid_reason == "[OAUTH_EXPIRED] token invalidated"

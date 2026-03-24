@@ -105,7 +105,7 @@
                   <div class="space-y-1.5">
                     <Label class="text-xs text-muted-foreground">自定义路径</Label>
                     <Input
-                      :model-value="getEndpointEditState(endpoint.id)?.path ?? (endpoint.custom_path || '')"
+                      :model-value="getDisplayedPath(endpoint)"
                       :placeholder="getDefaultPath(endpoint.api_format, endpoint.base_url) || '留空使用默认'"
                       :disabled="isFixedProvider"
                       @update:model-value="(v) => updateEndpointField(endpoint.id, 'path', v)"
@@ -1159,7 +1159,7 @@ function restoreOriginalPlaceholder(value: unknown): unknown {
     }
     return value
   }
-  if (Array.isArray(value)) return value.map(restoreOriginalPlaceholder)
+  if (Array.isArray(value)) return value.map(item => restoreOriginalPlaceholder(item))
   if (value !== null && typeof value === 'object') {
     const result: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) result[k] = restoreOriginalPlaceholder(v)
@@ -1262,7 +1262,7 @@ async function loadDefaultBodyRulesForFormat(apiFormat: string, force = false): 
   } catch (error: unknown) {
     defaultBodyRulesByFormat.value[cacheKey] = []
     defaultBodyRulesLoaded.value[cacheKey] = true
-    log.warn('加载默认请求体规则失败', apiFormat, error)
+    log.warn('加载默认请求体规则失败', { apiFormat, error })
     return []
   } finally {
     loadingDefaultBodyRulesByFormat.value[cacheKey] = false
@@ -1276,10 +1276,19 @@ async function preloadDefaultBodyRules(endpoints: ProviderEndpoint[]): Promise<v
 
 // 获取指定 API 格式的默认路径
 function getDefaultPath(apiFormat: string, baseUrl?: string): string {
+  const providerType = (props.provider?.provider_type || '').toLowerCase()
+  if (providerType === 'vertex_ai') {
+    if (apiFormat === 'gemini:chat') {
+      return '/v1/publishers/google/models/{model}:{action}'
+    }
+    if (apiFormat === 'claude:chat') {
+      return '/v1/projects/{project_id}/locations/{region}/publishers/anthropic/models/{model}:{action}'
+    }
+  }
+
   const format = apiFormats.value.find(f => f.value === apiFormat)
   const defaultPath = format?.default_path || ''
   // Codex 端点使用 /responses 而非 /v1/responses
-  const providerType = (props.provider?.provider_type || '').toLowerCase()
   const isCodex = providerType
     ? providerType === 'codex'
     : (!!baseUrl && isCodexUrl(baseUrl))
@@ -1287,6 +1296,13 @@ function getDefaultPath(apiFormat: string, baseUrl?: string): string {
     return '/responses'
   }
   return defaultPath
+}
+
+function getDisplayedPath(endpoint: ProviderEndpoint): string {
+  if (isFixedProvider.value) {
+    return getDefaultPath(endpoint.api_format, endpoint.base_url)
+  }
+  return getEndpointEditState(endpoint.id)?.path ?? (endpoint.custom_path || '')
 }
 
 // 判断是否是 Codex OAuth 端点

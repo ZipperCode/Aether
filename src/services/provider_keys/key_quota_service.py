@@ -15,7 +15,10 @@ from src.core.provider_types import ProviderType, normalize_provider_type
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
 from src.services.model.upstream_fetcher import merge_upstream_metadata
 from src.services.provider.pool import redis_ops as pool_redis
-from src.services.provider.pool.account_state import resolve_pool_account_state
+from src.services.provider.pool.account_state import (
+    resolve_pool_account_state,
+    should_auto_remove_account_state,
+)
 from src.services.provider.pool.config import parse_pool_config
 from src.services.provider_keys.key_side_effects import run_delete_key_side_effects
 from src.services.provider_keys.quota_refresh import (
@@ -88,7 +91,7 @@ async def refresh_provider_quota_for_provider(
     if provider_type not in QUOTA_REFRESH_PROVIDER_TYPES:
         raise InvalidRequestException("仅支持 Codex / Antigravity / Kiro 类型的 Provider 刷新限额")
     pool_cfg = parse_pool_config(getattr(provider, "config", None))
-    auto_remove_banned_keys = bool(pool_cfg and pool_cfg.auto_remove_banned_keys)
+    auto_remove_abnormal_keys = bool(pool_cfg and pool_cfg.auto_remove_banned_keys)
 
     selected_key_ids: list[str] | None = None
     if key_ids is not None:
@@ -201,7 +204,7 @@ async def refresh_provider_quota_for_provider(
         if rid:
             result_index_by_key_id[rid] = result
 
-    if metadata_updates or state_updates or auto_remove_banned_keys:
+    if metadata_updates or state_updates or auto_remove_abnormal_keys:
         for key in keys:
             key_dirty = False
             if key.id in metadata_updates:
@@ -216,13 +219,13 @@ async def refresh_provider_quota_for_provider(
                         setattr(key, field_name, field_value)
                     key_dirty = True
 
-            if auto_remove_banned_keys:
+            if auto_remove_abnormal_keys:
                 account_state = resolve_pool_account_state(
                     provider_type=provider_type,
                     upstream_metadata=getattr(key, "upstream_metadata", None),
                     oauth_invalid_reason=getattr(key, "oauth_invalid_reason", None),
                 )
-                if account_state.blocked:
+                if should_auto_remove_account_state(account_state):
                     key_id = str(getattr(key, "id", "") or "")
                     auto_removed_contexts.append(
                         (
@@ -261,7 +264,7 @@ async def refresh_provider_quota_for_provider(
                 deleted_key_allowed_models=allowed_models,
             )
         logger.warning(
-            "[QUOTA_REFRESH] Provider {}: auto removed {} banned key(s): {}",
+            "[QUOTA_REFRESH] Provider {}: auto removed {} abnormal key(s): {}",
             provider_id,
             len(auto_removed_contexts),
             [ctx[0][:8] for ctx in auto_removed_contexts if ctx[0]],

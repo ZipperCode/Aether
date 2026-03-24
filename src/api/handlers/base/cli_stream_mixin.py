@@ -318,6 +318,7 @@ class CliStreamMixin:
             endpoint=endpoint,
             key=key,
             request_body=request_body,
+            rules_original_body=working_request_body,
             original_headers=original_headers,
             query_params=query_params,
             client_api_format=client_api_format,

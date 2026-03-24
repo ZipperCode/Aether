@@ -120,7 +120,8 @@ class CliSyncMixin:
                     provider_id=str(provider.id),
                 )
 
-            request_body = request_state.build_attempt_body()
+            attempt_body = request_state.build_attempt_body()
+            request_body = attempt_body
             if mapped_model:
                 mapped_model_result = mapped_model  # 保存映射后的模型名，用于 Usage 记录
                 request_body = self.apply_mapped_model(request_body, mapped_model)
@@ -135,6 +136,7 @@ class CliSyncMixin:
                 endpoint=endpoint,
                 key=key,
                 request_body=request_body,
+                rules_original_body=attempt_body,
                 original_headers=original_headers,
                 query_params=query_params,
                 client_api_format=client_api_format,

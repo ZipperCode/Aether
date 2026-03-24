@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -16,6 +18,33 @@ class _DummyEndpoint:
     api_format: str
     custom_path: str | None = None
     provider: object | None = None
+    provider_id: str | None = None
+
+
+class _FakeQuery:
+    def __init__(self, row: object | None) -> None:
+        self._row = row
+
+    def filter(self, *_args: object, **_kwargs: object) -> "_FakeQuery":
+        return self
+
+    def first(self) -> object | None:
+        return self._row
+
+
+class _FakeSessionCtx:
+    def __init__(self, row: object | None) -> None:
+        self._row = row
+
+    def __enter__(self) -> "_FakeSessionCtx":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        _ = exc_type, exc, tb
+        return False
+
+    def query(self, _model: object) -> _FakeQuery:
+        return _FakeQuery(self._row)
 
 
 def test_codex_openai_cli_uses_responses_path_without_v1_prefix() -> None:
@@ -56,14 +85,16 @@ def test_codex_openai_cli_uses_compact_suffix_when_context_marked_compact() -> N
         api_format="openai:cli",
         provider=SimpleNamespace(provider_type="codex"),
     )
-    set_codex_request_context(CodexRequestContext(is_compact=True))
-    url = build_provider_url(
-        endpoint,  # type: ignore[arg-type]
-        path_params={"model": "ignored"},
-        is_stream=False,
-    )
-    assert url == "https://chatgpt.com/backend-api/codex/responses/compact"
-    set_codex_request_context(None)
+    try:
+        set_codex_request_context(CodexRequestContext(is_compact=True))
+        url = build_provider_url(
+            endpoint,  # type: ignore[arg-type]
+            path_params={"model": "ignored"},
+            is_stream=False,
+        )
+        assert url == "https://chatgpt.com/backend-api/codex/responses/compact"
+    finally:
+        set_codex_request_context(None)
 
 
 def test_codex_openai_compact_uses_compact_path_without_v1_prefix() -> None:
@@ -78,3 +109,34 @@ def test_codex_openai_compact_uses_compact_path_without_v1_prefix() -> None:
         is_stream=False,
     )
     assert url == "https://chatgpt.com/backend-api/codex/responses/compact"
+
+
+def test_codex_openai_cli_uses_provider_id_lookup_without_touching_endpoint_provider(
+    monkeypatch,
+) -> None:
+    class _DetachedEndpoint:
+        base_url = "https://chatgpt.com/backend-api/codex"
+        api_format = "openai:cli"
+        custom_path = None
+        provider_id = "provider-1"
+
+        @property
+        def provider(self) -> object:
+            raise RuntimeError("detached endpoint provider should not be lazy-loaded")
+
+    fake_provider = SimpleNamespace(id="provider-1", provider_type="codex", proxy=None)
+    fake_database = types.ModuleType("src.database")
+    fake_database.create_session = lambda: _FakeSessionCtx(fake_provider)
+    fake_models = types.ModuleType("src.models.database")
+    fake_models.Provider = type("Provider", (), {"id": "id"})
+
+    monkeypatch.setitem(sys.modules, "src.database", fake_database)
+    monkeypatch.setitem(sys.modules, "src.models.database", fake_models)
+
+    url = build_provider_url(
+        _DetachedEndpoint(),  # type: ignore[arg-type]
+        path_params={"model": "ignored"},
+        is_stream=True,
+    )
+
+    assert url == "https://chatgpt.com/backend-api/codex/responses"

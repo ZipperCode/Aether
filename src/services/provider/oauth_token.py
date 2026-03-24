@@ -22,6 +22,10 @@ from typing import Any
 from src.core.logger import logger
 from src.database import create_session
 from src.models.database import ProviderAPIKey
+from src.services.provider.pool.account_state import (
+    OAUTH_EXPIRED_PREFIX,
+    OAUTH_REFRESH_FAILED_PREFIX,
+)
 
 # ---------------------------------------------------------------------------
 # Account-level block 结构化标记
@@ -74,6 +78,51 @@ def is_account_level_block(reason: str | None) -> bool:
     return text.startswith(
         OAUTH_ACCOUNT_BLOCK_PREFIX
     ) and not _is_refresh_recoverable_account_block(text)
+
+
+async def verify_oauth_before_account_block(
+    *,
+    endpoint: Any,
+    key: Any,
+    candidate_reason: str,
+    request_id: str | None = None,
+    key_display: str | None = None,
+) -> bool:
+    """Before applying an account-level block, distinguish it from OAuth expiry."""
+    display = key_display or str(getattr(key, "id", "?") or "?")
+    try:
+        from src.services.provider.auth import get_provider_auth
+
+        await get_provider_auth(endpoint, key, force_refresh=True, refresh_skew=0)
+    except Exception as exc:
+        logger.debug(
+            "[OAUTH_VERIFY] [{}] {} account-block precheck failed: {}",
+            request_id,
+            display,
+            exc,
+        )
+
+    latest_reason = str(getattr(key, "oauth_invalid_reason", None) or "").strip()
+    if latest_reason.startswith(OAUTH_EXPIRED_PREFIX) or latest_reason.startswith(
+        OAUTH_REFRESH_FAILED_PREFIX
+    ):
+        logger.info(
+            "[OAUTH_VERIFY] [{}] {} candidate account block ({}) skipped due to {}",
+            request_id,
+            display,
+            candidate_reason,
+            latest_reason[:120],
+        )
+        return False
+
+    logger.debug(
+        "[OAUTH_VERIFY] [{}] {} proceeding with account block ({}), post-refresh reason: {}",
+        request_id,
+        display,
+        candidate_reason,
+        latest_reason[:120] if latest_reason else "<none>",
+    )
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,13 +184,14 @@ async def resolve_oauth_access_token(
                 if row is not None:
                     row.api_key = key_obj.api_key
                     row.auth_config = key_obj.auth_config
-                    # Refresh succeeded => clear all invalid markers (including
-                    # account-level blocks). A successful token refresh proves the
-                    # account is usable; stale block marks should not persist.
-                    if row.oauth_invalid_at is not None:
+                    # Refresh succeeded => only clear recoverable token errors.
+                    # True account-level blocks must be cleared explicitly.
+                    current_reason = str(getattr(row, "oauth_invalid_reason", None) or "")
+                    if row.oauth_invalid_at is not None and not is_account_level_block(
+                        current_reason
+                    ):
                         row.oauth_invalid_at = None
                         row.oauth_invalid_reason = None
-                    row.is_active = True
                     db.commit()
         except Exception as e:
             # Don't fail caller path; token is still usable for this request.
@@ -157,6 +207,7 @@ async def resolve_oauth_access_token(
 __all__ = [
     "OAuthAccessTokenResult",
     "TOKEN_INVALIDATED_KEYWORDS",
+    "verify_oauth_before_account_block",
     "looks_like_token_invalidated",
     "resolve_oauth_access_token",
 ]

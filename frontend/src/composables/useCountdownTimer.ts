@@ -174,15 +174,18 @@ export function getOAuthExpiresCountdown(
   invalidReason?: string | null
 ): OAuthStatusInfo | null {
   void _tick
+  const normalizedInvalidReason = typeof invalidReason === 'string'
+    ? invalidReason.trim()
+    : ''
 
   // 优先检查失效状态（失效比过期更严重）
-  if (invalidAt != null) {
+  if (invalidAt != null || normalizedInvalidReason) {
     return {
       text: '已失效',
       isExpired: false,
       isExpiringSoon: false,
       isInvalid: true,
-      invalidReason: invalidReason || undefined
+      invalidReason: normalizedInvalidReason || undefined
     }
   }
 

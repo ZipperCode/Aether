@@ -286,6 +286,7 @@ import {
 } from '@/api/endpoints'
 import { adminApi } from '@/api/admin'
 import { parseApiError } from '@/utils/errorParser'
+import { useRouteQuery } from '@/composables/useRouteQuery'
 
 interface ProviderDeleteProgressState {
   providerId: string
@@ -302,6 +303,7 @@ interface ProviderDeleteProgressState {
 
 const { error: showError, success: showSuccess, info: showInfo } = useToast()
 const { confirmDanger } = useConfirm()
+const { getQueryValue, patchQuery } = useRouteQuery()
 
 // 状态
 const loading = ref(false)
@@ -459,6 +461,46 @@ const {
   startTick,
   stopTick,
 } = useProviderBalance()
+
+watch(
+  () => getQueryValue('search') ?? '',
+  (value) => {
+    if (searchQuery.value === value) return
+    searchQuery.value = value
+  },
+  { immediate: true },
+)
+
+watch(searchQuery, (value) => {
+  patchQuery({ search: value.trim() || undefined })
+})
+
+watch(
+  () => getQueryValue('providerId'),
+  (value) => {
+    if (value) {
+      if (selectedProviderId.value === value) {
+        if (!providerDrawerOpen.value) providerDrawerOpen.value = true
+        return
+      }
+      openProviderDrawer(value)
+      return
+    }
+    if (selectedProviderId.value) selectedProviderId.value = null
+    if (providerDrawerOpen.value) providerDrawerOpen.value = false
+  },
+  { immediate: true },
+)
+
+watch(selectedProviderId, (value) => {
+  patchQuery({ providerId: value || undefined })
+})
+
+watch(providerDrawerOpen, (open) => {
+  if (!open && selectedProviderId.value) {
+    selectedProviderId.value = null
+  }
+})
 
 // 扩展操作配置对话框
 const opsConfigDialogOpen = ref(false)

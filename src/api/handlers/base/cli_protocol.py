@@ -188,6 +188,7 @@ class CliHandlerProtocol(Protocol):
         endpoint: Any,
         key: Any,
         request_body: dict[str, Any],
+        rules_original_body: dict[str, Any] | None = ...,
         original_headers: dict[str, str],
         query_params: dict[str, str] | None,
         client_api_format: str,

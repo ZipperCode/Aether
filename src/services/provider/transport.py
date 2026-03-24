@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING, Any, Callable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from src.core.api_format import (
     EndpointKind,
@@ -21,6 +21,7 @@ from src.core.api_format import (
 from src.core.logger import logger
 from src.core.provider_types import ProviderType, normalize_provider_type
 from src.services.provider.format import normalize_endpoint_signature
+from src.services.provider.provider_context import resolve_provider_type
 from src.services.provider.request_context import (
     get_selected_base_url,
     set_selected_base_url,
@@ -72,6 +73,34 @@ def redact_url_for_log(url: str) -> str:
     return _SENSITIVE_QUERY_PARAMS_PATTERN.sub(r"\1\2=***", url)
 
 
+# Vertex AI host 白名单：aiplatform.googleapis.com 及其区域子域名
+_VERTEX_AI_HOST = "aiplatform.googleapis.com"
+_VERTEX_AI_ENDPOINT_SIGS = {"gemini:chat", "claude:chat"}
+_VERTEX_AI_AUTH_TYPES = {"api_key", "service_account", "vertex_ai"}
+
+
+def looks_like_vertex_ai_host(
+    base_url: str,
+    endpoint_sig: str = "",
+    auth_type: str = "",
+) -> bool:
+    """根据 base_url + endpoint_sig/auth_type 判断是否属于 Vertex AI。
+
+    用于历史数据兼容：部分旧记录缺少 provider_type，但 base_url 已固定到 aiplatform。
+    """
+    try:
+        host = (urlparse(base_url).netloc or "").strip().lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    if host != _VERTEX_AI_HOST and not host.endswith(f".{_VERTEX_AI_HOST}"):
+        return False
+    sig = endpoint_sig.strip().lower()
+    at = auth_type.strip().lower()
+    return sig in _VERTEX_AI_ENDPOINT_SIGS or at in _VERTEX_AI_AUTH_TYPES
+
+
 def _normalize_base_url(base_url: str, path: str) -> str:
     """
     规范化 base_url，去除末尾的斜杠和可能与 path 重复的版本前缀。
@@ -109,34 +138,28 @@ def _get_provider_type(
     """尽力获取 Provider.provider_type（用于 Antigravity 等 Provider 特判）。
 
     优先级:
-    1. endpoint.provider.provider_type
+    1. endpoint.provider_type（如果调用方已做扁平化注入）
     2. key.provider.provider_type
     3. decrypted_auth_config["provider_type"]（OAuth 导入的凭证）
+    4. provider_id 对应的 Provider 记录
     """
+    resolved = resolve_provider_type(
+        endpoint=endpoint,
+        key=key,
+        decrypted_auth_config=decrypted_auth_config,
+    )
+    if resolved:
+        return resolved
+
+    # Fallback: 历史 Vertex 数据可能缺少 provider_type，但 base_url 已固定到 aiplatform。
     try:
-        provider = getattr(endpoint, "provider", None)
-        if provider is not None:
-            pt = getattr(provider, "provider_type", None)
-            if pt:
-                return str(pt).lower()
+        base_url = str(getattr(endpoint, "base_url", "") or "").strip()
+        endpoint_sig = str(getattr(endpoint, "api_format", "") or "").strip()
+        auth_type = str(getattr(key, "auth_type", "") or "").strip() if key else ""
+        if base_url and looks_like_vertex_ai_host(base_url, endpoint_sig, auth_type):
+            return ProviderType.VERTEX_AI.value
     except Exception:
         pass
-
-    try:
-        if key is not None:
-            provider = getattr(key, "provider", None)
-            if provider is not None:
-                pt = getattr(provider, "provider_type", None)
-                if pt:
-                    return str(pt).lower()
-    except Exception:
-        pass
-
-    # Fallback: OAuth 导入的凭证可能包含 provider_type（如 Kiro）
-    if decrypted_auth_config:
-        pt = decrypted_auth_config.get("provider_type")
-        if isinstance(pt, str) and pt.strip():
-            return pt.strip().lower()
 
     return None
 

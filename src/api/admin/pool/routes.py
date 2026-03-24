@@ -9,11 +9,10 @@ Provides endpoints for managing account pools at scale:
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -35,7 +34,9 @@ from src.models.database import Provider, ProviderAPIKey
 from src.services.billing.precision import to_money_decimal
 from src.services.provider.fingerprint import generate_fingerprint
 from src.services.provider.pool import redis_ops as pool_redis
-from src.services.provider.pool.account_state import resolve_pool_account_state
+from src.services.provider.pool.account_state import (
+    resolve_pool_account_state,
+)
 from src.services.provider.pool.config import parse_pool_config
 from src.services.provider.pool.dimensions import get_preset_dimension_metas
 from src.services.provider.pool.scheduling_dimensions import (
@@ -45,6 +46,18 @@ from src.services.provider.pool.scheduling_dimensions import (
 )
 from src.services.provider_keys.key_side_effects import cleanup_key_references
 from src.services.provider_keys.quota_reader import get_quota_reader
+from src.services.provider_keys.status_snapshot_store import (
+    derive_oauth_expires_at as derive_persisted_oauth_expires_at,
+)
+from src.services.provider_keys.status_snapshot_store import (
+    extract_oauth_auth_config as extract_persisted_oauth_auth_config,
+)
+from src.services.provider_keys.status_snapshot_store import (
+    normalize_oauth_expires_at as normalize_persisted_oauth_expires_at,
+)
+from src.services.provider_keys.status_snapshot_store import (
+    resolve_provider_key_status_snapshot,
+)
 
 from .schemas import (
     BatchActionRequest,
@@ -82,9 +95,7 @@ async def pool_overview(
 ) -> PoolOverviewResponse:
     """Return all pool-enabled providers with summary stats."""
     adapter = AdminPoolOverviewAdapter()
-    return await pipeline.run(
-        adapter=adapter, http_request=request, db=db, mode=adapter.mode
-    )
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +120,7 @@ async def list_scheduling_presets(
     """Return scheduling preset definitions for frontend rendering."""
 
     adapter = AdminListSchedulingPresetsAdapter()
-    return await pipeline.run(
-        adapter=adapter, http_request=request, db=db, mode=adapter.mode
-    )
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +152,7 @@ async def list_pool_keys(
         quick_selectors=quick_selectors.split(",") if quick_selectors else [],
         search_scope=search_scope,
     )
-    return await pipeline.run(
-        adapter=adapter, http_request=request, db=db, mode=adapter.mode
-    )
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
 # ---------------------------------------------------------------------------
@@ -162,9 +169,7 @@ async def batch_import_keys(
 ) -> BatchImportResponse:
     """Batch import keys into a provider's pool."""
     adapter = AdminBatchImportKeysAdapter(provider_id=provider_id, body=body)
-    return await pipeline.run(
-        adapter=adapter, http_request=request, db=db, mode=adapter.mode
-    )
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +200,7 @@ def _iter_batches(items: list[str], batch_size: int) -> list[list[str]]:
 def _resolve_delete_batch_size(db: Session) -> int:
     try:
         bind = db.get_bind()
-        dialect_name = str(
-            getattr(getattr(bind, "dialect", None), "name", "") or ""
-        ).lower()
+        dialect_name = str(getattr(getattr(bind, "dialect", None), "name", "") or "").lower()
     except Exception:
         dialect_name = ""
 
@@ -211,6 +214,7 @@ _COOLDOWN_REASON_LABELS: dict[str, str] = {
     "forbidden_403": "403 禁止",
     "overloaded_529": "529 过载",
     "auth_failed_401": "401 认证失败",
+    "account_deactivated_401": "401 账号停用",
     "payment_required_402": "402 欠费",
     "server_error_500": "500 错误",
     "request_timeout_408": "408 超时",
@@ -244,22 +248,21 @@ def _serialize_money(value: Any) -> str:
 
 
 def _is_known_banned_key(key: ProviderAPIKey, provider_type: str) -> bool:
-    from src.services.provider.pool.account_state import resolve_pool_account_state
+    from src.services.provider.pool.account_state import (
+        resolve_pool_account_state,
+        should_auto_remove_account_state,
+    )
 
     state = resolve_pool_account_state(
         provider_type=provider_type,
         upstream_metadata=getattr(key, "upstream_metadata", None),
         oauth_invalid_reason=getattr(key, "oauth_invalid_reason", None),
     )
-    return state.blocked
+    return should_auto_remove_account_state(state)
 
 
 def _build_account_quota(provider_type: str, upstream_metadata: Any) -> str | None:
     return get_quota_reader(provider_type, upstream_metadata).display_summary()
-
-
-def _extract_quota_updated_at(provider_type: str, upstream_metadata: Any) -> int | None:
-    return get_quota_reader(provider_type, upstream_metadata).updated_at()
 
 
 def _normalize_oauth_plan_type(plan_type: Any, provider_type: str) -> str | None:
@@ -279,56 +282,17 @@ def _normalize_oauth_plan_type(plan_type: Any, provider_type: str) -> str | None
 
 
 def _extract_oauth_auth_config(key: ProviderAPIKey) -> dict[str, Any] | None:
-    if str(getattr(key, "auth_type", "") or "").strip().lower() != "oauth":
-        return None
-
-    auth_config_raw = getattr(key, "auth_config", None)
-    if not auth_config_raw:
-        return None
-
-    try:
-        decrypted = crypto_service.decrypt(auth_config_raw)
-        parsed = json.loads(decrypted)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        return None
-
-    return None
+    return extract_persisted_oauth_auth_config(key)
 
 
 def _normalize_oauth_expires_at(raw: Any) -> int | None:
-    value = _to_float(raw)
-    if value is None or value <= 0:
-        return None
-    # 兼容毫秒时间戳
-    if value > 1_000_000_000_000:
-        value /= 1000
-    return int(value)
+    return normalize_persisted_oauth_expires_at(raw)
 
 
 def _derive_oauth_expires_at(
     key: ProviderAPIKey, auth_config: dict[str, Any] | None = None
 ) -> int | None:
-    if str(getattr(key, "auth_type", "") or "").strip().lower() != "oauth":
-        return None
-
-    cfg = (
-        auth_config
-        if isinstance(auth_config, dict)
-        else _extract_oauth_auth_config(key)
-    )
-    if cfg:
-        for field in ("expires_at", "expiresAt", "expiry", "exp"):
-            expires_at = _normalize_oauth_expires_at(cfg.get(field))
-            if expires_at is not None:
-                return expires_at
-
-    # 兼容历史字段
-    expires_dt = getattr(key, "expires_at", None)
-    if isinstance(expires_dt, datetime):
-        return int(expires_dt.timestamp())
-    return None
+    return derive_persisted_oauth_expires_at(key, auth_config=auth_config)
 
 
 def _derive_oauth_plan_type(
@@ -337,9 +301,7 @@ def _derive_oauth_plan_type(
     auth_config: dict[str, Any] | None = None,
 ) -> str | None:
     # Prefer persisted normalized field
-    persisted = _normalize_oauth_plan_type(
-        getattr(key, "oauth_plan_type", None), provider_type
-    )
+    persisted = _normalize_oauth_plan_type(getattr(key, "oauth_plan_type", None), provider_type)
     if persisted:
         return persisted
 
@@ -347,11 +309,7 @@ def _derive_oauth_plan_type(
         return None
 
     # Fallback 1: encrypted auth_config (common for Codex/Antigravity)
-    cfg = (
-        auth_config
-        if isinstance(auth_config, dict)
-        else _extract_oauth_auth_config(key)
-    )
+    cfg = auth_config if isinstance(auth_config, dict) else _extract_oauth_auth_config(key)
     if cfg:
         for plan_key in ("plan_type", "tier", "plan", "subscription_plan"):
             normalized = _normalize_oauth_plan_type(cfg.get(plan_key), provider_type)
@@ -430,9 +388,7 @@ def _compute_health_aggregate(
 ) -> tuple[float, bool]:
     """从按格式健康数据聚合出列表展示字段。"""
     health_map = health_by_format if isinstance(health_by_format, dict) else {}
-    circuit_map = (
-        circuit_breaker_by_format if isinstance(circuit_breaker_by_format, dict) else {}
-    )
+    circuit_map = circuit_breaker_by_format if isinstance(circuit_breaker_by_format, dict) else {}
 
     if health_map:
         scores = [
@@ -445,9 +401,7 @@ def _compute_health_aggregate(
         health_score = 1.0
 
     any_circuit_open = any(
-        bool(item.get("open", False))
-        for item in circuit_map.values()
-        if isinstance(item, dict)
+        bool(item.get("open", False)) for item in circuit_map.values() if isinstance(item, dict)
     )
 
     return health_score, any_circuit_open
@@ -536,14 +490,10 @@ async def batch_action_keys(
 ) -> BatchActionResponse:
     """Batch enable/disable/delete/clear_cooldown/reset_cost/regenerate_fingerprint on pool keys."""
     adapter = AdminBatchActionKeysAdapter(provider_id=provider_id, body=body)
-    return await pipeline.run(
-        adapter=adapter, http_request=request, db=db, mode=adapter.mode
-    )
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
-@router.post(
-    "/{provider_id}/keys/resolve-selection", response_model=PoolKeySelectionResponse
-)
+@router.post("/{provider_id}/keys/resolve-selection", response_model=PoolKeySelectionResponse)
 async def resolve_pool_key_selection(
     provider_id: str,
     body: PoolKeySelectionRequest,
@@ -552,9 +502,7 @@ async def resolve_pool_key_selection(
 ) -> PoolKeySelectionResponse:
     """Resolve all key ids matching the current batch dialog filters."""
     adapter = AdminResolvePoolKeySelectionAdapter(provider_id=provider_id, body=body)
-    return await pipeline.run(
-        adapter=adapter, http_request=request, db=db, mode=adapter.mode
-    )
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
 @router.get(
@@ -568,12 +516,8 @@ async def get_batch_delete_task_status(
     db: Session = Depends(get_db),
 ) -> BatchDeleteTaskResponse:
     """Query the progress of an async batch-delete task."""
-    adapter = AdminBatchDeleteTaskStatusAdapter(
-        provider_id=provider_id, task_id=task_id
-    )
-    return await pipeline.run(
-        adapter=adapter, http_request=request, db=db, mode=adapter.mode
-    )
+    adapter = AdminBatchDeleteTaskStatusAdapter(provider_id=provider_id, task_id=task_id)
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
 @router.post("/{provider_id}/keys/cleanup-banned", response_model=BatchActionResponse)
@@ -582,11 +526,9 @@ async def cleanup_banned_keys(
     request: Request,
     db: Session = Depends(get_db),
 ) -> BatchActionResponse:
-    """Delete known banned/suspended accounts for the provider."""
+    """Delete known hard-blocked abnormal accounts for the provider."""
     adapter = AdminCleanupBannedKeysAdapter(provider_id=provider_id)
-    return await pipeline.run(
-        adapter=adapter, http_request=request, db=db, mode=adapter.mode
-    )
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
 # ---------------------------------------------------------------------------
@@ -658,9 +600,7 @@ class AdminPoolOverviewAdapter(AdminApiAdapter):
         db = context.db
         providers = (
             db.query(Provider)
-            .options(
-                load_only(*cast(tuple[Any, ...], _PROVIDER_OVERVIEW_LOAD_ONLY_ATTRS))
-            )
+            .options(load_only(*cast(tuple[Any, ...], _PROVIDER_OVERVIEW_LOAD_ONLY_ATTRS)))
             .order_by(Provider.provider_priority.asc())
             .all()
         )
@@ -681,9 +621,7 @@ class AdminPoolOverviewAdapter(AdminApiAdapter):
                     ProviderAPIKey.provider_id,
                     func.count(ProviderAPIKey.id).label("total"),
                     func.coalesce(
-                        func.sum(
-                            case((ProviderAPIKey.is_active.is_(True), 1), else_=0)
-                        ),
+                        func.sum(case((ProviderAPIKey.is_active.is_(True), 1), else_=0)),
                         0,
                     ).label("active"),
                 )
@@ -706,8 +644,8 @@ class AdminPoolOverviewAdapter(AdminApiAdapter):
             if key_stats_by_provider.get(pid, {}).get("total", 0) > 0
         ]
         if cooldown_targets:
-            cooldown_count_by_provider = (
-                await pool_redis.batch_count_provider_cooldowns(cooldown_targets)
+            cooldown_count_by_provider = await pool_redis.batch_count_provider_cooldowns(
+                cooldown_targets
             )
 
         items: list[PoolOverviewItem] = []
@@ -719,9 +657,7 @@ class AdminPoolOverviewAdapter(AdminApiAdapter):
                 PoolOverviewItem(
                     provider_id=pid,
                     provider_name=str(getattr(p, "name", "") or ""),
-                    provider_type=str(
-                        getattr(p, "provider_type", "custom") or "custom"
-                    ),
+                    provider_type=str(getattr(p, "provider_type", "custom") or "custom"),
                     total_keys=key_stats["total"],
                     active_keys=key_stats["active"],
                     cooldown_count=cooldown_count_by_provider.get(pid, 0),
@@ -748,8 +684,17 @@ _ALLOWED_POOL_KEY_QUICK_SELECTORS = frozenset(
     }
 )
 _ACCOUNT_BANNED_CODES = frozenset(
-    {"account_banned", "account_forbidden", "account_blocked"}
+    {
+        "account_banned",
+        "account_forbidden",
+        "account_blocked",
+        "account_suspended",
+        "account_disabled",
+        "workspace_deactivated",
+        "account_verification",
+    }
 )
+_TOKEN_ISSUE_CODES = frozenset({"oauth_expired", "oauth_refresh_failed"})
 _BANNED_REASON_PATTERN = re.compile(r"(banned|forbidden|blocked|suspend|封|禁|受限)")
 
 _PROVIDER_OVERVIEW_LOAD_ONLY_ATTRS: tuple[Any, ...] = (
@@ -801,11 +746,7 @@ def _normalize_batch_text(value: Any) -> str:
 
 
 def _normalize_pool_search_scope(value: Any) -> str:
-    return (
-        _FULL_SEARCH_SCOPE
-        if _normalize_batch_text(value) == _FULL_SEARCH_SCOPE
-        else "name"
-    )
+    return _FULL_SEARCH_SCOPE if _normalize_batch_text(value) == _FULL_SEARCH_SCOPE else "name"
 
 
 def _normalize_pool_quick_selectors(values: Any) -> list[str]:
@@ -837,8 +778,7 @@ def _get_quota_segments(account_quota: Any) -> list[str]:
     return [
         segment
         for segment in (
-            _normalize_quota_segment(part)
-            for part in str(account_quota or "").split("|")
+            _normalize_quota_segment(part) for part in str(account_quota or "").split("|")
         )
         if segment
     ]
@@ -846,9 +786,7 @@ def _get_quota_segments(account_quota: Any) -> list[str]:
 
 def _quota_segment_has_depleted_keyword(segment: str) -> bool:
     return bool(
-        re.search(
-            r"(无额度|额度不足|已耗尽|耗尽|depleted|exhausted|insufficient)", segment
-        )
+        re.search(r"(无额度|额度不足|已耗尽|耗尽|depleted|exhausted|insufficient)", segment)
     )
 
 
@@ -900,20 +838,44 @@ def _has_no_weekly_limit(account_quota: Any) -> bool:
 def _detail_is_oauth_invalid(detail: PoolKeyDetail) -> bool:
     if _normalize_batch_text(detail.auth_type) != "oauth":
         return False
-    if detail.oauth_invalid_at is not None or _normalize_batch_text(
-        detail.oauth_invalid_reason
-    ):
+    snapshot_oauth_code = _normalize_batch_text(getattr(detail.status_snapshot.oauth, "code", None))
+    if snapshot_oauth_code == "invalid":
+        return True
+    if snapshot_oauth_code == "expired":
+        return True
+    if snapshot_oauth_code == "check_failed":
+        return False
+    status_code = _normalize_batch_text(
+        getattr(detail.status_snapshot.account, "code", None) or detail.account_status_code
+    )
+    if status_code in _TOKEN_ISSUE_CODES:
+        return True
+    if status_code in _ACCOUNT_BANNED_CODES or status_code == "oauth_request_failed":
+        return False
+
+    reason = _normalize_batch_text(detail.oauth_invalid_reason)
+    if reason.startswith("[oauth_expired]") or reason.startswith("[refresh_failed]"):
+        return True
+    if reason.startswith("[account_block]") or reason.startswith("[request_failed]"):
+        return False
+
+    if detail.oauth_invalid_at is not None or reason:
         return True
     expires_at = detail.oauth_expires_at
-    return (
-        isinstance(expires_at, int)
-        and expires_at > 0
-        and expires_at <= int(time.time())
-    )
+    return isinstance(expires_at, int) and expires_at > 0 and expires_at <= int(time.time())
 
 
 def _detail_is_banned(detail: PoolKeyDetail) -> bool:
-    reason = _normalize_batch_text(detail.oauth_invalid_reason)
+    snapshot_account_code = _normalize_batch_text(
+        getattr(detail.status_snapshot.account, "code", None)
+    )
+    if snapshot_account_code in _ACCOUNT_BANNED_CODES:
+        return True
+    if _normalize_batch_text(detail.account_status_code) in _ACCOUNT_BANNED_CODES:
+        return True
+    reason = _normalize_batch_text(
+        getattr(detail.status_snapshot.account, "reason", None) or detail.oauth_invalid_reason
+    )
     if reason and _BANNED_REASON_PATTERN.search(reason):
         return True
     for item in detail.scheduling_reasons or []:
@@ -944,10 +906,15 @@ def _matches_pool_key_search(
         detail.key_name,
         detail.auth_type,
         detail.oauth_plan_type,
+        getattr(detail.status_snapshot.account, "label", None) or detail.account_status_label,
+        getattr(detail.status_snapshot.account, "reason", None) or detail.account_status_reason,
         detail.account_quota,
         "独立代理" if _detail_has_proxy(detail) else "未配置代理",
         "已启用" if detail.is_active else "已禁用",
-        detail.oauth_invalid_reason,
+        getattr(detail.status_snapshot.oauth, "reason", None) or detail.oauth_invalid_reason,
+        getattr(detail.status_snapshot.oauth, "label", None),
+        getattr(detail.status_snapshot.quota, "label", None),
+        getattr(detail.status_snapshot.quota, "reason", None),
     ]
     return any(keyword in _normalize_batch_text(part) for part in parts)
 
@@ -983,6 +950,7 @@ def _filter_pool_key_details(
     quick_selectors: list[str] | None = None,
     search_scope: str = _FULL_SEARCH_SCOPE,
     require_cooldown: bool = False,
+    require_schedulable: bool = False,
 ) -> list[PoolKeyDetail]:
     normalized_selectors = _normalize_pool_quick_selectors(quick_selectors)
     normalized_search_scope = _normalize_pool_search_scope(search_scope)
@@ -990,17 +958,40 @@ def _filter_pool_key_details(
     for detail in details:
         if require_cooldown and not detail.cooldown_reason:
             continue
-        if not _matches_pool_key_search(
-            detail, search, search_scope=normalized_search_scope
-        ):
+        if require_schedulable and not _detail_is_schedulable(detail):
+            continue
+        if not _matches_pool_key_search(detail, search, search_scope=normalized_search_scope):
             continue
         if normalized_selectors and not any(
-            _matches_pool_key_quick_selector(detail, selector)
-            for selector in normalized_selectors
+            _matches_pool_key_quick_selector(detail, selector) for selector in normalized_selectors
         ):
             continue
         filtered.append(detail)
     return filtered
+
+
+def _detail_is_schedulable(detail: PoolKeyDetail) -> bool:
+    status = str(getattr(detail, "scheduling_status", "") or "").strip().lower()
+    if status:
+        return status in {"available", "degraded"}
+
+    if not detail.is_active:
+        return False
+    if bool(
+        getattr(detail.status_snapshot.account, "blocked", False) or detail.account_status_blocked
+    ):
+        return False
+    if detail.cooldown_reason:
+        return False
+    if detail.circuit_breaker_open:
+        return False
+    if (
+        detail.cost_limit is not None
+        and detail.cost_limit > 0
+        and detail.cost_window_usage >= detail.cost_limit
+    ):
+        return False
+    return True
 
 
 def _build_pool_keys_base_query(db: Session, provider_id: str) -> Any:
@@ -1085,11 +1076,15 @@ async def _serialize_pool_key_details(
         cost_limit = pcfg.cost_limit_per_key_tokens if pcfg else None
         latency_avg_raw = latency_avgs.get(kid)
         latency_avg_ms = float(latency_avg_raw) if latency_avg_raw is not None else None
-        account_state = resolve_pool_account_state(
+        oauth_auth_config = _extract_oauth_auth_config(k)
+        oauth_expires_at = _derive_oauth_expires_at(k, auth_config=oauth_auth_config)
+        status_snapshot = resolve_provider_key_status_snapshot(
+            k,
             provider_type=provider_type,
-            upstream_metadata=getattr(k, "upstream_metadata", None),
-            oauth_invalid_reason=getattr(k, "oauth_invalid_reason", None),
+            auth_config=oauth_auth_config,
+            oauth_expires_at=oauth_expires_at,
         )
+        account_state = status_snapshot.account
         (
             scheduling_status,
             scheduling_reason,
@@ -1106,9 +1101,7 @@ async def _serialize_pool_key_details(
             circuit_breaker_open=any_circuit_open,
             cost_window_usage=cost_usage,
             cost_limit=cost_limit,
-            cost_soft_threshold_percent=(
-                pcfg.cost_soft_threshold_percent if pcfg else 80
-            ),
+            cost_soft_threshold_percent=(pcfg.cost_soft_threshold_percent if pcfg else 80),
             health_score=health_score,
         )
 
@@ -1159,7 +1152,7 @@ async def _serialize_pool_key_details(
         key_total_tokens = int(getattr(k, "total_tokens", 0) or 0)
         key_total_cost_usd = _serialize_money(getattr(k, "total_cost_usd", 0.0))
         key_last_used_at = getattr(k, "last_used_at", None)
-        oauth_auth_config = _extract_oauth_auth_config(k)
+        oauth_invalid_at = status_snapshot.oauth.invalid_at
 
         key_details.append(
             PoolKeyDetail(
@@ -1167,14 +1160,8 @@ async def _serialize_pool_key_details(
                 key_name=str(getattr(k, "name", "") or ""),
                 is_active=bool(k.is_active),
                 auth_type=str(getattr(k, "auth_type", "api_key") or "api_key"),
-                oauth_expires_at=_derive_oauth_expires_at(
-                    k, auth_config=oauth_auth_config
-                ),
-                oauth_invalid_at=(
-                    int(k.oauth_invalid_at.timestamp())
-                    if getattr(k, "oauth_invalid_at", None)
-                    else None
-                ),
+                oauth_expires_at=oauth_expires_at,
+                oauth_invalid_at=oauth_invalid_at,
                 oauth_invalid_reason=getattr(k, "oauth_invalid_reason", None),
                 oauth_plan_type=_derive_oauth_plan_type(
                     k, provider_type, auth_config=oauth_auth_config
@@ -1183,10 +1170,14 @@ async def _serialize_pool_key_details(
                 oauth_account_name=_derive_oauth_account_name(oauth_auth_config),
                 oauth_account_user_id=_derive_oauth_account_user_id(oauth_auth_config),
                 oauth_organizations=_derive_oauth_organizations(oauth_auth_config),
-                quota_updated_at=_extract_quota_updated_at(
-                    provider_type,
-                    getattr(k, "upstream_metadata", None),
-                ),
+                account_status_code=account_state.code,
+                account_status_label=account_state.label,
+                account_status_reason=account_state.reason,
+                account_status_blocked=account_state.blocked,
+                account_status_recoverable=bool(getattr(account_state, "recoverable", False)),
+                account_status_source=getattr(account_state, "source", None),
+                status_snapshot=asdict(status_snapshot),
+                quota_updated_at=status_snapshot.quota.updated_at,
                 health_score=health_score,
                 circuit_breaker_open=any_circuit_open,
                 api_formats=api_formats,
@@ -1197,9 +1188,7 @@ async def _serialize_pool_key_details(
                     v if (v := getattr(k, "cache_ttl_minutes", None)) is not None else 5
                 ),
                 max_probe_interval_minutes=(
-                    v
-                    if (v := getattr(k, "max_probe_interval_minutes", None)) is not None
-                    else 32
+                    v if (v := getattr(k, "max_probe_interval_minutes", None)) is not None else 32
                 ),
                 note=getattr(k, "note", None),
                 allowed_models=allowed_models,
@@ -1227,12 +1216,8 @@ async def _serialize_pool_key_details(
                 total_cost_usd=key_total_cost_usd,
                 sticky_sessions=sticky_counts.get(kid, 0),
                 lru_score=lru_scores.get(kid),
-                created_at=(
-                    k.created_at.isoformat() if getattr(k, "created_at", None) else None
-                ),
-                last_used_at=(
-                    key_last_used_at.isoformat() if key_last_used_at else None
-                ),
+                created_at=(k.created_at.isoformat() if getattr(k, "created_at", None) else None),
+                last_used_at=(key_last_used_at.isoformat() if key_last_used_at else None),
                 scheduling_status=scheduling_status,
                 scheduling_reason=scheduling_reason,
                 scheduling_label=scheduling_label,
@@ -1257,6 +1242,7 @@ async def _resolve_filtered_pool_key_details(
     quick_selectors: list[str],
     search_scope: str,
     require_cooldown: bool,
+    require_schedulable: bool,
     max_scan: int = _DEFAULT_POOL_KEY_SCAN_LIMIT,
 ) -> tuple[list[PoolKeyDetail], float, float, float]:
     keys_query_started_at = time.perf_counter()
@@ -1275,6 +1261,7 @@ async def _resolve_filtered_pool_key_details(
         quick_selectors=quick_selectors,
         search_scope=search_scope,
         require_cooldown=require_cooldown,
+        require_schedulable=require_schedulable,
     )
     return filtered_details, keys_query_ms, redis_state_ms, serialize_ms
 
@@ -1304,18 +1291,12 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
         pcfg = parse_pool_config(getattr(provider, "config", None))
         pid = str(provider.id)
         provider_type = str(getattr(provider, "provider_type", "custom") or "custom")
-        normalized_quick_selectors = _normalize_pool_quick_selectors(
-            self.quick_selectors
-        )
+        normalized_quick_selectors = _normalize_pool_quick_selectors(self.quick_selectors)
         normalized_search_scope = _normalize_pool_search_scope(self.search_scope)
 
         q = _build_pool_keys_base_query(db, pid)
         if self.search and normalized_search_scope != _FULL_SEARCH_SCOPE:
-            escaped = (
-                self.search.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
+            escaped = self.search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             q = q.filter(ProviderAPIKey.name.ilike(f"%{escaped}%"))
 
         if self.status == "active":
@@ -1326,6 +1307,7 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
         total = 0
         if (
             normalized_quick_selectors
+            or self.status == "active"
             or self.status == "cooldown"
             or (bool(self.search) and normalized_search_scope == _FULL_SEARCH_SCOPE)
         ):
@@ -1343,6 +1325,7 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                 quick_selectors=normalized_quick_selectors,
                 search_scope=normalized_search_scope,
                 require_cooldown=self.status == "cooldown",
+                require_schedulable=self.status == "active",
             )
             total = len(filtered_details)
             offset = (self.page - 1) * self.page_size
@@ -1416,6 +1399,7 @@ class AdminResolvePoolKeySelectionAdapter(AdminApiAdapter):
             quick_selectors=_normalize_pool_quick_selectors(self.body.quick_selectors),
             search_scope=_FULL_SEARCH_SCOPE,
             require_cooldown=False,
+            require_schedulable=False,
             max_scan=_RESOLVE_SELECTION_SCAN_LIMIT,
         )
 
@@ -1435,9 +1419,7 @@ class AdminResolvePoolKeySelectionAdapter(AdminApiAdapter):
 @dataclass
 class AdminBatchImportKeysAdapter(AdminApiAdapter):
     provider_id: str = ""
-    body: BatchImportRequest = field(
-        default_factory=lambda: BatchImportRequest(keys=[])
-    )
+    body: BatchImportRequest = field(default_factory=lambda: BatchImportRequest(keys=[]))
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         db = context.db
@@ -1611,9 +1593,7 @@ class AdminBatchActionKeysAdapter(AdminApiAdapter):
                 except Exception as exc:
                     db.rollback()
                     logger.error("batch action commit failed: {}", exc)
-                    return BatchActionResponse(
-                        affected=0, message=f"commit failed: {exc}"
-                    )
+                    return BatchActionResponse(affected=0, message=f"commit failed: {exc}")
 
             admin_name = context.user.username if context.user else "admin"
             affected_ids = [str(k.id)[:8] for k in keys]
@@ -1654,15 +1634,13 @@ class AdminCleanupBannedKeysAdapter(AdminApiAdapter):
             raise NotFoundException("Provider not found", "provider")
 
         pid = str(provider.id)
-        provider_type = (
-            str(getattr(provider, "provider_type", "") or "").strip().lower()
-        )
+        provider_type = str(getattr(provider, "provider_type", "") or "").strip().lower()
 
         keys = db.query(ProviderAPIKey).filter(ProviderAPIKey.provider_id == pid).all()
         banned_keys = [key for key in keys if _is_known_banned_key(key, provider_type)]
 
         if not banned_keys:
-            return BatchActionResponse(affected=0, message="未发现已知封号账号")
+            return BatchActionResponse(affected=0, message="未发现可清理的异常账号")
 
         banned_key_ids = [str(key.id) for key in banned_keys]
         try:
@@ -1689,7 +1667,7 @@ class AdminCleanupBannedKeysAdapter(AdminApiAdapter):
 
         admin_name = context.user.username if context.user else "admin"
         logger.warning(
-            "Pool cleanup banned by {}: provider={}, affected={}, key_ids={}",
+            "Pool cleanup abnormal keys by {}: provider={}, affected={}, key_ids={}",
             admin_name,
             self.provider_id[:8],
             len(banned_key_ids),
@@ -1698,5 +1676,5 @@ class AdminCleanupBannedKeysAdapter(AdminApiAdapter):
 
         return BatchActionResponse(
             affected=len(banned_key_ids),
-            message=f"已清理 {len(banned_key_ids)} 个已知封号账号",
+            message=f"已清理 {len(banned_key_ids)} 个异常账号",
         )

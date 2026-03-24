@@ -91,6 +91,12 @@ class _AccountStateDimension:
         blocked_label = snapshot.account_block_label or "账号异常"
         if blocked_label == "账号封禁":
             blocked_code = "account_banned"
+        elif blocked_label == "工作区停用":
+            blocked_code = "workspace_deactivated"
+        elif blocked_label == "账号停用":
+            blocked_code = "account_disabled"
+        elif blocked_label == "需要验证":
+            blocked_code = "account_verification"
         elif blocked_label == "访问受限":
             blocked_code = "account_forbidden"
         else:

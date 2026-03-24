@@ -290,14 +290,19 @@ class PoolAdvancedConfig(BaseModel):
         le=32,
         description="批量操作并发数（前端批量刷新 OAuth/额度等）。默认 8",
     )
-    probing_enabled: bool = Field(False, description="启用主动探测（定期检查 Key 可用性）")
+    probing_enabled: bool = Field(
+        False, description="启用主动探测（定期刷新 Key 的账号状态与额度）"
+    )
     probing_interval_minutes: int | None = Field(
         None,
         ge=1,
         le=1440,
         description="主动探测间隔（分钟）。默认 10",
     )
-    auto_remove_banned_keys: bool = Field(False, description="检测到封号时自动清除账号")
+    auto_remove_banned_keys: bool = Field(
+        False,
+        description="检测到不可恢复账号异常时自动清除账号（不处理纯 Token 失效）",
+    )
 
 
 class ClaudeCodeAdvancedConfig(BaseModel):

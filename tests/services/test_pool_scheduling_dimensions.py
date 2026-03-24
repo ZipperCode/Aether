@@ -83,6 +83,20 @@ def test_account_state_takes_priority_over_manual_disabled() -> None:
     assert summary.reason == "account_forbidden"
 
 
+def test_workspace_deactivated_uses_specific_reason_code() -> None:
+    dimensions = evaluate_pool_scheduling_dimensions(
+        _snapshot(
+            account_blocked=True,
+            account_block_label="工作区停用",
+            account_block_reason="deactivated_workspace",
+        )
+    )
+    summary = summarize_pool_scheduling_dimensions(dimensions)
+
+    assert summary.status == "blocked"
+    assert summary.reason == "workspace_deactivated"
+
+
 def test_summary_degraded_when_cost_reaches_soft_threshold() -> None:
     dimensions = evaluate_pool_scheduling_dimensions(
         _snapshot(cost_window_usage=8200, cost_limit=10000, cost_soft_threshold_percent=80)

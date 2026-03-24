@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.models.status_snapshot import ProviderKeyStatusSnapshotResponse
+
 # ---------------------------------------------------------------------------
 # Overview
 # ---------------------------------------------------------------------------
@@ -80,14 +82,42 @@ class PoolKeyDetail(BaseModel):
     key_name: str
     is_active: bool
     auth_type: str = "api_key"
-    oauth_expires_at: int | None = None
-    oauth_invalid_at: int | None = None
-    oauth_invalid_reason: str | None = None
+    oauth_expires_at: int | None = Field(
+        default=None, description="兼容字段；优先使用 status_snapshot.oauth"
+    )
+    oauth_invalid_at: int | None = Field(
+        default=None, description="兼容字段；优先使用 status_snapshot.oauth"
+    )
+    oauth_invalid_reason: str | None = Field(
+        default=None, description="兼容字段；优先使用 status_snapshot.oauth"
+    )
     oauth_plan_type: str | None = None
     oauth_account_id: str | None = None
     oauth_account_name: str | None = None
     oauth_account_user_id: str | None = None
     oauth_organizations: list[OAuthOrganizationSummary] = Field(default_factory=list)
+    account_status_code: str | None = Field(
+        default=None, description="兼容字段；优先使用 status_snapshot.account"
+    )
+    account_status_label: str | None = Field(
+        default=None, description="兼容字段；优先使用 status_snapshot.account"
+    )
+    account_status_reason: str | None = Field(
+        default=None, description="兼容字段；优先使用 status_snapshot.account"
+    )
+    account_status_blocked: bool = Field(
+        default=False, description="兼容字段；优先使用 status_snapshot.account"
+    )
+    account_status_recoverable: bool = Field(
+        default=False, description="兼容字段；优先使用 status_snapshot.account"
+    )
+    account_status_source: str | None = Field(
+        default=None, description="兼容字段；优先使用 status_snapshot.account"
+    )
+    status_snapshot: ProviderKeyStatusSnapshotResponse = Field(
+        default_factory=ProviderKeyStatusSnapshotResponse,
+        description="统一的账号/OAuth/额度状态快照",
+    )
     quota_updated_at: int | None = None
     # 健康度聚合字段（与 Provider Key 列表口径一致）
     health_score: float = 1.0

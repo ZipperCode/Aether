@@ -1,3 +1,5 @@
+import type { ProviderKeyStatusSnapshot } from './statusSnapshot'
+
 /**
  * 代理配置类型
  * 支持两种模式：
@@ -290,8 +292,9 @@ export interface EndpointAPIKey {
   oauth_account_user_id?: string | null  // Codex ChatGPT account-user 联合 ID
   oauth_account_name?: string | null
   oauth_organizations?: OAuthOrganizationInfo[] | null  // OAuth 关联组织/工作区摘要
-  oauth_invalid_at?: number | null  // OAuth Token 失效时间（Unix 时间戳）
-  oauth_invalid_reason?: string | null  // OAuth Token 失效原因
+  oauth_invalid_at?: number | null  // 兼容字段；优先使用 status_snapshot.oauth
+  oauth_invalid_reason?: string | null  // 兼容字段；优先使用 status_snapshot.oauth
+  status_snapshot?: ProviderKeyStatusSnapshot | null
   // 上游元数据（由上游响应采集，如 Codex 额度信息 / Antigravity 配额信息）
   upstream_metadata?: UpstreamMetadata | null
   // Key 级别代理配置（覆盖 Provider 级别代理）
@@ -591,6 +594,7 @@ export interface HealthSummary {
     total: number
     active: number
     unhealthy: number
+    circuit_open?: number
   }
 }
 

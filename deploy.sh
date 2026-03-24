@@ -108,27 +108,26 @@ if [ -n "$HUB_TAG" ]; then
     esac
 fi
 
-# 提取 pyproject.toml 中"会影响运行时依赖安装"的最小指纹（与 CI 保持一致）：
-# - [build-system] requires / build-backend
-# - [project] requires-python / dependencies
-# 使用 Python tomllib 解析，不受 TOML 格式变化影响。
+# 提取 pyproject.toml 中会影响运行时依赖安装的字段指纹（纯 shell，无需 Python）
+# 用 sed 提取 dependencies / requires 数组块和单值字段，排序后输出稳定文本
 pyproject_deps_fingerprint() {
-    python3 - <<'PY'
-import json, pathlib, tomllib
-
-data = tomllib.loads(pathlib.Path("pyproject.toml").read_text("utf-8"))
-project = data.get("project") or {}
-build = data.get("build-system") or {}
-
-fingerprint = {
-    "requires-python": project.get("requires-python"),
-    "dependencies": sorted(project.get("dependencies") or []),
-    "build-backend": build.get("build-backend"),
-    "build-requires": sorted(build.get("requires") or []),
-}
-
-print(json.dumps(fingerprint, sort_keys=True, separators=(",", ":")))
-PY
+    local file="pyproject.toml"
+    # 提取 "key = [..." 多行数组块（从 key 行到 ] 行）
+    extract_array() {
+        sed -n "/^$1[[:space:]]*=[[:space:]]*\[/,/\]/p" "$file" | grep '"' | sed 's/.*"\(.*\)".*/\1/' | sort
+    }
+    # 提取 "key = "value"" 单行值
+    extract_value() {
+        grep -m1 "^$1[[:space:]]*=" "$file" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/'
+    }
+    {
+        echo "requires-python=$(extract_value requires-python)"
+        echo "build-backend=$(extract_value build-backend)"
+        echo "dependencies:"
+        extract_array dependencies
+        echo "build-requires:"
+        extract_array requires
+    }
 }
 
 # 计算依赖文件的哈希值（包含 Dockerfile.base.local）

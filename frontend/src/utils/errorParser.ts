@@ -133,6 +133,30 @@ function formatValidationError(error: ValidationError): string {
   return `${fieldName}: ${error.msg}`
 }
 
+function normalizeKnownApiErrorMessage(message: string): string {
+  const text = message.trim()
+  if (!text) return text
+
+  const lowered = text.toLowerCase()
+  if (
+    lowered.includes('refresh_token_reused')
+    || lowered.includes('already been used to generate a new access token')
+  ) {
+    return 'Token 刷新失败：refresh_token 已被使用并轮换，请重新登录授权'
+  }
+
+  if (
+    lowered.includes('token refresh 失败:')
+    || lowered.includes('token refresh failed:')
+  ) {
+    return text
+      .replace(/^token refresh 失败:\s*/i, 'Token 刷新失败：')
+      .replace(/^token refresh failed:\s*/i, 'Token 刷新失败：')
+  }
+
+  return text
+}
+
 /**
  * 解析 API 错误响应
  * @param err 错误对象
@@ -145,7 +169,7 @@ export function parseApiError(err: unknown, defaultMessage: string = '操作失�
   // 处理网络错误
   if (!isApiError(err) || !err.response) {
     if (err instanceof Error) {
-      return err.message || defaultMessage
+      return normalizeKnownApiErrorMessage(err.message || defaultMessage)
     }
     return '无法连接到服务器，请检查网络连接'
   }
@@ -154,14 +178,14 @@ export function parseApiError(err: unknown, defaultMessage: string = '操作失�
 
   // 1. 处理 {error: {type, message}} 格式（ProxyException 返回格式）
   if (data?.error?.message) {
-    return data.error.message
+    return normalizeKnownApiErrorMessage(data.error.message)
   }
 
   const detail = data?.detail
 
   // 如果没有 detail 字段
   if (!detail) {
-    return data?.message || err.message || defaultMessage
+    return normalizeKnownApiErrorMessage(data?.message || err.message || defaultMessage)
   }
 
   // 1. 处理 Pydantic 验证错误（数组格式）
@@ -174,14 +198,14 @@ export function parseApiError(err: unknown, defaultMessage: string = '操作失�
 
   // 2. 处理字符串错误
   if (typeof detail === 'string') {
-    return detail
+    return normalizeKnownApiErrorMessage(detail)
   }
 
   // 3. 处理对象错误
   if (typeof detail === 'object') {
     // 可能是自定义错误对象
     if ((detail as Record<string, unknown>).message) {
-      return String((detail as Record<string, unknown>).message)
+      return normalizeKnownApiErrorMessage(String((detail as Record<string, unknown>).message))
     }
     // 尝试 JSON 序列化
     try {

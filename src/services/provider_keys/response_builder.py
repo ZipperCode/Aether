@@ -5,7 +5,7 @@ Provider Key 响应对象构建器。
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from dataclasses import asdict
 from typing import Any
 
 from src.core.crypto import crypto_service
@@ -14,10 +14,17 @@ from src.core.provider_oauth_utils import normalize_oauth_organizations
 from src.models.database import ProviderAPIKey
 from src.models.endpoint_models import EndpointAPIKeyResponse
 from src.services.provider_keys.auth_type import normalize_auth_type
+from src.services.provider_keys.status_snapshot_store import (
+    normalize_oauth_expires_at,
+    resolve_provider_key_status_snapshot,
+)
 
 
 def build_key_response(
-    key: ProviderAPIKey, api_key_plain: str | None = None
+    key: ProviderAPIKey,
+    api_key_plain: str | None = None,
+    *,
+    provider_type: str | None = None,
 ) -> EndpointAPIKeyResponse:
     """构建 Key 响应对象。"""
     auth_type = normalize_auth_type(getattr(key, "auth_type", "api_key"))
@@ -40,9 +47,7 @@ def build_key_response(
             masked_key = "***ERROR***"
 
     success_rate = success_count / request_count if request_count > 0 else 0.0
-    avg_response_time_ms = (
-        total_response_time_ms / success_count if success_count > 0 else 0.0
-    )
+    avg_response_time_ms = total_response_time_ms / success_count if success_count > 0 else 0.0
 
     is_adaptive = rpm_limit is None
     key_dict: dict[str, Any] = dict(getattr(key, "__dict__", {}))
@@ -57,66 +62,61 @@ def build_key_response(
     oauth_account_id = None
     oauth_account_name = None
     oauth_account_user_id = None
+    auth_config: dict[str, Any] | None = None
     oauth_organizations: list[dict[str, object]] = []
     encrypted_auth_config = key_dict.pop("auth_config", None)  # 移除敏感字段，避免泄露
-    if (
-        auth_type == "oauth"
-        and isinstance(encrypted_auth_config, str)
-        and encrypted_auth_config
-    ):
+    if auth_type == "oauth" and isinstance(encrypted_auth_config, str) and encrypted_auth_config:
         try:
             decrypted_config = crypto_service.decrypt(encrypted_auth_config)
             auth_config = json.loads(decrypted_config)
-            oauth_expires_at = auth_config.get("expires_at")
+            oauth_expires_at = normalize_oauth_expires_at(auth_config.get("expires_at"))
             oauth_email = auth_config.get("email")
-            oauth_plan_type = auth_config.get(
-                "plan_type"
-            )  # Codex: plus/free/team/enterprise
+            oauth_plan_type = auth_config.get("plan_type")  # Codex: plus/free/team/enterprise
             # Antigravity 使用 "tier" 字段（如 "PAID"/"FREE"），做小写化 fallback
             if not oauth_plan_type:
                 ag_tier = auth_config.get("tier")
                 if ag_tier and isinstance(ag_tier, str):
                     oauth_plan_type = ag_tier.lower()
-            oauth_account_id = auth_config.get(
-                "account_id"
-            )  # Codex: chatgpt_account_id
+            oauth_account_id = auth_config.get("account_id")  # Codex: chatgpt_account_id
             oauth_account_name = auth_config.get("account_name")
             oauth_account_user_id = auth_config.get("account_user_id")
-            oauth_organizations = normalize_oauth_organizations(
-                auth_config.get("organizations")
-            )
+            oauth_organizations = normalize_oauth_organizations(auth_config.get("organizations"))
         except Exception as e:
             logger.error("Failed to decrypt auth_config for key {}: {}", key.id, e)
 
+    if not provider_type:
+        provider_rel = getattr(key, "provider", None)
+        provider_type = (
+            str(getattr(provider_rel, "provider_type", None) or "").strip()
+            or str(getattr(provider_rel, "type", None) or "").strip()
+            or None
+        )
+
+    status_snapshot = resolve_provider_key_status_snapshot(
+        key,
+        provider_type=provider_type,
+        auth_config=auth_config,
+        oauth_expires_at=oauth_expires_at,
+    )
+
     # 从 health_by_format 计算汇总字段（便于列表展示）
     raw_health_by_format = getattr(key, "health_by_format", None)
-    health_by_format = (
-        raw_health_by_format if isinstance(raw_health_by_format, dict) else {}
-    )
+    health_by_format = raw_health_by_format if isinstance(raw_health_by_format, dict) else {}
     raw_circuit_by_format = getattr(key, "circuit_breaker_by_format", None)
-    circuit_by_format = (
-        raw_circuit_by_format if isinstance(raw_circuit_by_format, dict) else {}
-    )
+    circuit_by_format = raw_circuit_by_format if isinstance(raw_circuit_by_format, dict) else {}
 
     # 计算整体健康度（取所有格式中的最低值）
     if health_by_format:
-        health_scores = [
-            float(h.get("health_score") or 1.0) for h in health_by_format.values()
-        ]
+        health_scores = [float(h.get("health_score") or 1.0) for h in health_by_format.values()]
         min_health_score = min(health_scores) if health_scores else 1.0
         # 取最大的连续失败次数
         max_consecutive = max(
-            (
-                int(h.get("consecutive_failures") or 0)
-                for h in health_by_format.values()
-            ),
+            (int(h.get("consecutive_failures") or 0) for h in health_by_format.values()),
             default=0,
         )
         # 取最近的失败时间
         failure_times = [
-            h.get("last_failure_at")
-            for h in health_by_format.values()
-            if h.get("last_failure_at")
+            h.get("last_failure_at") for h in health_by_format.values() if h.get("last_failure_at")
         ]
         last_failure = max(failure_times) if failure_times else None
     else:
@@ -154,15 +154,9 @@ def build_key_response(
             "oauth_account_name": oauth_account_name,
             "oauth_account_user_id": oauth_account_user_id,
             "oauth_organizations": oauth_organizations,
-            "oauth_invalid_at": (
-                int(oauth_invalid_at.timestamp())
-                if isinstance(
-                    (oauth_invalid_at := getattr(key, "oauth_invalid_at", None)),
-                    datetime,
-                )
-                else None
-            ),
+            "oauth_invalid_at": status_snapshot.oauth.invalid_at,
             "oauth_invalid_reason": getattr(key, "oauth_invalid_reason", None),
+            "status_snapshot": asdict(status_snapshot),
         }
     )
 

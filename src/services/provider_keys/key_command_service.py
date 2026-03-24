@@ -59,7 +59,7 @@ def _validate_vertex_api_formats(
     if auth_type == "api_key":
         allowed = {"gemini:chat"}
     elif auth_type in {"service_account", "vertex_ai"}:
-        allowed = {"gemini:chat", "claude:chat"}
+        allowed = {"claude:chat", "gemini:chat"}
     else:
         return
 
@@ -216,14 +216,11 @@ def _clear_oauth_invalid_marker(db: Session, key_id: str) -> dict[str, str]:
     old_reason = key.oauth_invalid_reason
     key.oauth_invalid_at = None
     key.oauth_invalid_reason = None
-    key.is_active = True
     db.commit()
     _run_async_with_fallback(_invalidate_cache_after_clear_oauth_invalid(key_id))
 
-    logger.info(
-        "[OK] 手动清除 Key {}... 的 OAuth 失效标记并自动启用 (原因: {})", key_id[:8], old_reason
-    )
-    return {"message": "已清除 OAuth 失效标记，Key 已自动启用"}
+    logger.info("[OK] 手动清除 Key {}... 的 OAuth 失效标记 (原因: {})", key_id[:8], old_reason)
+    return {"message": "已清除 OAuth 失效标记"}
 
 
 def clear_oauth_invalid_response(db: Session, key_id: str) -> dict[str, str]:
@@ -310,14 +307,16 @@ def _prepare_update_key_payload(
         exclude_key_id=key_id,
     )
 
-    # Vertex Provider: auth_type 与 api_formats 的组合必须合法
-    provider = getattr(key, "provider", None)
-    effective_api_formats = update_data.get("api_formats", key.api_formats)
-    _validate_vertex_api_formats(
-        getattr(provider, "provider_type", None),
-        target_auth_type,
-        effective_api_formats,
-    )
+    # Vertex Provider: 仅在 auth_type/api_formats 变更时校验组合，
+    # 避免历史旧数据在无关编辑时被强制阻断。
+    if "auth_type" in update_data or "api_formats" in update_data:
+        provider = getattr(key, "provider", None)
+        effective_api_formats = update_data.get("api_formats", key.api_formats)
+        _validate_vertex_api_formats(
+            getattr(provider, "provider_type", None),
+            target_auth_type,
+            effective_api_formats,
+        )
 
     if "api_key" in update_data:
         api_key_raw = update_data["api_key"]

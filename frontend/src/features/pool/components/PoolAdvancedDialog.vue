@@ -28,7 +28,7 @@
           <div class="space-y-0.5">
             <span class="text-sm font-medium">主动探测</span>
             <p class="text-xs text-muted-foreground">
-              定期检查 Key 可用性，提前发现异常
+              按固定间隔主动刷新 Key 的账号状态与额度
             </p>
           </div>
           <Switch
@@ -57,9 +57,9 @@
         </div>
         <div class="flex items-center justify-between p-3 border rounded-lg bg-muted/50">
           <div class="space-y-0.5">
-            <span class="text-sm font-medium">封号自动清除</span>
+            <span class="text-sm font-medium">异常自动清除</span>
             <p class="text-xs text-muted-foreground">
-              检测到账号被封禁时自动从号池中移除
+              仅在检测到不可恢复的账号异常时自动从号池中移除，不处理纯 Token 失效
             </p>
           </div>
           <Switch

@@ -1012,41 +1012,41 @@ class ProviderOpsService:
         # 使用架构的方法构建请求
         verify_endpoint = f"{base_url}{architecture.get_verify_endpoint()}"
 
-        # 执行异步预处理（如获取动态 Cookie、登录获取 Token）
-        # 返回值可以是 dict（仅额外配置）或 tuple[dict, dict]（额外配置 + 凭据更新）
-        prepare_result = await architecture.prepare_verify_config(base_url, config, credentials)
-        if isinstance(prepare_result, tuple):
-            extra_config, updated_creds = prepare_result
-        else:
-            extra_config = prepare_result
-            updated_creds = {}
-        merged_config = {**config, **extra_config}
-
-        # Token Rotation: prepare_verify_config 可能已消耗旧 refresh_token 并获取新值，
-        # 无论后续验证是否成功都需要立即持久化，否则旧 token 已失效但数据库未更新。
-        if updated_creds and provider_id:
-            logger.info(
-                "验证过程检测到凭据变更: provider_id={}, updated_keys={}",
-                provider_id,
-                list(updated_creds.keys()),
-            )
-            self._persist_updated_credentials(provider_id, updated_creds)
-
-        headers = architecture.build_verify_headers(merged_config, credentials)
-
-        logger.debug(
-            "验证认证: architecture={}, endpoint={}, headers={}",
-            architecture_id,
-            verify_endpoint,
-            list(headers.keys()),
-        )
-
-        # 获取代理配置（支持 proxy_node_id、tunnel 模式和旧的 proxy URL）
-        from src.services.proxy_node.resolver import resolve_ops_proxy_config_async
-
-        proxy, tunnel_node_id = await resolve_ops_proxy_config_async(config)
-
         try:
+            # 执行异步预处理（如获取动态 Cookie、登录获取 Token）
+            # 返回值可以是 dict（仅额外配置）或 tuple[dict, dict]（额外配置 + 凭据更新）
+            prepare_result = await architecture.prepare_verify_config(base_url, config, credentials)
+            if isinstance(prepare_result, tuple):
+                extra_config, updated_creds = prepare_result
+            else:
+                extra_config = prepare_result
+                updated_creds = {}
+            merged_config = {**config, **extra_config}
+
+            # Token Rotation: prepare_verify_config 可能已消耗旧 refresh_token 并获取新值，
+            # 无论后续验证是否成功都需要立即持久化，否则旧 token 已失效但数据库未更新。
+            if updated_creds and provider_id:
+                logger.info(
+                    "验证过程检测到凭据变更: provider_id={}, updated_keys={}",
+                    provider_id,
+                    list(updated_creds.keys()),
+                )
+                self._persist_updated_credentials(provider_id, updated_creds)
+
+            headers = architecture.build_verify_headers(merged_config, credentials)
+
+            logger.debug(
+                "验证认证: architecture={}, endpoint={}, headers={}",
+                architecture_id,
+                verify_endpoint,
+                list(headers.keys()),
+            )
+
+            # 获取代理配置（支持 proxy_node_id、tunnel 模式和旧的 proxy URL）
+            from src.services.proxy_node.resolver import resolve_ops_proxy_config_async
+
+            proxy, tunnel_node_id = await resolve_ops_proxy_config_async(config)
+
             # 构建 httpx client 参数
             client_kwargs: dict[str, Any] = {
                 "timeout": 30.0,
@@ -1106,6 +1106,8 @@ class ProviderOpsService:
 
                 return result_dict
 
+        except ValueError as e:
+            return {"success": False, "message": str(e)}
         except httpx.TimeoutException:
             return {"success": False, "message": "连接超时"}
         except httpx.ConnectError as e:

@@ -18,6 +18,7 @@ from src.core.crypto import crypto_service
 from src.core.logger import logger
 from src.core.provider_auth_types import ProviderAuthInfo
 from src.core.provider_oauth_utils import enrich_auth_config, post_oauth_token
+from src.services.provider.provider_context import resolve_provider_proxy
 
 if TYPE_CHECKING:
     from src.models.database import ProviderAPIKey, ProviderEndpoint
@@ -101,9 +102,14 @@ def _persist_refreshed_token(
     key.api_key = crypto_service.encrypt(access_token)
     key.auth_config = crypto_service.encrypt(json.dumps(token_meta))
 
-    # 刷新成功 => 清除所有 oauth_invalid 标记（包括 [ACCOUNT_BLOCK]）。
-    # Token 能成功刷新说明账号可用，之前的 block 标记应视为过时。
-    if getattr(key, "oauth_invalid_at", None) is not None:
+    # 刷新成功只清除可恢复的 token 类异常。
+    # 账号级 block（如验证要求/工作区停用）不能靠 token refresh 自动恢复。
+    from src.services.provider.oauth_token import is_account_level_block
+
+    current_reason = str(getattr(key, "oauth_invalid_reason", None) or "").strip()
+    if getattr(key, "oauth_invalid_at", None) is not None and not is_account_level_block(
+        current_reason
+    ):
         key.oauth_invalid_at = None
         key.oauth_invalid_reason = None
 
@@ -213,10 +219,7 @@ def _get_proxy_config(key: Any, endpoint: Any = None) -> Any:
     try:
         from src.services.proxy_node.resolver import resolve_effective_proxy
 
-        provider = getattr(key, "provider", None) or (
-            getattr(endpoint, "provider", None) if endpoint else None
-        )
-        provider_proxy = getattr(provider, "proxy", None)
+        provider_proxy = resolve_provider_proxy(endpoint=endpoint, key=key)
         key_proxy = getattr(key, "proxy", None)
         return resolve_effective_proxy(provider_proxy, key_proxy)
     except Exception:
@@ -556,7 +559,7 @@ async def get_provider_auth(
         # "vertex_ai" 保留为向后兼容（迁移期间旧数据可能仍使用该值）
         from src.services.provider.adapters.vertex_ai.auth import _auth_service_account
 
-        return await _auth_service_account(key)
+        return await _auth_service_account(key, endpoint)
 
     # 标准 API Key：返回 None，由 build_headers 处理
     return None
