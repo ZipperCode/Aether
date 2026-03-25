@@ -159,7 +159,7 @@ Expected: migration applies without error
 - [ ] **Step 4: Test downgrade**
 
 ```bash
-uv run alembic downgrade -1
+uv run alembic downgrade <target_revision>
 ```
 
 Expected: rollback applies without error

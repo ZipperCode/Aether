@@ -165,8 +165,9 @@ docker compose up -d app
 **没有备份的情况：**
 
 ```bash
-# 1. 用当前容器回退数据库迁移（回退 1 步，按需调整数字）
-docker compose exec app alembic downgrade -1
+# 1. 用当前容器回退数据库迁移
+#    merge head 场景下不要使用 `downgrade -1`，应显式指定目标 revision
+docker compose exec app alembic downgrade <target_revision>
 
 # 2. 查看回退后的版本确认正确
 docker compose exec app alembic current
@@ -175,7 +176,9 @@ docker compose exec app alembic current
 docker compose up -d app
 ```
 
-> 注意：没有备份的回滚依赖 alembic downgrade，如果迁移涉及不可逆的数据变更（如删除列），可能无法完全恢复数据。因此强烈建议升级前备份。
+> 注意：没有备份的回滚依赖 alembic downgrade。如果当前 revision 是 mergepoint，
+> `downgrade -1` 可能报 `Ambiguous walk`，应改为显式指定目标 revision。
+> 若迁移涉及不可逆的数据变更（如删除列），也可能无法完全恢复数据。因此强烈建议升级前备份。
 
 ---
 

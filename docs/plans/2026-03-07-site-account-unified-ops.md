@@ -81,7 +81,7 @@ def upgrade():
 
 **Step 4: Run migration verification**
 
-Run: `alembic upgrade head && alembic downgrade -1 && alembic upgrade head`  
+Run: `alembic upgrade head && alembic downgrade <target_revision> && alembic upgrade head`  
 Expected: 全部成功，无异常
 
 **Step 5: Commit**
