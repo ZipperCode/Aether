@@ -321,13 +321,24 @@ run_migration() {
         return 0
     }
 
-    # 检查是否是因为找不到旧版本（基线重置场景）
+    # 检查是否是因为找不到旧版本（基线重置/迁移文件历史变更场景）
     if echo "$UPGRADE_OUTPUT" | grep -q "Can't locate revision"; then
-        echo ">>> Detected baseline reset: old revision not found in migrations"
-        echo ">>> Clearing old version and stamping to new baseline..."
+        echo ">>> ERROR: Database revision is not present in the current Alembic migration chain."
+        echo ">>> This usually means the database came from an older baseline or a different branch history."
+        echo ">>> Refusing to auto-stamp latest head, because stamp only changes alembic_version and may hide real schema drift."
+        echo ">>>"
+        echo ">>> Recommended actions:"
+        echo ">>>   1. Backup the database first"
+        echo ">>>   2. If this is meant to be a true fresh deploy, delete the PostgreSQL volume and recreate the database"
+        echo ">>>   3. If this is an old database, compare schema against a fresh database upgraded to head"
+        echo ">>>   4. Only after confirming schema compatibility, run an explicit manual stamp"
+        echo ">>>"
+        echo ">>> Manual override is still available if you know the schema is already current:"
+        echo ">>>   ALLOW_ALEMBIC_FORCE_STAMP=1 ./deploy.sh"
 
-        # 先清除旧的版本记录，再 stamp 到新基线
-        $DC exec -T app python -c "
+        if [ "${ALLOW_ALEMBIC_FORCE_STAMP:-0}" = "1" ]; then
+            echo ">>> Manual override enabled. Clearing alembic_version and stamping latest head..."
+            $DC exec -T app python -c "
 from sqlalchemy import create_engine, text
 import os
 engine = create_engine(os.environ['DATABASE_URL'])
@@ -336,14 +347,16 @@ with engine.connect() as conn:
     conn.commit()
 print('Old version cleared')
 "
-        # 获取最新的迁移版本（匹配 revision_id (head) 格式）
-        LATEST_VERSION=$($DC exec -T app alembic heads 2>/dev/null | grep -oE '^[0-9a-zA-Z_]+' | head -1)
-        if [ -n "$LATEST_VERSION" ]; then
-            $DC exec -T app alembic stamp "$LATEST_VERSION"
-            echo ">>> Database stamped to $LATEST_VERSION"
-            save_migration_hash
+            LATEST_VERSION=$($DC exec -T app alembic heads 2>/dev/null | grep -oE '^[0-9a-zA-Z_]+' | head -1)
+            if [ -n "$LATEST_VERSION" ]; then
+                $DC exec -T app alembic stamp "$LATEST_VERSION"
+                echo ">>> Database stamped to $LATEST_VERSION"
+                save_migration_hash
+            else
+                echo ">>> ERROR: Could not determine latest migration version"
+                exit 1
+            fi
         else
-            echo ">>> ERROR: Could not determine latest migration version"
             exit 1
         fi
     else

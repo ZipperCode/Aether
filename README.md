@@ -180,6 +180,28 @@ docker compose up -d app
 > `downgrade -1` 可能报 `Ambiguous walk`，应改为显式指定目标 revision。
 > 若迁移涉及不可逆的数据变更（如删除列），也可能无法完全恢复数据。因此强烈建议升级前备份。
 
+### Alembic 版本整理与旧库升级
+
+- 当前仓库只有一个 Alembic head：`e8f1a2b3c4d5`
+- 当前可追溯基线是：`20251210_baseline`
+- 对于真正的空数据库，`alembic upgrade head` 已验证可直接升级到最新版本
+
+如果你感觉“从 0 开始部署也会冲突”，优先检查：
+
+1. 是否复用了 Docker 的 PostgreSQL 命名卷，而不是一个真正的新库
+2. 数据库里的 `alembic_version` 是否指向仓库中已不存在的旧 revision
+3. 是否曾经对旧库做过 `stamp latest`，导致版本号看起来是最新，但实际 schema 没有升级完整
+
+详细整理和处理策略见：
+
+- [docs/alembic-version-strategy.md](docs/alembic-version-strategy.md)
+
+快速体检当前数据库状态：
+
+```bash
+uv run python scripts/check_alembic_state.py
+```
+
 ---
 
 ## 许可证
