@@ -130,3 +130,47 @@ def test_trace_attempted_only_excludes_pending_without_started_at(monkeypatch: o
     assert response.total_candidates == 1
     assert len(response.candidates) == 1
     assert response.candidates[0].status == "pending"
+
+
+def test_trace_includes_transformer_diagnostics_from_usage_metadata(monkeypatch: object) -> None:
+    candidates = [_candidate(status="success", latency_ms=123)]
+    monkeypatch.setattr(
+        RequestCandidateService,
+        "get_candidates_by_request_id",
+        lambda _db, _request_id: candidates,
+    )
+
+    usage_row = SimpleNamespace(
+        request_metadata={
+            "transformer_diagnostics": [
+                {
+                    "stage": "request",
+                    "transformer": "sampling",
+                    "code": "sampling_clamped",
+                    "message": "temperature was clamped to target-supported range",
+                    "severity": "info",
+                }
+            ]
+        }
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = usage_row
+    ctx = SimpleNamespace(db=db, add_audit_metadata=lambda **_: None)
+
+    adapter = AdminGetRequestTraceAdapter(request_id="req-1")
+    response = asyncio.run(adapter.handle(ctx))
+
+    assert response.transformer_diagnostics == [
+        {
+            "stage": "request",
+            "transformer": "sampling",
+            "code": "sampling_clamped",
+            "message": "temperature was clamped to target-supported range",
+            "severity": "info",
+        }
+    ]
+    assert response.transformer_diagnostics_summary == {
+        "count": 1,
+        "by_code": {"sampling_clamped": 1},
+        "by_transformer": {"sampling": 1},
+    }

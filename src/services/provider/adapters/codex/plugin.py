@@ -27,6 +27,13 @@ from src.services.provider.preset_models import create_preset_models_fetcher
 
 fetch_models_codex = create_preset_models_fetcher("codex")
 
+CODEX_DEFAULT_TRANSFORMERS: tuple[dict[str, Any], ...] = (
+    {"name": "tooluse"},
+    {"name": "enhancetool"},
+    {"name": "reasoning"},
+    {"name": "maxtoken"},
+)
+
 
 # ---------------------------------------------------------------------------
 # Transport Hook
@@ -342,6 +349,7 @@ async def enrich_codex(
 def register_all() -> None:
     """一次性注册 Codex 的所有 hooks 到各通用 registry。"""
     from src.core.api_format.capabilities import register_provider_default_body_rules
+    from src.core.api_format.capabilities import register_provider_default_transformers
     from src.core.provider_oauth_utils import register_auth_enricher
     from src.services.model.upstream_fetcher import UpstreamModelsFetcherRegistry
     from src.services.provider.transport import register_transport_hook
@@ -360,6 +368,8 @@ def register_all() -> None:
     from src.core.api_format.metadata import CODEX_DEFAULT_BODY_RULES
 
     register_provider_default_body_rules("codex", "openai:cli", CODEX_DEFAULT_BODY_RULES)
+    register_provider_default_transformers("codex", "openai:cli", CODEX_DEFAULT_TRANSFORMERS)
+    register_provider_default_transformers("codex", "openai:compact", CODEX_DEFAULT_TRANSFORMERS)
 
     # Export: Codex uses the default export builder (strip null + temp fields)
     # No need to register a custom one — the default in export.py suffices.

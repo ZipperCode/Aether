@@ -397,6 +397,75 @@
                 </div>
               </Card>
 
+              <Card
+                v-if="transformerDiagnosticCount > 0"
+              >
+                <div class="p-3 sm:p-4 space-y-3">
+                  <div class="flex items-center justify-between gap-3 flex-wrap">
+                    <div>
+                      <h4 class="text-sm font-semibold">
+                        转换诊断
+                      </h4>
+                      <p class="text-xs text-muted-foreground">
+                        {{ transformerDiagnosticCount }} 次
+                      </p>
+                    </div>
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <Badge
+                        v-for="entry in transformerDiagnosticCodePreview"
+                        :key="entry"
+                        variant="outline"
+                        class="text-[11px]"
+                      >
+                        {{ entry }}
+                      </Badge>
+                    </div>
+                  </div>
+
+                  <div
+                    v-if="transformerDiagnosticTransformerPreview.length > 0"
+                    class="text-xs text-muted-foreground"
+                  >
+                    转换器: {{ transformerDiagnosticTransformerPreview.join(' / ') }}
+                  </div>
+
+                  <div
+                    v-if="transformerDiagnostics.length > 0"
+                    class="space-y-2"
+                  >
+                    <div
+                      v-for="(item, index) in transformerDiagnostics"
+                      :key="`${item.stage}-${item.transformer}-${item.code}-${index}`"
+                      class="rounded-lg border bg-muted/20 px-3 py-2"
+                    >
+                      <div class="flex items-center gap-2 flex-wrap text-xs">
+                        <span class="font-mono text-foreground">{{ item.code }}</span>
+                        <Badge
+                          variant="outline"
+                          class="text-[10px] h-5"
+                        >
+                          {{ item.transformer }}
+                        </Badge>
+                        <span class="text-muted-foreground">{{ item.stage }}</span>
+                        <span class="text-muted-foreground">{{ item.severity }}</span>
+                      </div>
+                      <p class="mt-1 text-sm break-words">
+                        {{ item.message }}
+                      </p>
+                      <details
+                        v-if="item.details && Object.keys(item.details).length > 0"
+                        class="mt-2"
+                      >
+                        <summary class="cursor-pointer text-xs text-muted-foreground">
+                          查看 details
+                        </summary>
+                        <pre class="mt-2 overflow-x-auto rounded bg-muted/40 p-2 text-xs">{{ formatDiagnosticDetails(item.details) }}</pre>
+                      </details>
+                    </div>
+                  </div>
+                </div>
+              </Card>
+
               <!-- 请求链路追踪卡片 -->
               <div>
                 <HorizontalRequestTimeline
@@ -714,6 +783,11 @@ import {
   type RenderResult,
   type RenderBlock,
 } from '../conversation'
+import {
+  buildTransformerDiagnosticSummary,
+  buildTransformerDiagnosticPreview,
+  buildTransformerDiagnosticTransformerPreview,
+} from '../transformerDiagnostics'
 
 const props = defineProps<{
   isOpen: boolean
@@ -972,6 +1046,31 @@ const responseRenderResult = computed<RenderResult>(() => {
   }
   return renderResponse(body, currentRequestBody.value, detail.value?.api_format)
 })
+
+const transformerDiagnostics = computed(() => detail.value?.transformer_diagnostics ?? [])
+
+const transformerDiagnosticsSummary = computed(() => {
+  return detail.value?.transformer_diagnostics_summary
+    ?? buildTransformerDiagnosticSummary(transformerDiagnostics.value)
+})
+
+const transformerDiagnosticCount = computed(() => {
+  if (transformerDiagnosticsSummary.value?.count) return transformerDiagnosticsSummary.value.count
+  return transformerDiagnostics.value.length
+})
+
+const transformerDiagnosticCodePreview = computed(() => {
+  return buildTransformerDiagnosticPreview(transformerDiagnosticsSummary.value, 3)
+})
+
+const transformerDiagnosticTransformerPreview = computed(() => {
+  return buildTransformerDiagnosticTransformerPreview(transformerDiagnosticsSummary.value, 3)
+})
+
+function formatDiagnosticDetails(details: Record<string, unknown> | undefined): string {
+  if (!details) return ''
+  return JSON.stringify(details, null, 2)
+}
 
 // 当前 Tab 是否支持对话视图
 const supportsConversationView = computed(() => {
@@ -1517,6 +1616,9 @@ function handleVisibilityChange() {
 
 onMounted(() => {
   document.addEventListener('visibilitychange', handleVisibilityChange)
+  if (props.isOpen && props.requestId) {
+    void loadDetail(props.requestId)
+  }
 })
 
 onBeforeUnmount(() => {

@@ -10,6 +10,7 @@ import src.api.handlers.base.chat_handler_base as chatmod
 from src.api.handlers.base.chat_handler_base import ChatHandlerBase
 from src.api.handlers.base.chat_sync_executor import ChatSyncExecutor
 from src.api.handlers.base.stream_context import StreamContext
+from src.core.api_format.transformers.registry import get_transformer_registry
 from src.services.task.request_state import MutableRequestBodyState
 
 
@@ -87,6 +88,52 @@ class _DummyChatHandler(ChatHandlerBase):
         mapped_model: str | None,
     ) -> str | None:
         return mapped_model or str(request_body.get("model") or "")
+
+
+class _SetTemperatureTransformer:
+    NAME = "test_set_temperature"
+
+    def transform_request(self, internal: Any, ctx: Any) -> Any:
+        del ctx
+        internal.temperature = 0.7
+        return internal
+
+    def transform_response(self, internal: Any, ctx: Any) -> Any:
+        del ctx
+        return internal
+
+    def transform_stream_event(self, event: Any, ctx: Any) -> list[Any]:
+        del ctx
+        return [event]
+
+    def transform_error(self, internal: Any, ctx: Any) -> Any:
+        del ctx
+        return internal
+
+
+class _DiagnosticRequestTransformer:
+    NAME = "test_request_diagnostic"
+
+    def transform_request(self, internal: Any, ctx: Any) -> Any:
+        ctx.add_diagnostic(
+            code="request_adjusted",
+            message="request adjusted",
+            severity="warning",
+            transformer=self.NAME,
+        )
+        return internal
+
+    def transform_response(self, internal: Any, ctx: Any) -> Any:
+        del ctx
+        return internal
+
+    def transform_stream_event(self, event: Any, ctx: Any) -> list[Any]:
+        del ctx
+        return [event]
+
+    def transform_error(self, internal: Any, ctx: Any) -> Any:
+        del ctx
+        return internal
 
 
 def _patch_chat_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,3 +245,94 @@ async def test_chat_sync_request_func_does_not_mutate_original_request_body(
     assert handler._request_builder.request_body is not None
     assert handler._request_builder.request_body["messages"][0]["content"] == "prepared"
     assert handler._request_builder.request_body["messages"][-1]["content"] == "finalized"
+
+
+@pytest.mark.asyncio
+async def test_chat_prepare_provider_request_applies_endpoint_transformers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_chat_upstream(monkeypatch)
+    get_transformer_registry().register(_SetTemperatureTransformer)
+
+    handler = _DummyChatHandler()
+    provider = SimpleNamespace(name="provider", id="provider-1", provider_type="", proxy=None)
+    endpoint = SimpleNamespace(
+        id="endpoint-1",
+        api_format="openai:chat",
+        base_url="https://x",
+        transformers=[{"name": "test_set_temperature"}],
+    )
+    key = SimpleNamespace(id="key-1", proxy=None)
+    candidate = SimpleNamespace(
+        mapping_matched_model=None, needs_conversion=False, output_limit=None
+    )
+
+    prep = await handler._prepare_provider_request(
+        model="gpt-test",
+        provider=provider,
+        endpoint=endpoint,
+        key=key,
+        working_request_body={
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        original_headers={},
+        client_api_format="openai:chat",
+        provider_api_format="openai:chat",
+        candidate=candidate,
+        client_is_stream=False,
+    )
+
+    assert prep.request_body["temperature"] == 0.7
+    assert prep.transformer_specs == [
+        {"name": "tooluse", "enabled": True, "config": {}},
+        {"name": "enhancetool", "enabled": True, "config": {}},
+        {"name": "reasoning", "enabled": True, "config": {}},
+        {"name": "test_set_temperature", "enabled": True, "config": {}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_execute_stream_request_collects_request_transformer_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_chat_upstream(monkeypatch)
+    get_transformer_registry().register(_DiagnosticRequestTransformer)
+
+    handler = _DummyChatHandler()
+    ctx = StreamContext(model="gpt-test", api_format="openai:chat")
+    ctx.client_api_format = "openai:chat"
+
+    provider = SimpleNamespace(name="provider", id="provider-1", provider_type="", proxy=None)
+    endpoint = SimpleNamespace(
+        id="endpoint-1",
+        api_format="openai:chat",
+        base_url="https://x",
+        transformers=[{"name": "test_request_diagnostic"}],
+    )
+    key = SimpleNamespace(id="key-1", proxy=None)
+    candidate = SimpleNamespace(
+        mapping_matched_model=None, needs_conversion=False, output_limit=None
+    )
+
+    with pytest.raises(_StopBuild):
+        await handler._execute_stream_request(
+            ctx,
+            object(),
+            provider,
+            endpoint,
+            key,
+            {"model": "gpt-test", "messages": [{"role": "user", "content": "hello"}]},
+            {},
+            candidate=candidate,
+        )
+
+    assert ctx.transformer_diagnostics == [
+        {
+            "stage": "request",
+            "transformer": "test_request_diagnostic",
+            "code": "request_adjusted",
+            "message": "request adjusted",
+            "severity": "warning",
+        }
+    ]

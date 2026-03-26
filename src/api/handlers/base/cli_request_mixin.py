@@ -10,7 +10,17 @@ from typing import (
 
 from src.api.handlers.base.request_builder import get_provider_auth
 from src.api.handlers.base.utils import get_format_converter_registry
+from src.core.api_format.capabilities import get_provider_default_transformers
 from src.core.api_format.headers import set_accept_if_absent
+from src.core.api_format.transformers import (
+    TransformContext,
+    apply_request_transformers,
+    resolve_transformer_specs,
+)
+from src.core.api_format.transformers.diagnostics import (
+    copy_transformer_diagnostics,
+    log_transformer_diagnostics,
+)
 from src.core.logger import logger
 from src.services.provider.behavior import get_provider_behavior
 from src.services.provider.prompt_cache import maybe_patch_request_with_prompt_cache_key
@@ -39,6 +49,8 @@ class CliUpstreamRequestResult:
     upstream_is_stream: bool
     tls_profile: str | None = None
     selected_base_url: str | None = None
+    transformer_specs: list[dict[str, Any]] | None = None
+    transformer_diagnostics: list[dict[str, Any]] | None = None
 
 
 class CliRequestMixin:
@@ -230,6 +242,10 @@ class CliRequestMixin:
             client_is_stream=client_is_stream,
             policy=upstream_policy,
         )
+        transformer_specs = resolve_transformer_specs(
+            provider_defaults=get_provider_default_transformers(provider_type, provider_api_format),
+            endpoint_specs=getattr(endpoint, "transformers", None),
+        )
 
         envelope_tls_profile: str | None = None
         if envelope and hasattr(envelope, "prepare_context"):
@@ -242,7 +258,49 @@ class CliRequestMixin:
                 key=key,
             )
 
-        if needs_conversion and provider_api_format:
+        transform_context: TransformContext | None = None
+        if transformer_specs and provider_api_format:
+            target_variant = conversion_variant if needs_conversion else target_variant
+            transform_context = TransformContext(
+                stage="request",
+                client_format=client_api_format,
+                provider_format=provider_api_format,
+                provider_type=provider_type or None,
+                target_variant=target_variant,
+                model=mapped_model or fallback_model,
+                is_stream=upstream_is_stream,
+                endpoint_id=str(getattr(endpoint, "id", "") or "") or None,
+                request_id=self.request_id,
+            )
+            request_body = apply_request_transformers(
+                request_body=request_body,
+                source_format=client_api_format,
+                target_format=provider_api_format,
+                specs=transformer_specs,
+                context=transform_context,
+                target_variant=target_variant,
+                output_limit=output_limit,
+            )
+            log_transformer_diagnostics(
+                logger,
+                request_id=self.request_id,
+                diagnostics=transform_context.diagnostics,
+                phase="request",
+            )
+            if not needs_conversion:
+                request_body = self.prepare_provider_request_body(request_body)
+            url_model = (
+                self.get_model_for_url(request_body, mapped_model) or mapped_model or fallback_model
+            )
+            self._finalize_converted_request(
+                request_body,
+                str(client_api_format),
+                str(provider_api_format),
+                mapped_model,
+                fallback_model,
+                upstream_is_stream,
+            )
+        elif needs_conversion and provider_api_format:
             request_body, url_model = await self._convert_request_for_cross_format(
                 request_body,
                 client_api_format,
@@ -348,6 +406,10 @@ class CliRequestMixin:
             upstream_is_stream=upstream_is_stream,
             tls_profile=envelope_tls_profile,
             selected_base_url=selected_base_url,
+            transformer_specs=transformer_specs,
+            transformer_diagnostics=copy_transformer_diagnostics(
+                transform_context.diagnostics if transform_context else None
+            ),
         )
 
     @staticmethod

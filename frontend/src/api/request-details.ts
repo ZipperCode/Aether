@@ -12,6 +12,21 @@ export interface VideoBilling {
   status?: string
 }
 
+export interface TransformerDiagnostic {
+  stage: string
+  transformer: string
+  code: string
+  message: string
+  severity: string
+  details?: Record<string, unknown>
+}
+
+export interface TransformerDiagnosticSummary {
+  count: number
+  by_code: Record<string, number>
+  by_transformer: Record<string, number>
+}
+
 export interface RequestDetail {
   id: string
   request_id: string
@@ -81,6 +96,8 @@ export interface RequestDetail {
   has_response_body?: boolean
   has_client_response_body?: boolean
   metadata?: Record<string, unknown>
+  transformer_diagnostics?: TransformerDiagnostic[] | null
+  transformer_diagnostics_summary?: TransformerDiagnosticSummary | null
   tiered_pricing?: {
     total_input_context: number
     tier_index: number

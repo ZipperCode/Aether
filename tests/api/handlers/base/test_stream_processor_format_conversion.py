@@ -7,6 +7,7 @@ import pytest
 from src.api.handlers.base.response_parser import ParsedResponse, ResponseParser, StreamStats
 from src.api.handlers.base.stream_context import StreamContext
 from src.api.handlers.base.stream_processor import StreamProcessor
+from src.core.api_format.transformers.registry import get_transformer_registry
 from src.core.api_format.conversion import register_default_normalizers
 
 
@@ -98,3 +99,184 @@ async def test_create_response_stream_converts_claude_to_openai() -> None:
         for e in events
         if isinstance(e, dict)
     )
+
+
+class _AppendStreamContentTransformer:
+    NAME = "test_append_stream_content"
+
+    def transform_request(self, internal, ctx):
+        return internal
+
+    def transform_response(self, internal, ctx):
+        return internal
+
+    def transform_stream_event(self, event, ctx):
+        if hasattr(event, "text_delta"):
+            event.text_delta += "|stream"
+        return [event]
+
+    def transform_error(self, internal, ctx):
+        return internal
+
+
+class _DiagnosticStreamTransformer:
+    NAME = "test_stream_diagnostic"
+
+    def transform_request(self, internal, ctx):
+        return internal
+
+    def transform_response(self, internal, ctx):
+        return internal
+
+    def transform_stream_event(self, event, ctx):
+        ctx.add_diagnostic(
+            code="stream_adjusted",
+            message="stream adjusted",
+            severity="info",
+            transformer=self.NAME,
+        )
+        return [event]
+
+    def transform_error(self, internal, ctx):
+        return internal
+
+
+@pytest.mark.asyncio
+async def test_create_response_stream_applies_transformers_during_conversion() -> None:
+    register_default_normalizers()
+    get_transformer_registry().register(_AppendStreamContentTransformer)
+
+    ctx = StreamContext(model="test-model", api_format="openai:chat")
+    ctx.client_api_format = "openai:chat"
+    ctx.provider_api_format = "claude:chat"
+    ctx.needs_conversion = True
+    ctx.transformer_specs = [{"name": "test_append_stream_content"}]
+
+    processor = StreamProcessor(request_id="test-request", default_parser=DummyParser())
+
+    response_ctx = AsyncMock()
+    response_ctx.__aexit__ = AsyncMock(return_value=None)
+
+    message_start = {
+        "type": "message_start",
+        "message": {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+        },
+    }
+    content_delta = {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "Hi"},
+    }
+
+    prefetched_chunks = [
+        b"event: message_start\n",
+        f"data: {json.dumps(message_start)}\n".encode("utf-8"),
+        b"\n",
+        f"data: {json.dumps(content_delta)}\n".encode("utf-8"),
+        b"\n",
+    ]
+
+    out = b"".join(
+        [
+            chunk
+            async for chunk in processor.create_response_stream(
+                ctx,
+                byte_iterator=_empty_async_iter(),
+                response_ctx=response_ctx,
+                prefetched_chunks=prefetched_chunks,
+            )
+        ]
+    )
+
+    text = out.decode("utf-8")
+    events = []
+    for line in text.splitlines():
+        if line.startswith("data: "):
+            if line == "data: [DONE]":
+                continue
+            events.append(json.loads(line[6:]))
+
+    assert any(
+        e.get("choices", [{}])[0].get("delta", {}).get("content") == "Hi|stream"
+        for e in events
+        if isinstance(e, dict)
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_response_stream_collects_transformer_diagnostics_into_response_metadata() -> None:
+    register_default_normalizers()
+    get_transformer_registry().register(_DiagnosticStreamTransformer)
+
+    ctx = StreamContext(model="test-model", api_format="openai:chat")
+    ctx.client_api_format = "openai:chat"
+    ctx.provider_api_format = "claude:chat"
+    ctx.needs_conversion = True
+    ctx.transformer_specs = [{"name": "test_stream_diagnostic"}]
+
+    processor = StreamProcessor(request_id="test-request", default_parser=DummyParser())
+
+    response_ctx = AsyncMock()
+    response_ctx.__aexit__ = AsyncMock(return_value=None)
+
+    message_start = {
+        "type": "message_start",
+        "message": {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+        },
+    }
+    content_delta = {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "Hi"},
+    }
+
+    prefetched_chunks = [
+        b"event: message_start\n",
+        f"data: {json.dumps(message_start)}\n".encode("utf-8"),
+        b"\n",
+        f"data: {json.dumps(content_delta)}\n".encode("utf-8"),
+        b"\n",
+    ]
+
+    _ = b"".join(
+        [
+            chunk
+            async for chunk in processor.create_response_stream(
+                ctx,
+                byte_iterator=_empty_async_iter(),
+                response_ctx=response_ctx,
+                prefetched_chunks=prefetched_chunks,
+            )
+        ]
+    )
+
+    assert ctx.response_metadata["transformer_diagnostics"] == [
+        {
+            "stage": "stream",
+            "transformer": "test_stream_diagnostic",
+            "code": "stream_adjusted",
+            "message": "stream adjusted",
+            "severity": "info",
+        },
+        {
+            "stage": "stream",
+            "transformer": "test_stream_diagnostic",
+            "code": "stream_adjusted",
+            "message": "stream adjusted",
+            "severity": "info",
+        },
+    ]

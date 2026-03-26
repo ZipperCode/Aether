@@ -10,6 +10,7 @@ import src.api.handlers.base.cli_request_mixin as request_mixmod
 from src.api.handlers.base.cli_request_mixin import CliRequestMixin
 from src.api.handlers.base.cli_stream_mixin import CliStreamMixin
 from src.api.handlers.base.stream_context import StreamContext
+from src.core.api_format.transformers.registry import get_transformer_registry
 from src.services.task.request_state import MutableRequestBodyState
 
 
@@ -72,6 +73,27 @@ class _DummyCliStreamHandler(CliRequestMixin, CliStreamMixin):
         mapped_model: str | None,
     ) -> str | None:
         return mapped_model or str(request_body.get("model") or "")
+
+
+class _SetCliTemperatureTransformer:
+    NAME = "test_cli_set_temperature"
+
+    def transform_request(self, internal: Any, ctx: Any) -> Any:
+        del ctx
+        internal.temperature = 0.4
+        return internal
+
+    def transform_response(self, internal: Any, ctx: Any) -> Any:
+        del ctx
+        return internal
+
+    def transform_stream_event(self, event: Any, ctx: Any) -> list[Any]:
+        del ctx
+        return [event]
+
+    def transform_error(self, internal: Any, ctx: Any) -> Any:
+        del ctx
+        return internal
 
 
 @pytest.mark.asyncio
@@ -153,3 +175,81 @@ async def test_execute_stream_request_does_not_mutate_original_request_body(
     assert handler._request_builder.request_body is not None
     assert handler._request_builder.request_body["input"][0]["content"][0]["text"] == "prepared"
     assert handler._request_builder.request_body["input"][0]["content"][-1]["text"] == "finalized"
+
+
+@pytest.mark.asyncio
+async def test_build_upstream_request_applies_endpoint_transformers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_get_provider_auth(endpoint: Any, key: Any) -> _DummyAuthInfo:
+        return _DummyAuthInfo()
+
+    monkeypatch.setattr(request_mixmod, "get_provider_auth", _fake_get_provider_auth)
+    monkeypatch.setattr(
+        request_mixmod,
+        "get_provider_behavior",
+        lambda **kwargs: SimpleNamespace(
+            envelope=None,
+            same_format_variant=None,
+            cross_format_variant=None,
+        ),
+    )
+    monkeypatch.setattr(request_mixmod, "get_upstream_stream_policy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        request_mixmod,
+        "resolve_upstream_is_stream",
+        lambda *, client_is_stream, policy: client_is_stream,
+    )
+    monkeypatch.setattr(
+        request_mixmod,
+        "enforce_stream_mode_for_upstream",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        request_mixmod,
+        "maybe_patch_request_with_prompt_cache_key",
+        lambda request_body, **kwargs: request_body,
+    )
+    get_transformer_registry().register(_SetCliTemperatureTransformer)
+
+    handler = _DummyCliStreamHandler()
+    provider = SimpleNamespace(name="provider", id="provider-1", provider_type="", proxy=None)
+    endpoint = SimpleNamespace(
+        id="endpoint-1",
+        api_format="openai:cli",
+        base_url="https://x",
+        custom_path=None,
+        transformers=[{"name": "test_cli_set_temperature"}],
+    )
+    key = SimpleNamespace(id="key-1", proxy=None)
+
+    with pytest.raises(_StopBuild):
+        await handler._build_upstream_request(
+            provider=provider,
+            endpoint=endpoint,
+            key=key,
+            request_body={
+                "model": "gpt-test",
+                "input": [
+                    {"role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+                ],
+            },
+            rules_original_body={
+                "model": "gpt-test",
+                "input": [
+                    {"role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+                ],
+            },
+            original_headers={},
+            query_params=None,
+            client_api_format="openai:cli",
+            provider_api_format="openai:cli",
+            fallback_model="gpt-test",
+            mapped_model=None,
+            client_is_stream=False,
+            needs_conversion=False,
+            output_limit=None,
+        )
+
+    assert handler._request_builder.request_body is not None
+    assert handler._request_builder.request_body["temperature"] == 0.4

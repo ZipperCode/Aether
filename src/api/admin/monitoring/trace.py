@@ -16,9 +16,10 @@ from sqlalchemy.orm import Session
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
 from src.api.base.pipeline import get_pipeline
+from src.core.api_format.transformers.reporting import summarize_transformer_diagnostics
 from src.core.crypto import crypto_service
 from src.database import get_db
-from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
+from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint, Usage
 from src.services.request.candidate import RequestCandidateService
 
 router = APIRouter(prefix="/api/admin/monitoring/trace", tags=["Admin - Monitoring: Trace"])
@@ -69,6 +70,8 @@ class RequestTraceResponse(BaseModel):
     total_candidates: int
     final_status: str  # 'success', 'failed', 'cancelled', 'streaming', 'pending'
     total_latency_ms: int
+    transformer_diagnostics: list[dict[str, Any]] = []
+    transformer_diagnostics_summary: dict[str, Any] | None = None
     candidates: list[CandidateResponse]
 
 
@@ -400,11 +403,30 @@ class AdminGetRequestTraceAdapter(AdminApiAdapter):
                 )
             )
 
+        usage_row = (
+            db.query(Usage)
+            .filter(Usage.request_id == self.request_id)
+            .order_by(Usage.created_at.desc())
+            .first()
+        )
+        transformer_diagnostics: list[dict[str, Any]] = []
+        usage_metadata = getattr(usage_row, "request_metadata", None)
+        if isinstance(usage_metadata, dict):
+            raw_diagnostics = usage_metadata.get("transformer_diagnostics")
+            if isinstance(raw_diagnostics, list):
+                transformer_diagnostics = [
+                    item for item in raw_diagnostics if isinstance(item, dict)
+                ]
+
         response = RequestTraceResponse(
             request_id=self.request_id,
             total_candidates=len(candidates),
             final_status=final_status,
             total_latency_ms=total_latency,
+            transformer_diagnostics=transformer_diagnostics,
+            transformer_diagnostics_summary=summarize_transformer_diagnostics(
+                transformer_diagnostics
+            ),
             candidates=candidate_responses,
         )
         context.add_audit_metadata(

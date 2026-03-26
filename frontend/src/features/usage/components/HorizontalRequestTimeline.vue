@@ -42,6 +42,23 @@
             </div>
           </div>
 
+          <div
+            v-if="transformerDiagnosticCount > 0"
+            class="mb-4 flex items-center gap-2 flex-wrap text-xs text-muted-foreground"
+          >
+            <span class="font-medium text-foreground">转换诊断 {{ transformerDiagnosticCount }} 次</span>
+            <span
+              v-for="entry in transformerDiagnosticCodePreview"
+              :key="entry"
+              class="rounded border bg-muted/30 px-2 py-0.5 font-mono text-[11px]"
+            >
+              {{ entry }}
+            </span>
+            <span v-if="transformerDiagnosticTransformerPreview.length > 0">
+              转换器: {{ transformerDiagnosticTransformerPreview.join(' / ') }}
+            </span>
+          </div>
+
           <!-- 极简时间线轨道（按组显示） -->
           <div class="minimal-track">
             <div
@@ -423,6 +440,11 @@ import { requestTraceApi, type RequestTrace, type CandidateRecord } from '@/api/
 import { log } from '@/utils/logger'
 import { parseApiError } from '@/utils/errorParser'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
+import {
+  buildTransformerDiagnosticSummary,
+  buildTransformerDiagnosticPreview,
+  buildTransformerDiagnosticTransformerPreview,
+} from '../transformerDiagnostics'
 
 // 节点组类型
 interface NodeGroup {
@@ -540,6 +562,24 @@ const trace = computed(() => props.traceData ?? internalTrace.value)
 const selectedGroupIndex = ref(0)
 const selectedAttemptIndex = ref(0)
 const hoveredGroupIndex = ref<number | null>(null)
+
+const transformerDiagnosticsSummary = computed(() => {
+  return trace.value?.transformer_diagnostics_summary
+    ?? buildTransformerDiagnosticSummary(trace.value?.transformer_diagnostics)
+})
+
+const transformerDiagnosticCount = computed(() => {
+  if (transformerDiagnosticsSummary.value?.count) return transformerDiagnosticsSummary.value.count
+  return trace.value?.transformer_diagnostics?.length ?? 0
+})
+
+const transformerDiagnosticCodePreview = computed(() => {
+  return buildTransformerDiagnosticPreview(transformerDiagnosticsSummary.value, 2)
+})
+
+const transformerDiagnosticTransformerPreview = computed(() => {
+  return buildTransformerDiagnosticTransformerPreview(transformerDiagnosticsSummary.value, 2)
+})
 
 // 格式化延迟（自动调整单位）
 const formatLatency = (ms: number | undefined | null): string => {

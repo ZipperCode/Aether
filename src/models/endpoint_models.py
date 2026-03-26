@@ -43,6 +43,7 @@ _HEADER_RULE_ACTIONS: frozenset[str] = frozenset({"set", "drop", "rename"})
 # 路径语法支持通配符：tools[*].name（遍历所有元素）, tools[0-4].name（遍历范围）
 # 运行时处理在 request_builder.py 的 apply_body_rules 中；结构校验见 _validate_body_rules
 BodyRule = dict[str, Any]
+TransformerRule = dict[str, Any]
 
 # body_rules 允许的 action 集合
 _BODY_RULE_ACTIONS: frozenset[str] = frozenset(
@@ -315,6 +316,26 @@ def _validate_body_rules(rules: list[BodyRule]) -> list[BodyRule]:
     return rules
 
 
+def _validate_transformers(rules: list[TransformerRule]) -> list[TransformerRule]:
+    for idx, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise ValueError(f"transformers[{idx}]: 规则必须是 JSON 对象")
+
+        name = rule.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"transformers[{idx}]: 必须提供非空 name")
+
+        enabled = rule.get("enabled")
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ValueError(f"transformers[{idx}]: enabled 必须为布尔值")
+
+        config = rule.get("config")
+        if config is not None and not isinstance(config, dict):
+            raise ValueError(f"transformers[{idx}]: config 必须为 JSON 对象")
+
+    return rules
+
+
 # ========== ProviderEndpoint CRUD ==========
 
 
@@ -341,6 +362,11 @@ class ProviderEndpointCreate(BaseModel):
     body_rules: list[BodyRule] | None = Field(
         default=None,
         description="请求体规则列表，支持 set/drop/rename/append/insert/regex_replace 操作",
+    )
+
+    transformers: list[TransformerRule] | None = Field(
+        default=None,
+        description="协议兼容 transformer 列表，按顺序执行",
     )
 
     max_retries: int = Field(default=2, ge=0, le=999, description="最大重试次数")
@@ -397,6 +423,13 @@ class ProviderEndpointCreate(BaseModel):
             return v
         return _validate_header_rules(v)
 
+    @field_validator("transformers")
+    @classmethod
+    def validate_transformers(cls, v: list[TransformerRule] | None) -> list[TransformerRule] | None:
+        if v is None:
+            return v
+        return _validate_transformers(v)
+
 
 class ProviderEndpointUpdate(BaseModel):
     """更新 Endpoint 请求"""
@@ -416,6 +449,11 @@ class ProviderEndpointUpdate(BaseModel):
     body_rules: list[BodyRule] | None = Field(
         default=None,
         description="请求体规则列表，支持 set/drop/rename/append/insert/regex_replace 操作",
+    )
+
+    transformers: list[TransformerRule] | None = Field(
+        default=None,
+        description="协议兼容 transformer 列表，按顺序执行",
     )
 
     max_retries: int | None = Field(default=None, ge=0, le=999, description="最大重试次数")
@@ -456,6 +494,13 @@ class ProviderEndpointUpdate(BaseModel):
         if v is None:
             return v
         return _validate_header_rules(v)
+
+    @field_validator("transformers")
+    @classmethod
+    def validate_transformers(cls, v: list[TransformerRule] | None) -> list[TransformerRule] | None:
+        if v is None:
+            return v
+        return _validate_transformers(v)
 
 
 class ProviderEndpointResponse(BaseModel):

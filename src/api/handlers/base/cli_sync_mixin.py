@@ -22,6 +22,11 @@ from src.api.handlers.base.utils import (
     resolve_client_content_encoding,
 )
 from src.config.settings import config
+from src.core.api_format.transformers import TransformContext, apply_response_transformers
+from src.core.api_format.transformers.diagnostics import (
+    log_transformer_diagnostics,
+    merge_transformer_diagnostics,
+)
 from src.core.error_utils import extract_client_error_message
 from src.core.exceptions import (
     ProviderAuthException,
@@ -99,6 +104,8 @@ class CliSyncMixin:
         response_metadata_result: dict[str, Any] = {}  # Provider 响应元数据
         needs_conversion = False  # 是否需要格式转换（由 candidate 决定）
         sync_proxy_info: dict[str, Any] | None = None  # 代理信息
+        transformer_specs: list[dict[str, Any]] = []
+        transformer_diagnostics: list[dict[str, Any]] = []
 
         request_state = MutableRequestBodyState(original_request_body)
 
@@ -108,7 +115,7 @@ class CliSyncMixin:
             key: "ProviderAPIKey",
             candidate: ProviderCandidate,
         ) -> dict[str, Any]:
-            nonlocal provider_name, response_json, status_code, response_headers, provider_api_format, provider_request_headers, provider_request_body, mapped_model_result, response_metadata_result, needs_conversion, sync_proxy_info
+            nonlocal provider_name, response_json, status_code, response_headers, provider_api_format, provider_request_headers, provider_request_body, mapped_model_result, response_metadata_result, needs_conversion, sync_proxy_info, transformer_specs, transformer_diagnostics
             provider_name = str(provider.name)
             provider_api_format = str(endpoint.api_format) if endpoint.api_format else ""
 
@@ -156,6 +163,8 @@ class CliSyncMixin:
             upstream_is_stream = upstream_request.upstream_is_stream
             envelope_tls_profile = upstream_request.tls_profile
             selected_base_url_cached = upstream_request.selected_base_url
+            transformer_specs = list(upstream_request.transformer_specs or [])
+            transformer_diagnostics = list(upstream_request.transformer_diagnostics or [])
 
             # 解析有效代理（Key 级别优先于 Provider 级别）
             from src.services.proxy_node.resolver import (
@@ -415,6 +424,50 @@ class CliSyncMixin:
             # 跨格式：响应转换回 client_format（失败不触发 failover，保守回退为原始响应）
             provider_response_json: dict[str, Any] | None = None
             if (
+                transformer_specs
+                and provider_api_format
+                and api_format
+                and isinstance(response_json, dict)
+            ):
+                try:
+                    if needs_conversion:
+                        provider_response_json = response_json.copy()
+                    transform_context = TransformContext(
+                        stage="response",
+                        client_format=str(api_format),
+                        provider_format=provider_api_format,
+                        provider_type=str(getattr(provider, "provider_type", "") or "") or None,
+                        model=model,
+                        is_stream=False,
+                        endpoint_id=str(getattr(endpoint, "id", "") or "") or None,
+                        request_id=self.request_id,
+                    )
+                    response_json = apply_response_transformers(
+                        response_body=response_json,
+                        source_format=provider_api_format,
+                        target_format=str(api_format),
+                        specs=transformer_specs,
+                        context=transform_context,
+                    )
+                    if transform_context.diagnostics:
+                        transformer_diagnostics.extend(transform_context.diagnostics)
+                        response_metadata_result = merge_transformer_diagnostics(
+                            response_metadata_result,
+                            transform_context.diagnostics,
+                        )
+                        log_transformer_diagnostics(
+                            logger,
+                            request_id=self.request_id,
+                            diagnostics=transform_context.diagnostics,
+                            phase="response",
+                        )
+                    logger.debug(
+                        "非流式响应格式转换完成: {} -> {}", provider_api_format, api_format
+                    )
+                except Exception as conv_err:
+                    logger.warning("非流式响应格式转换失败，使用原始响应: {}", conv_err)
+                    provider_response_json = None
+            elif (
                 needs_conversion
                 and provider_api_format
                 and api_format
@@ -459,6 +512,10 @@ class CliSyncMixin:
             request_metadata = self._build_request_metadata() or {}
             if sync_proxy_info:
                 request_metadata["proxy"] = sync_proxy_info
+            request_metadata = merge_transformer_diagnostics(
+                request_metadata,
+                transformer_diagnostics,
+            )
             request_metadata = self._merge_scheduling_metadata(
                 request_metadata,
                 exec_result=exec_result,
@@ -511,6 +568,10 @@ class CliSyncMixin:
             request_metadata = self._build_request_metadata() or {}
             if sync_proxy_info:
                 request_metadata["proxy"] = sync_proxy_info
+            request_metadata = merge_transformer_diagnostics(
+                request_metadata,
+                transformer_diagnostics,
+            )
             request_metadata = self._merge_scheduling_metadata(
                 request_metadata,
                 selected_key_id=key_id,
@@ -555,6 +616,10 @@ class CliSyncMixin:
             request_metadata = self._build_request_metadata() or {}
             if sync_proxy_info:
                 request_metadata["proxy"] = sync_proxy_info
+            request_metadata = merge_transformer_diagnostics(
+                request_metadata,
+                transformer_diagnostics,
+            )
             request_metadata = self._merge_scheduling_metadata(
                 request_metadata,
                 selected_key_id=key_id,

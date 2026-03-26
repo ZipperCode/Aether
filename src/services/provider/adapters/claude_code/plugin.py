@@ -10,6 +10,14 @@ from src.services.provider.preset_models import create_preset_models_fetcher
 
 fetch_models_claude_code = create_preset_models_fetcher("claude_code")
 
+CLAUDE_CODE_DEFAULT_TRANSFORMERS: tuple[dict[str, Any], ...] = (
+    {"name": "tooluse"},
+    {"name": "enhancetool"},
+    {"name": "reasoning"},
+    {"name": "sampling"},
+    {"name": "maxtoken"},
+)
+
 
 def build_claude_code_url(
     endpoint: Any,
@@ -39,6 +47,7 @@ def build_claude_code_url(
 
 def register_all() -> None:
     """Register Claude Code hooks into shared registries."""
+    from src.core.api_format.capabilities import register_provider_default_transformers
     from src.services.model.upstream_fetcher import UpstreamModelsFetcherRegistry
     from src.services.provider.adapters.claude_code.envelope import claude_code_envelope
     from src.services.provider.envelope import register_envelope
@@ -48,6 +57,11 @@ def register_all() -> None:
     register_envelope("claude_code", "", claude_code_envelope)
 
     register_transport_hook("claude_code", "claude:cli", build_claude_code_url)
+    register_provider_default_transformers(
+        "claude_code",
+        "claude:cli",
+        CLAUDE_CODE_DEFAULT_TRANSFORMERS,
+    )
 
     UpstreamModelsFetcherRegistry.register(
         provider_types=["claude_code"],

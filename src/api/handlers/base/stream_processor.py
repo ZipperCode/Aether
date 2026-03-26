@@ -38,10 +38,16 @@ from src.api.handlers.base.utils import (
 from src.config.constants import StreamDefaults
 from src.config.settings import config
 from src.core.api_format.conversion.exceptions import FormatConversionError
+from src.core.api_format.conversion.stream_state import StreamState
 from src.core.exceptions import (
     EmbeddedErrorException,
     ProviderNotAvailableException,
     ProviderTimeoutException,
+)
+from src.core.api_format.transformers import TransformContext, apply_stream_transformers
+from src.core.api_format.transformers.diagnostics import (
+    log_transformer_diagnostics,
+    merge_transformer_diagnostics,
 )
 from src.core.logger import logger
 from src.core.usage_tokens import extract_cache_creation_tokens, extract_cache_read_tokens
@@ -741,10 +747,13 @@ class StreamProcessor:
 
                 # 初始化流式转换状态（Canonical）
                 if ctx.stream_conversion_state is None:
-                    from src.core.api_format.conversion.stream_state import StreamState
-
                     # 使用客户端请求的模型（ctx.model），而非映射后的上游模型（ctx.mapped_model）
                     ctx.stream_conversion_state = StreamState(
+                        model=ctx.model or "",
+                        message_id=ctx.response_id or ctx.request_id or "",
+                    )
+                if ctx.stream_target_state is None:
+                    ctx.stream_target_state = StreamState(
                         model=ctx.model or "",
                         message_id=ctx.response_id or ctx.request_id or "",
                     )
@@ -831,12 +840,45 @@ class StreamProcessor:
                         )
 
                     try:
-                        converted_events = registry.convert_stream_chunk(
-                            data_obj,
-                            provider_format,
-                            client_format,
-                            state=ctx.stream_conversion_state,
-                        )
+                        if ctx.transformer_specs:
+                            transform_context = TransformContext(
+                                stage="stream",
+                                client_format=client_format,
+                                provider_format=provider_format,
+                                provider_type=ctx.provider_type,
+                                model=ctx.model,
+                                is_stream=True,
+                                endpoint_id=ctx.endpoint_id,
+                                request_id=ctx.request_id,
+                            )
+                            converted_events = apply_stream_transformers(
+                                chunk=data_obj,
+                                source_format=provider_format,
+                                target_format=client_format,
+                                specs=ctx.transformer_specs,
+                                context=transform_context,
+                                source_state=ctx.stream_conversion_state,
+                                target_state=ctx.stream_target_state,
+                            )
+                            if transform_context.diagnostics:
+                                ctx.transformer_diagnostics.extend(transform_context.diagnostics)
+                                ctx.response_metadata = merge_transformer_diagnostics(
+                                    ctx.response_metadata,
+                                    transform_context.diagnostics,
+                                )
+                                log_transformer_diagnostics(
+                                    logger,
+                                    request_id=ctx.request_id,
+                                    diagnostics=transform_context.diagnostics,
+                                    phase="stream",
+                                )
+                        else:
+                            converted_events = registry.convert_stream_chunk(
+                                data_obj,
+                                provider_format,
+                                client_format,
+                                state=ctx.stream_conversion_state,
+                            )
                     except Exception as conv_err:
                         # 首字节后无法 failover：输出目标格式错误事件并终止流
                         # 使用 502 表示上游返回了非预期格式（Bad Gateway）

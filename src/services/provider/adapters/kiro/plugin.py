@@ -34,6 +34,14 @@ from src.services.provider.request_context import set_selected_base_url
 
 fetch_models_kiro = create_preset_models_fetcher("kiro")
 
+KIRO_DEFAULT_TRANSFORMERS: tuple[dict[str, Any], ...] = (
+    {"name": "tooluse"},
+    {"name": "enhancetool"},
+    {"name": "reasoning"},
+    {"name": "sampling"},
+    {"name": "maxtoken"},
+)
+
 
 # ---------------------------------------------------------------------------
 # Transport hook
@@ -110,7 +118,7 @@ def kiro_export_builder(
 
 def register_all() -> None:
     """Register all Kiro hooks into shared registries."""
-
+    from src.core.api_format.capabilities import register_provider_default_transformers
     from src.services.model.upstream_fetcher import UpstreamModelsFetcherRegistry
     from src.services.provider.adapters.kiro.envelope import kiro_envelope
     from src.services.provider.envelope import register_envelope
@@ -121,6 +129,7 @@ def register_all() -> None:
     register_envelope("kiro", "", kiro_envelope)
 
     register_transport_hook("kiro", "claude:cli", build_kiro_url)
+    register_provider_default_transformers("kiro", "claude:cli", KIRO_DEFAULT_TRANSFORMERS)
 
     register_export_builder("kiro", kiro_export_builder)
 

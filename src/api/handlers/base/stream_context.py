@@ -138,6 +138,7 @@ class StreamContext:
 
     # Provider 响应元数据（CLI handler 需要）
     response_metadata: dict[str, Any] = field(default_factory=dict)
+    transformer_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     # 整流标记（Thinking Rectifier）
     rectified: bool = False  # 请求是否经过整流（移除 thinking 块后重试）
@@ -166,7 +167,9 @@ class StreamContext:
     scheduling_audit: dict[str, Any] | None = None
 
     # 流式格式转换状态（跨 chunk 追踪）
+    transformer_specs: list[dict[str, Any]] = field(default_factory=list)
     stream_conversion_state: StreamState | None = None
+    stream_target_state: StreamState | None = None
     stream_conversion_event_count: int = 0  # 流式转换成功的 event 计数
 
     def reset_for_retry(self) -> None:
@@ -200,11 +203,14 @@ class StreamContext:
         self.response_id = None
         self.final_usage = None
         self.final_response = None
+        self.response_metadata = {}
+        self.transformer_diagnostics = []
         self.proxy_info = None
         self.pool_summary = None
         self.candidate_keys = []
         self.scheduling_audit = None
         self.stream_conversion_state = None
+        self.stream_target_state = None
         self.stream_conversion_event_count = 0
         self.needs_conversion = False
         self.selected_base_url = None
@@ -420,6 +426,11 @@ class StreamContext:
                 "data_count": self.data_count,
                 "has_completion": self.has_completion,
                 "response_time_ms": response_time_ms,
+                **(
+                    {"transformer_diagnostics": list(self.transformer_diagnostics)}
+                    if self.transformer_diagnostics
+                    else {}
+                ),
             },
         }
 
@@ -440,6 +451,11 @@ class StreamContext:
                 "data_count": self.data_count,
                 "has_completion": self.has_completion,
                 "response_time_ms": response_time_ms,
+                **(
+                    {"transformer_diagnostics": list(self.transformer_diagnostics)}
+                    if self.transformer_diagnostics
+                    else {}
+                ),
             },
         }
 

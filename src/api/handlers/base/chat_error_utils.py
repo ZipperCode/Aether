@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 from src.api.handlers.base.utils import get_format_converter_registry
+from src.core.api_format.transformers import TransformContext, apply_error_transformers
 from src.core.exceptions import ThinkingSignatureException, UpstreamClientException
 from src.core.logger import logger
 from src.models.database import ProviderAPIKey
@@ -81,6 +82,9 @@ def _convert_error_response_best_effort(
     error_response: dict[str, Any],
     source_format: str,
     target_format: str,
+    *,
+    transformer_specs: list[dict[str, Any]] | None = None,
+    transform_context: TransformContext | None = None,
 ) -> dict[str, Any]:
     """
     将上游错误响应 best-effort 转换为客户端格式。
@@ -89,6 +93,15 @@ def _convert_error_response_best_effort(
     避免泄露上游原始错误详情。
     """
     try:
+        if transformer_specs:
+            return apply_error_transformers(
+                error_body=error_response,
+                source_format=source_format,
+                target_format=target_format,
+                specs=transformer_specs,
+                context=transform_context
+                or TransformContext(stage="error", client_format=target_format),
+            )
         registry = get_format_converter_registry()
         return registry.convert_error_response(error_response, source_format, target_format)
     except Exception as e:
@@ -124,6 +137,8 @@ def _build_error_json_payload(
     client_format: str,
     provider_format: str,
     needs_conversion: bool = True,
+    transformer_specs: list[dict[str, Any]] | None = None,
+    transform_context: TransformContext | None = None,
 ) -> dict[str, Any]:
     """
     构建错误 JSON 响应 payload（公共逻辑）。
@@ -150,7 +165,13 @@ def _build_error_json_payload(
 
         if isinstance(parsed, dict):
             if needs_conversion:
-                return _convert_error_response_best_effort(parsed, provider_format, client_format)
+                return _convert_error_response_best_effort(
+                    parsed,
+                    provider_format,
+                    client_format,
+                    transformer_specs=transformer_specs,
+                    transform_context=transform_context,
+                )
             return parsed
 
     return _build_client_error_response_best_effort(message, client_format)

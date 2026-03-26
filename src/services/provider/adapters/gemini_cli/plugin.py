@@ -11,6 +11,14 @@ from src.services.provider.adapters.gemini_cli.constants import V1INTERNAL_PATH_
 from src.services.provider.preset_models import get_preset_models
 from src.services.provider.request_context import set_selected_base_url
 
+GEMINI_CLI_DEFAULT_TRANSFORMERS: tuple[dict[str, Any], ...] = (
+    {"name": "tooluse"},
+    {"name": "enhancetool"},
+    {"name": "reasoning"},
+    {"name": "sampling"},
+    {"name": "maxtoken"},
+)
+
 
 async def fetch_models_gemini_cli(
     ctx: Any,
@@ -129,6 +137,7 @@ async def enrich_gemini_cli(
 
 def register_all() -> None:
     """Register all GeminiCLI hooks into shared registries."""
+    from src.core.api_format.capabilities import register_provider_default_transformers
     from src.core.provider_oauth_utils import register_auth_enricher
     from src.services.model.upstream_fetcher import UpstreamModelsFetcherRegistry
     from src.services.provider.adapters.gemini_cli.envelope import gemini_cli_v1internal_envelope
@@ -141,6 +150,16 @@ def register_all() -> None:
 
     register_transport_hook("gemini_cli", "gemini:cli", build_gemini_cli_url)
     register_transport_hook("gemini_cli", "gemini:chat", build_gemini_cli_url)
+    register_provider_default_transformers(
+        "gemini_cli",
+        "gemini:cli",
+        GEMINI_CLI_DEFAULT_TRANSFORMERS,
+    )
+    register_provider_default_transformers(
+        "gemini_cli",
+        "gemini:chat",
+        GEMINI_CLI_DEFAULT_TRANSFORMERS,
+    )
 
     register_auth_enricher("gemini_cli", enrich_gemini_cli)
 

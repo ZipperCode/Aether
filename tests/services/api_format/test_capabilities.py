@@ -15,7 +15,9 @@ from src.core.api_format.capabilities import (
     compute_total_input_context_for_api_format,
     fetch_models_for_api_format,
     get_provider_default_body_rules,
+    get_provider_default_transformers,
     register_provider_default_body_rules,
+    register_provider_default_transformers,
     register_provider_format_behavior,
     resolve_billing_template_for_api_format,
 )
@@ -49,6 +51,80 @@ def test_provider_default_body_rules_use_unified_registry() -> None:
     assert (
         get_default_body_rules_for_endpoint("openai:cli", provider_type=provider_type) == expected
     )
+
+
+def test_provider_default_transformers_use_unified_registry() -> None:
+    provider_type = "unit_test_provider_transformers"
+    expected = [
+        {"name": "tooluse"},
+        {"name": "reasoning", "config": {"mode": "safe"}},
+    ]
+
+    register_provider_default_transformers(provider_type, "openai:cli", expected)
+
+    assert get_provider_default_transformers(provider_type, "openai:cli") == expected
+
+
+def test_builtin_default_transformers_fall_back_by_endpoint_signature() -> None:
+    assert get_provider_default_transformers("unknown-provider", "claude:chat") == [
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+        {"name": "sampling"},
+        {"name": "maxtoken"},
+    ]
+
+    assert get_provider_default_transformers("unknown-provider", "openai:chat") == [
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+    ]
+
+
+def test_provider_plugins_can_register_provider_specific_transformer_presets() -> None:
+    from src.services.provider.adapters.claude_code.plugin import register_all as register_claude_code
+    from src.services.provider.adapters.codex.plugin import register_all as register_codex
+    from src.services.provider.adapters.gemini_cli.plugin import register_all as register_gemini_cli
+    from src.services.provider.adapters.kiro.plugin import register_all as register_kiro
+
+    register_codex()
+    register_claude_code()
+    register_kiro()
+    register_gemini_cli()
+
+    assert get_provider_default_transformers("codex", "openai:cli") == [
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+        {"name": "maxtoken"},
+    ]
+    assert get_provider_default_transformers("codex", "openai:compact") == [
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+        {"name": "maxtoken"},
+    ]
+    assert get_provider_default_transformers("claude_code", "claude:cli") == [
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+        {"name": "sampling"},
+        {"name": "maxtoken"},
+    ]
+    assert get_provider_default_transformers("kiro", "claude:cli") == [
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+        {"name": "sampling"},
+        {"name": "maxtoken"},
+    ]
+    assert get_provider_default_transformers("gemini_cli", "gemini:cli") == [
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+        {"name": "sampling"},
+        {"name": "maxtoken"},
+    ]
 
 
 def test_provider_behavior_variants_use_unified_registry() -> None:

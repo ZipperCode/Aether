@@ -64,6 +64,16 @@ from src.config.settings import config
 from src.core.api_format.conversion.stream_bridge import (
     iter_internal_response_as_stream_events,
 )
+from src.core.api_format.transformers import (
+    TransformContext,
+    apply_request_transformers,
+    resolve_transformer_specs,
+)
+from src.core.api_format.transformers.diagnostics import (
+    copy_transformer_diagnostics,
+    log_transformer_diagnostics,
+)
+from src.core.api_format.capabilities import get_provider_default_transformers
 from src.core.exceptions import (
     EmbeddedErrorException,
     ProviderNotAvailableException,
@@ -112,6 +122,8 @@ class ProviderRequestResult:
     client_api_format: str = ""
     auth_info: Any = None
     tls_profile: str | None = None
+    transformer_specs: list[dict[str, Any]] = field(default_factory=list)
+    transformer_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ChatHandlerBase(BaseMessageHandler, ABC):
@@ -746,6 +758,10 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             client_is_stream=client_is_stream,
             policy=upstream_policy,
         )
+        transformer_specs = resolve_transformer_specs(
+            provider_defaults=get_provider_default_transformers(provider_type, provider_api_format),
+            endpoint_specs=getattr(endpoint, "transformers", None),
+        )
 
         # Envelope lifecycle: prepare_context (pre-wrap hook).
         envelope_tls_profile: str | None = None
@@ -761,7 +777,49 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
 
         # 跨格式：先做请求体转换（失败触发 failover）
         registry = get_format_converter_registry()
-        if needs_conversion:
+        if transformer_specs:
+            target_variant = cross_format_variant if needs_conversion else same_format_variant
+            transform_context = TransformContext(
+                stage="request",
+                client_format=str(client_api_format),
+                provider_format=str(provider_api_format),
+                provider_type=provider_type or None,
+                target_variant=target_variant,
+                model=mapped_model or model,
+                is_stream=upstream_is_stream,
+                endpoint_id=str(getattr(endpoint, "id", "") or "") or None,
+                request_id=self.request_id,
+            )
+            request_body = apply_request_transformers(
+                request_body=request_body,
+                source_format=str(client_api_format),
+                target_format=str(provider_api_format),
+                specs=transformer_specs,
+                context=transform_context,
+                target_variant=target_variant,
+                output_limit=candidate.output_limit if candidate else None,
+            )
+            log_transformer_diagnostics(
+                logger,
+                request_id=self.request_id,
+                diagnostics=transform_context.diagnostics,
+                phase="request",
+            )
+            self._set_model_after_conversion(
+                request_body,
+                str(provider_api_format),
+                mapped_model,
+                model,
+            )
+            self._set_stream_after_conversion(
+                request_body,
+                str(client_api_format),
+                str(provider_api_format),
+                is_stream=upstream_is_stream,
+            )
+            if not needs_conversion:
+                request_body = self.prepare_provider_request_body(request_body)
+        elif needs_conversion:
             request_body = await registry.convert_request_async(
                 request_body,
                 str(client_api_format),
@@ -861,6 +919,10 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             client_api_format=client_api_format,
             auth_info=auth_info,
             tls_profile=envelope_tls_profile,
+            transformer_specs=transformer_specs,
+            transformer_diagnostics=copy_transformer_diagnostics(
+                transform_context.diagnostics if transformer_specs else None
+            ),
         )
 
     async def _execute_stream_request(
@@ -915,6 +977,8 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         needs_conversion = prep.needs_conversion
         ctx.provider_api_format = provider_api_format
         ctx.needs_conversion = needs_conversion
+        ctx.transformer_specs = list(prep.transformer_specs or [])
+        ctx.transformer_diagnostics = list(prep.transformer_diagnostics or [])
         mapped_model = prep.mapped_model
         if mapped_model:
             ctx.mapped_model = mapped_model

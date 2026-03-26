@@ -64,6 +64,7 @@ class ProviderFormatCapability:
     same_format_variant: str | None = None
     cross_format_variant: str | None = None
     default_body_rules: tuple[dict[str, Any], ...] | None = None
+    default_transformers: tuple[dict[str, Any], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +76,52 @@ class ProviderFormatBehavior:
 
 _registry: dict[str, ApiFormatCapability] = {}
 _provider_registry: dict[tuple[str, str], ProviderFormatCapability] = {}
+
+_BUILTIN_DEFAULT_TRANSFORMERS_BY_ENDPOINT: dict[str, tuple[dict[str, Any], ...]] = {
+    "claude:chat": (
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+        {"name": "sampling"},
+        {"name": "maxtoken"},
+    ),
+    "claude:cli": (
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+        {"name": "sampling"},
+        {"name": "maxtoken"},
+    ),
+    "gemini:chat": (
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+        {"name": "sampling"},
+        {"name": "maxtoken"},
+    ),
+    "gemini:cli": (
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+        {"name": "sampling"},
+        {"name": "maxtoken"},
+    ),
+    "openai:chat": (
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+    ),
+    "openai:cli": (
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+    ),
+    "openai:compact": (
+        {"name": "tooluse"},
+        {"name": "enhancetool"},
+        {"name": "reasoning"},
+    ),
+}
 
 
 def _normalize_api_format(api_format: str | None) -> str:
@@ -126,6 +173,7 @@ def register_provider_format_capability(
     same_format_variant: str | None = None,
     cross_format_variant: str | None = None,
     default_body_rules: Sequence[dict[str, Any]] | None = None,
+    default_transformers: Sequence[dict[str, Any]] | None = None,
 ) -> None:
     """注册 provider + endpoint 维度的格式能力。"""
     pt = normalize_provider_type(provider_type)
@@ -150,6 +198,11 @@ def register_provider_format_capability(
             tuple(deepcopy(list(default_body_rules)))
             if default_body_rules is not None
             else (current.default_body_rules if current else None)
+        ),
+        default_transformers=(
+            tuple(deepcopy(list(default_transformers)))
+            if default_transformers is not None
+            else (current.default_transformers if current else None)
         ),
     )
 
@@ -258,6 +311,34 @@ def get_provider_default_body_rules_for_endpoint(
     endpoint_sig: str | EndpointSignature | tuple[ApiFamily, EndpointKind] | tuple[Any, Any] = "",
 ) -> list[dict[str, Any]] | None:
     return get_provider_default_body_rules(provider_type, endpoint_sig)
+
+
+def register_provider_default_transformers(
+    provider_type: str,
+    endpoint_sig: str | EndpointSignature | tuple[ApiFamily, EndpointKind] | tuple[Any, Any],
+    rules: Sequence[dict[str, Any]],
+) -> None:
+    register_provider_format_capability(
+        provider_type,
+        endpoint_sig,
+        default_transformers=rules,
+    )
+
+
+def get_provider_default_transformers(
+    provider_type: str | None,
+    endpoint_sig: str | EndpointSignature | tuple[ApiFamily, EndpointKind] | tuple[Any, Any],
+) -> list[dict[str, Any]] | None:
+    capability = get_provider_format_capability(provider_type, endpoint_sig)
+    if capability is not None and capability.default_transformers is not None:
+        return deepcopy(list(capability.default_transformers))
+
+    builtin_defaults = _BUILTIN_DEFAULT_TRANSFORMERS_BY_ENDPOINT.get(
+        _normalize_endpoint_sig(endpoint_sig)
+    )
+    if builtin_defaults is None:
+        return None
+    return deepcopy(list(builtin_defaults))
 
 
 def resolve_billing_template_for_api_format(api_format: str | None) -> str | None:

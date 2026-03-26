@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, defer
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
 from src.api.base.pipeline import get_pipeline
+from src.core.api_format.transformers.reporting import summarize_transformer_diagnostics
 from src.core.logger import logger
 from src.database import get_db
 from src.models.database import (
@@ -274,6 +275,17 @@ class AdminUsageDetailAdapter(AdminApiAdapter):
         client_response_body = (
             usage_record.get_client_response_body() if self.include_bodies else None
         )
+        metadata = usage_record.request_metadata
+        transformer_diagnostics = None
+        if isinstance(metadata, dict):
+            raw_diagnostics = metadata.get("transformer_diagnostics")
+            if isinstance(raw_diagnostics, list):
+                transformer_diagnostics = [
+                    item for item in raw_diagnostics if isinstance(item, dict)
+                ]
+        transformer_diagnostics_summary = summarize_transformer_diagnostics(
+            transformer_diagnostics
+        )
 
         return {
             "id": usage_record.id,
@@ -371,7 +383,9 @@ class AdminUsageDetailAdapter(AdminApiAdapter):
             "client_response_headers": usage_record.client_response_headers,
             "response_body": response_body,
             "client_response_body": client_response_body,
-            "metadata": usage_record.request_metadata,
+            "metadata": metadata,
+            "transformer_diagnostics": transformer_diagnostics,
+            "transformer_diagnostics_summary": transformer_diagnostics_summary,
             "tiered_pricing": tiered_pricing_info,
             "video_billing": video_billing_info,
         }

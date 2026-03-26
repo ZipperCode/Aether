@@ -1,5 +1,20 @@
 import apiClient from './client'
 
+export interface TransformerDiagnostic {
+  stage: string
+  transformer: string
+  code: string
+  message: string
+  severity: string
+  details?: Record<string, unknown>
+}
+
+export interface TransformerDiagnosticSummary {
+  count: number
+  by_code: Record<string, number>
+  by_transformer: Record<string, number>
+}
+
 export interface CandidateRecord {
   id: string
   request_id: string
@@ -37,6 +52,8 @@ export interface RequestTrace {
   total_candidates: number
   final_status: 'success' | 'failed' | 'streaming' | 'pending' | 'cancelled'
   total_latency_ms: number
+  transformer_diagnostics: TransformerDiagnostic[]
+  transformer_diagnostics_summary?: TransformerDiagnosticSummary | null
   candidates: CandidateRecord[]
 }
 

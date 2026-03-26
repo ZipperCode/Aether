@@ -276,6 +276,9 @@ class CliStreamMixin:
         ctx.response_id = None
         ctx.response_metadata = {}  # 重置 Provider 响应元数据
         ctx.selected_base_url = None  # 重置本次请求选用的 base_url（重试时避免污染）
+        ctx.stream_conversion_state = None
+        ctx.stream_target_state = None
+        ctx.stream_conversion_event_count = 0
 
         # 记录 Provider 信息
         ctx.provider_name = str(provider.name)
@@ -335,6 +338,7 @@ class CliStreamMixin:
         envelope = upstream_request.envelope
         upstream_is_stream = upstream_request.upstream_is_stream
         envelope_tls_profile = upstream_request.tls_profile
+        ctx.transformer_specs = list(upstream_request.transformer_specs or [])
 
         # 保存发送给 Provider 的请求信息（用于调试和统计）
         ctx.provider_request_headers = provider_headers

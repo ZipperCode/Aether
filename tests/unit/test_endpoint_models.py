@@ -40,18 +40,25 @@ def test_provider_endpoint_models_accept_nested_conditions_and_source() -> None:
                 },
             }
         ],
+        "transformers": [
+            {"name": "tooluse"},
+            {"name": "reasoning", "config": {"mode": "safe"}},
+        ],
     }
 
     created = ProviderEndpointCreate(**payload)
     updated = ProviderEndpointUpdate(
         header_rules=payload["header_rules"],
         body_rules=payload["body_rules"],
+        transformers=payload["transformers"],
     )
 
     assert created.header_rules == payload["header_rules"]
     assert created.body_rules == payload["body_rules"]
+    assert created.transformers == payload["transformers"]
     assert updated.header_rules == payload["header_rules"]
     assert updated.body_rules == payload["body_rules"]
+    assert updated.transformers == payload["transformers"]
 
 
 @pytest.mark.parametrize(
@@ -91,4 +98,14 @@ def test_provider_endpoint_models_reject_invalid_condition_shapes(
             api_format="openai:chat",
             base_url="https://api.example.com",
             **{field_name: rules},
+        )
+
+
+def test_provider_endpoint_models_reject_transformers_without_name() -> None:
+    with pytest.raises(ValidationError):
+        ProviderEndpointCreate(
+            provider_id="provider-1",
+            api_format="openai:chat",
+            base_url="https://api.example.com",
+            transformers=[{"config": {"mode": "safe"}}],
         )

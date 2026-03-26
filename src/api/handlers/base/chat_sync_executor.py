@@ -35,6 +35,11 @@ from src.api.handlers.base.utils import (
     resolve_client_accept_encoding,
     resolve_client_content_encoding,
 )
+from src.core.api_format.transformers import TransformContext, apply_response_transformers
+from src.core.api_format.transformers.diagnostics import (
+    log_transformer_diagnostics,
+    merge_transformer_diagnostics,
+)
 from src.core.error_utils import extract_client_error_message
 from src.core.exceptions import (
     EmbeddedErrorException,
@@ -75,7 +80,10 @@ class SyncRequestContext:
     mapped_model_result: str | None = None
     sync_proxy_info: dict[str, Any] | None = None
     provider_response_json: dict[str, Any] | None = None  # 格式转换前的提供商原始响应
+    response_metadata: dict[str, Any] = field(default_factory=dict)
     pool_summary: dict[str, Any] | None = None
+    transformer_specs: list[dict[str, Any]] = field(default_factory=list)
+    transformer_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ChatSyncExecutor:
@@ -218,6 +226,10 @@ class ChatSyncExecutor:
             request_metadata = handler._build_request_metadata() or {}
             if ctx.sync_proxy_info:
                 request_metadata["proxy"] = ctx.sync_proxy_info
+            request_metadata = merge_transformer_diagnostics(
+                request_metadata,
+                ctx.transformer_diagnostics,
+            )
             request_metadata = handler._merge_scheduling_metadata(
                 request_metadata,
                 exec_result=exec_result,
@@ -256,6 +268,7 @@ class ChatSyncExecutor:
                 provider_api_key_id=ctx.key_id,
                 # 模型映射信息
                 target_model=ctx.mapped_model_result,
+                response_metadata=ctx.response_metadata if ctx.response_metadata else None,
                 request_metadata=request_metadata,
             )
 
@@ -306,6 +319,7 @@ class ChatSyncExecutor:
                 client_format,
                 provider_format,
                 needs_conversion=ctx.needs_conversion_for_error,
+                transformer_specs=ctx.transformer_specs,
             )
             return build_json_response_for_client(
                 status_code=_get_error_status_code(e),
@@ -319,6 +333,10 @@ class ChatSyncExecutor:
             request_metadata = handler._build_request_metadata() or {}
             if ctx.sync_proxy_info:
                 request_metadata["proxy"] = ctx.sync_proxy_info
+            request_metadata = merge_transformer_diagnostics(
+                request_metadata,
+                ctx.transformer_diagnostics,
+            )
             request_metadata = handler._merge_scheduling_metadata(
                 request_metadata,
                 selected_key_id=ctx.key_id,
@@ -327,11 +345,34 @@ class ChatSyncExecutor:
             )
             client_format = (ctx.client_api_format_for_error or "").upper()
             provider_format = (ctx.provider_api_format_for_error or client_format).upper()
+            transform_context = TransformContext(
+                stage="error",
+                client_format=client_format,
+                provider_format=provider_format,
+                model=model,
+                is_stream=False,
+                endpoint_id=ctx.endpoint_id,
+                request_id=handler.request_id,
+            )
             payload = _build_error_json_payload(
                 e,
                 client_format,
                 provider_format,
                 needs_conversion=ctx.needs_conversion_for_error,
+                transformer_specs=ctx.transformer_specs,
+                transform_context=transform_context,
+            )
+            if transform_context.diagnostics:
+                ctx.transformer_diagnostics.extend(transform_context.diagnostics)
+                log_transformer_diagnostics(
+                    logger,
+                    request_id=handler.request_id,
+                    diagnostics=transform_context.diagnostics,
+                    phase="error",
+                )
+            request_metadata = merge_transformer_diagnostics(
+                request_metadata,
+                ctx.transformer_diagnostics,
             )
             error_response = build_json_response_for_client(
                 status_code=_get_error_status_code(e),
@@ -389,6 +430,10 @@ class ChatSyncExecutor:
             request_metadata = handler._build_request_metadata() or {}
             if ctx.sync_proxy_info:
                 request_metadata["proxy"] = ctx.sync_proxy_info
+            request_metadata = merge_transformer_diagnostics(
+                request_metadata,
+                ctx.transformer_diagnostics,
+            )
             request_metadata = handler._merge_scheduling_metadata(
                 request_metadata,
                 selected_key_id=ctx.key_id,
@@ -480,6 +525,8 @@ class ChatSyncExecutor:
         upstream_is_stream = prep.upstream_is_stream
         auth_info = prep.auth_info
         tls_profile = prep.tls_profile
+        ctx.transformer_specs = prep.transformer_specs
+        ctx.transformer_diagnostics = list(prep.transformer_diagnostics or [])
 
         # 构建请求（上游始终使用 header 认证，不跟随客户端的 query 方式）
         provider_payload, provider_hdrs = handler._request_builder.build(
@@ -738,8 +785,41 @@ class ChatSyncExecutor:
                     error_status=parsed.error_type,
                 )
 
-        # 跨格式：响应转换回 client_format（失败触发 failover）
-        if needs_conversion and isinstance(ctx.response_json, dict):
+        # 响应 transformer / 跨格式响应转换
+        if isinstance(ctx.response_json, dict) and ctx.transformer_specs:
+            if needs_conversion:
+                ctx.provider_response_json = ctx.response_json.copy()
+            if ctx.transformer_specs:
+                transform_context = TransformContext(
+                    stage="response",
+                    client_format=client_api_format,
+                    provider_format=provider_api_format,
+                    provider_type=str(getattr(provider, "provider_type", "") or "") or None,
+                    model=model,
+                    is_stream=False,
+                    endpoint_id=str(getattr(endpoint, "id", "") or "") or None,
+                    request_id=handler.request_id,
+                )
+                ctx.response_json = apply_response_transformers(
+                    response_body=ctx.response_json,
+                    source_format=provider_api_format,
+                    target_format=client_api_format,
+                    specs=ctx.transformer_specs,
+                    context=transform_context,
+                )
+                if transform_context.diagnostics:
+                    ctx.transformer_diagnostics.extend(transform_context.diagnostics)
+                    ctx.response_metadata = merge_transformer_diagnostics(
+                        ctx.response_metadata,
+                        transform_context.diagnostics,
+                    )
+                    log_transformer_diagnostics(
+                        logger,
+                        request_id=handler.request_id,
+                        diagnostics=transform_context.diagnostics,
+                        phase="response",
+                    )
+        elif needs_conversion and isinstance(ctx.response_json, dict):
             ctx.provider_response_json = ctx.response_json.copy()
             registry = get_format_converter_registry()
             ctx.response_json = registry.convert_response(
