@@ -25,17 +25,19 @@ export interface QuotaWindowUsageSnapshot {
   total_cost_usd?: number | string | null
 }
 
+export type DecimalJsonValue = number | string | null
+
 export interface QuotaWindowSnapshot {
   code: string
   label?: string | null
   scope?: 'account' | 'workspace' | 'model' | string
   unit?: 'percent' | 'count' | 'usd' | 'tokens' | string
   model?: string | null
-  used_ratio?: number | null
-  remaining_ratio?: number | null
-  used_value?: number | null
-  remaining_value?: number | null
-  limit_value?: number | null
+  used_ratio?: DecimalJsonValue
+  remaining_ratio?: DecimalJsonValue
+  used_value?: DecimalJsonValue
+  remaining_value?: DecimalJsonValue
+  limit_value?: DecimalJsonValue
   reset_at?: number | null
   reset_seconds?: number | null
   window_minutes?: number | null
@@ -92,6 +94,22 @@ export interface QuotaStatusSnapshot {
   reset_credits?: QuotaResetCreditsSnapshot | null
   allowed_models_count?: number | null
   rate_limit?: Record<string, unknown> | null
+  /** Nous account and billing summary. Decimal values may arrive as strings. */
+  balance_usd?: number | string | null
+  purchased_credits_remaining?: number | string | null
+  total_usable_credits?: number | string | null
+  current_period_end?: number | null
+  billing_available?: boolean | null
+  billing_stale?: boolean | null
+  billing_source?: string | null
+  billing_error?: string | null
+  rate_limits?: {
+    rpm?: number | null
+    tpm?: number | null
+    rph?: number | null
+    tph?: number | null
+    kind?: 'configured_limits' | string | null
+  } | null
   windows?: QuotaWindowSnapshot[] | null
 }
 

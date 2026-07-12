@@ -112,6 +112,9 @@ use aether_data_contracts::repository::global_models::{
     StoredProviderModelStats, StoredPublicCatalogModel, StoredPublicGlobalModel,
     StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
 };
+use aether_data_contracts::repository::model_catalog::{
+    ModelCatalogReadRepository, StoredModelCatalogEntry,
+};
 use aether_data_contracts::repository::pool_scores::{
     GetPoolMemberScoresByIdsQuery, ListPoolMemberProbeCandidatesQuery, ListPoolMemberScoresQuery,
     ListRankedPoolMembersQuery, PoolMemberHardState, PoolMemberIdentity, PoolMemberProbeAttempt,
@@ -173,6 +176,7 @@ pub(crate) struct GatewayDataState {
     gemini_file_mapping_reader: Option<Arc<dyn GeminiFileMappingReadRepository>>,
     gemini_file_mapping_writer: Option<Arc<dyn GeminiFileMappingWriteRepository>>,
     global_model_reader: Option<Arc<dyn GlobalModelReadRepository>>,
+    model_catalog_reader: Option<Arc<dyn ModelCatalogReadRepository>>,
     global_model_writer: Option<Arc<dyn GlobalModelWriteRepository>>,
     minimal_candidate_selection_reader: Option<Arc<dyn MinimalCandidateSelectionReadRepository>>,
     request_candidate_reader: Option<Arc<dyn RequestCandidateReadRepository>>,
@@ -284,6 +288,10 @@ impl fmt::Debug for GatewayDataState {
             .field(
                 "has_global_model_reader",
                 &self.global_model_reader.is_some(),
+            )
+            .field(
+                "has_model_catalog_reader",
+                &self.model_catalog_reader.is_some(),
             )
             .field(
                 "has_global_model_writer",

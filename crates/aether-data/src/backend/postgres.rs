@@ -36,6 +36,9 @@ use crate::repository::global_models::{
 use crate::repository::management_tokens::{
     ManagementTokenReadRepository, ManagementTokenWriteRepository, SqlxManagementTokenRepository,
 };
+use crate::repository::model_catalog::{
+    ModelCatalogReadRepository, PostgresModelCatalogReadRepository,
+};
 use crate::repository::oauth_providers::{
     OAuthProviderReadRepository, OAuthProviderWriteRepository, SqlxOAuthProviderRepository,
 };
@@ -163,6 +166,10 @@ impl PostgresBackend {
 
     pub fn global_model_read_repository(&self) -> Arc<dyn GlobalModelReadRepository> {
         Arc::new(SqlxGlobalModelReadRepository::new(self.pool_clone()))
+    }
+
+    pub fn model_catalog_read_repository(&self) -> Arc<dyn ModelCatalogReadRepository> {
+        Arc::new(PostgresModelCatalogReadRepository::new(self.pool_clone()))
     }
 
     pub fn global_model_write_repository(&self) -> Arc<dyn GlobalModelWriteRepository> {

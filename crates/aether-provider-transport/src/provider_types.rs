@@ -646,6 +646,17 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             redirect_uri: "show-auth-token",
             use_pkce: false,
         }),
+        "nous" => Some(ProviderOAuthTemplate {
+            provider_type: "nous",
+            display_name: "Nous",
+            authorize_url: "https://portal.nousresearch.com/api/oauth/device/code",
+            token_url: "https://portal.nousresearch.com/api/oauth/token",
+            client_id: "hermes-cli",
+            client_secret: "",
+            scopes: &["inference:invoke"],
+            redirect_uri: "",
+            use_pkce: false,
+        }),
         _ => None,
     }
 }
@@ -657,6 +668,7 @@ pub const ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES: &[&str] = &[
     "gemini_cli",
     "antigravity",
     "windsurf",
+    "nous",
 ];
 
 #[cfg(test)]
@@ -858,6 +870,21 @@ mod tests {
         );
         assert_eq!(template.redirect_uri, "show-auth-token");
         assert!(ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"windsurf"));
+    }
+
+    #[test]
+    fn nous_admin_oauth_template_is_advertised() {
+        let template = provider_type_admin_oauth_template("nous").expect("nous oauth template");
+
+        assert_eq!(template.provider_type, "nous");
+        assert_eq!(template.display_name, "Nous");
+        assert_eq!(
+            template.token_url,
+            "https://portal.nousresearch.com/api/oauth/token"
+        );
+        assert_eq!(template.client_id, "hermes-cli");
+        assert_eq!(template.scopes, &["inference:invoke"]);
+        assert!(ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"nous"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod billing;
 pub mod candidate_selection;
 pub mod candidates;
 pub mod global_models;
+pub mod model_catalog;
 pub mod pool_scores;
 pub mod provider_catalog;
 pub mod quota;

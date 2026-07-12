@@ -34,6 +34,9 @@ use crate::repository::global_models::{
 use crate::repository::management_tokens::{
     ManagementTokenReadRepository, ManagementTokenWriteRepository, MysqlManagementTokenRepository,
 };
+use crate::repository::model_catalog::{
+    ModelCatalogReadRepository, MysqlModelCatalogReadRepository,
+};
 use crate::repository::oauth_providers::{
     MysqlOAuthProviderRepository, OAuthProviderReadRepository, OAuthProviderWriteRepository,
 };
@@ -168,6 +171,10 @@ impl MysqlBackend {
 
     pub fn global_model_read_repository(&self) -> Arc<dyn GlobalModelReadRepository> {
         Arc::new(MysqlGlobalModelReadRepository::new(self.pool_clone()))
+    }
+
+    pub fn model_catalog_read_repository(&self) -> Arc<dyn ModelCatalogReadRepository> {
+        Arc::new(MysqlModelCatalogReadRepository::new(self.pool_clone()))
     }
 
     pub fn global_model_write_repository(&self) -> Arc<dyn GlobalModelWriteRepository> {

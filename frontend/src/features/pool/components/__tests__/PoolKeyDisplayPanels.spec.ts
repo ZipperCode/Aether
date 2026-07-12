@@ -3,9 +3,23 @@ import { createApp, defineComponent, h } from 'vue'
 
 import PoolKeyQuotaPanel from '@/features/pool/components/PoolKeyQuotaPanel.vue'
 import PoolKeyStatsPanel from '@/features/pool/components/PoolKeyStatsPanel.vue'
+import PoolKeyHealthIndicator from '@/features/pool/components/PoolKeyHealthIndicator.vue'
 import { createI18n } from '@/i18n'
 
 describe('pool key display panels', () => {
+  it('renders the provider-compatible key health percentage and progress', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyHealthIndicator, { score: 0.73 })
+    app.mount(root)
+
+    expect(root.querySelector('[data-testid="pool-key-health"]')?.textContent).toContain('73%')
+    expect((root.querySelector('[data-testid="pool-key-health-bar"]') as HTMLElement).style.width).toBe('73%')
+
+    app.unmount()
+    root.remove()
+  })
+
   it('renders codex cycle stats with stable test hooks', () => {
     const root = document.createElement('div')
     document.body.appendChild(root)

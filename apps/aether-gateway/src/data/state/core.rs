@@ -111,6 +111,7 @@ impl GatewayDataState {
                 gemini_file_mapping_reader: None,
                 gemini_file_mapping_writer: None,
                 global_model_reader: None,
+                model_catalog_reader: None,
                 global_model_writer: None,
                 minimal_candidate_selection_reader: None,
                 request_candidate_reader: None,
@@ -160,6 +161,7 @@ impl GatewayDataState {
         let background_task_writer = backends.write().background_tasks();
         let gemini_file_mapping_reader = backends.read().gemini_file_mappings();
         let global_model_reader = backends.read().global_models();
+        let model_catalog_reader = backends.read().model_catalog();
         let global_model_writer = backends.write().global_models();
         let minimal_candidate_selection_reader =
             backends
@@ -228,6 +230,7 @@ impl GatewayDataState {
             gemini_file_mapping_reader,
             gemini_file_mapping_writer,
             global_model_reader,
+            model_catalog_reader,
             global_model_writer,
             minimal_candidate_selection_reader,
             request_candidate_reader,

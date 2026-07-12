@@ -1,4 +1,4 @@
-use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
+use aether_data_contracts::repository::model_catalog::StoredModelCatalogEntry;
 use axum::{
     body::Body,
     http,
@@ -102,7 +102,7 @@ pub(super) fn build_empty_models_list_response(api_format: &str) -> Response<Bod
 }
 
 pub(super) fn build_openai_models_list_response(
-    rows: &[StoredMinimalCandidateSelectionRow],
+    rows: &[StoredModelCatalogEntry],
 ) -> Response<Body> {
     Json(json!({
         "object": "list",
@@ -118,9 +118,7 @@ pub(super) fn build_openai_models_list_response(
     .into_response()
 }
 
-pub(super) fn build_openai_model_detail_response(
-    row: &StoredMinimalCandidateSelectionRow,
-) -> Response<Body> {
+pub(super) fn build_openai_model_detail_response(row: &StoredModelCatalogEntry) -> Response<Body> {
     Json(json!({
         "id": row.global_model_name,
         "object": "model",
@@ -131,7 +129,7 @@ pub(super) fn build_openai_model_detail_response(
 }
 
 pub(super) fn build_claude_models_list_response(
-    rows: &[StoredMinimalCandidateSelectionRow],
+    rows: &[StoredModelCatalogEntry],
     before_id: Option<&str>,
     after_id: Option<&str>,
     limit: usize,
@@ -182,9 +180,7 @@ pub(super) fn build_claude_models_list_response(
     .into_response()
 }
 
-pub(super) fn build_claude_model_detail_response(
-    row: &StoredMinimalCandidateSelectionRow,
-) -> Response<Body> {
+pub(super) fn build_claude_model_detail_response(row: &StoredModelCatalogEntry) -> Response<Body> {
     Json(json!({
         "id": row.global_model_name,
         "type": "model",
@@ -194,7 +190,7 @@ pub(super) fn build_claude_model_detail_response(
     .into_response()
 }
 
-fn build_gemini_model_value(row: &StoredMinimalCandidateSelectionRow) -> serde_json::Value {
+fn build_gemini_model_value(row: &StoredModelCatalogEntry) -> serde_json::Value {
     json!({
         "name": format!("models/{}", row.global_model_name),
         "baseModelId": row.global_model_name,
@@ -212,7 +208,7 @@ fn build_gemini_model_value(row: &StoredMinimalCandidateSelectionRow) -> serde_j
 }
 
 pub(super) fn build_gemini_models_list_response(
-    rows: &[StoredMinimalCandidateSelectionRow],
+    rows: &[StoredModelCatalogEntry],
     page_size: usize,
     page_token: Option<&str>,
 ) -> Response<Body> {
@@ -233,8 +229,6 @@ pub(super) fn build_gemini_models_list_response(
     Json(payload).into_response()
 }
 
-pub(super) fn build_gemini_model_detail_response(
-    row: &StoredMinimalCandidateSelectionRow,
-) -> Response<Body> {
+pub(super) fn build_gemini_model_detail_response(row: &StoredModelCatalogEntry) -> Response<Body> {
     Json(build_gemini_model_value(row)).into_response()
 }

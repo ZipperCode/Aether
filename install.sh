@@ -21,7 +21,7 @@ COMPOSE_DIR_EXPLICIT="false"
 if [[ -n "${AETHER_COMPOSE_DIR:-}" ]]; then
     COMPOSE_DIR_EXPLICIT="true"
 fi
-IMAGE_REPO="${AETHER_IMAGE_REPO:-ghcr.io/fawney19/aether}"
+IMAGE_REPO="${AETHER_IMAGE_REPO:-ghcr.io/zippercode/aether}"
 APP_IMAGE="${AETHER_APP_IMAGE:-}"
 SERVICE_USER_EXPLICIT="false"
 SERVICE_GROUP_EXPLICIT="false"

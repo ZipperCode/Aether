@@ -13,6 +13,7 @@ use crate::repository::candidates::RequestCandidateReadRepository;
 use crate::repository::gemini_file_mappings::GeminiFileMappingReadRepository;
 use crate::repository::global_models::GlobalModelReadRepository;
 use crate::repository::management_tokens::ManagementTokenReadRepository;
+use crate::repository::model_catalog::ModelCatalogReadRepository;
 use crate::repository::oauth_providers::OAuthProviderReadRepository;
 use crate::repository::pool_scores::PoolScoreReadRepository;
 use crate::repository::provider_catalog::ProviderCatalogReadRepository;
@@ -35,6 +36,7 @@ pub struct DataReadRepositories {
     gemini_file_mappings: Option<Arc<dyn GeminiFileMappingReadRepository>>,
     global_models: Option<Arc<dyn GlobalModelReadRepository>>,
     management_tokens: Option<Arc<dyn ManagementTokenReadRepository>>,
+    model_catalog: Option<Arc<dyn ModelCatalogReadRepository>>,
     oauth_providers: Option<Arc<dyn OAuthProviderReadRepository>>,
     pool_scores: Option<Arc<dyn PoolScoreReadRepository>>,
     proxy_nodes: Option<Arc<dyn ProxyNodeReadRepository>>,
@@ -126,6 +128,10 @@ impl DataReadRepositories {
                 .map(PostgresBackend::management_token_read_repository)
                 .or_else(|| mysql.map(MysqlBackend::management_token_read_repository))
                 .or_else(|| sqlite.map(SqliteBackend::management_token_read_repository)),
+            model_catalog: postgres
+                .map(PostgresBackend::model_catalog_read_repository)
+                .or_else(|| mysql.map(MysqlBackend::model_catalog_read_repository))
+                .or_else(|| sqlite.map(SqliteBackend::model_catalog_read_repository)),
             oauth_providers: postgres
                 .map(PostgresBackend::oauth_provider_read_repository)
                 .or_else(|| mysql.map(MysqlBackend::oauth_provider_read_repository))
@@ -218,6 +224,10 @@ impl DataReadRepositories {
         self.management_tokens.clone()
     }
 
+    pub fn model_catalog(&self) -> Option<Arc<dyn ModelCatalogReadRepository>> {
+        self.model_catalog.clone()
+    }
+
     pub fn oauth_providers(&self) -> Option<Arc<dyn OAuthProviderReadRepository>> {
         self.oauth_providers.clone()
     }
@@ -278,6 +288,7 @@ impl DataReadRepositories {
             || self.gemini_file_mappings.is_some()
             || self.global_models.is_some()
             || self.management_tokens.is_some()
+            || self.model_catalog.is_some()
             || self.oauth_providers.is_some()
             || self.pool_scores.is_some()
             || self.proxy_nodes.is_some()

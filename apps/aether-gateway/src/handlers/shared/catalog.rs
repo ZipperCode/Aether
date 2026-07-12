@@ -1984,6 +1984,7 @@ pub(crate) fn sync_provider_key_quota_status_snapshot(
         "antigravity" => build_antigravity_quota_status_snapshot(upstream_metadata, source),
         "grok" => build_grok_quota_status_snapshot(upstream_metadata, source),
         "gemini_cli" => build_gemini_cli_quota_status_snapshot(upstream_metadata, source),
+        "nous" => build_nous_quota_status_snapshot(upstream_metadata, source),
         _ => None,
     }?;
     if normalized_provider_type == "codex" {
@@ -1996,6 +1997,31 @@ pub(crate) fn sync_provider_key_quota_status_snapshot(
         .unwrap_or_default();
     snapshot.insert("quota".to_string(), quota);
     Some(Value::Object(snapshot))
+}
+
+fn build_nous_quota_status_snapshot(
+    upstream_metadata: Option<&Value>,
+    source: &str,
+) -> Option<Value> {
+    let mut quota = provider_quota_metadata_bucket(upstream_metadata, "nous")?.clone();
+    let windows = quota.get("windows").and_then(Value::as_array)?;
+    if windows.iter().any(|window| {
+        let Some(window) = window.as_object() else {
+            return true;
+        };
+        !window.contains_key("code")
+            || !window.contains_key("scope")
+            || !window.contains_key("limit_value")
+            || !window.contains_key("used_value")
+            || !window.contains_key("remaining_value")
+            || !window.contains_key("remaining_ratio")
+            || !window.contains_key("reset_at")
+    }) {
+        return None;
+    }
+    quota.insert("version".into(), json!(2));
+    quota.insert("source".into(), json!(source));
+    Some(Value::Object(quota.clone()))
 }
 
 fn quota_snapshot_has_materialized_data(

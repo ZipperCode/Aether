@@ -1316,6 +1316,14 @@ pub(super) fn build_admin_pool_key_payload(
         json!(key.auto_fetch_models),
     );
     payload.insert(
+        "last_models_fetch_at".to_string(),
+        json!(key.last_models_fetch_at_unix_secs),
+    );
+    payload.insert(
+        "last_models_fetch_error".to_string(),
+        json!(key.last_models_fetch_error),
+    );
+    payload.insert(
         "locked_models".to_string(),
         json!(admin_pool_string_list(key.locked_models.as_ref())),
     );

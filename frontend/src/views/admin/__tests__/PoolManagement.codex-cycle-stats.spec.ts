@@ -574,6 +574,87 @@ afterEach(() => {
 })
 
 describe('PoolManagement Codex cycle stats mode', () => {
+  it('renders Nous credits, monthly spend, balance, period, and configured rate-limit labels', async () => {
+    const nousKey = createPoolKey('nous', {
+      status_snapshot: {
+        oauth: { code: 'valid' },
+        account: { code: 'available', blocked: false },
+        quota: {
+          code: 'ok',
+          provider_type: 'nous',
+          exhausted: false,
+          plan_type: 'tier_5',
+          observed_at: 1_750_000_000,
+          current_period_end: 1_850_000_000,
+          balance_usd: '12.50',
+          purchased_credits_remaining: '8',
+          total_usable_credits: '68',
+          billing_available: true,
+          rate_limits: { rpm: 50, tpm: 500000, rph: 2100, tph: 6000000, kind: 'configured_limits' },
+          windows: [
+            { code: 'subscription_credits', scope: 'account', unit: 'count', limit_value: '100.00', used_value: '40.00', remaining_value: '60.00', remaining_ratio: '0.6000', reset_at: 1_850_000_000 },
+            { code: 'monthly_spend', scope: 'billing', unit: 'usd', limit_value: '20.00', used_value: '5.00', remaining_value: '15.00', remaining_ratio: '0.7500' },
+          ],
+        },
+      },
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('nous')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(nousKey))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('nous'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    expect(root.textContent).toContain('订阅 Credits')
+    expect(root.textContent).toContain('60/100')
+    expect(root.textContent).toContain('本月消费')
+    expect(root.textContent).toContain('$5/$20')
+    expect(root.textContent).toContain('可用 Credits 68')
+    expect(root.textContent).toContain('购买 Credits 8')
+    expect(root.textContent).toContain('余额 $12.5')
+    expect(root.textContent).toContain('速率上限 RPM 50 / TPM 500,000 / RPH 2,100 / TPH 6,000,000')
+    expect(root.textContent).not.toContain('RPM 剩余')
+  })
+
+  it('keeps Nous account quota visible when billing data is degraded and shows 429 recovery', async () => {
+    const nousKey = createPoolKey('nous', {
+      status_snapshot: {
+        oauth: { code: 'valid' },
+        account: { code: 'available', blocked: false },
+        quota: {
+          code: 'cooldown',
+          provider_type: 'nous',
+          exhausted: false,
+          billing_available: false,
+          billing_stale: true,
+          billing_source: 'preserved_snapshot',
+          balance_usd: '7.25',
+          windows: [
+            { code: 'subscription_credits', scope: 'account', limit_value: '100.00', remaining_value: '25.00', remaining_ratio: '0.2500' },
+            { code: 'monthly_spend', scope: 'billing', unit: 'usd', limit_value: '20.00', used_value: '12.00', remaining_value: '8.00', remaining_ratio: '0.4000' },
+            { code: 'rate_limit', scope: 'account', is_exhausted: true, reset_seconds: 120 },
+          ],
+        },
+      },
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('nous')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(nousKey))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('nous'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    expect(root.textContent).toContain('订阅 Credits')
+    expect(root.textContent).toContain('25/100')
+    expect(root.textContent).toContain('本月消费')
+    expect(root.textContent).toContain('$12/$20')
+    expect(root.textContent).toContain('余额 $7.25')
+    expect(root.textContent).toContain('账单数据为上次快照')
+    expect(root.textContent).not.toContain('账单信息暂不可用')
+    expect(root.textContent).toContain('临时限流')
+    expect(root.textContent).toContain('429')
+  })
+
   it('renders Codex current-cycle stats by default with a header icon toggle', async () => {
     const codexKey = createPoolKey('codex')
     endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
@@ -766,6 +847,26 @@ describe('PoolManagement Codex cycle stats mode', () => {
       ['codex-page-key-1', 'codex-page-key-2'],
     )
     expect(endpointMocks.refreshProviderQuota).not.toHaveBeenCalledWith('codex-provider')
+  })
+
+  it('enables quota refresh for Nous providers', async () => {
+    const nousKey = createPoolKey('nous', { key_id: 'nous-key-1', quota_updated_at: null })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('nous')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(nousKey))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('nous'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    const refreshButton = root.querySelector('button[title="刷新数据和额度"]') as HTMLButtonElement | null
+    expect(refreshButton).not.toBeNull()
+    refreshButton?.click()
+    await settle()
+
+    expect(endpointMocks.refreshProviderQuota).toHaveBeenCalledWith(
+      'nous-provider',
+      ['nous-key-1'],
+    )
   })
 
   it('toggles Codex stats to account totals and persists the choice', async () => {

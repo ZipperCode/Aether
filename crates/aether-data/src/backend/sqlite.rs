@@ -34,6 +34,9 @@ use crate::repository::global_models::{
 use crate::repository::management_tokens::{
     ManagementTokenReadRepository, ManagementTokenWriteRepository, SqliteManagementTokenRepository,
 };
+use crate::repository::model_catalog::{
+    ModelCatalogReadRepository, SqliteModelCatalogReadRepository,
+};
 use crate::repository::oauth_providers::{
     OAuthProviderReadRepository, OAuthProviderWriteRepository, SqliteOAuthProviderRepository,
 };
@@ -169,6 +172,10 @@ impl SqliteBackend {
 
     pub fn global_model_read_repository(&self) -> Arc<dyn GlobalModelReadRepository> {
         Arc::new(SqliteGlobalModelReadRepository::new(self.pool_clone()))
+    }
+
+    pub fn model_catalog_read_repository(&self) -> Arc<dyn ModelCatalogReadRepository> {
+        Arc::new(SqliteModelCatalogReadRepository::new(self.pool_clone()))
     }
 
     pub fn global_model_write_repository(&self) -> Arc<dyn GlobalModelWriteRepository> {

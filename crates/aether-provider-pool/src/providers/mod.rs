@@ -5,6 +5,7 @@ pub mod default;
 pub mod gemini_cli;
 pub mod grok;
 pub mod kiro;
+pub mod nous;
 pub mod unsupported;
 pub mod windsurf;
 
@@ -37,6 +38,10 @@ pub use kiro::KiroProviderPoolAdapter;
 pub use kiro::{
     build_kiro_pool_quota_request, KiroPoolQuotaAuthInput, KIRO_USAGE_LIMITS_PATH,
     KIRO_USAGE_SDK_VERSION,
+};
+pub use nous::{
+    build_nous_account_quota_request, build_nous_billing_quota_request, NousProviderPoolAdapter,
+    NOUS_ACCOUNT_PATH, NOUS_BILLING_PATH, NOUS_PORTAL_BASE_URL,
 };
 pub use unsupported::{
     UnsupportedQuotaProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,

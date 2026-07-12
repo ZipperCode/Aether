@@ -2,7 +2,7 @@ use super::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
     DataLayerError, GatewayDataState, PublicCatalogModelListQuery, PublicCatalogModelSearchQuery,
     PublicGlobalModelQuery, StoredAdminGlobalModel, StoredAdminGlobalModelPage,
-    StoredAdminProviderModel, StoredMinimalCandidateSelectionRow,
+    StoredAdminProviderModel, StoredMinimalCandidateSelectionRow, StoredModelCatalogEntry,
     StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
     StoredProviderActiveGlobalModel, StoredProviderModelStats, StoredPublicCatalogModel,
     StoredPublicGlobalModel, StoredPublicGlobalModelPage, StoredRequestedModelCandidateRowsQuery,
@@ -10,6 +10,43 @@ use super::{
 };
 
 impl GatewayDataState {
+    pub(crate) async fn list_model_catalog(
+        &self,
+    ) -> Result<Vec<StoredModelCatalogEntry>, DataLayerError> {
+        crate::request_diagnostics::observe_db_operation(
+            "model_catalog",
+            self.database_pool_summary(),
+            async {
+                match &self.model_catalog_reader {
+                    Some(repository) => repository.list_model_catalog().await,
+                    None => Ok(Vec::new()),
+                }
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn read_model_catalog_detail(
+        &self,
+        global_model_name: &str,
+    ) -> Result<Vec<StoredModelCatalogEntry>, DataLayerError> {
+        crate::request_diagnostics::observe_db_operation(
+            "model_catalog_detail",
+            self.database_pool_summary(),
+            async {
+                match &self.model_catalog_reader {
+                    Some(repository) => {
+                        repository
+                            .read_model_catalog_detail(global_model_name)
+                            .await
+                    }
+                    None => Ok(Vec::new()),
+                }
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn list_minimal_candidate_selection_rows(
         &self,
         api_format: &str,

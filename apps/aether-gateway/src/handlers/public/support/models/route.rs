@@ -2,7 +2,6 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
 use axum::{body::Body, response::Response};
 use tokio::time::timeout;
 use tracing::warn;
@@ -14,9 +13,7 @@ use super::models_responses::{
     build_models_not_found_response, build_openai_model_detail_response,
     build_openai_models_list_response,
 };
-use super::models_shared::{
-    filter_rows_for_models, models_api_format, models_detail_id, models_query_api_formats,
-};
+use super::models_shared::{filter_catalog_for_models, models_api_format, models_detail_id};
 use super::{query_param_value, AppState, GatewayPublicRequestContext};
 
 #[cfg(not(test))]
@@ -72,69 +69,27 @@ fn build_models_read_fallback_response(
     }
 }
 
-fn sort_and_dedup_model_rows(
-    mut rows: Vec<StoredMinimalCandidateSelectionRow>,
-) -> Vec<StoredMinimalCandidateSelectionRow> {
-    rows.sort_by(|left, right| {
-        left.global_model_name
-            .cmp(&right.global_model_name)
-            .then(left.provider_priority.cmp(&right.provider_priority))
-            .then(left.key_internal_priority.cmp(&right.key_internal_priority))
-            .then(left.provider_id.cmp(&right.provider_id))
-            .then(left.endpoint_id.cmp(&right.endpoint_id))
-            .then(left.key_id.cmp(&right.key_id))
-            .then(left.model_id.cmp(&right.model_id))
-    });
-    let mut deduped = Vec::with_capacity(rows.len());
-    let mut last_model_name: Option<String> = None;
-    for row in rows {
-        if last_model_name.as_deref() == Some(row.global_model_name.as_str()) {
-            continue;
-        }
-        last_model_name = Some(row.global_model_name.clone());
-        deduped.push(row);
-    }
-    deduped
-}
-
 async fn list_model_rows_for_client_format(
     state: &AppState,
     api_format: &str,
     auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
-) -> Option<Vec<StoredMinimalCandidateSelectionRow>> {
-    let mut collected = Vec::new();
-    for query_format in models_query_api_formats(api_format) {
-        let rows = await_models_route_read(
-            "candidate_selection_by_api_format",
-            state.list_minimal_candidate_selection_rows_for_api_format(query_format),
-        )
-        .await?;
-        let mut filtered = filter_rows_for_models(rows, auth_snapshot, query_format);
-        collected.append(&mut filtered);
-    }
-    Some(sort_and_dedup_model_rows(collected))
+) -> Option<Vec<aether_data_contracts::repository::model_catalog::StoredModelCatalogEntry>> {
+    let rows = await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
+    Some(filter_catalog_for_models(rows, auth_snapshot, api_format))
 }
 
-async fn list_model_rows_for_client_format_and_global_model(
+async fn detail_model_rows_for_client_format(
     state: &AppState,
+    model_id: &str,
     api_format: &str,
-    global_model_name: &str,
     auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
-) -> Option<Vec<StoredMinimalCandidateSelectionRow>> {
-    let mut collected = Vec::new();
-    for query_format in models_query_api_formats(api_format) {
-        let rows = await_models_route_read(
-            "candidate_selection_by_global_model",
-            state.list_minimal_candidate_selection_rows_for_api_format_and_global_model(
-                query_format,
-                global_model_name,
-            ),
-        )
-        .await?;
-        let mut filtered = filter_rows_for_models(rows, auth_snapshot, query_format);
-        collected.append(&mut filtered);
-    }
-    Some(sort_and_dedup_model_rows(collected))
+) -> Option<Vec<aether_data_contracts::repository::model_catalog::StoredModelCatalogEntry>> {
+    let rows = await_models_route_read(
+        "model_catalog_detail",
+        state.data.read_model_catalog_detail(model_id),
+    )
+    .await?;
+    Some(filter_catalog_for_models(rows, auth_snapshot, api_format))
 }
 
 pub(super) async fn maybe_build_local_models_route_response(
@@ -146,10 +101,6 @@ pub(super) async fn maybe_build_local_models_route_response(
         return None;
     }
     let api_format = models_api_format(request_context)?;
-    if !state.has_minimal_candidate_selection_reader() {
-        return None;
-    }
-
     let auth_context = decision.auth_context.as_ref()?;
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -232,10 +183,10 @@ pub(super) async fn maybe_build_local_models_route_response(
         }
         Some("detail") => {
             let model_id = models_detail_id(&request_context.request_path)?;
-            let rows = match list_model_rows_for_client_format_and_global_model(
+            let rows = match detail_model_rows_for_client_format(
                 state,
-                api_format,
                 &model_id,
+                api_format,
                 auth_snapshot,
             )
             .await
@@ -248,7 +199,7 @@ pub(super) async fn maybe_build_local_models_route_response(
                     ))
                 }
             };
-            let Some(row) = rows.first() else {
+            let Some(row) = rows.iter().find(|row| row.global_model_name == model_id) else {
                 return Some(build_models_not_found_response(&model_id, api_format));
             };
             let response = match api_format {

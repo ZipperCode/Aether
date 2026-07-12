@@ -731,6 +731,8 @@ pub fn build_admin_pool_key_payload(
         "allowed_models": admin_pool_string_list(key.allowed_models.as_ref()),
         "capabilities": admin_pool_json_object(key.capabilities.as_ref()),
         "auto_fetch_models": key.auto_fetch_models,
+        "last_models_fetch_at": key.last_models_fetch_at_unix_secs,
+        "last_models_fetch_error": key.last_models_fetch_error,
         "locked_models": admin_pool_string_list(key.locked_models.as_ref()),
         "model_include_patterns": admin_pool_string_list(key.model_include_patterns.as_ref()),
         "model_exclude_patterns": admin_pool_string_list(key.model_exclude_patterns.as_ref()),

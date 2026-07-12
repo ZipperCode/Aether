@@ -39,6 +39,10 @@ fn provider_oauth_service_for_template(
     template: AdminProviderOAuthTemplate,
     token_url: String,
 ) -> Result<ProviderOAuthService, Response<Body>> {
+    if template.provider_type.eq_ignore_ascii_case("nous") {
+        return Ok(ProviderOAuthService::with_builtin_adapters());
+    }
+
     GenericProviderOAuthAdapter::for_provider_type(template.provider_type)
         .map(|adapter| adapter.with_token_url_override(token_url))
         .map(|adapter| ProviderOAuthService::new().with_adapter(Arc::new(adapter)))

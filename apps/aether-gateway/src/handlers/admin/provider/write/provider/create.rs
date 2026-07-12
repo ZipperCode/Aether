@@ -121,7 +121,14 @@ pub(crate) async fn build_admin_create_provider_record(
     let mut config_map = normalize_json_object(payload.config, "config")?
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    if let Some(value) = normalize_pool_advanced_config(payload.pool_advanced)? {
+    if let Some(mut value) = normalize_pool_advanced_config(payload.pool_advanced)? {
+        if provider_type == "nous" {
+            value
+                .as_object_mut()
+                .expect("normalized pool_advanced must be an object")
+                .entry("skip_exhausted_accounts")
+                .or_insert(serde_json::Value::Bool(true));
+        }
         config_map.insert("pool_advanced".to_string(), value);
     }
     if let Some(value) = normalize_json_object(payload.failover_rules, "failover_rules")? {

@@ -7,6 +7,7 @@ use super::codex::refresh_codex_provider_quota_locally;
 use super::gemini_cli::refresh_gemini_cli_provider_quota_locally;
 use super::grok::refresh_grok_provider_quota_locally;
 use super::kiro::refresh_kiro_provider_quota_locally;
+use super::nous::refresh_nous_provider_quota_locally;
 use super::windsurf::refresh_windsurf_provider_quota_locally;
 use crate::handlers::admin::request::AdminAppState;
 use crate::GatewayError;
@@ -42,6 +43,7 @@ const PROVIDER_QUOTA_REFRESH_HANDLERS: &[(&str, ProviderQuotaRefreshHandler)] = 
     ),
     ("grok", refresh_grok_provider_quota_locally_boxed),
     ("kiro", refresh_kiro_provider_quota_locally_boxed),
+    ("nous", refresh_nous_provider_quota_locally_boxed),
     ("windsurf", refresh_windsurf_provider_quota_locally_boxed),
 ];
 
@@ -151,6 +153,22 @@ fn refresh_grok_provider_quota_locally_boxed<'a>(
     proxy_override: Option<ProxySnapshot>,
 ) -> ProviderQuotaRefreshFuture<'a> {
     Box::pin(refresh_grok_provider_quota_locally(
+        state,
+        provider,
+        endpoint,
+        keys,
+        proxy_override,
+    ))
+}
+
+fn refresh_nous_provider_quota_locally_boxed<'a>(
+    state: &'a AdminAppState<'a>,
+    provider: &'a StoredProviderCatalogProvider,
+    endpoint: &'a StoredProviderCatalogEndpoint,
+    keys: Vec<StoredProviderCatalogKey>,
+    proxy_override: Option<ProxySnapshot>,
+) -> ProviderQuotaRefreshFuture<'a> {
+    Box::pin(refresh_nous_provider_quota_locally(
         state,
         provider,
         endpoint,

@@ -321,6 +321,11 @@
                         </div>
                       </div>
                     </div>
+                    <NousQuotaCard
+                      v-if="provider.provider_type === 'nous' && getNousQuotaDisplay(key)"
+                      :quota="getNousQuotaDisplay(key)!"
+                      :loading="refreshingQuota"
+                    />
                     <!-- Antigravity 上游额度摘要（按家族分组展示关键配额） -->
                     <div
                       v-if="provider.provider_type === 'antigravity' && (hasAntigravityQuotaDisplayData(key) || isAntigravityForbiddenKey(key))"
@@ -956,6 +961,7 @@ import ProviderKeyIdentityBlock from '@/features/providers/components/ProviderKe
 import ProviderMonthlyQuotaCard from '@/features/providers/components/ProviderMonthlyQuotaCard.vue'
 import ProviderQuotaProgressRow from '@/features/providers/components/ProviderQuotaProgressRow.vue'
 import ProviderQuotaSectionHeader from '@/features/providers/components/ProviderQuotaSectionHeader.vue'
+import NousQuotaCard from '@/features/providers/components/NousQuotaCard.vue'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import {
   compareAntigravityQuotaItems,
@@ -1761,7 +1767,7 @@ function quotaSnapshotHasDisplayData(quota: QuotaStatusSnapshot | null | undefin
 
 function getQuotaSnapshotForProvider(
   key: EndpointAPIKey,
-  providerType: 'codex' | 'kiro' | 'windsurf' | 'antigravity' | 'chatgpt_web' | 'gemini_cli' | 'grok',
+  providerType: 'codex' | 'kiro' | 'windsurf' | 'antigravity' | 'chatgpt_web' | 'gemini_cli' | 'grok' | 'nous',
 ): QuotaStatusSnapshot | null {
   const quota = key.status_snapshot?.quota
   if (!quota) return null
@@ -1772,6 +1778,10 @@ function getQuotaSnapshotForProvider(
   }
 
   return quotaSnapshotHasDisplayData(quota) ? quota : null
+}
+
+function getNousQuotaDisplay(key: EndpointAPIKey): QuotaStatusSnapshot | null {
+  return getQuotaSnapshotForProvider(key, 'nous')
 }
 
 function getQuotaSnapshotUpdatedAt(quota: QuotaStatusSnapshot | null | undefined): number | undefined {
@@ -2720,7 +2730,7 @@ async function autoRefreshQuotaInBackground(options: { ignoreCooldown?: boolean 
   if (refreshingQuota.value) return
 
   const providerType = provider.value?.provider_type
-  if (providerType !== 'codex' && providerType !== 'gemini_cli' && providerType !== 'antigravity' && providerType !== 'kiro' && providerType !== 'windsurf' && providerType !== 'chatgpt_web' && providerType !== 'grok') return
+  if (providerType !== 'codex' && providerType !== 'gemini_cli' && providerType !== 'antigravity' && providerType !== 'kiro' && providerType !== 'windsurf' && providerType !== 'chatgpt_web' && providerType !== 'grok' && providerType !== 'nous') return
 
   // 检查是否需要刷新
   let shouldRefresh = false
@@ -2738,6 +2748,12 @@ async function autoRefreshQuotaInBackground(options: { ignoreCooldown?: boolean 
     shouldRefresh = shouldAutoRefreshWindsurfQuota()
   } else if (providerType === 'chatgpt_web') {
     shouldRefresh = shouldAutoRefreshChatGPTWebQuota()
+  } else if (providerType === 'nous') {
+    shouldRefresh = allKeys.value.some(({ key }) => {
+      if (!key.is_active) return false
+      const updatedAt = getQuotaSnapshotUpdatedAt(getNousQuotaDisplay(key))
+      return updatedAt == null || Math.floor(Date.now() / 1000) - updatedAt >= AUTO_QUOTA_REFRESH_STALE_SECONDS
+    })
   }
   if (!shouldRefresh) return
   if (!options.ignoreCooldown && isProviderQuotaAutoRefreshCoolingDown(providerId)) return
@@ -2757,6 +2773,8 @@ async function autoRefreshQuotaInBackground(options: { ignoreCooldown?: boolean 
     hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && hasWindsurfQuotaDisplayData(key))
   } else if (providerType === 'chatgpt_web') {
     hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && hasChatGPTWebQuotaDisplayData(key))
+  } else if (providerType === 'nous') {
+    hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && quotaSnapshotHasDisplayData(getNousQuotaDisplay(key)))
   }
 
   refreshingQuota.value = true

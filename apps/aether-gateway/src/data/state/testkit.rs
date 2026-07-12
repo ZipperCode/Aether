@@ -61,6 +61,7 @@ impl GatewayDataState {
             gemini_file_mapping_reader: None,
             gemini_file_mapping_writer: None,
             global_model_reader: None,
+            model_catalog_reader: None,
             global_model_writer: None,
             minimal_candidate_selection_reader: Some(candidate_selection_repository),
             request_candidate_reader: Some(request_candidate_reader),

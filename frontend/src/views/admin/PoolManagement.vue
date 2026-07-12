@@ -297,6 +297,15 @@
                       >
                         {{ keyUiStateMap[key.key_id]?.oauthOrgBadge?.label }}
                       </Badge>
+                      <span
+                        v-if="keyUiStateMap[key.key_id]?.modelFetchLabel"
+                        class="text-[10px] cursor-help"
+                        :class="keyUiStateMap[key.key_id]?.modelFetchClass"
+                        :title="keyUiStateMap[key.key_id]?.modelFetchTitle"
+                      >
+                        {{ keyUiStateMap[key.key_id]?.modelFetchLabel }}
+                      </span>
+                      <PoolKeyHealthIndicator :score="key.health_score" />
                     </div>
                   </div>
                 </TableCell>
@@ -541,6 +550,15 @@
                 >
                   {{ keyUiStateMap[key.key_id]?.schedulingBadgeLabel }}
                 </Badge>
+                <span
+                  v-if="keyUiStateMap[key.key_id]?.modelFetchLabel"
+                  class="inline-flex max-w-full items-center rounded-full border px-2 py-0.5 text-[10px] font-medium leading-4 cursor-help"
+                  :class="keyUiStateMap[key.key_id]?.modelFetchClass"
+                  :title="keyUiStateMap[key.key_id]?.modelFetchTitle"
+                >
+                  {{ keyUiStateMap[key.key_id]?.modelFetchLabel }}
+                </span>
+                <PoolKeyHealthIndicator :score="key.health_score" />
                 <span
                   v-if="key.cooldown_ttl_seconds"
                   class="inline-flex items-center rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium leading-4 text-red-700 dark:text-red-300"
@@ -1045,6 +1063,7 @@ import PoolAccountBatchDialog from '@/features/pool/components/PoolAccountBatchD
 import PoolManagementHeader from '@/features/pool/components/PoolManagementHeader.vue'
 import PoolKeyQuotaPanel from '@/features/pool/components/PoolKeyQuotaPanel.vue'
 import PoolKeyStatsPanel from '@/features/pool/components/PoolKeyStatsPanel.vue'
+import PoolKeyHealthIndicator from '@/features/pool/components/PoolKeyHealthIndicator.vue'
 import KeyAllowedModelsEditDialog from '@/features/providers/components/KeyAllowedModelsEditDialog.vue'
 import KeyFormDialog from '@/features/providers/components/KeyFormDialog.vue'
 import OAuthKeyEditDialog from '@/features/providers/components/OAuthKeyEditDialog.vue'
@@ -1565,6 +1584,7 @@ const showAccountQuotaColumn = computed(() => {
     || selectedProviderType.value === 'windsurf'
     || selectedProviderType.value === 'antigravity'
     || selectedProviderType.value === 'grok'
+    || selectedProviderType.value === 'nous'
     || selectedProviderType.value === 'chatgpt_web'
 })
 
@@ -1863,6 +1883,9 @@ type PoolKeyUiState = {
   statsDisplay: PoolStatsDisplay
   mobileTagItems: PoolMobileTagItem[]
   mobileActionIds: PoolMobileActionId[]
+  modelFetchLabel: string
+  modelFetchClass: string
+  modelFetchTitle: string
 }
 
 const quotaProgressMap = computed<Record<string, QuotaProgressItem[]>>(() => {
@@ -1929,11 +1952,37 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
         canClearCooldown: Boolean(key.cooldown_reason),
         hasProxy: true,
       }).primary,
+      ...getModelFetchDisplay(key),
     }
   }
 
   return map
 })
+
+function getModelFetchDisplay(key: PoolKeyDetail): Pick<PoolKeyUiState, 'modelFetchLabel' | 'modelFetchClass' | 'modelFetchTitle'> {
+  if (!key.auto_fetch_models) {
+    return { modelFetchLabel: '', modelFetchClass: '', modelFetchTitle: '' }
+  }
+  if (key.last_models_fetch_error) {
+    return {
+      modelFetchLabel: '模型同步失败',
+      modelFetchClass: 'text-amber-600 dark:text-amber-400',
+      modelFetchTitle: key.last_models_fetch_error,
+    }
+  }
+  if (key.last_models_fetch_at) {
+    return {
+      modelFetchLabel: '模型同步成功',
+      modelFetchClass: 'text-emerald-600 dark:text-emerald-400',
+      modelFetchTitle: `最近同步：${new Date(key.last_models_fetch_at * 1000).toLocaleString()}`,
+    }
+  }
+  return {
+    modelFetchLabel: '模型待同步',
+    modelFetchClass: 'text-muted-foreground',
+    modelFetchTitle: '已启用自动获取模型，尚无同步结果',
+  }
+}
 
 function getPoolKeyStatsDisplay(key: PoolKeyDetail): PoolStatsDisplay {
   return keyUiStateMap.value[key.key_id]?.statsDisplay
@@ -1997,6 +2046,7 @@ const quotaRefreshSupported = computed(() => {
     || selectedProviderType.value === 'antigravity'
     || selectedProviderType.value === 'grok'
     || selectedProviderType.value === 'chatgpt_web'
+    || selectedProviderType.value === 'nous'
 })
 
 function canResetCycleStats(_key: PoolKeyDetail): boolean {
@@ -3289,7 +3339,48 @@ function getQuotaFallbackText(key: PoolKeyDetail): string | null {
 }
 
 function getAccountQuotaText(key: PoolKeyDetail): string | null {
+  const nousText = getNousQuotaSummaryText(key)
+  if (nousText) return nousText
   return getGeminiCliAccountCreditsText(key, selectedProviderType.value)
+}
+
+function formatNousAmount(value: number | string | null | undefined, unit = ''): string | null {
+  if (value == null || value === '') return null
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  const formatted = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(parsed)
+  return unit ? `${unit}${formatted}` : formatted
+}
+
+function getNousQuotaSummaryText(key: PoolKeyDetail): string | null {
+  const quota = getQuotaSnapshot(key)
+  if (!quota || getQuotaSnapshotProviderType(key) !== 'nous') return null
+
+  const parts: string[] = []
+  const total = formatNousAmount(quota.total_usable_credits)
+  const purchased = formatNousAmount(quota.purchased_credits_remaining)
+  const balance = formatNousAmount(quota.balance_usd, '$')
+  if (total != null) parts.push(`可用 Credits ${total}`)
+  if (purchased != null) parts.push(`购买 Credits ${purchased}`)
+  if (balance != null) parts.push(`余额 ${balance}`)
+  if (quota.exhausted === true) {
+    parts.push(quota.exhausted_reason === 'no_usable_credits' ? '无可用推理 Credits' : '账号额度不可用')
+  }
+
+  const limits = quota.rate_limits
+  if (limits?.kind === 'configured_limits') {
+    const configured = ([['RPM', limits.rpm], ['TPM', limits.tpm], ['RPH', limits.rph], ['TPH', limits.tph]] as const)
+      .filter(([, value]) => typeof value === 'number' && Number.isFinite(value))
+      .map(([label, value]) => `${label} ${formatNousAmount(value)}`)
+    if (configured.length > 0) parts.push(`速率上限 ${configured.join(' / ')}`)
+  }
+
+  if (quota.billing_stale === true) {
+    parts.push('账单数据为上次快照')
+  } else if (quota.billing_available === false) {
+    parts.push('账单信息暂不可用')
+  }
+  return parts.join(' · ') || null
 }
 
 
@@ -3425,6 +3516,40 @@ function formatQuotaValue(value: number | null | undefined): string {
   return normalized.toFixed(1)
 }
 
+function parseNousDecimal(value: unknown): number | null {
+  if (typeof value !== 'number' && typeof value !== 'string') return null
+  if (typeof value === 'string' && value.trim() === '') return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function getNousWindowRemainingPercent(window: QuotaWindowSnapshot | null | undefined): number | null {
+  if (!window) return null
+  if (window.is_exhausted === true) return 0
+  const remainingRatio = parseNousDecimal(window.remaining_ratio)
+  if (remainingRatio != null) return clampPercent(remainingRatio * 100)
+  const usedRatio = parseNousDecimal(window.used_ratio)
+  if (usedRatio != null) return clampPercent((1 - usedRatio) * 100)
+  const limit = parseNousDecimal(window.limit_value)
+  if (limit == null || limit <= 0) return null
+  const remaining = parseNousDecimal(window.remaining_value)
+  if (remaining != null) return clampPercent((remaining / limit) * 100)
+  const used = parseNousDecimal(window.used_value)
+  return used == null ? null : clampPercent((1 - (used / limit)) * 100)
+}
+
+function getNousWindowValueText(window: QuotaWindowSnapshot | null | undefined, currency = false): string | undefined {
+  if (!window) return undefined
+  const limit = parseNousDecimal(window.limit_value)
+  if (limit == null || limit <= 0) return undefined
+  const remaining = parseNousDecimal(window.remaining_value)
+  const used = parseNousDecimal(window.used_value)
+  const value = currency ? used : (remaining ?? (used == null ? null : Math.max(limit - used, 0)))
+  if (value == null) return undefined
+  const prefix = currency ? '$' : ''
+  return `${prefix}${formatQuotaValue(value)}/${prefix}${formatQuotaValue(limit)}`
+}
+
 function getQuotaWindowValueText(window: QuotaWindowSnapshot | null | undefined): string | undefined {
   if (!window || typeof window.limit_value !== 'number' || window.limit_value <= 0) return undefined
   if (typeof window.remaining_value === 'number') {
@@ -3477,6 +3602,42 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
   if (!quota) return []
 
   const providerType = getQuotaSnapshotProviderType(key)
+
+  if (providerType === 'nous') {
+    const quotaResetAtSeconds = normalizeUnixSeconds(quota.current_period_end ?? quota.reset_at ?? null)
+    const items: QuotaProgressItem[] = []
+    for (const [label, code] of [['订阅 Credits', 'subscription_credits'], ['本月消费', 'monthly_spend']] as const) {
+      const window = getQuotaSnapshotWindow(quota, code)
+      let remainingPercent = getNousWindowRemainingPercent(window)
+      if (code === 'subscription_credits' && quota.exhausted === true) remainingPercent = 0
+      if (code === 'monthly_spend' && remainingPercent != null) remainingPercent = 100 - remainingPercent
+      if (remainingPercent == null) continue
+      const detail = getNousWindowValueText(window, code === 'monthly_spend')
+      items.push({
+        label,
+        remainingPercent,
+        detail,
+        resetAtSeconds: code === 'subscription_credits'
+          ? normalizeUnixSeconds(window?.reset_at ?? quotaResetAtSeconds)
+          : null,
+        resetSeconds: null,
+        updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+      })
+    }
+
+    const rateLimitWindow = getQuotaSnapshotWindow(quota, 'rate_limit')
+    if (rateLimitWindow?.is_exhausted) {
+      items.push({
+        label: '临时限流',
+        remainingPercent: 0,
+        detail: '429',
+        resetAtSeconds: normalizeUnixSeconds(rateLimitWindow.reset_at ?? null),
+        resetSeconds: normalizeRemainingSeconds(rateLimitWindow.reset_seconds ?? null),
+        updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+      })
+    }
+    return items
+  }
 
   if (providerType === 'codex') {
     const items: QuotaProgressItem[] = []
