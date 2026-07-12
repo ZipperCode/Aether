@@ -217,6 +217,26 @@
             </div>
           </template>
 
+          <!-- Nous: 官方设备授权 -->
+          <template v-else-if="isNousProvider">
+            <div class="space-y-4 text-center py-4">
+              <p class="text-xs text-muted-foreground">
+                {{ legacyT('通过 Nous Portal 完成 Hermes 官方 OAuth 授权。') }}
+              </p>
+              <div v-if="device.session_id && device.status === 'pending'" class="space-y-3">
+                <p class="text-sm font-medium">{{ legacyT('在浏览器中完成授权') }}</p>
+                <Button size="sm" @click="openDeviceVerificationUrl">
+                  <ExternalLink class="w-3.5 h-3.5 mr-1.5" />
+                  {{ legacyT('打开授权页面') }}
+                </Button>
+                <p class="text-xs text-muted-foreground">{{ remainingText }}</p>
+              </div>
+              <Button v-else :disabled="device.starting" @click="startDeviceAuth">
+                {{ device.starting ? legacyT('正在准备授权...') : legacyT('开始授权') }}
+              </Button>
+            </div>
+          </template>
+
           <!-- Kiro: 设备授权模式 -->
           <template v-else-if="isKiroProvider">
             <div class="space-y-3">
@@ -946,8 +966,9 @@ const isOpen = computed(() => props.open)
 
 const isKiroProvider = computed(() => (props.providerType || '').toLowerCase() === 'kiro')
 const isGrokProvider = computed(() => (props.providerType || '').toLowerCase() === 'grok')
+const isNousProvider = computed(() => (props.providerType || '').toLowerCase() === 'nous')
 const isWindsurfProvider = computed(() => (props.providerType || '').toLowerCase() === 'windsurf')
-const isDeviceBrowserProvider = computed(() => isKiroProvider.value || isWindsurfProvider.value)
+const isDeviceBrowserProvider = computed(() => isKiroProvider.value || isWindsurfProvider.value || isNousProvider.value)
 const showAuthorizationMode = computed(() => !isGrokProvider.value)
 const defaultMode = computed<DialogMode>(() => (isGrokProvider.value ? 'import' : 'oauth'))
 
@@ -1036,6 +1057,8 @@ const importDropHint = computed(() => (
 const importManualPlaceholder = computed(() => (
   isGrokProvider.value
     ? legacyT('粘贴 Grok sso/session token，支持每行一个；或粘贴包含 token、sso_token、access_token、plan_type、pool_tier 的 JSON')
+    : isNousProvider.value
+      ? legacyT('粘贴 Hermes OAuth JSON，或 Refresh Token')
     : isWindsurfProvider.value
       ? legacyT('粘贴 show-auth-token Token、API key 或 JSON 内容')
       : legacyT('粘贴 Refresh Token / Access Token 或 JSON 内容')
@@ -1340,6 +1363,8 @@ function switchMode(newMode: DialogMode) {
   if (newMode === 'oauth') {
     if (isKiroProvider.value) {
       void ensureKiroSocialDeviceAuth()
+    } else if (isNousProvider.value) {
+      void startDeviceAuth()
     } else if (!oauth.value.authorization_url && !oauth.value.starting) {
       initOAuth()
     }
@@ -1514,10 +1539,10 @@ function parseImportText(text: string): {
         ?? normalizeHeadersField(obj.extra_headers)
         ?? normalizeHeadersField(obj.extraHeaders)
       const importedAccessToken = normalizedAccessToken ?? grokSsoToken ?? normalizedSessionToken ?? bearerTokenFromHeaders(normalizedHeaders)
-      if (normalizedRefreshToken || importedAccessToken) {
+      if (normalizedRefreshToken || (!isNousProvider.value && importedAccessToken)) {
         return {
           refresh_token: normalizedRefreshToken,
-          access_token: importedAccessToken,
+          access_token: isNousProvider.value ? undefined : importedAccessToken,
           expires_at: normalizeExpiryField(obj.expires_at) ?? normalizeExpiryField(obj.expiresAt) ?? normalizeExpiryField(obj.expired),
           name: (typeof obj.name === 'string' ? obj.name : undefined) || (typeof obj.oauth_email === 'string' ? obj.oauth_email : undefined),
           email: normalizeStringField(obj.email) ?? normalizeStringField(obj.oauth_email),
@@ -1542,6 +1567,7 @@ function parseImportText(text: string): {
   }
 
   if (isLikelyJwtToken(trimmed)) {
+    if (isNousProvider.value) return null
     return { access_token: trimmed }
   }
 
@@ -1846,10 +1872,10 @@ async function startDeviceAuth() {
       ? 'browser'
       : (requestedAuthType === 'default' ? 'google' : requestedAuthType)
     const resp = await startDeviceAuthorize(props.providerId, {
-      auth_type: authTypeForRequest,
+      auth_type: isNousProvider.value ? undefined : authTypeForRequest,
       login_option: isWindsurf ? windsurfLoginOption : undefined,
-      start_url: isWindsurf ? undefined : (isBuilderID ? BUILDER_ID_START_URL : (isSocial ? undefined : (device.value.start_url.trim() || undefined))),
-      region: isWindsurf ? undefined : (isBuilderID || isSocial ? BUILDER_ID_REGION : (device.value.region.trim() || undefined)),
+      start_url: isWindsurf || isNousProvider.value ? undefined : (isBuilderID ? BUILDER_ID_START_URL : (isSocial ? undefined : (device.value.start_url.trim() || undefined))),
+      region: isWindsurf || isNousProvider.value ? undefined : (isBuilderID || isSocial ? BUILDER_ID_REGION : (device.value.region.trim() || undefined)),
       proxy_node_id: selectedProxyNodeId.value || undefined,
     })
     if (requestId !== deviceAuthRequestId || device.value.auth_type !== requestedAuthType) return
@@ -1859,7 +1885,7 @@ async function startDeviceAuth() {
     device.value.verification_uri_complete = resp.verification_uri_complete
     device.value.expires_at = Date.now() + resp.expires_in * 1000
     device.value.interval = resp.interval || 5
-    device.value.callback_required = resp.callback_required === true || isSocial || isWindsurf
+    device.value.callback_required = resp.callback_required === true || (!isNousProvider.value && (isSocial || isWindsurf))
     device.value.status = 'pending'
     startCountdown()
     if (!device.value.callback_required) {
@@ -1996,6 +2022,8 @@ watch(() => props.open, (newOpen) => {
       device.value.auth_type = 'default'
     } else if (isKiroProvider.value) {
       void ensureKiroSocialDeviceAuth()
+    } else if (isNousProvider.value) {
+      void startDeviceAuth()
     } else {
       initOAuth()
     }
@@ -2017,6 +2045,8 @@ watch(
         : 'default'
     } else if (props.open && isKiroProvider.value && mode.value === 'oauth') {
       void ensureKiroSocialDeviceAuth()
+    } else if (props.open && isNousProvider.value && mode.value === 'oauth' && !device.value.session_id) {
+      void startDeviceAuth()
     }
   },
 )

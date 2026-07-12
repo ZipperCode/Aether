@@ -12,7 +12,10 @@ use crate::GatewayError;
 use aether_data::repository::provider_oauth::{
     StoredAdminProviderOAuthDeviceSession, KIRO_DEVICE_AUTH_SESSION_TTL_BUFFER_SECS,
 };
-use aether_oauth::provider::{ProviderOAuthService, ProviderOAuthTransportContext};
+use aether_oauth::provider::{
+    providers::{NousProviderOAuthAdapter, NOUS_CLIENT_ID},
+    ProviderOAuthService, ProviderOAuthTransportContext,
+};
 use axum::{
     body::{Body, Bytes},
     http,
@@ -186,10 +189,10 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
         ));
     };
     let provider_type = provider.provider_type.trim().to_ascii_lowercase();
-    if provider_type != "kiro" && provider_type != "windsurf" {
+    if provider_type != "kiro" && provider_type != "windsurf" && provider_type != "nous" {
         return Ok(build_internal_control_error_response(
             http::StatusCode::BAD_REQUEST,
-            "设备授权仅支持 Kiro / Windsurf provider",
+            "设备授权仅支持 Kiro / Windsurf / Nous provider",
         ));
     }
     let endpoint_resolution =
@@ -206,6 +209,87 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
             ],
         )
         .await;
+
+    if provider_type == "nous" {
+        let ctx = ProviderOAuthTransportContext {
+            provider_id: provider_id.clone(),
+            provider_type: provider_type.clone(),
+            endpoint_id: runtime_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.id.clone()),
+            key_id: None,
+            auth_type: Some("oauth".to_string()),
+            decrypted_api_key: None,
+            decrypted_auth_config: None,
+            provider_config: provider.config.clone(),
+            endpoint_config: runtime_endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.config.clone()),
+            key_config: None,
+            network: aether_oauth::network::OAuthNetworkContext::provider_operation(request_proxy),
+        };
+        let authorization = match NousProviderOAuthAdapter::default()
+            .start_device_authorization(&crate::oauth::GatewayOAuthHttpExecutor::new(*state), &ctx)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(build_internal_control_error_response(
+                    http::StatusCode::BAD_GATEWAY,
+                    format!("Nous 设备授权发起失败: {error}"),
+                ))
+            }
+        };
+        let now = current_unix_secs();
+        let session_id = generate_provider_oauth_nonce();
+        let session = StoredAdminProviderOAuthDeviceSession {
+            provider_id: provider_id.clone(),
+            region: String::new(),
+            client_id: NOUS_CLIENT_ID.to_string(),
+            client_secret: String::new(),
+            device_code: authorization.device_code.clone(),
+            auth_type: Some("nous".to_string()),
+            social_provider: None,
+            code_verifier: None,
+            redirect_uri: None,
+            machine_id: None,
+            interval: authorization.interval,
+            expires_at_unix_secs: now.saturating_add(authorization.expires_in),
+            status: "pending".to_string(),
+            proxy_node_id: payload
+                .proxy_node_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned),
+            created_at_unix_ms: now,
+            key_id: None,
+            email: None,
+            replaced: false,
+            error_msg: None,
+        };
+        if let Err(response) = state
+            .save_provider_oauth_device_session(
+                &session_id,
+                &session,
+                authorization
+                    .expires_in
+                    .saturating_add(KIRO_DEVICE_AUTH_SESSION_TTL_BUFFER_SECS),
+            )
+            .await
+        {
+            return Ok(response);
+        }
+        return Ok(Json(json!({
+            "session_id": session_id,
+            "user_code": authorization.user_code,
+            "verification_uri": authorization.verification_uri,
+            "verification_uri_complete": authorization.verification_uri_complete,
+            "expires_in": authorization.expires_in,
+            "interval": authorization.interval,
+        }))
+        .into_response());
+    }
 
     if provider_type == "windsurf" {
         let session_id = generate_provider_oauth_nonce();

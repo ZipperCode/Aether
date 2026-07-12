@@ -275,6 +275,17 @@ const WINDSURF_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     supports_local_same_format_transport: false,
     ..STANDARD_RUNTIME_POLICY
 };
+const NOUS_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    fixed_provider: true,
+    api_format_inheritance: ProviderApiFormatInheritance::OAuth,
+    enable_format_conversion_by_default: true,
+    oauth_is_bearer_like: true,
+    supports_model_fetch: true,
+    supports_local_openai_chat_transport: true,
+    supports_local_same_format_transport: true,
+    local_embedding_support: ProviderLocalEmbeddingSupport::OpenAi,
+    ..STANDARD_RUNTIME_POLICY
+};
 
 const CLAUDE_CODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "claude_code",
@@ -440,6 +451,26 @@ const WINDSURF_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTem
     }],
     runtime_policy: WINDSURF_RUNTIME_POLICY,
 };
+const NOUS_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: "nous",
+    version: 1,
+    base_url: "https://inference-api.nousresearch.com/v1",
+    endpoints: &[
+        FixedProviderEndpointTemplate {
+            item_key: "openai:chat",
+            api_format: "openai:chat",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "openai:embedding",
+            api_format: "openai:embedding",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+    ],
+    runtime_policy: NOUS_RUNTIME_POLICY,
+};
 
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
@@ -493,6 +524,7 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "vertex_ai" => Some(&VERTEX_AI_FIXED_PROVIDER_TEMPLATE),
         "antigravity" => Some(&ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE),
         "windsurf" => Some(&WINDSURF_FIXED_PROVIDER_TEMPLATE),
+        "nous" => Some(&NOUS_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }
@@ -792,6 +824,25 @@ mod tests {
         assert!(policy.oauth_is_bearer_like);
         assert!(!policy.supports_model_fetch);
         assert!(!policy.supports_local_same_format_transport);
+    }
+
+    #[test]
+    fn nous_fixed_provider_template_is_openai_compatible() {
+        let template = fixed_provider_template("nous").expect("nous template should exist");
+        assert_eq!(
+            template.base_url,
+            "https://inference-api.nousresearch.com/v1"
+        );
+        assert!(template
+            .endpoints
+            .iter()
+            .any(|item| item.api_format == "openai:chat"));
+        assert!(template
+            .endpoints
+            .iter()
+            .any(|item| item.api_format == "openai:embedding"));
+        assert!(template.runtime_policy.oauth_is_bearer_like);
+        assert!(template.runtime_policy.supports_model_fetch);
     }
 
     #[test]

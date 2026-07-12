@@ -27,7 +27,8 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogProvider,
 };
 use aether_oauth::provider::{
-    ProviderOAuthImportInput, ProviderOAuthService, ProviderOAuthTransportContext,
+    providers::NousProviderOAuthAdapter, ProviderOAuthImportInput, ProviderOAuthService,
+    ProviderOAuthTransportContext,
 };
 use axum::{
     body::{Body, Bytes},
@@ -36,6 +37,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use sha2::Digest;
 use url::{form_urlencoded, Url};
 
 const KIRO_SOCIAL_TOKEN_URL: &str = "https://prod.us-east-1.auth.desktop.kiro.dev/oauth/token";
@@ -447,6 +449,123 @@ pub(super) async fn handle_admin_provider_oauth_device_poll(
             payload.token.as_deref(),
         )
         .await;
+    }
+
+    if provider_type == "nous" {
+        let ctx = ProviderOAuthTransportContext {
+            provider_id: provider.id.clone(),
+            provider_type: provider_type.clone(),
+            endpoint_id: runtime_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.id.clone()),
+            key_id: None,
+            auth_type: Some("oauth".to_string()),
+            decrypted_api_key: None,
+            decrypted_auth_config: None,
+            provider_config: provider.config.clone(),
+            endpoint_config: runtime_endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.config.clone()),
+            key_config: None,
+            network: aether_oauth::network::OAuthNetworkContext::provider_operation(
+                request_proxy.clone(),
+            ),
+        };
+        let result = match NousProviderOAuthAdapter::default()
+            .poll_device_authorization(
+                &crate::oauth::GatewayOAuthHttpExecutor::new(*state),
+                &ctx,
+                &session.device_code,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let detail = error.to_string();
+                if detail.contains("authorization_pending") {
+                    return Ok(Json(json!({"status":"pending","replaced":false})).into_response());
+                }
+                if detail.contains("slow_down") {
+                    return Ok(Json(json!({"status":"slow_down","replaced":false})).into_response());
+                }
+                return Ok(Json(json!({"status":"error","error":format!("Nous token 获取失败: {detail}"),"replaced":false})).into_response());
+            }
+        };
+        let access_token = result.token_set.access_token.trim().to_string();
+        let auth_config = result.auth_config.as_object().cloned().unwrap_or_default();
+        let duplicate = match state
+            .find_duplicate_provider_oauth_key(&provider_id, &auth_config, None)
+            .await
+        {
+            Ok(value) => value,
+            Err(detail) => {
+                return Ok(
+                    Json(json!({"status":"error","error":detail,"replaced":false})).into_response(),
+                )
+            }
+        };
+        let api_formats = provider_oauth_active_api_formats(&endpoints);
+        let key_proxy = provider_oauth_key_proxy_value(session.proxy_node_id.as_deref());
+        let expires_at = result.token_set.expires_at_unix_secs;
+        let mut replaced = false;
+        let persisted_key = if let Some(existing) = duplicate {
+            replaced = true;
+            state
+                .update_existing_provider_oauth_catalog_key(
+                    &existing,
+                    &provider.provider_type,
+                    &access_token,
+                    &auth_config,
+                    &api_formats,
+                    key_proxy,
+                    expires_at,
+                )
+                .await?
+        } else {
+            let suffix = auth_config
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .unwrap_or("nous");
+            let key_name = format!(
+                "nous_{}",
+                &sha2::Sha256::digest(suffix.as_bytes())[..3]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
+            state
+                .create_provider_oauth_catalog_key(
+                    &provider_id,
+                    &provider.provider_type,
+                    &key_name,
+                    &access_token,
+                    &auth_config,
+                    &api_formats,
+                    key_proxy,
+                    expires_at,
+                )
+                .await?
+        };
+        let Some(persisted_key) = persisted_key else {
+            return Ok(build_internal_control_error_response(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "provider oauth write unavailable",
+            ));
+        };
+        spawn_provider_oauth_account_state_refresh_after_update(
+            state.cloned_app(),
+            provider.clone(),
+            persisted_key.id.clone(),
+            request_proxy,
+        );
+        session.status = "authorized".to_string();
+        session.key_id = Some(persisted_key.id.clone());
+        session.replaced = replaced;
+        session.error_msg = None;
+        let _ = state
+            .save_provider_oauth_device_session(session_id, &session, 60)
+            .await;
+        return Ok(attach_admin_provider_oauth_device_poll_terminal_response(session_id, "authorized", Json(json!({"status":"authorized","key_id":persisted_key.id,"email":null,"replaced":replaced})).into_response()));
     }
 
     if kiro_device_session_is_social(&session) {

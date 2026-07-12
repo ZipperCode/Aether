@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
 use aether_oauth::provider::providers::{
-    GenericProviderOAuthAdapter, GENERIC_PROVIDER_OAUTH_TEMPLATES,
+    GenericProviderOAuthAdapter, NousProviderOAuthAdapter, GENERIC_PROVIDER_OAUTH_TEMPLATES,
 };
 use aether_oauth::provider::{ProviderOAuthAccount, ProviderOAuthAdapter, ProviderOAuthTokenSet};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 
 use super::oauth_refresh::{
     oauth_error_to_local_refresh_error, provider_oauth_transport_context_from_snapshot,
@@ -44,12 +45,21 @@ impl GenericOAuthRefreshAdapter {
     fn adapter_for_provider_type(
         &self,
         provider_type: &'static str,
-    ) -> Option<GenericProviderOAuthAdapter> {
+    ) -> Option<Arc<dyn ProviderOAuthAdapter>> {
+        if provider_type == "nous" {
+            let adapter = NousProviderOAuthAdapter::default();
+            if let Some(url) = self.token_url_overrides.get(provider_type) {
+                return Some(Arc::new(
+                    adapter.with_portal_base_url_for_tests(url.clone()),
+                ));
+            }
+            return Some(Arc::new(adapter));
+        }
         let adapter = GenericProviderOAuthAdapter::for_provider_type(provider_type)?;
         if let Some(token_url) = self.token_url_overrides.get(provider_type) {
-            return Some(adapter.with_token_url_override(token_url.clone()));
+            return Some(Arc::new(adapter.with_token_url_override(token_url.clone())));
         }
-        Some(adapter)
+        Some(Arc::new(adapter))
     }
 
     fn auth_config_from_transport(transport: &GatewayProviderTransportSnapshot) -> Option<Value> {
@@ -299,6 +309,9 @@ impl LocalOAuthRefreshAdapter for GenericOAuthRefreshAdapter {
 
 fn generic_provider_type(provider_type: &str) -> Option<&'static str> {
     let normalized = provider_type.trim();
+    if normalized.eq_ignore_ascii_case("nous") {
+        return Some("nous");
+    }
     GENERIC_PROVIDER_OAUTH_TEMPLATES
         .iter()
         .find(|template| normalized.eq_ignore_ascii_case(template.provider_type))

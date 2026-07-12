@@ -318,6 +318,66 @@ describe('OAuthAccountDialog Grok import', () => {
     expect(getButton(root, '导入账号')).toBeTruthy()
   })
 
+  it('routes Nous authorization through device authorize instead of redirect OAuth', async () => {
+    endpointMocks.startDeviceAuthorize.mockResolvedValue({
+      session_id: 'session-nous-1',
+      user_code: 'NOUS-CODE',
+      verification_uri: 'https://portal.example.test/device',
+      verification_uri_complete: 'https://portal.example.test/device?code=NOUS-CODE',
+      expires_in: 600,
+      interval: 60,
+      callback_required: false,
+    })
+
+    const root = mountDialog('nous')
+    await settle()
+    getButton(root, '开始授权')?.click()
+    await settle()
+
+    expect(endpointMocks.startProviderLevelOAuth).not.toHaveBeenCalled()
+    expect(endpointMocks.startDeviceAuthorize).toHaveBeenCalledWith('provider-1', {
+      auth_type: undefined,
+      login_option: undefined,
+      start_url: undefined,
+      region: undefined,
+      proxy_node_id: undefined,
+    })
+    expect(root.textContent).toContain('在浏览器中完成授权')
+  })
+
+  it('accepts a Nous Hermes refresh token JSON and rejects access-token-only JSON', async () => {
+    endpointMocks.importProviderRefreshToken.mockResolvedValue({
+      provider_type: 'nous',
+      has_refresh_token: true,
+      replaced: false,
+    })
+    const root = mountDialog('nous')
+    await settle()
+    getExactButton(root, '导入授权')?.click()
+    await settle()
+
+    const textarea = getImportTextarea(root)
+    expect(textarea.placeholder).toContain('Hermes OAuth JSON，或 Refresh Token')
+    expect(textarea.placeholder).not.toContain('Access Token')
+
+    textarea.value = JSON.stringify({ access_token: 'not-a-real-token' })
+    textarea.dispatchEvent(new Event('input'))
+    await settle()
+    getExactButton(root, '导入')?.click()
+    await settle()
+    expect(endpointMocks.importProviderRefreshToken).not.toHaveBeenCalled()
+
+    textarea.value = JSON.stringify({ refresh_token: 'rt-placeholder' })
+    textarea.dispatchEvent(new Event('input'))
+    await settle()
+    getExactButton(root, '导入')?.click()
+    await settle()
+    expect(endpointMocks.importProviderRefreshToken).toHaveBeenCalledWith('provider-1', expect.objectContaining({
+      refresh_token: 'rt-placeholder',
+      access_token: undefined,
+    }))
+  })
+
   it('maps a single Grok JSON token into account metadata import payload', async () => {
     const root = mountDialog('grok')
     await settle()

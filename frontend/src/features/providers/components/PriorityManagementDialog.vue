@@ -877,6 +877,7 @@ const PROVIDER_TYPE_LABELS: Record<string, string> = {
   antigravity: 'Antigravity',
   kiro: 'Kiro',
   grok: 'Grok',
+  nous: 'Nous',
 }
 
 function formatProviderType(type?: string): string {

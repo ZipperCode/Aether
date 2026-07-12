@@ -2,6 +2,7 @@ mod antigravity;
 mod codex;
 mod generic;
 mod kiro;
+mod nous;
 mod windsurf;
 
 pub use antigravity::AntigravityProviderOAuthAdapter;
@@ -14,6 +15,7 @@ pub use kiro::{
     DEFAULT_KIRO_VERSION, DEFAULT_NODE_VERSION, DEFAULT_REGION, DEFAULT_SYSTEM_VERSION,
     KIRO_PROVIDER_TYPE,
 };
+pub use nous::{NousProviderOAuthAdapter, NOUS_CLIENT_ID, NOUS_PROVIDER_TYPE};
 pub use windsurf::{
     WindsurfProviderOAuthAdapter, WINDSURF_CLIENT_ID, WINDSURF_PROVIDER_TYPE,
     WINDSURF_SHOW_AUTH_TOKEN_REDIRECT, WINDSURF_SIGNIN_URL,

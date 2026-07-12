@@ -21,6 +21,12 @@ describe('providerTypeUtils', () => {
     expect(isOAuthAccountProviderType('Windsurf')).toBe(true)
     expect(isKeyManagedProviderType('windsurf')).toBe(false)
   })
+
+  it('treats Nous as an OAuth account provider', () => {
+    expect(isOAuthAccountProviderType('nous')).toBe(true)
+    expect(isOAuthAccountProviderType('Nous')).toBe(true)
+    expect(isKeyManagedProviderType('nous')).toBe(false)
+  })
 })
 
 describe('normalizeBatchImportCredentials', () => {
