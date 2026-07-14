@@ -721,15 +721,6 @@ fn resolve_response_body_limit(meta: &RequestMeta) -> usize {
         .unwrap_or(DEFAULT_MAX_RESPONSE_BODY_BYTES)
 }
 
-fn timeout_duration_from_ms(ms: u64) -> Duration {
-    Duration::from_millis(ms.clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS))
-}
-
-fn timeout_duration_from_legacy_secs(secs: u64) -> Duration {
-    let ms = secs.saturating_mul(1_000);
-    timeout_duration_from_ms(ms)
-}
-
 async fn spool_request_body(
     stream_id: u32,
     mut body_rx: mpsc::Receiver<TunnelFrame>,

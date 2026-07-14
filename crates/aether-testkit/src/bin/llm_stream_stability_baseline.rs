@@ -952,6 +952,7 @@ fn relay_envelope(config: &LlmStreamStabilityConfig, stream_index: usize) -> Vec
         stream: true,
         request_timeout_ms: None,
         stream_first_byte_timeout_ms: Some(duration_ms_u64(config.idle_timeout)),
+        max_response_body_bytes: None,
         timeout: request_timeout.as_secs().max(1),
         follow_redirects: None,
         http1_only: false,

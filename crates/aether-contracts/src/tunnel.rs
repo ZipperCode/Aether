@@ -540,6 +540,7 @@ mod tests {
             stream,
             request_timeout_ms: None,
             stream_first_byte_timeout_ms: None,
+            max_response_body_bytes: None,
             timeout: 60,
             follow_redirects: None,
             http1_only: false,

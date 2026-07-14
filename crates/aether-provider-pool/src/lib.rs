@@ -71,6 +71,7 @@ pub use service::ProviderPoolService;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quota::provider_pool_quota_snapshot_exhausted_decision;
     use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
     use aether_pool_core::PoolSchedulingPreset;
     use serde_json::{json, Value};
