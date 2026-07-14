@@ -1710,7 +1710,7 @@ async fn gateway_does_not_locally_reject_image_model_name_on_chat_completions() 
 }
 
 #[tokio::test]
-async fn gateway_rejects_image_request_with_n_greater_than_four_without_hitting_fallback_probe() {
+async fn gateway_rejects_image_request_with_n_above_gateway_limit_without_hitting_fallback_probe() {
     let fallback_probe_hits = Arc::new(Mutex::new(0usize));
     let fallback_probe_hits_clone = Arc::clone(&fallback_probe_hits);
     let fallback_probe = Router::new().route(
@@ -1745,7 +1745,7 @@ async fn gateway_rejects_image_request_with_n_greater_than_four_without_hitting_
             serde_json::to_vec(&json!({
                 "model": "grok-imagine-image-lite",
                 "prompt": "draw",
-                "n": 5,
+                "n": openai_image_gateway_max_generation_count() + 1,
                 "response_format": "b64_json"
             }))
             .expect("request body should encode"),
