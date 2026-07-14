@@ -113,10 +113,14 @@ mod tests {
 
     #[test]
     fn quota_snapshot_accepts_supported_legacy_shape_without_provider_type() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
         let key = sample_key_with_quota(json!({
             "exhausted": true,
             "reset_seconds": 300,
-            "updated_at": 1_700_000_000u64
+            "updated_at": now
         }));
 
         assert_eq!(
