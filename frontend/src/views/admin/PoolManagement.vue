@@ -958,6 +958,17 @@
       :provider-type="selectedProviderData?.provider_type || selectedProviderType"
       :batch-concurrency="selectedProviderConfig?.batch_concurrency"
       @changed="handleAccountBatchChanged"
+      @edit-config="openKeyBatchEditDialog"
+    />
+    <PoolKeyBatchEditDialog
+      v-if="selectedProviderId"
+      :open="keyBatchEditDialogOpen"
+      :provider-id="selectedProviderId"
+      :provider-name="selectedProviderData?.name || ''"
+      :key-ids="keyBatchEditKeyIds"
+      :available-api-formats="selectedProviderData?.api_formats || []"
+      @close="closeKeyBatchEditDialog"
+      @saved="handleKeyBatchEditSaved"
     />
     <KeyFormDialog
       v-if="selectedProviderId"
@@ -1064,6 +1075,7 @@ import PoolSchedulingDialog from '@/features/pool/components/PoolSchedulingDialo
 import PoolAdvancedDialog from '@/features/pool/components/PoolAdvancedDialog.vue'
 import PoolDemandMetricsDialog from '@/features/pool/components/PoolDemandMetricsDialog.vue'
 import PoolAccountBatchDialog from '@/features/pool/components/PoolAccountBatchDialog.vue'
+import PoolKeyBatchEditDialog from '@/features/pool/components/PoolKeyBatchEditDialog.vue'
 import PoolManagementHeader from '@/features/pool/components/PoolManagementHeader.vue'
 import PoolKeyQuotaPanel from '@/features/pool/components/PoolKeyQuotaPanel.vue'
 import PoolKeyStatsPanel from '@/features/pool/components/PoolKeyStatsPanel.vue'
@@ -1271,6 +1283,8 @@ async function loadOverview(options: { cacheTtlMs?: number, silent?: boolean } =
       endpointEditDialogOpen.value = false
       providerEndpointsForEdit.value = []
       showAccountBatchDialog.value = false
+      keyBatchEditDialogOpen.value = false
+      keyBatchEditKeyIds.value = []
       closeProviderProxyPopovers()
       resetKeyPage()
     }
@@ -1641,6 +1655,8 @@ async function selectProvider(
   providerEndpointsForEdit.value = []
   editingKeyDetail.value = null
   showAccountBatchDialog.value = false
+  keyBatchEditDialogOpen.value = false
+  keyBatchEditKeyIds.value = []
   keyPermissionsDialogOpen.value = false
   keyFormDialogOpen.value = false
   oauthKeyEditDialogOpen.value = false
@@ -1722,6 +1738,8 @@ const prioritySavingKeyId = ref<string | null>(null)
 
 const keyPermissionsDialogOpen = ref(false)
 const keyFormDialogOpen = ref(false)
+const keyBatchEditDialogOpen = ref(false)
+const keyBatchEditKeyIds = ref<string[]>([])
 const oauthKeyEditDialogOpen = ref(false)
 const editingKeyDetail = ref<PoolKeyDetail | null>(null)
 
@@ -2448,6 +2466,20 @@ function handleEditKey(key: PoolKeyDetail) {
 function handleKeyPermissions(key: PoolKeyDetail) {
   editingKeyDetail.value = key
   keyPermissionsDialogOpen.value = true
+}
+
+function openKeyBatchEditDialog(keyIds: string[]): void {
+  keyBatchEditKeyIds.value = [...new Set(keyIds)]
+  keyBatchEditDialogOpen.value = keyBatchEditKeyIds.value.length > 0
+}
+
+function closeKeyBatchEditDialog(): void {
+  keyBatchEditDialogOpen.value = false
+  keyBatchEditKeyIds.value = []
+}
+
+async function handleKeyBatchEditSaved(): Promise<void> {
+  await Promise.all([loadKeys(), loadOverview()])
 }
 
 async function handleDialogSaved() {

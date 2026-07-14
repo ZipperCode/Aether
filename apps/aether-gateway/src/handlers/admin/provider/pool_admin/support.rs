@@ -259,6 +259,10 @@ pub(crate) fn is_admin_pool_route(request_context: &AdminRequestContext<'_>) -> 
             && path.starts_with("/api/admin/pool/")
             && path.ends_with("/keys/batch-action")
             && path.matches('/').count() == 6)
+        || (request_context.method() == http::Method::PATCH
+            && path.starts_with("/api/admin/pool/")
+            && path.ends_with("/keys/batch-update")
+            && path.matches('/').count() == 6)
         || (request_context.method() == http::Method::POST
             && path.starts_with("/api/admin/pool/")
             && path.ends_with("/keys/selection-snapshot")

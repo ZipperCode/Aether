@@ -15,6 +15,8 @@ mod batch_import;
 mod batch_shared;
 #[path = "batch_routes/task_status.rs"]
 mod batch_task_status;
+#[path = "batch_routes/update.rs"]
+mod batch_update;
 pub(crate) mod payloads;
 #[path = "read_routes/keys.rs"]
 mod read_keys;
@@ -168,6 +170,16 @@ pub(crate) async fn maybe_build_local_admin_pool_response(
         Some("batch_action_keys") => {
             return Ok(Some(
                 batch_action::build_admin_pool_batch_action_response(
+                    state,
+                    request_context,
+                    request_body,
+                )
+                .await?,
+            ));
+        }
+        Some("batch_update_keys") => {
+            return Ok(Some(
+                batch_update::build_admin_pool_batch_update_response(
                     state,
                     request_context,
                     request_body,

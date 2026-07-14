@@ -370,97 +370,113 @@ async fn gateway_handles_admin_pool_scheduling_presets_locally_with_trusted_admi
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_pool_batch_import_locally_with_trusted_admin_principal() {
-    let upstream_hits = Arc::new(Mutex::new(0usize));
-    let upstream_hits_clone = Arc::clone(&upstream_hits);
-    let upstream = Router::new().route(
-        "/api/admin/pool/provider-openai/keys/batch-import",
-        any(move |_request: Request| {
-            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
-            async move {
-                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
-                (StatusCode::OK, Body::from("unexpected upstream hit"))
-            }
-        }),
-    );
+#[test]
+fn gateway_handles_admin_pool_batch_import_locally_with_trusted_admin_principal() {
+    std::thread::Builder::new()
+        .name("admin-pool-batch-import-test".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime should build");
+            runtime.block_on(async {
+                let upstream_hits = Arc::new(Mutex::new(0usize));
+                let upstream_hits_clone = Arc::clone(&upstream_hits);
+                let upstream = Router::new().route(
+                    "/api/admin/pool/provider-openai/keys/batch-import",
+                    any(move |_request: Request| {
+                        let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+                        async move {
+                            *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                            (StatusCode::OK, Body::from("unexpected upstream hit"))
+                        }
+                    }),
+                );
 
-    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider("provider-openai", "openai", 10)],
-        vec![sample_endpoint(
-            "endpoint-openai-chat",
-            "provider-openai",
-            "openai:chat",
-            "https://api.openai.com/v1",
-        )],
-        vec![],
-    ));
+                let provider_catalog_repository =
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![sample_provider("provider-openai", "openai", 10)],
+                        vec![sample_endpoint(
+                            "endpoint-openai-chat",
+                            "provider-openai",
+                            "openai:chat",
+                            "https://api.openai.com/v1",
+                        )],
+                        vec![],
+                    ));
 
-    let (upstream_url, upstream_handle) = start_server(upstream).await;
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(
-                GatewayDataState::with_provider_catalog_repository_for_tests(
-                    provider_catalog_repository.clone(),
-                )
-                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
-            ),
-    );
-    let (gateway_url, gateway_handle) = start_server(gateway).await;
+                let (upstream_url, upstream_handle) = start_server(upstream).await;
+                let gateway = build_router_with_state(
+                    AppState::new()
+                        .expect("gateway should build")
+                        .with_data_state_for_tests(
+                            GatewayDataState::with_provider_catalog_repository_for_tests(
+                                provider_catalog_repository.clone(),
+                            )
+                            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+                        ),
+                );
+                let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{gateway_url}/api/admin/pool/provider-openai/keys/batch-import"
-        ))
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
-        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
-        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
-        .json(&json!({
-            "proxy_node_id": "proxy-node-1",
-            "keys": [
-                {
-                    "name": "batch key a",
-                    "api_key": "sk-batch-a"
-                },
-                {
-                    "name": "batch key b",
-                    "api_key": ""
-                }
-            ]
-        }))
-        .send()
-        .await
-        .expect("request should succeed");
+                let response = reqwest::Client::new()
+                    .post(format!(
+                        "{gateway_url}/api/admin/pool/provider-openai/keys/batch-import"
+                    ))
+                    .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+                    .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+                    .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+                    .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+                    .json(&json!({
+                        "proxy_node_id": "proxy-node-1",
+                        "keys": [
+                            {
+                                "name": "batch key a",
+                                "api_key": "sk-batch-a"
+                            },
+                            {
+                                "name": "batch key b",
+                                "api_key": ""
+                            }
+                        ]
+                    }))
+                    .send()
+                    .await
+                    .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["imported"], 1);
-    assert_eq!(payload["skipped"], 0);
-    let errors = payload["errors"]
-        .as_array()
-        .expect("errors should be an array");
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0]["index"], 1);
-    assert_eq!(errors[0]["reason"], "api_key is empty");
-    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+                assert_eq!(response.status(), StatusCode::OK);
+                let payload: serde_json::Value =
+                    response.json().await.expect("json body should parse");
+                assert_eq!(payload["imported"], 1);
+                assert_eq!(payload["skipped"], 0);
+                let errors = payload["errors"]
+                    .as_array()
+                    .expect("errors should be an array");
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0]["index"], 1);
+                assert_eq!(errors[0]["reason"], "api_key is empty");
+                assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
-    let keys = provider_catalog_repository
-        .list_keys_by_provider_ids(&["provider-openai".to_string()])
-        .await
-        .expect("keys should read");
-    assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0].name, "batch key a");
-    assert_eq!(keys[0].auth_type, "api_key");
-    assert_eq!(keys[0].api_formats, Some(json!(["openai:chat"])));
-    assert_eq!(
-        keys[0].proxy,
-        Some(json!({"node_id": "proxy-node-1", "enabled": true}))
-    );
+                let keys = provider_catalog_repository
+                    .list_keys_by_provider_ids(&["provider-openai".to_string()])
+                    .await
+                    .expect("keys should read");
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0].name, "batch key a");
+                assert_eq!(keys[0].auth_type, "api_key");
+                assert_eq!(keys[0].api_formats, Some(json!(["openai:chat"])));
+                assert_eq!(
+                    keys[0].proxy,
+                    Some(json!({"node_id": "proxy-node-1", "enabled": true}))
+                );
 
-    gateway_handle.abort();
-    upstream_handle.abort();
+                gateway_handle.abort();
+                upstream_handle.abort();
+            });
+        })
+        .expect("test thread should spawn")
+        .join()
+        .expect("test thread should finish");
 }
 
 #[tokio::test]
@@ -4926,6 +4942,127 @@ async fn gateway_handles_admin_pool_batch_action_locally_with_trusted_admin_prin
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_batch_updates_shared_pool_key_configuration() {
+    let provider = sample_provider("provider-openai", "openai", 10).with_transport_fields(
+        true,
+        false,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(json!({
+            "pool_advanced": {
+                "enabled": true
+            }
+        })),
+    );
+    let mut first_key = sample_key("key-openai-a", "provider-openai", "openai:chat", "sk-a");
+    first_key.name = "alpha".to_string();
+    first_key.auto_fetch_models = true;
+    first_key.allowed_models = Some(json!(["legacy-model"]));
+    let mut second_key = sample_key("key-openai-b", "provider-openai", "openai:chat", "sk-b");
+    second_key.name = "beta".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![first_key, second_key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                &provider_catalog_repository,
+            )),
+        );
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::PATCH,
+        "/api/admin/pool/provider-openai/keys/batch-update",
+        Some(json!({
+            "key_ids": ["key-openai-b", "key-openai-a", "key-openai-a"],
+            "patch": {
+                "api_formats": ["openai:responses"],
+                "internal_priority": 7,
+                "rpm_limit": null,
+                "auto_fetch_models": false,
+                "allowed_models": ["gpt-5.6-sol", "gpt-5.6-luna"],
+                "locked_models": [],
+                "note": null
+            }
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    assert_eq!(payload["affected"], json!(2));
+    assert_eq!(payload["model_sync"], serde_json::Value::Null);
+
+    let stored = provider_catalog_repository
+        .list_keys_by_ids(&["key-openai-a".to_string(), "key-openai-b".to_string()])
+        .await
+        .expect("keys should load");
+    assert_eq!(stored.len(), 2);
+    for key in stored {
+        assert_eq!(key.api_formats, Some(json!(["openai:responses"])));
+        assert_eq!(key.internal_priority, 7);
+        assert_eq!(key.rpm_limit, None);
+        assert!(!key.auto_fetch_models);
+        assert_eq!(
+            key.allowed_models,
+            Some(json!(["gpt-5.6-sol", "gpt-5.6-luna"]))
+        );
+        assert_eq!(key.locked_models, None);
+        assert_eq!(key.note, None);
+    }
+}
+
+#[tokio::test]
+async fn gateway_rejects_pool_batch_update_before_writing_any_key() {
+    let provider = sample_provider("provider-openai", "openai", 10);
+    let mut first_key = sample_key("key-openai-a", "provider-openai", "openai:chat", "sk-a");
+    first_key.internal_priority = 3;
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![first_key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                &provider_catalog_repository,
+            )),
+        );
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::PATCH,
+        "/api/admin/pool/provider-openai/keys/batch-update",
+        Some(json!({
+            "key_ids": ["key-openai-a", "key-missing"],
+            "patch": { "internal_priority": 9 }
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let stored = provider_catalog_repository
+        .list_keys_by_ids(&["key-openai-a".to_string()])
+        .await
+        .expect("key should load");
+    assert_eq!(stored[0].internal_priority, 3);
 }
 
 #[tokio::test]

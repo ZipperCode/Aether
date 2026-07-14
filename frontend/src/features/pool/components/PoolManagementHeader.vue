@@ -394,7 +394,7 @@ const desktopPostProxyActions = computed<HeaderAction[]>(() => {
   }
   actions.push(
     { key: 'advanced', title: legacyT('高级设置'), event: 'advanced', icon: Settings2 },
-    { key: 'accountBatch', title: legacyT('账号'), event: 'accountBatch', icon: Users },
+    { key: 'accountBatch', title: legacyT('账号批量操作'), event: 'accountBatch', icon: Users },
     { key: 'toggleProvider', title: props.providerToggleButtonTitle, event: 'toggleProvider', icon: Power },
   )
   return actions

@@ -192,6 +192,16 @@ impl<'a> AdminAppState<'a> {
             .await
     }
 
+    pub(crate) async fn update_provider_catalog_keys(
+        &self,
+        keys: &[aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey],
+    ) -> Result<
+        Option<Vec<aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey>>,
+        GatewayError,
+    > {
+        self.app.update_provider_catalog_keys(keys).await
+    }
+
     pub(crate) async fn create_provider_catalog_key(
         &self,
         key: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,

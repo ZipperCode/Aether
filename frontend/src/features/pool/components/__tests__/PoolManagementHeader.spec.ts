@@ -39,6 +39,7 @@ describe('PoolManagementHeader', () => {
           refreshTitle: '刷新',
           onImport: () => events.push('import'),
           onScheduling: () => events.push('scheduling'),
+          onAccountBatch: () => events.push('accountBatch'),
           onDemandMetrics: () => events.push('demandMetrics'),
           onRefresh: () => events.push('refresh'),
         })
@@ -53,10 +54,11 @@ describe('PoolManagementHeader', () => {
 
     root.querySelector<HTMLButtonElement>('[title="添加账号"]')?.click()
     root.querySelector<HTMLButtonElement>('[title="点击调整号池调度"]')?.click()
+    root.querySelector<HTMLButtonElement>('[title="账号批量操作"]')?.click()
     root.querySelector<HTMLButtonElement>('[title="查看自适应热池指标"]')?.click()
     root.querySelector<HTMLButtonElement>('[title="刷新"]')?.click()
 
-    expect(events).toEqual(['import', 'scheduling', 'demandMetrics', 'refresh'])
+    expect(events).toEqual(['import', 'scheduling', 'accountBatch', 'demandMetrics', 'refresh'])
     expect(root.textContent).toContain('2 维度')
 
     app.unmount()
