@@ -16,9 +16,26 @@ if [ ! -f .env ]; then
 	exit 1
 fi
 
+process_runtime_backend_is_set=false
+process_runtime_backend=""
+if [[ -v AETHER_RUNTIME_BACKEND ]]; then
+	process_runtime_backend_is_set=true
+	process_runtime_backend="$${AETHER_RUNTIME_BACKEND}"
+fi
+
 set -a
 source .env
 set +a
+
+# An explicit development override wins. Otherwise preserve the process
+# environment ahead of .env, and use memory only when neither defines a value.
+if [[ -v DEV_RUNTIME_BACKEND ]]; then
+	export AETHER_RUNTIME_BACKEND="$${DEV_RUNTIME_BACKEND}"
+elif [ "$${process_runtime_backend_is_set}" = "true" ]; then
+	export AETHER_RUNTIME_BACKEND="$${process_runtime_backend}"
+elif ! [[ -v AETHER_RUNTIME_BACKEND ]]; then
+	export AETHER_RUNTIME_BACKEND=memory
+fi
 
 dotenv_has_key() {
 	local key="$$1"

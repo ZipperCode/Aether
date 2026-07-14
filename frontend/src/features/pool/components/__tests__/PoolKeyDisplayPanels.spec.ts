@@ -82,4 +82,181 @@ describe('pool key display panels', () => {
     app.unmount()
     root.remove()
   })
+
+  it('renders structured provider balances instead of plain fallback text', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [],
+      providerType: 'deepseek',
+      quota: {
+        code: 'ok', exhausted: false, kind: 'balance',
+        balances: [{ unit: 'CNY', available: '47.73', granted: '0', topped_up: '47.73' }],
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    expect(root.querySelector('[data-testid="pool-quota-balance"]')?.textContent).toContain('47.73 CNY')
+    expect(root.textContent).not.toContain('可用 47.73 CNY')
+    app.unmount()
+    root.remove()
+  })
+
+  it('renders every currency with exact decimal strings', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [],
+      providerType: 'siliconflow',
+      quota: {
+        code: 'ok', exhausted: false, kind: 'balance',
+        balances: [
+          { unit: 'CNY', available: '9007199254740993.123456789' },
+          { unit: 'USD', available: '0.000000000000000001' },
+        ],
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    const balances = [...root.querySelectorAll('[data-testid="pool-quota-balance"]')]
+      .map(element => element.textContent)
+    expect(balances).toHaveLength(2)
+    expect(balances[0]).toContain('9,007,199,254,740,993.123456789 CNY')
+    expect(balances[1]).toContain('$0.000000000000000001')
+    expect(root.querySelector('[data-testid="pool-quota-available"]')?.classList).toContain('break-all')
+    expect(root.querySelector('[data-testid="pool-quota-available"]')?.classList).not.toContain('whitespace-nowrap')
+    app.unmount()
+    root.remove()
+  })
+
+  it('uses an alert tone for a negative available balance', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [], providerType: 'siliconflow',
+      quota: { code: 'ok', exhausted: true, balances: [{ unit: 'CNY', available: '-33.6545' }] },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    const available = root.querySelector('[data-testid="pool-quota-available"]')
+    expect(available?.classList).toContain('text-red-600')
+    expect(available?.classList).toContain('whitespace-nowrap')
+    expect(available?.classList).not.toContain('break-all')
+    app.unmount()
+    root.remove()
+  })
+
+  it('does not render a percentage meter for unlimited balances', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [],
+      providerType: 'openrouter',
+      quota: {
+        code: 'ok', exhausted: false, kind: 'balance', unlimited: true,
+        balances: [{ unit: 'USD', available: null, used: '45.421278308', total: null }],
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    expect(root.textContent).toContain('无限制')
+    expect(root.textContent).not.toContain('100.0%')
+    expect(root.querySelector('[style*="width: 100%"]')).toBeFalsy()
+    app.unmount()
+    root.remove()
+  })
+
+  it('renders structured subscription windows when the pool has no legacy items', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [],
+      providerType: 'kimi_coding',
+      quota: {
+        code: 'ok', exhausted: false, kind: 'subscription',
+        windows: [{ code: 'cycle', label: '周期配额', remaining_ratio: '0.99', remaining_value: '99', limit_value: '100' }],
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    expect(root.textContent).toContain('周期配额')
+    expect(root.querySelector('[data-testid="pool-quota-meter-text"]')?.textContent).toBe('99 / 100')
+    app.unmount()
+    root.remove()
+  })
+
+  it('preserves exact decimal strings in subscription window values', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [],
+      providerType: 'kimi_coding',
+      quota: {
+        code: 'ok', exhausted: false, kind: 'subscription',
+        windows: [{
+          code: 'cycle', label: '周期配额', remaining_ratio: '0.5',
+          remaining_value: '9007199254740993.123456789012345678',
+          limit_value: '18014398509481986.246913578024691356',
+        }],
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    const meter = root.querySelector('[data-testid="pool-quota-meter-text"]')
+    expect(meter?.textContent).toBe(
+      '9,007,199,254,740,993.123456789012345678 / 18,014,398,509,481,986.246913578024691356',
+    )
+    expect(meter?.classList).toContain('break-all')
+    app.unmount()
+    root.remove()
+  })
+
+  for (const providerType of ['deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai']) {
+    it(`keeps the pool quota column visible for ${providerType} before a snapshot exists`, () => {
+      const root = document.createElement('div')
+      document.body.appendChild(root)
+      const app = createApp(PoolKeyQuotaPanel, {
+        items: [],
+        providerType,
+        quota: null,
+      })
+      app.use(createI18n())
+      app.mount(root)
+
+      expect(root.textContent).toContain('待刷新')
+      app.unmount()
+      root.remove()
+    })
+  }
+
+  for (const providerType of ['codex', 'gemini_cli', 'kiro', 'windsurf', 'grok', 'nous', 'antigravity', 'chatgpt_web']) {
+    it(`does not route legacy ${providerType} snapshots through the new generic pool UI`, () => {
+      const root = document.createElement('div')
+      document.body.appendChild(root)
+      const app = createApp(PoolKeyQuotaPanel, {
+        items: [],
+        providerType,
+        quota: {
+          code: 'ok', exhausted: false,
+          balances: [{ unit: 'USD', available: '99' }],
+          windows: [{ code: 'legacy', label: '不应显示', remaining_ratio: 0.5 }],
+        },
+      })
+      app.use(createI18n())
+      app.mount(root)
+
+      expect(root.querySelector('[data-testid="pool-quota-balance"]')).toBeFalsy()
+      expect(root.querySelector('[data-testid="pool-quota-meter-text"]')).toBeFalsy()
+      expect(root.textContent).not.toContain('不应显示')
+      expect(root.textContent?.trim()).toBe('-')
+      app.unmount()
+      root.remove()
+    })
+  }
 })

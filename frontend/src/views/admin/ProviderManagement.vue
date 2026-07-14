@@ -59,7 +59,7 @@
       <!-- 桌面端表格 -->
       <div
         v-else
-        class="hidden xl:block overflow-x-auto"
+        class="hidden 2xl:block overflow-x-auto"
       >
         <Table>
           <TableHeader>
@@ -71,7 +71,7 @@
                 {{ legacyT('余额监控') }}
               </TableHead>
               <SortableTableHead
-                class="w-[12%] min-w-[100px] text-center"
+                class="w-[16%] min-w-[150px] text-center"
                 column-key="model"
                 :sortable="false"
                 align="center"
@@ -89,7 +89,7 @@
                 </template>
               </SortableTableHead>
               <SortableTableHead
-                class="w-[24%] min-w-[260px]"
+                class="w-[20%] min-w-[240px]"
                 column-key="api_format"
                 :sortable="false"
                 :filter-active="filterApiFormat !== 'all'"
@@ -162,7 +162,7 @@
       <!-- 移动端卡片列表 -->
       <div
         v-if="!loading && providers.length > 0"
-        class="xl:hidden divide-y divide-border/40"
+        class="2xl:hidden divide-y divide-border/40"
       >
         <ProviderMobileCard
           v-for="provider in displayedProviders"

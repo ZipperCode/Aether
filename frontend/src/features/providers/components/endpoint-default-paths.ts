@@ -3,6 +3,16 @@ interface ApiFormatPathDefinition {
   default_path: string
 }
 
+const OFFICIAL_PROVIDER_ENDPOINT_BASE_URLS: Readonly<Record<string, string>> = {
+  deepseek: 'https://api.deepseek.com',
+  openrouter: 'https://openrouter.ai/api/v1',
+  moonshot: 'https://api.moonshot.cn/v1',
+  kimi_coding: 'https://api.kimi.com/coding',
+  siliconflow: 'https://api.siliconflow.cn/v1',
+  zhipu: 'https://open.bigmodel.cn/api/paas/v4',
+  zai: 'https://api.z.ai/api/paas/v4',
+}
+
 export function normalizeEndpointApiFormat(apiFormat: string): string {
   switch (apiFormat.trim().toLowerCase()) {
     default:
@@ -165,6 +175,20 @@ export function getDefaultEndpointBaseUrl(params: {
     return appendVersionedApiRoot(rawBaseUrl, versionedApiRootSuffix(normalizedApiFormat))
   }
   return rawBaseUrl
+}
+
+export function resolveNewEndpointBaseUrl(params: {
+  apiFormat: string
+  providerType?: string | null
+  explicitBaseUrl?: string | null
+  website?: string | null
+}): string {
+  const explicitBaseUrl = (params.explicitBaseUrl || '').trim()
+  if (explicitBaseUrl) return explicitBaseUrl
+  const providerType = (params.providerType || '').trim().toLowerCase()
+  const seedBaseUrl = OFFICIAL_PROVIDER_ENDPOINT_BASE_URLS[providerType]
+    || (params.website || '').trim()
+  return getDefaultEndpointBaseUrl({ apiFormat: params.apiFormat, baseUrl: seedBaseUrl })
 }
 
 export function getDefaultEndpointPath(params: {

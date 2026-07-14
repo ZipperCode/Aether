@@ -215,6 +215,8 @@ pub struct RequestMeta {
     pub timeout: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_redirects: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_body_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub http1_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -640,6 +642,16 @@ mod tests {
         let raw = br#"{"method":"GET","url":"https://example.com","headers":{},"timeout":15.0}"#;
         let meta: RequestMeta = serde_json::from_slice(raw).expect("parse request meta");
         assert_eq!(meta.timeout, 15);
+    }
+
+    #[test]
+    fn old_request_meta_without_response_limit_remains_compatible() {
+        // Given / When
+        let raw = br#"{"method":"GET","url":"https://example.com","headers":{},"timeout":15}"#;
+        let meta: RequestMeta = serde_json::from_slice(raw).expect("parse old request meta");
+
+        // Then
+        assert_eq!(meta.max_response_body_bytes, None);
     }
 
     #[test]

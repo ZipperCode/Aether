@@ -1,11 +1,16 @@
 pub mod antigravity;
 pub mod chatgpt_web;
 pub mod codex;
+pub mod deepseek;
 pub mod default;
 pub mod gemini_cli;
 pub mod grok;
 pub mod kiro;
 pub mod nous;
+pub mod official_api_key;
+mod official_balance;
+mod official_subscription;
+pub mod openrouter;
 pub mod unsupported;
 pub mod windsurf;
 
@@ -25,6 +30,10 @@ pub use codex::{
     build_codex_pool_reset_credits_request, CODEX_WHAM_RESET_CREDITS_CONSUME_URL,
     CODEX_WHAM_RESET_CREDITS_URL, CODEX_WHAM_USAGE_URL,
 };
+pub use deepseek::{
+    build_deepseek_balance_request, is_official_deepseek_endpoint, parse_deepseek_balance,
+    DeepSeekProviderPoolAdapter, DEEPSEEK_BALANCE_URL,
+};
 pub use default::DefaultProviderPoolAdapter;
 pub use gemini_cli::GeminiCliProviderPoolAdapter;
 pub use gemini_cli::{
@@ -42,6 +51,16 @@ pub use kiro::{
 pub use nous::{
     build_nous_account_quota_request, build_nous_billing_quota_request, NousProviderPoolAdapter,
     NOUS_ACCOUNT_PATH, NOUS_BILLING_PATH, NOUS_PORTAL_BASE_URL,
+};
+pub use official_api_key::{
+    build_official_api_key_quota_request, is_official_api_key_quota_endpoint,
+    parse_official_api_key_quota, OfficialApiKeyQuotaProvider,
+    OfficialApiKeyQuotaProviderPoolAdapter,
+};
+pub use official_balance::clamp_official_balance_execution_timeouts;
+pub use openrouter::{
+    build_openrouter_credits_request, is_official_openrouter_endpoint, parse_openrouter_credits,
+    OpenRouterProviderPoolAdapter, OPENROUTER_CREDITS_URL,
 };
 pub use unsupported::{
     UnsupportedQuotaProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,

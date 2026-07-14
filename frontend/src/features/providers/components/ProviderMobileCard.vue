@@ -4,10 +4,13 @@
     @click="$emit('viewDetail', provider.id)"
   >
     <!-- 第一行：名称 + 状态 + 操作 -->
-    <div class="flex items-start justify-between gap-3">
+    <div class="space-y-2">
       <div class="flex-1 min-w-0 space-y-0.5">
-        <div class="flex items-center gap-1.5">
-          <span class="font-medium text-foreground truncate">{{ provider.name }}</span>
+        <div class="flex items-start gap-1.5">
+          <span
+            class="min-w-0 break-words font-medium text-foreground"
+            data-testid="provider-mobile-name"
+          >{{ provider.name }}</span>
           <a
             v-if="provider.website"
             :href="provider.website"
@@ -68,7 +71,8 @@
         >{{ legacyT('添加备注') }}</span>
       </div>
       <div
-        class="flex items-center gap-0.5 shrink-0"
+        class="flex items-center justify-end gap-0.5"
+        data-testid="provider-mobile-actions"
         @click.stop
       >
         <Button

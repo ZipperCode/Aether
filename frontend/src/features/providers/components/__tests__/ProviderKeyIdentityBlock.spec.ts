@@ -83,6 +83,7 @@ describe('ProviderKeyIdentityBlock', () => {
       oauthOrgBadge: { label: 'org:demo', title: 'org_id: demo' },
       kiroSubscriptionLabel: 'Pro',
       kiroSubscriptionClass: 'text-blue-600',
+      quotaTypeLabel: 'Token',
       canExportCredential: true,
       showOAuthRefreshControl: true,
       oauthStatus: { text: '12m', isExpired: false, isExpiringSoon: true, isInvalid: false },
@@ -98,6 +99,7 @@ describe('ProviderKeyIdentityBlock', () => {
     expect(root.querySelector('[data-testid="provider-key-oauth-plan"]')?.textContent).toContain('Team')
     expect(root.querySelector('[data-testid="provider-key-oauth-org"]')?.textContent).toContain('org:demo')
     expect(root.querySelector('[data-testid="provider-key-kiro-plan"]')?.textContent).toContain('Pro')
+    expect(root.querySelector('[data-testid="provider-key-quota-type"]')?.textContent).toContain('Token')
     expect(root.querySelector('[data-testid="provider-key-oauth-status"]')?.textContent).toContain('12m')
     expect(root.querySelector('[data-testid="provider-key-temporary"]')).toBeTruthy()
 

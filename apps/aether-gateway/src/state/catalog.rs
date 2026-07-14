@@ -794,6 +794,29 @@ impl AppState {
         Ok(updated)
     }
 
+    pub(crate) async fn mutate_provider_catalog_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota_snapshot: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, GatewayError> {
+        let updated = self
+            .data
+            .mutate_provider_catalog_key_quota_snapshot(
+                key_id,
+                quota_snapshot,
+                updated_at_unix_secs,
+            )
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        Ok(updated)
+    }
+
+    pub(crate) fn invalidate_provider_quota_candidate_caches(&self) {
+        self.candidate_page_cache.clear();
+        self.candidate_resolved_page_cache.clear();
+    }
+
     pub(crate) async fn delete_provider_catalog_key(
         &self,
         key_id: &str,
@@ -1435,5 +1458,141 @@ mod tests {
 
         assert!(updated.is_some());
         assert!(state.candidate_page_cache.get(&cache_key, ttl).is_some());
+    }
+
+    #[tokio::test]
+    async fn balance_quota_snapshot_write_preserves_transport_and_candidate_page_caches() {
+        // Given
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider()],
+            vec![sample_endpoint()],
+            vec![sample_key()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+        state
+            .read_provider_transport_snapshot("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("provider transport should read")
+            .expect("provider transport should exist");
+        let ttl = Duration::from_secs(300);
+        let cache_key = CandidatePageCacheKey::new(
+            "gpt-5",
+            "openai:chat",
+            true,
+            &sample_auth_snapshot(),
+            None,
+            None,
+            None,
+            state.scheduler_affinity_epoch(),
+            "fixed_order",
+            true,
+            None,
+            "",
+        );
+        state.candidate_page_cache.insert(
+            cache_key.clone(),
+            Some(Arc::new(crate::cache::CandidatePageSnapshot {
+                candidates: Vec::new(),
+                skipped_candidates: Vec::new(),
+            })),
+            ttl,
+        );
+
+        // When
+        let updated = state
+            .mutate_provider_catalog_key_quota_snapshot(
+                "key-1",
+                &serde_json::json!({"schema_version": 1, "kind": "balance"}),
+                Some(100),
+            )
+            .await
+            .expect("balance quota write should succeed");
+
+        // Then
+        assert!(updated);
+        assert_eq!(state.provider_transport_snapshot_cache.len(), 1);
+        assert!(state.candidate_page_cache.get(&cache_key, ttl).is_some());
+        let stored = state
+            .list_provider_catalog_keys_by_ids(&["key-1".to_string()])
+            .await
+            .expect("catalog should reload");
+        assert_eq!(
+            stored[0]
+                .status_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pointer("/quota/kind")),
+            Some(&serde_json::json!("balance"))
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_candidate_cache_invalidation_preserves_transport_and_affinity() {
+        // Given
+        let mut key = sample_key();
+        key.status_snapshot = Some(serde_json::json!({
+            "quota": {"schema_version": 1, "kind": "subscription", "exhausted": false}
+        }));
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider()],
+            vec![sample_endpoint()],
+            vec![key],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+        state
+            .read_provider_transport_snapshot("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("provider transport should read")
+            .expect("provider transport should exist");
+        let ttl = Duration::from_secs(300);
+        let cache_key = CandidatePageCacheKey::new(
+            "gpt-5",
+            "openai:chat",
+            true,
+            &sample_auth_snapshot(),
+            None,
+            None,
+            None,
+            state.scheduler_affinity_epoch(),
+            "fixed_order",
+            true,
+            None,
+            "",
+        );
+        state.candidate_page_cache.insert(
+            cache_key.clone(),
+            Some(Arc::new(crate::cache::CandidatePageSnapshot {
+                candidates: Vec::new(),
+                skipped_candidates: Vec::new(),
+            })),
+            ttl,
+        );
+        let affinity_key = "quota-cache-affinity";
+        let affinity_target = SchedulerAffinityTarget {
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+        };
+        state.remember_scheduler_affinity_target(affinity_key, affinity_target.clone(), ttl, 128);
+
+        // When
+        state.invalidate_provider_quota_candidate_caches();
+
+        // Then
+        assert!(state.candidate_page_cache.get(&cache_key, ttl).is_none());
+        assert_eq!(state.provider_transport_snapshot_cache.len(), 1);
+        assert_eq!(
+            state.read_scheduler_affinity_target(affinity_key, ttl),
+            Some(affinity_target)
+        );
     }
 }

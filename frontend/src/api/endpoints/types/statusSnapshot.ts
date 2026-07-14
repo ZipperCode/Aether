@@ -39,6 +39,7 @@ export interface QuotaWindowSnapshot {
   remaining_value?: DecimalJsonValue
   limit_value?: DecimalJsonValue
   reset_at?: number | null
+  reset_at_text?: string | null
   reset_seconds?: number | null
   window_minutes?: number | null
   is_exhausted?: boolean | null
@@ -52,6 +53,11 @@ export interface QuotaCreditsSnapshot {
   consumed?: number | null
   total?: number | null
   unlimited?: boolean | null
+  is_free_tier?: boolean | null
+  is_management_key?: boolean | null
+  is_provisioning_key?: boolean | null
+  limit_reset?: string | number | null
+  expires_at?: string | number | null
   trace_id?: string | null
   updated_at?: number | null
 }
@@ -74,7 +80,26 @@ export interface QuotaResetCreditsSnapshot {
   credits?: QuotaResetCreditSnapshot[] | null
 }
 
+export interface QuotaBalanceSnapshot {
+  unit: string
+  available?: DecimalJsonValue
+  total?: DecimalJsonValue
+  granted?: DecimalJsonValue
+  topped_up?: DecimalJsonValue
+  used?: DecimalJsonValue
+}
+
+export interface QuotaRefreshStateSnapshot {
+  last_attempt_at?: number | null
+  last_success_at?: number | null
+  error?: string | null
+  next_eligible_at?: number | null
+  failure_count?: number | null
+}
+
 export interface QuotaStatusSnapshot {
+  schema_version?: number | null
+  kind?: 'balance' | 'subscription' | string | null
   version?: number | null
   provider_type?: string | null
   code: 'unknown' | 'ok' | 'exhausted' | 'cooldown' | 'forbidden' | 'banned' | string
@@ -84,6 +109,15 @@ export interface QuotaStatusSnapshot {
   source?: string | null
   observed_at?: number | null
   exhausted: boolean
+  unlimited?: boolean | null
+  is_free_tier?: boolean | null
+  is_management_key?: boolean | null
+  is_provisioning_key?: boolean | null
+  limit_reset?: string | number | null
+  expires_at?: string | number | null
+  membership_level?: string | null
+  subscription_type?: string | null
+  parallel_limit?: DecimalJsonValue
   usage_ratio?: number | null
   updated_at?: number | null
   reset_at?: number | null
@@ -94,6 +128,8 @@ export interface QuotaStatusSnapshot {
   reset_credits?: QuotaResetCreditsSnapshot | null
   allowed_models_count?: number | null
   rate_limit?: Record<string, unknown> | null
+  balances?: QuotaBalanceSnapshot[] | null
+  refresh_state?: QuotaRefreshStateSnapshot | null
   /** Nous account and billing summary. Decimal values may arrive as strings. */
   balance_usd?: number | string | null
   purchased_credits_remaining?: number | string | null

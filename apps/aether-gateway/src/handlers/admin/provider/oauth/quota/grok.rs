@@ -250,7 +250,7 @@ async fn execute_grok_quota_plan(
     ));
     let transport_profile = state.resolve_transport_profile(transport);
     let base_url = grok_base_url(endpoint);
-    let headers = build_grok_quota_headers(
+    let mut headers = build_grok_quota_headers(
         grok_auth_config(transport).as_ref(),
         transport_profile.as_ref(),
         &base_url,
@@ -258,6 +258,10 @@ async fn execute_grok_quota_plan(
     .ok_or_else(|| {
         GatewayError::Internal("unsupported Grok browser transport profile".to_string())
     })?;
+    headers.insert(
+        aether_contracts::EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER.to_string(),
+        "false".to_string(),
+    );
     let plan = ExecutionPlan {
         request_id: format!("grok-quota:{}", transport.key.id),
         candidate_id: None,

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
@@ -12,6 +13,7 @@ use axum::routing::{any, post};
 use axum::{extract::Request, Json, Router};
 use http::StatusCode;
 use serde_json::json;
+use tokio::sync::oneshot;
 
 use super::super::super::{
     build_router_with_state, build_state_with_execution_runtime_override, sample_endpoint,
@@ -24,6 +26,7 @@ use crate::constants::{
 use crate::data::GatewayDataState;
 
 const PROVIDER_QUOTA_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+const WAVE2_ZERO_RESPONSE_QA_PORT: u16 = 19086;
 
 fn run_provider_quota_test<F, Fut>(test_name: &'static str, make_future: F)
 where
@@ -292,6 +295,145 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
     gateway_handle.abort();
     execution_runtime_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_returns_stable_zero_quota_payload_when_key_ids_are_blank() {
+    // Given
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![StoredProviderCatalogProvider::new(
+            "provider-codex".to_string(),
+            "codex".to_string(),
+            Some("https://example.com".to_string()),
+            "codex".to_string(),
+        )
+        .expect("provider should build")],
+        vec![sample_endpoint(
+            "endpoint-codex-cli",
+            "provider-codex",
+            "openai:responses",
+            "https://chatgpt.com/backend-api",
+        )],
+        Vec::new(),
+    ));
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override("http://127.0.0.1:1")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository,
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    // When
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-codex/refresh-quota"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({ "key_ids": [" ", ""] }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    // Then
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    for field in ["total", "success", "failed", "skipped", "results"] {
+        assert!(payload.get(field).is_some(), "missing {field}");
+    }
+    assert_eq!(payload["total"], 0);
+    assert_eq!(payload["success"], 0);
+    assert_eq!(payload["failed"], 0);
+    assert_eq!(payload["skipped"], 0);
+    assert_eq!(payload["results"], json!([]));
+    assert_eq!(
+        payload["total"].as_u64(),
+        payload["success"]
+            .as_u64()
+            .zip(payload["failed"].as_u64())
+            .and_then(|(success, failed)| payload["skipped"]
+                .as_u64()
+                .map(|skipped| success + failed + skipped))
+    );
+    assert_eq!(payload["message"], "未提供可刷新的 Key");
+    assert_eq!(payload["auto_removed"], 0);
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+#[ignore = "manual bound-router curl harness"]
+async fn manual_gateway_exposes_stable_zero_quota_payload() {
+    // Given
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![StoredProviderCatalogProvider::new(
+            "provider-codex".to_string(),
+            "codex".to_string(),
+            Some("https://example.com".to_string()),
+            "codex".to_string(),
+        )
+        .expect("provider should build")],
+        vec![sample_endpoint(
+            "endpoint-codex-cli",
+            "provider-codex",
+            "openai:responses",
+            "https://chatgpt.com/backend-api",
+        )],
+        Vec::new(),
+    ));
+    let (completed_tx, completed_rx) = oneshot::channel();
+    let completed = Arc::new(Mutex::new(Some(completed_tx)));
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override("http://127.0.0.1:1")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository,
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    )
+    .layer(axum::middleware::from_fn(
+        move |request: Request, next: axum::middleware::Next| {
+            let completed = Arc::clone(&completed);
+            async move {
+                let notify = request.uri().path()
+                    == "/api/admin/endpoints/providers/provider-codex/refresh-quota";
+                let response = next.run(request).await;
+                if notify && response.status() == StatusCode::OK {
+                    if let Some(sender) = completed.lock().expect("completion lock").take() {
+                        let _ = sender.send(());
+                    }
+                }
+                response
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", WAVE2_ZERO_RESPONSE_QA_PORT))
+        .await
+        .expect("manual QA port should bind");
+    let gateway_handle = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            gateway.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("manual gateway should serve");
+    });
+    eprintln!(
+        "WAVE2_ZERO_RESPONSE_QA_URL=http://127.0.0.1:{WAVE2_ZERO_RESPONSE_QA_PORT}/api/admin/endpoints/providers/provider-codex/refresh-quota"
+    );
+
+    // When
+    let completed = tokio::time::timeout(Duration::from_secs(180), completed_rx).await;
+
+    // Then
+    gateway_handle.abort();
+    assert!(completed.is_ok(), "manual curl did not arrive");
 }
 
 #[tokio::test]

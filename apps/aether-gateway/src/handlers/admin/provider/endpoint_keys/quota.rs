@@ -26,6 +26,7 @@ fn unsupported_provider_quota_refresh_response(provider_type: &str) -> Response<
     Json(json!({
         "success": 0,
         "failed": 0,
+        "skipped": 0,
         "total": 0,
         "results": [],
         "message": message,
@@ -195,6 +196,7 @@ pub(super) async fn maybe_handle(
             Json(json!({
                 "success": 0,
                 "failed": 0,
+                "skipped": 0,
                 "total": 0,
                 "results": [],
                 "message": "未提供可刷新的 Key",
@@ -214,6 +216,7 @@ pub(super) async fn maybe_handle(
             Json(json!({
                 "success": 0,
                 "failed": 0,
+                "skipped": 0,
                 "total": 0,
                 "results": [],
                 "message": message,
@@ -230,6 +233,7 @@ pub(super) async fn maybe_handle(
         &normalized_provider_type,
         keys,
         None,
+        super::super::oauth::quota::dispatch::QuotaRefreshSource::Manual,
     )
     .await?
     else {

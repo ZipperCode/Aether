@@ -1,12 +1,47 @@
 use std::collections::BTreeSet;
+use std::net::IpAddr;
+
+pub(crate) fn provider_conversion_endpoint_has_official_origin(
+    provider_type: &str,
+    base_url: &str,
+) -> bool {
+    let official_hosts: &[&str] = match provider_type {
+        "deepseek" => &["api.deepseek.com"],
+        "openrouter" => &["openrouter.ai"],
+        "moonshot" => &["api.moonshot.cn"],
+        "kimi_coding" => &["api.kimi.com"],
+        "siliconflow" => &["api.siliconflow.cn", "api.siliconflow.com"],
+        "zhipu" => &["bigmodel.cn", "open.bigmodel.cn"],
+        "zai" => &["api.z.ai"],
+        _ => return false,
+    };
+    let Ok(url) = url::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.parse::<IpAddr>().is_err()
+        && official_hosts
+            .iter()
+            .any(|official| host.eq_ignore_ascii_case(official))
+}
 
 pub(crate) fn normalize_provider_type_input(value: &str) -> Result<String, String> {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "custom" | "claude_code" | "kiro" | "codex" | "chatgpt_web" | "gemini_cli"
-        | "antigravity" | "vertex_ai" | "grok" | "windsurf" | "nous" => Ok(normalized),
+        | "antigravity" | "vertex_ai" | "grok" | "windsurf" | "nous" | "deepseek"
+        | "openrouter" | "moonshot" | "kimi_coding" | "siliconflow" | "zhipu" | "zai" => Ok(normalized),
         _ => Err(
-            "provider_type 仅支持 custom / claude_code / kiro / codex / chatgpt_web / gemini_cli / antigravity / vertex_ai / grok / windsurf / nous"
+            "provider_type 仅支持 custom / claude_code / kiro / codex / chatgpt_web / gemini_cli / antigravity / vertex_ai / grok / windsurf / nous / deepseek / openrouter / moonshot / kimi_coding / siliconflow / zhipu / zai"
                 .to_string(),
         ),
     }
@@ -237,7 +272,8 @@ mod tests {
         normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
         normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
         normalize_chat_pii_redaction_config, normalize_pool_advanced_config,
-        normalize_provider_type_input, normalize_rate_multipliers, validate_vertex_api_formats,
+        normalize_provider_type_input, normalize_rate_multipliers,
+        provider_conversion_endpoint_has_official_origin, validate_vertex_api_formats,
     };
     use serde_json::json;
 
@@ -318,6 +354,48 @@ mod tests {
             normalize_provider_type_input(" Grok ").expect("type should normalize"),
             "grok"
         );
+    }
+
+    #[test]
+    fn normalize_provider_type_supports_official_balance_providers() {
+        assert_eq!(
+            normalize_provider_type_input(" DeepSeek ").expect("type should normalize"),
+            "deepseek"
+        );
+        assert_eq!(
+            normalize_provider_type_input(" OpenRouter ").expect("type should normalize"),
+            "openrouter"
+        );
+    }
+
+    #[test]
+    fn provider_conversion_accepts_only_seven_official_origins() {
+        for (provider_type, base_url) in [
+            ("deepseek", "https://api.deepseek.com/v1"),
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("moonshot", "https://api.moonshot.cn/v1"),
+            ("kimi_coding", "https://api.kimi.com/coding/v1"),
+            ("siliconflow", "https://api.siliconflow.com/v1"),
+            ("zhipu", "https://open.bigmodel.cn/api/paas/v4"),
+            ("zai", "https://api.z.ai/api/paas/v4"),
+        ] {
+            assert!(
+                provider_conversion_endpoint_has_official_origin(provider_type, base_url),
+                "expected official origin for {provider_type}"
+            );
+        }
+        for (provider_type, base_url) in [
+            ("codex", "https://chatgpt.com/backend-api/codex"),
+            ("deepseek", "http://api.deepseek.com"),
+            ("deepseek", "https://api.deepseek.com.evil.test"),
+            ("deepseek", "https://user@api.deepseek.com"),
+            ("deepseek", "not a url"),
+        ] {
+            assert!(!provider_conversion_endpoint_has_official_origin(
+                provider_type,
+                base_url
+            ));
+        }
     }
 
     #[test]

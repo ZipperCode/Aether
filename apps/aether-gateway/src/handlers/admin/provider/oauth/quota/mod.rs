@@ -6,5 +6,6 @@ pub(crate) mod gemini_cli;
 pub(crate) mod grok;
 pub(crate) mod kiro;
 pub(crate) mod nous;
+pub(crate) mod official_balance;
 pub(crate) mod shared;
 pub(crate) mod windsurf;

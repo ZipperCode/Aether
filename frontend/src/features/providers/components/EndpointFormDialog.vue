@@ -7,7 +7,7 @@
     size="2xl"
     @update:model-value="handleDialogUpdate"
   >
-    <div class="flex flex-col gap-4">
+    <div class="flex min-h-[22rem] flex-col gap-4">
       <!-- 已有端点列表（可滚动） -->
       <div
         v-if="localEndpoints.length > 0"
@@ -924,19 +924,25 @@
       <!-- 添加新端点 -->
       <div
         v-if="!isFixedProvider && availableFormats.length > 0"
-        class="rounded-lg border border-dashed p-3"
+        class="rounded-lg border border-dashed"
       >
         <!-- 卡片头部：API 格式选择 + 添加按钮 -->
-        <div class="flex items-center justify-between px-4 py-2.5 bg-muted/30 border-b border-dashed">
-          <Select
-            v-model="newEndpoint.api_format"
-            :open="formatSelectOpen"
-            @update:open="handleFormatSelectOpen"
-          >
-            <SelectTrigger class="h-auto w-auto gap-1.5 !border-0 bg-transparent !shadow-none p-0 font-medium rounded-none flex-row-reverse !ring-0 !ring-offset-0 !outline-none [&>svg]:h-4 [&>svg]:w-4 [&>svg]:opacity-70">
-              <SelectValue placeholder="选择格式..." />
-            </SelectTrigger>
-            <SelectContent>
+        <div class="flex flex-col gap-3 border-b border-dashed bg-muted/30 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+          <div class="w-full space-y-1.5 sm:w-80">
+            <Label class="text-xs text-muted-foreground">API 格式</Label>
+            <Select
+              v-model="newEndpoint.api_format"
+              :open="formatSelectOpen"
+              @update:open="handleFormatSelectOpen"
+            >
+              <SelectTrigger class="h-9 w-full bg-background text-left">
+                <SelectValue placeholder="选择 API 格式" />
+              </SelectTrigger>
+              <SelectContent
+                :disable-portal="false"
+                class="min-w-[20rem]"
+                align="start"
+              >
               <SelectItem
                 v-for="format in availableFormats"
                 :key="format.value"
@@ -944,23 +950,24 @@
               >
                 {{ format.label }}
               </SelectItem>
-            </SelectContent>
-          </Select>
+              </SelectContent>
+            </Select>
+          </div>
           <Button
             variant="outline"
             size="sm"
-            class="h-7 px-3"
-            :disabled="!newEndpoint.api_format || (!newEndpoint.base_url?.trim() && !provider?.website?.trim()) || addingEndpoint"
+            class="h-9 w-full px-4 sm:w-auto sm:self-end"
+            :disabled="!newEndpoint.api_format || !getNewEndpointBaseUrl() || addingEndpoint"
             @click="handleAddEndpoint"
           >
             添加
           </Button>
         </div>
         <!-- 卡片内容：URL 配置 -->
-        <div class="p-4">
+        <div class="p-4 sm:p-5">
           <div class="flex items-end gap-3">
-            <div class="flex-1 min-w-0 grid grid-cols-3 gap-3">
-              <div class="col-span-2 space-y-1.5">
+            <div class="grid min-w-0 flex-1 grid-cols-1 gap-4 md:grid-cols-3">
+              <div class="space-y-1.5 md:col-span-2">
                 <Label class="text-xs text-muted-foreground">Base URL</Label>
                 <Input
                   v-model="newEndpoint.base_url"
@@ -1051,7 +1058,7 @@ import { useI18n } from '@/i18n'
 import AlertDialog from '@/components/common/AlertDialog.vue'
 import EndpointConditionEditor from './EndpointConditionEditor.vue'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
-import { getDefaultEndpointBaseUrl, getDefaultEndpointPath, normalizeEndpointApiFormat } from './endpoint-default-paths'
+import { getDefaultEndpointBaseUrl, getDefaultEndpointPath, normalizeEndpointApiFormat, resolveNewEndpointBaseUrl } from './endpoint-default-paths'
 import { fixedEndpointUpstreamStreamPolicy } from './endpoint-protocol-policy'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import {
@@ -1863,9 +1870,22 @@ function initBodyRuleSetValueForEditor(value: unknown): { value: string } {
 // 内部状态
 const internalOpen = computed(() => props.modelValue)
 
+const fixedProviderTypes = new Set([
+  'claude_code',
+  'codex',
+  'chatgpt_web',
+  'kiro',
+  'grok',
+  'gemini_cli',
+  'vertex_ai',
+  'antigravity',
+  'windsurf',
+  'nous',
+])
+
 const isFixedProvider = computed(() => {
-  const t = props.provider?.provider_type
-  return !!t && t !== 'custom'
+  const providerType = (props.provider?.provider_type || '').trim().toLowerCase()
+  return fixedProviderTypes.has(providerType)
 })
 
 const isEndpointConfigReadOnly = computed(() => {
@@ -1962,19 +1982,19 @@ function getEndpointDefaultPath(endpoint: ProviderEndpoint): string {
 }
 
 function getEndpointBaseUrlPlaceholder(apiFormat: string): string {
-  const seedBaseUrl = (props.provider?.website || fallbackEndpointBaseUrl).trim()
-  return getDefaultEndpointBaseUrl({
+  return resolveNewEndpointBaseUrl({
     apiFormat,
-    baseUrl: seedBaseUrl,
-  }) || seedBaseUrl
+    providerType: props.provider?.provider_type,
+    website: props.provider?.website || fallbackEndpointBaseUrl,
+  })
 }
 
 function getNewEndpointBaseUrl(): string {
-  const typedBaseUrl = newEndpoint.value.base_url.trim()
-  if (typedBaseUrl) return typedBaseUrl
-  return getDefaultEndpointBaseUrl({
+  return resolveNewEndpointBaseUrl({
     apiFormat: newEndpoint.value.api_format,
-    baseUrl: props.provider?.website || '',
+    providerType: props.provider?.provider_type,
+    explicitBaseUrl: newEndpoint.value.base_url,
+    website: props.provider?.website,
   })
 }
 

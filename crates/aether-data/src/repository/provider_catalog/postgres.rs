@@ -1999,6 +1999,23 @@ WHERE id = $1
         Ok(true)
     }
 
+    pub async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota: &serde_json::Value,
+        updated: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        if key_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog key_id is empty".into(),
+            ));
+        }
+        let rows = sqlx::query("UPDATE provider_api_keys SET status_snapshot = jsonb_set(CASE WHEN json_typeof(status_snapshot) = 'object' THEN status_snapshot::jsonb ELSE '{}'::jsonb END, '{quota}', $2::jsonb, true)::json, updated_at = CASE WHEN $3::double precision IS NULL THEN NOW() ELSE TO_TIMESTAMP($3::double precision) END WHERE id = $1")
+            .bind(key_id).bind(quota).bind(updated.map(|v| v as f64))
+             .execute(&self.pool).await.map_postgres_err()?.rows_affected();
+        Ok(rows > 0)
+    }
+
     pub async fn update_key_health_state(
         &self,
         key_id: &str,
@@ -2242,6 +2259,15 @@ impl ProviderCatalogWriteRepository for SqlxProviderCatalogReadRepository {
             updated_at_unix_secs,
         )
         .await
+    }
+
+    async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota: &serde_json::Value,
+        updated: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::mutate_key_quota_snapshot(self, key_id, quota, updated).await
     }
 
     async fn delete_key(&self, key_id: &str) -> Result<bool, DataLayerError> {
@@ -2732,6 +2758,11 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
 mod tests {
     use super::SqlxProviderCatalogReadRepository;
     use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
+    use crate::lifecycle::migrate::run_migrations;
+    use crate::repository::provider_catalog::{
+        StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    };
+    use serde_json::json;
 
     #[tokio::test]
     async fn repository_constructs_from_lazy_pool() {
@@ -2836,5 +2867,91 @@ mod tests {
         assert!(source.contains(
             "  CASE\n    WHEN $52::double precision IS NULL THEN NOW()\n    ELSE TO_TIMESTAMP($52::double precision)\n  END,\n  $53"
         ));
+    }
+
+    #[tokio::test]
+    async fn postgres_quota_snapshot_normalizes_scalar_status_when_url_is_set() {
+        let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!(
+                "skipping postgres quota snapshot compatibility because AETHER_TEST_POSTGRES_URL is unset"
+            );
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("postgres test pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("postgres migrations should run");
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should follow unix epoch")
+                .as_nanos()
+        );
+        let provider_id = format!("p-{suffix}");
+        let key_id = format!("k-{suffix}");
+        let repository = SqlxProviderCatalogReadRepository::new(pool);
+        let provider = StoredProviderCatalogProvider::new(
+            provider_id.clone(),
+            format!("Provider quota {suffix}"),
+            None,
+            "custom".to_string(),
+        )
+        .expect("provider should build");
+        repository
+            .create_provider(&provider, None)
+            .await
+            .expect("provider should create");
+        let mut key = StoredProviderCatalogKey::new(
+            key_id.clone(),
+            provider_id.clone(),
+            "quota".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.status_snapshot = Some(json!(""));
+        repository
+            .create_key(&key)
+            .await
+            .expect("key should create");
+
+        repository
+            .mutate_key_quota_snapshot(
+                &key_id,
+                &json!({"provider_type": "deepseek", "kind": "balance"}),
+                Some(200),
+            )
+            .await
+            .expect("scalar snapshot should normalize");
+
+        let stored = repository
+            .list_keys_by_ids(std::slice::from_ref(&key_id))
+            .await
+            .expect("key should read");
+        assert_eq!(
+            stored[0]
+                .status_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pointer("/quota/provider_type")),
+            Some(&json!("deepseek"))
+        );
+        repository
+            .delete_key(&key_id)
+            .await
+            .expect("key should delete");
+        repository
+            .delete_provider(&provider_id)
+            .await
+            .expect("provider should delete");
     }
 }

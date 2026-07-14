@@ -115,11 +115,12 @@
                         <ProviderKeyIdentityBlock
                           :api-key="key"
                           :masked-secret-label="getProviderMaskedSecretLabel(key, provider.provider_type)"
-                          :oauth-plan-label="key.oauth_plan_type ? formatOAuthPlanType(key.oauth_plan_type) : null"
-                          :oauth-plan-class="key.oauth_plan_type ? getOAuthPlanTypeClass(key.oauth_plan_type) : ''"
+                          :oauth-plan-label="getKeyPlanBadgeLabel(key)"
+                          :oauth-plan-class="getKeyPlanBadgeLabel(key) ? getOAuthPlanTypeClass(getKeyPlanBadgeLabel(key)!) : ''"
                           :oauth-org-badge="getOAuthOrgBadge(key)"
                           :kiro-subscription-label="shouldShowKiroSubscriptionBadge(key) ? getKiroSubscriptionBadgeLabel(key) : null"
                           :kiro-subscription-class="shouldShowKiroSubscriptionBadge(key) ? getOAuthPlanTypeClass(getKiroSubscriptionBadgeLabel(key)) : ''"
+                          :quota-type-label="getGenericQuotaTypeLabel(key)"
                           :can-export-credential="canExportOAuthCredential(key)"
                           :show-o-auth-refresh-control="shouldShowOAuthRefreshControl(key, provider.provider_type)"
                           :account-level-block="isAccountLevelBlock(key)"
@@ -161,6 +162,12 @@
                         @delete="handleDeleteKey(key)"
                       />
                     </div>
+                    <ProviderGenericQuotaCard
+                      v-if="shouldShowGenericQuotaCard(key)"
+                      :quota="key.status_snapshot?.quota"
+                      :loading="refreshingQuota"
+                      :provider-type="getGenericQuotaProviderType(key)"
+                    />
                     <!-- Codex 上游额度信息（仅当有元数据时显示） -->
                     <div
                       v-if="hasCodexQuotaDisplayData(key)"
@@ -1023,6 +1030,8 @@ import {
   getOAuthStatusTitle as resolveOAuthStatusTitle,
 } from '@/utils/providerKeyStatus'
 import { getGeminiCliAccountCreditsText } from '@/utils/providerKeyQuota'
+import { selectOpenProviderSnapshot } from '@/features/providers/utils/providerOpenState'
+import ProviderGenericQuotaCard from './ProviderGenericQuotaCard.vue'
 import {
   formatCodexResetCreditCount as formatCodexResetCreditCountLabel,
   formatCodexResetCreditExpiresAt,
@@ -1344,6 +1353,15 @@ watch(
   },
   { immediate: true },
 )
+
+watch(() => props.initialProvider, (incoming) => {
+  provider.value = selectOpenProviderSnapshot({
+    open: props.open,
+    providerId: props.providerId,
+    current: provider.value,
+    incoming,
+  })
+})
 
 // 处理背景点击
 function handleBackdropClick() {
@@ -1761,8 +1779,36 @@ function quotaSnapshotHasDisplayData(quota: QuotaStatusSnapshot | null | undefin
     || quota.observed_at != null
     || quota.usage_ratio != null
     || (Array.isArray(quota.windows) && quota.windows.length > 0)
+    || (Array.isArray(quota.balances) && quota.balances.length > 0)
     || quota.credits,
   )
+}
+
+const GENERIC_QUOTA_PROVIDER_TYPES = new Set([
+    'deepseek',
+    'openrouter',
+    'moonshot',
+    'kimi_coding',
+    'siliconflow',
+    'zhipu',
+    'zai',
+])
+
+function getGenericQuotaProviderType(key: EndpointAPIKey): string {
+  return key.status_snapshot?.quota?.provider_type?.trim().toLowerCase()
+    || provider.value?.provider_type?.trim().toLowerCase()
+    || ''
+}
+
+function shouldShowGenericQuotaCard(key: EndpointAPIKey): boolean {
+  return GENERIC_QUOTA_PROVIDER_TYPES.has(getGenericQuotaProviderType(key))
+}
+
+function getGenericQuotaTypeLabel(key: EndpointAPIKey): string | null {
+  if (!shouldShowGenericQuotaCard(key)) return null
+  const quota = key.status_snapshot?.quota
+  if (quota?.kind === 'subscription' || (quota?.windows?.length ?? 0) > 0) return 'Token'
+  return quota?.balances?.[0]?.unit?.trim().toUpperCase() || null
 }
 
 function getQuotaSnapshotForProvider(
@@ -2723,14 +2769,14 @@ function applyQuotaResults(
   return applied
 }
 
-// 通用的自动刷新配额函数（支持 Codex、Gemini CLI、Antigravity、Kiro、Windsurf 和 ChatGPT Web）
+// 通用的自动刷新配额函数
 async function autoRefreshQuotaInBackground(options: { ignoreCooldown?: boolean } = {}) {
   const providerId = props.providerId
   if (!providerId) return
   if (refreshingQuota.value) return
 
   const providerType = provider.value?.provider_type
-  if (providerType !== 'codex' && providerType !== 'gemini_cli' && providerType !== 'antigravity' && providerType !== 'kiro' && providerType !== 'windsurf' && providerType !== 'chatgpt_web' && providerType !== 'grok' && providerType !== 'nous') return
+  if (providerType !== 'codex' && providerType !== 'gemini_cli' && providerType !== 'antigravity' && providerType !== 'kiro' && providerType !== 'windsurf' && providerType !== 'chatgpt_web' && providerType !== 'grok' && providerType !== 'nous' && providerType !== 'deepseek' && providerType !== 'openrouter' && providerType !== 'moonshot' && providerType !== 'kimi_coding' && providerType !== 'siliconflow' && providerType !== 'zhipu' && providerType !== 'zai') return
 
   // 检查是否需要刷新
   let shouldRefresh = false
@@ -2754,6 +2800,12 @@ async function autoRefreshQuotaInBackground(options: { ignoreCooldown?: boolean 
       const updatedAt = getQuotaSnapshotUpdatedAt(getNousQuotaDisplay(key))
       return updatedAt == null || Math.floor(Date.now() / 1000) - updatedAt >= AUTO_QUOTA_REFRESH_STALE_SECONDS
     })
+  } else if (['deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai'].includes(providerType)) {
+    shouldRefresh = allKeys.value.some(({ key }) => {
+      if (!key.is_active) return false
+      const updatedAt = getQuotaSnapshotUpdatedAt(key.status_snapshot?.quota)
+      return updatedAt == null || Math.floor(Date.now() / 1000) - updatedAt >= AUTO_QUOTA_REFRESH_STALE_SECONDS
+    })
   }
   if (!shouldRefresh) return
   if (!options.ignoreCooldown && isProviderQuotaAutoRefreshCoolingDown(providerId)) return
@@ -2775,6 +2827,8 @@ async function autoRefreshQuotaInBackground(options: { ignoreCooldown?: boolean 
     hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && hasChatGPTWebQuotaDisplayData(key))
   } else if (providerType === 'nous') {
     hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && quotaSnapshotHasDisplayData(getNousQuotaDisplay(key)))
+  } else if (['deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai'].includes(providerType)) {
+    hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && quotaSnapshotHasDisplayData(key.status_snapshot?.quota))
   }
 
   refreshingQuota.value = true
@@ -2784,9 +2838,12 @@ async function autoRefreshQuotaInBackground(options: { ignoreCooldown?: boolean 
     const applied = applyQuotaResults(result.results)
     if (result.success <= 0 && applied === 0 && !hadCachedQuota && providerType === 'antigravity') {
       showError(legacyT('没有获取到配额信息（请检查账号是否已授权、project_id 是否存在）'), legacyT('提示'))
+    } else if (result.success <= 0 && applied === 0 && !hadCachedQuota && ['deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai'].includes(providerType)) {
+      const detail = result.results?.find(item => item.message)?.message || '没有获取到额度信息，请检查 Key 和官方 Endpoint'
+      showError(legacyT(detail), legacyT('额度刷新失败'))
     }
   } catch (err: unknown) {
-    if (!hadCachedQuota && providerType === 'antigravity') {
+    if (!hadCachedQuota && (providerType === 'antigravity' || ['deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai'].includes(providerType))) {
       showError(localizedApiError(err, '后台刷新配额失败'), legacyT('错误'))
     }
   } finally {
@@ -3593,6 +3650,15 @@ function getOAuthPlanTypeClass(planType: string): string {
     heavy: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
   }
   return classes[planType.toLowerCase()] || ''
+}
+
+function getKeyPlanBadgeLabel(key: EndpointAPIKey): string | null {
+  if (key.oauth_plan_type) return formatOAuthPlanType(key.oauth_plan_type)
+  if (provider.value?.provider_type !== 'openrouter') return null
+  const isFreeTier = key.status_snapshot?.quota?.is_free_tier
+  if (isFreeTier === true) return 'Free'
+  if (isFreeTier === false) return 'Paid'
+  return null
 }
 
 // OAuth 状态信息（包括失效和过期）

@@ -7,14 +7,16 @@ use aether_data_contracts::repository::provider_catalog::{
 use aether_pool_core::PoolSchedulingPreset;
 use serde_json::{Map, Value};
 
-use crate::capability::ProviderPoolCapability;
+use crate::capability::{ProviderPoolCapability, ProviderQuotaServingPolicy};
 use crate::presets::normalize_provider_scheduling_presets;
 use crate::provider::{ProviderPoolAdapter, ProviderPoolMemberInput};
 use crate::providers::{
     AntigravityProviderPoolAdapter, ChatGptWebProviderPoolAdapter, CodexProviderPoolAdapter,
-    DefaultProviderPoolAdapter, GeminiCliProviderPoolAdapter, GrokProviderPoolAdapter,
-    KiroProviderPoolAdapter, NousProviderPoolAdapter, WindsurfProviderPoolAdapter,
-    CLAUDE_CODE_PROVIDER_POOL_ADAPTER, VERTEX_AI_PROVIDER_POOL_ADAPTER,
+    DeepSeekProviderPoolAdapter, DefaultProviderPoolAdapter, GeminiCliProviderPoolAdapter,
+    GrokProviderPoolAdapter, KiroProviderPoolAdapter, NousProviderPoolAdapter,
+    OfficialApiKeyQuotaProvider, OfficialApiKeyQuotaProviderPoolAdapter,
+    OpenRouterProviderPoolAdapter, WindsurfProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,
+    VERTEX_AI_PROVIDER_POOL_ADAPTER,
 };
 
 #[derive(Clone)]
@@ -50,10 +52,27 @@ impl ProviderPoolService {
             .with_adapter(Arc::new(AntigravityProviderPoolAdapter))
             .with_adapter(Arc::new(CLAUDE_CODE_PROVIDER_POOL_ADAPTER))
             .with_adapter(Arc::new(CodexProviderPoolAdapter))
+            .with_adapter(Arc::new(DeepSeekProviderPoolAdapter))
             .with_adapter(Arc::new(GeminiCliProviderPoolAdapter))
             .with_adapter(Arc::new(GrokProviderPoolAdapter))
             .with_adapter(Arc::new(KiroProviderPoolAdapter))
             .with_adapter(Arc::new(NousProviderPoolAdapter))
+            .with_adapter(Arc::new(OpenRouterProviderPoolAdapter))
+            .with_adapter(Arc::new(OfficialApiKeyQuotaProviderPoolAdapter(
+                OfficialApiKeyQuotaProvider::Moonshot,
+            )))
+            .with_adapter(Arc::new(OfficialApiKeyQuotaProviderPoolAdapter(
+                OfficialApiKeyQuotaProvider::KimiCoding,
+            )))
+            .with_adapter(Arc::new(OfficialApiKeyQuotaProviderPoolAdapter(
+                OfficialApiKeyQuotaProvider::SiliconFlow,
+            )))
+            .with_adapter(Arc::new(OfficialApiKeyQuotaProviderPoolAdapter(
+                OfficialApiKeyQuotaProvider::Zhipu,
+            )))
+            .with_adapter(Arc::new(OfficialApiKeyQuotaProviderPoolAdapter(
+                OfficialApiKeyQuotaProvider::Zai,
+            )))
             .with_adapter(Arc::new(ChatGptWebProviderPoolAdapter))
             .with_adapter(Arc::new(WindsurfProviderPoolAdapter))
             .with_adapter(Arc::new(VERTEX_AI_PROVIDER_POOL_ADAPTER))
@@ -86,6 +105,10 @@ impl ProviderPoolService {
 
     pub fn supports_quota_refresh(&self, provider_type: &str) -> bool {
         self.adapter(provider_type).supports_quota_refresh()
+    }
+
+    pub fn quota_serving_policy(&self, provider_type: &str) -> Option<ProviderQuotaServingPolicy> {
+        self.adapter(provider_type).quota_serving_policy()
     }
 
     pub fn quota_refresh_endpoint_for_provider(

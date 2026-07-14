@@ -216,6 +216,7 @@ pub(crate) async fn refresh_provider_oauth_account_state_after_update(
         &provider_type,
         vec![key],
         proxy_override.cloned(),
+        super::quota::dispatch::QuotaRefreshSource::OAuthPostUpdate,
     )
     .await?;
     let Some(payload) = payload else {

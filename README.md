@@ -31,7 +31,9 @@ Aether 是一个自托管的 AI API 网关，为团队和个人提供多租户�
   </picture>
 </p>
 
-页面预览: https://fawney19.github.io/Aether/
+页面预览: https://zippercode.github.io/Aether/
+
+本项目延续自上游 [fawney19/Aether](https://github.com/fawney19/Aether)，感谢原作者和贡献者奠定的基础。
 
 ## 部署
 
@@ -39,7 +41,7 @@ Aether 是一个自托管的 AI API 网关，为团队和个人提供多租户�
 
 ```bash
 # 1. 克隆代码
-git clone https://github.com/fawney19/Aether.git
+git clone https://github.com/ZipperCode/Aether.git
 cd Aether
 
 # 2. 配置环境变量
@@ -68,6 +70,8 @@ Docker Compose 部署后，可在部署目录直接执行：
 ```bash
 ./update.sh --mode single-node
 ```
+
+升级到当前版本后，网关默认限制为：单请求解压后最大 `64 MiB`、单实例请求体缓冲预算 `256 MiB`、完整读取超时 120 秒。超过单请求限制可能返回 `413`，缓冲预算不足可能返回 `503`，读取超时可能返回 `408`；升级前请确认上游代理与客户端的限制和超时设置相容。
 
 仓库自带的 Docker Compose 默认把应用日志输出到容器 `stdout/stderr`，直接用 `docker compose logs -f app` 查看，并由 Docker 轮转日志，避免正式发布镜像切换到非 root 用户后再被宿主机挂载日志目录的权限问题拖垮启动。如果你确实需要文件日志，需要在 compose 里把 `AETHER_LOG_DESTINATION` 改成 `file|both`，并额外挂载一个容器用户可写的目录到 `/opt/aether/logs`。
 
@@ -108,9 +112,9 @@ docker compose -f docker-compose.release-local.yml down -v
 ### 一键安装（默认 Single Node：Linux systemd / macOS launchd + SQLite）
 
 ```bash
-git clone https://github.com/fawney19/Aether.git
+git clone https://github.com/ZipperCode/Aether.git
 cd Aether
-curl -fsSL https://raw.githubusercontent.com/fawney19/Aether/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/ZipperCode/Aether/main/install.sh | sudo bash
 ```
 
 ## 本地开发
@@ -177,4 +181,4 @@ Aether Tunnel 是配套的正向代理节点，部署在海外 VPS 上，为墙�
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=fawney19/Aether&type=date&legend=top-left)](https://www.star-history.com/?repos=fawney19%2FAether&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=ZipperCode/Aether&type=date&legend=top-left)](https://www.star-history.com/?repos=ZipperCode%2FAether&type=date&legend=top-left)

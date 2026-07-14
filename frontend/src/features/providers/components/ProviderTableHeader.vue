@@ -21,13 +21,17 @@
           />
         </div>
 
+        <div
+          class="grid w-full grid-cols-3 gap-2 sm:contents"
+          data-testid="provider-mobile-filters"
+        >
         <!-- 状态筛选 -->
-        <div class="xl:hidden">
+        <div class="min-w-0 2xl:hidden">
           <Select
             :model-value="filterStatus"
             @update:model-value="$emit('update:filterStatus', $event)"
           >
-            <SelectTrigger class="w-20 sm:w-28 h-8 text-xs border-border/60">
+            <SelectTrigger class="h-8 w-full border-border/60 px-2 text-xs sm:w-28 sm:px-4">
               <SelectValue :placeholder="legacyT('全部状态')" />
             </SelectTrigger>
             <SelectContent>
@@ -43,12 +47,12 @@
         </div>
 
         <!-- API 格式筛选 -->
-        <div class="xl:hidden">
+        <div class="min-w-0 2xl:hidden">
           <Select
             :model-value="filterApiFormat"
             @update:model-value="$emit('update:filterApiFormat', $event)"
           >
-            <SelectTrigger class="w-20 sm:w-28 h-8 text-xs border-border/60">
+            <SelectTrigger class="h-8 w-full border-border/60 px-2 text-xs sm:w-28 sm:px-4">
               <SelectValue :placeholder="legacyT('全部格式')" />
             </SelectTrigger>
             <SelectContent>
@@ -64,12 +68,12 @@
         </div>
 
         <!-- 模型筛选 -->
-        <div class="xl:hidden">
+        <div class="min-w-0 2xl:hidden">
           <Select
             :model-value="filterModel"
             @update:model-value="$emit('update:filterModel', $event)"
           >
-            <SelectTrigger class="w-20 sm:w-36 h-8 text-xs border-border/60">
+            <SelectTrigger class="h-8 w-full border-border/60 px-2 text-xs sm:w-36 sm:px-4">
               <SelectValue :placeholder="legacyT('全部模型')" />
             </SelectTrigger>
             <SelectContent>
@@ -82,6 +86,7 @@
               </SelectItem>
             </SelectContent>
           </Select>
+        </div>
         </div>
 
         <!-- 重置筛选 -->

@@ -5,6 +5,7 @@ use crate::handlers::admin::provider::shared::support::{
 use crate::handlers::admin::provider::write::normalize::normalize_chat_pii_redaction_config;
 use crate::handlers::admin::provider::write::normalize::normalize_pool_advanced_config;
 use crate::handlers::admin::provider::write::normalize::normalize_provider_type_input;
+use crate::handlers::admin::provider::write::normalize::provider_conversion_endpoint_has_official_origin;
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::normalize_json_object;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
@@ -53,6 +54,26 @@ pub(crate) async fn build_admin_update_provider_record(
             });
         };
         let normalized = normalize_provider_type_input(provider_type)?;
+        if normalized != existing.provider_type {
+            if existing.provider_type != "custom" {
+                return Err("仅 custom provider 可以转换 provider_type".to_string());
+            }
+            let endpoints = state
+                .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&existing.id))
+                .await
+                .map_err(|err| format!("{err:?}"))?;
+            if !endpoints.iter().any(|endpoint| {
+                endpoint.is_active
+                    && provider_conversion_endpoint_has_official_origin(
+                        &normalized,
+                        &endpoint.base_url,
+                    )
+            }) {
+                return Err(format!(
+                    "provider_type={normalized} 转换要求至少一个启用的官方 endpoint"
+                ));
+            }
+        }
         updated.provider_type = normalized.clone();
         normalized
     } else {

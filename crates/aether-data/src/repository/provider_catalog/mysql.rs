@@ -972,6 +972,19 @@ WHERE id = ?
         Ok(true)
     }
 
+    pub async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota: &serde_json::Value,
+        updated: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(key_id, "provider catalog key_id")?;
+        let rows = sqlx::query("UPDATE provider_api_keys SET status_snapshot = JSON_SET(CASE WHEN JSON_VALID(status_snapshot) THEN CASE WHEN JSON_TYPE(status_snapshot) = 'OBJECT' THEN status_snapshot ELSE JSON_OBJECT() END ELSE JSON_OBJECT() END, '$.quota', CAST(? AS JSON)), updated_at = ? WHERE id = ?")
+            .bind(quota.to_string()).bind(updated.unwrap_or_else(current_unix_secs) as i64).bind(key_id)
+             .execute(&self.pool).await.map_sql_err()?.rows_affected();
+        Ok(rows > 0)
+    }
+
     pub async fn clear_key_oauth_invalid_marker(
         &self,
         key_id: &str,
@@ -1327,6 +1340,15 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
             updated_at_unix_secs,
         )
         .await
+    }
+
+    async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota: &serde_json::Value,
+        updated: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::mutate_key_quota_snapshot(self, key_id, quota, updated).await
     }
 
     async fn delete_key(&self, key_id: &str) -> Result<bool, DataLayerError> {
@@ -2041,6 +2063,33 @@ mod tests {
             .await
             .expect("key should create");
         assert_eq!(created_key.concurrent_limit, Some(3));
+
+        sqlx::query("UPDATE provider_api_keys SET status_snapshot = '' WHERE id = ?")
+            .bind(&key_id)
+            .execute(&repository.pool)
+            .await
+            .expect("invalid snapshot fixture should seed");
+        assert!(repository
+            .mutate_key_quota_snapshot(
+                &key_id,
+                &json!({"provider_type": "deepseek", "kind": "balance"}),
+                Some(200),
+            )
+            .await
+            .expect("invalid snapshot should normalize"));
+        let normalized = repository
+            .list_keys_by_ids(std::slice::from_ref(&key_id))
+            .await
+            .expect("normalized key should read")
+            .pop()
+            .expect("normalized key should exist");
+        assert_eq!(
+            normalized
+                .status_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pointer("/quota/provider_type")),
+            Some(&json!("deepseek"))
+        );
 
         let keys = repository
             .list_keys_by_provider_ids(std::slice::from_ref(&provider_id))

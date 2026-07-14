@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use aether_contracts::USAGE_SERVER_NOW_UNIX_MS_HEADER;
+use aether_contracts::{
+    EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER, USAGE_SERVER_NOW_UNIX_MS_HEADER,
+};
 
 pub fn should_skip_request_header(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
@@ -20,6 +22,7 @@ pub fn should_skip_request_header(name: &str) -> bool {
             | "x-aether-execution-loop-guard"
             | "x-aether-control-execute-fallback"
             | "x-aether-rate-limit-preflight"
+            | EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER
             | USAGE_SERVER_NOW_UNIX_MS_HEADER
     )
 }
@@ -289,6 +292,15 @@ mod tests {
                 "should skip complete passthrough {h}"
             );
         }
+    }
+
+    #[test]
+    fn strips_internal_response_body_limit_from_provider_requests() {
+        let header = aether_contracts::EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER;
+
+        assert!(should_skip_request_header(header));
+        assert!(should_skip_upstream_passthrough_header(header));
+        assert!(should_skip_upstream_complete_passthrough_header(header));
     }
 
     #[test]

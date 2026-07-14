@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as _;
 use std::future::Future;
-use std::io::Read;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
@@ -11,15 +10,19 @@ use aether_contracts::{
     ExecutionPlan, ExecutionResult, ExecutionTelemetry, ProxySnapshot, ResolvedTransportProfile,
     ResponseBody, EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER,
     EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
-    TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_BACKEND_REQWEST_RUSTLS,
-    TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE, TRANSPORT_HTTP_MODE_HTTP1_ONLY,
+    EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER, TRANSPORT_BACKEND_BROWSER_WREQ,
+    TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE,
+    TRANSPORT_HTTP_MODE_HTTP1_ONLY,
 };
 use aether_data::repository::proxy_nodes::ProxyNodeTrafficMutation;
 use aether_http::{apply_http_client_config, HttpClientConfig};
+use aether_provider_transport::{
+    collect_reqwest_body_bounded, decode_response_body_bounded, BoundedBodyCollector,
+    BoundedBodyError, BoundedBodyReadError,
+};
 use aether_runtime::{MetricKind, MetricSample};
 use axum::body::Bytes;
 use base64::Engine as _;
-use flate2::read::{DeflateDecoder, GzDecoder};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures_util::stream::FuturesUnordered;
@@ -540,6 +543,8 @@ pub(crate) enum ExecutionRuntimeTransportError {
     BrowserBody(String),
     #[error("failed to execute upstream request: {0}")]
     UpstreamRequest(String),
+    #[error("response_too_large")]
+    ResponseTooLarge,
     #[error("hub relay request failed: {0}")]
     RelayError(String),
     #[error("upstream response is not valid JSON: {0}")]
@@ -563,6 +568,8 @@ struct RelayRequestMeta {
     timeout: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     follow_redirects: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_response_body_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "is_false")]
     http1_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -644,10 +651,13 @@ impl DirectSyncExecutionRuntime {
                 status_code,
                 ttfb_ms,
             });
-            let (body_bytes, stream_ttfb_ms) =
-                response.bytes_with_stream_timeout(plan, started_at).await?;
-            let decoded_body_bytes = decode_response_body_bytes(&headers, &body_bytes)
-                .unwrap_or_else(|| body_bytes.to_vec());
+            let response_body_limit = resolve_response_body_limit(plan);
+            let (body_bytes, stream_ttfb_ms) = response
+                .bytes_with_stream_timeout(plan, started_at, response_body_limit)
+                .await?;
+            let decoded_body_bytes =
+                decode_response_body_bytes_bounded(&headers, &body_bytes, response_body_limit)?
+                    .unwrap_or_else(|| body_bytes.to_vec());
             let elapsed_ms = started_at.elapsed().as_millis() as u64;
             let upstream_bytes = body_bytes.len() as u64;
 
@@ -950,10 +960,18 @@ async fn execute_sync_plan_via_local_tunnel_inner(
     let status_code = response.status();
     let headers = collect_tunnel_response_headers(response.headers());
     let proxy_timing = execution_header_for_log(&headers, "x-proxy-timing").unwrap_or("-");
-    let (body_bytes, stream_ttfb_ms) =
-        collect_local_tunnel_response_body(response, plan, started_at).await?;
+    let response_body_limit = resolve_response_body_limit(plan);
+    let (body_bytes, stream_ttfb_ms) = collect_local_tunnel_response_body(
+        response,
+        plan,
+        started_at,
+        &headers,
+        response_body_limit,
+    )
+    .await?;
     let decoded_body_bytes =
-        decode_response_body_bytes(&headers, &body_bytes).unwrap_or_else(|| body_bytes.clone());
+        decode_response_body_bytes_bounded(&headers, &body_bytes, response_body_limit)?
+            .unwrap_or_else(|| body_bytes.clone());
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
     let upstream_bytes = body_bytes.len() as u64;
     if status_code >= 400 {
@@ -1012,8 +1030,12 @@ async fn collect_local_tunnel_response_body(
     mut response: tunnel::DirectRelayResponse,
     plan: &ExecutionPlan,
     started_at: Instant,
+    headers: &BTreeMap<String, String>,
+    limit: usize,
 ) -> Result<(Vec<u8>, Option<u64>), ExecutionRuntimeTransportError> {
-    let mut body_bytes = Vec::new();
+    let mut body =
+        BoundedBodyCollector::new(headers.get("content-length").map(String::as_str), limit)
+            .map_err(map_bounded_body_error)?;
     let mut first_byte_ms = None;
     let first_byte_timeout = plan
         .stream
@@ -1034,10 +1056,10 @@ async fn collect_local_tunnel_response_body(
         if plan.stream && first_byte_ms.is_none() && !chunk.is_empty() {
             first_byte_ms = Some(started_at.elapsed().as_millis() as u64);
         }
-        body_bytes.extend_from_slice(&chunk);
+        body.push(&chunk).map_err(map_bounded_body_error)?;
     }
 
-    Ok((body_bytes, first_byte_ms))
+    Ok((body.into_bytes(), first_byte_ms))
 }
 
 fn build_direct_tunnel_request_meta(
@@ -1058,6 +1080,7 @@ fn build_direct_tunnel_request_meta(
         stream_first_byte_timeout_ms: timeout_metadata.stream_first_byte_timeout_ms,
         timeout: timeout_metadata.legacy_timeout_secs,
         follow_redirects: transport_controls.follow_redirects,
+        max_response_body_bytes: Some(resolve_response_body_limit(plan) as u64),
         http1_only: transport_controls.http1_only,
         transport_profile: plan.transport_profile.clone(),
     }
@@ -1194,23 +1217,26 @@ impl DirectHttpResponse {
     }
 
     pub(crate) async fn bytes(self) -> Result<Bytes, ExecutionRuntimeTransportError> {
+        self.bytes_bounded(crate::headers::max_internal_buffered_body_bytes())
+            .await
+    }
+
+    async fn bytes_bounded(self, limit: usize) -> Result<Bytes, ExecutionRuntimeTransportError> {
         match self {
-            DirectHttpResponse::Reqwest(response) => response.bytes().await.map_err(|err| {
-                ExecutionRuntimeTransportError::UpstreamRequest(format_upstream_request_error(&err))
-            }),
-            DirectHttpResponse::HyperH2c(response) => response
-                .into_body()
-                .collect()
+            DirectHttpResponse::Reqwest(response) => collect_reqwest_body_bounded(response, limit)
                 .await
-                .map(|collected| collected.to_bytes())
-                .map_err(|err| {
-                    ExecutionRuntimeTransportError::UpstreamRequest(format_hyper_error_chain(&err))
-                }),
-            DirectHttpResponse::BrowserWreq(response) => response.bytes().await.map_err(|err| {
-                ExecutionRuntimeTransportError::BrowserBody(format_wreq_upstream_request_error(
-                    &err,
-                ))
-            }),
+                .map(Bytes::from)
+                .map_err(map_bounded_body_read_error),
+            DirectHttpResponse::HyperH2c(response) => {
+                collect_hyper_stream_body(response, Instant::now(), None, limit)
+                    .await
+                    .map(|(bytes, _)| bytes)
+            }
+            DirectHttpResponse::BrowserWreq(response) => {
+                collect_wreq_stream_body(response, Instant::now(), None, limit)
+                    .await
+                    .map(|(bytes, _)| bytes)
+            }
         }
     }
 
@@ -1218,21 +1244,22 @@ impl DirectHttpResponse {
         self,
         plan: &ExecutionPlan,
         started_at: Instant,
+        limit: usize,
     ) -> Result<(Bytes, Option<u64>), ExecutionRuntimeTransportError> {
         if !plan.stream {
-            return self.bytes().await.map(|bytes| (bytes, None));
+            return self.bytes_bounded(limit).await.map(|bytes| (bytes, None));
         }
 
         let first_byte_timeout = resolve_stream_first_byte_timeout(plan);
         match self {
             DirectHttpResponse::Reqwest(response) => {
-                collect_reqwest_stream_body(response, started_at, first_byte_timeout).await
+                collect_reqwest_stream_body(response, started_at, first_byte_timeout, limit).await
             }
             DirectHttpResponse::HyperH2c(response) => {
-                collect_hyper_stream_body(response, started_at, first_byte_timeout).await
+                collect_hyper_stream_body(response, started_at, first_byte_timeout, limit).await
             }
             DirectHttpResponse::BrowserWreq(response) => {
-                collect_wreq_stream_body(response, started_at, first_byte_timeout).await
+                collect_wreq_stream_body(response, started_at, first_byte_timeout, limit).await
             }
         }
     }
@@ -1278,9 +1305,15 @@ async fn collect_reqwest_stream_body(
     response: reqwest::Response,
     started_at: Instant,
     first_byte_timeout: Option<Duration>,
+    limit: usize,
 ) -> Result<(Bytes, Option<u64>), ExecutionRuntimeTransportError> {
+    let content_length = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok());
+    let mut body =
+        BoundedBodyCollector::new(content_length, limit).map_err(map_bounded_body_error)?;
     let mut stream = response.bytes_stream();
-    let mut body_bytes = Vec::new();
     let mut first_byte_ms = None;
 
     loop {
@@ -1298,19 +1331,25 @@ async fn collect_reqwest_stream_body(
         if first_byte_ms.is_none() && !chunk.is_empty() {
             first_byte_ms = Some(started_at.elapsed().as_millis() as u64);
         }
-        body_bytes.extend_from_slice(&chunk);
+        body.push(&chunk).map_err(map_bounded_body_error)?;
     }
 
-    Ok((Bytes::from(body_bytes), first_byte_ms))
+    Ok((Bytes::from(body.into_bytes()), first_byte_ms))
 }
 
 async fn collect_hyper_stream_body(
     response: hyper::Response<HyperIncomingBody>,
     started_at: Instant,
     first_byte_timeout: Option<Duration>,
+    limit: usize,
 ) -> Result<(Bytes, Option<u64>), ExecutionRuntimeTransportError> {
+    let content_length = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok());
+    let mut body =
+        BoundedBodyCollector::new(content_length, limit).map_err(map_bounded_body_error)?;
     let mut stream = response.into_body().into_data_stream();
-    let mut body_bytes = Vec::new();
     let mut first_byte_ms = None;
 
     loop {
@@ -1328,19 +1367,25 @@ async fn collect_hyper_stream_body(
         if first_byte_ms.is_none() && !chunk.is_empty() {
             first_byte_ms = Some(started_at.elapsed().as_millis() as u64);
         }
-        body_bytes.extend_from_slice(&chunk);
+        body.push(&chunk).map_err(map_bounded_body_error)?;
     }
 
-    Ok((Bytes::from(body_bytes), first_byte_ms))
+    Ok((Bytes::from(body.into_bytes()), first_byte_ms))
 }
 
 async fn collect_wreq_stream_body(
     response: wreq::Response,
     started_at: Instant,
     first_byte_timeout: Option<Duration>,
+    limit: usize,
 ) -> Result<(Bytes, Option<u64>), ExecutionRuntimeTransportError> {
+    let content_length = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok());
+    let mut body =
+        BoundedBodyCollector::new(content_length, limit).map_err(map_bounded_body_error)?;
     let mut stream = response.bytes_stream();
-    let mut body_bytes = Vec::new();
     let mut first_byte_ms = None;
 
     loop {
@@ -1358,10 +1403,10 @@ async fn collect_wreq_stream_body(
         if first_byte_ms.is_none() && !chunk.is_empty() {
             first_byte_ms = Some(started_at.elapsed().as_millis() as u64);
         }
-        body_bytes.extend_from_slice(&chunk);
+        body.push(&chunk).map_err(map_bounded_body_error)?;
     }
 
-    Ok((Bytes::from(body_bytes), first_byte_ms))
+    Ok((Bytes::from(body.into_bytes()), first_byte_ms))
 }
 
 fn direct_h2c_fast_path_applies(
@@ -1980,6 +2025,7 @@ async fn send_via_tunnel_relay(
             stream_first_byte_timeout_ms: timeout_metadata.stream_first_byte_timeout_ms,
             timeout: timeout_secs,
             follow_redirects: transport_controls.follow_redirects,
+            max_response_body_bytes: Some(resolve_response_body_limit(plan) as u64),
             http1_only: transport_controls.http1_only,
             transport_profile: plan.transport_profile.clone(),
         },
@@ -3586,6 +3632,7 @@ pub(crate) fn build_request_headers(
             || normalized_key == EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER
             || normalized_key == EXECUTION_REQUEST_HTTP1_ONLY_HEADER
             || normalized_key == EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER
+            || normalized_key == EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER
         {
             continue;
         }
@@ -3643,6 +3690,34 @@ fn parse_execution_transport_bool(value: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+fn resolve_response_body_limit(plan: &ExecutionPlan) -> usize {
+    execution_transport_header_value(
+        &plan.headers,
+        EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER,
+    )
+    .and_then(|value| value.trim().parse::<u64>().ok())
+    .and_then(|value| usize::try_from(value).ok())
+    .unwrap_or_else(crate::headers::max_internal_buffered_body_bytes)
+}
+
+fn map_bounded_body_error(error: BoundedBodyError) -> ExecutionRuntimeTransportError {
+    match error {
+        BoundedBodyError::ResponseTooLarge => ExecutionRuntimeTransportError::ResponseTooLarge,
+        BoundedBodyError::AllocationFailed => ExecutionRuntimeTransportError::UpstreamRequest(
+            "response body allocation failed".to_string(),
+        ),
+    }
+}
+
+fn map_bounded_body_read_error(error: BoundedBodyReadError) -> ExecutionRuntimeTransportError {
+    match error {
+        BoundedBodyReadError::Bounds(error) => map_bounded_body_error(error),
+        BoundedBodyReadError::Read(error) => {
+            ExecutionRuntimeTransportError::UpstreamRequest(format_upstream_request_error(&error))
+        }
     }
 }
 
@@ -3710,27 +3785,28 @@ pub(crate) fn decode_response_body_bytes(
     headers: &BTreeMap<String, String>,
     body_bytes: &[u8],
 ) -> Option<Vec<u8>> {
+    decode_response_body_bytes_bounded(
+        headers,
+        body_bytes,
+        crate::headers::max_internal_buffered_body_bytes(),
+    )
+    .ok()
+    .flatten()
+}
+
+fn decode_response_body_bytes_bounded(
+    headers: &BTreeMap<String, String>,
+    body_bytes: &[u8],
+    limit: usize,
+) -> Result<Option<Vec<u8>>, ExecutionRuntimeTransportError> {
     let encoding = headers
         .get("content-encoding")
         .map(String::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase());
-    match encoding.as_deref() {
-        Some("gzip") => {
-            let mut decoder = GzDecoder::new(body_bytes);
-            let mut out = Vec::new();
-            decoder.read_to_end(&mut out).ok()?;
-            Some(out)
-        }
-        Some("deflate") => {
-            let mut decoder = DeflateDecoder::new(body_bytes);
-            let mut out = Vec::new();
-            decoder.read_to_end(&mut out).ok()?;
-            Some(out)
-        }
-        _ => None,
-    }
+    decode_response_body_bounded(encoding.as_deref(), body_bytes, limit)
+        .map_err(map_bounded_body_error)
 }
 
 pub(crate) fn response_body_is_json(headers: &BTreeMap<String, String>, body_bytes: &[u8]) -> bool {
@@ -3800,7 +3876,8 @@ mod tests {
     use aether_contracts::{
         ExecutionPlan, ExecutionTimeouts, ProxySnapshot, RequestBody, ResolvedTransportProfile,
         EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
-        TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_AUTO,
+        EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER, TRANSPORT_BACKEND_BROWSER_WREQ,
+        TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_AUTO,
         TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE, TRANSPORT_HTTP_MODE_HTTP1_ONLY,
     };
     use aether_data::repository::proxy_nodes::{
@@ -3813,7 +3890,10 @@ mod tests {
     use axum::routing::{any, post};
     use axum::{Json, Router};
     use base64::Engine as _;
+    use flate2::{write::GzEncoder, Compression};
+    use futures_util::stream;
     use serde_json::json;
+    use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
 
@@ -4577,8 +4657,34 @@ mod tests {
     }
 
     #[test]
+    fn direct_sync_execution_runtime_strips_max_response_body_control_header() {
+        // Given
+        let headers = BTreeMap::from([
+            ("content-type".into(), "application/json".into()),
+            (
+                "x-aether-execution-max-response-body-bytes".into(),
+                "17".into(),
+            ),
+        ]);
+
+        // When
+        let forwarded = build_request_headers(&headers, None, false)
+            .expect("headers should build after stripping internal controls");
+
+        // Then
+        assert!(forwarded.get("content-type").is_some());
+        assert!(forwarded
+            .get("x-aether-execution-max-response-body-bytes")
+            .is_none());
+    }
+
+    #[test]
     fn tunnel_request_meta_uses_total_timeout_for_non_stream_requests() {
-        let plan = tunnel_timeout_plan(false);
+        let mut plan = tunnel_timeout_plan(false);
+        plan.headers.insert(
+            "x-aether-execution-max-response-body-bytes".into(),
+            "17".into(),
+        );
         let meta = build_direct_tunnel_request_meta(
             &plan,
             &reqwest::header::HeaderMap::new(),
@@ -4589,6 +4695,7 @@ mod tests {
         assert_eq!(meta.request_timeout_ms, Some(90_000));
         assert_eq!(meta.stream_first_byte_timeout_ms, Some(12_345));
         assert_eq!(meta.timeout, 90);
+        assert_eq!(meta.max_response_body_bytes, Some(17));
     }
 
     #[test]
@@ -5994,6 +6101,141 @@ mod tests {
             result.headers.get("location").map(String::as_str),
             Some("/final")
         );
+    }
+
+    fn bounded_response_plan(url: String, limit: usize) -> ExecutionPlan {
+        ExecutionPlan {
+            request_id: "req-bounded-response".into(),
+            candidate_id: None,
+            provider_name: Some("provider_ops".into()),
+            provider_id: "prov-bounded".into(),
+            endpoint_id: "ep-bounded".into(),
+            key_id: "key-bounded".into(),
+            method: "GET".into(),
+            url,
+            headers: BTreeMap::from([(
+                EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER.into(),
+                limit.to_string(),
+            )]),
+            content_type: None,
+            content_encoding: None,
+            body: RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            stream: false,
+            client_api_format: "openai:chat".into(),
+            provider_api_format: "openai:chat".into(),
+            model_name: Some("bounded-response".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: Some(ExecutionTimeouts {
+                connect_ms: Some(5_000),
+                total_ms: Some(LOCAL_HTTP_SUCCESS_TIMEOUT_MS),
+                ..ExecutionTimeouts::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_sync_rejects_declared_response_larger_than_limit() {
+        // Given
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let app = Router::new().route(
+            "/body",
+            any(|| async {
+                axum::http::Response::builder()
+                    .header(axum::http::header::CONTENT_LENGTH, "9")
+                    .body(Body::from("123456789"))
+                    .expect("response")
+            }),
+        );
+        let server =
+            tokio::spawn(async move { axum::serve(listener, app).await.expect("test server") });
+
+        // When
+        let error = DirectSyncExecutionRuntime::new()
+            .execute_sync(&bounded_response_plan(format!("http://{addr}/body"), 8))
+            .await
+            .expect_err("declared oversized response must fail");
+        server.abort();
+
+        // Then
+        assert_eq!(error.to_string(), "response_too_large");
+    }
+
+    #[tokio::test]
+    async fn direct_sync_rejects_streamed_response_crossing_limit() {
+        // Given
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let app = Router::new().route(
+            "/body",
+            any(|| async {
+                let chunks = stream::iter([
+                    Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"12345678")),
+                    Ok(Bytes::from_static(b"9")),
+                ]);
+                Body::from_stream(chunks)
+            }),
+        );
+        let server =
+            tokio::spawn(async move { axum::serve(listener, app).await.expect("test server") });
+
+        // When
+        let error = DirectSyncExecutionRuntime::new()
+            .execute_sync(&bounded_response_plan(format!("http://{addr}/body"), 8))
+            .await
+            .expect_err("streamed oversized response must fail");
+        server.abort();
+
+        // Then
+        assert_eq!(error.to_string(), "response_too_large");
+    }
+
+    #[tokio::test]
+    async fn direct_sync_rejects_gzip_expansion_crossing_limit() {
+        // Given
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&vec![b'x'; 65])
+            .expect("gzip source should write");
+        let compressed = encoder.finish().expect("gzip should finish");
+        assert!(compressed.len() < 64, "fixture must prove expansion bound");
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let app = Router::new().route(
+            "/body",
+            any(move || {
+                let compressed = compressed.clone();
+                async move {
+                    axum::http::Response::builder()
+                        .header(axum::http::header::CONTENT_ENCODING, "gzip")
+                        .body(Body::from(compressed))
+                        .expect("response")
+                }
+            }),
+        );
+        let server =
+            tokio::spawn(async move { axum::serve(listener, app).await.expect("test server") });
+
+        // When
+        let error = DirectSyncExecutionRuntime::new()
+            .execute_sync(&bounded_response_plan(format!("http://{addr}/body"), 64))
+            .await
+            .expect_err("gzip expansion oversized response must fail");
+        server.abort();
+
+        // Then
+        assert_eq!(error.to_string(), "response_too_large");
     }
 
     #[tokio::test]

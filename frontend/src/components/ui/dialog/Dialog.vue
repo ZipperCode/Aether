@@ -34,10 +34,16 @@
         >
           <div
             v-if="isOpen"
+            ref="contentRef"
             class="relative flex max-h-[calc(100dvh-2rem)] w-full transform flex-col overflow-hidden rounded-lg border border-border bg-background text-left shadow-2xl transition-all pointer-events-auto sm:my-8 sm:w-full sm:max-h-[calc(100dvh-4rem)]"
             :style="{ zIndex: contentZIndex }"
             :class="maxWidthClass"
+            :role="role || 'dialog'"
+            aria-modal="true"
+            :aria-label="ariaLabel"
+            tabindex="-1"
             @click.stop
+            @keydown="handleKeydown"
           >
             <!-- Header 区域：优先使用 slot，否则使用 title prop -->
             <slot name="header">
@@ -92,7 +98,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, provide, useSlots, type Component } from 'vue'
+import { computed, nextTick, onBeforeUnmount, provide, ref, useSlots, watch, type Component } from 'vue'
 import { useEscapeKey } from '@/composables/useEscapeKey'
 import { DIALOG_CONTEXT_KEY } from './context'
 
@@ -110,6 +116,8 @@ const props = defineProps<{
   noPadding?: boolean // Disable default content padding
   persistent?: boolean // Prevent closing on backdrop click
   closeOnBackdrop?: boolean // Allow closing on backdrop click (default: true)
+  role?: 'dialog' | 'alertdialog'
+  ariaLabel?: string
 }>()
 
 // Emits 定义
@@ -122,6 +130,17 @@ provide(DIALOG_CONTEXT_KEY, true)
 
 // 获取 slots 以便在模板中使用
 const slots = useSlots()
+const contentRef = ref<HTMLElement | null>(null)
+let previouslyFocused: HTMLElement | null = null
+
+const focusableSelector = [
+  'button:not([disabled])',
+  '[href]',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',')
 
 // 统一处理 open 状态
 const isOpen = computed(() => {
@@ -177,6 +196,50 @@ const contentBodyClass = computed(() => [
 const containerZIndex = computed(() => props.zIndex || 60)
 const backdropZIndex = computed(() => props.zIndex || 60)
 const contentZIndex = computed(() => (props.zIndex || 60) + 10)
+
+function restoreFocus() {
+  if (previouslyFocused?.isConnected) {
+    previouslyFocused.focus()
+  }
+  previouslyFocused = null
+}
+
+watch(isOpen, async (open) => {
+  if (!open) {
+    await nextTick()
+    if (!isOpen.value) restoreFocus()
+    return
+  }
+  previouslyFocused = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null
+  await nextTick()
+  const content = contentRef.value
+  const initial = content?.querySelector<HTMLElement>('[data-dialog-initial-focus]')
+    || content?.querySelector<HTMLElement>(focusableSelector)
+  ;(initial || content)?.focus()
+}, { immediate: true })
+
+function handleKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Tab' || !contentRef.value) return
+  const focusable = [...contentRef.value.querySelectorAll<HTMLElement>(focusableSelector)]
+  if (!focusable.length) {
+    event.preventDefault()
+    contentRef.value.focus()
+    return
+  }
+  const first = focusable[0]
+  const last = focusable[focusable.length - 1]
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
+  }
+}
+
+onBeforeUnmount(restoreFocus)
 
 // 添加 ESC 键监听
 useEscapeKey(() => {

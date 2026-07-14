@@ -2,12 +2,13 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_data_contracts::repository::pool_scores::{
-    PoolMemberHardState, PoolMemberIdentity, PoolMemberProbeAttempt, PoolMemberProbeResult,
-    PoolMemberProbeStatus,
+    ListPoolMemberScoresQuery, PoolMemberHardState, PoolMemberIdentity, PoolMemberProbeAttempt,
+    PoolMemberProbeResult, PoolMemberProbeStatus, POOL_KIND_PROVIDER_KEY_POOL,
 };
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
+use aether_provider_pool::ProviderQuotaServingPolicy;
 use aether_runtime_state::{RuntimeLockLease, RuntimeState};
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
@@ -15,8 +16,10 @@ use tracing::{debug, info, warn};
 
 use crate::admin_api::{
     admin_provider_pool_config, provider_quota_refresh_endpoint_for_provider,
-    provider_type_supports_quota_refresh, refresh_provider_pool_quota_locally, AdminAppState,
+    provider_quota_serving_policy, provider_type_supports_quota_refresh,
+    refresh_provider_pool_quota_locally, AdminAppState,
 };
+use crate::handlers::admin::QuotaRefreshSource;
 use crate::{AppState, GatewayError};
 
 const ACCOUNT_SELF_CHECK_REDIS_PREFIX: &str = "ap:account_self_check:last";
@@ -93,6 +96,7 @@ enum AccountSelfCheckOutcome {
     Success {
         status_code: Option<u16>,
         message: Option<String>,
+        exhausted: bool,
     },
     Blocked {
         status_code: Option<u16>,
@@ -411,10 +415,20 @@ fn quota_payload_result_for_key(key_id: &str, payload: Option<Value>) -> Account
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    if status == "backoff" {
+        return AccountSelfCheckOutcome::Skipped {
+            message: "quota refresh deferred by backoff".to_string(),
+        };
+    }
     if status == "success" {
         return AccountSelfCheckOutcome::Success {
             status_code,
             message,
+            exhausted: item
+                .get("quota_snapshot")
+                .and_then(|snapshot| snapshot.get("exhausted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         };
     }
     if auto_removed {
@@ -462,6 +476,7 @@ async fn perform_quota_refresh_check(
         provider_type,
         vec![key],
         None,
+        QuotaRefreshSource::AccountSelfCheck,
     )
     .await?;
     Ok(quota_payload_result_for_key(&key_id, payload))
@@ -508,14 +523,72 @@ async fn record_score_probe_result_for_key(
     key_id: &str,
     attempted_at: u64,
     outcome: &AccountSelfCheckOutcome,
+    serving_policy: ProviderQuotaServingPolicy,
 ) {
     if !state.data.has_pool_score_writer() {
+        return;
+    }
+    if matches!(serving_policy, ProviderQuotaServingPolicy::ObservationOnly) {
+        return;
+    }
+    let subscription_hard_state = if matches!(
+        serving_policy,
+        ProviderQuotaServingPolicy::SubscriptionExhaustionOnly
+    ) {
+        match outcome {
+            AccountSelfCheckOutcome::Success {
+                exhausted: true, ..
+            } => Some(PoolMemberHardState::QuotaExhausted),
+            AccountSelfCheckOutcome::Success {
+                exhausted: false, ..
+            } => {
+                let scope = crate::ai_serving::provider_key_pool_score_scope();
+                state
+                    .data
+                    .list_pool_member_scores(&ListPoolMemberScoresQuery {
+                        pool_kind: POOL_KIND_PROVIDER_KEY_POOL.to_string(),
+                        pool_id: provider_id.to_string(),
+                        capability: Some(scope.capability),
+                        scope_kind: Some(scope.scope_kind),
+                        scope_id: scope.scope_id,
+                        hard_states: vec![PoolMemberHardState::QuotaExhausted],
+                        probe_statuses: None,
+                        offset: 0,
+                        limit: 10_000,
+                    })
+                    .await
+                    .ok()
+                    .and_then(|scores| {
+                        scores.into_iter().find(|score| {
+                            score.member_id == key_id
+                                && score
+                                    .score_reason
+                                    .pointer("/quota_refresh_health/state")
+                                    .and_then(Value::as_str)
+                                    == Some("quota_exhausted")
+                        })
+                    })
+                    .map(|_| PoolMemberHardState::Available)
+            }
+            AccountSelfCheckOutcome::Blocked { .. }
+            | AccountSelfCheckOutcome::AutoRemoved { .. }
+            | AccountSelfCheckOutcome::Failed { .. }
+            | AccountSelfCheckOutcome::Skipped { .. } => None,
+        }
+    } else {
+        None
+    };
+    if matches!(
+        serving_policy,
+        ProviderQuotaServingPolicy::SubscriptionExhaustionOnly
+    ) && subscription_hard_state.is_none()
+    {
         return;
     }
     let (succeeded, hard_state, probe_status) = match outcome {
         AccountSelfCheckOutcome::Success { .. } => (
             true,
-            Some(PoolMemberHardState::Available),
+            subscription_hard_state.or(Some(PoolMemberHardState::Available)),
             PoolMemberProbeStatus::Ok,
         ),
         AccountSelfCheckOutcome::Blocked { .. } => (
@@ -539,6 +612,35 @@ async fn record_score_probe_result_for_key(
             PoolMemberProbeStatus::Never,
         ),
     };
+    let mut score_reason_patch = json!({
+        "last_probe": {
+            "source": "account_self_check",
+            "status": outcome.score_status(),
+            "status_code": outcome.status_code(),
+            "message": outcome.message()
+        },
+        "last_self_check": {
+            "source": "account_self_check",
+            "status": outcome.score_status(),
+            "status_code": outcome.status_code(),
+            "message": outcome.message(),
+            "attempted_at": attempted_at
+        }
+    });
+    if let Some(state_name) = match subscription_hard_state {
+        Some(PoolMemberHardState::QuotaExhausted) => Some("quota_exhausted"),
+        Some(PoolMemberHardState::Available) => Some("available"),
+        Some(
+            PoolMemberHardState::Unknown
+            | PoolMemberHardState::Cooldown
+            | PoolMemberHardState::AuthInvalid
+            | PoolMemberHardState::Banned
+            | PoolMemberHardState::Inactive,
+        )
+        | None => None,
+    } {
+        score_reason_patch["quota_refresh_health"] = json!({"state": state_name});
+    }
     let result = PoolMemberProbeResult {
         identity: PoolMemberIdentity::provider_api_key(provider_id.to_string(), key_id.to_string()),
         scope: None,
@@ -546,21 +648,7 @@ async fn record_score_probe_result_for_key(
         succeeded,
         hard_state,
         probe_status,
-        score_reason_patch: Some(json!({
-            "last_probe": {
-                "source": "account_self_check",
-                "status": outcome.score_status(),
-                "status_code": outcome.status_code(),
-                "message": outcome.message()
-            },
-            "last_self_check": {
-                "source": "account_self_check",
-                "status": outcome.score_status(),
-                "status_code": outcome.status_code(),
-                "message": outcome.message(),
-                "attempted_at": attempted_at
-            }
-        })),
+        score_reason_patch: Some(score_reason_patch),
     };
     if let Err(err) = state.data.record_pool_member_probe_result(result).await {
         debug!(
@@ -668,6 +756,8 @@ pub(crate) async fn perform_account_self_check_once_with_config(
             summary.providers_skipped = summary.providers_skipped.saturating_add(1);
             continue;
         }
+        let serving_policy = provider_quota_serving_policy(&provider_type)
+            .unwrap_or(ProviderQuotaServingPolicy::ServingProbe);
 
         let interval_seconds = pool_config
             .account_self_check_interval_minutes
@@ -691,8 +781,10 @@ pub(crate) async fn perform_account_self_check_once_with_config(
         summary.scanned_keys = summary.scanned_keys.saturating_add(selected_count);
         summary.selected_keys = summary.selected_keys.saturating_add(selected_count);
         summary.providers_checked_with_keys = summary.providers_checked_with_keys.saturating_add(1);
-        for key in &keys {
-            record_score_probe_in_progress_for_key(state, &provider.id, &key.id, now_ts).await;
+        if matches!(serving_policy, ProviderQuotaServingPolicy::ServingProbe) {
+            for key in &keys {
+                record_score_probe_in_progress_for_key(state, &provider.id, &key.id, now_ts).await;
+            }
         }
 
         let provider_short_id = provider.id.chars().take(8).collect::<String>();
@@ -730,7 +822,15 @@ pub(crate) async fn perform_account_self_check_once_with_config(
                     message: gateway_error_message(err),
                 },
             };
-            record_score_probe_result_for_key(state, &provider.id, &key.id, now_ts, &outcome).await;
+            record_score_probe_result_for_key(
+                state,
+                &provider.id,
+                &key.id,
+                now_ts,
+                &outcome,
+                serving_policy,
+            )
+            .await;
             update_summary_from_outcome(&mut summary, &outcome);
         }
 
@@ -792,8 +892,111 @@ pub(crate) fn spawn_account_self_check_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::select_account_self_check_key_ids;
+    use super::{
+        quota_payload_result_for_key, record_score_probe_result_for_key,
+        select_account_self_check_key_ids, update_summary_from_outcome, AccountSelfCheckOutcome,
+        AccountSelfCheckRunSummary,
+    };
+    use serde_json::json;
     use std::collections::BTreeMap;
+
+    use std::sync::Arc;
+
+    use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
+    use aether_data_contracts::repository::pool_scores::{
+        GetPoolMemberScoresByIdsQuery, PoolMemberHardState, PoolMemberProbeStatus,
+        StoredPoolMemberScore,
+    };
+    use aether_provider_pool::ProviderQuotaServingPolicy;
+
+    use crate::{data::GatewayDataState, AppState};
+
+    #[test]
+    fn quota_backoff_is_skipped_and_never_failed() {
+        // Given
+        let payload = json!({
+            "total": 1,
+            "success": 0,
+            "failed": 0,
+            "skipped": 1,
+            "results": [{"key_id":"key-1","status":"backoff"}]
+        });
+        let mut summary = AccountSelfCheckRunSummary::empty();
+
+        // When
+        let outcome = quota_payload_result_for_key("key-1", Some(payload));
+        update_summary_from_outcome(&mut summary, &outcome);
+
+        // Then
+        assert!(matches!(outcome, AccountSelfCheckOutcome::Skipped { .. }));
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.blocked, 0);
+    }
+
+    #[tokio::test]
+    async fn subscription_refresh_success_preserves_unrelated_hard_state() {
+        // Given
+        let existing = StoredPoolMemberScore {
+            id: "score-key-1".to_string(),
+            pool_kind: "provider_key_pool".to_string(),
+            pool_id: "provider-kimi".to_string(),
+            member_kind: "provider_api_key".to_string(),
+            member_id: "key-1".to_string(),
+            capability: "account".to_string(),
+            scope_kind: "account".to_string(),
+            scope_id: None,
+            score: 0.25,
+            hard_state: PoolMemberHardState::Banned,
+            score_version: 1,
+            score_reason: json!({"serving_failure": {"source": "network"}}),
+            last_ranked_at: None,
+            last_scheduled_at: None,
+            last_success_at: None,
+            last_failure_at: Some(90),
+            failure_count: 2,
+            last_probe_attempt_at: Some(90),
+            last_probe_success_at: None,
+            last_probe_failure_at: Some(90),
+            probe_failure_count: 2,
+            probe_status: PoolMemberProbeStatus::Failed,
+            updated_at: 90,
+        };
+        let repository = Arc::new(InMemoryPoolMemberScoreRepository::seed([existing]));
+        let state = AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_pool_score_repository_for_tests(Arc::clone(&repository)),
+            );
+
+        // When
+        record_score_probe_result_for_key(
+            &state,
+            "provider-kimi",
+            "key-1",
+            100,
+            &AccountSelfCheckOutcome::Success {
+                status_code: Some(200),
+                message: None,
+                exhausted: false,
+            },
+            ProviderQuotaServingPolicy::SubscriptionExhaustionOnly,
+        )
+        .await;
+
+        // Then
+        let scores = state
+            .data
+            .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+                ids: vec!["score-key-1".to_string()],
+            })
+            .await
+            .expect("score should load");
+        assert_eq!(scores[0].hard_state, PoolMemberHardState::Banned);
+        assert_eq!(scores[0].score, 0.25);
+        assert_eq!(scores[0].probe_failure_count, 2);
+    }
 
     #[test]
     fn selects_never_and_stale_self_check_keys_first() {

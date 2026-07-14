@@ -24,6 +24,9 @@ use aether_provider_transport::windsurf::cascade::{
 };
 use aether_provider_transport::windsurf::models::resolve_windsurf_model;
 use aether_provider_transport::windsurf::{GET_CHAT_MESSAGE_PATH, WINDSURF_ENVELOPE_NAME};
+use aether_provider_transport::{
+    collect_reqwest_body_bounded, BoundedBodyError, BoundedBodyReadError,
+};
 use axum::body::Bytes;
 use base64::Engine as _;
 use futures_util::stream::BoxStream;
@@ -1543,19 +1546,32 @@ async fn windsurf_grpc_unary(
             ))
         })?;
     let status = response.status();
-    let body = response.bytes().await.map_err(|err| {
-        ExecutionRuntimeTransportError::UpstreamRequest(format!(
-            "Windsurf Connect {method} response read failed: {}",
-            super::transport::format_upstream_request_error(&err)
-        ))
-    })?;
+    let body =
+        collect_reqwest_body_bounded(response, crate::headers::max_internal_buffered_body_bytes())
+            .await
+            .map_err(|err| match err {
+                BoundedBodyReadError::Bounds(BoundedBodyError::ResponseTooLarge) => {
+                    ExecutionRuntimeTransportError::ResponseTooLarge
+                }
+                BoundedBodyReadError::Bounds(BoundedBodyError::AllocationFailed) => {
+                    ExecutionRuntimeTransportError::UpstreamRequest(
+                        "Windsurf Connect response body allocation failed".to_string(),
+                    )
+                }
+                BoundedBodyReadError::Read(err) => {
+                    ExecutionRuntimeTransportError::UpstreamRequest(format!(
+                        "Windsurf Connect {method} response read failed: {}",
+                        super::transport::format_upstream_request_error(&err)
+                    ))
+                }
+            })?;
     if !status.is_success() {
         return Err(ExecutionRuntimeTransportError::UpstreamRequest(format!(
             "Windsurf Connect {method} returned HTTP {status}: {}",
             String::from_utf8_lossy(&body)
         )));
     }
-    Ok(body.to_vec())
+    Ok(body)
 }
 
 fn detect_windsurf_request(

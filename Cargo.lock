@@ -353,9 +353,12 @@ dependencies = [
 name = "aether-provider-pool"
 version = "0.1.0"
 dependencies = [
+ "aether-contracts",
  "aether-data-contracts",
  "aether-pool-core",
+ "serde",
  "serde_json",
+ "tokio",
  "url",
  "uuid",
 ]
@@ -374,6 +377,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "flate2",
  "http",
  "regex",
  "reqwest",
@@ -495,6 +499,7 @@ dependencies = [
  "aether-contracts",
  "aether-gateway",
  "aether-http",
+ "aether-provider-transport",
  "aether-runtime",
  "aether-runtime-state",
  "anyhow",

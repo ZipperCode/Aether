@@ -246,6 +246,13 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
     if !provider_pool_quota_snapshot_matches_provider(quota_snapshot, provider_type) {
         return None;
     }
+    if quota_snapshot
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("balance"))
+    {
+        return Some(false);
+    }
     let exhausted = provider_pool_json_bool(quota_snapshot.get("exhausted"))?;
     if exhausted {
         let now_unix_secs = provider_pool_current_unix_secs();

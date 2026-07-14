@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use aether_provider_transport::{should_skip_request_header, BoundedBodyCollector};
 use aether_runtime::{AdmissionPermit, QueueSendError};
 use bytes::{Bytes, BytesMut};
 use futures_util::stream;
@@ -31,6 +32,7 @@ use super::writer::FrameSender;
 
 /// Maximum response body chunk size per frame (32 KB).
 const MAX_CHUNK_SIZE: usize = 32 * 1024;
+const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 /// Timeout for sending a single frame to the writer channel.
 /// Control frames are allowed a short wait; body frames fail fast.
@@ -546,7 +548,9 @@ fn sanitize_upstream_headers(
         .iter()
         .filter_map(|(key, value)| {
             let normalized = key.to_ascii_lowercase();
-            if BLOCKED_HEADERS.contains(&normalized.as_str()) {
+            if BLOCKED_HEADERS.contains(&normalized.as_str())
+                || should_skip_request_header(&normalized)
+            {
                 None
             } else {
                 Some((key.clone(), value.clone()))
@@ -709,6 +713,21 @@ fn resolve_request_timeouts(meta: &RequestMeta) -> RequestTimeouts {
         first_byte_timeout: Duration::from_millis(resolved.first_byte_ms),
         response_body_timeout: resolved.response_body_ms.map(Duration::from_millis),
     }
+}
+
+fn resolve_response_body_limit(meta: &RequestMeta) -> usize {
+    meta.max_response_body_bytes
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(DEFAULT_MAX_RESPONSE_BODY_BYTES)
+}
+
+fn timeout_duration_from_ms(ms: u64) -> Duration {
+    Duration::from_millis(ms.clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS))
+}
+
+fn timeout_duration_from_legacy_secs(secs: u64) -> Duration {
+    let ms = secs.saturating_mul(1_000);
+    timeout_duration_from_ms(ms)
 }
 
 async fn spool_request_body(
@@ -1049,12 +1068,26 @@ async fn relay_upstream_response<B>(
     request_body_mode: &'static str,
     emit_proxy_timing_header: bool,
     response_body_deadline: Option<Instant>,
+    max_response_body_bytes: usize,
 ) -> Option<Duration>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: std::fmt::Display,
 {
     let status = response.status().as_u16();
+    let content_length = response
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok());
+    let mut response_body = match BoundedBodyCollector::new(content_length, max_response_body_bytes)
+    {
+        Ok(body) => body,
+        Err(_) => {
+            server.metrics.stream_errors.fetch_add(1, Ordering::Release);
+            send_error(frame_tx, stream_id, "response_too_large").await;
+            return Some(total_elapsed);
+        }
+    };
     let ttfb_ms = total_elapsed.as_millis() as u64;
     let mut resp_headers: Vec<(String, String)> = Vec::with_capacity(response.headers().len() + 1);
     for (key, value) in response.headers() {
@@ -1167,6 +1200,11 @@ where
 
         match chunk_result {
             Ok(chunk) => {
+                if response_body.push(&chunk).is_err() {
+                    server.metrics.stream_errors.fetch_add(1, Ordering::Release);
+                    send_error(frame_tx, stream_id, "response_too_large").await;
+                    return Some(total_elapsed);
+                }
                 if chunk.len() <= MAX_CHUNK_SIZE {
                     let (payload, extra_flags) = raw_payload(chunk);
                     if !acquire_response_credit(response_window, frame_tx, stream_id, payload.len())
@@ -1624,6 +1662,7 @@ async fn handle_stream_inner(
                         request_body_mode,
                         state.config.emit_proxy_timing_header,
                         response_body_deadline,
+                        resolve_response_body_limit(&meta),
                     )
                     .await;
                 }
@@ -1665,6 +1704,7 @@ async fn handle_stream_inner(
                             request_body_mode,
                             state.config.emit_proxy_timing_header,
                             response_body_deadline,
+                            resolve_response_body_limit(&meta),
                         )
                         .await;
                     }
@@ -1722,6 +1762,7 @@ async fn handle_stream_inner(
             request_body_mode,
             state.config.emit_proxy_timing_header,
             response_body_deadline,
+            resolve_response_body_limit(&meta),
         )
         .await;
     }
@@ -2156,6 +2197,29 @@ mod tests {
     }
 
     #[test]
+    fn response_body_limit_metadata_is_not_forwarded_upstream() {
+        // Given
+        let headers = std::collections::HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                aether_contracts::EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER.to_string(),
+                "1048576".to_string(),
+            ),
+        ]);
+
+        // When
+        let sanitized = sanitize_upstream_headers(&headers);
+
+        // Then
+        assert!(sanitized
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type")));
+        assert!(!sanitized.iter().any(|(name, _)| name.eq_ignore_ascii_case(
+            aether_contracts::EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER
+        )));
+    }
+
+    #[test]
     fn resolve_redirect_changes_post_to_get_for_302() {
         let current_url = url::Url::parse("https://redirect.test/start").expect("url");
         let response = Response::builder()
@@ -2383,6 +2447,7 @@ mod tests {
             "empty",
             true,
             Some(Instant::now()),
+            DEFAULT_MAX_RESPONSE_BODY_BYTES,
         )
         .await;
 
@@ -2393,6 +2458,93 @@ mod tests {
             Some("upstream response body timeout")
         );
         assert_eq!(server.metrics.stream_errors.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn declared_oversized_response_emits_stable_stream_error() {
+        // Given
+        let state = sample_state(None, None);
+        let server = sample_server(&state);
+        let (frame_tx, sent, writer_handle) = spawn_test_writer();
+        let request_url = url::Url::parse("https://example.com/large").expect("url");
+        let request_body_size = AtomicUsize::new(0);
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, "9")
+            .body(Body::from("123456789"))
+            .expect("response");
+        let response_window = test_response_window();
+
+        // When
+        relay_upstream_response(
+            &server,
+            15,
+            &hyper::Method::GET,
+            &request_url,
+            &frame_tx,
+            response_window.as_ref(),
+            response,
+            0,
+            Duration::ZERO,
+            upstream_client::RequestTiming::default(),
+            &request_body_size,
+            0,
+            "empty",
+            true,
+            None,
+            8,
+        )
+        .await;
+        let result = collect_stream_result(frame_tx, sent, writer_handle).await;
+
+        // Then
+        assert_eq!(result.error.as_deref(), Some("response_too_large"));
+        assert!(result.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamed_oversized_response_emits_stable_stream_error() {
+        // Given
+        let state = sample_state(None, None);
+        let server = sample_server(&state);
+        let (frame_tx, sent, writer_handle) = spawn_test_writer();
+        let request_url = url::Url::parse("https://example.com/large-stream").expect("url");
+        let request_body_size = AtomicUsize::new(0);
+        let body = Body::from_stream(stream::iter([
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"12345678")),
+            Ok(Bytes::from_static(b"9")),
+        ]));
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(body)
+            .expect("response");
+        let response_window = test_response_window();
+
+        // When
+        relay_upstream_response(
+            &server,
+            16,
+            &hyper::Method::GET,
+            &request_url,
+            &frame_tx,
+            response_window.as_ref(),
+            response,
+            0,
+            Duration::ZERO,
+            upstream_client::RequestTiming::default(),
+            &request_body_size,
+            0,
+            "empty",
+            true,
+            None,
+            8,
+        )
+        .await;
+        let result = collect_stream_result(frame_tx, sent, writer_handle).await;
+
+        // Then
+        assert_eq!(result.error.as_deref(), Some("response_too_large"));
+        assert_eq!(result.body, Bytes::from_static(b"12345678"));
     }
 
     #[tokio::test]
@@ -2428,6 +2580,7 @@ mod tests {
             "empty",
             true,
             None,
+            DEFAULT_MAX_RESPONSE_BODY_BYTES,
         )
         .await;
 
@@ -2793,6 +2946,7 @@ mod tests {
             stream_first_byte_timeout_ms: None,
             timeout: 30,
             follow_redirects: None,
+            max_response_body_bytes: None,
             http1_only: false,
             transport_profile: None,
         }

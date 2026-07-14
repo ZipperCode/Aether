@@ -1379,6 +1379,7 @@ fn build_tunnel_probe_relay_envelope(
         stream_first_byte_timeout_ms: None,
         timeout: timeout_secs,
         follow_redirects: Some(false),
+        max_response_body_bytes: None,
         http1_only: false,
         transport_profile: None,
     };

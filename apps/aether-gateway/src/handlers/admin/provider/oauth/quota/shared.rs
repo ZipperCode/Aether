@@ -12,13 +12,18 @@ use aether_admin::provider::quota as admin_provider_quota_pure;
 use aether_contracts::{
     ExecutionPlan, ExecutionResult, ExecutionTimeouts, ProxySnapshot, RequestBody,
     ResolvedTransportProfile, EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER,
+    EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER,
 };
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
-use aether_provider_pool::{ProviderPoolQuotaRequestSpec, ProviderPoolService};
+use aether_provider_pool::{
+    ProviderPoolQuotaRequestSpec, ProviderPoolService, ProviderQuotaServingPolicy,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
+
+const OFFICIAL_QUOTA_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 const PROVIDER_QUOTA_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const PROVIDER_QUOTA_PROXY_TIMEOUT_MS: u64 = 60_000;
@@ -146,6 +151,12 @@ pub(crate) fn provider_type_supports_quota_refresh(provider_type: &str) -> bool 
     ProviderPoolService::with_builtin_adapters().supports_quota_refresh(provider_type)
 }
 
+pub(crate) fn provider_quota_serving_policy(
+    provider_type: &str,
+) -> Option<ProviderQuotaServingPolicy> {
+    ProviderPoolService::with_builtin_adapters().quota_serving_policy(provider_type)
+}
+
 pub(crate) fn unsupported_provider_quota_refresh_message(provider_type: &str) -> String {
     ProviderPoolService::with_builtin_adapters().quota_refresh_unsupported_message(provider_type)
 }
@@ -250,6 +261,14 @@ pub(super) fn build_provider_quota_execution_plan(
             "true".to_string(),
         );
     }
+    headers.insert(
+        EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER.to_string(),
+        "false".to_string(),
+    );
+    headers.insert(
+        EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER.to_string(),
+        OFFICIAL_QUOTA_MAX_RESPONSE_BODY_BYTES.to_string(),
+    );
     let body = json_body
         .map(RequestBody::from_json)
         .unwrap_or(RequestBody {
@@ -334,13 +353,15 @@ pub(crate) async fn persist_provider_quota_refresh_state(
 pub(super) async fn execute_provider_quota_plan(
     state: &AdminAppState<'_>,
     transport: &AdminGatewayProviderTransportSnapshot,
-    plan: ExecutionPlan,
+    mut plan: ExecutionPlan,
     quota_kind: &str,
 ) -> Result<ProviderQuotaExecutionOutcome, GatewayError> {
+    force_provider_quota_redirect_closed(&mut plan);
     match state.execute_execution_runtime_sync_plan(None, &plan).await {
         Ok(result) => Ok(ProviderQuotaExecutionOutcome::Response(result)),
         Err(err) => {
             let error = err.into_message();
+            let error_class = quota_transport_error_class(&error);
             let proxy_node_id = plan
                 .proxy
                 .as_ref()
@@ -360,15 +381,114 @@ pub(super) async fn execute_provider_quota_plan(
             warn!(
                 key_id = %transport.key.id,
                 endpoint_id = %transport.endpoint.id,
-                url = %plan.url,
                 proxy_source = ?proxy_source,
                 proxy_node_id = ?proxy_node_id,
                 proxy_url_present,
-                error = %error,
+                error_class,
                 quota_kind = %quota_kind,
                 "gateway provider quota execution runtime request failed"
             );
             Ok(ProviderQuotaExecutionOutcome::Failure(error))
         }
+    }
+}
+
+fn force_provider_quota_redirect_closed(plan: &mut ExecutionPlan) {
+    plan.headers.insert(
+        EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER.to_string(),
+        "false".to_string(),
+    );
+    plan.headers.insert(
+        EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER.to_string(),
+        OFFICIAL_QUOTA_MAX_RESPONSE_BODY_BYTES.to_string(),
+    );
+}
+
+fn quota_transport_error_class(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("timeout") || normalized.contains("timed out") {
+        "timeout"
+    } else if normalized.contains("certificate")
+        || normalized.contains("tls")
+        || normalized.contains("ssl")
+    {
+        "tls"
+    } else if normalized.contains("proxy") || normalized.contains("tunnel") {
+        "route"
+    } else if normalized.contains("connect") || normalized.contains("dns") {
+        "connect"
+    } else {
+        "transport"
+    }
+}
+
+#[cfg(test)]
+mod transport_logging_tests {
+    use super::{force_provider_quota_redirect_closed, quota_transport_error_class};
+    use aether_contracts::{
+        ExecutionPlan, RequestBody, EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
+        EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn transport_log_class_never_contains_untrusted_error_text() {
+        // Given
+        let malicious = "Bearer secret\r\nX-Api-Key: stolen http://user:pass@proxy/?token=x";
+
+        // When
+        let class = quota_transport_error_class(malicious);
+
+        // Then
+        assert_eq!(class, "route");
+        for secret in ["Bearer", "secret", "X-Api-Key", "user:pass", "token=x"] {
+            assert!(!class.contains(secret));
+        }
+    }
+
+    #[test]
+    fn credential_quota_plan_redirect_is_closed_for_manual_builders() {
+        // Given: a manually-built quota plan that requests redirects.
+        let mut plan = ExecutionPlan {
+            request_id: "grok-quota:test".to_string(),
+            candidate_id: None,
+            provider_name: Some("grok".to_string()),
+            provider_id: "provider-test".to_string(),
+            endpoint_id: "endpoint-test".to_string(),
+            key_id: "key-test".to_string(),
+            method: "POST".to_string(),
+            url: "https://grok.com/rest/rate-limits".to_string(),
+            headers: BTreeMap::from([(
+                EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER.to_string(),
+                "true".to_string(),
+            )]),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(serde_json::json!({})),
+            stream: false,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "grok:rate_limits".to_string(),
+            model_name: Some("grok-quota".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+
+        // When
+        force_provider_quota_redirect_closed(&mut plan);
+
+        // Then
+        assert_eq!(
+            plan.headers
+                .get(EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER)
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            plan.headers
+                .get(EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER)
+                .map(String::as_str),
+            Some("1048576")
+        );
     }
 }

@@ -40,6 +40,15 @@
       >
         {{ kiroSubscriptionLabel }}
       </Badge>
+
+      <Badge
+        v-if="quotaTypeLabel"
+        variant="outline"
+        class="h-4 shrink-0 px-1.5 py-0 text-[9px] font-normal border-emerald-500/30 text-emerald-600 dark:text-emerald-400"
+        data-testid="provider-key-quota-type"
+      >
+        {{ quotaTypeLabel }}
+      </Badge>
     </div>
 
     <div class="flex items-center gap-1">
@@ -162,6 +171,7 @@ const props = withDefaults(defineProps<{
   oauthOrgBadge?: OAuthOrgBadgeDisplay | null
   kiroSubscriptionLabel?: string | null
   kiroSubscriptionClass?: string
+  quotaTypeLabel?: string | null
   canExportCredential?: boolean
   showOAuthRefreshControl?: boolean
   accountLevelBlock?: boolean
@@ -178,6 +188,7 @@ const props = withDefaults(defineProps<{
   oauthOrgBadge: null,
   kiroSubscriptionLabel: null,
   kiroSubscriptionClass: '',
+  quotaTypeLabel: null,
   canExportCredential: false,
   showOAuthRefreshControl: false,
   accountLevelBlock: false,

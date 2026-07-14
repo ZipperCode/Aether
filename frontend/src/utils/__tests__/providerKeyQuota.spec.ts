@@ -1,11 +1,50 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  getGenericQuotaSections,
   getGeminiCliAccountCreditsText,
   getQuotaDisplayText,
 } from '../providerKeyQuota'
 
 describe('providerKeyQuota', () => {
+  it('prefers provider-neutral balances and keeps quota categories separate', () => {
+    const quota = {
+      kind: 'balance',
+      code: 'ok',
+      exhausted: false,
+      freshness: 'stale',
+      balances: [{ unit: 'USD', available: '12.50', total: 20 }],
+      windows: [{ code: 'monthly', label: '月度', remaining_value: '800', limit_value: '1000' }],
+      rate_limits: { rpm: 60, tpm: 100000, kind: 'configured_limits' },
+      refresh_state: { error: '上游暂时不可用' },
+    } as const
+
+    expect(getGenericQuotaSections(quota)).toEqual({
+      balances: ['可用 $12.50 / 总额 $20'],
+      windows: ['月度 剩余 800/1000'],
+      rateLimits: ['RPM 60', 'TPM 100000'],
+      status: ['数据已过期', '上游暂时不可用'],
+    })
+    expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'deepseek'))
+      .toBe('可用 $12.50 / 总额 $20 | 月度 剩余 800/1000 | RPM 60 | TPM 100000')
+  })
+
+  it('preserves decimal strings beyond Number precision', () => {
+    const quota = {
+      code: 'ok',
+      exhausted: false,
+      balances: [{
+        unit: 'CNY',
+        available: '9007199254740993.123456789012345678',
+        total: '9007199254740994.000000000000000001',
+      }],
+    } as const
+
+    expect(getGenericQuotaSections(quota).balances).toEqual([
+      '可用 9,007,199,254,740,993.123456789012345678 CNY / 总额 9,007,199,254,740,994.000000000000000001 CNY',
+    ])
+  })
+
   it('includes Codex Spark quota windows in display text', () => {
     expect(getQuotaDisplayText({
       status_snapshot: {

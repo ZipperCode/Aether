@@ -1,14 +1,20 @@
+mod background_limiter;
 mod capability;
 mod plan;
 mod presets;
 mod provider;
 mod quota;
 mod quota_refresh;
+mod quota_snapshot;
 mod service;
 
 pub mod providers;
 
-pub use capability::{ProviderPoolCapabilities, ProviderPoolCapability};
+pub use background_limiter::OfficialProviderBackgroundLimiter;
+pub use capability::{
+    ProviderPoolCapabilities, ProviderPoolCapability, ProviderQuotaHealthTransition,
+    ProviderQuotaServingPolicy,
+};
 pub use plan::{derive_oauth_plan_type, derive_plan_tier, normalize_provider_plan_tier};
 pub use presets::{
     build_admin_pool_scheduling_presets_payload, normalize_provider_scheduling_presets,
@@ -17,30 +23,49 @@ pub use provider::{ProviderPoolAdapter, ProviderPoolMemberInput};
 pub use providers::{
     build_antigravity_pool_quota_request, build_chatgpt_web_pool_quota_request,
     build_codex_pool_quota_request, build_codex_pool_reset_credit_consume_request,
-    build_codex_pool_reset_credits_request, build_gemini_cli_pool_quota_request,
-    build_kiro_pool_quota_request, build_nous_account_quota_request,
-    build_nous_billing_quota_request, build_windsurf_pool_model_configs_request,
+    build_codex_pool_reset_credits_request, build_deepseek_balance_request,
+    build_gemini_cli_pool_quota_request, build_kiro_pool_quota_request,
+    build_nous_account_quota_request, build_nous_billing_quota_request,
+    build_openrouter_credits_request, build_windsurf_pool_model_configs_request,
     build_windsurf_pool_model_configs_request_with_base_url, build_windsurf_pool_quota_request,
     build_windsurf_pool_quota_request_with_base_url, build_windsurf_pool_rate_limit_request,
-    build_windsurf_pool_rate_limit_request_with_base_url, enrich_chatgpt_web_quota_metadata,
+    build_windsurf_pool_rate_limit_request_with_base_url,
+    clamp_official_balance_execution_timeouts, enrich_chatgpt_web_quota_metadata,
     grok_mode_id_for_model, grok_pool_tier_from_quota_bucket, grok_quota_window_key_for_model,
-    grok_supported_quota_windows_for_tier, normalize_chatgpt_web_image_quota_limit,
-    AntigravityProviderPoolAdapter, ChatGptWebProviderPoolAdapter, CodexProviderPoolAdapter,
+    grok_supported_quota_windows_for_tier, is_official_deepseek_endpoint,
+    is_official_openrouter_endpoint, normalize_chatgpt_web_image_quota_limit,
+    parse_deepseek_balance, parse_openrouter_credits, AntigravityProviderPoolAdapter,
+    ChatGptWebProviderPoolAdapter, CodexProviderPoolAdapter, DeepSeekProviderPoolAdapter,
     DefaultProviderPoolAdapter, GeminiCliProviderPoolAdapter, GrokProviderPoolAdapter,
     KiroPoolQuotaAuthInput, KiroProviderPoolAdapter, NousProviderPoolAdapter,
-    UnsupportedQuotaProviderPoolAdapter, ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH,
-    CHATGPT_WEB_CONVERSATION_INIT_PATH, CHATGPT_WEB_DEFAULT_BASE_URL,
-    CODEX_WHAM_RESET_CREDITS_CONSUME_URL, CODEX_WHAM_RESET_CREDITS_URL, CODEX_WHAM_USAGE_URL,
+    OpenRouterProviderPoolAdapter, UnsupportedQuotaProviderPoolAdapter,
+    ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH, CHATGPT_WEB_CONVERSATION_INIT_PATH,
+    CHATGPT_WEB_DEFAULT_BASE_URL, CODEX_WHAM_RESET_CREDITS_CONSUME_URL,
+    CODEX_WHAM_RESET_CREDITS_URL, CODEX_WHAM_USAGE_URL, DEEPSEEK_BALANCE_URL,
     GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH, GEMINI_CLI_USER_AGENT, KIRO_USAGE_LIMITS_PATH,
-    KIRO_USAGE_SDK_VERSION, WINDSURF_MODEL_CONFIGS_PATH, WINDSURF_RATE_LIMIT_PATH,
-    WINDSURF_USER_STATUS_PATH,
+    KIRO_USAGE_SDK_VERSION, OPENROUTER_CREDITS_URL, WINDSURF_MODEL_CONFIGS_PATH,
+    WINDSURF_RATE_LIMIT_PATH, WINDSURF_USER_STATUS_PATH,
+};
+pub use providers::{
+    build_official_api_key_quota_request, is_official_api_key_quota_endpoint,
+    parse_official_api_key_quota, OfficialApiKeyQuotaProvider,
+    OfficialApiKeyQuotaProviderPoolAdapter,
 };
 pub use quota::{
     provider_pool_key_account_quota_exhausted, provider_pool_key_scheduling_label,
     provider_pool_member_quota_snapshot, provider_pool_quota_metadata_provider_type,
     provider_pool_quota_metadata_updated_at, provider_pool_quota_snapshot_updated_at,
 };
-pub use quota_refresh::ProviderPoolQuotaRequestSpec;
+pub use quota_refresh::{
+    official_balance_backoff_secs, official_balance_backoff_with_jitter_secs,
+    ProviderPoolQuotaRequestSpec, OFFICIAL_BALANCE_MAX_BACKOFF_SECS,
+    OFFICIAL_BALANCE_MIN_BACKOFF_SECS,
+};
+pub use quota_snapshot::{
+    ProviderQuotaBalance, ProviderQuotaRefreshState, ProviderQuotaSnapshotContract,
+    ProviderQuotaSnapshotKind, ProviderQuotaValue, ProviderQuotaWindow,
+    PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
+};
 pub use service::ProviderPoolService;
 
 #[cfg(test)]
@@ -64,6 +89,56 @@ mod tests {
         key
     }
 
+    fn sample_key_with_quota(quota: Value) -> StoredProviderCatalogKey {
+        let mut key = sample_key(None);
+        key.status_snapshot = Some(json!({ "quota": quota }));
+        key
+    }
+
+    #[test]
+    fn quota_snapshot_accepts_current_schema_for_matching_provider() {
+        let key = sample_key_with_quota(json!({
+            "schema_version": PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
+            "provider_type": "deepseek",
+            "kind": "balance",
+            "updated_at": 1_700_000_000u64
+        }));
+
+        let snapshot = provider_pool_member_quota_snapshot(&key, "deepseek")
+            .expect("matching current snapshot should be accepted");
+
+        assert_eq!(snapshot["kind"], json!("balance"));
+    }
+
+    #[test]
+    fn quota_snapshot_accepts_supported_legacy_shape_without_provider_type() {
+        let key = sample_key_with_quota(json!({
+            "exhausted": true,
+            "reset_seconds": 300,
+            "updated_at": 1_700_000_000u64
+        }));
+
+        assert_eq!(
+            provider_pool_quota_snapshot_exhausted_decision(&key, "codex"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn quota_snapshot_ignores_snapshot_for_different_provider_type() {
+        let key = sample_key_with_quota(json!({
+            "provider_type": "deepseek",
+            "kind": "balance",
+            "updated_at": 1_700_000_000u64
+        }));
+
+        assert!(provider_pool_member_quota_snapshot(&key, "codex").is_none());
+        assert_eq!(
+            provider_pool_quota_snapshot_exhausted_decision(&key, "codex"),
+            None
+        );
+    }
+
     #[test]
     fn builtin_service_registers_provider_pool_adapters() {
         let service = ProviderPoolService::with_builtin_adapters();
@@ -75,12 +150,19 @@ mod tests {
                 "chatgpt_web",
                 "claude_code",
                 "codex",
+                "deepseek",
                 "gemini_cli",
                 "grok",
+                "kimi_coding",
                 "kiro",
+                "moonshot",
                 "nous",
+                "openrouter",
+                "siliconflow",
                 "vertex_ai",
-                "windsurf"
+                "windsurf",
+                "zai",
+                "zhipu"
             ]
         );
         assert!(service
@@ -100,11 +182,18 @@ mod tests {
                 "antigravity",
                 "chatgpt_web",
                 "codex",
+                "deepseek",
                 "gemini_cli",
                 "grok",
+                "kimi_coding",
                 "kiro",
+                "moonshot",
                 "nous",
-                "windsurf"
+                "openrouter",
+                "siliconflow",
+                "windsurf",
+                "zai",
+                "zhipu"
             ]
         );
         assert!(service.supports_quota_refresh("codex"));
@@ -112,6 +201,13 @@ mod tests {
         assert!(service.supports_quota_refresh("grok"));
         assert!(service.supports_quota_refresh("gemini_cli"));
         assert!(service.supports_quota_refresh("windsurf"));
+        assert!(service.supports_quota_refresh("deepseek"));
+        assert!(service.supports_quota_refresh("openrouter"));
+        assert!(service.supports_quota_refresh("moonshot"));
+        assert!(service.supports_quota_refresh("kimi_coding"));
+        assert!(service.supports_quota_refresh("siliconflow"));
+        assert!(service.supports_quota_refresh("zhipu"));
+        assert!(service.supports_quota_refresh("zai"));
         assert_eq!(
             service.quota_refresh_unsupported_message("claude_code"),
             "Claude Code 暂不支持自动刷新额度：上游没有稳定可用的账号额度查询接口"
@@ -119,6 +215,57 @@ mod tests {
         assert_eq!(
             service.quota_refresh_unsupported_message("vertex_ai"),
             "Vertex AI 暂不支持自动刷新额度：额度属于 Google Cloud 项目/区域配额"
+        );
+    }
+
+    #[test]
+    fn official_quota_providers_expose_typed_serving_policy() {
+        let service = ProviderPoolService::with_builtin_adapters();
+
+        for provider_type in ["deepseek", "openrouter", "moonshot", "siliconflow"] {
+            assert_eq!(
+                service.quota_serving_policy(provider_type),
+                Some(ProviderQuotaServingPolicy::ObservationOnly)
+            );
+        }
+        for provider_type in ["kimi_coding", "zhipu", "zai"] {
+            assert_eq!(
+                service.quota_serving_policy(provider_type),
+                Some(ProviderQuotaServingPolicy::SubscriptionExhaustionOnly)
+            );
+        }
+        for provider_type in ["codex", "gemini_cli", "grok"] {
+            assert_eq!(
+                service.quota_serving_policy(provider_type),
+                Some(ProviderQuotaServingPolicy::ServingProbe)
+            );
+        }
+        assert_eq!(service.quota_serving_policy("malformed-provider"), None);
+    }
+
+    #[test]
+    fn subscription_health_transition_preserves_unrelated_state() {
+        let policy = ProviderQuotaServingPolicy::SubscriptionExhaustionOnly;
+
+        assert_eq!(
+            policy.subscription_transition(false, true, true),
+            ProviderQuotaHealthTransition::Preserve
+        );
+        assert_eq!(
+            policy.subscription_transition(true, true, false),
+            ProviderQuotaHealthTransition::QuotaExhausted
+        );
+        assert_eq!(
+            policy.subscription_transition(true, false, true),
+            ProviderQuotaHealthTransition::Available
+        );
+        assert_eq!(
+            policy.subscription_transition(true, false, false),
+            ProviderQuotaHealthTransition::Preserve
+        );
+        assert_eq!(
+            ProviderQuotaServingPolicy::ObservationOnly.subscription_transition(false, true, true),
+            ProviderQuotaHealthTransition::Preserve
         );
     }
 
@@ -737,6 +884,24 @@ mod tests {
     }
 
     #[test]
+    fn balance_snapshot_is_observation_only_even_with_legacy_exhausted_flag() {
+        let mut key = sample_key(None);
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "schema_version": 1,
+                "kind": "balance",
+                "provider_type": "codex",
+                "code": "exhausted",
+                "exhausted": true,
+                "balances": [{"unit": "USD", "available": "0"}],
+                "refresh_state": {"last_success_at": 1_700_000_000u64}
+            }
+        }));
+
+        assert!(!provider_pool_key_account_quota_exhausted(&key, "codex"));
+    }
+
+    #[test]
     fn provider_quota_exhaustion_metadata_expires_after_reset_at() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -856,3 +1021,5 @@ mod tests {
         );
     }
 }
+mod singleflight;
+pub use singleflight::AsyncSingleflight;

@@ -78,7 +78,7 @@
       />
     </TableCell>
     <TableCell class="py-3.5 text-center">
-      <div class="inline-grid grid-cols-[1.75rem_1.75rem_1.75rem] gap-x-0.5 gap-y-0.5 text-xs text-left">
+      <div class="inline-grid grid-cols-[4.5rem_1.75rem_2rem] gap-x-1 gap-y-0.5 text-xs text-left">
         <span class="text-muted-foreground/70">{{ legacyT('端点:') }}</span>
         <span class="font-medium text-foreground/90 tabular-nums text-right">{{ provider.active_endpoints }}</span>
         <span class="text-muted-foreground/50 tabular-nums">/{{ provider.total_endpoints }}</span>

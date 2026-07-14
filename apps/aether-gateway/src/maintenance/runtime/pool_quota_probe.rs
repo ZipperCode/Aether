@@ -9,7 +9,7 @@ use aether_data_contracts::repository::pool_scores::{
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
-use aether_provider_pool::provider_pool_quota_metadata_updated_at;
+use aether_provider_pool::{provider_pool_quota_metadata_updated_at, ProviderQuotaServingPolicy};
 use aether_runtime_state::{RuntimeLockLease, RuntimeState};
 use futures_util::{stream, StreamExt};
 use serde_json::Value;
@@ -17,9 +17,11 @@ use tracing::{debug, info, warn};
 
 use crate::admin_api::{
     admin_provider_pool_config, provider_quota_refresh_endpoint_for_provider,
-    provider_type_supports_quota_refresh, reconcile_admin_fixed_provider_template_endpoints,
-    refresh_provider_pool_quota_locally, AdminAppState,
+    provider_quota_serving_policy, provider_type_supports_quota_refresh,
+    reconcile_admin_fixed_provider_template_endpoints, refresh_provider_pool_quota_locally,
+    AdminAppState,
 };
+use crate::handlers::admin::QuotaRefreshSource;
 use crate::{AppState, GatewayError};
 
 use crate::ai_serving::provider_key_pool_score_scope;
@@ -846,6 +848,7 @@ async fn select_keys_for_provider(
     config: PoolQuotaProbeWorkerConfig,
     mode: PoolQuotaProbeMode,
     now_ts: u64,
+    mutate_active_members: bool,
 ) -> Result<PoolQuotaProbeSelectionOutcome, GatewayError> {
     let lease = acquire_provider_probe_lock(runtime, &provider.id).await;
     if lease.is_none() {
@@ -905,10 +908,13 @@ async fn select_keys_for_provider(
             .map(|summary| summary.id.clone())
             .collect::<Vec<_>>();
         let scores_by_key = load_provider_key_account_scores(state, &provider.id, &key_ids).await;
-        let mut active_member_ids =
+        let mut active_member_ids = if mutate_active_members {
             load_pruned_active_probe_member_ids(runtime, &provider.id, &key_ids, &scores_by_key)
-                .await;
-        if matches!(mode, PoolQuotaProbeMode::Base) {
+                .await
+        } else {
+            BTreeSet::new()
+        };
+        if mutate_active_members && matches!(mode, PoolQuotaProbeMode::Base) {
             let trimmed_ids = trim_pool_quota_probe_active_member_ids_to_target(
                 &active_member_ids,
                 &scores_by_key,
@@ -1038,8 +1044,16 @@ async fn refresh_provider_probe_keys(
     provider_type: &str,
     keys: Vec<StoredProviderCatalogKey>,
 ) -> Result<Option<Value>, GatewayError> {
-    refresh_provider_pool_quota_locally(admin_state, provider, endpoint, provider_type, keys, None)
-        .await
+    refresh_provider_pool_quota_locally(
+        admin_state,
+        provider,
+        endpoint,
+        provider_type,
+        keys,
+        None,
+        QuotaRefreshSource::PoolBackground,
+    )
+    .await
 }
 
 fn update_summary_from_payload(
@@ -1082,6 +1096,9 @@ async fn record_score_probe_results_from_payload(
                 continue;
             };
             recorded.insert(key_id.to_string());
+            if probe_result_is_neutral(item) {
+                continue;
+            }
             if probe_result_succeeded(item) {
                 succeeded.insert(key_id.to_string());
             }
@@ -1196,6 +1213,12 @@ fn probe_result_succeeded(item: &Value) -> bool {
         .is_some_and(|status| status == "success")
 }
 
+fn probe_result_is_neutral(item: &Value) -> bool {
+    item.get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.trim().eq_ignore_ascii_case("backoff"))
+}
+
 fn probe_result_hard_state(item: &Value) -> Option<PoolMemberHardState> {
     if probe_result_succeeded(item) {
         return Some(PoolMemberHardState::Available);
@@ -1226,6 +1249,101 @@ fn probe_result_hard_state(item: &Value) -> Option<PoolMemberHardState> {
     }
 }
 
+fn quota_refresh_derived_exhaustion(score: &StoredPoolMemberScore) -> bool {
+    score.hard_state == PoolMemberHardState::QuotaExhausted
+        && score
+            .score_reason
+            .pointer("/quota_refresh_health/state")
+            .and_then(Value::as_str)
+            == Some("quota_exhausted")
+}
+
+fn subscription_refresh_hard_state(
+    score: Option<&StoredPoolMemberScore>,
+    item: &Value,
+) -> Option<PoolMemberHardState> {
+    if !probe_result_succeeded(item) {
+        return None;
+    }
+    let exhausted = item
+        .get("quota_snapshot")
+        .and_then(|snapshot| snapshot.get("exhausted"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if exhausted {
+        return Some(PoolMemberHardState::QuotaExhausted);
+    }
+    score
+        .filter(|score| quota_refresh_derived_exhaustion(score))
+        .map(|_| PoolMemberHardState::Available)
+}
+
+async fn record_subscription_refresh_results(
+    state: &AppState,
+    provider_id: &str,
+    selected_key_ids: &[String],
+    payload: Option<&Value>,
+    attempted_at: u64,
+) -> BTreeSet<String> {
+    let scores = load_provider_key_account_scores(state, provider_id, selected_key_ids).await;
+    let mut available = BTreeSet::new();
+    let Some(results) = payload
+        .and_then(|value| value.get("results"))
+        .and_then(Value::as_array)
+    else {
+        return available;
+    };
+    for item in results {
+        let Some(key_id) = item.get("key_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(hard_state) = subscription_refresh_hard_state(scores.get(key_id), item) else {
+            continue;
+        };
+        let marker = match hard_state {
+            PoolMemberHardState::QuotaExhausted => "quota_exhausted",
+            PoolMemberHardState::Available => {
+                available.insert(key_id.to_string());
+                "available"
+            }
+            PoolMemberHardState::Unknown
+            | PoolMemberHardState::Cooldown
+            | PoolMemberHardState::AuthInvalid
+            | PoolMemberHardState::Banned
+            | PoolMemberHardState::Inactive => continue,
+        };
+        record_score_probe_result_for_key(
+            state,
+            provider_id,
+            key_id,
+            attempted_at,
+            true,
+            Some(hard_state),
+            serde_json::json!({"quota_refresh_health": {"state": marker}}),
+        )
+        .await;
+    }
+    available
+}
+
+/// API-key balance observations are informational only. Their upstream failures must never
+/// feed serving-health score, cooldown, hard-state, or active-member mutations.
+fn quota_refresh_is_observation_only(provider_type: &str) -> bool {
+    matches!(
+        provider_quota_serving_policy(provider_type),
+        Some(ProviderQuotaServingPolicy::ObservationOnly)
+    )
+}
+
+fn quota_probe_concurrency(provider_type: &str, configured: usize, global: usize) -> usize {
+    let concurrency = configured.clamp(1, 64).min(global).max(1);
+    if quota_refresh_is_observation_only(provider_type) {
+        concurrency.min(3)
+    } else {
+        concurrency
+    }
+}
+
 async fn perform_pool_quota_probe_for_provider(
     state: &AppState,
     admin_state: &AdminAppState<'_>,
@@ -1238,9 +1356,15 @@ async fn perform_pool_quota_probe_for_provider(
     now_ts: u64,
 ) -> Result<PoolQuotaProbeRunSummary, GatewayError> {
     let mut summary = PoolQuotaProbeRunSummary::empty();
+    let serving_policy = provider_quota_serving_policy(provider_type)
+        .unwrap_or(ProviderQuotaServingPolicy::ServingProbe);
+    let observation_only = matches!(serving_policy, ProviderQuotaServingPolicy::ObservationOnly);
+    let full_serving_probe = matches!(serving_policy, ProviderQuotaServingPolicy::ServingProbe);
     let provider_short_id = provider.id.chars().take(8).collect::<String>();
 
-    if aether_admin::provider::quota::provider_auto_remove_banned_keys(provider.config.as_ref()) {
+    if full_serving_probe
+        && aether_admin::provider::quota::provider_auto_remove_banned_keys(provider.config.as_ref())
+    {
         let auto_removed = admin_state
             .cleanup_known_banned_provider_catalog_keys(provider)
             .await?;
@@ -1255,9 +1379,11 @@ async fn perform_pool_quota_probe_for_provider(
             );
         }
     }
-    if aether_admin::provider::quota::provider_auto_remove_quota_exhausted_keys(
-        provider.config.as_ref(),
-    ) {
+    if full_serving_probe
+        && aether_admin::provider::quota::provider_auto_remove_quota_exhausted_keys(
+            provider.config.as_ref(),
+        )
+    {
         let auto_removed = admin_state
             .cleanup_quota_exhausted_provider_catalog_keys(provider, provider_type)
             .await?;
@@ -1302,6 +1428,7 @@ async fn perform_pool_quota_probe_for_provider(
         config,
         mode,
         now_ts,
+        !observation_only,
     )
     .await?
     {
@@ -1321,41 +1448,48 @@ async fn perform_pool_quota_probe_for_provider(
     let score_ensure_budget = (pool_config.score_fallback_scan_limit as usize)
         .min(50_000)
         .max(selected_count.min(50_000));
-    match ensure_provider_key_pool_scores_for_keys(
-        state,
-        provider,
-        pool_config,
-        &endpoints,
-        &keys,
-        now_ts,
-        score_ensure_budget,
-    )
-    .await
-    {
-        Ok(upserted) if upserted > 0 => {
-            debug!(
-                provider_id = %provider.id,
-                key_count = selected_count,
-                scores_upserted = upserted,
-                "gateway pool quota probe: ensured score rows for selected probe keys"
-            );
-        }
-        Ok(_) => {}
-        Err(err) => {
-            warn!(
-                provider_id = %provider.id,
-                key_count = selected_count,
-                error = ?err,
-                "gateway pool quota probe: failed to ensure score rows for selected probe keys"
-            );
+    if !observation_only {
+        match ensure_provider_key_pool_scores_for_keys(
+            state,
+            provider,
+            pool_config,
+            &endpoints,
+            &keys,
+            now_ts,
+            score_ensure_budget,
+        )
+        .await
+        {
+            Ok(upserted) if upserted > 0 => {
+                debug!(
+                    provider_id = %provider.id,
+                    key_count = selected_count,
+                    scores_upserted = upserted,
+                    "gateway pool quota probe: ensured score rows for selected probe keys"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    provider_id = %provider.id,
+                    key_count = selected_count,
+                    error = ?err,
+                    "gateway pool quota probe: failed to ensure score rows for selected probe keys"
+                );
+            }
         }
     }
-    for key_id in &selected_key_ids {
-        record_score_probe_in_progress_for_key(state, &provider.id, key_id, now_ts).await;
+    if !observation_only {
+        for key_id in &selected_key_ids {
+            record_score_probe_in_progress_for_key(state, &provider.id, key_id, now_ts).await;
+        }
     }
 
-    let probe_concurrency = pool_config.probe_concurrency.clamp(1, 64) as usize;
-    let probe_concurrency = probe_concurrency.min(config.global_concurrency).max(1);
+    let probe_concurrency = quota_probe_concurrency(
+        provider_type,
+        pool_config.probe_concurrency as usize,
+        config.global_concurrency,
+    );
     let probe_results = stream::iter(keys.into_iter().map(|key| {
         let key_id = key.id.clone();
         let endpoint = &endpoint;
@@ -1392,40 +1526,59 @@ async fn perform_pool_quota_probe_for_provider(
                     .and_then(|value| value.get("failed"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize;
-                let successful_key_ids = record_score_probe_results_from_payload(
-                    state,
-                    &provider.id,
-                    std::slice::from_ref(&key_id),
-                    payload.as_ref(),
-                    now_ts,
-                )
-                .await;
-                add_active_probe_member_ids(
-                    state.runtime_state.as_ref(),
-                    &provider.id,
-                    &successful_key_ids,
-                )
-                .await;
+                if !observation_only {
+                    let successful_key_ids = match serving_policy {
+                        ProviderQuotaServingPolicy::ServingProbe => {
+                            record_score_probe_results_from_payload(
+                                state,
+                                &provider.id,
+                                std::slice::from_ref(&key_id),
+                                payload.as_ref(),
+                                now_ts,
+                            )
+                            .await
+                        }
+                        ProviderQuotaServingPolicy::SubscriptionExhaustionOnly => {
+                            record_subscription_refresh_results(
+                                state,
+                                &provider.id,
+                                std::slice::from_ref(&key_id),
+                                payload.as_ref(),
+                                now_ts,
+                            )
+                            .await
+                        }
+                        ProviderQuotaServingPolicy::ObservationOnly => BTreeSet::new(),
+                    };
+                    add_active_probe_member_ids(
+                        state.runtime_state.as_ref(),
+                        &provider.id,
+                        &successful_key_ids,
+                    )
+                    .await;
+                }
             }
             Err(err) => {
                 summary.failed += 1;
                 probe_failed += 1;
-                record_score_probe_result_for_key(
-                    state,
-                    &provider.id,
-                    &key_id,
-                    now_ts,
-                    false,
-                    Some(PoolMemberHardState::Cooldown),
-                    serde_json::json!({
-                        "last_probe": {
-                            "source": "pool_quota_probe",
-                            "status": "worker_error",
-                            "message": format!("{err:?}")
-                        }
-                    }),
-                )
-                .await;
+                if full_serving_probe {
+                    record_score_probe_result_for_key(
+                        state,
+                        &provider.id,
+                        &key_id,
+                        now_ts,
+                        false,
+                        Some(PoolMemberHardState::Cooldown),
+                        serde_json::json!({
+                            "last_probe": {
+                                "source": "pool_quota_probe",
+                                "status": "worker_error",
+                                "message": format!("{err:?}")
+                            }
+                        }),
+                    )
+                    .await;
+                }
                 warn!(
                     provider_id = %provider_short_id,
                     provider_type,
@@ -1721,6 +1874,7 @@ pub(crate) fn spawn_pool_quota_probe_worker(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn key(
         id: &str,
@@ -1738,6 +1892,82 @@ mod tests {
         .expect("key should build");
         key.upstream_metadata = upstream_metadata;
         key
+    }
+
+    #[test]
+    fn existing_oauth_quota_probe_retains_serving_health_mapping() {
+        // Given: the established OAuth quota probe outcomes.
+        let outcomes = [
+            (json!({"status": "success"}), PoolMemberHardState::Available),
+            (
+                json!({"status": "auth_invalid"}),
+                PoolMemberHardState::AuthInvalid,
+            ),
+            (
+                json!({"status": "quota_exhausted"}),
+                PoolMemberHardState::QuotaExhausted,
+            ),
+            (
+                json!({"status": "failed", "status_code": 429}),
+                PoolMemberHardState::Cooldown,
+            ),
+        ];
+
+        // When / Then: OAuth serving probes continue to drive their historical hard states.
+        for (outcome, expected) in outcomes {
+            assert_eq!(probe_result_hard_state(&outcome), Some(expected));
+        }
+    }
+
+    #[test]
+    fn quota_backoff_is_neutral_and_not_a_cooldown() {
+        // Given
+        let item = json!({"key_id":"key-1","status":"backoff"});
+
+        // When
+        let neutral = probe_result_is_neutral(&item);
+        let hard_state = probe_result_hard_state(&item);
+
+        // Then
+        assert!(neutral);
+        assert_eq!(hard_state, None);
+    }
+
+    #[test]
+    fn official_balance_fanout_is_capped_without_changing_other_providers() {
+        assert_eq!(quota_probe_concurrency("deepseek", 20, 16), 3);
+        assert_eq!(quota_probe_concurrency("openrouter", 64, 32), 3);
+        assert_eq!(quota_probe_concurrency("codex", 20, 16), 16);
+    }
+
+    #[test]
+    fn all_official_balance_providers_are_observation_only() {
+        for provider_type in ["deepseek", "openrouter", "moonshot", "siliconflow"] {
+            assert!(
+                quota_refresh_is_observation_only(provider_type),
+                "{provider_type} balance refresh must be observation-only"
+            );
+        }
+        for provider_type in ["kimi_coding", "zhipu", "zai"] {
+            assert!(!quota_refresh_is_observation_only(provider_type));
+        }
+    }
+
+    #[tokio::test]
+    async fn official_balance_fanout_peak_does_not_exceed_three() {
+        let limiter = Arc::new(aether_provider_pool::OfficialProviderBackgroundLimiter::new(3));
+        let first = limiter.acquire("provider-a").await.expect("permit");
+        let second = limiter.acquire("provider-a").await.expect("permit");
+        let third = limiter.acquire("provider-a").await.expect("permit");
+        let waiting_limiter = Arc::clone(&limiter);
+        let waiting = tokio::spawn(async move { waiting_limiter.acquire("provider-a").await });
+        tokio::task::yield_now().await;
+
+        assert!(!waiting.is_finished());
+        assert!(limiter.acquire("provider-b").await.is_ok());
+        drop(first);
+        assert!(waiting.await.expect("join").is_ok());
+        drop((second, third));
     }
 
     #[test]

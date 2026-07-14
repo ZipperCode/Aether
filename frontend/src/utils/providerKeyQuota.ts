@@ -81,10 +81,27 @@ function getQuotaWindow(
 function finiteNumber(value: unknown): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
   if (typeof value === 'string') {
-    const parsed = Number(value.trim())
+    const text = value.trim()
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(text)) return null
+    const parsed = Number(text)
     return Number.isFinite(parsed) ? parsed : null
   }
   return null
+}
+
+export function formatDecimalDisplay(value: unknown): string | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value)
+      ? value.toLocaleString(undefined, { maximumFractionDigits: 20 })
+      : null
+  }
+  if (typeof value !== 'string') return null
+  const text = value.trim()
+  const match = /^([+-]?)(\d+)(?:\.(\d*))?$/.exec(text)
+  if (!match) return null
+  const [, sign, integer, fraction] = match
+  const grouped = integer.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return `${sign}${grouped}${fraction === undefined ? '' : `.${fraction}`}`
 }
 
 function firstFiniteNumber(...values: unknown[]): number | null {
@@ -137,14 +154,58 @@ function formatQuotaValue(value: number | null | undefined): string {
   return normalized.toFixed(1)
 }
 
+function formatBalanceValue(value: unknown, unit: string): string | null {
+  const amount = formatDecimalDisplay(value)
+  if (amount == null) return null
+  const normalizedUnit = unit.trim().toUpperCase()
+  return normalizedUnit === 'USD' ? `$${amount}` : `${amount} ${normalizedUnit || '额度'}`
+}
+
+/** Provider-neutral quota text. Structured snapshots take precedence over legacy labels. */
+export function getGenericQuotaSections(quota: QuotaStatusSnapshot | null | undefined): {
+  balances: string[]
+  windows: string[]
+  rateLimits: string[]
+  status: string[]
+} {
+  if (!quota) return { balances: [], windows: [], rateLimits: [], status: [] }
+
+  const balances = (Array.isArray(quota.balances) ? quota.balances : []).flatMap((balance) => {
+    const available = formatBalanceValue(balance.available, balance.unit)
+    if (!available) return []
+    const total = formatBalanceValue(balance.total ?? balance.granted, balance.unit)
+    return [`可用 ${available}${total ? ` / 总额 ${total}` : ''}`]
+  })
+  if (quota.unlimited === true && balances.length === 0) balances.push('无限制')
+  const windows = getQuotaWindows(quota).flatMap((window) => {
+    const label = normalizeText(window.label) || normalizeText(window.code) || '订阅窗口'
+    const remaining = getQuotaWindowRemainingPercent(window)
+    const value = getQuotaWindowValueText(window)
+    if (value) return [`${label} 剩余 ${value}`]
+    if (remaining != null) return [`${label} 剩余 ${formatPercent(remaining)}`]
+    return []
+  })
+  const rateLimits = Object.entries(quota.rate_limits ?? {}).flatMap(([key, value]) => {
+    if (key === 'kind') return []
+    const limit = finiteNumber(value)
+    return limit == null ? [] : [`${key.toUpperCase()} ${formatQuotaValue(limit)}`]
+  })
+  const status: string[] = []
+  if (quota.freshness === 'stale') status.push('数据已过期')
+  else if (quota.freshness === 'error') status.push('刷新失败')
+  else if (quota.freshness === 'unknown') status.push('更新时间未知')
+  const error = normalizeText(quota.refresh_state?.error)
+  if (error) status.push(error)
+  return { balances, windows, rateLimits, status }
+}
+
 function getQuotaWindowValueText(window: QuotaWindowSnapshot | null | undefined): string | null {
-  if (!window || typeof window.limit_value !== 'number' || window.limit_value <= 0) return null
-  if (typeof window.remaining_value === 'number') {
-    return `${formatQuotaValue(window.remaining_value)}/${formatQuotaValue(window.limit_value)}`
-  }
-  if (typeof window.used_value === 'number') {
-    return `${formatQuotaValue(Math.max(window.limit_value - window.used_value, 0))}/${formatQuotaValue(window.limit_value)}`
-  }
+  const limit = finiteNumber(window?.limit_value)
+  if (!window || limit == null || limit <= 0) return null
+  const remaining = finiteNumber(window.remaining_value)
+  if (remaining != null) return `${formatQuotaValue(remaining)}/${formatQuotaValue(limit)}`
+  const used = finiteNumber(window.used_value)
+  if (used != null) return `${formatQuotaValue(Math.max(limit - used, 0))}/${formatQuotaValue(limit)}`
   return null
 }
 
@@ -474,5 +535,11 @@ export function getQuotaDisplayText(
   input: ProviderKeyQuotaCarrier,
   fallbackProviderType?: string | null,
 ): string | null {
+  const quota = getQuotaSnapshot(input)
+  if (quota && (quota.kind || (quota.balances?.length ?? 0) > 0)) {
+    const sections = getGenericQuotaSections(quota)
+    const structured = [...sections.balances, ...sections.windows, ...sections.rateLimits]
+    if (structured.length > 0) return structured.join(' | ')
+  }
   return getQuotaSnapshotFallbackText(input, fallbackProviderType) || getLegacyAccountQuotaText(input)
 }

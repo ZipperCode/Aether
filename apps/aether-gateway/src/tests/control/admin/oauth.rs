@@ -5149,6 +5149,12 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_p
                 }
 
                 assert_eq!(plan.request_id, "kiro-quota:key-kiro-batch-runtime");
+                assert_eq!(
+                    plan.headers
+                        .get(EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER)
+                        .map(String::as_str),
+                    Some("false")
+                );
                 Json(json!({
                     "request_id": plan.request_id,
                     "status_code": 200,

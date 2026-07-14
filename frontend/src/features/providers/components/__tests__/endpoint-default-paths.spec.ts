@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { getDefaultEndpointBaseUrl, getDefaultEndpointPath } from '../endpoint-default-paths'
+import { getDefaultEndpointBaseUrl, getDefaultEndpointPath, resolveNewEndpointBaseUrl } from '../endpoint-default-paths'
 
 const apiFormats = [
   { value: 'openai:chat', default_path: '/v1/chat/completions' },
@@ -274,5 +274,20 @@ describe('endpoint default paths', () => {
       apiFormat: 'openai:chat',
       baseUrl: 'https://api.deepseek.com',
     })).toBe('https://api.deepseek.com')
+  })
+
+  it('selects explicit URL, official API URL, then website URL for new official endpoints', () => {
+    expect(resolveNewEndpointBaseUrl({
+      apiFormat: 'openai:chat', providerType: 'deepseek',
+      explicitBaseUrl: 'https://override.example/v1', website: 'https://www.deepseek.com',
+    })).toBe('https://override.example/v1')
+    expect(resolveNewEndpointBaseUrl({
+      apiFormat: 'openai:chat', providerType: 'deepseek',
+      explicitBaseUrl: '', website: 'https://www.deepseek.com',
+    })).toBe('https://api.deepseek.com')
+    expect(resolveNewEndpointBaseUrl({
+      apiFormat: 'openai:chat', providerType: 'custom',
+      explicitBaseUrl: '', website: 'https://gateway.example',
+    })).toBe('https://gateway.example/v1')
   })
 })

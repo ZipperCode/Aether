@@ -88,7 +88,7 @@
         <!-- Desktop table -->
         <div
           v-if="keyPage.keys.length > 0 || hasPoolKeyFilters"
-          class="hidden xl:block overflow-x-auto"
+          class="hidden 2xl:block overflow-x-auto"
         >
           <Table class="w-full table-fixed">
             <TableHeader>
@@ -315,6 +315,8 @@
                 >
                   <PoolKeyQuotaPanel
                     :items="quotaProgressDisplayMap[key.key_id] || []"
+                    :quota="getQuotaSnapshot(key)"
+                    :provider-type="selectedProviderType"
                     :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
                     :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
                     :text-class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
@@ -529,7 +531,7 @@
         <!-- Mobile card list -->
         <div
           v-if="keyPage.keys.length > 0"
-          class="xl:hidden divide-y divide-border/40"
+          class="2xl:hidden divide-y divide-border/40"
         >
           <div
             v-for="key in keyPage.keys"
@@ -690,6 +692,8 @@
               <PoolKeyQuotaPanel
                 v-if="showAccountQuotaColumn"
                 :items="quotaProgressDisplayMap[key.key_id] || []"
+                :quota="getQuotaSnapshot(key)"
+                :provider-type="selectedProviderType"
                 :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
                 :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
                 :text-class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
@@ -1586,6 +1590,13 @@ const showAccountQuotaColumn = computed(() => {
     || selectedProviderType.value === 'grok'
     || selectedProviderType.value === 'nous'
     || selectedProviderType.value === 'chatgpt_web'
+    || selectedProviderType.value === 'deepseek'
+    || selectedProviderType.value === 'openrouter'
+    || selectedProviderType.value === 'moonshot'
+    || selectedProviderType.value === 'kimi_coding'
+    || selectedProviderType.value === 'siliconflow'
+    || selectedProviderType.value === 'zhipu'
+    || selectedProviderType.value === 'zai'
 })
 
 const desktopColumnWidths = computed(() => {
@@ -2047,6 +2058,13 @@ const quotaRefreshSupported = computed(() => {
     || selectedProviderType.value === 'grok'
     || selectedProviderType.value === 'chatgpt_web'
     || selectedProviderType.value === 'nous'
+    || selectedProviderType.value === 'deepseek'
+    || selectedProviderType.value === 'openrouter'
+    || selectedProviderType.value === 'moonshot'
+    || selectedProviderType.value === 'kimi_coding'
+    || selectedProviderType.value === 'siliconflow'
+    || selectedProviderType.value === 'zhipu'
+    || selectedProviderType.value === 'zai'
 })
 
 function canResetCycleStats(_key: PoolKeyDetail): boolean {

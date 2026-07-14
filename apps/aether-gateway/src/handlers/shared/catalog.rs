@@ -2057,6 +2057,13 @@ fn quota_snapshot_has_materialized_data(
         return true;
     }
     if quota_snapshot
+        .get("balances")
+        .and_then(Value::as_array)
+        .is_some_and(|balances| !balances.is_empty())
+    {
+        return true;
+    }
+    if quota_snapshot
         .get("credits")
         .is_some_and(|credits| !credits.is_null())
     {
@@ -3536,6 +3543,71 @@ mod tests {
                 .and_then(|window| window.get("used_ratio")),
             Some(&json!(0.25))
         );
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_preserves_materialized_balance_snapshot() {
+        let mut key = sample_catalog_key();
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "schema_version": 1,
+                "kind": "balance",
+                "provider_type": "deepseek",
+                "code": "ok",
+                "freshness": "fresh",
+                "observed_at": 200u64,
+                "updated_at": 200u64,
+                "exhausted": false,
+                "balances": [{
+                    "unit": "USD",
+                    "available": "13.82",
+                    "total": "13.82",
+                    "granted": "0.00",
+                    "topped_up": "13.82"
+                }]
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "deepseek");
+        assert_eq!(
+            payload.pointer("/quota/balances/0/available"),
+            Some(&json!("13.82"))
+        );
+        assert_eq!(payload.pointer("/quota/kind"), Some(&json!("balance")));
+    }
+
+    #[test]
+    fn quota_snapshot_materialization_accepts_current_and_legacy_shapes_but_rejects_mismatch() {
+        // Given
+        let current = json!({
+            "schema_version": 1,
+            "kind": "balance",
+            "provider_type": "deepseek",
+            "balances": [{"unit": "USD", "available": "1.00"}]
+        });
+        let legacy = json!({
+            "windows": [{"code": "5h", "remaining_ratio": 0.5}]
+        });
+        let mismatched = json!({
+            "schema_version": 1,
+            "kind": "balance",
+            "provider_type": "openrouter",
+            "balances": [{"unit": "USD", "available": "1.00"}]
+        });
+
+        // When / Then
+        assert!(quota_snapshot_has_materialized_data(
+            current.as_object(),
+            "deepseek"
+        ));
+        assert!(quota_snapshot_has_materialized_data(
+            legacy.as_object(),
+            "deepseek"
+        ));
+        assert!(!quota_snapshot_has_materialized_data(
+            mismatched.as_object(),
+            "deepseek"
+        ));
     }
 
     #[test]

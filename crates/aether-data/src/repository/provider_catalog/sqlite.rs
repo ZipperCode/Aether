@@ -1396,6 +1396,19 @@ WHERE id = ?
         Ok(true)
     }
 
+    pub async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota: &serde_json::Value,
+        updated: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(key_id, "provider catalog key_id")?;
+        let rows = sqlx::query("UPDATE provider_api_keys SET status_snapshot = json_set(CASE WHEN json_valid(status_snapshot) THEN CASE WHEN json_type(status_snapshot) = 'object' THEN status_snapshot ELSE '{}' END ELSE '{}' END, '$.quota', json(?)), updated_at = ? WHERE id = ?")
+            .bind(quota.to_string()).bind(updated.unwrap_or_else(current_unix_secs) as i64).bind(key_id)
+             .execute(&self.pool).await.map_sql_err()?.rows_affected();
+        Ok(rows > 0)
+    }
+
     pub async fn clear_key_oauth_invalid_marker(
         &self,
         key_id: &str,
@@ -1736,6 +1749,15 @@ impl ProviderCatalogWriteRepository for SqliteProviderCatalogReadRepository {
             updated_at_unix_secs,
         )
         .await
+    }
+
+    async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota: &serde_json::Value,
+        updated: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::mutate_key_quota_snapshot(self, key_id, quota, updated).await
     }
 
     async fn delete_key(&self, key_id: &str) -> Result<bool, DataLayerError> {
@@ -2410,6 +2432,79 @@ mod tests {
             .await
             .expect("stats should load");
         assert_eq!(stats[0].active_keys, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_quota_snapshot_update_normalizes_invalid_status_and_preserves_siblings() {
+        // Given
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_sqlite_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        seed_rows(&pool).await;
+        sqlx::query("UPDATE provider_api_keys SET status_snapshot = ? WHERE id = 'key-1'")
+            .bind("")
+            .execute(&pool)
+            .await
+            .expect("invalid snapshot fixture should seed");
+        let repository = SqliteProviderCatalogReadRepository::new(pool.clone());
+
+        // When
+        repository
+            .mutate_key_quota_snapshot(
+                "key-1",
+                &json!({"provider_type": "deepseek", "kind": "balance"}),
+                Some(200),
+            )
+            .await
+            .expect("invalid status should normalize");
+        sqlx::query("UPDATE provider_api_keys SET status_snapshot = json_set(status_snapshot, '$.oauth', json(?), '$.account', json(?), '$.future_field', json(?)) WHERE id = 'key-1'")
+            .bind(r#"{"state":"valid"}"#)
+            .bind(r#"{"plan":"pro"}"#)
+            .bind(r#"{"opaque":true}"#)
+            .execute(&pool)
+            .await
+            .expect("sibling fixture should seed");
+        let quota = json!({
+            "provider_type": "deepseek",
+            "kind": "balance",
+            "balances": []
+        });
+        let (quota_updated, oauth_updated) = tokio::join!(
+            repository.mutate_key_quota_snapshot("key-1", &quota, Some(201)),
+            repository.update_key_oauth_credentials(
+                "key-1",
+                "enc-key-after",
+                Some("enc-auth-after"),
+                Some(4_102_444_800),
+            )
+        );
+
+        // Then
+        let snapshot: String =
+            sqlx::query_scalar("SELECT status_snapshot FROM provider_api_keys WHERE id = 'key-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("snapshot should read");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&snapshot).expect("snapshot should be valid json");
+        assert!(quota_updated.expect("quota replacement should succeed"));
+        assert!(oauth_updated.expect("oauth update should succeed"));
+        assert_eq!(snapshot["oauth"], json!({"state": "valid"}));
+        assert_eq!(snapshot["account"], json!({"plan": "pro"}));
+        assert_eq!(snapshot["future_field"], json!({"opaque": true}));
+        assert_eq!(snapshot["quota"]["provider_type"], "deepseek");
+        let credentials: (String, Option<String>) =
+            sqlx::query_as("SELECT api_key, auth_config FROM provider_api_keys WHERE id = 'key-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("credentials should read");
+        assert_eq!(credentials.0, "enc-key-after");
+        assert_eq!(credentials.1.as_deref(), Some("enc-auth-after"));
     }
 
     #[tokio::test]

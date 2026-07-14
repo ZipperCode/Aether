@@ -1,6 +1,8 @@
 <template>
   <Dialog
     :model-value="modelValue"
+    role="alertdialog"
+    :aria-label="displayTitle"
     :z-index="120"
     @update:model-value="handleClose"
   >
@@ -44,6 +46,7 @@
         variant="outline"
         :disabled="loading"
         class="h-10 px-5"
+        data-dialog-initial-focus
         @click="handleCancel"
       >
         {{ displayCancelText }}

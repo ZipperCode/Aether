@@ -10,7 +10,8 @@ use aether_contracts::{
     ExecutionTimeouts, ProxySnapshot, RequestBody, ResolvedTransportProfile, ResponseBody,
     StreamFrame, StreamFramePayload, StreamFrameType,
     EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER, EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
-    TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_HTTP_MODE_AUTO, TRANSPORT_POOL_SCOPE_KEY,
+    EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER, TRANSPORT_BACKEND_BROWSER_WREQ,
+    TRANSPORT_HTTP_MODE_AUTO, TRANSPORT_POOL_SCOPE_KEY,
 };
 use aether_provider_pool::{
     build_chatgpt_web_pool_quota_request, normalize_chatgpt_web_image_quota_limit,
@@ -46,6 +47,7 @@ const CHATGPT_WEB_SEC_CH_UA: &str =
 const CHATGPT_WEB_BROWSER_PROFILE: &str = "chrome143";
 const CHATGPT_WEB_QUOTA_REFRESH_TIMEOUT_MS: u64 = 30_000;
 const CHATGPT_WEB_QUOTA_REFRESH_PROXY_TIMEOUT_MS: u64 = 60_000;
+const CHATGPT_WEB_QUOTA_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const GPT_IMAGE2_TOKEN_MIN_PIXELS: u64 = 655_360;
 const GPT_IMAGE2_TOKEN_MAX_PIXELS: u64 = 8_294_400;
 const GPT_IMAGE2_TOKEN_MAX_EDGE: u64 = 3_840;
@@ -1496,6 +1498,14 @@ fn build_chatgpt_web_image_quota_refresh_plan(
             "true".to_string(),
         );
     }
+    headers.insert(
+        EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER.to_string(),
+        "false".to_string(),
+    );
+    headers.insert(
+        EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER.to_string(),
+        CHATGPT_WEB_QUOTA_MAX_RESPONSE_BODY_BYTES.to_string(),
+    );
     let body = json_body
         .map(RequestBody::from_json)
         .unwrap_or(RequestBody {
@@ -3415,6 +3425,20 @@ mod tests {
                 .get(EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER)
                 .map(String::as_str),
             Some("true")
+        );
+        assert_eq!(
+            quota_plan
+                .headers
+                .get(EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER)
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            quota_plan
+                .headers
+                .get(EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER)
+                .map(String::as_str),
+            Some("1048576")
         );
         assert_eq!(
             quota_plan

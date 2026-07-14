@@ -1,6 +1,7 @@
 pub mod antigravity;
 pub mod auth;
 mod auth_config;
+mod bounded_body;
 mod cache;
 pub mod claude_code;
 pub mod conversion;
@@ -30,6 +31,10 @@ pub mod windsurf;
 pub use aether_oauth as oauth;
 pub use auth::{build_passthrough_headers, ensure_upstream_auth_header};
 pub use auth_config::apply_local_auth_config_header_overrides;
+pub use bounded_body::{
+    collect_reqwest_body_bounded, decode_response_body_bounded, BoundedBodyCollector,
+    BoundedBodyError, BoundedBodyReadError, RESPONSE_TOO_LARGE_ERROR,
+};
 pub use cache::{provider_transport_snapshot_looks_refreshed, ProviderTransportSnapshotCacheKey};
 pub use conversion::{
     candidate_common_transport_skip_reason, candidate_transport_pair_skip_reason,

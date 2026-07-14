@@ -31,7 +31,7 @@
             <Label>{{ legacyT('提供商类型') }}</Label>
             <Select
               v-model="form.provider_type"
-              :disabled="isEditMode"
+              :disabled="isEditMode && !canConvertProvider"
             >
               <SelectTrigger>
                 <SelectValue :placeholder="legacyT('请选择')" />
@@ -42,6 +42,17 @@
                   <SelectItem value="custom">
                     {{ legacyT('自定义') }}
                   </SelectItem>
+                  <SelectItem value="deepseek">
+                    DeepSeek
+                  </SelectItem>
+                  <SelectItem value="openrouter">
+                    OpenRouter
+                  </SelectItem>
+                  <SelectItem value="moonshot">Moonshot 国内</SelectItem>
+                  <SelectItem value="kimi_coding">Kimi Coding Plan</SelectItem>
+                  <SelectItem value="siliconflow">SiliconFlow</SelectItem>
+                  <SelectItem value="zhipu">智谱 GLM</SelectItem>
+                  <SelectItem value="zai">Z.ai</SelectItem>
                   <SelectItem value="vertex_ai">
                     Vertex AI
                   </SelectItem>
@@ -81,6 +92,17 @@
                   <SelectItem value="custom">
                     {{ legacyT('自定义') }}
                   </SelectItem>
+                  <SelectItem value="deepseek">
+                    DeepSeek
+                  </SelectItem>
+                  <SelectItem value="openrouter">
+                    OpenRouter
+                  </SelectItem>
+                  <SelectItem value="moonshot">Moonshot 国内</SelectItem>
+                  <SelectItem value="kimi_coding">Kimi Coding Plan</SelectItem>
+                  <SelectItem value="siliconflow">SiliconFlow</SelectItem>
+                  <SelectItem value="zhipu">智谱 GLM</SelectItem>
+                  <SelectItem value="zai">Z.ai</SelectItem>
                   <SelectItem value="vertex_ai">
                     Vertex AI
                   </SelectItem>
@@ -115,10 +137,13 @@
               </SelectContent>
             </Select>
             <p
-              v-if="!isEditMode && form.provider_type !== 'custom'"
+              v-if="!isEditMode && fixedProviderTypes.has(form.provider_type)"
               class="text-xs text-muted-foreground"
             >
               {{ legacyT('反代使用固定端点且不可修改') }}
+            </p>
+            <p v-else-if="canConvertProvider" class="text-xs text-amber-600 dark:text-amber-400">
+              {{ legacyT('转换会保留现有端点和密钥，保存前需要再次确认') }}
             </p>
           </div>
           <div class="space-y-1.5">
@@ -349,6 +374,7 @@ import {
 } from '@/components/ui'
 import { Server, SquarePen } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
+import { useConfirm } from '@/composables/useConfirm'
 import { useFormDialog } from '@/composables/useFormDialog'
 import { useI18n } from '@/i18n'
 import {
@@ -361,6 +387,10 @@ import {
 import { parseApiError } from '@/utils/errorParser'
 import { parseNumberInput } from '@/utils/form'
 import { dateTimeLocalToRfc3339, formatDateTimeLocalInput } from '@/utils/date'
+import {
+  canConvertExistingProvider,
+  formatProviderConversionConfirmation,
+} from '@/features/providers/utils/providerConversion'
 
 const props = defineProps<{
   modelValue: boolean
@@ -375,6 +405,7 @@ const emit = defineEmits<{
 }>()
 
 const { success, error: showError } = useToast()
+const { confirm } = useConfirm()
 const { legacyT } = useI18n()
 const loading = ref(false)
 
@@ -424,6 +455,40 @@ const form = ref({
   // Kiro 专属配置
   kiro_simulated_cache_enabled: false,
 })
+
+const fixedProviderTypes = new Set<ProviderType>([
+  'claude_code',
+  'codex',
+  'chatgpt_web',
+  'kiro',
+  'grok',
+  'gemini_cli',
+  'vertex_ai',
+  'antigravity',
+  'windsurf',
+  'nous',
+])
+
+const providerTypeLabels: Readonly<Record<ProviderType, string>> = {
+  custom: '自定义',
+  claude_code: 'ClaudeCode',
+  codex: 'Codex',
+  chatgpt_web: 'ChatGPT Web',
+  gemini_cli: 'Gemini CLI',
+  antigravity: 'Antigravity',
+  kiro: 'Kiro',
+  grok: 'Grok',
+  nous: 'Nous',
+  windsurf: 'Windsurf',
+  vertex_ai: 'Vertex AI',
+  deepseek: 'DeepSeek',
+  openrouter: 'OpenRouter',
+  moonshot: 'Moonshot 国内',
+  kimi_coding: 'Kimi Coding Plan',
+  siliconflow: 'SiliconFlow',
+  zhipu: '智谱 GLM',
+  zai: 'Z.ai',
+}
 
 // 重置表单
 function resetForm() {
@@ -496,6 +561,11 @@ const { isEditMode, handleDialogUpdate, handleCancel } = useFormDialog({
   resetForm,
 })
 
+const canConvertProvider = computed(() => canConvertExistingProvider({
+  providerType: props.provider?.provider_type,
+  isEditMode: isEditMode.value,
+}))
+
 // 新建模式下切换 provider_type 时不自动开启号池模式
 watch(() => form.value.provider_type, () => {
   if (!isEditMode.value) {
@@ -528,6 +598,23 @@ const handleSubmit = async () => {
   if (form.value.quota_expires_at && !quotaExpiresAt) {
     showError(legacyT('过期时间必须是合法时间'), legacyT('验证失败'))
     return
+  }
+
+  if (isEditMode.value && props.provider && form.value.provider_type !== props.provider.provider_type) {
+    const confirmed = await confirm({
+      title: legacyT('转换提供商类型'),
+      message: legacyT(formatProviderConversionConfirmation({
+        targetType: providerTypeLabels[form.value.provider_type],
+        endpointCount: props.provider.total_endpoints,
+        keyCount: props.provider.total_keys,
+      })),
+      confirmText: legacyT('确认转换'),
+      variant: 'warning',
+    })
+    if (!confirmed) {
+      form.value.provider_type = props.provider.provider_type || 'custom'
+      return
+    }
   }
 
   loading.value = true

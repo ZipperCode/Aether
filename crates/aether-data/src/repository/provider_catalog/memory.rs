@@ -854,6 +854,30 @@ impl ProviderCatalogWriteRepository for InMemoryProviderCatalogReadRepository {
         Ok(true)
     }
 
+    async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota_snapshot: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        let mut index = self
+            .index
+            .write()
+            .expect("provider catalog repository lock");
+        let Some(key) = index.keys.get_mut(key_id) else {
+            return Ok(false);
+        };
+        let mut snapshot = key
+            .status_snapshot
+            .take()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        snapshot["quota"] = quota_snapshot.clone();
+        key.status_snapshot = Some(snapshot);
+        key.updated_at_unix_secs = updated_at_unix_secs;
+        Ok(true)
+    }
+
     async fn delete_key(&self, key_id: &str) -> Result<bool, DataLayerError> {
         let mut index = self
             .index
@@ -1076,6 +1100,106 @@ mod tests {
             Some("ciphertext-auth-2")
         );
         assert_eq!(stored[0].expires_at_unix_secs, Some(4_102_444_800));
+    }
+
+    #[tokio::test]
+    async fn quota_snapshot_update_preserves_status_siblings_and_oauth_credentials() {
+        // Given
+        let mut key = sample_key("key-1", "provider-1")
+            .with_transport_fields(
+                None,
+                "ciphertext-before".to_string(),
+                Some("auth-before".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("key transport should build");
+        key.status_snapshot = Some(json!({
+            "oauth": {"state": "valid"},
+            "account": {"plan": "pro"},
+            "future_field": {"opaque": true},
+            "quota": {"provider_type": "legacy", "exhausted": true}
+        }));
+        let repository = InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider("provider-1")],
+            vec![],
+            vec![key],
+        );
+
+        // When
+        let quota = json!({"provider_type": "deepseek", "kind": "balance"});
+        let (quota_updated, oauth_updated) = tokio::join!(
+            repository.mutate_key_quota_snapshot("key-1", &quota, Some(200),),
+            repository.update_key_oauth_credentials(
+                "key-1",
+                "ciphertext-after",
+                Some("auth-after"),
+                Some(4_102_444_800),
+            )
+        );
+
+        // Then
+        assert!(quota_updated.expect("quota update should succeed"));
+        assert!(oauth_updated.expect("oauth update should succeed"));
+        let stored = repository
+            .list_keys_by_ids(&["key-1".to_string()])
+            .await
+            .expect("key should read");
+        let snapshot = stored[0]
+            .status_snapshot
+            .as_ref()
+            .expect("snapshot should exist");
+        assert_eq!(snapshot["oauth"], json!({"state": "valid"}));
+        assert_eq!(snapshot["account"], json!({"plan": "pro"}));
+        assert_eq!(snapshot["future_field"], json!({"opaque": true}));
+        assert_eq!(snapshot["quota"]["provider_type"], "deepseek");
+        assert_eq!(
+            stored[0].encrypted_api_key.as_deref(),
+            Some("ciphertext-after")
+        );
+        assert_eq!(
+            stored[0].encrypted_auth_config.as_deref(),
+            Some("auth-after")
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_snapshot_update_normalizes_non_object_status_snapshot() {
+        // Given
+        let mut key = sample_key("key-1", "provider-1");
+        key.status_snapshot = Some(json!(""));
+        let repository = InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider("provider-1")],
+            vec![],
+            vec![key],
+        );
+
+        // When
+        repository
+            .mutate_key_quota_snapshot(
+                "key-1",
+                &json!({"provider_type": "deepseek", "kind": "balance"}),
+                Some(200),
+            )
+            .await
+            .expect("quota update should succeed");
+
+        // Then
+        let stored = repository
+            .list_keys_by_ids(&["key-1".to_string()])
+            .await
+            .expect("key should read");
+        assert_eq!(
+            stored[0]
+                .status_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pointer("/quota/provider_type")),
+            Some(&json!("deepseek"))
+        );
     }
 
     #[tokio::test]

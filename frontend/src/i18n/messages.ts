@@ -602,6 +602,21 @@ export const messages = {
 } as const
 
 const legacyExactEnglishMessages: Record<string, string> = {
+  '可用余额': 'Available balance',
+  '累计已用': 'Cumulative usage',
+  '剩余余额': 'Remaining balance',
+  '赠送': 'Granted',
+  '充值': 'Top-up',
+  '暂无模型': 'No models',
+  '请前往"模型目录"页面添加模型': 'Add models from the Model Catalog page.',
+  '暂无模型映射': 'No model mappings',
+  '添加映射': 'Add mapping',
+  '点击上方"添加映射"按钮为模型创建名称映射': 'Click Add mapping to create a model name mapping.',
+  '转换提供商类型': 'Convert provider type',
+  '转换会保留现有端点和密钥，保存前需要再次确认': 'Conversion preserves existing endpoints and keys and requires confirmation before saving.',
+  '确认转换': 'Confirm conversion',
+  '数据已过期': 'Data is stale',
+  '更新时间未知': 'Update time unknown',
   '关闭': 'Close',
   '取消': 'Cancel',
   '确定': 'Confirm',
@@ -2559,6 +2574,7 @@ const legacyPhraseEnglishMessages: Array<[string, string]> = [
 ]
 
 const legacyDynamicPatterns: Array<[RegExp, (match: RegExpMatchArray) => string]> = [
+  [/^确认将此提供商转换为 (.+)？转换会影响 (.+) 个端点和 (.+) 个密钥。取消后将保持当前自定义类型不变。$/u, match => `Convert this provider to ${match[1]}? This conversion affects ${match[2]} endpoints and ${match[3]} keys. Cancel keeps the current Custom type unchanged.`],
   [/^(.+) 次请求 · (.+)$/u, match => `${match[1]} requests · ${match[2]}`],
   [/^暂无 (.+) 格式的 Key$/u, match => `No ${match[1]} format keys`],
   [/^会话剩余 (.+)$/u, match => `Session remaining ${match[1]}`],

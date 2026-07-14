@@ -397,6 +397,7 @@ mod tests {
             stream_first_byte_timeout_ms: None,
             timeout: 5,
             follow_redirects: None,
+            max_response_body_bytes: None,
             http1_only: false,
             transport_profile: None,
         };

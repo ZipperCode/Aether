@@ -824,7 +824,6 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
         .json(&json!({
             "name": "openai-renamed",
-            "provider_type": "claude_code",
             "description": "Updated provider",
             "website": "https://updated.example",
             "provider_priority": 3,
@@ -839,7 +838,6 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
                 "provider_ops": {"architecture_id": "cubence"},
                 "chat_pii_redaction": {"enabled": true}
             },
-            "claude_code_advanced": {"pool_size": 2},
             "proxy": {"url": "https://proxy.example"}
         }))
         .send()
@@ -852,7 +850,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
     let payload: serde_json::Value = serde_json::from_str(&body).expect("json body should parse");
     assert_eq!(payload["id"], "provider-openai");
     assert_eq!(payload["name"], "openai-renamed");
-    assert_eq!(payload["provider_type"], "claude_code");
+    assert_eq!(payload["provider_type"], "custom");
     assert_eq!(payload["description"], "Updated provider");
     assert_eq!(payload["website"], "https://updated.example");
     assert_eq!(payload["provider_priority"], 3);
@@ -866,7 +864,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
     );
     assert_eq!(payload["stream_first_byte_timeout"], 11.0);
     assert_eq!(payload["proxy"], json!({"url": "https://proxy.example"}));
-    assert_eq!(payload["claude_code_advanced"], json!({"pool_size": 2}));
+    assert_eq!(payload["claude_code_advanced"], serde_json::Value::Null);
     assert_eq!(payload["pool_advanced"], json!({}));
     assert_eq!(payload["failover_rules"], json!({"strategy": "ordered"}));
     assert_eq!(payload["chat_pii_redaction"], json!({"enabled": true}));
@@ -974,6 +972,147 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn custom_provider_converts_to_supported_official_type_without_rewriting_records() {
+    // Given
+    let provider = sample_provider("provider-custom", "custom", 17);
+    let endpoint = sample_endpoint(
+        "endpoint-custom",
+        "provider-custom",
+        "openai:chat",
+        "https://api.deepseek.com/v1",
+    );
+    let key = sample_key(
+        "key-custom",
+        "provider-custom",
+        "openai:chat",
+        "secret-placeholder",
+    );
+    let encrypted_key = key.encrypted_api_key.clone();
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(repository.clone()),
+        );
+
+    // When
+    let response = local_admin_providers_response(
+        &state,
+        http::Method::PATCH,
+        "/api/admin/providers/provider-custom",
+        Some(json!({"provider_type": "deepseek"})),
+    )
+    .await;
+
+    // Then
+    assert_eq!(response.status(), StatusCode::OK);
+    let providers = repository
+        .list_providers_by_ids(&["provider-custom".to_string()])
+        .await
+        .expect("provider should read");
+    let endpoints = repository
+        .list_endpoints_by_provider_ids(&["provider-custom".to_string()])
+        .await
+        .expect("endpoint should read");
+    let keys = repository
+        .list_keys_by_provider_ids(&["provider-custom".to_string()])
+        .await
+        .expect("key should read");
+    assert_eq!(providers[0].provider_type, "deepseek");
+    assert_eq!(providers[0].provider_priority, 17);
+    assert_eq!(endpoints[0].id, "endpoint-custom");
+    assert_eq!(endpoints[0].base_url, "https://api.deepseek.com/v1");
+    assert_eq!(keys[0].id, "key-custom");
+    assert_eq!(keys[0].encrypted_api_key, encrypted_key);
+}
+
+#[tokio::test]
+async fn typed_provider_rejects_conversion_and_remains_unchanged() {
+    // Given
+    let mut provider = sample_provider("provider-typed", "typed", 23);
+    provider.provider_type = "codex".to_string();
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-typed",
+            "provider-typed",
+            "openai:chat",
+            "https://api.deepseek.com",
+        )],
+        Vec::new(),
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(repository.clone()),
+        );
+
+    // When
+    let response = local_admin_providers_response(
+        &state,
+        http::Method::PATCH,
+        "/api/admin/providers/provider-typed",
+        Some(json!({"provider_type": "deepseek"})),
+    )
+    .await;
+
+    // Then
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let providers = repository
+        .list_providers_by_ids(&["provider-typed".to_string()])
+        .await
+        .expect("provider should read");
+    assert_eq!(providers[0].provider_type, "codex");
+    assert_eq!(providers[0].provider_priority, 23);
+}
+
+#[tokio::test]
+async fn custom_provider_without_active_official_endpoint_rejects_conversion_and_remains_unchanged()
+{
+    // Given
+    let provider = sample_provider("provider-custom-inactive", "custom", 29);
+    let mut endpoint = sample_endpoint(
+        "endpoint-custom-inactive",
+        "provider-custom-inactive",
+        "openai:chat",
+        "https://api.deepseek.com/v1",
+    );
+    endpoint.is_active = false;
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        Vec::new(),
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(repository.clone()),
+        );
+
+    // When
+    let response = local_admin_providers_response(
+        &state,
+        http::Method::PATCH,
+        "/api/admin/providers/provider-custom-inactive",
+        Some(json!({"provider_type": "deepseek"})),
+    )
+    .await;
+
+    // Then
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let providers = repository
+        .list_providers_by_ids(&["provider-custom-inactive".to_string()])
+        .await
+        .expect("provider should read");
+    assert_eq!(providers[0].provider_type, "custom");
+    assert_eq!(providers[0].provider_priority, 29);
 }
 
 #[tokio::test]

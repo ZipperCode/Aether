@@ -4,7 +4,9 @@ use aether_data_contracts::repository::provider_catalog::{
 use aether_pool_core::{PoolMemberSignals, PoolSchedulingPreset};
 use serde_json::{Map, Value};
 
-use crate::capability::{ProviderPoolCapabilities, ProviderPoolCapability};
+use crate::capability::{
+    ProviderPoolCapabilities, ProviderPoolCapability, ProviderQuotaServingPolicy,
+};
 use crate::plan::{derive_plan_tier, normalize_provider_plan_tier};
 use crate::quota::{
     provider_pool_account_blocked, provider_pool_quota_reset_seconds,
@@ -32,6 +34,11 @@ pub trait ProviderPoolAdapter: Send + Sync {
     fn supports_quota_refresh(&self) -> bool {
         self.capabilities()
             .supports(ProviderPoolCapability::QuotaRefresh)
+    }
+
+    fn quota_serving_policy(&self) -> Option<ProviderQuotaServingPolicy> {
+        self.supports_quota_refresh()
+            .then_some(ProviderQuotaServingPolicy::ServingProbe)
     }
 
     fn quota_refresh_endpoint(

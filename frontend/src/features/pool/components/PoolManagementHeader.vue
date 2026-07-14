@@ -1,6 +1,6 @@
 <template>
   <div class="px-4 sm:px-6 py-3 sm:py-3.5 border-b border-border/60">
-    <div class="flex flex-col gap-3 xl:hidden">
+    <div class="flex flex-col gap-3 2xl:hidden">
       <div class="min-w-0">
         <h3 class="text-base font-semibold">
           {{ legacyT('号池管理') }}
@@ -112,7 +112,7 @@
       </div>
     </div>
 
-    <div class="hidden xl:flex items-center justify-between gap-4">
+    <div class="hidden 2xl:flex items-center justify-between gap-4">
       <div class="flex items-center gap-2">
         <h3 class="text-base font-semibold">
           {{ legacyT('号池管理') }}
