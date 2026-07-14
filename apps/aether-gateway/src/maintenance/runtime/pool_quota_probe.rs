@@ -19,9 +19,8 @@ use crate::admin_api::{
     admin_provider_pool_config, provider_quota_refresh_endpoint_for_provider,
     provider_quota_serving_policy, provider_type_supports_quota_refresh,
     reconcile_admin_fixed_provider_template_endpoints, refresh_provider_pool_quota_locally,
-    AdminAppState,
+    AdminAppState, QuotaRefreshSource,
 };
-use crate::handlers::admin::QuotaRefreshSource;
 use crate::{AppState, GatewayError};
 
 use crate::ai_serving::provider_key_pool_score_scope;

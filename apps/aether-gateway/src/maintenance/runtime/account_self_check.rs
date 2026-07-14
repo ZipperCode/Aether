@@ -17,9 +17,8 @@ use tracing::{debug, info, warn};
 use crate::admin_api::{
     admin_provider_pool_config, provider_quota_refresh_endpoint_for_provider,
     provider_quota_serving_policy, provider_type_supports_quota_refresh,
-    refresh_provider_pool_quota_locally, AdminAppState,
+    refresh_provider_pool_quota_locally, AdminAppState, QuotaRefreshSource,
 };
-use crate::handlers::admin::QuotaRefreshSource;
 use crate::{AppState, GatewayError};
 
 const ACCOUNT_SELF_CHECK_REDIS_PREFIX: &str = "ap:account_self_check:last";

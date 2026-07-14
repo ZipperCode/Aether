@@ -2535,7 +2535,7 @@ mod tests {
 
         // Then
         assert_eq!(result.error.as_deref(), Some("response_too_large"));
-        assert_eq!(result.body, Bytes::from_static(b"12345678"));
+        assert!(result.body.is_empty());
     }
 
     #[tokio::test]
