@@ -3223,6 +3223,9 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
         model: String,
         authorization: String,
         x_client_request_id: String,
+        session_id: String,
+        thread_id: String,
+        prompt_cache_key: String,
         stream_present: bool,
         plan_stream: bool,
     }
@@ -3509,6 +3512,25 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    session_id: payload
+                        .get("headers")
+                        .and_then(|value| value.get("session-id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    thread_id: payload
+                        .get("headers")
+                        .and_then(|value| value.get("thread-id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    prompt_cache_key: payload
+                        .get("body")
+                        .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("prompt_cache_key"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
                     stream_present: payload
                         .get("body")
                         .and_then(|value| value.get("json_body"))
@@ -3646,7 +3668,16 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
     );
     assert_eq!(
         seen_execution_runtime_request.x_client_request_id,
-        "trace-codex-cli-local-123"
+        seen_execution_runtime_request.thread_id
+    );
+    assert_eq!(
+        seen_execution_runtime_request.session_id,
+        seen_execution_runtime_request.thread_id
+    );
+    assert!(seen_execution_runtime_request.prompt_cache_key.is_empty());
+    assert_ne!(
+        seen_execution_runtime_request.thread_id,
+        seen_execution_runtime_request.trace_id
     );
     assert!(seen_execution_runtime_request.stream_present);
     assert!(seen_execution_runtime_request.plan_stream);

@@ -60,7 +60,9 @@ pub(super) async fn resolve_local_standard_decision_input(
         state,
         auth_context,
         Some(requested_model.as_str()),
+        decision.auth_endpoint_signature.as_deref(),
         None,
+        &decision.model_directive_policy,
     )
     .await
     {
@@ -119,6 +121,7 @@ pub(super) async fn materialize_local_standard_candidate_attempts(
     );
     let preselection = preselect_local_execution_candidates_with_serving(
         planner_state,
+        &input.model_directive_policy,
         spec_metadata.api_format,
         &input.requested_model,
         false,
@@ -243,6 +246,7 @@ pub(super) async fn build_local_standard_candidate_attempt_source<'a>(
     let (source, candidate_count) =
         build_lazy_requested_model_execution_candidate_attempt_source_with_serving(
             planner_state,
+            &input.model_directive_policy,
             trace_id,
             spec_metadata.api_format,
             &input.requested_model,
@@ -338,6 +342,7 @@ async fn maybe_append_gemini_image_openai_image_preselection(
 
     let image_preselection = preselect_local_execution_candidates_for_api_formats_with_serving(
         planner_state,
+        &input.model_directive_policy,
         spec_metadata.api_format,
         &input.requested_model,
         spec_metadata.require_streaming,

@@ -4,7 +4,10 @@ use aether_ai_formats::api::{
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_contracts::ExecutionPlan;
 use aether_data_contracts::repository::usage::{
+    extract_provider_actual_service_tier_from_response,
     extract_provider_reasoning_effort_from_body, extract_provider_service_tier_from_body,
+    normalize_provider_service_tier, resolve_provider_cache_ttl_minutes,
+    PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY,
     PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_SERVICE_TIER_METADATA_KEY,
 };
 use serde_json::{json, Map, Value};
@@ -75,12 +78,25 @@ pub(crate) fn sanitize_usage_request_metadata_ref(value: Option<&Value>) -> Opti
 
 pub(crate) fn attach_provider_request_body_metadata(
     metadata: Option<Value>,
+    provider_api_format: Option<&str>,
+    provider_model: Option<&str>,
+    source_model: Option<&str>,
     provider_request_body: Option<&Value>,
 ) -> Option<Value> {
     let provider_body_is_object = provider_request_body.and_then(Value::as_object).is_some();
     let reasoning_effort = extract_provider_reasoning_effort_from_body(provider_request_body);
     let service_tier = extract_provider_service_tier_from_body(provider_request_body);
-    if !provider_body_is_object && reasoning_effort.is_none() && service_tier.is_none() {
+    let cache_ttl_minutes = resolve_provider_cache_ttl_minutes(
+        provider_api_format,
+        provider_model,
+        source_model,
+        provider_request_body,
+    );
+    if !provider_body_is_object
+        && reasoning_effort.is_none()
+        && service_tier.is_none()
+        && cache_ttl_minutes.is_none()
+    {
         return metadata;
     }
     let mut object = match metadata {
@@ -90,6 +106,7 @@ pub(crate) fn attach_provider_request_body_metadata(
     if provider_body_is_object {
         object.remove(PROVIDER_REASONING_EFFORT_METADATA_KEY);
         object.remove(PROVIDER_SERVICE_TIER_METADATA_KEY);
+        object.remove(PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY);
     }
     if let Some(reasoning_effort) = reasoning_effort {
         object.insert(
@@ -103,6 +120,50 @@ pub(crate) fn attach_provider_request_body_metadata(
             Value::String(service_tier),
         );
     }
+    if let Some(cache_ttl_minutes) = cache_ttl_minutes {
+        object.insert(
+            PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY.to_string(),
+            Value::Number(cache_ttl_minutes.into()),
+        );
+    }
+    (!object.is_empty()).then_some(Value::Object(object))
+}
+
+pub(crate) fn attach_provider_response_body_metadata(
+    metadata: Option<Value>,
+    provider_response_body: Option<&Value>,
+) -> Option<Value> {
+    if metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY))
+        .and_then(Value::as_str)
+        .and_then(normalize_provider_service_tier)
+        .is_some()
+    {
+        return metadata;
+    }
+    let actual_service_tier =
+        extract_provider_actual_service_tier_from_response(provider_response_body);
+    attach_provider_actual_service_tier_metadata(metadata, actual_service_tier.as_deref())
+}
+
+pub(crate) fn attach_provider_actual_service_tier_metadata(
+    metadata: Option<Value>,
+    actual_service_tier: Option<&str>,
+) -> Option<Value> {
+    let Some(actual_service_tier) = actual_service_tier.and_then(normalize_provider_service_tier)
+    else {
+        return metadata;
+    };
+    let mut object = match metadata {
+        Some(Value::Object(object)) => object,
+        _ => Map::new(),
+    };
+    object.insert(
+        PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY.to_string(),
+        Value::String(actual_service_tier),
+    );
     (!object.is_empty()).then_some(Value::Object(object))
 }
 
@@ -120,6 +181,8 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_non_empty_string(source, target, "request_path_and_query");
     copy_non_empty_string(source, target, PROVIDER_REASONING_EFFORT_METADATA_KEY);
     copy_non_empty_string(source, target, PROVIDER_SERVICE_TIER_METADATA_KEY);
+    copy_non_empty_string(source, target, PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY);
+    copy_number(source, target, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY);
     copy_number(source, target, "provider_request_body_base64_bytes");
     copy_number(source, target, "provider_response_body_base64_bytes");
     copy_number(source, target, "client_response_body_base64_bytes");
@@ -165,6 +228,12 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_non_empty_string(&mut source, target, "request_path_and_query");
     remove_non_empty_string(&mut source, target, PROVIDER_REASONING_EFFORT_METADATA_KEY);
     remove_non_empty_string(&mut source, target, PROVIDER_SERVICE_TIER_METADATA_KEY);
+    remove_non_empty_string(
+        &mut source,
+        target,
+        PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY,
+    );
+    remove_number(&mut source, target, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY);
     remove_number(&mut source, target, "provider_request_body_base64_bytes");
     remove_number(&mut source, target, "provider_response_body_base64_bytes");
     remove_number(&mut source, target, "client_response_body_base64_bytes");
@@ -449,7 +518,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        attach_provider_request_body_metadata, build_usage_request_metadata_seed,
+        attach_provider_actual_service_tier_metadata, attach_provider_request_body_metadata,
+        attach_provider_response_body_metadata, build_usage_request_metadata_seed,
         merge_usage_request_metadata, merge_usage_request_metadata_owned,
         sanitize_usage_request_metadata, sanitize_usage_request_metadata_ref,
         MAX_USAGE_REQUEST_METADATA_BYTES, MAX_USAGE_REQUEST_METADATA_DEPTH,
@@ -770,8 +840,11 @@ mod tests {
 
         let updated = attach_provider_request_body_metadata(
             metadata.clone(),
+            Some("openai:responses"),
+            Some("gpt-5.6-sol"),
+            Some("gpt-5.6-sol"),
             Some(&json!({
-                "model": "gpt-5",
+                "model": "gpt-5.6-sol",
                 "reasoning": { "effort": "low" },
                 "service_tier": "standard"
             })),
@@ -783,12 +856,16 @@ mod tests {
             json!({
                 "trace_id": "trace-1",
                 "provider_reasoning_effort": "low",
-                "provider_service_tier": "standard"
+                "provider_service_tier": "standard",
+                "provider_cache_ttl_minutes": 30
             })
         );
 
         let cleared = attach_provider_request_body_metadata(
             metadata,
+            Some("openai:responses"),
+            Some("gpt-5"),
+            Some("gpt-5"),
             Some(&json!({
                 "model": "gpt-5"
             })),
@@ -804,6 +881,59 @@ mod tests {
     }
 
     #[test]
+    fn provider_response_metadata_preserves_terminal_actual_service_tier() {
+        let metadata = attach_provider_response_body_metadata(
+            Some(json!({"provider_service_tier": "priority"})),
+            Some(&json!({
+                "chunks": [
+                    {"service_tier": "priority"},
+                    {"service_tier": "Default", "usage": {"total_tokens": 12}}
+                ]
+            })),
+        )
+        .expect("requested and actual provider tiers should be preserved");
+
+        assert_eq!(
+            metadata,
+            json!({
+                "provider_service_tier": "priority",
+                "provider_actual_service_tier": "default"
+            })
+        );
+    }
+
+    #[test]
+    fn terminal_summary_tier_uses_the_same_normalized_metadata_field() {
+        let metadata = attach_provider_actual_service_tier_metadata(
+            Some(json!({"trace_id": "trace-1"})),
+            Some(" Flex "),
+        )
+        .expect("terminal summary tier should be retained");
+
+        assert_eq!(
+            metadata,
+            json!({
+                "trace_id": "trace-1",
+                "provider_actual_service_tier": "flex"
+            })
+        );
+    }
+
+    #[test]
+    fn terminal_summary_tier_precedes_truncated_response_capture() {
+        let metadata = attach_provider_response_body_metadata(
+            Some(json!({"provider_actual_service_tier": "default"})),
+            Some(&json!({"chunks": [{"service_tier": "priority"}]})),
+        )
+        .expect("terminal summary tier should remain");
+
+        assert_eq!(
+            metadata.get("provider_actual_service_tier"),
+            Some(&Value::String("default".to_string()))
+        );
+    }
+
+    #[test]
     fn owned_merge_matches_filtered_merge_for_trusted_objects() {
         let base = Some(json!({
             "trace_id": "trace-1",
@@ -811,7 +941,8 @@ mod tests {
         }));
         let override_value = Some(json!({
             "billing_snapshot_status": "complete",
-            "trace_id": "trace-2"
+            "trace_id": "trace-2",
+            "provider_actual_service_tier": "default"
         }));
 
         assert_eq!(

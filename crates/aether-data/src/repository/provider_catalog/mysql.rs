@@ -3,9 +3,10 @@ use sqlx::{mysql::MySqlRow, MySql, QueryBuilder, Row};
 
 use super::{
     InMemoryProviderCatalogReadRepository, ProviderCatalogKeyListQuery,
-    ProviderCatalogReadRepository, ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint,
-    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    ProviderCatalogReadRepository, ProviderCatalogUpstreamMetadataNamespaceUpdate,
+    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
+    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use crate::driver::mysql::MysqlPool;
 use crate::error::SqlResultExt;
@@ -746,6 +747,19 @@ WHERE id = ?
                 "provider_api_keys.last_models_fetch_at",
             )?)
             .bind(&key.last_models_fetch_error)
+            .bind(optional_json_to_string(
+                &key.upstream_metadata,
+                "provider_api_keys.upstream_metadata",
+            )?)
+            .bind(optional_i64_from_u64(
+                key.oauth_invalid_at_unix_secs,
+                "provider_api_keys.oauth_invalid_at",
+            )?)
+            .bind(&key.oauth_invalid_reason)
+            .bind(optional_json_to_string(
+                &key.status_snapshot,
+                "provider_api_keys.status_snapshot",
+            )?)
             .bind(updated_at)
             .bind(&key.id)
             .execute(&self.pool)
@@ -798,6 +812,164 @@ WHERE id = ?
         .map_sql_err()?
         .rows_affected();
         Ok(rows_affected > 0)
+    }
+
+    pub async fn upsert_key_upstream_metadata_namespace(
+        &self,
+        key_id: &str,
+        namespace: &str,
+        value: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(key_id, "provider catalog key_id")?;
+        validate_non_empty(namespace, "provider catalog upstream metadata namespace")?;
+        let value_json = serde_json::to_string(value).map_err(|err| {
+            DataLayerError::UnexpectedValue(format!(
+                "provider_api_keys.upstream_metadata namespace is not serializable: {err}"
+            ))
+        })?;
+        let namespace_path = format!(
+            "$.{}",
+            serde_json::to_string(namespace).map_err(|err| {
+                DataLayerError::UnexpectedValue(format!(
+                    "provider_api_keys.upstream_metadata namespace is not serializable: {err}"
+                ))
+            })?
+        );
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET upstream_metadata = JSON_SET(
+      COALESCE(NULLIF(upstream_metadata, ''), '{}'),
+      ?, CAST(? AS JSON)
+    ),
+    updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(namespace_path)
+        .bind(value_json)
+        .bind(updated_at_unix_secs.unwrap_or_else(current_unix_secs) as i64)
+        .bind(key_id)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
+    pub async fn update_key_model_fetch_state(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: Option<u64>,
+        last_models_fetch_error: Option<&str>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(key_id, "provider catalog key_id")?;
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET allowed_models = ?, last_models_fetch_at = ?, last_models_fetch_error = ?, updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(optional_json_ref_to_string(
+            allowed_models,
+            "provider_api_keys.allowed_models",
+        )?)
+        .bind(optional_i64_from_u64(
+            last_models_fetch_at_unix_secs,
+            "provider_api_keys.last_models_fetch_at",
+        )?)
+        .bind(last_models_fetch_error)
+        .bind(updated_at_unix_secs.unwrap_or_else(current_unix_secs) as i64)
+        .bind(key_id)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
+    pub async fn update_key_model_fetch_success(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: u64,
+        upstream_metadata_updates: &[ProviderCatalogUpstreamMetadataNamespaceUpdate],
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(key_id, "provider catalog key_id")?;
+        let allowed_models =
+            optional_json_ref_to_string(allowed_models, "provider_api_keys.allowed_models")?;
+        let namespace_updates = upstream_metadata_updates
+            .iter()
+            .map(|update| {
+                validate_non_empty(
+                    &update.namespace,
+                    "provider catalog upstream metadata namespace",
+                )?;
+                let path = format!(
+                    "$.{}",
+                    serde_json::to_string(&update.namespace).map_err(|err| {
+                        DataLayerError::UnexpectedValue(format!(
+                            "provider_api_keys.upstream_metadata namespace is not serializable: {err}"
+                        ))
+                    })?
+                );
+                let value = serde_json::to_string(&update.value).map_err(|err| {
+                    DataLayerError::UnexpectedValue(format!(
+                        "provider_api_keys.upstream_metadata namespace is not serializable: {err}"
+                    ))
+                })?;
+                Ok((path, value))
+            })
+            .collect::<Result<Vec<_>, DataLayerError>>()?;
+        let updated_at = updated_at_unix_secs.unwrap_or_else(current_unix_secs) as i64;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET allowed_models = ?, last_models_fetch_at = ?, last_models_fetch_error = NULL, updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(allowed_models)
+        .bind(optional_i64_from_u64(
+            Some(last_models_fetch_at_unix_secs),
+            "provider_api_keys.last_models_fetch_at",
+        )?)
+        .bind(updated_at)
+        .bind(key_id)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        if rows_affected == 0 {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        for (path, value) in namespace_updates {
+            sqlx::query(
+                r#"
+UPDATE provider_api_keys
+SET upstream_metadata = JSON_SET(
+      COALESCE(NULLIF(upstream_metadata, ''), '{}'),
+      ?, CAST(? AS JSON)
+    )
+WHERE id = ?
+"#,
+            )
+            .bind(path)
+            .bind(value)
+            .bind(key_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        }
+        tx.commit().await.map_sql_err()?;
+        Ok(true)
     }
 
     pub async fn clear_key_oauth_invalid_marker(
@@ -1102,6 +1274,61 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
             .await
     }
 
+    async fn upsert_key_upstream_metadata_namespace(
+        &self,
+        key_id: &str,
+        namespace: &str,
+        value: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::upsert_key_upstream_metadata_namespace(
+            self,
+            key_id,
+            namespace,
+            value,
+            updated_at_unix_secs,
+        )
+        .await
+    }
+
+    async fn update_key_model_fetch_state(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: Option<u64>,
+        last_models_fetch_error: Option<&str>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::update_key_model_fetch_state(
+            self,
+            key_id,
+            allowed_models,
+            last_models_fetch_at_unix_secs,
+            last_models_fetch_error,
+            updated_at_unix_secs,
+        )
+        .await
+    }
+
+    async fn update_key_model_fetch_success(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: u64,
+        upstream_metadata_updates: &[ProviderCatalogUpstreamMetadataNamespaceUpdate],
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::update_key_model_fetch_success(
+            self,
+            key_id,
+            allowed_models,
+            last_models_fetch_at_unix_secs,
+            upstream_metadata_updates,
+            updated_at_unix_secs,
+        )
+        .await
+    }
+
     async fn delete_key(&self, key_id: &str) -> Result<bool, DataLayerError> {
         Self::delete_key(self, key_id).await
     }
@@ -1312,6 +1539,10 @@ SET
   last_rpm_peak = ?,
   last_models_fetch_at = ?,
   last_models_fetch_error = ?,
+  upstream_metadata = ?,
+  oauth_invalid_at = ?,
+  oauth_invalid_reason = ?,
+  status_snapshot = ?,
   updated_at = ?
 WHERE id = ?
 "#

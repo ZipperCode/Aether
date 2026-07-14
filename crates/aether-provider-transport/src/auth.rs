@@ -275,7 +275,7 @@ pub fn resolve_local_gemini_auth(
     }
 }
 
-pub(crate) fn resolve_local_auth_type_for_transport_format(
+pub fn resolve_local_auth_type_for_transport_format(
     transport: &GatewayProviderTransportSnapshot,
 ) -> String {
     let default_auth_type = transport.key.auth_type.trim().to_ascii_lowercase();

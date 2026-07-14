@@ -142,20 +142,18 @@ pub fn classify_same_format_provider_request_behavior(
             params.provider_api_format,
             params.require_streaming,
         );
-    let upstream_is_stream = aether_ai_formats::resolve_upstream_is_stream_from_endpoint_config(
+    let upstream_is_stream = aether_ai_formats::resolve_upstream_is_stream_for_provider(
         transport.endpoint.config.as_ref(),
+        transport.provider.provider_type.as_str(),
+        params.provider_api_format,
         params.require_streaming,
-        is_kiro
-            || is_antigravity
-            || gemini_cli_requires_upstream_streaming
-            || aether_ai_formats::api::force_upstream_streaming_for_provider(
-                transport.provider.provider_type.as_str(),
-                params.provider_api_format,
-            ),
+        is_kiro || is_antigravity || gemini_cli_requires_upstream_streaming,
     );
-    let force_body_stream_field = aether_ai_formats::endpoint_config_forces_upstream_stream_policy(
-        transport.endpoint.config.as_ref(),
-    );
+    let force_body_stream_field =
+        aether_ai_formats::api_format_uses_body_stream_field(params.provider_api_format)
+            && aether_ai_formats::endpoint_config_forces_upstream_stream_policy(
+                transport.endpoint.config.as_ref(),
+            );
     let report_kind = if is_kiro && !params.require_streaming {
         "claude_cli_sync_finalize"
     } else if (is_gemini_cli || is_antigravity) && !params.require_streaming {
@@ -238,10 +236,11 @@ fn build_same_format_provider_request_body_inner(
                 .map(|(key, value)| (key.clone(), value.clone())),
         )
     } else {
-        aether_ai_formats::convert_request_pure(
+        aether_ai_formats::convert_request_pure_with_context(
             input.client_api_format,
             input.provider_api_format,
             input.body_json,
+            &aether_ai_formats::FormatContext::default().with_mapped_model(input.mapped_model),
         )
         .ok()?
         .value
@@ -396,6 +395,30 @@ fn build_same_format_provider_request_body_inner(
                 input.upstream_is_stream
             ),
         );
+    }
+    let provider_model = provider_request_body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(input.mapped_model)
+        .to_string();
+    if aether_ai_formats::finalize_openai_provider_request(
+        &mut provider_request_body,
+        aether_ai_formats::OpenAiProviderRequestFinalization {
+            source_api_format: input.provider_api_format,
+            provider_api_format: input.provider_api_format,
+            provider_type: "",
+            provider_model: &provider_model,
+            source_model: input.source_model.unwrap_or(input.mapped_model),
+            body_rules: input.body_rules,
+            upstream_is_stream: input.upstream_is_stream,
+            require_body_stream_field,
+        },
+    )
+    .is_err()
+    {
+        return None;
     }
     Some(provider_request_body)
 }
@@ -601,6 +624,7 @@ pub fn same_format_provider_transport_unsupported_reason_for_trace(
             "openai:chat" => "openai:chat",
             "openai:responses" => "openai:responses",
             "openai:responses:compact" => "openai:responses:compact",
+            "openai:search" => "openai:search",
             "claude:messages" => "claude:messages",
             "gemini:generate_content" => "gemini:generate_content",
             "gemini:interactions" => "gemini:interactions",
@@ -681,7 +705,9 @@ fn resolve_same_format_standard_direct_auth(
     transport: &GatewayProviderTransportSnapshot,
     provider_api_format: &str,
 ) -> Option<(String, String)> {
-    if aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:embedding") {
+    if aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:embedding")
+        || aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:search")
+    {
         resolve_local_openai_bearer_auth(transport)
     } else {
         resolve_local_standard_auth(transport)
@@ -851,6 +877,35 @@ mod tests {
             },
         );
         assert!(!sync_behavior.upstream_is_stream);
+
+        let mut compact = sample_transport("codex");
+        compact.endpoint.config = Some(json!({
+            "upstream_stream_policy": "force_stream"
+        }));
+        let compact_behavior = classify_same_format_provider_request_behavior(
+            &compact,
+            SameFormatProviderRequestBehaviorParams {
+                require_streaming: true,
+                provider_api_format: "openai:responses:compact",
+                report_kind: "openai_responses_compact_sync_success",
+            },
+        );
+        assert!(!compact_behavior.upstream_is_stream);
+
+        let mut search = sample_transport("codex");
+        search.endpoint.config = Some(json!({
+            "upstream_stream_policy": "force_stream"
+        }));
+        let search_behavior = classify_same_format_provider_request_behavior(
+            &search,
+            SameFormatProviderRequestBehaviorParams {
+                require_streaming: true,
+                provider_api_format: "openai:search",
+                report_kind: "openai_search_sync_success",
+            },
+        );
+        assert!(!search_behavior.upstream_is_stream);
+        assert!(!search_behavior.force_body_stream_field);
     }
 
     #[test]
@@ -1001,6 +1056,31 @@ mod tests {
     }
 
     #[test]
+    fn resolves_openai_search_direct_auth_with_bearer_header() {
+        let mut transport = sample_transport("custom");
+        transport.endpoint.api_format = "openai:search".to_string();
+        transport.key.auth_type = "api_key".to_string();
+        let behavior = classify_same_format_provider_request_behavior(
+            &transport,
+            SameFormatProviderRequestBehaviorParams {
+                require_streaming: false,
+                provider_api_format: "openai:search",
+                report_kind: "openai_search_sync_success",
+            },
+        );
+
+        assert_eq!(
+            resolve_same_format_provider_direct_auth(
+                &behavior,
+                &transport,
+                SameFormatProviderFamily::Standard,
+                "openai:search",
+            ),
+            Some(("authorization".to_string(), "Bearer secret".to_string()))
+        );
+    }
+
+    #[test]
     fn keeps_claude_same_format_api_key_on_x_api_key_header() {
         let mut transport = sample_transport("custom");
         transport.endpoint.api_format = "claude:messages".to_string();
@@ -1079,6 +1159,227 @@ mod tests {
         assert_eq!(body["n"], 2);
         assert_eq!(body["reasoning_effort"], "max");
         assert_eq!(body["unknown_vendor_field"]["keep"], true);
+    }
+
+    #[test]
+    fn same_format_responses_body_preserves_gpt_5_6_protocol_contract_verbatim() {
+        let input = json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "before",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    },
+                    {"type": "input_text", "text": "after"}
+                ]
+            },
+            {
+                "type": "program",
+                "call_id": "program-call-1",
+                "fingerprint": "fp-program-1"
+            },
+            {
+                "type": "program_output",
+                "call_id": "program-call-1",
+                "result": "hello",
+                "status": "completed"
+            },
+            {
+                "type": "multi_agent_call",
+                "call_id": "agent-call-1",
+                "action": "delegate",
+                "arguments": {"query": "release notes"},
+                "agent": "researcher"
+            },
+            {
+                "type": "agent_message",
+                "author": "researcher",
+                "recipient": "assistant",
+                "encrypted_content": "encrypted-agent-message"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "ok",
+                "caller": {"type": "multi_agent", "id": "agent-call-1"}
+            }
+        ]);
+        let prompt_cache_options = json!({
+            "mode": "explicit",
+            "ttl": "30m"
+        });
+        let body_json = json!({
+            "model": "gpt-5.6-sol",
+            "input": input,
+            "reasoning": {
+                "effort": "max",
+                "mode": "pro",
+                "context": "all_turns"
+            },
+            "prompt_cache_options": prompt_cache_options,
+            "multi_agent": {
+                "enabled": true,
+                "max_concurrent_subagents": 2
+            }
+        });
+
+        let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
+            body_json: &body_json,
+            mapped_model: "gpt-5.6-sol",
+            client_api_format: "openai:responses",
+            provider_api_format: "openai:responses",
+            source_model: Some("gpt-5.6-sol"),
+            family: SameFormatProviderFamily::Standard,
+            body_rules: None,
+            request_headers: None,
+            upstream_is_stream: false,
+            force_body_stream_field: false,
+            kiro_auth_config: None,
+            is_claude_code: false,
+            enable_model_directives: false,
+        })
+        .expect("valid GPT-5.6 Responses request should use raw same-format transport");
+
+        assert_eq!(body["input"], input);
+        assert_eq!(body["reasoning"], body_json["reasoning"]);
+        assert_eq!(body["prompt_cache_options"], prompt_cache_options);
+        assert_eq!(body["multi_agent"], body_json["multi_agent"]);
+    }
+
+    #[test]
+    fn same_format_prompt_cache_capability_uses_mapped_provider_model() {
+        let body_json = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"}
+        });
+        let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
+            body_json: &body_json,
+            mapped_model: "gpt-5.6-sol",
+            client_api_format: "openai:chat",
+            provider_api_format: "openai:chat",
+            source_model: Some("gpt-5.5"),
+            family: SameFormatProviderFamily::Standard,
+            body_rules: None,
+            request_headers: None,
+            upstream_is_stream: false,
+            force_body_stream_field: false,
+            kiro_auth_config: None,
+            is_claude_code: false,
+            enable_model_directives: false,
+        })
+        .expect("final GPT-5.6 provider model should accept prompt_cache_options");
+
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(
+            body["prompt_cache_options"],
+            body_json["prompt_cache_options"]
+        );
+
+        let rejected =
+            build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
+                body_json: &body_json,
+                mapped_model: "gpt-5.5",
+                client_api_format: "openai:chat",
+                provider_api_format: "openai:chat",
+                source_model: Some("gpt-5.5"),
+                family: SameFormatProviderFamily::Standard,
+                body_rules: None,
+                request_headers: None,
+                upstream_is_stream: false,
+                force_body_stream_field: false,
+                kiro_auth_config: None,
+                is_claude_code: false,
+                enable_model_directives: false,
+            });
+        assert!(rejected.is_none());
+    }
+
+    #[test]
+    fn same_format_reasoning_capability_uses_mapped_provider_model() {
+        let body_json = json!({
+            "model": "deployment-alias",
+            "input": "hello",
+            "reasoning": {"effort": "max"}
+        });
+        let build = |mapped_model: &str| {
+            build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
+                body_json: &body_json,
+                mapped_model,
+                client_api_format: "openai:responses",
+                provider_api_format: "openai:responses",
+                source_model: Some("deployment-alias"),
+                family: SameFormatProviderFamily::Standard,
+                body_rules: None,
+                request_headers: None,
+                upstream_is_stream: false,
+                force_body_stream_field: false,
+                kiro_auth_config: None,
+                is_claude_code: false,
+                enable_model_directives: false,
+            })
+        };
+
+        assert!(build("gpt-5.6-sol").is_some());
+        assert!(build("gpt-5.4").is_none());
+    }
+
+    #[test]
+    fn same_format_gpt_5_6_requires_prompt_cache_options() {
+        let body_json = json!({
+            "model": "client-alias",
+            "input": "hello",
+            "prompt_cache_retention": "24h"
+        });
+        let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
+            body_json: &body_json,
+            mapped_model: "gpt-5.6-luna",
+            client_api_format: "openai:responses",
+            provider_api_format: "openai:responses",
+            source_model: Some("client-alias"),
+            family: SameFormatProviderFamily::Standard,
+            body_rules: None,
+            request_headers: None,
+            upstream_is_stream: false,
+            force_body_stream_field: false,
+            kiro_auth_config: None,
+            is_claude_code: false,
+            enable_model_directives: false,
+        });
+
+        assert!(body.is_none());
+    }
+
+    #[test]
+    fn same_format_responses_body_preserves_opaque_extension_fields() {
+        let opaque_option = json!({"mode": "custom"});
+        let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
+            body_json: &json!({
+                "model": "gpt-5.6-sol",
+                "input": "hello",
+                "multi_agent": {"enabled": true},
+                "opaque_responses_option": opaque_option
+            }),
+            mapped_model: "gpt-5.6-sol",
+            client_api_format: "openai:responses",
+            provider_api_format: "openai:responses",
+            source_model: Some("gpt-5.6-sol"),
+            family: SameFormatProviderFamily::Standard,
+            body_rules: None,
+            request_headers: None,
+            upstream_is_stream: false,
+            force_body_stream_field: false,
+            kiro_auth_config: None,
+            is_claude_code: false,
+            enable_model_directives: false,
+        });
+
+        let body = body.expect("same-format Responses request should remain transparent");
+        assert_eq!(body["multi_agent"], json!({"enabled": true}));
+        assert_eq!(body["opaque_responses_option"], opaque_option);
     }
 
     #[test]
@@ -1512,6 +1813,44 @@ mod tests {
         assert_eq!(body["model"], "upstream-model");
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["metadata"]["body_rule_seen"], true);
+    }
+
+    #[test]
+    fn search_body_projects_the_protocol_contract_and_keeps_fast_routing_only() {
+        let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
+            body_json: &json!({
+                "id": "session-1",
+                "model": "gpt-5.6-luna-high-fast",
+                "commands": {"search_query": [{"q": "Aether"}]},
+                "settings": {"allowed_callers": ["direct"]},
+                "store": false,
+                "future_extension": {"enabled": true},
+                "stream": true
+            }),
+            mapped_model: "gpt-5.6-luna",
+            client_api_format: "openai:search",
+            provider_api_format: "openai:search",
+            source_model: Some("gpt-5.6-luna-high-fast"),
+            family: SameFormatProviderFamily::Standard,
+            body_rules: None,
+            request_headers: None,
+            upstream_is_stream: false,
+            force_body_stream_field: false,
+            kiro_auth_config: None,
+            is_claude_code: false,
+            enable_model_directives: true,
+        })
+        .expect("search body should build");
+
+        assert_eq!(body["id"], "session-1");
+        assert_eq!(body["model"], "gpt-5.6-luna");
+        assert_eq!(body["commands"]["search_query"][0]["q"], "Aether");
+        assert_eq!(body["settings"]["allowed_callers"][0], "direct");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body.get("store").is_none());
+        assert!(body.get("future_extension").is_none());
+        assert!(body.get("service_tier").is_none());
+        assert!(body.get("stream").is_none());
     }
 
     #[test]

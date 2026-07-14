@@ -31,6 +31,7 @@ fn test_decision() -> GatewayControlDecision {
         auth_context: None,
         admin_principal: None,
         local_auth_rejection: None,
+        model_directive_policy: Default::default(),
     }
 }
 
@@ -1166,7 +1167,7 @@ fn local_finalize_handles_openai_responses_compact_cross_format_sync_response() 
     assert_eq!(report.report_kind, "openai_responses_compact_sync_success");
     assert_eq!(
         report.client_body_json.expect("client body should exist")["object"],
-        "response"
+        "response.compaction"
     );
 }
 
@@ -1222,7 +1223,7 @@ fn local_finalize_handles_openai_responses_compact_cross_format_function_call_re
         .background_report
         .expect("compact tool-call should downgrade to success report");
     let client_body = report.client_body_json.expect("client body should exist");
-    assert_eq!(client_body["object"], "response");
+    assert_eq!(client_body["object"], "response.compaction");
     assert_eq!(client_body["output"][1]["type"], "function_call");
 }
 
@@ -1841,6 +1842,7 @@ fn local_finalize_handles_claude_chat_cross_format_sync_response_from_openai_cha
             auth_context: None,
             admin_principal: None,
             local_auth_rejection: None,
+            model_directive_policy: Default::default(),
         },
         &payload,
     )
@@ -1908,6 +1910,7 @@ fn local_finalize_handles_gemini_cli_cross_format_sync_response_from_claude_cli(
             auth_context: None,
             admin_principal: None,
             local_auth_rejection: None,
+            model_directive_policy: Default::default(),
         },
         &payload,
     )

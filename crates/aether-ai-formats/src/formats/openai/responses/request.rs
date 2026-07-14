@@ -2,24 +2,26 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::{json, Map, Value};
 
+use super::encode_tool_result_error;
+
 use crate::{
     formats::context::FormatContext,
-    formats::openai::shared::{
-        map_thinking_budget_to_openai_reasoning_effort, OpenAiResponsesReasoningEffort,
-    },
+    formats::openai::shared::map_thinking_budget_to_openai_reasoning_effort,
     protocol::canonical::{
         canonical_response_format_to_openai_responses, canonical_tool_is_openai_custom,
         canonical_tool_use_to_openai_responses_input_item, is_claude_messages_request,
         is_claude_system_instruction, is_claude_thinking_block, is_claude_tool_result,
-        is_openai_responses_input_message, is_openai_thinking_block, media_data_or_url,
-        namespace_extension_object, openai_content_text, openai_extensions,
+        is_openai_responses_content_block, is_openai_responses_input_message,
+        is_openai_responses_raw_block, is_openai_responses_raw_content_block,
+        is_openai_thinking_block, media_data_or_url, namespace_extension_object,
+        openai_content_text, openai_extensions, openai_prompt_cache_breakpoint_from_extensions,
         openai_response_format_to_canonical, openai_responses_extension,
         openai_responses_generation_config, openai_responses_input_to_canonical_messages,
-        openai_responses_tool_choice_to_canonical, openai_responses_tools_to_canonical,
-        openai_tool_choice_raw_to_responses, strip_claude_billing_header, CanonicalContentBlock,
-        CanonicalInstruction, CanonicalRequest, CanonicalRole, CanonicalThinkingConfig,
-        CanonicalToolChoice, CanonicalToolDefinition, OPENAI_RESPONSES_EXTENSION_NAMESPACE,
-        OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
+        openai_responses_item_extension_object, openai_responses_tool_choice_to_canonical,
+        openai_responses_tools_to_canonical, openai_tool_choice_raw_to_responses,
+        strip_claude_billing_header, CanonicalContentBlock, CanonicalInstruction, CanonicalRequest,
+        CanonicalRole, CanonicalThinkingConfig, CanonicalToolChoice, CanonicalToolDefinition,
+        OPENAI_RESPONSES_EXTENSION_NAMESPACE, OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
     },
 };
 
@@ -43,6 +45,77 @@ pub fn to_compact(request: &CanonicalRequest, ctx: &FormatContext) -> Option<Val
         false,
         true,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenAiResponsesRequestContractViolation {
+    pub field: &'static str,
+    pub reason: &'static str,
+}
+
+const COMPACT_OMITTED_REQUEST_FIELDS: &[&str] = &[
+    "client_metadata",
+    "include",
+    "store",
+    "stream",
+    "stream_options",
+    "tool_choice",
+];
+
+/// Validates combinations that the Responses API rejects before transport.
+///
+/// This contract intentionally operates on the wire request so conversion
+/// boundaries can reject combinations the target API does not accept. The
+/// authoritative same-format transport remains a transparent raw pass-through.
+pub fn validate_openai_responses_request_contract(
+    body: &Value,
+    target_api_format: &str,
+) -> Result<(), OpenAiResponsesRequestContractViolation> {
+    if !crate::is_openai_responses_family_format(target_api_format) {
+        return Ok(());
+    }
+    let Some(object) = body.as_object() else {
+        return Ok(());
+    };
+    let multi_agent_enabled = object
+        .get("multi_agent")
+        .and_then(Value::as_object)
+        .and_then(|multi_agent| multi_agent.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if !multi_agent_enabled {
+        return Ok(());
+    }
+    if crate::is_openai_responses_compact_format(target_api_format) {
+        return Err(OpenAiResponsesRequestContractViolation {
+            field: "multi_agent",
+            reason: "OpenAI multi-agent requests are incompatible with Responses Compact",
+        });
+    }
+    if object
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .is_some_and(|reasoning| {
+            reasoning
+                .get("summary")
+                .is_some_and(|value| !value.is_null())
+        })
+    {
+        return Err(OpenAiResponsesRequestContractViolation {
+            field: "reasoning.summary",
+            reason: "OpenAI multi-agent requests do not support reasoning summaries",
+        });
+    }
+    if object
+        .get("max_tool_calls")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(OpenAiResponsesRequestContractViolation {
+            field: "max_tool_calls",
+            reason: "OpenAI multi-agent requests do not support max_tool_calls",
+        });
+    }
+    Ok(())
 }
 
 pub fn from_raw(body_json: &Value) -> Option<CanonicalRequest> {
@@ -205,10 +278,26 @@ pub fn to_raw(
     ));
     apply_claude_responses_request_defaults(canonical, mapped_model, &mut output);
     if compact {
-        output.remove("stream");
+        apply_compact_request_projection(&mut output);
     }
     output.remove("verbosity");
-    Some(Value::Object(output))
+    let output = Value::Object(output);
+    validate_openai_responses_request_contract(
+        &output,
+        if compact {
+            "openai:responses:compact"
+        } else {
+            "openai:responses"
+        },
+    )
+    .ok()?;
+    Some(output)
+}
+
+pub(super) fn apply_compact_request_projection(output: &mut Map<String, Value>) {
+    for field in COMPACT_OMITTED_REQUEST_FIELDS {
+        output.remove(*field);
+    }
 }
 
 fn chat_openai_extension_object_to_responses(
@@ -221,6 +310,9 @@ fn chat_openai_extension_object_to_responses(
         "service_tier",
         "safety_identifier",
         "prompt_cache_key",
+        "prompt_cache_options",
+        "prompt_cache_retention",
+        "user",
     ];
     extensions
         .get("openai")
@@ -337,7 +429,7 @@ fn canonical_messages_to_responses_input(canonical: &CanonicalRequest) -> Option
                     input: arguments,
                     extensions,
                 } => {
-                    flush_responses_message(&mut input, role, &mut content);
+                    flush_responses_message(&mut input, role, &mut content, &message.extensions);
                     saw_tool_item = true;
                     let call_id = responses_tool_call_id(id, &mut next_generated_tool_call_index);
                     let tool_name = responses_tool_name(name);
@@ -350,24 +442,35 @@ fn canonical_messages_to_responses_input(canonical: &CanonicalRequest) -> Option
                     tool_use_id,
                     output,
                     content_text,
+                    is_error,
                     extensions,
                     ..
                 } => {
-                    flush_responses_message(&mut input, role, &mut content);
+                    flush_responses_message(&mut input, role, &mut content, &message.extensions);
                     saw_tool_item = true;
                     let (tool_output, extra_user_content) = responses_tool_result_payload(
                         output.as_ref(),
                         content_text.as_deref(),
+                        *is_error,
                         extensions,
                     )?;
                     let call_id =
                         responses_tool_result_call_id(tool_use_id, &mut pending_tool_call_ids)?;
-                    input.push(json!({
-                        "type": responses_tool_result_item_type(extensions)
-                            .unwrap_or("function_call_output"),
-                        "call_id": call_id,
-                        "output": tool_output,
-                    }));
+                    let mut item = Map::new();
+                    item.insert(
+                        "type".to_string(),
+                        Value::String(
+                            responses_tool_result_item_type(extensions)
+                                .unwrap_or("function_call_output")
+                                .to_string(),
+                        ),
+                    );
+                    item.insert("call_id".to_string(), Value::String(call_id));
+                    item.insert("output".to_string(), tool_output);
+                    let extension_fields =
+                        openai_responses_item_extension_object(extensions, &item);
+                    item.extend(extension_fields);
+                    input.push(Value::Object(item));
                     if !extra_user_content.is_empty() {
                         input.push(json!({
                             "type": "message",
@@ -388,7 +491,12 @@ fn canonical_messages_to_responses_input(canonical: &CanonicalRequest) -> Option
                     if role == "assistant"
                         && is_openai_responses_reasoning_history_block(extensions)
                     {
-                        flush_responses_message(&mut input, role, &mut content);
+                        flush_responses_message(
+                            &mut input,
+                            role,
+                            &mut content,
+                            &message.extensions,
+                        );
                         if let Some(reasoning_item) = canonical_thinking_to_responses_reasoning_item(
                             text,
                             encrypted_content.as_deref(),
@@ -406,6 +514,15 @@ fn canonical_messages_to_responses_input(canonical: &CanonicalRequest) -> Option
                         }));
                     }
                 }
+                CanonicalContentBlock::Unknown {
+                    payload,
+                    extensions,
+                    ..
+                } if is_openai_responses_raw_block(extensions) => {
+                    flush_responses_message(&mut input, role, &mut content, &message.extensions);
+                    input.push(payload.clone());
+                    saw_tool_item = true;
+                }
                 other => {
                     if let Some(part) = canonical_block_to_responses_input_part(
                         other,
@@ -418,25 +535,25 @@ fn canonical_messages_to_responses_input(canonical: &CanonicalRequest) -> Option
             }
         }
         if content.is_empty() && !saw_tool_item {
-            if role == "assistant" {
-                input.push(json!({
-                    "type": "message",
-                    "role": role,
-                    "content": [{
-                        "type": "output_text",
-                        "text": "",
-                    }],
-                }));
+            let content = if role == "assistant" {
+                json!([{
+                    "type": "output_text",
+                    "text": "",
+                }])
             } else {
-                input.push(json!({
-                    "type": "message",
-                    "role": role,
-                    "content": "",
-                }));
-            }
+                Value::String(String::new())
+            };
+            let mut item = Map::new();
+            item.insert("type".to_string(), Value::String("message".to_string()));
+            item.insert("role".to_string(), Value::String(role.to_string()));
+            item.insert("content".to_string(), content);
+            let extension_fields =
+                openai_responses_item_extension_object(&message.extensions, &item);
+            item.extend(extension_fields);
+            input.push(Value::Object(item));
             continue;
         }
-        flush_responses_message(&mut input, role, &mut content);
+        flush_responses_message(&mut input, role, &mut content, &message.extensions);
     }
     Some(input)
 }
@@ -556,15 +673,22 @@ fn value_contains_json_word(value: &Value) -> bool {
     }
 }
 
-fn flush_responses_message(input: &mut Vec<Value>, role: &str, content: &mut Vec<Value>) {
+fn flush_responses_message(
+    input: &mut Vec<Value>,
+    role: &str,
+    content: &mut Vec<Value>,
+    extensions: &BTreeMap<String, Value>,
+) {
     if content.is_empty() {
         return;
     }
-    input.push(json!({
-        "type": "message",
-        "role": role,
-        "content": std::mem::take(content),
-    }));
+    let mut item = Map::new();
+    item.insert("type".to_string(), Value::String("message".to_string()));
+    item.insert("role".to_string(), Value::String(role.to_string()));
+    item.insert("content".to_string(), Value::Array(std::mem::take(content)));
+    let extension_fields = openai_responses_item_extension_object(extensions, &item);
+    item.extend(extension_fields);
+    input.push(Value::Object(item));
 }
 
 fn canonical_thinking_to_responses_reasoning_item(
@@ -610,26 +734,36 @@ fn canonical_block_to_responses_input_part(
     strip_claude_billing_header_from_text: bool,
 ) -> Option<Value> {
     match block {
-        CanonicalContentBlock::Text { text, .. } => {
+        CanonicalContentBlock::Text { text, extensions } => {
             let text = if strip_claude_billing_header_from_text {
                 strip_claude_billing_header(text)
             } else {
                 text.clone()
             };
-            if text.is_empty() {
+            if text.is_empty() && !is_openai_responses_content_block(extensions) {
                 return None;
             }
-            Some(json!({
-                "type": if role == "assistant" { "output_text" } else { "input_text" },
-                "text": text,
-            }))
+            let mut part = Map::new();
+            part.insert(
+                "type".to_string(),
+                Value::String(if role == "assistant" {
+                    "output_text".to_string()
+                } else {
+                    "input_text".to_string()
+                }),
+            );
+            part.insert("text".to_string(), Value::String(text));
+            insert_prompt_cache_breakpoint(&mut part, extensions);
+            let extension_fields = openai_responses_item_extension_object(extensions, &part);
+            part.extend(extension_fields);
+            Some(Value::Object(part))
         }
         CanonicalContentBlock::Image {
             data,
             url,
             media_type,
             detail,
-            ..
+            extensions,
         } => {
             let mut item = Map::new();
             item.insert(
@@ -647,6 +781,9 @@ fn canonical_block_to_responses_input_part(
             if let Some(detail) = detail {
                 item.insert("detail".to_string(), Value::String(detail.clone()));
             }
+            insert_prompt_cache_breakpoint(&mut item, extensions);
+            let extension_fields = openai_responses_item_extension_object(extensions, &item);
+            item.extend(extension_fields);
             Some(Value::Object(item))
         }
         CanonicalContentBlock::File {
@@ -655,7 +792,7 @@ fn canonical_block_to_responses_input_part(
             file_url,
             media_type,
             filename,
-            ..
+            extensions,
         } => {
             let mut item = Map::new();
             item.insert("type".to_string(), Value::String("input_file".to_string()));
@@ -675,15 +812,35 @@ fn canonical_block_to_responses_input_part(
             if let Some(value) = filename {
                 item.insert("filename".to_string(), Value::String(value.clone()));
             }
+            insert_prompt_cache_breakpoint(&mut item, extensions);
+            let extension_fields = openai_responses_item_extension_object(extensions, &item);
+            item.extend(extension_fields);
             (item.len() > 1).then_some(Value::Object(item))
         }
-        CanonicalContentBlock::Audio { data, format, .. } => Some(json!({
-            "type": "input_audio",
-            "input_audio": {
-                "data": data.clone().unwrap_or_default(),
-                "format": format.clone().unwrap_or_else(|| "mp3".to_string()),
-            }
-        })),
+        CanonicalContentBlock::Audio {
+            data,
+            format,
+            extensions,
+            ..
+        } => {
+            let mut item = Map::new();
+            item.insert("type".to_string(), Value::String("input_audio".to_string()));
+            item.insert(
+                "input_audio".to_string(),
+                json!({
+                    "data": data.clone().unwrap_or_default(),
+                    "format": format.clone().unwrap_or_else(|| "mp3".to_string()),
+                }),
+            );
+            let extension_fields = openai_responses_item_extension_object(extensions, &item);
+            item.extend(extension_fields);
+            Some(Value::Object(item))
+        }
+        CanonicalContentBlock::Unknown {
+            payload,
+            extensions,
+            ..
+        } if is_openai_responses_raw_content_block(extensions) => Some(payload.clone()),
         CanonicalContentBlock::Unknown {
             raw_type, payload, ..
         } if raw_type == "refusal" => payload
@@ -695,6 +852,15 @@ fn canonical_block_to_responses_input_part(
         | CanonicalContentBlock::ToolUse { .. }
         | CanonicalContentBlock::ToolResult { .. }
         | CanonicalContentBlock::Unknown { .. } => None,
+    }
+}
+
+fn insert_prompt_cache_breakpoint(
+    part: &mut Map<String, Value>,
+    extensions: &BTreeMap<String, Value>,
+) {
+    if let Some(value) = openai_prompt_cache_breakpoint_from_extensions(extensions) {
+        part.insert("prompt_cache_breakpoint".to_string(), value);
     }
 }
 
@@ -788,13 +954,8 @@ fn reasoning_config_to_responses(thinking: &CanonicalThinkingConfig) -> Option<V
         })
 }
 
-fn openai_responses_reasoning_effort(effort: &str) -> Option<&'static str> {
-    match effort.trim().to_ascii_lowercase().as_str() {
-        "max" => Some("xhigh"),
-        value => {
-            OpenAiResponsesReasoningEffort::parse(value).map(OpenAiResponsesReasoningEffort::as_str)
-        }
-    }
+fn openai_responses_reasoning_effort(effort: &str) -> Option<&str> {
+    (!effort.trim().is_empty()).then_some(effort)
 }
 
 fn canonical_text_config_to_responses(canonical: &CanonicalRequest) -> Option<Value> {
@@ -833,6 +994,11 @@ fn canonical_tool_to_responses(tool: &CanonicalToolDefinition) -> Value {
         .or_else(|| {
             tool.extensions
                 .get(OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE)
+        })
+        .filter(|raw| {
+            raw.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|tool_type| !tool_type.eq_ignore_ascii_case("function"))
         })
     {
         return raw.clone();
@@ -967,18 +1133,19 @@ fn canonical_tool_choice_to_responses(
 fn responses_tool_result_payload(
     output: Option<&Value>,
     content_text: Option<&str>,
+    is_error: bool,
     extensions: &BTreeMap<String, Value>,
 ) -> Option<(Value, Vec<Value>)> {
     if let Some(Value::Array(parts)) = output {
         if is_claude_tool_result(extensions) {
-            return claude_tool_result_parts_to_responses_payload(parts);
+            return claude_tool_result_parts_to_responses_payload(parts, is_error);
         }
         if let Some(output) = openai_chat_tool_result_parts_to_responses_output(parts) {
-            return Some((output, Vec::new()));
+            return Some((encode_tool_result_error(output, is_error), Vec::new()));
         }
     }
     Some((
-        responses_tool_result_output(output, content_text),
+        responses_tool_result_output(output, content_text, is_error),
         Vec::new(),
     ))
 }
@@ -1094,14 +1261,22 @@ fn openai_chat_tool_result_fallback_part(part: &Value) -> Value {
     })
 }
 
-fn responses_tool_result_output(output: Option<&Value>, content_text: Option<&str>) -> Value {
+fn responses_tool_result_output(
+    output: Option<&Value>,
+    content_text: Option<&str>,
+    is_error: bool,
+) -> Value {
     let text = match output {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Null) => String::new(),
         Some(value) => serde_json::to_string(value).unwrap_or_default(),
         None => content_text.unwrap_or_default().to_string(),
     };
-    Value::String(non_empty_responses_tool_output(&text))
+    let output = encode_tool_result_error(Value::String(text), is_error);
+    match output {
+        Value::String(text) => Value::String(non_empty_responses_tool_output(&text)),
+        output => output,
+    }
 }
 
 pub(crate) fn claude_tool_result_parts_are_openai_responses_representable(parts: &[Value]) -> bool {
@@ -1156,7 +1331,10 @@ fn claude_document_block_is_openai_responses_representable(block: &Map<String, V
     }
 }
 
-fn claude_tool_result_parts_to_responses_payload(parts: &[Value]) -> Option<(Value, Vec<Value>)> {
+fn claude_tool_result_parts_to_responses_payload(
+    parts: &[Value],
+    is_error: bool,
+) -> Option<(Value, Vec<Value>)> {
     let mut output_texts = Vec::new();
     let mut extra_user_content = Vec::new();
 
@@ -1199,10 +1377,12 @@ fn claude_tool_result_parts_to_responses_payload(parts: &[Value]) -> Option<(Val
         }
     }
 
-    Some((
-        Value::String(non_empty_responses_tool_output(&output_texts.join("\n\n"))),
-        extra_user_content,
-    ))
+    let output = encode_tool_result_error(Value::String(output_texts.join("\n\n")), is_error);
+    let output = match output {
+        Value::String(text) => Value::String(non_empty_responses_tool_output(&text)),
+        output => output,
+    };
+    Some((output, extra_user_content))
 }
 
 fn claude_image_block_to_responses_input_part(block: &Map<String, Value>) -> Option<Value> {
@@ -1304,7 +1484,7 @@ fn insert_number(output: &mut Map<String, Value>, key: &str, value: Option<f64>)
 
 #[cfg(test)]
 mod tests {
-    use super::to_raw;
+    use super::{from_raw, to_raw, COMPACT_OMITTED_REQUEST_FIELDS};
     use crate::protocol::canonical::{
         CanonicalContentBlock, CanonicalMessage, CanonicalRequest, CanonicalResponseFormat,
         CanonicalRole,
@@ -1390,6 +1570,85 @@ mod tests {
     }
 
     #[test]
+    fn compact_request_uses_the_codex_request_projection() {
+        let source = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }],
+            "client_metadata": {"origin": "codex"},
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "stream": true,
+            "stream_options": {"reasoning_summary_delivery": "sequential_cutoff"},
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "max", "context": "all_turns"},
+            "text": {"verbosity": "medium"},
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "service_tier": "priority",
+            "prompt_cache_key": "session:compact"
+        });
+        let request = from_raw(&source).expect("canonical Responses request");
+
+        let regular = to_raw(&request, "gpt-5.6-sol", true, false).expect("Responses request body");
+        let compact = to_raw(&request, "gpt-5.6-sol", false, true).expect("Compact request body");
+
+        for field in COMPACT_OMITTED_REQUEST_FIELDS {
+            assert!(
+                regular.get(*field).is_some(),
+                "regular request should contain {field}"
+            );
+            assert!(
+                compact.get(*field).is_none(),
+                "Compact request should omit {field}"
+            );
+        }
+        for field in [
+            "model",
+            "parallel_tool_calls",
+            "reasoning",
+            "text",
+            "tools",
+            "service_tier",
+            "prompt_cache_key",
+        ] {
+            assert_eq!(
+                compact[field], regular[field],
+                "Compact should preserve {field}"
+            );
+        }
+        assert_eq!(compact["input"], regular["input"]);
+    }
+
+    #[test]
+    fn responses_request_preserves_compaction_trigger_input_item() {
+        let source = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "compact"}]
+                },
+                {"type": "compaction_trigger"}
+            ],
+            "stream": true
+        });
+        let request = from_raw(&source).expect("canonical Responses request");
+        let body = to_raw(&request, "gpt-5.6-sol", true, false).expect("Responses request body");
+
+        assert_eq!(body["input"].as_array().map(Vec::len), Some(2));
+        assert_eq!(body["input"][1], json!({"type": "compaction_trigger"}));
+    }
+
+    #[test]
     fn responses_request_uses_empty_marker_for_empty_tool_output() {
         let request = CanonicalRequest {
             model: "gpt-5.5".to_string(),
@@ -1414,6 +1673,37 @@ mod tests {
         assert_eq!(body["input"][0]["type"], "function_call_output");
         assert_eq!(body["input"][0]["call_id"], "call_empty");
         assert_eq!(body["input"][0]["output"], "(empty)");
+    }
+
+    #[test]
+    fn responses_request_encodes_tool_errors_for_regular_and_compact_requests() {
+        let request = CanonicalRequest {
+            model: "gpt-5.6-sol".to_string(),
+            messages: vec![CanonicalMessage {
+                role: CanonicalRole::Tool,
+                content: vec![CanonicalContentBlock::ToolResult {
+                    tool_use_id: "call_error".to_string(),
+                    name: None,
+                    output: Some(json!("command failed")),
+                    content_text: None,
+                    is_error: true,
+                    extensions: Default::default(),
+                }],
+                extensions: Default::default(),
+            }],
+            ..CanonicalRequest::default()
+        };
+
+        for compact in [false, true] {
+            let body =
+                to_raw(&request, "gpt-5.6-sol", false, compact).expect("Responses request body");
+            let item = &body["input"][0];
+
+            assert_eq!(item["type"], "function_call_output");
+            assert_eq!(item["call_id"], "call_error");
+            assert_eq!(item["output"], "[tool error]\ncommand failed");
+            assert!(item.get("is_error").is_none());
+        }
     }
 
     #[test]

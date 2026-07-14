@@ -704,6 +704,11 @@ impl ClaudeClientEmitter {
                 };
                 self.emit_content_part(part)
             }
+            CanonicalStreamEvent::OpenAiResponsesOutputItem { .. } => Err(
+                AiSurfaceFinalizeError::new(
+                    "OpenAI Responses output items cannot be converted losslessly to Claude Messages",
+                ),
+            ),
             CanonicalStreamEvent::ToolCallStart {
                 index,
                 call_id,

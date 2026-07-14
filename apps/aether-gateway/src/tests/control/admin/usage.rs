@@ -641,7 +641,7 @@ async fn gateway_handles_admin_usage_aggregation_stats_locally_with_trusted_admi
     assert_eq!(items[0]["model"], "gpt-5");
     assert_eq!(items[0]["request_count"], 2);
     assert_eq!(items[0]["output_tokens"], 40);
-    assert_eq!(items[0]["effective_input_tokens"], 150);
+    assert_eq!(items[0]["effective_input_tokens"], 120);
     assert_eq!(items[0]["total_input_context"], 160);
     assert_eq!(items[0]["cache_creation_tokens"], 30);
     assert_eq!(items[0]["cache_creation_ephemeral_5m_tokens"], 12);
@@ -750,6 +750,440 @@ async fn gateway_handles_admin_usage_aggregation_stats_for_legacy_provider_name_
     assert_eq!(items[0]["provider_identity_source"], "legacy_name");
 
     gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_handles_admin_usage_attribution_locally_with_metric_shares() {
+    let (upstream_url, upstream_hits, upstream_handle) =
+        start_usage_upstream("/api/admin/usage/attribution").await;
+
+    let mut usage_1 = sample_usage_row(
+        "usage-1",
+        "req-1",
+        Some("user-1"),
+        Some("key-1"),
+        Some("primary"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        120,
+        30,
+        0.3,
+        0.6,
+        DAY_1_UNIX_SECS,
+    );
+    usage_1.provider_id = Some("provider-openai".to_string());
+    usage_1.total_tokens = usage_1.input_tokens;
+
+    let mut usage_2 = sample_usage_row(
+        "usage-2",
+        "req-2",
+        Some("user-2"),
+        Some("key-2"),
+        Some("secondary"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        40,
+        10,
+        0.1,
+        0.3,
+        DAY_1_UNIX_SECS,
+    );
+    usage_2.provider_id = Some("provider-openai".to_string());
+    usage_2.total_tokens = usage_2.input_tokens;
+
+    let mut usage_3 = sample_usage_row(
+        "usage-3",
+        "req-3",
+        Some("user-3"),
+        Some("key-3"),
+        Some("tertiary"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        80,
+        20,
+        0.2,
+        0.1,
+        DAY_1_UNIX_SECS,
+    );
+    usage_3.provider_id = Some("provider-openai".to_string());
+    usage_3.total_tokens = usage_3.input_tokens;
+
+    let mut usage_4 = sample_usage_row(
+        "usage-4",
+        "req-4",
+        Some("user-3"),
+        Some("key-3"),
+        Some("tertiary"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        60,
+        20,
+        0.1,
+        0.0,
+        DAY_1_UNIX_SECS,
+    );
+    usage_4.provider_id = Some("provider-openai".to_string());
+    usage_4.total_tokens = usage_4.input_tokens;
+
+    let mut other_provider_usage = sample_usage_row(
+        "usage-other",
+        "req-other",
+        Some("user-4"),
+        Some("key-4"),
+        Some("other"),
+        "Anthropic",
+        "claude-3-7",
+        "completed",
+        200,
+        50,
+        1.0,
+        1.0,
+        DAY_1_UNIX_SECS,
+    );
+    other_provider_usage.provider_id = Some("provider-anthropic".to_string());
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![
+        usage_1,
+        usage_2,
+        usage_3,
+        usage_4,
+        other_provider_usage,
+    ]));
+    let user_repository = Arc::new(InMemoryUserReadRepository::seed(vec![
+        sample_user_summary("user-1", "alice"),
+        sample_user_summary("user-2", "bob"),
+        sample_user_summary("user-3", "carol"),
+        sample_user_summary("user-4", "dave"),
+    ]));
+
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_usage_reader_for_tests(usage_repository)
+                    .with_user_reader(user_repository),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/attribution?provider_id=provider-openai&metric=actual_cost&limit=2&start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0"
+    )))
+    .send()
+    .await
+    .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["provider"]["id"], "provider-openai");
+    assert_eq!(payload["group_by"], "user");
+    assert_eq!(payload["metric"], "actual_cost");
+    assert_eq!(payload["total"], 1.0);
+    let items = payload["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], "user-1");
+    assert_eq!(items[0]["name"], "alice");
+    assert_eq!(items[0]["actual_cost"], 0.6);
+    assert_eq!(items[0]["share"], 0.6);
+    assert_eq!(items[1]["id"], "user-2");
+    assert_eq!(items[1]["share"], 0.3);
+    assert_eq!(payload["others"]["requests"], 2);
+    assert_eq!(payload["others"]["actual_cost"], 0.1);
+    assert_eq!(payload["others"]["share"], 0.1);
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_usage_attribution_provider_name_matches_legacy_rows_only() {
+    let mut legacy_usage = sample_usage_row(
+        "usage-legacy",
+        "req-legacy",
+        Some("legacy-user"),
+        Some("key-legacy"),
+        Some("legacy"),
+        "OpenAI",
+        "gpt-4o",
+        "completed",
+        10,
+        5,
+        0.4,
+        0.7,
+        DAY_1_UNIX_SECS,
+    );
+    legacy_usage.provider_id = None;
+
+    let mut modern_same_name_usage = sample_usage_row(
+        "usage-modern",
+        "req-modern",
+        Some("modern-user"),
+        Some("key-modern"),
+        Some("modern"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        100,
+        50,
+        5.0,
+        9.0,
+        DAY_1_UNIX_SECS,
+    );
+    modern_same_name_usage.provider_id = Some("provider-openai".to_string());
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![
+        legacy_usage,
+        modern_same_name_usage,
+    ]));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(
+                usage_repository,
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/attribution?provider_name=OpenAI&metric=actual_cost&limit=10&start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0"
+    )))
+    .send()
+    .await
+    .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["provider"]["name"], "OpenAI");
+    assert_eq!(payload["total"], 0.7);
+    let items = payload["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "legacy-user");
+    assert_eq!(items[0]["actual_cost"], 0.7);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_usage_attribution_sorts_metric_before_visible_limit() {
+    let mut usage_rows = Vec::new();
+    for index in 0..10_001 {
+        let mut row = sample_usage_row(
+            &format!("usage-low-{index}"),
+            &format!("req-low-{index}"),
+            Some(&format!("user-low-{index:05}")),
+            Some(&format!("key-low-{index}")),
+            Some("low"),
+            "OpenAI",
+            "gpt-5",
+            "completed",
+            1,
+            0,
+            0.001,
+            0.001,
+            DAY_1_UNIX_SECS,
+        );
+        row.provider_id = Some("provider-openai".to_string());
+        usage_rows.push(row);
+    }
+
+    let mut high_cost_row = sample_usage_row(
+        "usage-high",
+        "req-high",
+        Some("user-zz-high-cost"),
+        Some("key-high"),
+        Some("high"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        1,
+        0,
+        9.0,
+        9.0,
+        DAY_1_UNIX_SECS,
+    );
+    high_cost_row.provider_id = Some("provider-openai".to_string());
+    usage_rows.push(high_cost_row);
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(usage_rows));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(
+                usage_repository,
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/attribution?provider_id=provider-openai&metric=actual_cost&limit=1&start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0"
+    )))
+    .send()
+    .await
+    .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    let items = payload["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "user-zz-high-cost");
+    assert_eq!(items[0]["actual_cost"], 9.0);
+    assert_eq!(payload["others"]["requests"], 10_001);
+    assert_eq!(payload["total"], 19.001);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_handles_admin_usage_attribution_for_legacy_provider_name_only() {
+    let (upstream_url, upstream_hits, upstream_handle) =
+        start_usage_upstream("/api/admin/usage/attribution").await;
+
+    let mut legacy_usage = sample_usage_row(
+        "legacy-usage",
+        "legacy-req",
+        Some("legacy-user"),
+        Some("legacy-key"),
+        Some("legacy"),
+        "OpenAI",
+        "legacy-model",
+        "completed",
+        10,
+        5,
+        0.4,
+        0.7,
+        DAY_1_UNIX_SECS,
+    );
+    legacy_usage.provider_id = None;
+
+    let mut modern_same_name_usage = sample_usage_row(
+        "modern-usage",
+        "modern-req",
+        Some("modern-user"),
+        Some("modern-key"),
+        Some("modern"),
+        "OpenAI",
+        "modern-model",
+        "completed",
+        10,
+        5,
+        4.0,
+        9.0,
+        DAY_1_UNIX_SECS,
+    );
+    modern_same_name_usage.provider_id = Some("provider-openai".to_string());
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![
+        legacy_usage,
+        modern_same_name_usage,
+    ]));
+
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(
+                usage_repository,
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/attribution?provider_name=OpenAI&metric=actual_cost&limit=10&start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0"
+    )))
+    .send()
+    .await
+    .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["provider"]["name"], "OpenAI");
+    assert_eq!(payload["total"], 0.7);
+    let items = payload["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "legacy-user");
+    assert_eq!(items[0]["actual_cost"], 0.7);
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_handles_admin_usage_attribution_without_internal_group_truncation() {
+    let (upstream_url, upstream_hits, upstream_handle) =
+        start_usage_upstream("/api/admin/usage/attribution").await;
+
+    let mut rows = Vec::with_capacity(10_002);
+    for index in 0..10_001 {
+        let mut usage = sample_usage_row(
+            &format!("usage-low-{index}"),
+            &format!("req-low-{index}"),
+            Some(&format!("user-{index:05}")),
+            Some("key-low"),
+            Some("low"),
+            "OpenAI",
+            "gpt-5",
+            "completed",
+            1,
+            1,
+            0.001,
+            0.001,
+            DAY_1_UNIX_SECS,
+        );
+        usage.provider_id = Some("provider-openai".to_string());
+        rows.push(usage);
+    }
+    let mut high_cost_usage = sample_usage_row(
+        "usage-high",
+        "req-high",
+        Some("user-zz-high-cost"),
+        Some("key-high"),
+        Some("high"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        1,
+        1,
+        9.0,
+        9.0,
+        DAY_1_UNIX_SECS,
+    );
+    high_cost_usage.provider_id = Some("provider-openai".to_string());
+    rows.push(high_cost_usage);
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(rows));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(
+                usage_repository,
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/attribution?provider_id=provider-openai&metric=actual_cost&limit=1&start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0"
+    )))
+    .send()
+    .await
+    .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    let items = payload["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "user-zz-high-cost");
+    assert_eq!(items[0]["actual_cost"], 9.0);
+    assert_eq!(payload["total"], 19.001);
+    assert_eq!(payload["others"]["requests"], 10_001);
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
 }
 
 #[tokio::test]
@@ -1026,7 +1460,7 @@ async fn gateway_handles_admin_usage_active_locally_with_trusted_admin_principal
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["requests"].as_array().expect("array").len(), 1);
     assert_eq!(payload["requests"][0]["id"], "usage-pending");
-    assert_eq!(payload["requests"][0]["effective_input_tokens"], 5);
+    assert_eq!(payload["requests"][0]["effective_input_tokens"], 0);
     assert_eq!(payload["requests"][0]["provider"], "OpenAI");
     assert_eq!(payload["requests"][0]["api_key_name"], "fresh-primary");
     assert_eq!(payload["requests"][0]["has_fallback"], true);
@@ -1326,7 +1760,7 @@ async fn gateway_handles_admin_usage_records_locally_with_trusted_admin_principa
         payload["records"][0]["provider_key_name"],
         "upstream-primary"
     );
-    assert_eq!(payload["records"][0]["effective_input_tokens"], 35);
+    assert_eq!(payload["records"][0]["effective_input_tokens"], 20);
     assert_eq!(payload["records"][0]["first_byte_time_ms"], 120);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
@@ -2053,8 +2487,8 @@ async fn gateway_handles_admin_usage_detail_locally_with_trusted_admin_principal
     assert_eq!(payload["api_key"]["name"], "primary");
     assert_eq!(payload["provider"], "OpenAI");
     assert_eq!(payload["model"], "gpt-5");
-    assert_eq!(payload["effective_input_tokens"], 115);
-    assert_eq!(payload["total_tokens"], 165);
+    assert_eq!(payload["effective_input_tokens"], 100);
+    assert_eq!(payload["total_tokens"], 150);
     assert_eq!(payload["cache_creation_cost"], 0.0);
     assert_eq!(payload["cache_read_cost"], 0.0);
     assert_eq!(

@@ -1,8 +1,8 @@
 use super::{
-    hash_api_key, unrestricted_models_snapshot, InMemoryAuthApiKeySnapshotRepository,
-    InMemoryMinimalCandidateSelectionReadRepository, InMemoryVideoTaskRepository, UpsertVideoTask,
-    VideoTaskLookupKey, VideoTaskReadRepository, VideoTaskStatus, VideoTaskWriteRepository,
-    DEVELOPMENT_ENCRYPTION_KEY,
+    hash_api_key, sample_models_candidate_row, unrestricted_models_snapshot,
+    InMemoryAuthApiKeySnapshotRepository, InMemoryMinimalCandidateSelectionReadRepository,
+    InMemoryVideoTaskRepository, StoredAuthApiKeySnapshot, UpsertVideoTask, VideoTaskLookupKey,
+    VideoTaskReadRepository, VideoTaskStatus, VideoTaskWriteRepository, DEVELOPMENT_ENCRYPTION_KEY,
 };
 use crate::image_capabilities::openai_image_gateway_max_generation_count;
 use crate::tests::{
@@ -10,9 +10,7 @@ use crate::tests::{
     to_bytes, AppState, Arc, Body, Json, Mutex, Request, Router, StatusCode, EXECUTION_PATH_HEADER,
     EXECUTION_PATH_LOCAL_AI_PUBLIC, EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS,
 };
-use aether_data::repository::auth::StoredAuthApiKeySnapshot;
 use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
-use aether_data::repository::model_catalog::InMemoryModelCatalogReadRepository;
 use aether_data::DataLayerError;
 use aether_data_contracts::repository::candidate_selection::{
     MinimalCandidateSelectionReadRepository, StoredMinimalCandidateSelectionRow,
@@ -22,93 +20,13 @@ use aether_data_contracts::repository::candidate_selection::{
 use aether_data_contracts::repository::global_models::{
     StoredAdminGlobalModel, UpdateAdminGlobalModelRecord,
 };
-use aether_data_contracts::repository::model_catalog::{
-    ModelCatalogReadRepository, StoredModelCatalogEntry,
-};
 use async_trait::async_trait;
 use axum::response::IntoResponse;
+use std::collections::HashMap;
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-fn sample_model_catalog_entry(
-    provider_id: &str,
-    provider_name: &str,
-    api_format: &str,
-    global_model_name: &str,
-) -> StoredModelCatalogEntry {
-    StoredModelCatalogEntry {
-        global_model_id: format!("global-{global_model_name}"),
-        global_model_name: global_model_name.to_string(),
-        global_model_config: None,
-        global_model_supported_capabilities: None,
-        global_model_is_active: true,
-        provider_model_id: format!("model-{provider_id}-{global_model_name}"),
-        provider_model_name: global_model_name.to_string(),
-        provider_model_mappings: Some(json!([{"api_formats": [api_format]}])),
-        provider_model_config: None,
-        provider_model_is_active: true,
-        provider_model_is_available: true,
-        provider_id: provider_id.to_string(),
-        provider_name: provider_name.to_string(),
-        provider_type: "custom".to_string(),
-        provider_is_active: true,
-    }
-}
-
-fn empty_candidate_repository() -> Arc<InMemoryMinimalCandidateSelectionReadRepository> {
-    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(
-        Vec::new(),
-    ))
-}
-
-struct ToggleModelCatalogReadRepository {
-    row: StoredModelCatalogEntry,
-    active: AtomicBool,
-}
-
-impl ToggleModelCatalogReadRepository {
-    fn new(row: StoredModelCatalogEntry) -> Self {
-        Self {
-            row,
-            active: AtomicBool::new(true),
-        }
-    }
-
-    fn set_active(&self, active: bool) {
-        self.active.store(active, Ordering::SeqCst);
-    }
-
-    fn rows(&self) -> Vec<StoredModelCatalogEntry> {
-        let mut row = self.row.clone();
-        row.global_model_is_active = self.active.load(Ordering::SeqCst);
-        vec![row]
-    }
-}
-
-#[async_trait]
-impl ModelCatalogReadRepository for ToggleModelCatalogReadRepository {
-    async fn list_model_catalog(&self) -> Result<Vec<StoredModelCatalogEntry>, DataLayerError> {
-        Ok(self.rows())
-    }
-
-    async fn read_model_catalog_detail(
-        &self,
-        global_model_name: &str,
-    ) -> Result<Vec<StoredModelCatalogEntry>, DataLayerError> {
-        Ok(self
-            .rows()
-            .into_iter()
-            .filter(|row| row.global_model_name == global_model_name)
-            .collect())
-    }
-}
-
-fn restricted_models_snapshot(
-    api_key_id: &str,
-    user_id: &str,
-    allowed_providers: &[&str],
-    allowed_models: &[&str],
-) -> StoredAuthApiKeySnapshot {
+fn codex_models_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
     StoredAuthApiKeySnapshot::new(
         user_id.to_string(),
         "alice".to_string(),
@@ -117,22 +35,83 @@ fn restricted_models_snapshot(
         "local".to_string(),
         true,
         false,
-        Some(json!(allowed_providers)),
-        None,
-        Some(json!(allowed_models)),
+        Some(json!(["codex"])),
+        Some(json!(["openai:responses"])),
+        Some(json!(["frontier-sol", "broken-luna"])),
         api_key_id.to_string(),
-        Some("default".to_string()),
+        Some("codex-models".to_string()),
         true,
         false,
         false,
         Some(10),
         Some(5),
         Some(4_102_444_800),
-        None,
-        None,
-        None,
+        Some(json!(["codex"])),
+        Some(json!(["openai:responses"])),
+        Some(json!(["frontier-sol", "broken-luna"])),
     )
-    .expect("restricted models snapshot should build")
+    .expect("Codex models auth snapshot should build")
+}
+
+fn sample_codex_models_candidate_row(
+    provider_id: &str,
+    global_model_name: &str,
+    source_model_name: &str,
+) -> StoredMinimalCandidateSelectionRow {
+    let mut row = sample_models_candidate_row(
+        provider_id,
+        "codex",
+        "openai:responses",
+        global_model_name,
+        10,
+    );
+    row.provider_type = "codex".to_string();
+    row.key_auth_type = "oauth".to_string();
+    row.model_provider_model_name = source_model_name.to_string();
+    row.model_provider_model_mappings = Some(vec![
+        aether_data_contracts::repository::candidate_selection::StoredProviderModelMapping {
+            name: source_model_name.to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:responses".to_string()]),
+            endpoint_ids: None,
+        },
+    ]);
+    row
+}
+
+fn complete_codex_model_card(source_model_name: &str) -> serde_json::Value {
+    json!({
+        "id": source_model_name,
+        "api_formats": ["openai:responses"],
+        "slug": source_model_name,
+        "display_name": "GPT-5.6-Sol",
+        "description": "Frontier coding model",
+        "default_reasoning_level": "low",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Low"},
+            {"effort": "medium", "description": "Medium"},
+            {"effort": "high", "description": "High"},
+            {"effort": "xhigh", "description": "XHigh"},
+            {"effort": "max", "description": "Max"},
+            {"effort": "ultra", "description": "Ultra"}
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 1,
+        "availability_nux": null,
+        "upgrade": null,
+        "base_instructions": "Use the current Codex instructions.",
+        "model_messages": null,
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "apply_patch_tool_type": "freeform",
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "supports_parallel_tool_calls": true,
+        "experimental_supported_tools": [],
+        "minimal_client_version": "0.144.0",
+        "future_capability": {"enabled": true}
+    })
 }
 
 fn gemini_operation_status_label(status: VideoTaskStatus) -> &'static str {
@@ -298,6 +277,120 @@ impl MinimalCandidateSelectionReadRepository for PendingMinimalCandidateSelectio
     }
 }
 
+struct CachedToggleMinimalCandidateSelectionReadRepository {
+    row: StoredMinimalCandidateSelectionRow,
+    active: AtomicBool,
+    cached_rows_by_api_format: Mutex<HashMap<String, Vec<StoredMinimalCandidateSelectionRow>>>,
+}
+
+impl CachedToggleMinimalCandidateSelectionReadRepository {
+    fn new(row: StoredMinimalCandidateSelectionRow) -> Self {
+        Self {
+            row,
+            active: AtomicBool::new(true),
+            cached_rows_by_api_format: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
+    }
+
+    fn rows_for_api_format(&self, api_format: &str) -> Vec<StoredMinimalCandidateSelectionRow> {
+        let api_format = api_format.trim().to_string();
+        let mut cached = self
+            .cached_rows_by_api_format
+            .lock()
+            .expect("candidate row cache lock");
+        if let Some(rows) = cached.get(&api_format) {
+            return rows.clone();
+        }
+
+        let rows = if self.active.load(Ordering::SeqCst)
+            && self
+                .row
+                .endpoint_api_format
+                .eq_ignore_ascii_case(&api_format)
+        {
+            vec![self.row.clone()]
+        } else {
+            Vec::new()
+        };
+        cached.insert(api_format, rows.clone());
+        rows
+    }
+}
+
+#[async_trait]
+impl MinimalCandidateSelectionReadRepository
+    for CachedToggleMinimalCandidateSelectionReadRepository
+{
+    fn clear_local_cache(&self) {
+        self.cached_rows_by_api_format
+            .lock()
+            .expect("candidate row cache lock")
+            .clear();
+    }
+
+    async fn list_for_exact_api_format(
+        &self,
+        api_format: &str,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+        Ok(self.rows_for_api_format(api_format))
+    }
+
+    async fn list_for_exact_api_format_and_global_model(
+        &self,
+        api_format: &str,
+        global_model_name: &str,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+        Ok(self
+            .rows_for_api_format(api_format)
+            .into_iter()
+            .filter(|row| row.global_model_name == global_model_name)
+            .collect())
+    }
+
+    async fn list_for_exact_api_format_and_requested_model(
+        &self,
+        api_format: &str,
+        requested_model_name: &str,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+        Ok(self
+            .rows_for_api_format(api_format)
+            .into_iter()
+            .filter(|row| row.global_model_name == requested_model_name)
+            .collect())
+    }
+
+    async fn list_for_exact_api_format_and_requested_model_page(
+        &self,
+        query: &StoredRequestedModelCandidateRowsQuery,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+        Ok(self
+            .rows_for_api_format(&query.api_format)
+            .into_iter()
+            .filter(|row| row.global_model_name == query.requested_model_name)
+            .skip(query.offset as usize)
+            .take(query.limit as usize)
+            .collect())
+    }
+
+    async fn list_pool_key_rows_for_group(
+        &self,
+        _query: &StoredPoolKeyCandidateRowsQuery,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_pool_key_rows_for_group_key_ids(
+        &self,
+        _query: &StoredPoolKeyCandidateRowsByKeyIdsQuery,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+        Ok(Vec::new())
+    }
+}
+
 #[tokio::test]
 async fn gateway_handles_public_openai_models_without_hitting_fallback_probe() {
     let fallback_probe_hits = Arc::new(Mutex::new(0usize));
@@ -317,10 +410,11 @@ async fn gateway_handles_public_openai_models_without_hitting_fallback_probe() {
         Some(hash_api_key("sk-openai-models")),
         unrestricted_models_snapshot("key-1", "user-1"),
     )]));
-    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
-        sample_model_catalog_entry("provider-openai", "openai", "openai:chat", "gpt-5"),
-        sample_model_catalog_entry("provider-openai", "openai", "openai:chat", "gpt-4.1"),
-    ]));
+    let candidate_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_models_candidate_row("provider-openai", "openai", "openai:chat", "gpt-5", 10),
+            sample_models_candidate_row("provider-openai", "openai", "openai:chat", "gpt-4.1", 10),
+        ]));
 
     let (_unused_fallback_probe_url, fallback_probe_handle) = start_server(fallback_probe).await;
     let gateway = build_router_with_state(
@@ -328,10 +422,9 @@ async fn gateway_handles_public_openai_models_without_hitting_fallback_probe() {
             .expect("gateway should build")
             .with_data_state_for_tests(
                 crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                    empty_candidate_repository(),
+                    candidate_repository,
                     auth_repository,
-                )
-                .with_model_catalog_reader(model_catalog_repository),
+                ),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -356,65 +449,116 @@ async fn gateway_handles_public_openai_models_without_hitting_fallback_probe() {
 }
 
 #[tokio::test]
-async fn gateway_models_catalog_applies_provider_and_model_permissions() {
-    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
-        Some(hash_api_key("sk-models-restricted")),
-        restricted_models_snapshot(
-            "key-models-restricted",
-            "user-models-restricted",
-            &["provider-openai-allowed"],
-            &["gpt-5"],
+async fn gateway_serves_codex_model_cards_for_versioned_models_requests() {
+    let codex_row =
+        sample_codex_models_candidate_row("provider-codex-models", "frontier-sol", "gpt-5.6-sol");
+    let incomplete_codex_row = sample_codex_models_candidate_row(
+        "provider-codex-incomplete",
+        "broken-luna",
+        "gpt-5.6-luna",
+    );
+    let candidate_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            codex_row.clone(),
+            incomplete_codex_row.clone(),
+            sample_models_candidate_row(
+                "provider-openai-responses",
+                "openai",
+                "openai:responses",
+                "custom-responses-model",
+                20,
+            ),
+        ]));
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![
+        (
+            Some(hash_api_key("sk-codex-models")),
+            codex_models_snapshot("key-codex-models", "user-codex-models"),
         ),
-    )]));
-    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
-        sample_model_catalog_entry(
-            "provider-openai-allowed",
-            "openai-allowed",
-            "openai:chat",
-            "gpt-5",
-        ),
-        sample_model_catalog_entry(
-            "provider-openai-allowed",
-            "openai-allowed",
-            "openai:chat",
-            "gpt-4.1",
-        ),
-        sample_model_catalog_entry(
-            "provider-openai-denied",
-            "openai-denied",
-            "openai:chat",
-            "gpt-5",
+        (
+            Some(hash_api_key("sk-standard-models")),
+            unrestricted_models_snapshot("key-standard-models", "user-standard-models"),
         ),
     ]));
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(
-                crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                    empty_candidate_repository(),
-                    auth_repository,
-                )
-                .with_model_catalog_reader(model_catalog_repository),
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
+                candidate_repository,
+                auth_repository,
             ),
-    );
-    let (gateway_url, gateway_handle) = start_server(gateway).await;
+        );
+    state
+        .runtime_kv_setex(
+            &format!(
+                "upstream_models:{}:{}",
+                codex_row.provider_id, codex_row.key_id
+            ),
+            &serde_json::to_string(&vec![complete_codex_model_card("gpt-5.6-sol")])
+                .expect("model cache should serialize"),
+            60,
+        )
+        .await
+        .expect("model cache should seed");
+    state
+        .runtime_kv_setex(
+            &format!(
+                "upstream_models:{}:{}",
+                incomplete_codex_row.provider_id, incomplete_codex_row.key_id
+            ),
+            &serde_json::to_string(&vec![json!({
+                "id": "gpt-5.6-luna",
+                "slug": "gpt-5.6-luna",
+                "display_name": "GPT-5.6-Luna"
+            })])
+            .expect("incomplete model cache should serialize"),
+            60,
+        )
+        .await
+        .expect("incomplete model cache should seed");
 
-    let response = reqwest::Client::new()
-        .get(format!("{gateway_url}/v1/models"))
-        .header("authorization", "Bearer sk-models-restricted")
+    let gateway = build_router_with_state(state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+
+    let codex_response = client
+        .get(format!("{gateway_url}/v1/models?client_version=0.144.1"))
+        .header("authorization", "Bearer sk-codex-models")
         .send()
         .await
-        .expect("request should succeed");
+        .expect("Codex models request should succeed");
+    assert_eq!(codex_response.status(), StatusCode::OK);
+    let codex_payload: serde_json::Value = codex_response
+        .json()
+        .await
+        .expect("Codex models body should parse");
+    assert_eq!(codex_payload["models"].as_array().map(Vec::len), Some(1));
+    assert_eq!(codex_payload["models"][0]["slug"], "frontier-sol");
+    assert_eq!(
+        codex_payload["models"][0]["supported_reasoning_levels"][5]["effort"],
+        "ultra"
+    );
+    assert_eq!(
+        codex_payload["models"][0]["future_capability"],
+        json!({"enabled": true})
+    );
+    assert!(codex_payload["models"][0].get("id").is_none());
+    assert!(codex_payload["models"][0].get("api_formats").is_none());
+    assert!(codex_payload.get("object").is_none());
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    let model_ids = payload["data"]
-        .as_array()
-        .expect("data should be an array")
-        .iter()
-        .map(|model| model["id"].as_str().expect("model id should be text"))
-        .collect::<Vec<_>>();
-    assert_eq!(model_ids, vec!["gpt-5"]);
+    let standard_response = client
+        .get(format!("{gateway_url}/v1/models"))
+        .header("authorization", "Bearer sk-standard-models")
+        .send()
+        .await
+        .expect("standard models request should succeed");
+    assert_eq!(standard_response.status(), StatusCode::OK);
+    let standard_payload: serde_json::Value = standard_response
+        .json()
+        .await
+        .expect("standard models body should parse");
+    assert_eq!(standard_payload["object"], "list");
+    assert!(standard_payload["data"].is_array());
+    assert!(standard_payload.get("models").is_none());
 
     gateway_handle.abort();
 }
@@ -425,9 +569,17 @@ async fn gateway_openai_models_list_drops_disabled_global_model_after_cache_inva
         Some(hash_api_key("sk-openai-models-cache")),
         unrestricted_models_snapshot("key-models-cache", "user-models-cache"),
     )]));
-    let row = sample_model_catalog_entry("provider-openai-cache", "openai", "openai:chat", "gpt-5");
+    let row = sample_models_candidate_row(
+        "provider-openai-cache",
+        "openai",
+        "openai:chat",
+        "gpt-5",
+        10,
+    );
     let global_model_id = row.global_model_id.clone();
-    let model_catalog_repository = Arc::new(ToggleModelCatalogReadRepository::new(row.clone()));
+    let candidate_repository = Arc::new(CachedToggleMinimalCandidateSelectionReadRepository::new(
+        row.clone(),
+    ));
     let global_model_repository = Arc::new(
         InMemoryGlobalModelReadRepository::seed(Vec::new()).with_admin_global_models(vec![
             StoredAdminGlobalModel::new(
@@ -452,10 +604,9 @@ async fn gateway_openai_models_list_drops_disabled_global_model_after_cache_inva
         .expect("gateway should build")
         .with_data_state_for_tests(
             crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                empty_candidate_repository(),
+                candidate_repository.clone(),
                 auth_repository,
             )
-            .with_model_catalog_reader(model_catalog_repository.clone())
             .with_global_model_repository_for_tests(global_model_repository),
         );
     let gateway = build_router_with_state(state.clone());
@@ -472,7 +623,7 @@ async fn gateway_openai_models_list_drops_disabled_global_model_after_cache_inva
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["data"][0]["id"], "gpt-5");
 
-    model_catalog_repository.set_active(false);
+    candidate_repository.set_active(false);
     let disabled_global_model = UpdateAdminGlobalModelRecord::new(
         global_model_id,
         "GPT 5".to_string(),
@@ -537,10 +688,7 @@ async fn gateway_returns_empty_openai_models_when_candidate_rows_stall() {
                 crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
                     candidate_repository,
                     auth_repository,
-                )
-                .with_model_catalog_reader(Arc::new(
-                    InMemoryModelCatalogReadRepository::new(Vec::new()),
-                )),
+                ),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -572,58 +720,6 @@ async fn gateway_returns_empty_openai_models_when_candidate_rows_stall() {
 }
 
 #[tokio::test]
-async fn gateway_models_catalog_remains_visible_when_candidate_routability_stalls() {
-    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
-        Some(hash_api_key("sk-models-catalog-only")),
-        unrestricted_models_snapshot("key-models-catalog-only", "user-models-catalog-only"),
-    )]));
-    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
-        StoredModelCatalogEntry {
-            global_model_id: "global-gpt-5".to_string(),
-            global_model_name: "gpt-5".to_string(),
-            global_model_config: None,
-            global_model_supported_capabilities: None,
-            global_model_is_active: true,
-            provider_model_id: "model-gpt-5".to_string(),
-            provider_model_name: "gpt-5".to_string(),
-            provider_model_mappings: None,
-            provider_model_config: None,
-            provider_model_is_active: true,
-            provider_model_is_available: true,
-            provider_id: "provider-openai".to_string(),
-            provider_name: "openai".to_string(),
-            provider_type: "openai".to_string(),
-            provider_is_active: true,
-        },
-    ]));
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(
-                crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                    Arc::new(PendingMinimalCandidateSelectionReadRepository),
-                    auth_repository,
-                )
-                .with_model_catalog_reader(model_catalog_repository),
-            ),
-    );
-    let (gateway_url, gateway_handle) = start_server(gateway).await;
-
-    let response = reqwest::Client::new()
-        .get(format!("{gateway_url}/v1/models"))
-        .header("authorization", "Bearer sk-models-catalog-only")
-        .send()
-        .await
-        .expect("catalog request should return before candidate timeout");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["data"][0]["id"], "gpt-5");
-
-    gateway_handle.abort();
-}
-
-#[tokio::test]
 async fn gateway_returns_not_found_for_openai_model_detail_when_candidate_rows_stall() {
     let fallback_probe_hits = Arc::new(Mutex::new(0usize));
     let fallback_probe_hits_clone = Arc::clone(&fallback_probe_hits);
@@ -652,10 +748,7 @@ async fn gateway_returns_not_found_for_openai_model_detail_when_candidate_rows_s
                 crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
                     candidate_repository,
                     auth_repository,
-                )
-                .with_model_catalog_reader(Arc::new(
-                    InMemoryModelCatalogReadRepository::new(Vec::new()),
-                )),
+                ),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -680,7 +773,7 @@ async fn gateway_returns_not_found_for_openai_model_detail_when_candidate_rows_s
 }
 
 #[tokio::test]
-async fn gateway_handles_public_openai_models_with_cross_format_catalog_without_hitting_fallback_probe(
+async fn gateway_handles_public_openai_models_with_cross_format_candidates_without_hitting_fallback_probe(
 ) {
     let fallback_probe_hits = Arc::new(Mutex::new(0usize));
     let fallback_probe_hits_clone = Arc::clone(&fallback_probe_hits);
@@ -699,14 +792,16 @@ async fn gateway_handles_public_openai_models_with_cross_format_catalog_without_
         Some(hash_api_key("sk-openai-models-cross-format")),
         unrestricted_models_snapshot("key-1", "user-1"),
     )]));
-    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
-        sample_model_catalog_entry(
-            "provider-claude",
-            "claude",
-            "claude:messages",
-            "claude-3-7-sonnet",
-        ),
-    ]));
+    let candidate_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_models_candidate_row(
+                "provider-claude",
+                "claude",
+                "claude:messages",
+                "claude-3-7-sonnet",
+                10,
+            ),
+        ]));
 
     let (_unused_fallback_probe_url, fallback_probe_handle) = start_server(fallback_probe).await;
     let gateway = build_router_with_state(
@@ -714,10 +809,9 @@ async fn gateway_handles_public_openai_models_with_cross_format_catalog_without_
             .expect("gateway should build")
             .with_data_state_for_tests(
                 crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                    empty_candidate_repository(),
+                    candidate_repository,
                     auth_repository,
-                )
-                .with_model_catalog_reader(model_catalog_repository),
+                ),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -776,20 +870,23 @@ async fn gateway_handles_public_claude_models_without_hitting_fallback_probe() {
         Some(hash_api_key("sk-claude-models")),
         unrestricted_models_snapshot("key-claude", "user-claude"),
     )]));
-    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
-        sample_model_catalog_entry(
-            "provider-claude",
-            "claude",
-            "claude:messages",
-            "claude-3-7-sonnet",
-        ),
-        sample_model_catalog_entry(
-            "provider-claude",
-            "claude",
-            "claude:messages",
-            "claude-3-5-haiku",
-        ),
-    ]));
+    let candidate_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_models_candidate_row(
+                "provider-claude",
+                "claude",
+                "claude:messages",
+                "claude-3-7-sonnet",
+                10,
+            ),
+            sample_models_candidate_row(
+                "provider-claude",
+                "claude",
+                "claude:messages",
+                "claude-3-5-haiku",
+                10,
+            ),
+        ]));
 
     let (_unused_fallback_probe_url, fallback_probe_handle) = start_server(fallback_probe).await;
     let gateway = build_router_with_state(
@@ -797,10 +894,9 @@ async fn gateway_handles_public_claude_models_without_hitting_fallback_probe() {
             .expect("gateway should build")
             .with_data_state_for_tests(
                 crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                    empty_candidate_repository(),
+                    candidate_repository,
                     auth_repository,
-                )
-                .with_model_catalog_reader(model_catalog_repository),
+                ),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -819,22 +915,6 @@ async fn gateway_handles_public_claude_models_without_hitting_fallback_probe() {
     assert_eq!(payload["first_id"], "claude-3-5-haiku");
     assert_eq!(payload["last_id"], "claude-3-5-haiku");
     assert_eq!(payload["has_more"], true);
-
-    let detail_response = reqwest::Client::new()
-        .get(format!("{gateway_url}/v1/models/claude-3-7-sonnet"))
-        .header("x-api-key", "sk-claude-models")
-        .header("anthropic-version", "2023-06-01")
-        .send()
-        .await
-        .expect("detail request should succeed");
-    assert_eq!(detail_response.status(), StatusCode::OK);
-    let detail_payload: serde_json::Value = detail_response
-        .json()
-        .await
-        .expect("detail json body should parse");
-    assert_eq!(detail_payload["id"], "claude-3-7-sonnet");
-    assert_eq!(detail_payload["type"], "model");
-    assert_eq!(detail_payload["display_name"], "claude-3-7-sonnet");
     assert_eq!(*fallback_probe_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -860,20 +940,23 @@ async fn gateway_handles_public_gemini_models_without_hitting_fallback_probe() {
         Some(hash_api_key("sk-gemini-models")),
         unrestricted_models_snapshot("key-gemini", "user-gemini"),
     )]));
-    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
-        sample_model_catalog_entry(
-            "provider-gemini",
-            "gemini",
-            "gemini:generate_content",
-            "gemini-2.5-flash",
-        ),
-        sample_model_catalog_entry(
-            "provider-gemini",
-            "gemini",
-            "gemini:generate_content",
-            "gemini-2.5-pro",
-        ),
-    ]));
+    let candidate_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_models_candidate_row(
+                "provider-gemini",
+                "gemini",
+                "gemini:generate_content",
+                "gemini-2.5-flash",
+                10,
+            ),
+            sample_models_candidate_row(
+                "provider-gemini",
+                "gemini",
+                "gemini:generate_content",
+                "gemini-2.5-pro",
+                10,
+            ),
+        ]));
 
     let (_unused_fallback_probe_url, fallback_probe_handle) = start_server(fallback_probe).await;
     let gateway = build_router_with_state(
@@ -881,10 +964,9 @@ async fn gateway_handles_public_gemini_models_without_hitting_fallback_probe() {
             .expect("gateway should build")
             .with_data_state_for_tests(
                 crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                    empty_candidate_repository(),
+                    candidate_repository,
                     auth_repository,
-                )
-                .with_model_catalog_reader(model_catalog_repository),
+                ),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -901,25 +983,6 @@ async fn gateway_handles_public_gemini_models_without_hitting_fallback_probe() {
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["models"][0]["name"], "models/gemini-2.5-flash");
     assert_eq!(payload["nextPageToken"], "1");
-
-    let detail_response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/v1beta/models/gemini-2.5-pro?key=sk-gemini-models"
-        ))
-        .send()
-        .await
-        .expect("detail request should succeed");
-    assert_eq!(detail_response.status(), StatusCode::OK);
-    let detail_payload: serde_json::Value = detail_response
-        .json()
-        .await
-        .expect("detail json body should parse");
-    assert_eq!(detail_payload["name"], "models/gemini-2.5-pro");
-    assert_eq!(detail_payload["baseModelId"], "gemini-2.5-pro");
-    assert_eq!(
-        detail_payload["supportedGenerationMethods"],
-        json!(["generateContent", "countTokens"])
-    );
     assert_eq!(*fallback_probe_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -1352,7 +1415,7 @@ async fn gateway_does_not_locally_reject_image_model_name_on_chat_completions() 
 }
 
 #[tokio::test]
-async fn gateway_rejects_image_request_with_n_greater_than_four_without_hitting_fallback_probe() {
+async fn gateway_rejects_image_request_above_gateway_limit_without_hitting_fallback_probe() {
     let fallback_probe_hits = Arc::new(Mutex::new(0usize));
     let fallback_probe_hits_clone = Arc::clone(&fallback_probe_hits);
     let fallback_probe = Router::new().route(
@@ -1387,7 +1450,7 @@ async fn gateway_rejects_image_request_with_n_greater_than_four_without_hitting_
             serde_json::to_vec(&json!({
                 "model": "grok-imagine-image-lite",
                 "prompt": "draw",
-                "n": 5,
+                "n": openai_image_gateway_max_generation_count() + 1,
                 "response_format": "b64_json"
             }))
             .expect("request body should encode"),

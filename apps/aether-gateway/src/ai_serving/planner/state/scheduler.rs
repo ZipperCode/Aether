@@ -20,14 +20,8 @@ impl<'a> PlannerAppState<'a> {
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
+        enable_model_directives: bool,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
-        let enable_model_directives =
-            crate::system_features::reasoning_model_directive_enabled_for_api_format_and_model(
-                self.app(),
-                api_format,
-                Some(global_model_name),
-            )
-            .await;
         crate::scheduler::candidate::list_selectable_candidates(
             self.app().data.as_ref(),
             self.app(),
@@ -52,6 +46,7 @@ impl<'a> PlannerAppState<'a> {
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
+        enable_model_directives: bool,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -63,14 +58,6 @@ impl<'a> PlannerAppState<'a> {
         let wait_interval = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS.max(1));
         let wait_deadline = Instant::now() + wait_timeout;
         let mut attempt_now_unix_secs = now_unix_secs;
-        let enable_model_directives =
-            crate::system_features::reasoning_model_directive_enabled_for_api_format_and_model(
-                self.app(),
-                api_format,
-                Some(global_model_name),
-            )
-            .await;
-
         loop {
             let result = crate::scheduler::candidate::list_selectable_candidates_with_skip_reasons(
                 self.app().data.as_ref(),

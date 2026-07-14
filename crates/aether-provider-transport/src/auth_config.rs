@@ -45,6 +45,7 @@ const IGNORABLE_AUTH_CONFIG_METADATA_KEYS: &[&str] = &[
     "access_token_import_temporary",
     "email",
     "expires_at",
+    "is_fedramp",
     "model_regions",
     "organizations",
     "plan_type",

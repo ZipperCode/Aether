@@ -46,6 +46,18 @@ pub fn force_upstream_streaming_for_provider(
         && aether_ai_formats::is_openai_responses_format(provider_api_format)
 }
 
+pub fn forbid_upstream_streaming_for_provider(
+    provider_type: &str,
+    provider_api_format: &str,
+) -> bool {
+    aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:search")
+        || aether_ai_formats::is_openai_responses_compact_format(provider_api_format)
+        || (provider_type.trim().eq_ignore_ascii_case("codex")
+            && provider_api_format
+                .trim()
+                .eq_ignore_ascii_case("openai:image"))
+}
+
 pub(crate) fn parse_upstream_stream_policy(
     value: Option<&serde_json::Value>,
 ) -> UpstreamStreamPolicy {
@@ -160,13 +172,31 @@ pub fn resolve_upstream_is_stream_from_endpoint_config(
     )
 }
 
+pub fn resolve_upstream_is_stream_for_provider(
+    endpoint_config: Option<&serde_json::Value>,
+    provider_type: &str,
+    provider_api_format: &str,
+    client_is_stream: bool,
+    hard_requires_streaming: bool,
+) -> bool {
+    if forbid_upstream_streaming_for_provider(provider_type, provider_api_format) {
+        return false;
+    }
+    resolve_upstream_is_stream_from_endpoint_config(
+        endpoint_config,
+        client_is_stream,
+        hard_requires_streaming
+            || force_upstream_streaming_for_provider(provider_type, provider_api_format),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         endpoint_config_forces_upstream_stream_policy, enforce_request_body_stream_field,
-        force_upstream_streaming_for_provider, parse_direct_request_body,
-        parse_upstream_stream_policy, resolve_upstream_is_stream,
-        resolve_upstream_is_stream_from_endpoint_config,
+        forbid_upstream_streaming_for_provider, force_upstream_streaming_for_provider,
+        parse_direct_request_body, parse_upstream_stream_policy, resolve_upstream_is_stream,
+        resolve_upstream_is_stream_for_provider, resolve_upstream_is_stream_from_endpoint_config,
         upstream_stream_policy_from_endpoint_config, UpstreamStreamPolicy,
     };
     use serde_json::json;
@@ -225,6 +255,42 @@ mod tests {
         assert!(!force_upstream_streaming_for_provider(
             "openai",
             "openai:responses"
+        ));
+    }
+
+    #[test]
+    fn forbids_streaming_for_sync_only_openai_formats() {
+        assert!(forbid_upstream_streaming_for_provider(
+            "codex",
+            "openai:search"
+        ));
+        assert!(forbid_upstream_streaming_for_provider(
+            "custom",
+            "/v1/alpha/search"
+        ));
+        assert!(forbid_upstream_streaming_for_provider(
+            "codex",
+            "openai:responses:compact"
+        ));
+        assert!(forbid_upstream_streaming_for_provider(
+            "openai",
+            "openai:responses:compact"
+        ));
+        assert!(forbid_upstream_streaming_for_provider(
+            "custom",
+            "openai:responses:compact"
+        ));
+        assert!(forbid_upstream_streaming_for_provider(
+            "codex",
+            "openai:image"
+        ));
+        assert!(!forbid_upstream_streaming_for_provider(
+            "codex",
+            "openai:responses"
+        ));
+        assert!(!forbid_upstream_streaming_for_provider(
+            "openai",
+            "openai:image"
         ));
     }
 
@@ -398,6 +464,39 @@ mod tests {
         ));
         assert!(!resolve_upstream_is_stream_from_endpoint_config(
             None, false, false,
+        ));
+    }
+
+    #[test]
+    fn provider_policy_gives_non_stream_contracts_precedence() {
+        let force_stream = json!({"upstream_stream_policy": "force_stream"});
+        assert!(!resolve_upstream_is_stream_for_provider(
+            Some(&force_stream),
+            "codex",
+            "openai:search",
+            true,
+            true,
+        ));
+        assert!(!resolve_upstream_is_stream_for_provider(
+            Some(&force_stream),
+            "codex",
+            "openai:responses:compact",
+            true,
+            true,
+        ));
+        assert!(!resolve_upstream_is_stream_for_provider(
+            Some(&force_stream),
+            "codex",
+            "openai:image",
+            true,
+            true,
+        ));
+        assert!(resolve_upstream_is_stream_for_provider(
+            Some(&json!({"upstream_stream_policy": "force_non_stream"})),
+            "codex",
+            "openai:responses",
+            false,
+            false,
         ));
     }
 }

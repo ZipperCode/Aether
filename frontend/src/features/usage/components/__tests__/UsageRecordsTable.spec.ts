@@ -288,11 +288,36 @@ describe('UsageRecordsTable', () => {
     expect(root.textContent).toContain('xhigh')
   })
 
+  it('shows request reasoning effort while the record is pending', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      status: 'pending',
+      reasoning_effort: 'max',
+    })])
+
+    expect(root.textContent).toContain('max')
+  })
+
   it('shows fast badge for priority service tier', () => {
     const root = mountUsageRecordsTable([buildRecord({ service_tier: 'priority' })])
 
     expect(root.textContent).toContain('gpt-5')
     expect(root.textContent).toContain('fast')
+  })
+
+  it('uses the actual service tier when the provider changes processing class', () => {
+    const downgraded = mountUsageRecordsTable([buildRecord({
+      service_tier: 'priority',
+      actual_service_tier: 'default',
+    })])
+    expect(downgraded.textContent).not.toContain('fast')
+    expect(downgraded.querySelector('[title*="Requested service tier: priority"]')).not.toBeNull()
+    expect(downgraded.querySelector('[title*="Actual service tier: default"]')).not.toBeNull()
+
+    const upgraded = mountUsageRecordsTable([buildRecord({
+      service_tier: 'flex',
+      actual_service_tier: 'priority',
+    })])
+    expect(upgraded.textContent).toContain('fast')
   })
 
   it('offers embedding API formats in the usage record filter', () => {

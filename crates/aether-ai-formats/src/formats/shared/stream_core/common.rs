@@ -152,6 +152,7 @@ pub fn canonical_usage_from_openai_usage(value: Option<&Value>) -> Option<Canoni
                     details
                         .get("cache_write_tokens")
                         .or_else(|| details.get("cached_creation_tokens"))
+                        .or_else(|| details.get("cache_creation_tokens"))
                 })
                 .and_then(Value::as_u64)
         })

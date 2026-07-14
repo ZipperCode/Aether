@@ -38,7 +38,7 @@ pub fn parse_request(
         FormatId::GeminiEmbedding => gemini::embedding::request::from(body, ctx),
         FormatId::DoubaoEmbedding => doubao::embedding::request::from(body, ctx),
         FormatId::AliyunMultimodalEmbedding => aliyun::embedding::request::from(body, ctx),
-        FormatId::GeminiInteractions => None,
+        FormatId::OpenAiSearch | FormatId::GeminiInteractions => None,
     }
     .ok_or_else(|| FormatError::RequestParseFailed {
         format: source.as_str().to_string(),
@@ -72,7 +72,7 @@ fn emit_request_inner(
         FormatId::GeminiEmbedding => gemini::embedding::request::to(request, ctx),
         FormatId::DoubaoEmbedding => doubao::embedding::request::to(request, ctx),
         FormatId::AliyunMultimodalEmbedding => aliyun::embedding::request::to(request, ctx),
-        FormatId::GeminiInteractions => None,
+        FormatId::OpenAiSearch | FormatId::GeminiInteractions => None,
     }
     .ok_or_else(|| FormatError::RequestEmitFailed {
         format: target.as_str().to_string(),
@@ -114,7 +114,14 @@ pub fn convert_request_pure_with_context(
 ) -> Result<Converted<Value>, FormatError> {
     let pure_ctx = ctx.without_runtime_request_edits();
     let request = parse_request(source_format, body, &pure_ctx)?;
-    validate_request_conversion(source_format, target_format, body, &request)?;
+    validate_openai_responses_target_contract(target_format, body)?;
+    validate_request_conversion(
+        source_format,
+        target_format,
+        body,
+        &request,
+        ctx.mapped_model.as_deref(),
+    )?;
     let value = emit_request_inner(target_format, &request, &pure_ctx)?;
     let report = build_request_conversion_report(source_format, target_format, body, &value);
     Ok(Converted { value, report })
@@ -128,8 +135,15 @@ pub fn convert_request(
 ) -> Result<Value, FormatError> {
     let source = parse_format(source_format)?;
     let target = parse_format(target_format)?;
-    validate_runtime_request_conversion(source, target, body)?;
+    validate_openai_responses_target_contract(target_format, body)?;
     let mut request = parse_request(source_format, body, ctx)?;
+    validate_runtime_request_conversion(
+        source,
+        target,
+        body,
+        &request,
+        ctx.mapped_model.as_deref(),
+    )?;
     if let Some(mapped_model) = ctx
         .mapped_model
         .as_deref()
@@ -144,7 +158,30 @@ fn validate_runtime_request_conversion(
     source: FormatId,
     target: FormatId,
     body: &Value,
+    _request: &CanonicalRequest,
+    mapped_model: Option<&str>,
 ) -> Result<(), FormatError> {
+    validate_openai_cross_format_store(source, target, body)?;
+    validate_openai_prompt_cache_contract(source, body, mapped_model)?;
+    validate_openai_reasoning_effort(source, target, body, mapped_model)?;
+    validate_openai_responses_cross_format_input(source, target, body)?;
+    validate_openai_responses_runtime_reasoning(source, target, body)?;
+    if matches!(source, FormatId::OpenAiChat)
+        && matches!(
+            target,
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+        )
+        && body
+            .as_object()
+            .is_some_and(openai_chat_request_has_unsupported_responses_cache_breakpoint)
+    {
+        return Err(FormatError::LossyConversionBlocked {
+            source_format: source.as_str().to_string(),
+            target_format: target.as_str().to_string(),
+            field: "messages[].content[].prompt_cache_breakpoint".to_string(),
+            reason: "OpenAI Responses supports prompt cache breakpoints only on input_text, input_image, and input_file blocks".to_string(),
+        });
+    }
     if source == FormatId::ClaudeMessages {
         match target {
             FormatId::OpenAiChat
@@ -177,6 +214,58 @@ fn validate_runtime_request_conversion(
     Ok(())
 }
 
+fn validate_openai_responses_target_contract(
+    target_format: &str,
+    body: &Value,
+) -> Result<(), FormatError> {
+    if !matches!(
+        FormatId::parse(target_format),
+        Some(FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact)
+    ) {
+        return Ok(());
+    }
+    crate::formats::openai::responses::request::validate_openai_responses_request_contract(
+        body,
+        target_format,
+    )
+    .map_err(|violation| FormatError::InvalidTargetField {
+        format: crate::normalize_api_format_alias(target_format),
+        field: violation.field.to_string(),
+        reason: violation.reason.to_string(),
+    })
+}
+
+fn validate_openai_responses_runtime_reasoning(
+    source: FormatId,
+    target: FormatId,
+    body: &Value,
+) -> Result<(), FormatError> {
+    if !matches!(
+        source,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) || matches!(
+        target,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) {
+        return Ok(());
+    }
+    let Some(reasoning) = body.get("reasoning").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if let Some(field) = reasoning
+        .keys()
+        .find(|field| !matches!(field.as_str(), "effort" | "summary"))
+    {
+        return openai_responses_lossy_input(
+            source,
+            target,
+            format!("thinking.openai_responses.{field}"),
+            "target format cannot preserve this provider-specific Responses reasoning field",
+        );
+    }
+    Ok(())
+}
+
 pub fn parse_response(
     source_format: &str,
     body: &Value,
@@ -191,6 +280,7 @@ pub fn parse_response(
         FormatId::ClaudeMessages => claude_messages::response::from(body, ctx),
         FormatId::GeminiGenerateContent => gemini_generate_content::response::from(body, ctx),
         FormatId::OpenAiEmbedding
+        | FormatId::OpenAiSearch
         | FormatId::JinaEmbedding
         | FormatId::OpenAiRerank
         | FormatId::JinaRerank
@@ -229,6 +319,7 @@ fn emit_response_inner(
         FormatId::ClaudeMessages => claude_messages::response::to(response, ctx),
         FormatId::GeminiGenerateContent => gemini_generate_content::response::to(response, ctx),
         FormatId::OpenAiEmbedding
+        | FormatId::OpenAiSearch
         | FormatId::JinaEmbedding
         | FormatId::OpenAiRerank
         | FormatId::JinaRerank
@@ -314,9 +405,12 @@ fn validate_request_conversion(
     target_format: &str,
     body: &Value,
     request: &CanonicalRequest,
+    mapped_model: Option<&str>,
 ) -> Result<(), FormatError> {
     let source = parse_format(source_format)?;
     let target = parse_format(target_format)?;
+    validate_openai_prompt_cache_contract(source, body, mapped_model)?;
+    validate_openai_reasoning_effort(source, target, body, mapped_model)?;
     if source == target {
         return Ok(());
     }
@@ -327,8 +421,9 @@ fn validate_request_conversion(
         return validate_rerank_request_conversion(source, target, request);
     }
     validate_known_standard_request_root_fields(source, target, body)?;
+    validate_openai_responses_cross_format_input(source, target, body)?;
     validate_cross_format_generation_target(source, target, request)?;
-    validate_openai_reasoning_effort(source, target, body)?;
+    validate_openai_cross_format_store(source, target, body)?;
     match (source, target) {
         (FormatId::OpenAiChat, FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact) => {
             validate_openai_chat_to_responses(body)?;
@@ -347,6 +442,142 @@ fn validate_request_conversion(
     validate_cross_format_request_extensions(source, target, request)
 }
 
+fn validate_openai_responses_cross_format_input(
+    source: FormatId,
+    target: FormatId,
+    body: &Value,
+) -> Result<(), FormatError> {
+    if !matches!(
+        source,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) || matches!(
+        target,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) {
+        return Ok(());
+    }
+    if body
+        .get("multi_agent")
+        .and_then(Value::as_object)
+        .and_then(|multi_agent| multi_agent.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return openai_responses_lossy_input(
+            source,
+            target,
+            "multi_agent".to_string(),
+            "target format cannot represent the OpenAI multi-agent request contract",
+        );
+    }
+
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (item_index, item) in items.iter().enumerate() {
+        let Some(item_object) = item.as_object() else {
+            if !item.is_string() {
+                return openai_responses_lossy_input(
+                    source,
+                    target,
+                    format!("input[{item_index}]"),
+                    "target format cannot represent this raw Responses input item",
+                );
+            }
+            continue;
+        };
+        let item_type = item_object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("message")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(
+            item_type.as_str(),
+            "message"
+                | "reasoning"
+                | "function_call"
+                | "custom_tool_call"
+                | "function_call_output"
+                | "custom_tool_call_output"
+                | "local_shell_call_output"
+                | "shell_call_output"
+                | "apply_patch_call_output"
+                | "computer_call_output"
+        ) {
+            return openai_responses_lossy_input(
+                source,
+                target,
+                format!("input[{item_index}]"),
+                "target format has no lossless mapping for this Responses input item type",
+            );
+        }
+        if matches!(item_type.as_str(), "function_call" | "function_call_output")
+            && item_object.contains_key("caller")
+        {
+            return openai_responses_lossy_input(
+                source,
+                target,
+                format!("input[{item_index}].caller"),
+                "target format cannot preserve function call caller provenance",
+            );
+        }
+        if item_type != "message" {
+            continue;
+        }
+        let Some(content) = item_object.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for (content_index, block) in content.iter().enumerate() {
+            let block_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if !matches!(
+                block_type.as_str(),
+                "input_text"
+                    | "output_text"
+                    | "text"
+                    | "input_image"
+                    | "output_image"
+                    | "image_url"
+                    | "input_file"
+                    | "file"
+                    | "input_audio"
+                    | "audio"
+                    | "output_audio"
+                    | "reasoning"
+                    | "thinking"
+                    | "refusal"
+            ) {
+                return openai_responses_lossy_input(
+                    source,
+                    target,
+                    format!("input[{item_index}].content[{content_index}]"),
+                    "target format has no lossless mapping for this raw Responses content block",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn openai_responses_lossy_input(
+    source: FormatId,
+    target: FormatId,
+    field: String,
+    reason: &str,
+) -> Result<(), FormatError> {
+    Err(FormatError::LossyConversionBlocked {
+        source_format: source.as_str().to_string(),
+        target_format: target.as_str().to_string(),
+        field,
+        reason: reason.to_string(),
+    })
+}
+
 fn validate_response_conversion(
     source_format: &str,
     target_format: &str,
@@ -361,7 +592,277 @@ fn validate_response_conversion(
 
     validate_source_response_stop_enums(source, target, body)?;
     validate_response_content_has_no_unknown_blocks(source, target, response)?;
+    validate_openai_responses_cross_format_response_extensions(source, target, response)?;
     validate_canonical_response_stop_reasons(source, target, response)
+}
+
+fn validate_openai_responses_cross_format_response_extensions(
+    source: FormatId,
+    target: FormatId,
+    response: &CanonicalResponse,
+) -> Result<(), FormatError> {
+    if !matches!(
+        source,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) || matches!(
+        target,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) {
+        return Ok(());
+    }
+
+    validate_openai_responses_response_extension_namespace(
+        source,
+        target,
+        "response",
+        &response.extensions,
+        |key, value| {
+            matches!(key, "raw_status" | "incomplete_details")
+                || (key == "output_text" && value.is_string())
+                || (matches!(key, "created_at" | "completed_at")
+                    && (value.is_number() || value.is_null()))
+                || (key == "error" && value.is_null())
+                || (target == FormatId::OpenAiChat && key == "service_tier")
+        },
+    )?;
+
+    for output in &response.outputs {
+        validate_openai_responses_message_item_provenance(source, target, &output.extensions)?;
+        validate_openai_responses_response_extension_namespace(
+            source,
+            target,
+            "output[]",
+            &output.extensions,
+            |key, _| key == "message_items",
+        )?;
+    }
+
+    if let Some(usage) = &response.usage {
+        validate_openai_responses_usage_extension_fields(source, target, &usage.extensions)?;
+        validate_openai_responses_response_extension_namespace(
+            source,
+            target,
+            "usage",
+            &usage.extensions,
+            |key, _| matches!(key, "input_tokens_details" | "output_tokens_details"),
+        )?;
+    }
+
+    for block in &response.content {
+        if let CanonicalContentBlock::Thinking {
+            encrypted_content: Some(encrypted_content),
+            ..
+        } = block
+        {
+            if !encrypted_content.is_empty() {
+                return openai_responses_lossy_response(
+                    source,
+                    target,
+                    "output[].encrypted_content",
+                    "target format cannot preserve encrypted OpenAI reasoning content",
+                );
+            }
+        }
+        let (location, extensions): (&str, &std::collections::BTreeMap<String, Value>) = match block
+        {
+            CanonicalContentBlock::Text { extensions, .. } => ("output[].content[]", extensions),
+            CanonicalContentBlock::Thinking { extensions, .. } => {
+                ("output[].reasoning", extensions)
+            }
+            CanonicalContentBlock::Image { extensions, .. }
+            | CanonicalContentBlock::File { extensions, .. }
+            | CanonicalContentBlock::Audio { extensions, .. } => ("output[].content[]", extensions),
+            CanonicalContentBlock::ToolUse { extensions, .. } => {
+                ("output[].function_call", extensions)
+            }
+            CanonicalContentBlock::ToolResult { extensions, .. } => {
+                ("output[].function_call_output", extensions)
+            }
+            CanonicalContentBlock::Unknown { .. } => continue,
+        };
+        validate_openai_responses_response_extension_namespace(
+            source,
+            target,
+            location,
+            extensions,
+            |key, value| match block {
+                CanonicalContentBlock::Text { .. } => {
+                    key == "annotations"
+                        && (target == FormatId::OpenAiChat
+                            || value.as_array().is_some_and(Vec::is_empty))
+                }
+                CanonicalContentBlock::Thinking { .. } => key == "item_type",
+                CanonicalContentBlock::ToolUse { .. } => {
+                    matches!(key, "item_id" | "item_type" | "status")
+                }
+                CanonicalContentBlock::ToolResult { .. } => key == "item_type",
+                CanonicalContentBlock::Image { .. }
+                | CanonicalContentBlock::File { .. }
+                | CanonicalContentBlock::Audio { .. } => key == "item_type",
+                CanonicalContentBlock::Unknown { .. } => false,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_openai_responses_message_item_provenance(
+    source: FormatId,
+    target: FormatId,
+    extensions: &std::collections::BTreeMap<String, Value>,
+) -> Result<(), FormatError> {
+    for (namespace, value) in extensions {
+        if !matches!(namespace.as_str(), "openai_responses" | "openai_cli") {
+            continue;
+        }
+        let Some(message_items) = value
+            .as_object()
+            .and_then(|object| object.get("message_items"))
+        else {
+            continue;
+        };
+        let Some(message_items) = message_items.as_array() else {
+            return openai_responses_lossy_response(
+                source,
+                target,
+                "output[].message_items",
+                "Responses message item provenance is not an array",
+            );
+        };
+        for item in message_items {
+            let Some(item) = item.as_object() else {
+                return openai_responses_lossy_response(
+                    source,
+                    target,
+                    "output[].message_items[]",
+                    "Responses message item provenance entry is not an object",
+                );
+            };
+            let output_index = item
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let Some(fields) = item.get("fields").and_then(Value::as_object) else {
+                return openai_responses_lossy_response(
+                    source,
+                    target,
+                    &format!("output[{output_index}]"),
+                    "Responses message item provenance fields are not an object",
+                );
+            };
+            if let Some(field) = fields.keys().next() {
+                return openai_responses_lossy_response(
+                    source,
+                    target,
+                    &format!("output[{output_index}].{field}"),
+                    "target format cannot preserve this Responses message item field",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_responses_usage_extension_fields(
+    source: FormatId,
+    target: FormatId,
+    extensions: &std::collections::BTreeMap<String, Value>,
+) -> Result<(), FormatError> {
+    for (namespace, value) in extensions {
+        if !matches!(namespace.as_str(), "openai_responses" | "openai_cli") {
+            continue;
+        }
+        let Some(usage) = value.as_object() else {
+            continue;
+        };
+        for (details_key, mapped_fields) in [
+            (
+                "input_tokens_details",
+                &["cached_tokens", "cache_write_tokens"] as &[&str],
+            ),
+            ("output_tokens_details", &["reasoning_tokens"] as &[&str]),
+        ] {
+            let Some(details) = usage.get(details_key) else {
+                continue;
+            };
+            let Some(details) = details.as_object() else {
+                return openai_responses_lossy_response(
+                    source,
+                    target,
+                    &format!("usage.{details_key}"),
+                    "Responses usage details are not an object",
+                );
+            };
+            for (field, value) in details {
+                let mapped = mapped_fields.contains(&field.as_str()) && value.as_u64().is_some();
+                let cache_write_supported =
+                    field != "cache_write_tokens" || target != FormatId::GeminiGenerateContent;
+                if mapped && cache_write_supported {
+                    continue;
+                }
+                return openai_responses_lossy_response(
+                    source,
+                    target,
+                    &format!("usage.{details_key}.{field}"),
+                    "target format cannot preserve this Responses usage detail field",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_responses_response_extension_namespace(
+    source: FormatId,
+    target: FormatId,
+    location: &str,
+    extensions: &std::collections::BTreeMap<String, Value>,
+    is_safe: impl Fn(&str, &Value) -> bool,
+) -> Result<(), FormatError> {
+    for (namespace, value) in extensions {
+        if namespace == "aether" {
+            continue;
+        }
+        let Some(object) = value.as_object() else {
+            return openai_responses_lossy_response(
+                source,
+                target,
+                location,
+                "Responses extension namespace is not an object",
+            );
+        };
+        for (key, value) in object {
+            let internal_openai_field = namespace == "openai" && key == "omit_reasoning_parts";
+            if internal_openai_field
+                || (matches!(namespace.as_str(), "openai_responses" | "openai_cli")
+                    && is_safe(key, value))
+            {
+                continue;
+            }
+            return openai_responses_lossy_response(
+                source,
+                target,
+                &extension_field_path(location, namespace, key),
+                "target format cannot preserve this Responses provider field",
+            );
+        }
+    }
+    Ok(())
+}
+
+fn openai_responses_lossy_response(
+    source: FormatId,
+    target: FormatId,
+    field: &str,
+    reason: &str,
+) -> Result<(), FormatError> {
+    Err(FormatError::LossyConversionBlocked {
+        source_format: source.as_str().to_string(),
+        target_format: target.as_str().to_string(),
+        field: field.to_string(),
+        reason: reason.to_string(),
+    })
 }
 
 fn validate_response_content_has_no_unknown_blocks(
@@ -376,7 +877,14 @@ fn validate_response_content_has_no_unknown_blocks(
             .flat_map(|output| output.content.iter()),
     ) {
         if let CanonicalContentBlock::Unknown { raw_type, .. } = block {
-            if raw_type == "refusal" {
+            if raw_type == "refusal"
+                && matches!(
+                    target,
+                    FormatId::OpenAiChat
+                        | FormatId::OpenAiResponses
+                        | FormatId::OpenAiResponsesCompact
+                )
+            {
                 continue;
             }
             return Err(FormatError::LossyConversionBlocked {
@@ -435,6 +943,7 @@ fn standard_request_root_field_is_audited(source: FormatId, key: &str) -> bool {
                 | "prediction"
                 | "presence_penalty"
                 | "prompt_cache_key"
+                | "prompt_cache_options"
                 | "prompt_cache_retention"
                 | "reasoning_effort"
                 | "response_format"
@@ -466,10 +975,12 @@ fn standard_request_root_field_is_audited(source: FormatId, key: &str) -> bool {
                 | "max_tool_calls"
                 | "metadata"
                 | "model"
+                | "multi_agent"
                 | "parallel_tool_calls"
                 | "previous_response_id"
                 | "prompt"
                 | "prompt_cache_key"
+                | "prompt_cache_options"
                 | "prompt_cache_retention"
                 | "reasoning"
                 | "safety_identifier"
@@ -546,6 +1057,7 @@ fn standard_request_root_field_is_audited(source: FormatId, key: &str) -> bool {
                 | "tools"
         ),
         FormatId::OpenAiEmbedding
+        | FormatId::OpenAiSearch
         | FormatId::OpenAiRerank
         | FormatId::GeminiEmbedding
         | FormatId::JinaEmbedding
@@ -838,6 +1350,23 @@ fn request_extension_key_is_cross_format_safe(
     namespace: &str,
     key: &str,
 ) -> bool {
+    if location == "messages[].content[]"
+        && key == "prompt_cache_breakpoint"
+        && matches!(
+            (source, target, namespace),
+            (
+                FormatId::OpenAiChat,
+                FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+                "openai",
+            ) | (
+                FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+                FormatId::OpenAiChat,
+                "openai_responses" | "openai_cli",
+            )
+        )
+    {
+        return true;
+    }
     if location == "tools[]" {
         return tool_extension_key_is_cross_format_safe(source, target, namespace, key);
     }
@@ -858,7 +1387,9 @@ fn request_extension_key_is_cross_format_safe(
                 | "service_tier"
                 | "safety_identifier"
                 | "prompt_cache_key"
+                | "prompt_cache_options"
                 | "prompt_cache_retention"
+                | "user"
                 | "verbosity",
         ) | (
             FormatId::OpenAiChat,
@@ -879,7 +1410,9 @@ fn request_extension_key_is_cross_format_safe(
                 | "service_tier"
                 | "safety_identifier"
                 | "prompt_cache_key"
+                | "prompt_cache_options"
                 | "prompt_cache_retention"
+                | "user"
                 | "verbosity",
         ) | (
             FormatId::ClaudeMessages,
@@ -1005,6 +1538,7 @@ fn validate_source_response_stop_enums(
         FormatId::GeminiGenerateContent => validate_gemini_response_finish_reasons(body, target),
         FormatId::GeminiInteractions => Ok(()),
         FormatId::OpenAiEmbedding
+        | FormatId::OpenAiSearch
         | FormatId::OpenAiRerank
         | FormatId::GeminiEmbedding
         | FormatId::JinaEmbedding
@@ -1584,6 +2118,89 @@ fn validate_openai_reasoning_effort(
     source: FormatId,
     target: FormatId,
     body: &Value,
+    mapped_model: Option<&str>,
+) -> Result<(), FormatError> {
+    let same_openai_format = source == target
+        && matches!(
+            source,
+            FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+        );
+    let openai_cross_format = matches!(
+        (source, target),
+        (
+            FormatId::OpenAiChat,
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+        ) | (
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+            FormatId::OpenAiChat
+        )
+    );
+    if !same_openai_format && !openai_cross_format {
+        return Ok(());
+    }
+    crate::validate_openai_reasoning_request(
+        source.as_str(),
+        target.as_str(),
+        mapped_model.unwrap_or_default(),
+        body,
+    )
+    .map_err(|violation| match violation.kind {
+        crate::OpenAiReasoningViolationKind::InvalidEnum => FormatError::InvalidEnumValue {
+            format: source.as_str().to_string(),
+            field: violation.field,
+            value: violation.value.unwrap_or_default(),
+        },
+        crate::OpenAiReasoningViolationKind::InvalidType
+        | crate::OpenAiReasoningViolationKind::UnsupportedForModel => {
+            FormatError::InvalidTargetField {
+                format: source.as_str().to_string(),
+                field: violation.field,
+                reason: violation.reason,
+            }
+        }
+    })
+}
+
+fn validate_openai_prompt_cache_contract(
+    source: FormatId,
+    body: &Value,
+    mapped_model: Option<&str>,
+) -> Result<(), FormatError> {
+    if !matches!(
+        source,
+        FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) {
+        return Ok(());
+    }
+    let provider_model = mapped_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| body.get("model").and_then(Value::as_str))
+        .unwrap_or_default();
+    crate::validate_openai_prompt_cache_request(source.as_str(), provider_model, body).map_err(
+        |violation| match violation.kind {
+            crate::OpenAiPromptCacheViolationKind::InvalidEnum => FormatError::InvalidEnumValue {
+                format: source.as_str().to_string(),
+                field: violation.field,
+                value: violation.value.unwrap_or_default(),
+            },
+            crate::OpenAiPromptCacheViolationKind::InvalidType
+            | crate::OpenAiPromptCacheViolationKind::UnsupportedForModel
+            | crate::OpenAiPromptCacheViolationKind::UnsupportedContentBlock => {
+                FormatError::InvalidTargetField {
+                    format: source.as_str().to_string(),
+                    field: violation.field,
+                    reason: violation.reason,
+                }
+            }
+        },
+    )
+}
+
+fn validate_openai_cross_format_store(
+    source: FormatId,
+    target: FormatId,
+    body: &Value,
 ) -> Result<(), FormatError> {
     if !matches!(
         (source, target),
@@ -1597,65 +2214,35 @@ fn validate_openai_reasoning_effort(
     ) {
         return Ok(());
     }
-    let Some(object) = body.as_object() else {
+    let Some(value) = body.get("store") else {
         return Ok(());
     };
-    match source {
-        FormatId::OpenAiChat => validate_openai_reasoning_effort_value(
-            source.as_str(),
-            "reasoning_effort",
-            object.get("reasoning_effort"),
-            openai_chat_reasoning_effort_is_valid,
-        ),
-        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact => {
-            let effort = object
-                .get("reasoning")
-                .and_then(Value::as_object)
-                .and_then(|reasoning| reasoning.get("effort"));
-            validate_openai_reasoning_effort_value(
-                source.as_str(),
-                "reasoning.effort",
-                effort,
-                openai_responses_reasoning_effort_is_valid,
-            )
-        }
-        _ => Ok(()),
+    if target == FormatId::OpenAiResponsesCompact {
+        return if value.is_boolean() {
+            Ok(())
+        } else {
+            Err(FormatError::InvalidTargetField {
+                format: source.as_str().to_string(),
+                field: "store".to_string(),
+                reason: "store must be a boolean".to_string(),
+            })
+        };
     }
-}
-
-fn validate_openai_reasoning_effort_value(
-    format: &str,
-    field: &str,
-    value: Option<&Value>,
-    is_valid: fn(&str) -> bool,
-) -> Result<(), FormatError> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let Some(raw) = value.as_str() else {
-        return Err(FormatError::InvalidTargetField {
-            format: format.to_string(),
-            field: field.to_string(),
-            reason: "reasoning effort must be a string".to_string(),
-        });
-    };
-    if is_valid(raw) {
-        Ok(())
-    } else {
-        Err(FormatError::InvalidEnumValue {
-            format: format.to_string(),
-            field: field.to_string(),
-            value: raw.to_string(),
-        })
+    match value.as_bool() {
+        Some(false) => Ok(()),
+        Some(true) => Err(FormatError::LossyConversionBlocked {
+            source_format: source.as_str().to_string(),
+            target_format: target.as_str().to_string(),
+            field: "store".to_string(),
+            reason: "Chat and Responses assign different persistence behavior to store=true"
+                .to_string(),
+        }),
+        None => Err(FormatError::InvalidTargetField {
+            format: source.as_str().to_string(),
+            field: "store".to_string(),
+            reason: "store must be a boolean".to_string(),
+        }),
     }
-}
-
-fn openai_chat_reasoning_effort_is_valid(value: &str) -> bool {
-    crate::formats::openai::shared::OpenAiChatReasoningEffort::parse(value).is_some()
-}
-
-fn openai_responses_reasoning_effort_is_valid(value: &str) -> bool {
-    crate::formats::openai::shared::OpenAiResponsesReasoningEffort::parse(value).is_some()
 }
 
 fn validate_openai_chat_to_responses(body: &Value) -> Result<(), FormatError> {
@@ -1670,7 +2257,6 @@ fn validate_openai_chat_to_responses(body: &Value) -> Result<(), FormatError> {
         "seed",
         "logprobs",
         "stream_options",
-        "user",
     ] {
         if object.contains_key(field) {
             return Err(FormatError::LossyConversionBlocked {
@@ -1682,7 +2268,64 @@ fn validate_openai_chat_to_responses(body: &Value) -> Result<(), FormatError> {
             });
         }
     }
+    if openai_chat_request_has_unsupported_responses_cache_breakpoint(object) {
+        return Err(FormatError::LossyConversionBlocked {
+            source_format: FormatId::OpenAiChat.as_str().to_string(),
+            target_format: FormatId::OpenAiResponses.as_str().to_string(),
+            field: "messages[].content[].prompt_cache_breakpoint".to_string(),
+            reason: "OpenAI Responses supports prompt cache breakpoints only on input_text, input_image, and input_file blocks".to_string(),
+        });
+    }
     Ok(())
+}
+
+fn openai_chat_request_has_unsupported_responses_cache_breakpoint(
+    request: &Map<String, Value>,
+) -> bool {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .any(|message| {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_ascii_lowercase);
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_object)
+                .any(|part| {
+                    part.contains_key("prompt_cache_breakpoint")
+                        && !openai_chat_part_maps_to_cacheable_responses_input(
+                            role.as_deref(),
+                            part,
+                        )
+                })
+        })
+}
+
+fn openai_chat_part_maps_to_cacheable_responses_input(
+    role: Option<&str>,
+    part: &Map<String, Value>,
+) -> bool {
+    if !matches!(role, Some("user" | "system" | "developer")) {
+        return false;
+    }
+    matches!(
+        part.get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("text")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "text" | "input_text" | "image_url" | "input_image" | "file" | "input_file"
+    )
 }
 
 fn validate_openai_responses_to_chat(
@@ -1700,6 +2343,7 @@ fn validate_openai_responses_to_chat(
         "conversation",
         "background",
         "max_tool_calls",
+        "multi_agent",
     ] {
         if object.contains_key(field) {
             return Err(FormatError::LossyConversionBlocked {
@@ -2740,7 +3384,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_claude_to_openai_chat_clamps_max_output_effort_to_high() {
+    fn pure_claude_to_openai_chat_preserves_max_output_effort() {
         let body = json!({
             "model": "claude-sonnet",
             "messages": [{"role": "user", "content": "hello"}],
@@ -2754,7 +3398,7 @@ mod tests {
             .expect("pure conversion should succeed")
             .value;
 
-        assert_eq!(converted["reasoning_effort"], "xhigh");
+        assert_eq!(converted["reasoning_effort"], "max");
     }
 
     #[test]
@@ -3241,6 +3885,666 @@ mod tests {
     }
 
     #[test]
+    fn pure_openai_responses_same_format_preserves_ptc_contract() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "program",
+                    "id": "program_1",
+                    "code": "result = lookup({\"id\": 7})"
+                },
+                {
+                    "type": "program_output",
+                    "program_id": "program_1",
+                    "output": "ok"
+                },
+                {
+                    "type": "agent_message",
+                    "agent_id": "agent_1",
+                    "content": [{"type": "input_text", "text": "delegated result"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{\"id\":7}",
+                    "caller": {"type": "program", "id": "program_1"}
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "found",
+                    "caller": {"type": "program", "id": "program_1"}
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Look up a record",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"id": {"type": "integer"}},
+                        "required": ["id"]
+                    },
+                    "strict": true,
+                    "output_schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}}
+                    },
+                    "allowed_callers": ["programmatic"]
+                },
+                {"type": "programmatic_tool_calling"}
+            ]
+        });
+
+        let converted = convert_request_pure("openai:responses", "openai:responses", &body)
+            .expect("same-format Responses conversion should preserve the PTC wire contract")
+            .value;
+
+        assert_eq!(converted["input"], body["input"]);
+        assert_eq!(converted["tools"], body["tools"]);
+        assert_eq!(
+            converted["tools"][0]["allowed_callers"],
+            json!(["programmatic"])
+        );
+        assert_eq!(converted["tools"][1]["type"], "programmatic_tool_calling");
+    }
+
+    #[test]
+    fn pure_openai_responses_same_format_preserves_message_items() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "message",
+                    "id": "msg_developer",
+                    "status": "completed",
+                    "role": "developer",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "Use policy",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    }]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_user",
+                    "status": "completed",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_assistant",
+                    "status": "completed",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [
+                        {"type": "output_text", "text": ""},
+                        {"type": "refusal", "refusal": "cannot comply"},
+                        {"type": "future_content", "payload": {"value": 1}}
+                    ]
+                }
+            ]
+        });
+
+        let converted = convert_request_pure("openai:responses", "openai:responses", &body)
+            .expect("same-format Responses conversion should preserve message input items")
+            .value;
+
+        assert_eq!(converted["input"], body["input"]);
+    }
+
+    #[test]
+    fn pure_openai_responses_refusal_history_fails_closed_across_formats() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "refusal", "refusal": "cannot comply"}]
+            }]
+        });
+
+        for target in ["openai:chat", "claude:messages", "gemini:generate_content"] {
+            let error = convert_request_pure("openai:responses", target, &body)
+                .expect_err("target request format cannot represent refusal history");
+            assert!(matches!(
+                error,
+                super::FormatError::LossyConversionBlocked { ref field, .. }
+                    if field == "messages[].content[].type"
+            ));
+        }
+    }
+
+    #[test]
+    fn pure_openai_responses_cross_format_rejects_opaque_input_item() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "program",
+                "call_id": "program-call-1",
+                "fingerprint": "fp-program-1"
+            }]
+        });
+
+        let error = convert_request_pure("openai:responses", "openai:chat", &body)
+            .expect_err("provider-scoped opaque item must fail closed across formats");
+
+        assert!(matches!(
+            error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "input[0]"
+        ));
+    }
+
+    #[test]
+    fn runtime_openai_responses_cross_format_rejects_unknown_content_block() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "hello"},
+                    {"type": "future_content_block", "payload": {"keep": true}}
+                ]
+            }]
+        });
+
+        let error = convert_request(
+            "openai:responses",
+            "claude:messages",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect_err("runtime conversion must fail closed for raw provider content blocks");
+
+        assert!(matches!(
+            error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "input[0].content[1]"
+        ));
+    }
+
+    #[test]
+    fn openai_responses_rejects_official_multi_agent_incompatibilities() {
+        let cases = [
+            (
+                "openai:responses:compact",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "hello",
+                    "multi_agent": {"enabled": true}
+                }),
+                "multi_agent",
+            ),
+            (
+                "openai:responses",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "hello",
+                    "multi_agent": {"enabled": true},
+                    "reasoning": {"effort": "high", "summary": "auto"}
+                }),
+                "reasoning.summary",
+            ),
+            (
+                "openai:responses",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "hello",
+                    "multi_agent": {"enabled": true},
+                    "max_tool_calls": 8
+                }),
+                "max_tool_calls",
+            ),
+        ];
+
+        for (format, body, expected_field) in cases {
+            let error = convert_request_pure(format, format, &body)
+                .expect_err("invalid multi-agent combination must be rejected");
+            assert!(matches!(
+                error,
+                super::FormatError::InvalidTargetField { ref field, .. }
+                    if field == expected_field
+            ));
+        }
+    }
+
+    #[test]
+    fn openai_responses_multi_agent_disabled_does_not_trigger_incompatibilities() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": "hello",
+            "multi_agent": {"enabled": false},
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "max_tool_calls": 8
+        });
+
+        let converted = convert_request_pure("openai:responses", "openai:responses", &body)
+            .expect("disabled multi-agent config must not activate incompatibility rules");
+
+        assert_eq!(converted.value["multi_agent"]["enabled"], false);
+    }
+
+    #[test]
+    fn openai_prompt_cache_contract_converts_responses_to_chat_without_loss() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "store": false,
+            "user": "user_123",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "stable text",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": "https://example.com/stable.png",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    },
+                    {
+                        "type": "input_file",
+                        "file_id": "file_123",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    }
+                ]
+            }]
+        });
+
+        let converted = convert_request_pure("openai:responses", "openai:chat", &body)
+            .expect("official Responses cache contract should map to Chat")
+            .value;
+
+        assert_eq!(
+            converted["prompt_cache_options"],
+            body["prompt_cache_options"]
+        );
+        assert_eq!(converted["store"], false);
+        assert_eq!(converted["user"], "user_123");
+        let parts = converted["messages"][0]["content"]
+            .as_array()
+            .expect("chat content should remain structured");
+        assert_eq!(parts.len(), 3);
+        assert!(parts
+            .iter()
+            .all(|part| { part["prompt_cache_breakpoint"] == json!({"mode": "explicit"}) }));
+    }
+
+    #[test]
+    fn openai_prompt_cache_contract_converts_chat_to_responses_without_loss() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "store": false,
+            "user": "user_123",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "stable text",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/stable.png"},
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    },
+                    {
+                        "type": "file",
+                        "file": {"file_id": "file_123"},
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    }
+                ]
+            }]
+        });
+
+        let converted = convert_request_pure("openai:chat", "openai:responses", &body)
+            .expect("official Chat cache contract should map to Responses")
+            .value;
+
+        assert_eq!(
+            converted["prompt_cache_options"],
+            body["prompt_cache_options"]
+        );
+        assert_eq!(converted["store"], false);
+        assert_eq!(converted["user"], "user_123");
+        let parts = converted["input"][0]["content"]
+            .as_array()
+            .expect("Responses content should remain structured");
+        assert_eq!(parts.len(), 3);
+        assert!(parts
+            .iter()
+            .all(|part| { part["prompt_cache_breakpoint"] == json!({"mode": "explicit"}) }));
+    }
+
+    #[test]
+    fn openai_prompt_cache_contract_is_preserved_for_compact() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "prompt_cache_key": "tenant:compact",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "stable text",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }]
+            }]
+        });
+
+        let converted = convert_request_pure("openai:chat", "openai:responses:compact", &body)
+            .expect("Compact supports the GPT-5.6 prompt cache contract")
+            .value;
+
+        assert_eq!(converted["prompt_cache_key"], "tenant:compact");
+        assert_eq!(
+            converted["prompt_cache_options"],
+            json!({"mode": "explicit", "ttl": "30m"})
+        );
+        assert_eq!(
+            converted["input"][0]["content"][0]["prompt_cache_breakpoint"],
+            json!({"mode": "explicit"})
+        );
+    }
+
+    #[test]
+    fn openai_prompt_cache_contract_uses_gpt_5_6_options_and_rejects_invalid_values() {
+        let retention = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "prompt_cache_retention": "24h"
+        });
+        let error = convert_request_pure("openai:chat", "openai:responses", &retention)
+            .expect_err("GPT-5.6 uses prompt_cache_options.ttl");
+        assert!(matches!(
+            error,
+            super::FormatError::InvalidTargetField { ref field, .. }
+                if field == "prompt_cache_retention"
+        ));
+
+        let invalid_options = json!({
+            "model": "gpt-5.6-sol",
+            "input": "hello",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "1h"}
+        });
+        let error = convert_request_pure("openai:responses", "openai:chat", &invalid_options)
+            .expect_err("cross-format conversion must validate cache option enums");
+        assert!(matches!(
+            error,
+            super::FormatError::InvalidEnumValue { ref field, .. }
+                if field == "prompt_cache_options.ttl"
+        ));
+    }
+
+    #[test]
+    fn openai_prompt_cache_contract_preserves_earlier_model_retention() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": "hello",
+            "prompt_cache_retention": "24h"
+        });
+        let converted = convert_request_pure("openai:responses", "openai:chat", &body)
+            .expect("GPT-5.5 24h retention should map between OpenAI APIs")
+            .value;
+
+        assert_eq!(converted["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn runtime_openai_prompt_cache_contract_uses_mapped_provider_model() {
+        let options = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"}
+        });
+        let converted = convert_request(
+            "openai:chat",
+            "openai:responses",
+            &options,
+            &FormatContext::default().with_mapped_model("gpt-5.6-sol"),
+        )
+        .expect("mapped GPT-5.6 provider model should accept prompt_cache_options");
+        assert_eq!(
+            converted["prompt_cache_options"],
+            options["prompt_cache_options"]
+        );
+
+        let error = convert_request(
+            "openai:chat",
+            "openai:responses",
+            &options,
+            &FormatContext::default().with_mapped_model("gpt-5.5"),
+        )
+        .expect_err("mapped earlier provider model should reject prompt_cache_options");
+        assert!(matches!(
+            error,
+            super::FormatError::InvalidTargetField { ref field, .. }
+                if field == "prompt_cache_options"
+        ));
+
+        let retention = json!({
+            "model": "gpt-5.6-sol",
+            "input": "hello",
+            "prompt_cache_retention": "24h"
+        });
+        let converted = convert_request(
+            "openai:responses",
+            "openai:chat",
+            &retention,
+            &FormatContext::default().with_mapped_model("gpt-5.5"),
+        )
+        .expect("mapped earlier provider model should accept its retention contract");
+        assert_eq!(converted["prompt_cache_retention"], "24h");
+
+        let error = convert_request(
+            "openai:responses",
+            "openai:chat",
+            &retention,
+            &FormatContext::default().with_mapped_model("gpt-5.6-luna"),
+        )
+        .expect_err("mapped GPT-5.6 provider model uses prompt_cache_options.ttl");
+        assert!(matches!(
+            error,
+            super::FormatError::InvalidTargetField { ref field, .. }
+                if field == "prompt_cache_retention"
+        ));
+    }
+
+    #[test]
+    fn openai_cross_format_store_only_maps_false() {
+        for (source, target, body) in [
+            (
+                "openai:chat",
+                "openai:responses",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "store": true
+                }),
+            ),
+            (
+                "openai:responses",
+                "openai:chat",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "hello",
+                    "store": true
+                }),
+            ),
+        ] {
+            let error = convert_request_pure(source, target, &body)
+                .expect_err("store=true has different behavior across the OpenAI APIs");
+            assert!(matches!(
+                error,
+                super::FormatError::LossyConversionBlocked { ref field, .. }
+                    if field == "store"
+            ));
+        }
+    }
+
+    #[test]
+    fn openai_chat_store_is_validated_then_omitted_for_compact() {
+        for store in [true, false] {
+            let converted = convert_request_pure(
+                "openai:chat",
+                "openai:responses:compact",
+                &json!({
+                    "model": "gpt-5.6-sol",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "store": store
+                }),
+            )
+            .expect("Compact should validate and omit the transport-ineligible store field");
+            assert!(converted.value.get("store").is_none());
+        }
+
+        let error = convert_request_pure(
+            "openai:chat",
+            "openai:responses:compact",
+            &json!({
+                "model": "gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "hello"}],
+                "store": "true"
+            }),
+        )
+        .expect_err("Compact should reject a non-boolean store field");
+        assert!(matches!(
+            error,
+            super::FormatError::InvalidTargetField { ref field, .. }
+                if field == "store"
+        ));
+    }
+
+    #[test]
+    fn openai_chat_audio_cache_breakpoint_fails_closed_for_responses() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": {"data": "ZmFrZQ==", "format": "mp3"},
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }]
+            }]
+        });
+
+        let error = convert_request_pure("openai:chat", "openai:responses", &body)
+            .expect_err("Responses does not support cache breakpoints on audio blocks");
+
+        assert!(matches!(
+            error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "messages[].content[].prompt_cache_breakpoint"
+        ));
+    }
+
+    #[test]
+    fn openai_chat_assistant_text_cache_breakpoint_fails_closed_for_responses() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": "previous output",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }]
+            }]
+        });
+
+        let error = convert_request_pure("openai:chat", "openai:responses", &body)
+            .expect_err("assistant text maps to output_text, which cannot carry a breakpoint");
+
+        assert!(matches!(
+            error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "messages[].content[].prompt_cache_breakpoint"
+        ));
+    }
+
+    #[test]
+    fn runtime_responses_cross_format_blocks_advanced_reasoning_and_caller_fields() {
+        for (body, expected_field) in [
+            (
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "hello",
+                    "reasoning": {"effort": "high", "mode": "pro"}
+                }),
+                "thinking.openai_responses.mode",
+            ),
+            (
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "hello",
+                    "reasoning": {"effort": "high", "context": "all_turns"}
+                }),
+                "thinking.openai_responses.context",
+            ),
+            (
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "hello",
+                    "multi_agent": {"enabled": true}
+                }),
+                "multi_agent",
+            ),
+            (
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": [{
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "{}",
+                        "caller": {"type": "multi_agent", "id": "agent_1"}
+                    }]
+                }),
+                "input[0].caller",
+            ),
+            (
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": [{
+                        "type": "web_search_call",
+                        "id": "search_1",
+                        "action": {"query": "latest docs"}
+                    }]
+                }),
+                "input[0]",
+            ),
+        ] {
+            let error = convert_request(
+                "openai:responses",
+                "openai:chat",
+                &body,
+                &FormatContext::default(),
+            )
+            .expect_err("runtime conversion must fail closed for provider-only fields");
+            assert!(
+                matches!(
+                    error,
+                    super::FormatError::LossyConversionBlocked { ref field, .. }
+                        if field == expected_field
+                ),
+                "unexpected conversion error for {expected_field}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn pure_openai_chat_to_claude_blocks_target_unsupported_generation_field() {
         let body = json!({
             "model": "gpt-source",
@@ -3336,40 +4640,233 @@ mod tests {
     }
 
     #[test]
-    fn pure_openai_cross_format_rejects_invalid_reasoning_effort_enum() {
-        let body = json!({
-            "model": "gpt-source",
+    fn pure_openai_cross_format_preserves_reasoning_effort_contract() {
+        for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+            let chat = json!({
+                "model": "gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": effort
+            });
+            let responses = convert_request_pure("openai:chat", "openai:responses", &chat)
+                .expect("Chat effort should convert to Responses")
+                .value;
+            assert_eq!(responses["reasoning"]["effort"], effort);
+
+            let responses = json!({
+                "model": "gpt-5.6-sol",
+                "input": [{"role": "user", "content": "hello"}],
+                "reasoning": {"effort": effort}
+            });
+            let chat = convert_request_pure("openai:responses", "openai:chat", &responses)
+                .expect("Responses effort should convert to Chat")
+                .value;
+            assert_eq!(chat["reasoning_effort"], effort);
+        }
+    }
+
+    #[test]
+    fn runtime_openai_cross_format_preserves_gpt_5_6_reasoning_efforts() {
+        for target in ["openai:responses", "openai:responses:compact"] {
+            for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+                let chat = json!({
+                    "model": "deployment-alias",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "reasoning_effort": effort
+                });
+                let responses = convert_request(
+                    "openai:chat",
+                    target,
+                    &chat,
+                    &FormatContext::default().with_mapped_model("gpt-5.6-sol"),
+                )
+                .expect("runtime Chat effort should convert to Responses");
+                assert_eq!(responses["reasoning"]["effort"], effort, "target: {target}");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_reasoning_effort_uses_concrete_mapped_model_as_authoritative_capability() {
+        let alias_to_gpt_5_6 = json!({
+            "model": "deployment-alias",
             "messages": [{"role": "user", "content": "hello"}],
             "reasoning_effort": "max"
         });
+        let converted = convert_request(
+            "openai:chat",
+            "openai:responses",
+            &alias_to_gpt_5_6,
+            &FormatContext::default().with_mapped_model("gpt-5.6-sol"),
+        )
+        .expect("a concrete GPT-5.6 mapped target should accept max");
+        assert_eq!(converted["model"], "gpt-5.6-sol");
+        assert_eq!(converted["reasoning"]["effort"], "max");
 
-        let error = convert_request_pure("openai:chat", "openai:responses", &body)
-            .expect_err("invalid OpenAI enum should fail closed");
-
+        let gpt_5_6_to_gpt_5_4 = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "max"
+        });
+        let error = convert_request(
+            "openai:chat",
+            "openai:responses",
+            &gpt_5_6_to_gpt_5_4,
+            &FormatContext::default().with_mapped_model("gpt-5.4"),
+        )
+        .expect_err("a concrete GPT-5.4 mapped target must reject max");
         assert!(matches!(
             error,
-            super::FormatError::InvalidEnumValue { ref field, ref value, .. }
-                if field == "reasoning_effort" && value == "max"
+            super::FormatError::InvalidTargetField { ref field, .. }
+                if field == "reasoning_effort"
         ));
     }
 
     #[test]
-    fn pure_openai_responses_to_chat_rejects_invalid_reasoning_effort_enum() {
-        let body = json!({
-            "model": "gpt-source",
+    fn pure_conversion_reasoning_effort_uses_the_concrete_mapped_model() {
+        let alias_to_gpt_5_6 = json!({
+            "model": "deployment-alias",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "max"
+        });
+        let converted = convert_request_pure_with_context(
+            "openai:chat",
+            "openai:responses",
+            &alias_to_gpt_5_6,
+            &FormatContext::default().with_mapped_model("gpt-5.6-sol"),
+        )
+        .expect("a concrete GPT-5.6 target should accept max");
+        assert_eq!(converted.value["reasoning"]["effort"], "max");
+
+        let gpt_5_6_to_gpt_5_4 = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "max"
+        });
+        let error = convert_request_pure_with_context(
+            "openai:chat",
+            "openai:responses",
+            &gpt_5_6_to_gpt_5_4,
+            &FormatContext::default().with_mapped_model("gpt-5.4"),
+        )
+        .expect_err("a concrete GPT-5.4 target must reject max");
+        assert!(matches!(
+            error,
+            super::FormatError::InvalidTargetField { ref field, .. }
+                if field == "reasoning_effort"
+        ));
+    }
+
+    #[test]
+    fn runtime_openai_cross_format_enforces_known_efforts_and_preserves_custom_efforts() {
+        let alias_minimal = json!({
+            "model": "deployment-alias",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "minimal"
+        });
+        for target in ["openai:responses", "openai:responses:compact"] {
+            let error = convert_request(
+                "openai:chat",
+                target,
+                &alias_minimal,
+                &FormatContext::default().with_mapped_model("gpt-5.6-terra"),
+            )
+            .expect_err("mapped GPT-5.6 deployments must reject minimal effort");
+            assert!(matches!(
+                error,
+                super::FormatError::InvalidTargetField { ref field, .. }
+                    if field == "reasoning_effort"
+            ));
+        }
+
+        let custom = json!({
+            "model": "gpt-5.6-sol",
             "input": [{"role": "user", "content": "hello"}],
-            "reasoning": {
-                "effort": "max"
-            }
+            "reasoning": {"effort": "future"}
+        });
+        for source in ["openai:responses", "openai:responses:compact"] {
+            let converted = convert_request(
+                source,
+                "openai:chat",
+                &custom,
+                &FormatContext::default().with_mapped_model("gpt-5.6-sol"),
+            )
+            .expect("model-advertised effort should survive runtime conversion");
+            assert_eq!(converted["reasoning_effort"], "future");
+        }
+
+        let ultra = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{"role": "user", "content": "hello"}],
+            "reasoning": {"effort": "ultra"}
+        });
+        for source in ["openai:responses", "openai:responses:compact"] {
+            let error = convert_request(
+                source,
+                "openai:chat",
+                &ultra,
+                &FormatContext::default().with_mapped_model("gpt-5.6-sol"),
+            )
+            .expect_err("Codex local ultra preset should not enter the OpenAI wire contract");
+            assert!(matches!(
+                error,
+                super::FormatError::InvalidEnumValue { ref field, ref value, .. }
+                    if field == "reasoning.effort" && value == "ultra"
+            ));
+        }
+    }
+
+    #[test]
+    fn pure_openai_cross_format_preserves_custom_reasoning_effort() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "future"
         });
 
-        let error = convert_request_pure("openai:responses", "openai:chat", &body)
-            .expect_err("invalid Responses reasoning enum should fail closed");
+        let converted = convert_request_pure("openai:chat", "openai:responses", &body)
+            .expect("custom effort should remain wire-compatible");
+        assert_eq!(converted.value["reasoning"]["effort"], "future");
 
+        let ultra = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "ultra"
+        });
+        let error = convert_request_pure("openai:chat", "openai:responses", &ultra)
+            .expect_err("Codex local ultra preset should not enter the OpenAI wire contract");
         assert!(matches!(
             error,
             super::FormatError::InvalidEnumValue { ref field, ref value, .. }
-                if field == "reasoning.effort" && value == "max"
+                if field == "reasoning_effort" && value == "ultra"
+        ));
+    }
+
+    #[test]
+    fn pure_openai_cross_format_rejects_gpt_5_6_minimal_effort() {
+        let chat = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "minimal"
+        });
+        let error = convert_request_pure("openai:chat", "openai:responses", &chat)
+            .expect_err("GPT-5.6 does not publish minimal as a supported effort");
+        assert!(matches!(
+            error,
+            super::FormatError::InvalidTargetField { ref field, .. }
+                if field == "reasoning_effort"
+        ));
+
+        let responses = json!({
+            "model": "gpt-5.6-terra",
+            "input": [{"role": "user", "content": "hello"}],
+            "reasoning": {"effort": "minimal"}
+        });
+        let error = convert_request_pure("openai:responses", "openai:chat", &responses)
+            .expect_err("GPT-5.6 does not publish minimal as a supported effort");
+        assert!(matches!(
+            error,
+            super::FormatError::InvalidTargetField { ref field, .. }
+                if field == "reasoning.effort"
         ));
     }
 
@@ -3588,6 +5085,7 @@ mod tests {
                 {
                     "type": "message",
                     "id": "msg_123",
+                    "status": "completed",
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": "done"}]
                 }
@@ -3598,10 +5096,49 @@ mod tests {
             .expect("same-format Responses response should preserve raw output items")
             .value;
 
-        assert_eq!(converted["output"][0]["type"], "file_search_call");
-        assert_eq!(converted["output"][0]["results"][0]["file_id"], "file_123");
-        assert_eq!(converted["output"][1]["type"], "code_interpreter_call");
-        assert_eq!(converted["output"][2]["content"][0]["text"], "done");
+        assert_eq!(converted["output"], body["output"]);
+    }
+
+    #[test]
+    fn pure_openai_responses_response_preserves_ptc_and_blocks_lossy_targets() {
+        let body = json!({
+            "id": "resp_ptc",
+            "object": "response",
+            "model": "gpt-5.6-sol",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "status": "completed",
+                    "name": "lookup",
+                    "arguments": "{\"id\":7}",
+                    "caller": {"type": "program", "id": "program_1"}
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "found",
+                    "caller": {"type": "program", "id": "program_1"}
+                }
+            ]
+        });
+
+        let same_format = convert_response_pure("openai:responses", "openai:responses", &body)
+            .expect("same-format response should preserve PTC output items")
+            .value;
+        assert_eq!(same_format["output"], body["output"]);
+
+        for target in ["openai:chat", "claude:messages", "gemini:generate_content"] {
+            let error = convert_response_pure("openai:responses", target, &body)
+                .expect_err("target response format cannot preserve PTC caller provenance");
+            assert!(matches!(
+                error,
+                super::FormatError::LossyConversionBlocked { ref field, .. }
+                    if field.ends_with(".caller")
+            ));
+        }
     }
 
     #[test]
@@ -3627,6 +5164,111 @@ mod tests {
             super::FormatError::LossyConversionBlocked { ref field, .. }
                 if field == "output[].type"
         ));
+    }
+
+    #[test]
+    fn pure_openai_responses_response_refusal_only_maps_to_openai_chat() {
+        let body = json!({
+            "id": "resp_refusal",
+            "object": "response",
+            "model": "gpt-5.6-sol",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_refusal",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "refusal", "refusal": "cannot comply"}]
+            }]
+        });
+
+        let chat = convert_response_pure("openai:responses", "openai:chat", &body)
+            .expect("OpenAI Chat has a refusal response field")
+            .value;
+        assert_eq!(chat["choices"][0]["message"]["refusal"], "cannot comply");
+
+        for target in ["claude:messages", "gemini:generate_content"] {
+            let error = convert_response_pure("openai:responses", target, &body)
+                .expect_err("target response format cannot preserve refusal content");
+            assert!(matches!(
+                error,
+                super::FormatError::LossyConversionBlocked { ref field, .. }
+                    if field == "output[].type"
+            ));
+        }
+    }
+
+    #[test]
+    fn pure_openai_responses_response_blocks_unknown_message_item_fields_cross_format() {
+        let body = json!({
+            "id": "resp_message_extension",
+            "object": "response",
+            "model": "gpt-5.6-sol",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_extension",
+                "status": "completed",
+                "role": "assistant",
+                "future_message_option": {"mode": "verified"},
+                "content": [{"type": "output_text", "text": "done"}]
+            }]
+        });
+
+        let same_format = convert_response_pure("openai:responses", "openai:responses", &body)
+            .expect("same-format response should preserve message item fields")
+            .value;
+        assert_eq!(same_format["output"], body["output"]);
+
+        for target in ["openai:chat", "claude:messages", "gemini:generate_content"] {
+            let error = convert_response_pure("openai:responses", target, &body)
+                .expect_err("target response format cannot preserve message item extensions");
+            assert!(matches!(
+                error,
+                super::FormatError::LossyConversionBlocked { ref field, .. }
+                    if field == "output[0].future_message_option"
+            ));
+        }
+    }
+
+    #[test]
+    fn pure_openai_responses_response_preserves_usage_and_audits_unknown_details() {
+        let body = json!({
+            "id": "resp_usage_extension",
+            "object": "response",
+            "model": "gpt-5.6-sol",
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "total_tokens": 150,
+                "input_tokens_details": {
+                    "cached_tokens": 40,
+                    "future_cache_tokens": 3
+                },
+                "output_tokens_details": {
+                    "reasoning_tokens": 20,
+                    "future_reasoning_tokens": 2
+                },
+                "future_usage_option": "metered"
+            }
+        });
+
+        let same_format = convert_response_pure("openai:responses", "openai:responses", &body)
+            .expect("same-format response should preserve usage extensions")
+            .value;
+        assert_eq!(same_format["usage"], body["usage"]);
+
+        for target in ["openai:chat", "claude:messages", "gemini:generate_content"] {
+            let error = convert_response_pure("openai:responses", target, &body)
+                .expect_err("target response format cannot preserve unknown usage details");
+            assert!(matches!(
+                error,
+                super::FormatError::LossyConversionBlocked { ref field, .. }
+                    if field == "usage.input_tokens_details.future_cache_tokens"
+            ));
+        }
     }
 
     #[test]

@@ -221,6 +221,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("endpoints_manage"), http::Method::POST, Some("create_endpoint"))
                 | (Some("endpoints_manage"), http::Method::POST, Some("batch_delete_keys"))
                 | (Some("endpoints_manage"), http::Method::POST, Some("refresh_quota"))
+                | (
+                    Some("endpoints_manage"),
+                    http::Method::POST,
+                    Some("codex_reset_credit_consume"),
+                )
                 | (Some("endpoints_manage"), http::Method::PUT, Some("update_key"))
                 | (Some("endpoints_manage"), http::Method::PUT, Some("update_endpoint"))
                 | (Some("modules_manage"), http::Method::PUT, Some("set_enabled"))
@@ -366,6 +371,7 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("users_manage"), http::Method::PATCH, Some("lock_user_api_key"))
                 | (Some("pool_manage"), http::Method::POST, Some("batch_import_keys"))
                 | (Some("pool_manage"), http::Method::POST, Some("batch_action_keys"))
+                | (Some("pool_manage"), http::Method::POST, Some("create_selection_snapshot"))
                 | (Some("pool_manage"), http::Method::POST, Some("resolve_selection"))
                 | (Some("usage_manage"), http::Method::POST, Some("replay"))
                 | (Some("wallets_manage"), http::Method::POST, Some("adjust_balance"))

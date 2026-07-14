@@ -742,6 +742,7 @@ impl OpenAiImageStreamTerminalState {
                 .model
                 .clone()
                 .or_else(|| image_bridge_model(Some(report_context))),
+            provider_actual_service_tier: None,
             observed_finish: self.observed_finish,
             unknown_event_count: 0,
             parser_error: self.parser_error.clone(),
@@ -856,6 +857,7 @@ fn openai_image_usage_to_standardized_usage(value: &Value) -> Option<Standardize
                     details
                         .get("cache_write_tokens")
                         .or_else(|| details.get("cached_creation_tokens"))
+                        .or_else(|| details.get("cache_creation_tokens"))
                 })
                 .and_then(Value::as_i64)
         })
@@ -937,6 +939,7 @@ fn openai_image_chat_usage_counts(usage: Option<&Value>) -> Option<(u64, u64, u6
                     details
                         .get("cache_write_tokens")
                         .or_else(|| details.get("cached_creation_tokens"))
+                        .or_else(|| details.get("cache_creation_tokens"))
                 })
                 .and_then(Value::as_u64)
         })

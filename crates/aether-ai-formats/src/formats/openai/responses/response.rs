@@ -5,6 +5,8 @@ use std::{
 
 use serde_json::{json, Map, Value};
 
+use super::encode_tool_result_error;
+
 use crate::{
     formats::context::FormatContext,
     protocol::canonical::{
@@ -12,12 +14,14 @@ use crate::{
         canonical_tool_use_to_openai_responses_item, canonical_usage_to_openai_responses_usage,
         flush_openai_responses_message_item, is_openai_responses_raw_block,
         is_openai_thinking_block, namespace_extension_object, openai_responses_extensions,
-        openai_responses_output_to_canonical_blocks, openai_usage_to_canonical,
-        CanonicalContentBlock, CanonicalResponse, CanonicalResponseOutput, CanonicalRole,
-        CanonicalStopReason, OPENAI_RESPONSES_EXTENSION_NAMESPACE,
-        OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
+        openai_responses_item_extension_object, openai_responses_output_to_canonical,
+        openai_responses_usage_to_canonical, openai_service_tier_extension, CanonicalContentBlock,
+        CanonicalResponse, CanonicalResponseOutput, CanonicalRole, CanonicalStopReason,
+        OPENAI_RESPONSES_EXTENSION_NAMESPACE, OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
     },
 };
+
+const AETHER_RESPONSES_RAW_OUTPUT_KEY: &str = "openai_responses_raw_output";
 
 pub fn from(body: &Value, _ctx: &FormatContext) -> Option<CanonicalResponse> {
     from_raw(body)
@@ -38,7 +42,7 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalResponse> {
     {
         return None;
     }
-    let content = openai_responses_output_to_canonical_blocks(body.get("output"))?;
+    let (content, output_extensions) = openai_responses_output_to_canonical(body.get("output"))?;
     let has_tool_use = content
         .iter()
         .any(|block| matches!(block, CanonicalContentBlock::ToolUse { .. }));
@@ -53,11 +57,17 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalResponse> {
     };
     let mut extensions = openai_responses_extensions(
         body,
-        &["id", "object", "model", "output", "usage", "status"],
+        &[
+            "id", "object", "model", "output", "usage", "status", "error",
+        ],
     );
     if let Some(raw_status) = body.get("status").cloned() {
         canonical_extension_object_mut(&mut extensions, OPENAI_RESPONSES_EXTENSION_NAMESPACE)
             .insert("raw_status".to_string(), raw_status);
+    }
+    if let Some(raw_output) = body.get("output").cloned() {
+        canonical_extension_object_mut(&mut extensions, "aether")
+            .insert(AETHER_RESPONSES_RAW_OUTPUT_KEY.to_string(), raw_output);
     }
     Some(CanonicalResponse {
         id: body
@@ -75,11 +85,11 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalResponse> {
             role: CanonicalRole::Assistant,
             content: content.clone(),
             stop_reason: stop_reason.clone(),
-            extensions: BTreeMap::new(),
+            extensions: output_extensions,
         }],
         content,
         stop_reason,
-        usage: openai_usage_to_canonical(body.get("usage")),
+        usage: openai_responses_usage_to_canonical(body.get("usage")),
         extensions,
     })
 }
@@ -97,26 +107,35 @@ fn openai_responses_incomplete_stop_reason(body: &Map<String, Value>) -> Canonic
     }
 }
 
-pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, _compact: bool) -> Value {
+pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bool) -> Value {
     let mut response = Map::new();
     let response_id = canonical.id.replace("chatcmpl", "resp");
     response.insert("id".to_string(), Value::String(response_id.clone()));
-    response.insert("object".to_string(), Value::String("response".to_string()));
-    response.insert("status".to_string(), Value::String("completed".to_string()));
-    response.insert("model".to_string(), Value::String(canonical.model.clone()));
-    if let Some(raw_status) = canonical
-        .extensions
-        .get(OPENAI_RESPONSES_EXTENSION_NAMESPACE)
-        .or_else(|| {
-            canonical
-                .extensions
-                .get(OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE)
-        })
-        .and_then(Value::as_object)
-        .and_then(|openai| openai.get("raw_status"))
-        .cloned()
-    {
-        response.insert("status".to_string(), raw_status);
+    response.insert(
+        "object".to_string(),
+        Value::String(if compact {
+            "response.compaction".to_string()
+        } else {
+            "response".to_string()
+        }),
+    );
+    if !compact {
+        response.insert("status".to_string(), Value::String("completed".to_string()));
+        response.insert("model".to_string(), Value::String(canonical.model.clone()));
+        if let Some(raw_status) = canonical
+            .extensions
+            .get(OPENAI_RESPONSES_EXTENSION_NAMESPACE)
+            .or_else(|| {
+                canonical
+                    .extensions
+                    .get(OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE)
+            })
+            .and_then(Value::as_object)
+            .and_then(|openai| openai.get("raw_status"))
+            .cloned()
+        {
+            response.insert("status".to_string(), raw_status);
+        }
     }
 
     let mut output = Vec::new();
@@ -253,13 +272,15 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, _compact: b
                 item.insert("call_id".to_string(), Value::String(tool_use_id.clone()));
                 item.insert(
                     "output".to_string(),
-                    result_output
-                        .clone()
-                        .unwrap_or_else(|| Value::String(content_text.clone().unwrap_or_default())),
+                    encode_tool_result_error(
+                        result_output.clone().unwrap_or_else(|| {
+                            Value::String(content_text.clone().unwrap_or_default())
+                        }),
+                        *is_error,
+                    ),
                 );
-                if *is_error {
-                    item.insert("is_error".to_string(), Value::Bool(true));
-                }
+                let extension_fields = openai_responses_item_extension_object(extensions, &item);
+                item.extend(extension_fields);
                 output.push(Value::Object(item));
             }
             CanonicalContentBlock::Unknown {
@@ -296,12 +317,37 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, _compact: b
         &response_id,
         &mut message_index,
     );
+    if let Some(raw_output) = canonical
+        .extensions
+        .get("aether")
+        .and_then(Value::as_object)
+        .and_then(|aether| aether.get(AETHER_RESPONSES_RAW_OUTPUT_KEY))
+        .and_then(Value::as_array)
+    {
+        output.clone_from(raw_output);
+    }
     response.insert("output".to_string(), Value::Array(output));
     if let Some(usage) = &canonical.usage {
         response.insert(
             "usage".to_string(),
             canonical_usage_to_openai_responses_usage(usage),
         );
+    }
+    if compact {
+        let created_at = canonical
+            .extensions
+            .get(OPENAI_RESPONSES_EXTENSION_NAMESPACE)
+            .or_else(|| {
+                canonical
+                    .extensions
+                    .get(OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE)
+            })
+            .and_then(Value::as_object)
+            .and_then(|openai| openai.get("created_at").or_else(|| openai.get("created")))
+            .and_then(openai_responses_timestamp_value)
+            .unwrap_or_else(openai_responses_current_timestamp);
+        response.insert("created_at".to_string(), Value::from(created_at));
+        return Value::Object(response);
     }
     if let Some(request_object) = report_context
         .get("original_request_body")
@@ -327,9 +373,9 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, _compact: b
                 response.insert(key.to_string(), value.clone());
             }
         }
-        if let Some(service_tier) = request_object.get("service_tier").cloned() {
-            response.insert("service_tier".to_string(), service_tier);
-        }
+    }
+    if let Some(service_tier) = openai_service_tier_extension(&canonical.extensions).cloned() {
+        response.insert("service_tier".to_string(), service_tier);
     }
     let mut extension_fields = namespace_extension_object(
         &canonical.extensions,
@@ -572,6 +618,70 @@ mod tests {
         assert_eq!(body["created_at"], 111);
         assert_eq!(body["completed_at"], 222);
         assert_eq!(body["conversation"]["id"], "conv_123");
+    }
+
+    #[test]
+    fn responses_response_builder_encodes_tool_errors_in_output() {
+        let response = CanonicalResponse {
+            id: "resp_tool_error".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            content: vec![CanonicalContentBlock::ToolResult {
+                tool_use_id: "call_error".to_string(),
+                name: None,
+                output: Some(json!("command failed")),
+                content_text: None,
+                is_error: true,
+                extensions: BTreeMap::new(),
+            }],
+            outputs: Vec::new(),
+            stop_reason: Some(CanonicalStopReason::EndTurn),
+            usage: None,
+            extensions: BTreeMap::new(),
+        };
+
+        let body = to_raw(&response, &json!({}), false);
+        let item = &body["output"][0];
+
+        assert_eq!(item["type"], "function_call_output");
+        assert_eq!(item["call_id"], "call_error");
+        assert_eq!(item["output"], "[tool error]\ncommand failed");
+        assert!(item.get("is_error").is_none());
+    }
+
+    #[test]
+    fn compact_response_builder_emits_the_compaction_resource_shape() {
+        let mut extensions = BTreeMap::new();
+        extensions.insert(
+            OPENAI_RESPONSES_EXTENSION_NAMESPACE.to_string(),
+            json!({"created_at": 123}),
+        );
+        let response = CanonicalResponse {
+            id: "resp_compact".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            content: vec![CanonicalContentBlock::Text {
+                text: "compacted context".to_string(),
+                extensions: BTreeMap::new(),
+            }],
+            outputs: Vec::new(),
+            stop_reason: Some(CanonicalStopReason::EndTurn),
+            usage: None,
+            extensions,
+        };
+
+        let body = to_raw(&response, &json!({}), true);
+        let keys = body
+            .as_object()
+            .expect("Compact response should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(body["object"], "response.compaction");
+        assert_eq!(body["created_at"], 123);
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["created_at", "id", "object", "output"])
+        );
     }
 
     #[test]

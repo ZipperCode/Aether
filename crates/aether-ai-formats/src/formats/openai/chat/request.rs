@@ -2,7 +2,6 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     formats::context::FormatContext,
-    formats::openai::shared::OpenAiChatReasoningEffort,
     protocol::canonical::{
         canonical_extension_object_mut, canonical_message_to_openai_chat_messages,
         canonical_response_format_to_openai, canonical_tool_choice_to_openai,
@@ -367,11 +366,8 @@ fn non_empty_source_str<'a>(source: &'a Map<String, Value>, key: &str) -> Option
         .filter(|value| !value.trim().is_empty())
 }
 
-fn openai_chat_reasoning_effort(value: &str) -> Option<&'static str> {
-    if value.trim().eq_ignore_ascii_case("max") {
-        return Some("xhigh");
-    }
-    OpenAiChatReasoningEffort::parse(value).map(OpenAiChatReasoningEffort::as_str)
+fn openai_chat_reasoning_effort(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn chat_compatible_openai_responses_extension_object(
@@ -384,7 +380,14 @@ fn chat_compatible_openai_responses_extension_object(
         .filter(|(key, _)| {
             matches!(
                 key.as_str(),
-                "verbosity" | "service_tier" | "prompt_cache_key" | "safety_identifier" | "user"
+                "verbosity"
+                    | "store"
+                    | "service_tier"
+                    | "prompt_cache_key"
+                    | "prompt_cache_options"
+                    | "prompt_cache_retention"
+                    | "safety_identifier"
+                    | "user"
             )
         })
         .collect()

@@ -6,6 +6,7 @@ import type { ProviderModelMapping } from './provider'
 export interface CacheTTLPricing {
   ttl_minutes: number
   cache_creation_price_per_1m: number
+  [key: string]: unknown
 }
 
 /** 单个价格阶梯配置 */
@@ -16,22 +17,39 @@ export interface PricingTier {
   cache_creation_price_per_1m?: number
   cache_read_price_per_1m?: number
   cache_ttl_pricing?: CacheTTLPricing[]
+  [key: string]: unknown
 }
 
 export type ImageOutputQuality = 'low' | 'medium' | 'high'
 
+export interface ImageOutputQualityPricing extends Partial<Record<ImageOutputQuality, number>> {
+  [quality: string]: unknown
+}
+
 export interface ImageOutputPriceRange {
   up_to_pixels: number | null
-  prices: Partial<Record<ImageOutputQuality, number>>
+  prices: ImageOutputQualityPricing
   label?: string | null
+  [key: string]: unknown
+}
+
+/** 按处理层级覆盖的费率配置。允许图像或未来计费字段独立扩展。 */
+export interface ProcessingTierPricingConfig {
+  tiers?: PricingTier[]
+  image_output_prices?: Record<string, ImageOutputQualityPricing> | null
+  image_output_price_default?: number | null
+  image_output_price_ranges?: ImageOutputPriceRange[] | null
+  [key: string]: unknown
 }
 
 /** 阶梯计费配置 */
 export interface TieredPricingConfig {
   tiers: PricingTier[]
-  image_output_prices?: Record<string, Record<string, number>> | null
+  image_output_prices?: Record<string, ImageOutputQualityPricing> | null
   image_output_price_default?: number | null
   image_output_price_ranges?: ImageOutputPriceRange[] | null
+  processing_tiers?: Record<string, ProcessingTierPricingConfig> | null
+  [key: string]: unknown
 }
 
 export interface Model {
@@ -270,6 +288,8 @@ export interface UpstreamModel {
   id: string
   owned_by?: string
   display_name?: string
+  visibility?: string
+  supported_in_api?: boolean
   api_formats: string[]  // 该模型支持的所有 API 格式（后端保证返回数组）
   model_test_capabilities?: ModelTestCapabilities | null
 }

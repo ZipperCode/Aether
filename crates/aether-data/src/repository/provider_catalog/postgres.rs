@@ -4,7 +4,8 @@ use sqlx::{postgres::PgRow, PgPool, Postgres, QueryBuilder, Row};
 
 use super::{
     ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
@@ -1857,6 +1858,147 @@ WHERE id = $1
         Ok(rows_affected > 0)
     }
 
+    pub async fn upsert_key_upstream_metadata_namespace(
+        &self,
+        key_id: &str,
+        namespace: &str,
+        value: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        if key_id.trim().is_empty() || namespace.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog key_id and upstream metadata namespace are required".to_string(),
+            ));
+        }
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET
+  upstream_metadata = COALESCE(upstream_metadata, '{}'::jsonb) || jsonb_build_object($2, $3::jsonb),
+  updated_at = CASE
+    WHEN $4::double precision IS NULL THEN NOW()
+    ELSE TO_TIMESTAMP($4::double precision)
+  END
+WHERE id = $1
+"#,
+        )
+        .bind(key_id)
+        .bind(namespace)
+        .bind(value)
+        .bind(updated_at_unix_secs.map(|value| value as f64))
+        .execute(&self.pool)
+        .await
+        .map_postgres_err()?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
+    pub async fn update_key_model_fetch_state(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: Option<u64>,
+        last_models_fetch_error: Option<&str>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        if key_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog key_id is empty".to_string(),
+            ));
+        }
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET
+  allowed_models = $2,
+  last_models_fetch_at = CASE
+    WHEN $3::double precision IS NULL THEN NULL
+    ELSE TO_TIMESTAMP($3::double precision)
+  END,
+  last_models_fetch_error = $4,
+  updated_at = CASE
+    WHEN $5::double precision IS NULL THEN NOW()
+    ELSE TO_TIMESTAMP($5::double precision)
+  END
+WHERE id = $1
+"#,
+        )
+        .bind(key_id)
+        .bind(allowed_models)
+        .bind(last_models_fetch_at_unix_secs.map(|value| value as f64))
+        .bind(last_models_fetch_error)
+        .bind(updated_at_unix_secs.map(|value| value as f64))
+        .execute(&self.pool)
+        .await
+        .map_postgres_err()?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
+    pub async fn update_key_model_fetch_success(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: u64,
+        upstream_metadata_updates: &[ProviderCatalogUpstreamMetadataNamespaceUpdate],
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        if key_id.trim().is_empty()
+            || upstream_metadata_updates
+                .iter()
+                .any(|update| update.namespace.trim().is_empty())
+        {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog key_id and upstream metadata namespaces are required".to_string(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_postgres_err()?;
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET
+  allowed_models = $2,
+  last_models_fetch_at = TO_TIMESTAMP($3::double precision),
+  last_models_fetch_error = NULL,
+  updated_at = CASE
+    WHEN $4::double precision IS NULL THEN NOW()
+    ELSE TO_TIMESTAMP($4::double precision)
+  END
+WHERE id = $1
+"#,
+        )
+        .bind(key_id)
+        .bind(allowed_models)
+        .bind(last_models_fetch_at_unix_secs as f64)
+        .bind(updated_at_unix_secs.map(|value| value as f64))
+        .execute(&mut *tx)
+        .await
+        .map_postgres_err()?
+        .rows_affected();
+        if rows_affected == 0 {
+            tx.rollback().await.map_postgres_err()?;
+            return Ok(false);
+        }
+        for update in upstream_metadata_updates {
+            sqlx::query(
+                r#"
+UPDATE provider_api_keys
+SET upstream_metadata = COALESCE(upstream_metadata, '{}'::jsonb)
+      || jsonb_build_object($2, $3::jsonb)
+WHERE id = $1
+"#,
+            )
+            .bind(key_id)
+            .bind(&update.namespace)
+            .bind(&update.value)
+            .execute(&mut *tx)
+            .await
+            .map_postgres_err()?;
+        }
+        tx.commit().await.map_postgres_err()?;
+        Ok(true)
+    }
+
     pub async fn update_key_health_state(
         &self,
         key_id: &str,
@@ -2045,6 +2187,61 @@ impl ProviderCatalogWriteRepository for SqlxProviderCatalogReadRepository {
     ) -> Result<bool, DataLayerError> {
         Self::update_key_upstream_metadata(self, key_id, upstream_metadata, updated_at_unix_secs)
             .await
+    }
+
+    async fn upsert_key_upstream_metadata_namespace(
+        &self,
+        key_id: &str,
+        namespace: &str,
+        value: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::upsert_key_upstream_metadata_namespace(
+            self,
+            key_id,
+            namespace,
+            value,
+            updated_at_unix_secs,
+        )
+        .await
+    }
+
+    async fn update_key_model_fetch_state(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: Option<u64>,
+        last_models_fetch_error: Option<&str>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::update_key_model_fetch_state(
+            self,
+            key_id,
+            allowed_models,
+            last_models_fetch_at_unix_secs,
+            last_models_fetch_error,
+            updated_at_unix_secs,
+        )
+        .await
+    }
+
+    async fn update_key_model_fetch_success(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: u64,
+        upstream_metadata_updates: &[ProviderCatalogUpstreamMetadataNamespaceUpdate],
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::update_key_model_fetch_success(
+            self,
+            key_id,
+            allowed_models,
+            last_models_fetch_at_unix_secs,
+            upstream_metadata_updates,
+            updated_at_unix_secs,
+        )
+        .await
     }
 
     async fn delete_key(&self, key_id: &str) -> Result<bool, DataLayerError> {

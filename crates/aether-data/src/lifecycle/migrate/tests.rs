@@ -321,6 +321,7 @@ fn empty_database_snapshot_covers_current_cutoff_versions() {
             20260528000000,
             20260528010000,
             20260528020000,
+            20260711000000,
         ]
     );
 }
@@ -1564,6 +1565,7 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260528000000,
             20260528010000,
             20260528020000,
+            20260711000000,
         ]
     );
 }
@@ -1753,6 +1755,198 @@ WHERE table_schema = 'public'
         total_adjusted_exists, 1,
         "missing postgres wallets.total_adjusted"
     );
+}
+
+#[tokio::test]
+async fn postgres_provider_upstream_metadata_migration_preserves_json_when_url_is_set() {
+    const MIGRATION_VERSION: i64 = 20260711000000;
+
+    let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!(
+            "skipping postgres provider metadata migration test because AETHER_TEST_POSTGRES_URL is unset"
+        );
+        return;
+    };
+
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("postgres test pool should connect");
+    super::run_migrations(&pool)
+        .await
+        .expect("postgres migrations should run");
+
+    POSTGRES_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == MIGRATION_VERSION)
+        .expect("provider upstream metadata migration should be embedded");
+
+    query("DELETE FROM public.providers WHERE id = 'metadata-migration-provider'")
+        .execute(&pool)
+        .await
+        .expect("provider migration fixture should reset");
+    query(
+        r#"
+INSERT INTO public.providers (id, name)
+VALUES ('metadata-migration-provider', 'Metadata Migration Provider')
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("provider migration fixture should insert");
+    query(
+        r#"
+INSERT INTO public.provider_api_keys (
+  id,
+  provider_id,
+  name,
+  total_tokens,
+  total_cost_usd,
+  upstream_metadata
+)
+VALUES (
+  'metadata-migration-key',
+  'metadata-migration-provider',
+  'Metadata Migration Key',
+  0,
+  0,
+  '{"catalog":{"model":"gpt-5.6","nested":[1,true,null]}}'::jsonb
+)
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("provider key migration fixture should insert");
+
+    query(
+        r#"
+ALTER TABLE public.provider_api_keys
+  ALTER COLUMN upstream_metadata TYPE json
+  USING upstream_metadata::json
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("provider metadata fixture should use json storage");
+    query("DELETE FROM public._sqlx_migrations WHERE version = $1")
+        .bind(MIGRATION_VERSION)
+        .execute(&pool)
+        .await
+        .expect("provider metadata migration fixture should be pending");
+
+    super::run_migrations(&pool)
+        .await
+        .expect("provider upstream metadata migration should run");
+
+    let data_type: String = query_scalar(
+        r#"
+SELECT data_type
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'provider_api_keys'
+  AND column_name = 'upstream_metadata'
+"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("provider upstream metadata type should load");
+    assert_eq!(data_type, "jsonb");
+
+    let metadata: serde_json::Value = query_scalar(
+        "SELECT upstream_metadata FROM public.provider_api_keys WHERE id = 'metadata-migration-key'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("provider upstream metadata should load");
+    assert_eq!(
+        metadata,
+        serde_json::json!({
+            "catalog": {
+                "model": "gpt-5.6",
+                "nested": [1, true, null]
+            }
+        })
+    );
+
+    let repository =
+        crate::repository::provider_catalog::SqlxProviderCatalogReadRepository::new(pool.clone());
+    assert!(repository
+        .upsert_key_upstream_metadata_namespace(
+            "metadata-migration-key",
+            "admin",
+            &serde_json::json!({"source": "manual"}),
+            Some(1_740_000_001),
+        )
+        .await
+        .expect("provider upstream metadata namespace should update"));
+    assert!(repository
+        .update_key_model_fetch_success(
+            "metadata-migration-key",
+            Some(&serde_json::json!(["gpt-5.6-sol"])),
+            1_740_000_002,
+            &[crate::repository::provider_catalog::ProviderCatalogUpstreamMetadataNamespaceUpdate {
+                namespace: "codex_models".to_string(),
+                value: serde_json::json!({
+                    "cards": {
+                        "gpt-5.6-sol": {
+                            "slug": "gpt-5.6-sol",
+                            "use_responses_lite": true
+                        }
+                    }
+                }),
+            }],
+            Some(1_740_000_002),
+        )
+        .await
+        .expect("provider model fetch state should update atomically"));
+
+    let (allowed_models, metadata, fetched_at, fetch_error): (
+        serde_json::Value,
+        serde_json::Value,
+        i64,
+        Option<String>,
+    ) = sqlx::query_as(
+        r#"
+SELECT
+  allowed_models,
+  upstream_metadata,
+  EXTRACT(EPOCH FROM last_models_fetch_at)::bigint,
+  last_models_fetch_error
+FROM public.provider_api_keys
+WHERE id = 'metadata-migration-key'
+"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("provider model fetch state should load");
+    assert_eq!(allowed_models, serde_json::json!(["gpt-5.6-sol"]));
+    assert_eq!(fetched_at, 1_740_000_002);
+    assert_eq!(fetch_error, None);
+    assert_eq!(
+        metadata,
+        serde_json::json!({
+            "admin": {"source": "manual"},
+            "catalog": {
+                "model": "gpt-5.6",
+                "nested": [1, true, null]
+            },
+            "codex_models": {
+                "cards": {
+                    "gpt-5.6-sol": {
+                        "slug": "gpt-5.6-sol",
+                        "use_responses_lite": true
+                    }
+                }
+            }
+        })
+    );
+
+    query("DELETE FROM public.providers WHERE id = 'metadata-migration-provider'")
+        .execute(&pool)
+        .await
+        .expect("provider migration fixture should clean up");
 }
 
 #[tokio::test]

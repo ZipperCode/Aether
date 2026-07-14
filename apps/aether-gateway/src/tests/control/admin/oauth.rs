@@ -305,13 +305,14 @@ async fn gateway_handles_admin_provider_oauth_supported_types_locally_with_trust
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     let items = payload.as_array().expect("items should be array");
-    assert_eq!(items.len(), 6);
+    assert_eq!(items.len(), 7);
     assert_eq!(items[0]["provider_type"], "claude_code");
     assert_eq!(items[1]["provider_type"], "codex");
     assert_eq!(items[2]["provider_type"], "chatgpt_web");
     assert_eq!(items[3]["provider_type"], "gemini_cli");
     assert_eq!(items[4]["provider_type"], "antigravity");
     assert_eq!(items[5]["provider_type"], "windsurf");
+    assert_eq!(items[6]["provider_type"], "nous");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -5126,6 +5127,27 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_p
                     }));
                 }
 
+                if plan.request_id == "provider-oauth:kiro-profile-discovery" {
+                    assert_eq!(
+                        plan.url,
+                        "https://q.us-east-1.amazonaws.com/ListAvailableProfiles"
+                    );
+                    return Json(json!({
+                        "request_id": plan.request_id,
+                        "status_code": 200,
+                        "headers": {
+                            "content-type": "application/json"
+                        },
+                        "body": {
+                            "json_body": {
+                                "profiles": [{
+                                    "arn": "arn:aws:bedrock:us-east-1:123456789012:inference-profile/kiro-runtime"
+                                }]
+                            }
+                        }
+                    }));
+                }
+
                 assert_eq!(plan.request_id, "kiro-quota:key-kiro-batch-runtime");
                 Json(json!({
                     "request_id": plan.request_id,
@@ -5235,14 +5257,14 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_p
 
     for _ in 0..40 {
         let plan_count = execution_plans.lock().expect("mutex should lock").len();
-        if plan_count == 2 {
+        if plan_count == 3 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     {
         let plans = execution_plans.lock().expect("mutex should lock");
-        assert_eq!(plans.len(), 2);
+        assert_eq!(plans.len(), 3);
     }
 
     let stored_key = provider_catalog_repository
@@ -5271,6 +5293,10 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_p
     assert_eq!(
         auth_config["refresh_token"],
         "kiro-runtime-refresh-token-new"
+    );
+    assert_eq!(
+        auth_config["profile_arn"],
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/kiro-runtime"
     );
 
     gateway_handle.abort();
@@ -6086,6 +6112,9 @@ async fn gateway_manual_codex_oauth_refresh_reconciles_missing_fixed_endpoint_im
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:responses")
         .expect("openai responses endpoint should be reconciled");
+    assert!(endpoints
+        .iter()
+        .any(|endpoint| endpoint.api_format == "openai:search"));
     assert_eq!(
         responses_endpoint.base_url,
         "https://chatgpt.com/backend-api/codex"

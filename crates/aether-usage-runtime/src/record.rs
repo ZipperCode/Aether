@@ -40,6 +40,11 @@ pub fn build_upsert_usage_record_from_event(
     let mut data = event.data.clone();
     data.request_metadata = attach_provider_request_body_metadata(
         data.request_metadata,
+        data.endpoint_api_format
+            .as_deref()
+            .or(data.api_format.as_deref()),
+        data.target_model.as_deref().or(Some(data.model.as_str())),
+        Some(data.model.as_str()),
         data.provider_request_body.as_ref(),
     );
     let now_unix_secs = event.timestamp_ms / 1_000;
@@ -185,6 +190,9 @@ mod tests {
                     "reasoning": { "effort": "max" },
                     "service_tier": "priority"
                 })),
+                request_metadata: Some(serde_json::json!({
+                    "provider_actual_service_tier": "default"
+                })),
                 ..UsageEventData::default()
             },
         })
@@ -209,6 +217,14 @@ mod tests {
                 .and_then(|value| value.get("provider_service_tier"))
                 .and_then(serde_json::Value::as_str),
             Some("priority")
+        );
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("provider_actual_service_tier"))
+                .and_then(serde_json::Value::as_str),
+            Some("default")
         );
         assert_eq!(record.finalized_at_unix_secs, Some(1_700_000_000));
     }

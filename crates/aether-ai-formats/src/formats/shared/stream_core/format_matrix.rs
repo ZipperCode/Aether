@@ -23,6 +23,7 @@ use crate::formats::shared::AiSurfaceFinalizeError;
 pub struct StreamingStandardFormatMatrix {
     provider: Option<ProviderStreamParser>,
     client: Option<ClientStreamEmitter>,
+    propagated_actual_service_tier: Option<String>,
     terminated: bool,
 }
 
@@ -40,10 +41,21 @@ impl StreamingStandardFormatMatrix {
             self.terminated = true;
             return self.emit_error(error_body);
         }
-        let Some(provider) = self.provider.as_mut() else {
+        let (provider, client, propagated_actual_service_tier) = (
+            &mut self.provider,
+            &mut self.client,
+            &mut self.propagated_actual_service_tier,
+        );
+        let Some(provider) = provider.as_mut() else {
             return Ok(Vec::new());
         };
         let frames = provider.push_line(report_context, line)?;
+        if provider.actual_service_tier() != propagated_actual_service_tier.as_deref() {
+            *propagated_actual_service_tier = provider.actual_service_tier().map(ToOwned::to_owned);
+            if let Some(client) = client.as_mut() {
+                client.set_actual_service_tier(propagated_actual_service_tier.as_deref());
+            }
+        }
         self.emit_frames(frames)
     }
 
@@ -52,10 +64,21 @@ impl StreamingStandardFormatMatrix {
             return Ok(Vec::new());
         }
         self.ensure_initialized(report_context);
-        let Some(provider) = self.provider.as_mut() else {
+        let (provider, client, propagated_actual_service_tier) = (
+            &mut self.provider,
+            &mut self.client,
+            &mut self.propagated_actual_service_tier,
+        );
+        let Some(provider) = provider.as_mut() else {
             return Ok(Vec::new());
         };
         let frames = provider.finish(report_context)?;
+        if provider.actual_service_tier() != propagated_actual_service_tier.as_deref() {
+            *propagated_actual_service_tier = provider.actual_service_tier().map(ToOwned::to_owned);
+            if let Some(client) = client.as_mut() {
+                client.set_actual_service_tier(propagated_actual_service_tier.as_deref());
+            }
+        }
         let mut out = self.emit_frames(frames)?;
         if let Some(client) = self.client.as_mut() {
             out.extend(client.finish()?);
@@ -100,6 +123,14 @@ impl StreamingStandardFormatMatrix {
                 out.extend(client.emit_unknown_event(payload)?);
                 break;
             }
+            if let CanonicalStreamEvent::OpenAiResponsesOutputItem { raw_event, .. } = &frame.event
+            {
+                if !matches!(client, ClientStreamEmitter::OpenAIResponses(_)) {
+                    self.terminated = true;
+                    out.extend(client.emit_unknown_event(raw_event)?);
+                    break;
+                }
+            }
             out.extend(client.emit(frame)?);
         }
         Ok(out)
@@ -132,7 +163,13 @@ impl StreamingStandardTerminalObserver {
         match provider {
             TerminalStreamParser::Standard(provider) => {
                 let frames = provider.push_line(report_context, line)?;
+                let actual_service_tier = provider.actual_service_tier().map(ToOwned::to_owned);
                 self.observe_frames(frames);
+                if let Some(actual_service_tier) = actual_service_tier {
+                    self.latest_summary
+                        .get_or_insert_with(ExecutionStreamTerminalSummary::default)
+                        .provider_actual_service_tier = Some(actual_service_tier);
+                }
             }
             TerminalStreamParser::OpenAIImage(provider) => {
                 if let Some(summary) = provider.push_line(report_context, line)? {
@@ -272,6 +309,7 @@ impl ProviderStreamParser {
             FormatId::ClaudeMessages => Self::Claude(ClaudeProviderState::default()),
             FormatId::GeminiGenerateContent => Self::Gemini(GeminiProviderState::default()),
             FormatId::OpenAiEmbedding
+            | FormatId::OpenAiSearch
             | FormatId::OpenAiRerank
             | FormatId::GeminiEmbedding
             | FormatId::GeminiInteractions
@@ -306,11 +344,19 @@ impl ProviderStreamParser {
             ProviderStreamParser::Gemini(state) => state.finish(report_context),
         }
     }
+
+    fn actual_service_tier(&self) -> Option<&str> {
+        match self {
+            ProviderStreamParser::OpenAIChat(state) => state.actual_service_tier(),
+            ProviderStreamParser::OpenAIResponses(state) => state.actual_service_tier(),
+            ProviderStreamParser::Claude(_) | ProviderStreamParser::Gemini(_) => None,
+        }
+    }
 }
 
 enum ClientStreamEmitter {
     OpenAIChat(OpenAIChatClientEmitter),
-    OpenAIResponses(OpenAIResponsesClientEmitter),
+    OpenAIResponses(Box<OpenAIResponsesClientEmitter>),
     Claude(ClaudeClientEmitter),
     Gemini(GeminiClientEmitter),
 }
@@ -359,11 +405,12 @@ impl ClientStreamEmitter {
         Some(match FormatId::parse(client_api_format)? {
             FormatId::OpenAiChat => Self::OpenAIChat(OpenAIChatClientEmitter::default()),
             FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact => {
-                Self::OpenAIResponses(OpenAIResponsesClientEmitter::default())
+                Self::OpenAIResponses(Box::default())
             }
             FormatId::ClaudeMessages => Self::Claude(ClaudeClientEmitter::default()),
             FormatId::GeminiGenerateContent => Self::Gemini(GeminiClientEmitter::default()),
             FormatId::OpenAiEmbedding
+            | FormatId::OpenAiSearch
             | FormatId::OpenAiRerank
             | FormatId::GeminiEmbedding
             | FormatId::GeminiInteractions
@@ -380,6 +427,14 @@ impl ClientStreamEmitter {
             ClientStreamEmitter::OpenAIResponses(state) => state.emit(frame),
             ClientStreamEmitter::Claude(state) => state.emit(frame),
             ClientStreamEmitter::Gemini(state) => state.emit(frame),
+        }
+    }
+
+    fn set_actual_service_tier(&mut self, value: Option<&str>) {
+        match self {
+            ClientStreamEmitter::OpenAIChat(state) => state.set_actual_service_tier(value),
+            ClientStreamEmitter::OpenAIResponses(state) => state.set_actual_service_tier(value),
+            ClientStreamEmitter::Claude(_) | ClientStreamEmitter::Gemini(_) => {}
         }
     }
 
@@ -478,6 +533,7 @@ fn parse_provider_error(
             parse_gemini_error(payload)
         }
         FormatId::OpenAiEmbedding
+        | FormatId::OpenAiSearch
         | FormatId::OpenAiRerank
         | FormatId::GeminiEmbedding
         | FormatId::JinaEmbedding
@@ -575,6 +631,15 @@ mod tests {
 
     fn data_line(value: Value) -> Vec<u8> {
         format!("data: {}\n", value).into_bytes()
+    }
+
+    fn json_data_events(bytes: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .filter_map(|payload| serde_json::from_str(payload).ok())
+            .collect()
     }
 
     #[test]
@@ -1090,6 +1155,66 @@ mod tests {
                 )
                 .expect("terminated matrix should ignore later lines")
                 .is_empty());
+        }
+    }
+
+    #[test]
+    fn responses_compaction_output_is_lossless_within_family_and_rejected_cross_format() {
+        let compaction_event = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "compaction",
+                "encrypted_content": "ENCRYPTED_CONTEXT_COMPACTION_SUMMARY"
+            }
+        });
+
+        let mut responses_matrix = StreamingStandardFormatMatrix::default();
+        let responses_context = report_context("openai:responses", "openai:responses");
+        let mut responses_output = responses_matrix
+            .transform_line(&responses_context, data_line(compaction_event.clone()))
+            .expect("same-family compaction output should convert");
+        responses_output.extend(
+            responses_matrix
+                .transform_line(
+                    &responses_context,
+                    data_line(json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-compact",
+                            "model": "gpt-5.6-sol",
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0
+                            }
+                        }
+                    })),
+                )
+                .expect("terminal response should convert"),
+        );
+        let responses_sse = String::from_utf8(responses_output).expect("valid Responses SSE");
+        assert!(responses_sse.contains("event: response.output_item.done\n"));
+        assert!(responses_sse.contains("\"type\":\"compaction\""));
+        assert!(!responses_sse.contains("\"output_index\""));
+        assert!(responses_sse.contains("event: response.completed\n"));
+
+        for client_api_format in ["openai:chat", "claude:messages", "gemini:generate_content"] {
+            let mut matrix = StreamingStandardFormatMatrix::default();
+            let context = report_context("openai:responses", client_api_format);
+            let output = matrix
+                .transform_line(&context, data_line(compaction_event.clone()))
+                .expect("cross-format rejection should be encoded for the client");
+            let sse = String::from_utf8(output).expect("valid error SSE");
+            assert!(
+                sse.contains("Unsupported provider stream event cannot be converted losslessly")
+                    && sse.contains("compaction"),
+                "{client_api_format}: {sse}"
+            );
+            if client_api_format == "gemini:generate_content" {
+                assert!(sse.contains("\"status\":\"INTERNAL\""), "{sse}");
+            } else {
+                assert!(sse.contains("unsupported_stream_event"), "{sse}");
+            }
         }
     }
 
@@ -1793,6 +1918,147 @@ mod tests {
         assert_eq!(summary.finish_reason.as_deref(), Some("length"));
         assert_eq!(summary.parser_error, None);
         assert_eq!(summary.unknown_event_count, 0);
+    }
+
+    #[test]
+    fn terminal_observer_preserves_actual_service_tier_without_response_capture() {
+        let chat_context = report_context("openai:chat", "openai:chat");
+        let mut chat_observer = StreamingStandardTerminalObserver::default();
+        chat_observer
+            .push_line(
+                &chat_context,
+                data_line(json!({
+                    "id": "chatcmpl_tier_1",
+                    "object": "chat.completion.chunk",
+                    "model": "gpt-5.6",
+                    "service_tier": "Default",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+                })),
+            )
+            .expect("Chat terminal tier should be observed");
+        assert_eq!(
+            chat_observer
+                .latest_summary()
+                .and_then(|summary| summary.provider_actual_service_tier.as_deref()),
+            Some("default")
+        );
+        let chat_summary = chat_observer
+            .latest_summary()
+            .expect("Chat summary should exist");
+        assert!(chat_summary.observed_finish);
+        assert_eq!(
+            chat_summary
+                .standardized_usage
+                .as_ref()
+                .map(|usage| (usage.input_tokens, usage.output_tokens)),
+            Some((10, 2))
+        );
+
+        let responses_context = report_context("openai:responses", "openai:responses");
+        let mut responses_observer = StreamingStandardTerminalObserver::default();
+        responses_observer
+            .push_line(
+                &responses_context,
+                data_line(json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_tier_1",
+                        "model": "gpt-5.6",
+                        "status": "completed",
+                        "service_tier": "Flex",
+                        "output": [],
+                        "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+                    },
+                    "sequence_number": 1,
+                })),
+            )
+            .expect("Responses terminal tier should be observed");
+        assert_eq!(
+            responses_observer
+                .latest_summary()
+                .and_then(|summary| summary.provider_actual_service_tier.as_deref()),
+            Some("flex")
+        );
+        let responses_summary = responses_observer
+            .latest_summary()
+            .expect("Responses summary should exist");
+        assert!(responses_summary.observed_finish);
+        assert_eq!(
+            responses_summary
+                .standardized_usage
+                .as_ref()
+                .map(|usage| (usage.input_tokens, usage.output_tokens)),
+            Some((10, 2))
+        );
+    }
+
+    #[test]
+    fn openai_chat_client_chunks_carry_provider_actual_service_tier() {
+        let context = report_context("openai:chat", "openai:chat");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let output = matrix
+            .transform_line(
+                &context,
+                data_line(json!({
+                    "id": "chatcmpl_tier_stream",
+                    "object": "chat.completion.chunk",
+                    "model": "gpt-5.6",
+                    "service_tier": "Default",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "done"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+                })),
+            )
+            .expect("Chat stream should transform");
+        let events = json_data_events(&output);
+
+        assert!(!events.is_empty());
+        assert!(events
+            .iter()
+            .all(|event| event.get("service_tier") == Some(&json!("default"))));
+    }
+
+    #[test]
+    fn responses_actual_service_tier_reaches_transformed_chat_chunks() {
+        let context = report_context("openai:responses", "openai:chat");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let output = matrix
+            .transform_line(
+                &context,
+                data_line(json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_tier_stream",
+                        "object": "response",
+                        "model": "gpt-5.6",
+                        "status": "completed",
+                        "service_tier": "Flex",
+                        "output": [{
+                            "type": "message",
+                            "id": "msg_tier_stream",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "done",
+                                "annotations": []
+                            }]
+                        }],
+                        "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+                    }
+                })),
+            )
+            .expect("Responses stream should transform");
+        let events = json_data_events(&output);
+
+        assert!(!events.is_empty());
+        assert!(events
+            .iter()
+            .all(|event| event.get("service_tier") == Some(&json!("flex"))));
     }
 
     #[test]

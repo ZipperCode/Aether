@@ -1,8 +1,10 @@
 mod types;
 
 pub use types::{
-    extract_provider_reasoning_effort_from_body, extract_provider_service_tier_from_body,
-    parse_usage_body_ref, usage_body_ref, usage_request_metadata_client_family,
+    extract_provider_actual_service_tier_from_response,
+    extract_provider_cache_ttl_minutes_from_metadata, extract_provider_reasoning_effort_from_body,
+    extract_provider_service_tier_from_body, normalize_provider_service_tier, parse_usage_body_ref,
+    resolve_provider_cache_ttl_minutes, usage_body_ref, usage_request_metadata_client_family,
     ApiKeyLastUsedDelta, ManagementTokenCounterDelta, PendingUsageCleanupSummary,
     ProviderApiKeyWindowUsageRequest, ProxyNodeCounterDelta, StoredProviderApiKeyUsageSummary,
     StoredProviderApiKeyWindowUsageSummary, StoredProviderUsageSummary, StoredProviderUsageWindow,
@@ -28,6 +30,7 @@ pub use types::{
     UsageLeaderboardQuery, UsageMonitoringErrorCountQuery, UsageMonitoringErrorListQuery,
     UsagePerformancePercentilesQuery, UsageProviderPerformanceQuery, UsageReadRepository,
     UsageRepository, UsageSettledCostSummaryQuery, UsageTimeSeriesGranularity,
-    UsageTimeSeriesQuery, UsageWriteRepository, PROVIDER_REASONING_EFFORT_METADATA_KEY,
+    UsageTimeSeriesQuery, UsageWriteRepository, PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY,
+    PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY, PROVIDER_REASONING_EFFORT_METADATA_KEY,
     PROVIDER_SERVICE_TIER_METADATA_KEY,
 };

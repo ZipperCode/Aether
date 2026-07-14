@@ -4,6 +4,8 @@ use serde_json::Value;
 
 pub const PROVIDER_REASONING_EFFORT_METADATA_KEY: &str = "provider_reasoning_effort";
 pub const PROVIDER_SERVICE_TIER_METADATA_KEY: &str = "provider_service_tier";
+pub const PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY: &str = "provider_actual_service_tier";
+pub const PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY: &str = "provider_cache_ttl_minutes";
 
 pub fn extract_provider_reasoning_effort_from_body(value: Option<&Value>) -> Option<String> {
     let object = value.and_then(Value::as_object)?;
@@ -43,12 +45,73 @@ pub fn extract_provider_service_tier_from_body(value: Option<&Value>) -> Option<
         .and_then(normalize_provider_service_tier)
 }
 
-fn normalize_provider_service_tier(value: &str) -> Option<String> {
+pub fn extract_provider_actual_service_tier_from_response(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    value
+        .get("chunks")
+        .and_then(Value::as_array)
+        .and_then(|chunks| {
+            chunks
+                .iter()
+                .rev()
+                .find_map(|chunk| extract_provider_actual_service_tier_from_response(Some(chunk)))
+        })
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| extract_provider_service_tier_from_body(Some(response)))
+        })
+        .or_else(|| extract_provider_service_tier_from_body(Some(value)))
+}
+
+pub fn normalize_provider_service_tier(value: &str) -> Option<String> {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty() || normalized.len() > 64 {
         return None;
     }
     Some(normalized)
+}
+
+pub fn resolve_provider_cache_ttl_minutes(
+    provider_api_format: Option<&str>,
+    provider_model: Option<&str>,
+    source_model: Option<&str>,
+    provider_request_body: Option<&Value>,
+) -> Option<i64> {
+    let provider_api_format = provider_api_format?.trim();
+    let provider_request_body = provider_request_body?;
+    let provider_model = provider_request_body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            provider_model
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })?;
+    let source_model = source_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(provider_model);
+    aether_ai_formats::resolve_openai_prompt_cache_ttl_minutes(
+        provider_api_format,
+        provider_model,
+        source_model,
+        provider_request_body,
+    )
+}
+
+pub fn extract_provider_cache_ttl_minutes_from_metadata(value: Option<&Value>) -> Option<i64> {
+    value
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        })
+        .filter(|value| *value > 0)
 }
 
 /// Joined usage read model assembled from the accounting row plus the newer audit/snapshot
@@ -454,6 +517,28 @@ impl StoredRequestUsageAudit {
             .and_then(normalize_provider_service_tier)
     }
 
+    pub fn provider_actual_service_tier(&self) -> Option<String> {
+        self.request_metadata_string(PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY)
+            .and_then(normalize_provider_service_tier)
+            .or_else(|| {
+                extract_provider_actual_service_tier_from_response(self.response_body.as_ref())
+            })
+    }
+
+    pub fn provider_cache_ttl_minutes(&self) -> Option<i64> {
+        resolve_provider_cache_ttl_minutes(
+            self.endpoint_api_format
+                .as_deref()
+                .or(self.api_format.as_deref()),
+            self.target_model.as_deref().or(Some(self.model.as_str())),
+            Some(self.model.as_str()),
+            self.provider_request_body.as_ref(),
+        )
+        .or_else(|| {
+            extract_provider_cache_ttl_minutes_from_metadata(self.request_metadata.as_ref())
+        })
+    }
+
     pub fn body_ref(&self, field: UsageBodyField) -> Option<&str> {
         match field {
             UsageBodyField::RequestBody => self.request_body_ref.as_deref(),
@@ -781,6 +866,8 @@ pub struct UsageAuditAggregationQuery {
     pub created_from_unix_secs: u64,
     pub created_until_unix_secs: u64,
     pub group_by: UsageAuditAggregationGroupBy,
+    pub provider_id: Option<String>,
+    pub provider_name: Option<String>,
     pub limit: usize,
     pub exclude_reserved_provider_labels: bool,
 }
@@ -2069,6 +2156,7 @@ fn parse_timestamp(value: i64, field_name: &str) -> Result<u64, crate::DataLayer
 #[cfg(test)]
 mod tests {
     use super::{
+        extract_provider_actual_service_tier_from_response, resolve_provider_cache_ttl_minutes,
         StoredRequestUsageAudit, UpsertUsageRecord, UsageBodyCaptureState, UsageBodyCaptureStorage,
         UsageBodyField,
     };
@@ -2484,6 +2572,104 @@ mod tests {
 
         assert_eq!(usage.provider_reasoning_effort(), None);
         assert_eq!(usage.provider_service_tier(), None);
+    }
+
+    #[test]
+    fn provider_cache_ttl_uses_final_openai_contract_then_preserved_metadata() {
+        let mut usage = sample_usage();
+        usage.model = "gpt-5.6-sol".to_string();
+        usage.target_model = Some("gpt-5.6-sol".to_string());
+        usage.provider_request_body = Some(json!({"model": "gpt-5.6-sol"}));
+        usage.request_metadata = Some(json!({"provider_cache_ttl_minutes": 60}));
+
+        assert_eq!(usage.provider_cache_ttl_minutes(), Some(30));
+
+        usage.provider_request_body = None;
+        usage.request_metadata = Some(json!({"provider_cache_ttl_minutes": 30}));
+        assert_eq!(usage.provider_cache_ttl_minutes(), Some(30));
+    }
+
+    #[test]
+    fn provider_cache_ttl_prefers_final_body_model() {
+        assert_eq!(
+            resolve_provider_cache_ttl_minutes(
+                Some("openai:responses"),
+                Some("gpt-5.5"),
+                Some("client-alias"),
+                Some(&json!({"model": "gpt-5.6-sol"})),
+            ),
+            Some(30)
+        );
+        assert_eq!(
+            resolve_provider_cache_ttl_minutes(
+                Some("openai:responses"),
+                Some("gpt-5.6-sol"),
+                Some("client-alias"),
+                Some(&json!({"model": "gpt-5.5"})),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn actual_service_tier_is_independent_from_requested_tier() {
+        let mut usage = sample_usage();
+        usage.request_metadata = Some(json!({
+            "provider_service_tier": "priority",
+            "provider_actual_service_tier": "Default"
+        }));
+
+        assert_eq!(usage.provider_service_tier().as_deref(), Some("priority"));
+        assert_eq!(
+            usage.provider_actual_service_tier().as_deref(),
+            Some("default")
+        );
+
+        usage.response_body = Some(json!({"service_tier": "flex"}));
+        assert_eq!(
+            usage.provider_actual_service_tier().as_deref(),
+            Some("default")
+        );
+
+        usage.request_metadata = Some(json!({"provider_service_tier": "priority"}));
+        assert_eq!(
+            usage.provider_actual_service_tier().as_deref(),
+            Some("flex")
+        );
+    }
+
+    #[test]
+    fn extracts_terminal_actual_service_tier_from_sync_and_stream_responses() {
+        let sync = json!({"id": "resp_1", "service_tier": "Priority"});
+        let chat_stream = json!({
+            "service_tier": "priority",
+            "chunks": [
+                {"service_tier": "priority"},
+                {"service_tier": "Default", "usage": {"total_tokens": 12}}
+            ]
+        });
+        let responses_stream = json!({
+            "chunks": [
+                {"type": "response.created", "response": {"service_tier": "priority"}},
+                {
+                    "type": "response.completed",
+                    "response": {"service_tier": "Flex", "status": "completed"}
+                }
+            ]
+        });
+
+        assert_eq!(
+            extract_provider_actual_service_tier_from_response(Some(&sync)).as_deref(),
+            Some("priority")
+        );
+        assert_eq!(
+            extract_provider_actual_service_tier_from_response(Some(&chat_stream)).as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            extract_provider_actual_service_tier_from_response(Some(&responses_stream)).as_deref(),
+            Some("flex")
+        );
     }
 
     #[test]

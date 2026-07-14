@@ -24,6 +24,8 @@ const OPENAI_CHAT_TOOL_RESULT_SOURCE_MARKER: &str = "openai_chat_tool_result";
 const OPENAI_RESPONSES_TOOL_RESULT_SOURCE_MARKER: &str = "openai_responses_tool_result";
 const OPENAI_RESPONSES_INPUT_MESSAGE_SOURCE_MARKER: &str = "openai_responses_input_message";
 const OPENAI_RESPONSES_RAW_SOURCE_MARKER: &str = "openai_responses_raw";
+const OPENAI_RESPONSES_RAW_CONTENT_SOURCE_MARKER: &str = "openai_responses_raw_content";
+const OPENAI_RESPONSES_CONTENT_MARKER: &str = "openai_responses_content";
 const OPENAI_CHAT_TOOL_ERROR_PREFIX: &str = "[tool error]";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -785,27 +787,45 @@ pub(crate) fn canonical_tool_use_to_openai_responses_item(
         } else if !name.trim().is_empty() {
             item.insert("name".to_string(), Value::String(name.to_string()));
         }
+        let extension_fields = openai_responses_item_extension_object(extensions, &item);
+        item.extend(extension_fields);
         return Value::Object(item);
     }
     if is_openai_custom_tool_call(extensions) {
         let item_id = openai_responses_tool_call_item_id(id, extensions);
-        return json!({
-            "type": "custom_tool_call",
-            "id": item_id,
-            "call_id": id,
-            "status": "completed",
-            "name": name,
-            "input": openai_custom_tool_input_text(input),
-        });
+        let mut item = Map::new();
+        item.insert(
+            "type".to_string(),
+            Value::String("custom_tool_call".to_string()),
+        );
+        item.insert("id".to_string(), Value::String(item_id));
+        item.insert("call_id".to_string(), Value::String(id.to_string()));
+        item.insert("status".to_string(), Value::String("completed".to_string()));
+        item.insert("name".to_string(), Value::String(name.to_string()));
+        item.insert(
+            "input".to_string(),
+            Value::String(openai_custom_tool_input_text(input)),
+        );
+        let extension_fields = openai_responses_item_extension_object(extensions, &item);
+        item.extend(extension_fields);
+        return Value::Object(item);
     }
     let item_id = openai_responses_tool_call_item_id(id, extensions);
-    json!({
-        "type": "function_call",
-        "id": item_id,
-        "call_id": id,
-        "name": name,
-        "arguments": canonicalize_tool_arguments(input),
-    })
+    let mut item = Map::new();
+    item.insert(
+        "type".to_string(),
+        Value::String("function_call".to_string()),
+    );
+    item.insert("id".to_string(), Value::String(item_id));
+    item.insert("call_id".to_string(), Value::String(id.to_string()));
+    item.insert("name".to_string(), Value::String(name.to_string()));
+    item.insert(
+        "arguments".to_string(),
+        Value::String(canonicalize_tool_arguments(input)),
+    );
+    let extension_fields = openai_responses_item_extension_object(extensions, &item);
+    item.extend(extension_fields);
+    Value::Object(item)
 }
 
 pub(crate) fn canonical_tool_use_to_openai_responses_input_item(
@@ -831,6 +851,8 @@ pub(crate) fn canonical_tool_use_to_openai_responses_input_item(
         } else if !name.trim().is_empty() {
             item.insert("name".to_string(), Value::String(name.to_string()));
         }
+        let extension_fields = openai_responses_item_extension_object(extensions, &item);
+        item.extend(extension_fields);
         return Value::Object(item);
     }
     if is_openai_custom_tool_call(extensions) {
@@ -849,6 +871,8 @@ pub(crate) fn canonical_tool_use_to_openai_responses_input_item(
             "input".to_string(),
             Value::String(openai_custom_tool_input_text(input)),
         );
+        let extension_fields = openai_responses_item_extension_object(extensions, &item);
+        item.extend(extension_fields);
         return Value::Object(item);
     }
     let mut item = Map::new();
@@ -865,6 +889,8 @@ pub(crate) fn canonical_tool_use_to_openai_responses_input_item(
         "arguments".to_string(),
         Value::String(canonicalize_tool_arguments(input)),
     );
+    let extension_fields = openai_responses_item_extension_object(extensions, &item);
+    item.extend(extension_fields);
     Value::Object(item)
 }
 
@@ -1940,6 +1966,10 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                     continue;
                 }
                 let Some(item_object) = item.as_object() else {
+                    messages.push(openai_responses_opaque_input_item_message(
+                        item,
+                        String::new(),
+                    ));
                     pending_reasoning = None;
                     continue;
                 };
@@ -1960,36 +1990,16 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                                 .and_then(Value::as_str)
                                 .unwrap_or("user"),
                         );
-                        if matches!(role, CanonicalRole::System | CanonicalRole::Developer) {
-                            let text = openai_content_text(item_object.get("content"));
-                            if !text.trim().is_empty() {
-                                let mut extensions = openai_responses_extensions(
-                                    item_object,
-                                    &["type", "role", "content"],
-                                );
-                                mark_openai_responses_input_message(&mut extensions);
-                                messages.push(CanonicalMessage {
-                                    role,
-                                    content: vec![CanonicalContentBlock::Text {
-                                        text,
-                                        extensions: BTreeMap::new(),
-                                    }],
-                                    extensions,
-                                });
-                            }
-                            pending_reasoning = None;
-                            continue;
-                        }
                         let is_assistant = role == CanonicalRole::Assistant;
+                        let mut extensions =
+                            openai_responses_extensions(item_object, &["type", "role", "content"]);
+                        mark_openai_responses_input_message(&mut extensions);
                         let mut message = CanonicalMessage {
                             role,
-                            content: openai_responses_chat_safe_content_to_blocks(
+                            content: openai_responses_content_to_blocks(
                                 item_object.get("content"),
                             )?,
-                            extensions: openai_responses_extensions(
-                                item_object,
-                                &["type", "role", "content"],
-                            ),
+                            extensions,
                         };
                         if is_assistant {
                             if let Some(reasoning) = pending_reasoning.take() {
@@ -2154,6 +2164,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                         pending_reasoning = None;
                     }
                     _ => {
+                        messages.push(openai_responses_opaque_input_item_message(item, item_type));
                         pending_reasoning = None;
                     }
                 }
@@ -2167,6 +2178,18 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
     }
 }
 
+fn openai_responses_opaque_input_item_message(item: &Value, raw_type: String) -> CanonicalMessage {
+    CanonicalMessage {
+        role: CanonicalRole::Unknown,
+        content: vec![CanonicalContentBlock::Unknown {
+            raw_type,
+            payload: item.clone(),
+            extensions: openai_responses_raw_extensions(BTreeMap::new()),
+        }],
+        extensions: BTreeMap::new(),
+    }
+}
+
 fn append_openai_responses_tool_use(
     messages: &mut Vec<CanonicalMessage>,
     tool_use: CanonicalContentBlock,
@@ -2174,7 +2197,10 @@ fn append_openai_responses_tool_use(
 ) {
     let reasoning = pending_reasoning.take();
     if let Some(last_message) = messages.last_mut() {
-        if last_message.role == CanonicalRole::Assistant {
+        if last_message.role == CanonicalRole::Assistant
+            && (!is_openai_responses_input_message(&last_message.extensions)
+                || canonical_assistant_message_has_visible_content(last_message))
+        {
             if let Some(reasoning) = reasoning {
                 prepend_openai_responses_reasoning_block(last_message, reasoning);
             }
@@ -2193,6 +2219,20 @@ fn append_openai_responses_tool_use(
         content,
         extensions: BTreeMap::new(),
     });
+}
+
+fn canonical_assistant_message_has_visible_content(message: &CanonicalMessage) -> bool {
+    message.content.iter().any(|block| match block {
+        CanonicalContentBlock::Text { text, .. } | CanonicalContentBlock::Thinking { text, .. } => {
+            !text.trim().is_empty()
+        }
+        CanonicalContentBlock::Unknown { payload, .. } => !payload.is_null(),
+        CanonicalContentBlock::Image { .. }
+        | CanonicalContentBlock::File { .. }
+        | CanonicalContentBlock::Audio { .. }
+        | CanonicalContentBlock::ToolUse { .. }
+        | CanonicalContentBlock::ToolResult { .. } => true,
+    })
 }
 
 fn prepend_openai_responses_reasoning_block(
@@ -2280,17 +2320,6 @@ fn openai_responses_reasoning_text_part(raw: &Value) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-fn openai_responses_chat_safe_content_to_blocks(
-    content: Option<&Value>,
-) -> Option<Vec<CanonicalContentBlock>> {
-    Some(
-        openai_responses_content_to_blocks(content)?
-            .into_iter()
-            .filter(|block| !matches!(block, CanonicalContentBlock::Unknown { .. }))
-            .collect(),
-    )
-}
-
 pub(crate) fn openai_responses_content_to_blocks(
     content: Option<&Value>,
 ) -> Option<Vec<CanonicalContentBlock>> {
@@ -2311,14 +2340,15 @@ pub(crate) fn openai_responses_content_to_blocks(
     }
 }
 
-pub(crate) fn openai_responses_output_to_canonical_blocks(
+pub(crate) fn openai_responses_output_to_canonical(
     output: Option<&Value>,
-) -> Option<Vec<CanonicalContentBlock>> {
+) -> Option<(Vec<CanonicalContentBlock>, BTreeMap<String, Value>)> {
     let Some(output) = output else {
-        return Some(Vec::new());
+        return Some((Vec::new(), BTreeMap::new()));
     };
     let output_items = output.as_array()?;
     let mut blocks = Vec::new();
+    let mut message_item_provenance = Vec::new();
     for (index, item) in output_items.iter().enumerate() {
         let Some(item_object) = item.as_object() else {
             blocks.push(CanonicalContentBlock::Unknown {
@@ -2336,6 +2366,19 @@ pub(crate) fn openai_responses_output_to_canonical_blocks(
             .to_ascii_lowercase();
         match item_type.as_str() {
             "message" => {
+                let message_extensions = openai_responses_extensions(
+                    item_object,
+                    &["type", "id", "status", "role", "content"],
+                )
+                .remove(OPENAI_RESPONSES_EXTENSION_NAMESPACE)
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+                if !message_extensions.is_empty() {
+                    message_item_provenance.push(json!({
+                        "output_index": index,
+                        "fields": message_extensions,
+                    }));
+                }
                 blocks.extend(openai_responses_content_to_blocks(
                     item_object.get("content"),
                 )?);
@@ -2415,7 +2458,7 @@ pub(crate) fn openai_responses_output_to_canonical_blocks(
                     .unwrap_or_else(|| format!("call_auto_{index}"));
                 let mut extensions = openai_responses_extensions(
                     item_object,
-                    &["type", "id", "call_id", "name", "arguments", "status"],
+                    &["type", "id", "call_id", "name", "arguments"],
                 );
                 remember_openai_responses_tool_call_item_id(&mut extensions, item_object);
                 blocks.push(CanonicalContentBlock::ToolUse {
@@ -2562,7 +2605,14 @@ pub(crate) fn openai_responses_output_to_canonical_blocks(
             }),
         }
     }
-    Some(blocks)
+    let mut extensions = BTreeMap::new();
+    if !message_item_provenance.is_empty() {
+        extensions.insert(
+            OPENAI_RESPONSES_EXTENSION_NAMESPACE.to_string(),
+            json!({ "message_items": message_item_provenance }),
+        );
+    }
+    Some((blocks, extensions))
 }
 
 fn openai_responses_hosted_tool_call_to_block(
@@ -2790,7 +2840,11 @@ pub(crate) fn openai_responses_part_to_canonical_block(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            extensions: openai_responses_extensions(part_object, &["type", "text"]),
+            extensions: {
+                let mut extensions = openai_responses_extensions(part_object, &["type", "text"]);
+                mark_openai_responses_content_block(&mut extensions);
+                extensions
+            },
         }),
         "reasoning" | "thinking" => Some(CanonicalContentBlock::Thinking {
             text: part_object
@@ -2940,12 +2994,12 @@ pub(crate) fn openai_responses_part_to_canonical_block(
         "refusal" => Some(CanonicalContentBlock::Unknown {
             raw_type,
             payload: part.clone(),
-            extensions: BTreeMap::new(),
+            extensions: openai_responses_raw_content_extensions(BTreeMap::new()),
         }),
         _ => Some(CanonicalContentBlock::Unknown {
             raw_type,
             payload: part.clone(),
-            extensions: BTreeMap::new(),
+            extensions: openai_responses_raw_content_extensions(BTreeMap::new()),
         }),
     }
 }
@@ -3309,6 +3363,23 @@ fn openai_responses_raw_extensions(
     extensions
 }
 
+fn openai_responses_raw_content_extensions(
+    mut extensions: BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    canonical_extension_object_mut(&mut extensions, AETHER_EXTENSION_NAMESPACE).insert(
+        "source".to_string(),
+        Value::String(OPENAI_RESPONSES_RAW_CONTENT_SOURCE_MARKER.to_string()),
+    );
+    extensions
+}
+
+fn mark_openai_responses_content_block(extensions: &mut BTreeMap<String, Value>) {
+    canonical_extension_object_mut(extensions, AETHER_EXTENSION_NAMESPACE).insert(
+        OPENAI_RESPONSES_CONTENT_MARKER.to_string(),
+        Value::Bool(true),
+    );
+}
+
 fn openai_thinking_extensions(mut extensions: BTreeMap<String, Value>) -> BTreeMap<String, Value> {
     canonical_extension_object_mut(&mut extensions, AETHER_EXTENSION_NAMESPACE).insert(
         "source".to_string(),
@@ -3375,6 +3446,22 @@ pub(crate) fn is_openai_responses_raw_block(extensions: &BTreeMap<String, Value>
         .and_then(|value| value.get("source"))
         .and_then(Value::as_str)
         == Some(OPENAI_RESPONSES_RAW_SOURCE_MARKER)
+}
+
+pub(crate) fn is_openai_responses_raw_content_block(extensions: &BTreeMap<String, Value>) -> bool {
+    extensions
+        .get(AETHER_EXTENSION_NAMESPACE)
+        .and_then(|value| value.get("source"))
+        .and_then(Value::as_str)
+        == Some(OPENAI_RESPONSES_RAW_CONTENT_SOURCE_MARKER)
+}
+
+pub(crate) fn is_openai_responses_content_block(extensions: &BTreeMap<String, Value>) -> bool {
+    extensions
+        .get(AETHER_EXTENSION_NAMESPACE)
+        .and_then(|value| value.get(OPENAI_RESPONSES_CONTENT_MARKER))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 pub(crate) fn is_openai_responses_input_message(extensions: &BTreeMap<String, Value>) -> bool {
@@ -3620,16 +3707,19 @@ pub(crate) fn canonical_content_block_to_openai_part(
     block: &CanonicalContentBlock,
 ) -> Option<Value> {
     match block {
-        CanonicalContentBlock::Text { text, .. } => Some(json!({
-            "type": "text",
-            "text": text,
-        })),
+        CanonicalContentBlock::Text { text, extensions } => {
+            let mut part = Map::new();
+            part.insert("type".to_string(), Value::String("text".to_string()));
+            part.insert("text".to_string(), Value::String(text.clone()));
+            insert_openai_prompt_cache_breakpoint(&mut part, extensions);
+            Some(Value::Object(part))
+        }
         CanonicalContentBlock::Image {
             data,
             url,
             media_type,
             detail,
-            ..
+            extensions,
         } => {
             let mut image = Map::new();
             image.insert(
@@ -3639,10 +3729,11 @@ pub(crate) fn canonical_content_block_to_openai_part(
             if let Some(detail) = detail {
                 image.insert("detail".to_string(), Value::String(detail.clone()));
             }
-            Some(json!({
-                "type": "image_url",
-                "image_url": Value::Object(image),
-            }))
+            let mut part = Map::new();
+            part.insert("type".to_string(), Value::String("image_url".to_string()));
+            part.insert("image_url".to_string(), Value::Object(image));
+            insert_openai_prompt_cache_breakpoint(&mut part, extensions);
+            Some(Value::Object(part))
         }
         CanonicalContentBlock::File {
             data,
@@ -3650,7 +3741,7 @@ pub(crate) fn canonical_content_block_to_openai_part(
             file_url,
             media_type,
             filename,
-            ..
+            extensions,
         } => {
             let mut file = Map::new();
             if let Some(value) = file_id {
@@ -3669,18 +3760,30 @@ pub(crate) fn canonical_content_block_to_openai_part(
             if let Some(value) = filename {
                 file.insert("filename".to_string(), Value::String(value.clone()));
             }
-            Some(json!({
-                "type": "file",
-                "file": Value::Object(file),
-            }))
+            let mut part = Map::new();
+            part.insert("type".to_string(), Value::String("file".to_string()));
+            part.insert("file".to_string(), Value::Object(file));
+            insert_openai_prompt_cache_breakpoint(&mut part, extensions);
+            Some(Value::Object(part))
         }
-        CanonicalContentBlock::Audio { data, format, .. } => Some(json!({
-            "type": "input_audio",
-            "input_audio": {
-                "data": data.clone().unwrap_or_default(),
-                "format": format.clone().unwrap_or_else(|| "mp3".to_string()),
-            }
-        })),
+        CanonicalContentBlock::Audio {
+            data,
+            format,
+            extensions,
+            ..
+        } => {
+            let mut part = Map::new();
+            part.insert("type".to_string(), Value::String("input_audio".to_string()));
+            part.insert(
+                "input_audio".to_string(),
+                json!({
+                    "data": data.clone().unwrap_or_default(),
+                    "format": format.clone().unwrap_or_else(|| "mp3".to_string()),
+                }),
+            );
+            insert_openai_prompt_cache_breakpoint(&mut part, extensions);
+            Some(Value::Object(part))
+        }
         CanonicalContentBlock::Thinking { text, .. } => Some(json!({
             "type": "text",
             "text": text,
@@ -3688,6 +3791,32 @@ pub(crate) fn canonical_content_block_to_openai_part(
         CanonicalContentBlock::ToolUse { .. }
         | CanonicalContentBlock::ToolResult { .. }
         | CanonicalContentBlock::Unknown { .. } => None,
+    }
+}
+
+pub(crate) fn openai_prompt_cache_breakpoint_from_extensions(
+    extensions: &BTreeMap<String, Value>,
+) -> Option<Value> {
+    [
+        "openai",
+        OPENAI_RESPONSES_EXTENSION_NAMESPACE,
+        OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
+    ]
+    .into_iter()
+    .find_map(|namespace| {
+        extensions
+            .get(namespace)
+            .and_then(|value| value.get("prompt_cache_breakpoint"))
+            .cloned()
+    })
+}
+
+fn insert_openai_prompt_cache_breakpoint(
+    part: &mut Map<String, Value>,
+    extensions: &BTreeMap<String, Value>,
+) {
+    if let Some(value) = openai_prompt_cache_breakpoint_from_extensions(extensions) {
+        part.insert("prompt_cache_breakpoint".to_string(), value);
     }
 }
 
@@ -5819,6 +5948,40 @@ pub(crate) fn openai_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
     })
 }
 
+pub(crate) fn openai_responses_usage_to_canonical(value: Option<&Value>) -> Option<CanonicalUsage> {
+    let usage = value?.as_object()?;
+    let mut canonical = openai_usage_to_canonical(value)?;
+    let provider_fields = usage
+        .iter()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "input_tokens" | "output_tokens" | "total_tokens"
+            )
+        })
+        .map(|(key, value)| {
+            let value = if key == "input_tokens_details" {
+                let mut details = value.as_object().cloned().unwrap_or_default();
+                details.remove("cached_creation_tokens");
+                details.remove("cache_creation_tokens");
+                Value::Object(details)
+            } else {
+                value.clone()
+            };
+            (key.clone(), value)
+        })
+        .collect::<Map<String, Value>>();
+    canonical.extensions = if provider_fields.is_empty() {
+        BTreeMap::new()
+    } else {
+        BTreeMap::from([(
+            OPENAI_RESPONSES_EXTENSION_NAMESPACE.to_string(),
+            Value::Object(provider_fields),
+        )])
+    };
+    Some(canonical)
+}
+
 pub(crate) fn claude_usage_to_canonical(value: Option<&Value>) -> Option<CanonicalUsage> {
     let usage = value?.as_object()?;
     let input_tokens = usage
@@ -5989,7 +6152,27 @@ pub(crate) fn canonical_usage_to_openai_responses_usage(value: &CanonicalUsage) 
         output["input_tokens_details"]["cache_write_tokens"] =
             Value::from(value.cache_write_tokens);
     }
+    if let (Some(output), Some(provider_fields)) = (
+        output.as_object_mut(),
+        openai_responses_extension(&value.extensions).and_then(Value::as_object),
+    ) {
+        merge_json_object_missing(output, provider_fields);
+    }
     output
+}
+
+fn merge_json_object_missing(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    for (key, source_value) in source {
+        match (target.get_mut(key), source_value) {
+            (Some(Value::Object(target_object)), Value::Object(source_object)) => {
+                merge_json_object_missing(target_object, source_object);
+            }
+            (Some(_), _) => {}
+            (None, _) => {
+                target.insert(key.clone(), source_value.clone());
+            }
+        }
+    }
 }
 
 pub(crate) fn canonical_usage_to_claude(value: &CanonicalUsage) -> Value {
@@ -6392,6 +6575,41 @@ pub(crate) fn openai_responses_extension(extensions: &BTreeMap<String, Value>) -
     extensions
         .get(OPENAI_RESPONSES_EXTENSION_NAMESPACE)
         .or_else(|| extensions.get(OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE))
+}
+
+pub(crate) fn openai_service_tier_extension(
+    extensions: &BTreeMap<String, Value>,
+) -> Option<&Value> {
+    [
+        OPENAI_RESPONSES_EXTENSION_NAMESPACE,
+        OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
+        "openai",
+    ]
+    .into_iter()
+    .find_map(|namespace| {
+        extensions
+            .get(namespace)
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("service_tier"))
+    })
+}
+
+pub(crate) fn openai_responses_item_extension_object(
+    extensions: &BTreeMap<String, Value>,
+    existing: &Map<String, Value>,
+) -> Map<String, Value> {
+    openai_responses_extension(extensions)
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .filter(|(key, _)| {
+                    !existing.contains_key(*key) && !matches!(key.as_str(), "item_id" | "item_type")
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn strip_claude_billing_header(text: &str) -> String {
@@ -8177,6 +8395,67 @@ mod tests {
             3
         );
         assert_eq!(rebuilt_gemini["usageMetadata"]["totalTokenCount"], 23);
+    }
+
+    #[test]
+    fn openai_usage_prefers_cache_write_tokens_and_emits_the_official_field() {
+        let response = json!({
+            "id": "resp_cache_write",
+            "model": "gpt-5.6-sol",
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 4,
+                "total_tokens": 24,
+                "input_tokens_details": {
+                    "cached_tokens": 3,
+                    "cache_write_tokens": 7,
+                    "cached_creation_tokens": 99
+                }
+            }
+        });
+
+        let canonical = from_openai_responses_to_canonical_response(&response)
+            .expect("Responses usage should parse");
+        assert_eq!(canonical.usage.as_ref().unwrap().cache_write_tokens, 7);
+
+        let rebuilt = canonical_to_openai_responses_response(&canonical, &json!({}));
+        assert_eq!(
+            rebuilt["usage"]["input_tokens_details"]["cache_write_tokens"],
+            7
+        );
+        assert!(rebuilt["usage"]["input_tokens_details"]
+            .get("cached_creation_tokens")
+            .is_none());
+
+        let rebuilt_chat = canonical_to_openai_chat_response(&canonical);
+        assert_eq!(
+            rebuilt_chat["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            7
+        );
+        assert!(rebuilt_chat["usage"]["prompt_tokens_details"]
+            .get("cached_creation_tokens")
+            .is_none());
+    }
+
+    #[test]
+    fn openai_usage_accepts_cached_creation_tokens_as_legacy_input_alias() {
+        let response = json!({
+            "id": "resp_cache_write_legacy",
+            "model": "gpt-5.6-sol",
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "input_tokens_details": {"cached_creation_tokens": 5}
+            }
+        });
+
+        let canonical = from_openai_responses_to_canonical_response(&response)
+            .expect("legacy usage alias should parse");
+        assert_eq!(canonical.usage.as_ref().unwrap().cache_write_tokens, 5);
     }
 
     #[test]

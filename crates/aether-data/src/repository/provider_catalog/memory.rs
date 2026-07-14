@@ -7,7 +7,8 @@ use serde_json::{json, Map, Value};
 
 use super::{
     ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
@@ -745,6 +746,111 @@ impl ProviderCatalogWriteRepository for InMemoryProviderCatalogReadRepository {
 
         key.upstream_metadata = upstream_metadata.cloned();
         key.updated_at_unix_secs = updated_at_unix_secs;
+        Ok(true)
+    }
+
+    async fn upsert_key_upstream_metadata_namespace(
+        &self,
+        key_id: &str,
+        namespace: &str,
+        value: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        if namespace.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog upstream metadata namespace is empty".to_string(),
+            ));
+        }
+        let mut index = self
+            .index
+            .write()
+            .expect("provider catalog repository lock");
+        let Some(key) = index.keys.get_mut(key_id) else {
+            return Ok(false);
+        };
+        let metadata = key
+            .upstream_metadata
+            .get_or_insert_with(|| serde_json::json!({}));
+        let Some(metadata) = metadata.as_object_mut() else {
+            return Err(DataLayerError::UnexpectedValue(
+                "provider catalog upstream metadata must be an object".to_string(),
+            ));
+        };
+        metadata.insert(namespace.to_string(), value.clone());
+        key.updated_at_unix_secs = updated_at_unix_secs;
+        Ok(true)
+    }
+
+    async fn update_key_model_fetch_state(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: Option<u64>,
+        last_models_fetch_error: Option<&str>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        let mut index = self
+            .index
+            .write()
+            .expect("provider catalog repository lock");
+        let Some(key) = index.keys.get_mut(key_id) else {
+            return Ok(false);
+        };
+        key.allowed_models = allowed_models.cloned();
+        key.last_models_fetch_at_unix_secs = last_models_fetch_at_unix_secs;
+        key.last_models_fetch_error = last_models_fetch_error.map(str::to_string);
+        key.updated_at_unix_secs = updated_at_unix_secs;
+        Ok(true)
+    }
+
+    async fn update_key_model_fetch_success(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: u64,
+        upstream_metadata_updates: &[ProviderCatalogUpstreamMetadataNamespaceUpdate],
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        if upstream_metadata_updates
+            .iter()
+            .any(|update| update.namespace.trim().is_empty())
+        {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog upstream metadata namespace is empty".to_string(),
+            ));
+        }
+        let mut index = self
+            .index
+            .write()
+            .expect("provider catalog repository lock");
+        let Some(key) = index.keys.get_mut(key_id) else {
+            return Ok(false);
+        };
+        if !upstream_metadata_updates.is_empty()
+            && key
+                .upstream_metadata
+                .as_ref()
+                .is_some_and(|metadata| !metadata.is_object())
+        {
+            return Err(DataLayerError::UnexpectedValue(
+                "provider catalog upstream metadata must be an object".to_string(),
+            ));
+        }
+
+        key.allowed_models = allowed_models.cloned();
+        key.last_models_fetch_at_unix_secs = Some(last_models_fetch_at_unix_secs);
+        key.last_models_fetch_error = None;
+        key.updated_at_unix_secs = updated_at_unix_secs;
+        if !upstream_metadata_updates.is_empty() {
+            let metadata = key
+                .upstream_metadata
+                .get_or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .expect("upstream metadata object was validated");
+            for update in upstream_metadata_updates {
+                metadata.insert(update.namespace.clone(), update.value.clone());
+            }
+        }
         Ok(true)
     }
 

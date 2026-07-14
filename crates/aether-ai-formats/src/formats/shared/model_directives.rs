@@ -1,5 +1,19 @@
 use serde_json::{json, Value};
 
+pub const MODEL_DIRECTIVE_API_FORMATS: [&str; 6] = [
+    "openai:chat",
+    "openai:responses",
+    "openai:responses:compact",
+    "openai:search",
+    "claude:messages",
+    "gemini:generate_content",
+];
+pub const OPENAI_MODEL_DIRECTIVE_SUFFIXES: [&str; 9] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "fast",
+];
+pub const CROSS_PROVIDER_MODEL_DIRECTIVE_SUFFIXES: [&str; 5] =
+    ["low", "medium", "high", "xhigh", "max"];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDirective {
     pub base_model: String,
@@ -7,9 +21,26 @@ pub struct ModelDirective {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDirectiveSuffixResolution {
+    pub base_model: String,
+    pub suffixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelOverride {
     ReasoningEffort(ReasoningEffort),
+    CodexReasoningPreset(CodexReasoningPreset),
     ServiceTier(ServiceTier),
+}
+
+impl ModelOverride {
+    pub fn suffix(&self) -> &'static str {
+        match self {
+            Self::ReasoningEffort(effort) => effort.as_str(),
+            Self::CodexReasoningPreset(preset) => preset.as_str(),
+            Self::ServiceTier(tier) => tier.as_directive_suffix(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +55,16 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    pub const ALL: [Self; 7] = [
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
+
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "none" => Some(Self::None),
@@ -31,13 +72,13 @@ impl ReasoningEffort {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
-            "xhigh" => Some(Self::XHigh),
+            "xhigh" | "extra" => Some(Self::XHigh),
             "max" => Some(Self::Max),
             _ => None,
         }
     }
 
-    pub fn as_openai_chat_value(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Minimal => "minimal",
@@ -49,16 +90,16 @@ impl ReasoningEffort {
         }
     }
 
+    pub fn as_openai_chat_value(self) -> &'static str {
+        self.as_str()
+    }
+
     pub fn as_openai_responses_value(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::XHigh => "xhigh",
-            Self::Max => "max",
-        }
+        self.as_str()
+    }
+
+    pub fn as_openai_model_directive_value(self) -> &'static str {
+        self.as_str()
     }
 
     pub fn as_claude_output_value(self) -> &'static str {
@@ -93,6 +134,19 @@ impl ReasoningEffort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexReasoningPreset {
+    Ultra,
+}
+
+impl CodexReasoningPreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceTier {
     Priority,
 }
@@ -105,6 +159,12 @@ impl ServiceTier {
         }
     }
 
+    pub fn as_directive_suffix(self) -> &'static str {
+        match self {
+            Self::Priority => "fast",
+        }
+    }
+
     pub fn as_openai_value(self) -> &'static str {
         match self {
             Self::Priority => "priority",
@@ -113,28 +173,109 @@ impl ServiceTier {
 }
 
 pub fn parse_model_directive(model: &str) -> Option<ModelDirective> {
-    let (base_model, overrides) = parse_model_directive_parts(model)?;
+    let resolution = parse_model_directive_with_suffixes(
+        model,
+        OPENAI_MODEL_DIRECTIVE_SUFFIXES.iter().copied(),
+    )?;
+    let overrides = resolution
+        .suffixes
+        .iter()
+        .map(|suffix| parse_model_override_for_model(suffix, &resolution.base_model))
+        .collect::<Option<Vec<_>>>()?;
     Some(ModelDirective {
-        base_model,
+        base_model: resolution.base_model,
         overrides,
     })
 }
 
-fn parse_model_directive_parts(model: &str) -> Option<(String, Vec<ModelOverride>)> {
+pub fn parse_model_directive_with_suffixes<'a>(
+    model: &str,
+    suffixes: impl IntoIterator<Item = &'a str>,
+) -> Option<ModelDirectiveSuffixResolution> {
+    let mut configured_suffixes = Vec::<String>::new();
+    for suffix in suffixes {
+        let suffix = suffix.trim();
+        if suffix.is_empty() || suffix.starts_with('-') || suffix.ends_with('-') {
+            continue;
+        }
+        if let Some(existing) = configured_suffixes
+            .iter()
+            .find(|existing| existing.eq_ignore_ascii_case(suffix))
+        {
+            if existing != suffix {
+                return None;
+            }
+            continue;
+        }
+        configured_suffixes.push(suffix.to_string());
+    }
+    configured_suffixes
+        .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+
     let mut base_model = model.trim();
-    let mut overrides = ModelOverrideAccumulator::default();
-    while let Some((candidate_base, suffix)) = base_model.rsplit_once('-') {
-        let Some(override_item) = parse_model_override(suffix) else {
-            break;
-        };
-        overrides.insert(override_item)?;
+    let mut matched_suffixes = Vec::<String>::new();
+    let mut matched_reasoning_effort = false;
+    let mut matched_service_tier = false;
+    while let Some((candidate_base, suffix)) = configured_suffixes.iter().find_map(|suffix| {
+        strip_model_directive_suffix(base_model, suffix)
+            .map(|candidate_base| (candidate_base, suffix))
+    }) {
+        if matched_suffixes
+            .iter()
+            .any(|matched| matched.eq_ignore_ascii_case(suffix))
+        {
+            return None;
+        }
+        if model_directive_suffix_is_reasoning(suffix) {
+            if matched_reasoning_effort {
+                return None;
+            }
+            matched_reasoning_effort = true;
+        } else if ServiceTier::parse(suffix).is_some() {
+            if matched_service_tier {
+                return None;
+            }
+            matched_service_tier = true;
+        }
+        matched_suffixes.push(suffix.clone());
         base_model = candidate_base.trim();
     }
-    if base_model.is_empty() {
+
+    if base_model.is_empty() || matched_suffixes.is_empty() {
         return None;
     }
-    let overrides = overrides.into_overrides()?;
-    Some((base_model.to_string(), overrides))
+    matched_suffixes.sort_by(|left, right| {
+        model_directive_suffix_rank(left)
+            .cmp(&model_directive_suffix_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+    Some(ModelDirectiveSuffixResolution {
+        base_model: base_model.to_string(),
+        suffixes: matched_suffixes,
+    })
+}
+
+fn strip_model_directive_suffix<'a>(model: &'a str, suffix: &str) -> Option<&'a str> {
+    let suffix_start = model.len().checked_sub(suffix.len())?;
+    let separator = suffix_start.checked_sub(1)?;
+    if !model.is_char_boundary(suffix_start)
+        || !model.is_char_boundary(separator)
+        || model.as_bytes().get(separator) != Some(&b'-')
+        || !model[suffix_start..].eq_ignore_ascii_case(suffix)
+    {
+        return None;
+    }
+    Some(&model[..separator])
+}
+
+fn model_directive_suffix_rank(suffix: &str) -> u8 {
+    if model_directive_suffix_is_reasoning(suffix) {
+        0
+    } else if ServiceTier::parse(suffix).is_some() {
+        1
+    } else {
+        2
+    }
 }
 
 fn parse_model_override(suffix: &str) -> Option<ModelOverride> {
@@ -143,39 +284,35 @@ fn parse_model_override(suffix: &str) -> Option<ModelOverride> {
         .or_else(|| ServiceTier::parse(suffix).map(ModelOverride::ServiceTier))
 }
 
-#[derive(Default)]
-struct ModelOverrideAccumulator {
-    reasoning_effort: Option<ReasoningEffort>,
-    service_tier: Option<ServiceTier>,
+fn parse_model_override_for_model(suffix: &str, model: &str) -> Option<ModelOverride> {
+    if suffix.eq_ignore_ascii_case("ultra") && codex_ultra_preset_supported_for_model(model) {
+        return Some(ModelOverride::CodexReasoningPreset(
+            CodexReasoningPreset::Ultra,
+        ));
+    }
+    parse_model_override(suffix)
 }
 
-impl ModelOverrideAccumulator {
-    fn insert(&mut self, override_item: ModelOverride) -> Option<()> {
-        match override_item {
-            ModelOverride::ReasoningEffort(value) => {
-                if self.reasoning_effort.replace(value).is_some() {
-                    return None;
-                }
-            }
-            ModelOverride::ServiceTier(value) => {
-                if self.service_tier.replace(value).is_some() {
-                    return None;
-                }
-            }
-        }
-        Some(())
-    }
+pub fn model_directive_suffix_has_builtin_mapping(suffix: &str) -> bool {
+    parse_model_override(suffix).is_some() || suffix.eq_ignore_ascii_case("ultra")
+}
 
-    fn into_overrides(self) -> Option<Vec<ModelOverride>> {
-        let mut overrides = Vec::new();
-        if let Some(reasoning_effort) = self.reasoning_effort {
-            overrides.push(ModelOverride::ReasoningEffort(reasoning_effort));
-        }
-        if let Some(service_tier) = self.service_tier {
-            overrides.push(ModelOverride::ServiceTier(service_tier));
-        }
-        (!overrides.is_empty()).then_some(overrides)
-    }
+pub fn model_directive_builtin_suffix_supported_for_source_model(
+    suffix: &str,
+    source_model: &str,
+) -> bool {
+    parse_model_override_for_model(suffix, source_model).is_some()
+}
+
+fn model_directive_suffix_is_reasoning(suffix: &str) -> bool {
+    ReasoningEffort::parse(suffix).is_some() || suffix.eq_ignore_ascii_case("ultra")
+}
+
+fn codex_ultra_preset_supported_for_model(model: &str) -> bool {
+    crate::formats::openai::responses::codex::resolve_codex_responses_model_capabilities(
+        model, model, None,
+    )
+    .supports_reasoning_effort("ultra")
 }
 
 pub fn model_directive_base_model(model: &str) -> Option<String> {
@@ -241,7 +378,15 @@ pub fn apply_model_directive_overrides_from_model(
                     &mut patched_body,
                     provider_api_format,
                     provider_model,
+                    &directive.base_model,
                     *effort,
+                )?;
+            }
+            ModelOverride::CodexReasoningPreset(preset) => {
+                apply_codex_reasoning_preset_override(
+                    &mut patched_body,
+                    provider_api_format,
+                    *preset,
                 )?;
             }
             ModelOverride::ServiceTier(tier) => {
@@ -259,6 +404,65 @@ pub fn apply_model_directive_mapping_patch(
 ) -> Option<()> {
     deep_merge_json(provider_request_body, patch);
     Some(())
+}
+
+pub fn default_model_directive_mapping_patch(
+    provider_api_format: &str,
+    provider_model: &str,
+    source_model: &str,
+    suffix: &str,
+) -> Option<Value> {
+    let override_item = parse_model_override_for_model(suffix, source_model)?;
+    let mut patch = json!({});
+    match override_item {
+        ModelOverride::ReasoningEffort(effort) => apply_reasoning_effort_override(
+            &mut patch,
+            provider_api_format,
+            provider_model,
+            source_model,
+            effort,
+        )?,
+        ModelOverride::CodexReasoningPreset(preset) => {
+            apply_codex_reasoning_preset_override(&mut patch, provider_api_format, preset)?
+        }
+        ModelOverride::ServiceTier(tier) => {
+            apply_service_tier_override(&mut patch, provider_api_format, tier)?
+        }
+    }
+    Some(patch)
+}
+
+pub fn default_model_directive_suffixes(provider_api_format: &str) -> &'static [&'static str] {
+    match crate::normalize_api_format_alias(provider_api_format).as_str() {
+        "openai:chat" | "openai:responses" | "openai:responses:compact" | "openai:search" => {
+            &OPENAI_MODEL_DIRECTIVE_SUFFIXES
+        }
+        "claude:messages" | "gemini:generate_content" => &CROSS_PROVIDER_MODEL_DIRECTIVE_SUFFIXES,
+        _ => &[],
+    }
+}
+
+pub fn default_model_directives_config() -> Value {
+    let api_formats = MODEL_DIRECTIVE_API_FORMATS
+        .into_iter()
+        .map(|api_format| {
+            (
+                api_format.to_string(),
+                json!({
+                    "enabled": true,
+                    "suffixes": default_model_directive_suffixes(api_format),
+                    "mappings": {},
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    json!({
+        "reasoning_effort": {
+            "enabled": true,
+            "api_formats": api_formats,
+        },
+    })
 }
 
 fn deep_merge_json(target: &mut Value, patch: &Value) {
@@ -283,15 +487,24 @@ fn apply_reasoning_effort_override(
     provider_request_body: &mut Value,
     provider_api_format: &str,
     provider_model: &str,
+    source_model: &str,
     effort: ReasoningEffort,
 ) -> Option<()> {
+    if !reasoning_effort_supported_for_model(
+        provider_api_format,
+        provider_model,
+        source_model,
+        effort,
+    ) {
+        return None;
+    }
     match crate::normalize_api_format_alias(provider_api_format).as_str() {
         "openai:chat" => set_object_string(
             provider_request_body,
             "reasoning_effort",
-            effort.as_openai_chat_value(),
+            effort.as_openai_model_directive_value(),
         ),
-        "openai:responses" | "openai:responses:compact" => {
+        "openai:responses" | "openai:responses:compact" | "openai:search" => {
             set_openai_responses_reasoning_effort(provider_request_body, effort)
         }
         "claude:messages" => {
@@ -299,6 +512,29 @@ fn apply_reasoning_effort_override(
         }
         "gemini:generate_content" => {
             set_gemini_reasoning_effort(provider_request_body, effort, provider_model)
+        }
+        _ => None,
+    }
+}
+
+fn apply_codex_reasoning_preset_override(
+    provider_request_body: &mut Value,
+    provider_api_format: &str,
+    preset: CodexReasoningPreset,
+) -> Option<()> {
+    match crate::normalize_api_format_alias(provider_api_format).as_str() {
+        "openai:chat" => {
+            set_object_string(provider_request_body, "reasoning_effort", preset.as_str())
+        }
+        "openai:responses" | "openai:responses:compact" | "openai:search" => {
+            let object = provider_request_body.as_object_mut()?;
+            let reasoning = object
+                .entry("reasoning".to_string())
+                .or_insert_with(|| json!({}));
+            reasoning
+                .as_object_mut()?
+                .insert("effort".to_string(), json!(preset.as_str()));
+            Some(())
         }
         _ => None,
     }
@@ -315,6 +551,7 @@ fn apply_service_tier_override(
             "service_tier",
             tier.as_openai_value(),
         ),
+        "openai:search" => Some(()),
         _ => None,
     }
 }
@@ -335,7 +572,7 @@ fn set_openai_responses_reasoning_effort(body: &mut Value, effort: ReasoningEffo
     }
     reasoning.as_object_mut()?.insert(
         "effort".to_string(),
-        Value::String(effort.as_openai_responses_value().to_string()),
+        Value::String(effort.as_openai_model_directive_value().to_string()),
     );
     Some(())
 }
@@ -457,6 +694,158 @@ pub fn gemini_model_uses_thinking_level(model: &str) -> bool {
         .any(|part| part.starts_with("gemini-3"))
 }
 
+pub fn openai_model_supports_max_reasoning_effort(model: &str) -> bool {
+    is_openai_gpt_5_6_family(model)
+}
+
+pub fn openai_model_supports_prompt_cache_options(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase().replace('_', "-");
+    let model = normalized.rsplit('/').next().unwrap_or_default();
+    openai_gpt_model_version(model)
+        .is_some_and(|(major, minor)| major > 5 || (major == 5 && minor >= 6))
+}
+
+pub fn reasoning_effort_supported_for_model(
+    provider_api_format: &str,
+    provider_model: &str,
+    source_model: &str,
+    effort: ReasoningEffort,
+) -> bool {
+    match crate::normalize_api_format_alias(provider_api_format).as_str() {
+        "openai:chat" | "openai:responses" | "openai:responses:compact" | "openai:search" => {
+            match resolved_openai_model_identity(provider_model, source_model).0 {
+                OpenAiModelIdentity::Gpt56 => effort != ReasoningEffort::Minimal,
+                OpenAiModelIdentity::ConcreteOther => effort != ReasoningEffort::Max,
+                OpenAiModelIdentity::Opaque => true,
+            }
+        }
+        "claude:messages" | "gemini:generate_content" => matches!(
+            effort,
+            ReasoningEffort::Low
+                | ReasoningEffort::Medium
+                | ReasoningEffort::High
+                | ReasoningEffort::XHigh
+                | ReasoningEffort::Max
+        ),
+        _ => false,
+    }
+}
+
+pub(crate) fn openai_model_resolves_to_gpt_5_6(provider_model: &str, source_model: &str) -> bool {
+    matches!(
+        resolved_openai_model_identity(provider_model, source_model).0,
+        OpenAiModelIdentity::Gpt56 | OpenAiModelIdentity::Opaque
+    )
+}
+
+pub(crate) fn openai_model_capability_identity(provider_model: &str, source_model: &str) -> String {
+    resolved_openai_model_identity(provider_model, source_model).1
+}
+
+pub(crate) fn openai_model_capability_is_opaque(provider_model: &str, source_model: &str) -> bool {
+    resolved_openai_model_identity(provider_model, source_model).0 == OpenAiModelIdentity::Opaque
+}
+
+fn resolved_openai_model_identity(
+    provider_model: &str,
+    source_model: &str,
+) -> (OpenAiModelIdentity, String) {
+    let provider_model = normalize_model_directive_model(provider_model);
+    let provider_identity = classify_openai_model_identity(&provider_model);
+    if provider_identity != OpenAiModelIdentity::Opaque {
+        return (provider_identity, provider_model);
+    }
+    let source_model = normalize_model_directive_model(source_model);
+    (classify_openai_model_identity(&source_model), source_model)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAiModelIdentity {
+    Gpt56,
+    ConcreteOther,
+    Opaque,
+}
+
+fn classify_openai_model_identity(model: &str) -> OpenAiModelIdentity {
+    if is_openai_gpt_5_6_family(model) {
+        return OpenAiModelIdentity::Gpt56;
+    }
+    let normalized = model.trim().to_ascii_lowercase().replace('_', "-");
+    let model = normalized.rsplit('/').next().unwrap_or_default();
+    if openai_gpt_model_identity_is_concrete(model)
+        || openai_o_series_model_identity_is_concrete(model)
+        || model.starts_with("chatgpt-")
+        || model.starts_with("codex-")
+    {
+        OpenAiModelIdentity::ConcreteOther
+    } else {
+        OpenAiModelIdentity::Opaque
+    }
+}
+
+fn openai_gpt_model_identity_is_concrete(model: &str) -> bool {
+    let Some(rest) = model.strip_prefix("gpt-") else {
+        return false;
+    };
+    let mut segments = rest.split('-');
+    let Some(version) = segments.next() else {
+        return false;
+    };
+    if openai_gpt_model_version(model).is_none() {
+        return false;
+    }
+    let version_is_omni = version.ends_with('o');
+    if version.contains('.') || version_is_omni {
+        return true;
+    }
+    match segments.next() {
+        None => true,
+        Some(variant) => {
+            variant.chars().all(|character| character.is_ascii_digit())
+                || matches!(
+                    variant,
+                    "audio"
+                        | "chat"
+                        | "codex"
+                        | "mini"
+                        | "nano"
+                        | "pro"
+                        | "realtime"
+                        | "search"
+                        | "turbo"
+                        | "vision"
+                )
+        }
+    }
+}
+
+fn openai_gpt_model_version(model: &str) -> Option<(u64, u64)> {
+    let version = model.strip_prefix("gpt-")?.split('-').next()?;
+    let version = version.strip_suffix('o').unwrap_or(version);
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map(str::parse).transpose().ok()?.unwrap_or(0);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor))
+}
+
+fn openai_o_series_model_identity_is_concrete(model: &str) -> bool {
+    let Some(rest) = model.strip_prefix('o') else {
+        return false;
+    };
+    rest.split('-').next().is_some_and(|version| {
+        !version.is_empty() && version.chars().all(|character| character.is_ascii_digit())
+    })
+}
+
+fn is_openai_gpt_5_6_family(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase().replace('_', "-");
+    let model = normalized.rsplit('/').next().unwrap_or_default();
+    openai_gpt_model_version(model) == Some((5, 6))
+}
+
 pub fn extract_gemini_model_from_path(path: &str) -> Option<String> {
     let marker = "/models/";
     let start = path.find(marker)? + marker.len();
@@ -471,12 +860,87 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        apply_model_directive_overrides_from_model, parse_model_directive, ModelDirective,
-        ModelOverride, ReasoningEffort, ServiceTier,
+        apply_model_directive_overrides_from_model, default_model_directive_suffixes,
+        default_model_directives_config, parse_model_directive,
+        parse_model_directive_with_suffixes, CodexReasoningPreset, ModelDirective,
+        ModelDirectiveSuffixResolution, ModelOverride, ReasoningEffort, ServiceTier,
+        MODEL_DIRECTIVE_API_FORMATS,
     };
 
     #[test]
+    fn policy_suffix_parser_prefers_the_longest_configured_suffix() {
+        assert_eq!(
+            parse_model_directive_with_suffixes(
+                "deployment-alias-VendorFuture",
+                ["Future", "VendorFuture"],
+            ),
+            Some(ModelDirectiveSuffixResolution {
+                base_model: "deployment-alias".to_string(),
+                suffixes: vec!["VendorFuture".to_string()],
+            })
+        );
+        assert_eq!(
+            parse_model_directive_with_suffixes(
+                "deployment-alias-high-VendorFuture",
+                ["high", "VendorFuture"],
+            ),
+            Some(ModelDirectiveSuffixResolution {
+                base_model: "deployment-alias".to_string(),
+                suffixes: vec!["high".to_string(), "VendorFuture".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn policy_suffix_parser_rejects_duplicate_or_ambiguous_suffixes() {
+        assert_eq!(
+            parse_model_directive_with_suffixes("deployment-low-high", ["low", "high"]),
+            None
+        );
+        assert_eq!(
+            parse_model_directive_with_suffixes(
+                "deployment-VendorFuture",
+                ["VendorFuture", "vendorfuture"],
+            ),
+            None
+        );
+        assert_eq!(
+            parse_model_directive_with_suffixes(
+                "deployment-VendorFuture-VendorFuture",
+                ["VendorFuture"],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn policy_suffix_parser_does_not_strip_unconfigured_suffixes() {
+        assert_eq!(
+            parse_model_directive_with_suffixes("deployment-alias-VendorFuture", ["high"]),
+            None
+        );
+    }
+
+    #[test]
     fn parses_supported_reasoning_effort_suffixes() {
+        let expected = [
+            ("none", ReasoningEffort::None),
+            ("minimal", ReasoningEffort::Minimal),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::XHigh),
+            ("max", ReasoningEffort::Max),
+        ];
+        for (suffix, effort) in expected {
+            assert_eq!(
+                parse_model_directive(&format!("gpt-5.6-sol-{suffix}")),
+                Some(ModelDirective {
+                    base_model: "gpt-5.6-sol".to_string(),
+                    overrides: vec![ModelOverride::ReasoningEffort(effort)],
+                })
+            );
+        }
         assert_eq!(
             parse_model_directive("gpt-5.4-xhigh"),
             Some(ModelDirective {
@@ -491,6 +955,21 @@ mod tests {
                 overrides: vec![ModelOverride::ReasoningEffort(ReasoningEffort::Max)],
             })
         );
+    }
+
+    #[test]
+    fn default_config_is_generated_from_the_shared_directive_contract() {
+        let config = default_model_directives_config();
+        for api_format in MODEL_DIRECTIVE_API_FORMATS {
+            assert_eq!(
+                config["reasoning_effort"]["api_formats"][api_format]["mappings"],
+                json!({})
+            );
+            assert_eq!(
+                config["reasoning_effort"]["api_formats"][api_format]["suffixes"],
+                json!(default_model_directive_suffixes(api_format))
+            );
+        }
     }
 
     #[test]
@@ -519,11 +998,42 @@ mod tests {
 
     #[test]
     fn ignores_unknown_or_incomplete_suffixes() {
-        assert_eq!(parse_model_directive("gpt-5.4-ultra"), None);
+        assert_eq!(parse_model_directive("gpt-5.4-turbo"), None);
         assert_eq!(parse_model_directive("gpt-5.4"), None);
         assert_eq!(parse_model_directive("-high"), None);
         assert_eq!(parse_model_directive("gpt-5.4-high-json"), None);
         assert_eq!(parse_model_directive("gpt-5.4-low-high"), None);
+    }
+
+    #[test]
+    fn parses_gpt_5_6_ultra_as_an_internal_reasoning_preset() {
+        assert_eq!(
+            parse_model_directive("gpt-5.6-sol-ultra"),
+            Some(ModelDirective {
+                base_model: "gpt-5.6-sol".to_string(),
+                overrides: vec![ModelOverride::CodexReasoningPreset(
+                    CodexReasoningPreset::Ultra,
+                )],
+            })
+        );
+
+        for model in [
+            "gpt-5.6-ultra",
+            "gpt-5.6-luna-ultra",
+            "gpt-5.4-ultra",
+            "gemini-ultra",
+        ] {
+            assert_eq!(parse_model_directive(model), None);
+        }
+
+        let mut unsupported = json!({"model": "gpt-5.4"});
+        assert!(apply_model_directive_overrides_from_model(
+            &mut unsupported,
+            "openai:responses",
+            "gpt-5.4",
+            "gpt-5.4-ultra",
+        )
+        .is_none());
     }
 
     #[test]
@@ -546,7 +1056,7 @@ mod tests {
             &mut responses,
             "openai:responses",
             "gpt-5-upstream",
-            "gpt-5.4-max",
+            "gpt-5.6-max",
         )
         .expect("directive should apply");
         assert_eq!(responses["reasoning"]["effort"], "max");
@@ -560,7 +1070,7 @@ mod tests {
             &mut compact,
             "openai:responses:compact",
             "gpt-5-upstream",
-            "gpt-5.4-max",
+            "gpt-5.6-max",
         )
         .expect("directive should apply");
         assert_eq!(compact["reasoning"]["effort"], "max");
@@ -570,7 +1080,7 @@ mod tests {
             &mut openai_chat_max,
             "openai:chat",
             "gpt-5-upstream",
-            "gpt-5.4-max",
+            "gpt-5.6-max",
         )
         .expect("directive should apply");
         assert_eq!(openai_chat_max["reasoning_effort"], "max");
@@ -597,6 +1107,142 @@ mod tests {
             gemini["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             2048
         );
+    }
+
+    #[test]
+    fn max_suffix_is_capability_aware_for_openai_models() {
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let mut body = json!({"model": model});
+            apply_model_directive_overrides_from_model(
+                &mut body,
+                "openai:responses",
+                model,
+                &format!("{model}-max"),
+            )
+            .expect("max directive should apply");
+            assert_eq!(body["reasoning"]["effort"], "max", "model: {model}");
+        }
+
+        let mut unsupported_model = json!({"model": "gpt-5.4"});
+        let original = unsupported_model.clone();
+        assert!(apply_model_directive_overrides_from_model(
+            &mut unsupported_model,
+            "openai:responses",
+            "gpt-5.4",
+            "gpt-5.4-max",
+        )
+        .is_none());
+        assert_eq!(unsupported_model, original);
+
+        let mut mapped_deployment = json!({"model": "azure-production"});
+        apply_model_directive_overrides_from_model(
+            &mut mapped_deployment,
+            "openai:responses",
+            "azure-production",
+            "gpt-5.6-sol-max",
+        )
+        .expect("source model capability should survive provider model mapping");
+        assert_eq!(mapped_deployment["reasoning"]["effort"], "max");
+
+        let mut explicit_unsupported_target = json!({"model": "gpt-5.4"});
+        let original = explicit_unsupported_target.clone();
+        assert!(apply_model_directive_overrides_from_model(
+            &mut explicit_unsupported_target,
+            "openai:responses",
+            "gpt-5.4",
+            "gpt-5.6-sol-max",
+        )
+        .is_none());
+        assert_eq!(explicit_unsupported_target, original);
+
+        let mut unknown_future = json!({"model": "gpt-6.0"});
+        let original = unknown_future.clone();
+        assert!(apply_model_directive_overrides_from_model(
+            &mut unknown_future,
+            "openai:responses",
+            "gpt-6.0",
+            "gpt-6.0-max",
+        )
+        .is_none());
+        assert_eq!(unknown_future, original);
+    }
+
+    #[test]
+    fn openai_only_efforts_do_not_leak_into_cross_provider_mappings() {
+        for effort in ["none", "minimal"] {
+            for (api_format, provider_model) in [
+                ("claude:messages", "claude-sonnet-4-6"),
+                ("gemini:generate_content", "gemini-3-pro"),
+            ] {
+                let mut body = json!({"model": provider_model});
+                let original = body.clone();
+                assert!(apply_model_directive_overrides_from_model(
+                    &mut body,
+                    api_format,
+                    provider_model,
+                    &format!("gpt-5.6-sol-{effort}"),
+                )
+                .is_none());
+                assert_eq!(body, original);
+            }
+        }
+    }
+
+    #[test]
+    fn gpt_5_6_rejects_minimal_but_accepts_published_efforts() {
+        for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+            let mut body = json!({"model": "azure-production"});
+            apply_model_directive_overrides_from_model(
+                &mut body,
+                "openai:responses",
+                "azure-production",
+                &format!("gpt-5.6-sol-{effort}"),
+            )
+            .expect("published GPT-5.6 effort should apply");
+            assert_eq!(body["reasoning"]["effort"], effort);
+        }
+
+        let mut body = json!({"model": "azure-production"});
+        let original = body.clone();
+        assert!(apply_model_directive_overrides_from_model(
+            &mut body,
+            "openai:responses",
+            "azure-production",
+            "gpt-5.6-sol-minimal",
+        )
+        .is_none());
+        assert_eq!(body, original);
+
+        for family_variant in ["gpt-5.6-preview", "gpt-5.6-sol-2026-07-01"] {
+            assert!(super::openai_model_supports_max_reasoning_effort(
+                family_variant
+            ));
+            let mut body = json!({"model": family_variant});
+            apply_model_directive_overrides_from_model(
+                &mut body,
+                "openai:responses",
+                family_variant,
+                &format!("{family_variant}-max"),
+            )
+            .expect("GPT-5.6 family variants should accept max");
+            assert_eq!(body["reasoning"]["effort"], "max");
+        }
+    }
+
+    #[test]
+    fn prompt_cache_options_capability_requires_gpt_5_6_or_later() {
+        for model in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.7",
+            "gpt-6",
+            "openai/gpt-6.1-pro",
+        ] {
+            assert!(super::openai_model_supports_prompt_cache_options(model));
+        }
+        for model in ["gpt-5.5", "gpt-4o", "o3", "azure-production", "gpt-5.6.1"] {
+            assert!(!super::openai_model_supports_prompt_cache_options(model));
+        }
     }
 
     #[test]

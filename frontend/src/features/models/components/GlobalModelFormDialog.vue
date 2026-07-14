@@ -602,6 +602,7 @@ import {
   buildGlobalModelCreatePayload,
   buildGlobalModelUpdatePayload,
 } from './global-model-form-helpers'
+import { tieredPricingHasImageOutputPricing } from '../utils/tiered-pricing'
 
 const props = defineProps<{
   open: boolean
@@ -1104,17 +1105,9 @@ function selectModel(model: ModelsDevModelItem) {
   }
   loadVideoPricingFromConfig()
 
-  if (model.inputPrice !== undefined || model.outputPrice !== undefined) {
-    tieredPricing.value = {
-      tiers: [{
-        up_to: null,
-        input_price_per_1m: model.inputPrice || 0,
-        output_price_per_1m: model.outputPrice || 0,
-      }]
-    }
-  } else {
-    tieredPricing.value = null
-  }
+  tieredPricing.value = model.tieredPricing
+    ? structuredClone(model.tieredPricing)
+    : null
 
   presetPanelCollapsed.value = true
   scrollToBasicInformation()
@@ -1204,6 +1197,12 @@ async function handleSubmit() {
     return
   }
 
+  const pricingValidationError = tieredPricingEditorRef.value?.getValidationError()
+  if (pricingValidationError) {
+    showError(pricingValidationError, '价格配置错误')
+    return
+  }
+
   const finalTieredPricing = tieredPricingEditorRef.value?.getFinalPricing() ?? tieredPricing.value
 
   if (!finalTieredPricing?.tiers?.length) {
@@ -1244,28 +1243,4 @@ async function handleSubmit() {
   }
 }
 
-function tieredPricingHasImageOutputPricing(pricing: TieredPricingConfig | null | undefined): boolean {
-  if (!pricing) return false
-  if (toFinitePrice(pricing.image_output_price_default) !== null) return true
-  if (Object.values(pricing.image_output_prices || {}).some((prices) => {
-    if (!prices || typeof prices !== 'object') return false
-    return Object.values(prices).some((price) => toFinitePrice(price) !== null)
-  })) return true
-  return (pricing.image_output_price_ranges || []).some((range) => {
-    if (!range || typeof range !== 'object') return false
-    const prices = range.prices && typeof range.prices === 'object'
-      ? range.prices
-      : range as Record<string, unknown>
-    return Object.values(prices).some((price) => toFinitePrice(price) !== null)
-  })
-}
-
-function toFinitePrice(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isFinite(value)) return value
-  if (typeof value === 'string' && value.trim()) {
-    const parsed = Number(value)
-    return Number.isFinite(parsed) ? parsed : null
-  }
-  return null
-}
 </script>

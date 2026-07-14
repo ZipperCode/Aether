@@ -91,7 +91,9 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
         state,
         auth_context.clone(),
         Some(requested_model.as_str()),
+        decision.auth_endpoint_signature.as_deref(),
         None,
+        &decision.model_directive_policy,
     )
     .await
     {
@@ -171,6 +173,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
     );
     let preselection = preselect_local_execution_candidates_with_serving(
         planner_state,
+        &input.model_directive_policy,
         spec_metadata.api_format,
         &input.requested_model,
         spec_metadata.require_streaming,
@@ -280,6 +283,7 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
     Ok(
         build_lazy_requested_model_execution_candidate_attempt_source_with_serving(
             planner_state,
+            &input.model_directive_policy,
             trace_id,
             spec_metadata.api_format,
             &input.requested_model,
@@ -365,6 +369,7 @@ pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<
     );
     let preselection = preselect_local_execution_candidates_for_api_formats_with_serving(
         planner_state,
+        &input.model_directive_policy,
         spec_metadata.api_format,
         &input.requested_model,
         false,

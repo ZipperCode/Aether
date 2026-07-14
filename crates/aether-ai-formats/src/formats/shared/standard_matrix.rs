@@ -1293,6 +1293,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_store_body_rule_preserves_response_input_item_ids() {
+        let request = json!({
+            "model": "gpt-5.4",
+            "input": [{
+                "id": "msg-1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }]
+        });
+        let body_rules = json!([{"action":"set","path":"store","value":true}]);
+
+        let converted = build_standard_request_body(
+            &request,
+            "openai:responses",
+            "gpt-5.4",
+            "codex",
+            "openai:responses",
+            "/v1/responses",
+            true,
+            Some(&body_rules),
+            Some("key-1"),
+        )
+        .expect("Codex Responses request should apply the store body rule");
+
+        assert_eq!(converted["store"], true);
+        assert_eq!(converted["input"][0]["id"], "msg-1");
+    }
+
+    #[test]
     fn standard_openai_responses_strips_content_cache_control_after_body_rules() {
         let request = json!({
             "model": "gpt-5.1",
@@ -1329,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_codex_responses_derives_prompt_cache_key_before_stripping_cache_control() {
+    fn standard_codex_responses_strip_cache_control_without_synthesizing_a_cache_key() {
         fn claude_request(user_text: &str) -> Value {
             json!({
                 "model": "claude-sonnet",
@@ -1373,13 +1403,8 @@ mod tests {
         )
         .expect("claude to codex responses request should build");
 
-        assert!(converted_a["prompt_cache_key"]
-            .as_str()
-            .is_some_and(|value| !value.trim().is_empty()));
-        assert_eq!(
-            converted_a["prompt_cache_key"],
-            converted_b["prompt_cache_key"]
-        );
+        assert!(converted_a.get("prompt_cache_key").is_none());
+        assert!(converted_b.get("prompt_cache_key").is_none());
         assert!(!converted_a.to_string().contains("cache_control"));
         assert!(!converted_b.to_string().contains("cache_control"));
     }

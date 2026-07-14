@@ -760,7 +760,7 @@ mod tests {
     #[test]
     fn local_openai_responses_request_body_applies_reasoning_effort_suffix() {
         let body_json = json!({
-            "model": "gpt-5.4-max",
+            "model": "gpt-5.6-sol-max",
             "input": "hello",
             "reasoning": {"effort": "low", "summary": "auto"}
         });

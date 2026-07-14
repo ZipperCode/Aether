@@ -25,6 +25,7 @@ pub struct SchedulerMinimalCandidateSelectionCandidate {
     pub global_model_id: String,
     pub global_model_name: String,
     pub selected_provider_model_name: String,
+    pub supports_streaming: bool,
     pub mapping_matched_model: Option<String>,
 }
 

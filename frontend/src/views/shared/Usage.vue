@@ -568,6 +568,11 @@ async function pollActiveRequests() {
             ? update.service_tier
             : null
         }
+        if ('actual_service_tier' in update) {
+          record.actual_service_tier = typeof update.actual_service_tier === 'string'
+            ? update.actual_service_tier
+            : null
+        }
         // 管理员接口返回额外字段
         // 只有当返回的 provider 不是 pending/unknown/unknow 时才更新，避免覆盖已有的正确值
         if ('provider' in update && typeof update.provider === 'string') {
@@ -1039,6 +1044,7 @@ function handleDetailRequestState(update: {
   targetModel?: string | null
   reasoningEffort?: string | null
   serviceTier?: string | null
+  actualServiceTier?: string | null
   imageProgress?: ImageProgress | null
   errorMessage?: string | null
 }) {
@@ -1129,6 +1135,11 @@ function handleDetailRequestState(update: {
   }
   if ('serviceTier' in update) {
     record.service_tier = typeof update.serviceTier === 'string' ? update.serviceTier : null
+  }
+  if ('actualServiceTier' in update) {
+    record.actual_service_tier = typeof update.actualServiceTier === 'string'
+      ? update.actualServiceTier
+      : null
   }
   if ('imageProgress' in update) {
     const nextProgress = update.imageProgress ?? null

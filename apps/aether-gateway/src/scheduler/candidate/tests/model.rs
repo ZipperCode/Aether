@@ -138,6 +138,7 @@ fn scheduler_candidate_is_serializable() {
         global_model_id: "global-model-1".to_string(),
         global_model_name: "gpt-4.1".to_string(),
         selected_provider_model_name: "gpt-4.1-canary".to_string(),
+        supports_streaming: true,
         mapping_matched_model: Some("gpt-4.1-canary".to_string()),
     };
 

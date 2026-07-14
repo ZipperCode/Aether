@@ -83,6 +83,8 @@ pub struct AiExecutionDecision {
     #[serde(default)]
     pub provider_name: Option<String>,
     #[serde(default)]
+    pub provider_type: Option<String>,
+    #[serde(default)]
     pub provider_id: Option<String>,
     #[serde(default)]
     pub endpoint_id: Option<String>,
@@ -208,6 +210,7 @@ mod tests {
             request_id: None,
             candidate_id: None,
             provider_name: None,
+            provider_type: None,
             provider_id: None,
             endpoint_id: None,
             key_id: None,

@@ -73,6 +73,7 @@ fn enumerate_minimal_candidate_selection_inner(
             continue;
         };
 
+        let supports_streaming = row.supports_streaming();
         candidates.push(SchedulerMinimalCandidateSelectionCandidate {
             provider_id: row.provider_id,
             provider_name: row.provider_name,
@@ -93,6 +94,7 @@ fn enumerate_minimal_candidate_selection_inner(
             global_model_id: row.global_model_id,
             global_model_name: row.global_model_name,
             selected_provider_model_name,
+            supports_streaming,
             mapping_matched_model,
         });
     }

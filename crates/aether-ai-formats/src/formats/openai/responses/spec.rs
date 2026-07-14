@@ -1,5 +1,4 @@
 use crate::contracts::{
-    OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND, OPENAI_RESPONSES_COMPACT_STREAM_SUCCESS_REPORT_KIND,
     OPENAI_RESPONSES_COMPACT_SYNC_PLAN_KIND, OPENAI_RESPONSES_COMPACT_SYNC_SUCCESS_REPORT_KIND,
     OPENAI_RESPONSES_STREAM_PLAN_KIND, OPENAI_RESPONSES_STREAM_SUCCESS_REPORT_KIND,
     OPENAI_RESPONSES_SYNC_PLAN_KIND, OPENAI_RESPONSES_SYNC_SUCCESS_REPORT_KIND,
@@ -43,13 +42,6 @@ pub fn resolve_stream_spec(plan_kind: &str) -> Option<LocalOpenAiResponsesSpec> 
             compact: false,
             require_streaming: true,
         }),
-        OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND => Some(LocalOpenAiResponsesSpec {
-            api_format: "openai:responses:compact",
-            decision_kind: OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND,
-            report_kind: OPENAI_RESPONSES_COMPACT_STREAM_SUCCESS_REPORT_KIND,
-            compact: true,
-            require_streaming: true,
-        }),
         _ => None,
     }
 }
@@ -68,11 +60,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_openai_responses_compact_stream_spec() {
-        let spec = resolve_stream_spec("openai_responses_compact_stream").expect("spec");
-        assert_eq!(spec.api_format, "openai:responses:compact");
-        assert_eq!(spec.report_kind, "openai_responses_compact_stream_success");
-        assert!(spec.compact);
-        assert!(spec.require_streaming);
+    fn does_not_resolve_openai_responses_compact_as_streaming() {
+        assert!(resolve_stream_spec("openai_responses_compact_stream").is_none());
     }
 }

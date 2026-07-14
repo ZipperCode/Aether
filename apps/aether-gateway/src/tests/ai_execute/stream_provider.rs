@@ -248,7 +248,8 @@ async fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_cand
             "api_region": "us-east-1",
             "kiro_version": "0.8.0",
             "system_version": "darwin#24.6.0",
-            "node_version": "22.21.1"
+            "node_version": "22.21.1",
+            "profile_arn": "arn:aws:bedrock:us-east-1:123456789012:inference-profile/demo"
         });
 
         StoredProviderCatalogKey::new(

@@ -318,10 +318,16 @@ const CODEX_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTempla
             config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
         },
         FixedProviderEndpointTemplate {
+            item_key: "openai:search",
+            api_format: "openai:search",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
             item_key: "openai:image",
             api_format: "openai:image",
             custom_path: None,
-            config_defaults: FORCE_STREAM_ENDPOINT_CONFIG_DEFAULTS,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
         },
     ],
     runtime_policy: CODEX_RUNTIME_POLICY,
@@ -683,7 +689,7 @@ mod tests {
     };
 
     #[test]
-    fn codex_fixed_provider_template_includes_openai_image() {
+    fn codex_fixed_provider_template_includes_codex_companion_endpoints() {
         let template = fixed_provider_template("codex").expect("codex template should exist");
         assert_eq!(template.base_url, "https://chatgpt.com/backend-api/codex");
         assert_eq!(template.version, 1);
@@ -696,6 +702,7 @@ mod tests {
             vec![
                 "openai:responses",
                 "openai:responses:compact",
+                "openai:search",
                 "openai:image"
             ]
         );
@@ -703,17 +710,12 @@ mod tests {
         let image_template =
             fixed_provider_endpoint_template_by_api_format("codex", "openai:image")
                 .expect("codex image endpoint should exist");
-        assert_eq!(
-            image_template
-                .config_defaults
-                .iter()
-                .map(|item| (item.key, item.value))
-                .collect::<Vec<_>>(),
-            vec![(
-                "upstream_stream_policy",
-                FixedProviderEndpointConfigValue::String("force_stream")
-            )]
-        );
+        assert!(image_template.config_defaults.is_empty());
+
+        let search_template =
+            fixed_provider_endpoint_template_by_api_format("codex", "openai:search")
+                .expect("codex search endpoint should exist");
+        assert!(search_template.config_defaults.is_empty());
     }
 
     #[test]

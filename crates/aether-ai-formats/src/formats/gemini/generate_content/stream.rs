@@ -490,6 +490,11 @@ impl GeminiClientEmitter {
                     None,
                 )
             }
+            CanonicalStreamEvent::OpenAiResponsesOutputItem { .. } => Err(
+                AiSurfaceFinalizeError::new(
+                    "OpenAI Responses output items cannot be converted losslessly to Gemini GenerateContent",
+                ),
+            ),
             CanonicalStreamEvent::ToolCallStart {
                 index,
                 call_id,

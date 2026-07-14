@@ -50,6 +50,11 @@ pub enum CanonicalStreamEvent {
         index: usize,
         item: Value,
     },
+    OpenAiResponsesOutputItem {
+        output_index: Option<usize>,
+        item: Value,
+        raw_event: Value,
+    },
     ToolCallStart {
         index: usize,
         call_id: String,

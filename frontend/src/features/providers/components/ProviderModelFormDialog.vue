@@ -321,6 +321,7 @@ import { parseNumberInput, sortResolutionEntries } from '@/utils/form'
 import { createModel, updateModel, getProviderModels } from '@/api/endpoints/models'
 import { createGlobalModel, listGlobalModels, type GlobalModelResponse } from '@/api/global-models'
 import TieredPricingEditor from '@/features/models/components/TieredPricingEditor.vue'
+import { tieredPricingHasImageOutputPricing } from '@/features/models/utils/tiered-pricing'
 import type { Model, TieredPricingConfig } from '@/api/endpoints'
 import {
   buildProviderModelCreatePayload,
@@ -572,31 +573,6 @@ function modelSupportsImageGeneration(model: {
     || tieredPricingHasImageOutputPricing(model.effective_tiered_pricing)
 }
 
-function tieredPricingHasImageOutputPricing(pricing: TieredPricingConfig | null | undefined): boolean {
-  if (!pricing) return false
-  if (toFinitePrice(pricing.image_output_price_default) !== null) return true
-  if (Object.values(pricing.image_output_prices || {}).some((prices) => {
-    if (!prices || typeof prices !== 'object') return false
-    return Object.values(prices).some((price) => toFinitePrice(price) !== null)
-  })) return true
-  return (pricing.image_output_price_ranges || []).some((range) => {
-    if (!range || typeof range !== 'object') return false
-    const prices = range.prices && typeof range.prices === 'object'
-      ? range.prices
-      : range as Record<string, unknown>
-    return Object.values(prices).some((price) => toFinitePrice(price) !== null)
-  })
-}
-
-function toFinitePrice(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isFinite(value)) return value
-  if (typeof value === 'string' && value.trim()) {
-    const parsed = Number(value)
-    return Number.isFinite(parsed) ? parsed : null
-  }
-  return null
-}
-
 function setImageGenerationEnabled(value: boolean | 'indeterminate') {
   const enabled = value === true
   imageGenerationExplicitOverride.value = enabled
@@ -809,6 +785,12 @@ async function handleSubmit() {
   if (submitting.value) return
   if (!isEditing.value && !canSubmitCreate.value) {
     showError(manualGlobalModelMode.value ? '请填写模型ID和 Provider 模型名' : '请选择模型并填写 Provider 模型名', '错误')
+    return
+  }
+
+  const pricingValidationError = tieredPricingEditorRef.value?.getValidationError()
+  if (pricingValidationError) {
+    showError(pricingValidationError, '价格配置错误')
     return
   }
 

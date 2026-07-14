@@ -1610,26 +1610,42 @@ function getReasoningEffortTitle(record: UsageRecord): string {
   return effort ? `Reasoning: ${effort}` : ''
 }
 
-function getServiceTier(record: UsageRecord): string | null {
-  const serviceTier = record.service_tier?.trim().toLowerCase()
+function normalizeServiceTier(value: string | null | undefined): string | null {
+  const serviceTier = value?.trim().toLowerCase()
   return serviceTier || null
 }
 
+function getRequestedServiceTier(record: UsageRecord): string | null {
+  return normalizeServiceTier(record.service_tier)
+}
+
+function getActualServiceTier(record: UsageRecord): string | null {
+  return normalizeServiceTier(record.actual_service_tier)
+}
+
 function getFastBadge(record: UsageRecord): boolean {
-  return getServiceTier(record) === 'priority'
+  return (getActualServiceTier(record) ?? getRequestedServiceTier(record)) === 'priority'
 }
 
 function getFastBadgeTitle(record: UsageRecord): string {
-  const serviceTier = getServiceTier(record)
-  return serviceTier ? `Service tier: ${serviceTier}` : ''
+  const requested = getRequestedServiceTier(record)
+  const actual = getActualServiceTier(record)
+  if (requested && actual) {
+    return requested === actual
+      ? `Requested and actual service tier: ${actual}`
+      : `Requested service tier: ${requested}\nActual service tier: ${actual}`
+  }
+  if (actual) return `Actual service tier: ${actual}`
+  return requested ? `Requested service tier: ${requested}` : ''
 }
 
 // 获取模型列的 tooltip
 function getModelTooltip(record: UsageRecord): string {
   const actualModel = getActualModel(record)
   const reasoningEffort = getReasoningEffort(record)
-  const fastSuffix = getFastBadge(record) ? '\nService tier: priority' : ''
-  const suffix = `${reasoningEffort ? `\nReasoning: ${reasoningEffort}` : ''}${fastSuffix}`
+  const serviceTierTitle = getFastBadgeTitle(record)
+  const tierSuffix = serviceTierTitle ? `\n${serviceTierTitle}` : ''
+  const suffix = `${reasoningEffort ? `\nReasoning: ${reasoningEffort}` : ''}${tierSuffix}`
   if (actualModel) {
     return `${record.model} -> ${actualModel}${suffix}`
   }

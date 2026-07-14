@@ -98,6 +98,7 @@ mod tests {
             global_model_id: format!("global-model-{id}"),
             global_model_name: "gpt-5".to_string(),
             selected_provider_model_name: "gpt-5".to_string(),
+            supports_streaming: true,
             mapping_matched_model: None,
         }
     }
@@ -209,6 +210,27 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].provider_id, "provider-1");
         assert_eq!(candidates[0].selected_provider_model_name, "gpt-5-canary-1");
+    }
+
+    #[test]
+    fn enumeration_preserves_effective_streaming_capability() {
+        let mut row = sample_row("1");
+        row.model_supports_streaming = Some(false);
+
+        let candidates =
+            super::enumerate_minimal_candidate_selection(EnumerateMinimalCandidateSelectionInput {
+                rows: vec![row],
+                normalized_api_format: "openai:chat",
+                requested_model_name: "gpt-5",
+                resolved_global_model_name: "gpt-5",
+                require_streaming: false,
+                required_capabilities: None,
+                auth_constraints: None,
+            })
+            .expect("candidate selection should build");
+
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].supports_streaming);
     }
 
     #[test]

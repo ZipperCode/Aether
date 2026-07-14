@@ -6,7 +6,8 @@ mod sqlite;
 #[allow(unused_imports)]
 pub(crate) use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };

@@ -37,7 +37,24 @@ pub fn convert_claude_messages_to_conversation_state(
     let thinking_prefix = generate_thinking_prefix(request_body);
 
     let mut history = Vec::new();
-    let system_text = system_to_text(request_body.get("system"));
+    let mut system_text = system_to_text(request_body.get("system"));
+    for message in messages {
+        let Some(message) = message.as_object() else {
+            continue;
+        };
+        if matches!(
+            message.get("role").and_then(Value::as_str),
+            Some("system" | "developer")
+        ) {
+            let text = system_to_text(message.get("content"));
+            if !text.is_empty() {
+                if !system_text.is_empty() {
+                    system_text.push('\n');
+                }
+                system_text.push_str(&text);
+            }
+        }
+    }
     if !system_text.is_empty() {
         history.push(json!({
             "userInputMessage": {
@@ -53,16 +70,23 @@ pub fn convert_claude_messages_to_conversation_state(
         }));
     }
 
-    let last_is_assistant = messages
-        .last()
-        .and_then(Value::as_object)
-        .and_then(|message| message.get("role"))
-        .and_then(Value::as_str)
-        .is_some_and(|role| role == "assistant");
+    let (last_message_index, last_message_role) =
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                let role = message
+                    .as_object()
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)?;
+                matches!(role, "user" | "assistant").then_some((index, role))
+            })?;
+    let last_is_assistant = last_message_role == "assistant";
     let history_end_index = if last_is_assistant {
         messages.len()
     } else {
-        messages.len().saturating_sub(1)
+        last_message_index
     };
 
     let mut user_buffer = Vec::new();
@@ -106,7 +130,7 @@ pub fn convert_claude_messages_to_conversation_state(
     let (mut text_content, images, tool_results) = if last_is_assistant {
         ("Continue.".to_string(), Vec::new(), Vec::new())
     } else {
-        let last = messages.last()?.as_object()?;
+        let last = messages.get(last_message_index)?.as_object()?;
         if last.get("role").and_then(Value::as_str) != Some("user") {
             return None;
         }

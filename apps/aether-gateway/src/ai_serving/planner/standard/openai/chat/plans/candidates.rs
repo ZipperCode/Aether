@@ -21,6 +21,7 @@ pub(crate) async fn list_local_openai_chat_candidates(
 > {
     let outcome = preselect_local_execution_candidates_with_serving(
         PlannerAppState::new(state),
+        &input.model_directive_policy,
         "openai:chat",
         &input.requested_model,
         require_streaming,

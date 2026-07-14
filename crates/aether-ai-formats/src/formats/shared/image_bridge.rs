@@ -14,6 +14,7 @@ pub struct OpenAiImageRequestForGemini {
 pub struct GeminiImageRequestForOpenAi {
     pub requested_model: String,
     pub mapped_model: String,
+    pub operation: crate::formats::openai::image::request::OpenAiImageOperation,
     pub body_json: Value,
     pub summary_json: Value,
 }
@@ -136,52 +137,53 @@ pub fn build_openai_image_request_body_from_gemini_image_request(
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    if !prompt.is_empty() {
-        content.insert(
-            0,
-            json!({
-                "type": "input_text",
-                "text": prompt,
-            }),
-        );
-    }
-    if content.is_empty() {
+    if prompt.is_empty() {
         return None;
     }
 
-    let action = if content.iter().any(|value| {
+    let operation = if content.iter().any(|value| {
         value
             .get("type")
             .and_then(Value::as_str)
             .is_some_and(|kind| kind == "input_image")
     }) {
-        "edit"
+        crate::formats::openai::image::request::OpenAiImageOperation::Edit
     } else {
-        "generate"
+        crate::formats::openai::image::request::OpenAiImageOperation::Generate
     };
-    let body_json = json!({
-        "model": mapped_model,
-        "input": [{
-            "role": "user",
-            "content": content,
-        }],
-        "tools": [{
-            "type": "image_generation",
-            "action": action,
-        }],
-        "tool_choice": {
-            "type": "image_generation"
-        },
-        "stream": false,
-    });
+    let mut body = Map::new();
+    body.insert("model".to_string(), Value::String(mapped_model.to_string()));
+    body.insert("prompt".to_string(), Value::String(prompt));
+    if operation == crate::formats::openai::image::request::OpenAiImageOperation::Edit {
+        let images = content
+            .iter()
+            .filter(|value| value.get("type").and_then(Value::as_str) == Some("input_image"))
+            .map(|value| {
+                let image_url = value
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                Some(json!({ "image_url": image_url }))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if images.is_empty() {
+            return None;
+        }
+        crate::formats::openai::image::request::insert_standard_openai_image_inputs(
+            &mut body, images,
+        );
+    }
+    let body_json = Value::Object(body);
     let summary_json = json!({
-        "operation": action,
+        "operation": operation.as_str(),
         "response_format": "b64_json",
     });
 
     Some(GeminiImageRequestForOpenAi {
         requested_model,
         mapped_model: mapped_model.to_string(),
+        operation,
         body_json,
         summary_json,
     })
@@ -1003,11 +1005,50 @@ mod tests {
 
         assert_eq!(converted.requested_model, "gemini-image");
         assert_eq!(converted.body_json["model"], "gpt-image-2");
-        assert_eq!(converted.body_json["tools"][0]["action"], "edit");
+        assert_eq!(converted.operation.as_str(), "edit");
         assert_eq!(
-            converted.body_json["input"][0]["content"][1]["image_url"],
+            converted.body_json["image"]["image_url"],
             "data:image/png;base64,aGVsbG8="
         );
+        assert!(converted.body_json.get("input").is_none());
+        assert!(converted.body_json.get("tools").is_none());
+        assert!(converted.body_json.get("stream").is_none());
+    }
+
+    #[test]
+    fn converts_multiple_gemini_image_inputs_to_standard_openai_image_array() {
+        let body = json!({
+            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": "Combine these references"},
+                    {"inlineData": {"mimeType": "image/png", "data": "aGVsbG8="}},
+                    {"fileData": {"mimeType": "image/jpeg", "fileUri": "https://example.test/reference.jpg"}}
+                ]
+            }]
+        });
+
+        let converted = build_openai_image_request_body_from_gemini_image_request(
+            &body,
+            "/v1beta/models/gemini-image:generateContent",
+            "gpt-image-2",
+        )
+        .expect("conversion should succeed");
+
+        assert_eq!(
+            converted.body_json["image"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            converted.body_json["image"][0]["image_url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        assert_eq!(
+            converted.body_json["image"][1]["image_url"],
+            "https://example.test/reference.jpg"
+        );
+        assert!(converted.body_json.get("images").is_none());
     }
 
     #[test]

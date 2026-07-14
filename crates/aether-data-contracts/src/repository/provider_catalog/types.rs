@@ -1,6 +1,12 @@
 use async_trait::async_trait;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderCatalogUpstreamMetadataNamespaceUpdate {
+    pub namespace: String,
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredProviderCatalogProvider {
     pub id: String,
     pub name: String,
@@ -682,6 +688,32 @@ pub trait ProviderCatalogWriteRepository: Send + Sync {
         &self,
         key_id: &str,
         upstream_metadata: Option<&serde_json::Value>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, crate::DataLayerError>;
+
+    async fn upsert_key_upstream_metadata_namespace(
+        &self,
+        key_id: &str,
+        namespace: &str,
+        value: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, crate::DataLayerError>;
+
+    async fn update_key_model_fetch_state(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: Option<u64>,
+        last_models_fetch_error: Option<&str>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, crate::DataLayerError>;
+
+    async fn update_key_model_fetch_success(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: u64,
+        upstream_metadata_updates: &[ProviderCatalogUpstreamMetadataNamespaceUpdate],
         updated_at_unix_secs: Option<u64>,
     ) -> Result<bool, crate::DataLayerError>;
 

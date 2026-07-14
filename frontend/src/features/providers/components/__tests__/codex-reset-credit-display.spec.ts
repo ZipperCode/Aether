@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   formatCodexResetCreditCount,
-  formatCodexResetCreditDays,
+  formatCodexResetCreditExpiresAt,
   getCodexResetCreditAvailableCount,
   getVisibleCodexResetCreditItems,
 } from '@/features/providers/components/codex-reset-credit-display'
@@ -74,8 +74,20 @@ describe('codex reset credit display helpers', () => {
     ])
   })
 
-  it('formats reset credit remaining days with a one-day minimum', () => {
-    expect(formatCodexResetCreditDays(1)).toBe('1天')
-    expect(formatCodexResetCreditDays(86_401)).toBe('2天')
+  it('formats reset credit expiry as a precise local timestamp', () => {
+    const expiresAt = new Date(2026, 6, 12, 22, 4, 41).getTime() / 1000
+    expect(formatCodexResetCreditExpiresAt(expiresAt)).toBe('07-12 22:04:41')
+    expect(formatCodexResetCreditExpiresAt(null)).toBe('-')
+  })
+
+  it('derives a stable expiry timestamp from remaining seconds', () => {
+    const snapshot: QuotaResetCreditsSnapshot = {
+      available_count: 1,
+      updated_at: 1_700_000_000,
+      credits: [{ status: 'available', remaining_seconds: 600 }],
+    }
+
+    expect(getVisibleCodexResetCreditItems(snapshot, 1_700_000_300)[0]?.expiresAt)
+      .toBe(1_700_000_600)
   })
 })

@@ -12,6 +12,7 @@ macro_rules! define_openai_reasoning_effort {
             Medium,
             High,
             XHigh,
+            Max,
         }
 
         impl $name {
@@ -23,6 +24,7 @@ macro_rules! define_openai_reasoning_effort {
                     "medium" => Some(Self::Medium),
                     "high" => Some(Self::High),
                     "xhigh" => Some(Self::XHigh),
+                    "max" => Some(Self::Max),
                     _ => None,
                 }
             }
@@ -35,6 +37,7 @@ macro_rules! define_openai_reasoning_effort {
                     Self::Medium => "medium",
                     Self::High => "high",
                     Self::XHigh => "xhigh",
+                    Self::Max => "max",
                 }
             }
         }
@@ -43,6 +46,29 @@ macro_rules! define_openai_reasoning_effort {
 
 define_openai_reasoning_effort!(OpenAiChatReasoningEffort);
 define_openai_reasoning_effort!(OpenAiResponsesReasoningEffort);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiPromptCacheRetention {
+    InMemory,
+    TwentyFourHours,
+}
+
+impl OpenAiPromptCacheRetention {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "in_memory" => Some(Self::InMemory),
+            "24h" => Some(Self::TwentyFourHours),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InMemory => "in_memory",
+            Self::TwentyFourHours => "24h",
+        }
+    }
+}
 
 #[deprecated(note = "use OpenAiChatReasoningEffort or OpenAiResponsesReasoningEffort")]
 pub type OpenAiReasoningEffort = OpenAiChatReasoningEffort;
@@ -136,4 +162,37 @@ pub fn extract_openai_reasoning_effort(request: &Map<String, Value>) -> Option<S
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        OpenAiChatReasoningEffort, OpenAiPromptCacheRetention, OpenAiResponsesReasoningEffort,
+    };
+
+    #[test]
+    fn openai_reasoning_effort_contract_includes_gpt_5_6_max() {
+        assert_eq!(
+            OpenAiChatReasoningEffort::parse("max").map(OpenAiChatReasoningEffort::as_str),
+            Some("max")
+        );
+        assert_eq!(
+            OpenAiResponsesReasoningEffort::parse("max")
+                .map(OpenAiResponsesReasoningEffort::as_str),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn prompt_cache_retention_uses_the_openai_wire_enum() {
+        assert_eq!(
+            OpenAiPromptCacheRetention::parse("in_memory").map(OpenAiPromptCacheRetention::as_str),
+            Some("in_memory")
+        );
+        assert_eq!(
+            OpenAiPromptCacheRetention::parse("24h").map(OpenAiPromptCacheRetention::as_str),
+            Some("24h")
+        );
+        assert_eq!(OpenAiPromptCacheRetention::parse("in-memory"), None);
+    }
 }

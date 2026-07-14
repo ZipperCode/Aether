@@ -154,6 +154,18 @@ export interface RequestSchedulingFailure {
   no_upstream_attempt?: boolean | null
 }
 
+export interface RequestSettlementPricingSnapshot {
+  requested_processing_tier?: string | null
+  actual_processing_tier?: string | null
+  billing_processing_tier?: string | null
+  [key: string]: unknown
+}
+
+export interface RequestSettlementSnapshot {
+  pricing_snapshot?: RequestSettlementPricingSnapshot | null
+  [key: string]: unknown
+}
+
 export interface RequestDetail {
   id: string // UUID
   request_id: string
@@ -175,6 +187,7 @@ export interface RequestDetail {
   target_model?: string | null  // 映射后的目标模型名
   reasoning_effort?: string | null
   service_tier?: string | null
+  actual_service_tier?: string | null
   tokens: {
     input: number
     output: number
@@ -262,6 +275,7 @@ export interface RequestDetail {
     cache_creation_price_per_1m?: number
     cache_read_price_per_1m?: number
     price_per_request?: number
+    settlement_snapshot?: RequestSettlementSnapshot | null
   } | null
   // 阶梯计费信息
   tiered_pricing?: {

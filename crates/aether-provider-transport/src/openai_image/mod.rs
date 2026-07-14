@@ -7,7 +7,7 @@ use crate::grok::{is_grok_provider_transport, resolve_grok_session_auth};
 use crate::policy::local_standard_transport_unsupported_reason_with_network;
 use crate::rules::apply_local_header_rules_with_request_headers;
 use crate::snapshot::GatewayProviderTransportSnapshot;
-use crate::url::{build_openai_image_url, build_openai_responses_url};
+use crate::url::build_openai_image_url;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderOpenAiImageHeadersInput<'a> {
@@ -15,7 +15,7 @@ pub struct ProviderOpenAiImageHeadersInput<'a> {
     pub headers: &'a http::HeaderMap,
     pub auth_header: &'a str,
     pub auth_value: &'a str,
-    pub accept: &'a str,
+    pub accept: Option<&'a str>,
     pub header_rules: Option<&'a Value>,
     pub provider_request_body: &'a Value,
     pub original_request_body: &'a Value,
@@ -44,6 +44,11 @@ fn is_dedicated_openai_image_provider(transport: &GatewayProviderTransportSnapsh
         .provider_type
         .trim()
         .eq_ignore_ascii_case("chatgpt_web")
+        || transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("codex")
         || is_grok_provider_transport(transport)
 }
 
@@ -61,14 +66,6 @@ pub fn build_openai_image_upstream_url(
     request_path: Option<&str>,
     request_query: Option<&str>,
 ) -> String {
-    if transport
-        .provider
-        .provider_type
-        .trim()
-        .eq_ignore_ascii_case("codex")
-    {
-        return build_openai_responses_url(&transport.endpoint.base_url, request_query, false);
-    }
     build_openai_image_url(&transport.endpoint.base_url, request_path, request_query)
 }
 
@@ -82,7 +79,11 @@ pub fn build_openai_image_headers(
         &BTreeMap::new(),
     );
     provider_request_headers.insert("content-type".to_string(), "application/json".to_string());
-    provider_request_headers.insert("accept".to_string(), input.accept.to_string());
+    if let Some(accept) = input.accept {
+        provider_request_headers.insert("accept".to_string(), accept.to_string());
+    } else {
+        provider_request_headers.remove("accept");
+    }
     crate::apply_local_auth_config_header_overrides(
         &mut provider_request_headers,
         input.transport.key.decrypted_auth_config.as_deref(),
@@ -171,14 +172,25 @@ mod tests {
     }
 
     #[test]
-    fn codex_openai_image_url_stays_on_responses_surface() {
+    fn codex_openai_image_url_uses_images_surface() {
         let url = build_openai_image_upstream_url(
             &sample_transport(),
             Some("/v1/images/generations"),
             Some("trace=1"),
         );
 
-        assert_eq!(url, "https://api.openai.com/v1/responses?trace=1");
+        assert_eq!(url, "https://api.openai.com/v1/images/generations?trace=1");
+    }
+
+    #[test]
+    fn codex_openai_image_edit_url_uses_images_edit_surface() {
+        let url = build_openai_image_upstream_url(
+            &sample_transport(),
+            Some("/v1/images/edits"),
+            Some("trace=1"),
+        );
+
+        assert_eq!(url, "https://api.openai.com/v1/images/edits?trace=1");
     }
 
     #[test]
@@ -229,6 +241,19 @@ mod tests {
     }
 
     #[test]
+    fn codex_is_supported_by_dedicated_openai_image_transport_policy() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "codex".to_string();
+        transport.key.auth_type = "oauth".to_string();
+        transport.key.decrypted_auth_config = Some(json!({"access_token":"token"}).to_string());
+
+        assert_eq!(
+            openai_image_transport_unsupported_reason(&transport, "openai:image"),
+            None
+        );
+    }
+
+    #[test]
     fn grok_oauth_session_is_supported_by_dedicated_openai_image_transport_policy() {
         let mut transport = sample_transport();
         transport.provider.provider_type = "grok".to_string();
@@ -264,7 +289,7 @@ mod tests {
             headers: &HeaderMap::new(),
             auth_header: "authorization",
             auth_value: "Bearer secret",
-            accept: "text/event-stream",
+            accept: Some("text/event-stream"),
             header_rules: Some(&json!([
                 {"action":"set","key":"x-image-route","value":"codex"}
             ])),
@@ -307,7 +332,7 @@ mod tests {
             headers: &HeaderMap::new(),
             auth_header: "authorization",
             auth_value: "Bearer refreshed-access-token",
-            accept: "text/event-stream",
+            accept: Some("text/event-stream"),
             header_rules: None,
             provider_request_body: &json!({"model":"gpt-5.4-mini"}),
             original_request_body: &json!({"prompt":"draw"}),
@@ -332,7 +357,7 @@ mod tests {
             headers: &HeaderMap::new(),
             auth_header: "authorization",
             auth_value: "Bearer secret",
-            accept: "application/json",
+            accept: Some("application/json"),
             header_rules: None,
             provider_request_body: &json!({
                 "model": "upstream-image-model",
@@ -347,6 +372,31 @@ mod tests {
             headers.get("content-type"),
             Some(&"application/json".to_string())
         );
+    }
+
+    #[test]
+    fn codex_images_omits_explicit_accept_header() {
+        let transport = sample_transport();
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("accept", "text/event-stream".parse().expect("valid header"));
+        let headers = build_openai_image_headers(ProviderOpenAiImageHeadersInput {
+            transport: &transport,
+            headers: &request_headers,
+            auth_header: "authorization",
+            auth_value: "Bearer secret",
+            accept: None,
+            header_rules: Some(&json!([
+                {"action":"set","key":"accept","value":"application/json"}
+            ])),
+            provider_request_body: &json!({
+                "model": "gpt-image-2",
+                "prompt": "draw a city",
+            }),
+            original_request_body: &json!({"prompt":"draw a city"}),
+        })
+        .expect("headers should build");
+
+        assert!(!headers.contains_key("accept"));
     }
 
     #[test]
