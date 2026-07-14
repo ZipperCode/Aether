@@ -645,9 +645,12 @@ function buildEndpointPatch(endpoint: ProviderEndpoint, rules: ParsedEndpointRul
       : null
   }
   if (endpointState.value.formatConversion.include) {
-    patch.format_acceptance_config = endpointState.value.formatConversion.enabled
-      ? { enabled: true }
-      : null
+    const enabled = endpointState.value.formatConversion.enabled
+    patch.format_acceptance_config = endpoint.format_acceptance_config
+      ? { ...endpoint.format_acceptance_config, enabled }
+      : enabled
+        ? { enabled: true }
+        : null
   }
   if (endpointState.value.upstreamPolicy.include) {
     patch.config = buildUpstreamStreamConfig(endpoint.config, endpointState.value.upstreamPolicy.value)

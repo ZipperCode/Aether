@@ -446,12 +446,13 @@ async function loadProviderStats() {
 }
 
 async function loadProviderAttribution() {
+  const requestId = ++providerAttributionRequestId
   const provider = selectedProvider.value
   if (!provider) {
     providerAttribution.value = null
+    providerAttributionLoading.value = false
     return
   }
-  const requestId = ++providerAttributionRequestId
   providerAttributionLoading.value = true
   try {
     const response = await usageApi.getUsageAttribution({

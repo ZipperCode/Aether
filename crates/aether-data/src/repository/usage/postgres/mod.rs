@@ -7387,6 +7387,9 @@ ORDER BY request_count DESC, group_key ASC
         if matches!(query.group_by, UsageAuditAggregationGroupBy::Provider) {
             return self.aggregate_usage_audits_raw(query).await;
         }
+        if query.provider_id.is_some() || query.provider_name.is_some() {
+            return self.aggregate_usage_audits_raw(query).await;
+        }
         if query.exclude_reserved_provider_labels
             && !matches!(query.group_by, UsageAuditAggregationGroupBy::Provider)
         {
