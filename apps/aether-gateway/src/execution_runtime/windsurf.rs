@@ -12,6 +12,7 @@ use aether_contracts::{
     ExecutionStreamTerminalSummary, ExecutionTelemetry, ResponseBody, StandardizedUsage,
     StreamFrame, StreamFramePayload, StreamFrameType,
 };
+use aether_http::{collect_reqwest_body_bounded, BoundedBodyError, BoundedBodyReadError};
 use aether_provider_transport::windsurf::cascade::{
     build_add_tracked_workspace_request, build_additional_step,
     build_get_generator_metadata_request, build_get_trajectory_request,
@@ -24,9 +25,6 @@ use aether_provider_transport::windsurf::cascade::{
 };
 use aether_provider_transport::windsurf::models::resolve_windsurf_model;
 use aether_provider_transport::windsurf::{GET_CHAT_MESSAGE_PATH, WINDSURF_ENVELOPE_NAME};
-use aether_provider_transport::{
-    collect_reqwest_body_bounded, BoundedBodyError, BoundedBodyReadError,
-};
 use axum::body::Bytes;
 use base64::Engine as _;
 use futures_util::stream::BoxStream;

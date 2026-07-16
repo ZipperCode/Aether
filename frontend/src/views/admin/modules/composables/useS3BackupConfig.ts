@@ -143,38 +143,37 @@ export function useS3BackupConfig() {
     loading.value = true
     try {
       const next = defaultS3BackupConfig()
-      await Promise.all(CONFIG_KEYS.map(async (key) => {
-        try {
-          const response = await adminApi.getSystemConfig(key)
-          const field = FIELD_BY_CONFIG_KEY[key]
-          if (field === 'secretAccessKey') {
-            next.secretAccessKey = ''
-            next.secretAccessKeyIsSet = !!response.is_set
-            return
-          }
-          if (response.value === null || response.value === undefined) return
-          if (field === 'enabled' || field === 'pathStyle') {
-            next[field] = booleanValue(response.value, next[field])
-          } else if (
-            field === 'scheduleInterval' ||
-            field === 'scheduleMinute' ||
-            field === 'scheduleHour' ||
-            field === 'scheduleWeekday' ||
-            field === 'scheduleMonthDay' ||
-            field === 'retentionCount'
-          ) {
-            next[field] = numberValue(response.value, next[field])
-          } else if (field === 'scope') {
-            next.scope = scopeValue(response.value, next.scope)
-          } else if (field === 'scheduleUnit') {
-            next.scheduleUnit = scheduleUnitValue(response.value, next.scheduleUnit)
-          } else {
-            next[field] = stringValue(response.value, next[field] as string)
-          }
-        } catch {
-          // 单个配置缺失时使用默认值
+      const configs = await adminApi.getAllSystemConfigs({ cacheTtlMs: 30_000 })
+      const configsByKey = new Map(configs.map((item) => [item.key, item]))
+      for (const key of CONFIG_KEYS) {
+        const response = configsByKey.get(key)
+        if (!response) continue
+        const field = FIELD_BY_CONFIG_KEY[key]
+        if (field === 'secretAccessKey') {
+          next.secretAccessKey = ''
+          next.secretAccessKeyIsSet = !!response.is_set
+          continue
         }
-      }))
+        if (response.value === null || response.value === undefined) continue
+        if (field === 'enabled' || field === 'pathStyle') {
+          next[field] = booleanValue(response.value, next[field])
+        } else if (
+          field === 'scheduleInterval' ||
+          field === 'scheduleMinute' ||
+          field === 'scheduleHour' ||
+          field === 'scheduleWeekday' ||
+          field === 'scheduleMonthDay' ||
+          field === 'retentionCount'
+        ) {
+          next[field] = numberValue(response.value, next[field])
+        } else if (field === 'scope') {
+          next.scope = scopeValue(response.value, next.scope)
+        } else if (field === 'scheduleUnit') {
+          next.scheduleUnit = scheduleUnitValue(response.value, next.scheduleUnit)
+        } else {
+          next[field] = stringValue(response.value, next[field] as string)
+        }
+      }
       config.value = next
       originalConfig.value = cloneConfig(next)
     } catch (err) {

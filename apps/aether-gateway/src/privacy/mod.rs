@@ -4169,7 +4169,7 @@ mod tests {
     use std::time::Duration;
 
     use aether_runtime_state::{RedisClientConfig, RuntimeState};
-    use aether_testkit::ManagedRedisServer;
+    use aether_test_support::ManagedRedisServer;
     use serde_json::{json, Value};
 
     fn assert_debug_surface_hides_values(debug: &str, originals: &[&str], sentinels: &[String]) {

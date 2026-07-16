@@ -1283,7 +1283,7 @@ mod tests {
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
-    use aether_testkit::ManagedRedisServer;
+    use aether_test_support::ManagedRedisServer;
     use serde_json::{json, Value};
 
     use super::{

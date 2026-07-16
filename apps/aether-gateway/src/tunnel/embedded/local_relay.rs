@@ -159,6 +159,15 @@ fn relay_header_timeout(meta: &protocol::RequestMeta) -> Duration {
     Duration::from_millis(resolve_tunnel_request_timeouts(meta).first_byte_ms)
 }
 
+fn is_rollout_probe_request(headers: &HeaderMap, forwarded_by_gateway: bool) -> bool {
+    forwarded_by_gateway
+        && headers
+            .get(crate::tunnel::TUNNEL_RELAY_ROLLOUT_PROBE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .is_some_and(|value| value == crate::tunnel::TUNNEL_RELAY_ROLLOUT_PROBE_VALUE)
+}
+
 pub async fn relay_request(
     Path(node_id): Path<String>,
     State(state): State<AppState>,
@@ -171,6 +180,7 @@ pub async fn relay_request(
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
+    let rollout_probe = is_rollout_probe_request(request.headers(), forwarded_by_gateway);
     if !addr.ip().is_loopback() && !forwarded_by_gateway {
         return tunnel_error_response(
             StatusCode::FORBIDDEN,
@@ -348,12 +358,16 @@ pub async fn relay_request(
             );
         }
     };
-    if let Err(error) = record_proxy_upgrade_traffic_success(state.data.as_ref(), &node_id).await {
-        warn!(
-            node_id = %node_id,
-            error = %error,
-            "failed to record proxy upgrade traffic confirmation"
-        );
+    if !rollout_probe {
+        if let Err(error) =
+            record_proxy_upgrade_traffic_success(state.data.as_ref(), &node_id).await
+        {
+            warn!(
+                node_id = %node_id,
+                error = %error,
+                "failed to record proxy upgrade traffic confirmation"
+            );
+        }
     }
 
     let Some(mut body_rx) = stream.take_body_receiver() else {
@@ -462,8 +476,8 @@ mod tests {
     use super::super::hub::ProxyConn;
     use super::super::{protocol, AppState, ConnConfig, ControlPlaneClient};
     use super::{
-        relay_header_timeout, relay_request, Body, Request, SocketAddr, StatusCode,
-        TUNNEL_ERROR_HEADER,
+        is_rollout_probe_request, relay_header_timeout, relay_request, Body, HeaderMap, Request,
+        SocketAddr, StatusCode, TUNNEL_ERROR_HEADER,
     };
     use crate::data::GatewayDataState;
     use crate::maintenance::start_proxy_upgrade_rollout;
@@ -481,6 +495,20 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::watch;
+
+    #[test]
+    fn rollout_probe_marker_is_only_trusted_from_a_forwarding_gateway() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::tunnel::TUNNEL_RELAY_ROLLOUT_PROBE_HEADER,
+            crate::tunnel::TUNNEL_RELAY_ROLLOUT_PROBE_VALUE
+                .parse()
+                .expect("probe marker should be a valid header"),
+        );
+
+        assert!(!is_rollout_probe_request(&headers, false));
+        assert!(is_rollout_probe_request(&headers, true));
+    }
 
     fn test_app_state() -> AppState {
         AppState::new(
@@ -530,7 +558,6 @@ mod tests {
             stream_first_byte_timeout_ms: None,
             timeout: 60,
             follow_redirects: None,
-            max_response_body_bytes: None,
             http1_only: false,
             transport_profile: None,
         };

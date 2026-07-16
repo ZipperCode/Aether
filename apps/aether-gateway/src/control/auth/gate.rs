@@ -213,6 +213,7 @@ async fn estimate_execution_plan_cost_upper_bound_usd(
     );
     let ttl = state.frontdoor_runtime_guards.auth_capacity_cache_ttl;
     if ttl.is_zero() {
+        let _permit = state.acquire_auth_snapshot_load_gate().await?;
         return calculate_execution_plan_cost_upper_bound(
             state,
             plan,
@@ -230,6 +231,7 @@ async fn estimate_execution_plan_cost_upper_bound_usd(
     state
         .auth_request_cost_upper_bound_cache
         .get_or_load(cache_key, ttl, || async {
+            let _permit = state.acquire_auth_snapshot_load_gate().await?;
             calculate_execution_plan_cost_upper_bound(
                 state,
                 plan,
@@ -499,9 +501,16 @@ async fn request_model_resolves_to_allowed_model(
             .model_directive_policy
             .resolve_reasoning(&api_format, Some(requested_model));
         let routing_model = resolution.base_model().unwrap_or(requested_model);
-        let rows = state
-            .list_minimal_candidate_selection_rows_for_api_format(&api_format)
-            .await?;
+        let rows = {
+            // Model alias authorization runs before candidate planning, so its database read must
+            // participate in the same foreground DB admission budget as the rest of auth. Keep
+            // the permit scoped to this one read; callers do not hold this gate, and releasing it
+            // here avoids carrying a DB permit through pure filtering or subsequent formats.
+            let _permit = state.acquire_auth_snapshot_load_gate().await?;
+            state
+                .list_minimal_candidate_selection_rows_for_api_format(&api_format)
+                .await?
+        };
         let matching_rows = rows
             .into_iter()
             .filter(|row| {
@@ -553,6 +562,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use aether_contracts::{ExecutionPlan, RequestBody};
     use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
@@ -564,6 +574,7 @@ mod tests {
         StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
     };
     use aether_data_contracts::DataLayerError;
+    use aether_runtime::ConcurrencyGate;
     use async_trait::async_trait;
     use axum::body::Bytes;
     use axum::http::{HeaderMap, Uri};
@@ -610,6 +621,7 @@ mod tests {
                 priority: 1,
                 api_formats: Some(vec!["openai:chat".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -897,6 +909,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_alias_resolution_waits_for_auth_database_gate() {
+        let mut state = state_with_model_mapping();
+        state.auth_snapshot_load_gate = Some(Arc::new(ConcurrencyGate::new(
+            "test_auth_model_resolution",
+            1,
+        )));
+        let held = state
+            .acquire_auth_snapshot_load_gate()
+            .await
+            .expect("auth gate acquisition should succeed")
+            .expect("auth gate should be configured");
+        let decision = decision_with_allowed_models(vec!["gpt-5".to_string()]);
+        let uri: Uri = "/v1/chat/completions".parse().expect("uri should parse");
+        let headers = json_headers();
+        let body = Bytes::from_static(br#"{"model":"gpt-5.2","messages":[]}"#);
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(25),
+            request_model_local_rejection(&state, Some(&decision), &uri, &headers, &body),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "model alias candidate reads must wait for the auth DB gate"
+        );
+
+        drop(held);
+        let rejection = tokio::time::timeout(
+            Duration::from_secs(1),
+            request_model_local_rejection(&state, Some(&decision), &uri, &headers, &body),
+        )
+        .await
+        .expect("model alias resolution should resume after releasing the auth gate")
+        .expect("model rejection should resolve");
+        assert_eq!(rejection, None);
+    }
+
+    #[tokio::test]
     async fn model_rejection_allows_cross_format_provider_mapping_to_allowed_global_model() {
         let mut row = sample_row_for_api_format("gemini:generate_content");
         row.model_provider_model_name = "gemini-2.5-pro-upstream".to_string();
@@ -905,6 +955,7 @@ mod tests {
             priority: 1,
             api_formats: Some(vec!["gemini:generate_content".to_string()]),
             endpoint_ids: None,
+            operations: None,
         }]);
         let state = state_with_rows(vec![row]);
         let decision = decision_with_allowed_models(vec!["gpt-5".to_string()]);

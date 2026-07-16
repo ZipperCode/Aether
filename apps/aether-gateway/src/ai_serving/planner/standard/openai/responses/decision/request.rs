@@ -685,8 +685,9 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
             Some(trace_id),
             transport.key.decrypted_auth_config.as_deref(),
         );
-        crate::ai_serving::apply_codex_openai_responses_lite_header_with_capabilities(
+        crate::ai_serving::apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
             &mut provider_request_headers,
+            Some(&provider_request_body),
             transport.provider.provider_type.as_str(),
             provider_api_format,
             mapped_model.as_str(),

@@ -269,7 +269,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 }
 
 pub(crate) fn should_skip_request_header(name: &str) -> bool {
-    crate::provider_transport::should_skip_request_header(name)
+    aether_http::should_skip_request_header(name)
 }
 
 pub(crate) fn should_skip_upstream_passthrough_header(name: &str) -> bool {

@@ -36,7 +36,6 @@ fn relay_request_meta(
         stream_first_byte_timeout_ms,
         timeout: 60,
         follow_redirects: None,
-        max_response_body_bytes: None,
         http1_only: false,
         transport_profile: None,
     }

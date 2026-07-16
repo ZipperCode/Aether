@@ -809,29 +809,6 @@ impl AppState {
         Ok(updated)
     }
 
-    pub(crate) async fn mutate_provider_catalog_key_quota_snapshot(
-        &self,
-        key_id: &str,
-        quota_snapshot: &serde_json::Value,
-        updated_at_unix_secs: Option<u64>,
-    ) -> Result<bool, GatewayError> {
-        let updated = self
-            .data
-            .mutate_provider_catalog_key_quota_snapshot(
-                key_id,
-                quota_snapshot,
-                updated_at_unix_secs,
-            )
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
-        Ok(updated)
-    }
-
-    pub(crate) fn invalidate_provider_quota_candidate_caches(&self) {
-        self.candidate_page_cache.clear();
-        self.candidate_resolved_page_cache.clear();
-    }
-
     pub(crate) async fn delete_provider_catalog_key(
         &self,
         key_id: &str,
@@ -1442,6 +1419,7 @@ mod tests {
         let ttl = Duration::from_secs(300);
         let cache_key = CandidatePageCacheKey::new(
             "gpt-5",
+            None,
             "openai:chat",
             true,
             &sample_auth_snapshot(),

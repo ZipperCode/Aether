@@ -413,7 +413,7 @@ export const dashboardApi = {
         const response = await apiClient.get<DashboardStatsResponse>('/api/dashboard/stats', { params })
         return response.data
       },
-      10 * 1000
+      30 * 1000
     )
   },
 
@@ -476,7 +476,7 @@ export const dashboardApi = {
         })
         return response.data
       },
-      20 * 1000
+      60 * 1000
     )
   },
 

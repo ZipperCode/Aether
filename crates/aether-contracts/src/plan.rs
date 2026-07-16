@@ -12,6 +12,7 @@ pub const MAX_EXECUTION_REQUEST_TIMEOUT_MS: u64 = MAX_EXECUTION_REQUEST_TIMEOUT_
 pub const MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_SECS: u64 = 300;
 pub const MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_MS: u64 =
     MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_SECS * 1_000;
+/// Internal execution header used to cap buffered upstream response bodies.
 pub const EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER: &str =
     "x-aether-execution-max-response-body-bytes";
 

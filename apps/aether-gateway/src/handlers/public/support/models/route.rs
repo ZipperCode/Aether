@@ -1,31 +1,33 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aether_data_contracts::repository::model_catalog::StoredModelCatalogEntry;
-use axum::{
-    body::Body,
-    response::{IntoResponse, Response},
-    Json,
-};
-use futures_util::stream::{self, StreamExt};
-use serde_json::{json, Value};
+use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
+use axum::{body::Body, response::Response};
+use serde_json::Value;
 use tokio::time::timeout;
 use tracing::warn;
 
 use super::models_responses::{
+    build_claude_model_detail_response, build_claude_models_list_response,
     build_codex_models_list_response, build_empty_models_list_response,
+    build_gemini_model_detail_response, build_gemini_models_list_response,
     build_models_auth_error_response, build_models_not_found_response,
+    build_openai_model_detail_response, build_openai_models_list_response,
 };
 use super::models_shared::{filter_catalog_for_models, models_api_format, models_detail_id};
+use super::models_shared::{
+    filter_eligible_model_rows, filter_rows_for_models, models_api_format, models_detail_id,
+    models_query_api_formats,
+};
 use super::{query_param_value, AppState, GatewayPublicRequestContext};
 
 #[cfg(not(test))]
 const MODELS_ROUTE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const MODELS_ROUTE_READ_TIMEOUT: Duration = Duration::from_millis(50);
-const PUBLIC_MODELS_OWNER: &str = "aether";
+const CODEX_MODELS_QUERY_API_FORMATS: &[&str] = &["openai:responses"];
 
 async fn await_models_route_read<T, E, Fut>(operation: &'static str, future: Fut) -> Option<T>
 where
@@ -75,108 +77,29 @@ fn build_models_read_fallback_response(
     }
 }
 
-fn is_codex_models_api_format(api_format: &str) -> bool {
-    crate::ai_serving::normalize_api_format_alias(api_format) == "openai:responses"
+fn sort_model_rows(
+    mut rows: Vec<StoredMinimalCandidateSelectionRow>,
+) -> Vec<StoredMinimalCandidateSelectionRow> {
+    rows.sort_by(|left, right| {
+        left.global_model_name
+            .cmp(&right.global_model_name)
+            .then(left.provider_priority.cmp(&right.provider_priority))
+            .then(left.key_internal_priority.cmp(&right.key_internal_priority))
+            .then(left.provider_id.cmp(&right.provider_id))
+            .then(left.endpoint_id.cmp(&right.endpoint_id))
+            .then(left.key_id.cmp(&right.key_id))
+            .then(left.model_id.cmp(&right.model_id))
+    });
+    rows
 }
 
-fn is_codex_provider_row(row: &StoredModelCatalogEntry) -> bool {
-    row.provider_type.trim().eq_ignore_ascii_case("codex")
-}
-
-fn codex_model_card_is_complete(card: &serde_json::Map<String, Value>) -> bool {
-    card.get("slug").and_then(Value::as_str).is_some()
-        && card.get("display_name").and_then(Value::as_str).is_some()
-        && card
-            .get("supported_reasoning_levels")
-            .and_then(Value::as_array)
-            .is_some()
-        && card.get("shell_type").and_then(Value::as_str).is_some()
-        && card.get("visibility").and_then(Value::as_str).is_some()
-        && card
-            .get("supported_in_api")
-            .and_then(Value::as_bool)
-            .is_some()
-        && card.get("priority").and_then(Value::as_i64).is_some()
-        && card
-            .get("base_instructions")
-            .and_then(Value::as_str)
-            .is_some()
-        && card
-            .get("supports_reasoning_summary_parameter")
-            .is_none_or(Value::is_boolean)
-        && card
-            .get("support_verbosity")
-            .and_then(Value::as_bool)
-            .is_some()
-        && card
-            .get("truncation_policy")
-            .and_then(Value::as_object)
-            .is_some()
-        && card
-            .get("supports_parallel_tool_calls")
-            .and_then(Value::as_bool)
-            .is_some()
-        && card
-            .get("experimental_supported_tools")
-            .and_then(Value::as_array)
-            .is_some()
-}
-
-fn project_codex_model_card(
-    cached_models: &[Value],
-    source_model: &str,
-    global_model: &str,
-) -> Option<Value> {
-    let mut card = cached_models
-        .iter()
-        .find(|model| {
-            model.get("id").and_then(Value::as_str) == Some(source_model)
-                || model.get("slug").and_then(Value::as_str) == Some(source_model)
-        })?
-        .as_object()?
-        .clone();
-    if !codex_model_card_is_complete(&card) {
-        return None;
-    }
-
-    card.remove("id");
-    card.remove("api_formats");
-    card.insert("slug".to_string(), Value::String(global_model.to_string()));
-    Some(Value::Object(card))
-}
-
-fn codex_catalog_cards(value: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
-    value?
-        .get("codex_models")
-        .and_then(|catalog| catalog.get("cards"))
-        .and_then(Value::as_object)
-}
-
-fn codex_catalog_card_candidates(row: &StoredModelCatalogEntry) -> Vec<Value> {
-    [
-        row.provider_model_config.as_ref(),
-        row.global_model_config.as_ref(),
-    ]
-    .into_iter()
-    .filter_map(codex_catalog_cards)
-    .flat_map(|cards| {
-        [
-            row.provider_model_name.as_str(),
-            row.global_model_name.as_str(),
-            row.provider_model_id.as_str(),
-        ]
-        .into_iter()
-        .filter_map(|name| cards.get(name).cloned())
-        .collect::<Vec<_>>()
-    })
-    .collect()
-}
-
-async fn load_codex_model_cards(_state: &AppState, rows: &[StoredModelCatalogEntry]) -> Vec<Value> {
-    let mut seen_global_models = BTreeSet::new();
-    let mut cards = Vec::new();
-    for row in rows.iter().filter(|row| is_codex_provider_row(row)) {
-        if seen_global_models.contains(&row.global_model_name) {
+fn sort_and_dedup_model_rows(
+    rows: Vec<StoredMinimalCandidateSelectionRow>,
+) -> Vec<StoredMinimalCandidateSelectionRow> {
+    let mut deduped = Vec::with_capacity(rows.len());
+    let mut last_model_name: Option<String> = None;
+    for row in sort_model_rows(rows) {
+        if last_model_name.as_deref() == Some(row.global_model_name.as_str()) {
             continue;
         }
         let cached_models = codex_catalog_card_candidates(row);
@@ -322,14 +245,157 @@ fn build_gemini_catalog_model_detail_response(row: &StoredModelCatalogEntry) -> 
     Json(build_gemini_catalog_model_value(row)).into_response()
 }
 
+fn is_codex_models_api_format(api_format: &str) -> bool {
+    crate::ai_serving::normalize_api_format_alias(api_format) == "openai:responses"
+}
+
+fn is_codex_provider_row(row: &StoredMinimalCandidateSelectionRow) -> bool {
+    row.provider_type.trim().eq_ignore_ascii_case("codex")
+}
+
+fn codex_model_card_is_complete(card: &serde_json::Map<String, Value>) -> bool {
+    card.get("slug").and_then(Value::as_str).is_some()
+        && card.get("display_name").and_then(Value::as_str).is_some()
+        && card
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .is_some()
+        && card.get("shell_type").and_then(Value::as_str).is_some()
+        && card.get("visibility").and_then(Value::as_str).is_some()
+        && card
+            .get("supported_in_api")
+            .and_then(Value::as_bool)
+            .is_some()
+        && card.get("priority").and_then(Value::as_i64).is_some()
+        && card
+            .get("base_instructions")
+            .and_then(Value::as_str)
+            .is_some()
+        && card
+            .get("supports_reasoning_summary_parameter")
+            .is_none_or(Value::is_boolean)
+        && card
+            .get("support_verbosity")
+            .and_then(Value::as_bool)
+            .is_some()
+        && card
+            .get("truncation_policy")
+            .and_then(Value::as_object)
+            .is_some()
+        && card
+            .get("supports_parallel_tool_calls")
+            .and_then(Value::as_bool)
+            .is_some()
+        && card
+            .get("experimental_supported_tools")
+            .and_then(Value::as_array)
+            .is_some()
+}
+
+fn project_codex_model_card(
+    cached_models: &[Value],
+    source_model: &str,
+    global_model: &str,
+) -> Option<Value> {
+    let mut card = cached_models
+        .iter()
+        .find(|model| {
+            model.get("id").and_then(Value::as_str) == Some(source_model)
+                || model.get("slug").and_then(Value::as_str) == Some(source_model)
+        })?
+        .as_object()?
+        .clone();
+    if !codex_model_card_is_complete(&card) {
+        return None;
+    }
+
+    card.remove("id");
+    card.remove("api_formats");
+    card.insert("slug".to_string(), Value::String(global_model.to_string()));
+    Some(Value::Object(card))
+}
+
+async fn load_codex_model_cards(
+    state: &AppState,
+    rows: &[StoredMinimalCandidateSelectionRow],
+) -> Vec<Value> {
+    let cache_keys = rows
+        .iter()
+        .filter(|row| is_codex_provider_row(row))
+        .map(|row| format!("upstream_models:{}:{}", row.provider_id, row.key_id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let cached_values = await_models_route_read(
+        "codex_models_cache",
+        state.runtime_state.kv_get_many(&cache_keys),
+    )
+    .await
+    .unwrap_or_default();
+    let cached_models_by_key = cache_keys
+        .into_iter()
+        .zip(cached_values)
+        .filter_map(|(key, raw)| {
+            let models = serde_json::from_str::<Vec<Value>>(raw.as_deref()?).ok()?;
+            Some((key, models))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut seen_global_models = BTreeSet::new();
+    let mut cards = Vec::new();
+    for row in rows.iter().filter(|row| is_codex_provider_row(row)) {
+        if seen_global_models.contains(&row.global_model_name) {
+            continue;
+        }
+        let cache_key = format!("upstream_models:{}:{}", row.provider_id, row.key_id);
+        let Some(cached_models) = cached_models_by_key.get(&cache_key) else {
+            continue;
+        };
+        let source_model =
+            aether_scheduler_core::select_provider_model_name(row, "openai:responses");
+        let Some(card) = project_codex_model_card(
+            cached_models,
+            source_model.as_str(),
+            row.global_model_name.as_str(),
+        ) else {
+            continue;
+        };
+        seen_global_models.insert(row.global_model_name.clone());
+        cards.push(card);
+    }
+    cards
+}
+
 async fn list_model_rows_for_client_format(
     state: &AppState,
     api_format: &str,
     auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
-    now_unix_secs: u64,
-) -> Option<Vec<StoredModelCatalogEntry>> {
-    let rows = await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
-    retain_routable_model_rows(state, rows, api_format, auth_snapshot, now_unix_secs).await
+) -> Option<Vec<StoredMinimalCandidateSelectionRow>> {
+    let mut collected = Vec::new();
+    let query_api_formats = if is_codex_models_api_format(api_format) {
+        CODEX_MODELS_QUERY_API_FORMATS
+    } else {
+        models_query_api_formats(api_format)
+    };
+    for query_format in query_api_formats {
+        let rows = await_models_route_read(
+            "candidate_selection_by_api_format",
+            state.list_minimal_candidate_selection_rows_for_api_format(query_format),
+        )
+        .await?;
+        let mut filtered = if is_codex_models_api_format(api_format) {
+            filter_eligible_model_rows(rows, auth_snapshot, query_format)
+        } else {
+            filter_rows_for_models(rows, auth_snapshot, query_format)
+        };
+        collected.append(&mut filtered);
+    }
+    if is_codex_models_api_format(api_format) {
+        collected.retain(is_codex_provider_row);
+        Some(sort_model_rows(collected))
+    } else {
+        Some(sort_and_dedup_model_rows(collected))
+    }
 }
 
 async fn detail_model_rows_for_client_format(

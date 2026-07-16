@@ -15,10 +15,9 @@ use aether_contracts::{
     TRANSPORT_HTTP_MODE_HTTP1_ONLY,
 };
 use aether_data::repository::proxy_nodes::ProxyNodeTrafficMutation;
-use aether_http::{apply_http_client_config, HttpClientConfig};
-use aether_provider_transport::{
-    collect_reqwest_body_bounded, decode_response_body_bounded, BoundedBodyCollector,
-    BoundedBodyError, BoundedBodyReadError,
+use aether_http::{
+    apply_http_client_config, collect_reqwest_body_bounded, decode_response_body_bounded,
+    BoundedBodyCollector, BoundedBodyError, BoundedBodyReadError, HttpClientConfig,
 };
 use aether_runtime::{MetricKind, MetricSample};
 use axum::body::Bytes;

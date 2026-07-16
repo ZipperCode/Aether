@@ -122,8 +122,9 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision(
             input.requested_model.as_str(),
         )
     });
-    crate::ai_serving::apply_codex_openai_responses_lite_header_with_capabilities(
+    crate::ai_serving::apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
         &mut decision.provider_request_headers,
+        decision.provider_request_body.as_ref(),
         provider_type.as_str(),
         provider_api_format.as_str(),
         terminal_provider_model,
@@ -254,8 +255,9 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision(
             input.requested_model.as_str(),
         )
     });
-    crate::ai_serving::apply_codex_openai_responses_lite_header_with_capabilities(
+    crate::ai_serving::apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
         &mut provider_request_headers,
+        Some(&provider_request_body),
         provider_type.as_str(),
         provider_api_format.as_str(),
         provider_model,

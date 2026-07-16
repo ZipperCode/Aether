@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use aether_provider_transport::{should_skip_request_header, BoundedBodyCollector};
+use aether_http::{should_skip_request_header, BoundedBodyCollector};
 use aether_runtime::{AdmissionPermit, QueueSendError};
 use bytes::{Bytes, BytesMut};
 use futures_util::stream;
@@ -32,6 +32,7 @@ use super::writer::FrameSender;
 
 /// Maximum response body chunk size per frame (32 KB).
 const MAX_CHUNK_SIZE: usize = 32 * 1024;
+/// Default response-body cap when the gateway does not provide a per-request limit.
 const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 /// Timeout for sending a single frame to the writer channel.
@@ -715,6 +716,7 @@ fn resolve_request_timeouts(meta: &RequestMeta) -> RequestTimeouts {
     }
 }
 
+/// Resolves the bounded response-body limit carried in tunnel request metadata.
 fn resolve_response_body_limit(meta: &RequestMeta) -> usize {
     meta.max_response_body_bytes
         .and_then(|value| usize::try_from(value).ok())
@@ -2185,29 +2187,6 @@ mod tests {
         let expected = Duration::from_millis(aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_MS);
         assert_eq!(timeouts.first_byte_timeout, expected);
         assert_eq!(timeouts.response_body_timeout, Some(expected));
-    }
-
-    #[test]
-    fn response_body_limit_metadata_is_not_forwarded_upstream() {
-        // Given
-        let headers = std::collections::HashMap::from([
-            ("content-type".to_string(), "application/json".to_string()),
-            (
-                aether_contracts::EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER.to_string(),
-                "1048576".to_string(),
-            ),
-        ]);
-
-        // When
-        let sanitized = sanitize_upstream_headers(&headers);
-
-        // Then
-        assert!(sanitized
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("content-type")));
-        assert!(!sanitized.iter().any(|(name, _)| name.eq_ignore_ascii_case(
-            aether_contracts::EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER
-        )));
     }
 
     #[test]

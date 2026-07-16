@@ -3464,8 +3464,9 @@ async fn provider_query_execute_standard_test_candidate(
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or(request_model);
-        crate::ai_serving::apply_codex_openai_responses_lite_header_with_capabilities(
+        crate::ai_serving::apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
             &mut request_headers,
+            Some(&provider_request_body),
             transport.provider.provider_type.as_str(),
             provider_api_format,
             final_provider_model,

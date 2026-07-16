@@ -601,6 +601,7 @@ import {
   EMBEDDING_API_FORMATS,
   buildGlobalModelCreatePayload,
   buildGlobalModelUpdatePayload,
+  cloneTieredPricingConfig,
 } from './global-model-form-helpers'
 import { tieredPricingHasImageOutputPricing } from '../utils/tiered-pricing'
 
@@ -1106,7 +1107,7 @@ function selectModel(model: ModelsDevModelItem) {
   loadVideoPricingFromConfig()
 
   tieredPricing.value = model.tieredPricing
-    ? structuredClone(model.tieredPricing)
+    ? cloneTieredPricingConfig(model.tieredPricing)
     : null
 
   presetPanelCollapsed.value = true

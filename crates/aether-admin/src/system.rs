@@ -1779,22 +1779,26 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
 pub fn build_admin_system_configs_payload(
     entries: &[StoredSystemConfigEntry],
 ) -> serde_json::Value {
-    let has_request_record_level = entries
+    let canonical_keys = entries
         .iter()
-        .any(|entry| entry.key == REQUEST_RECORD_LEVEL_KEY);
+        .filter_map(|entry| {
+            let normalized = normalize_admin_system_config_key(&entry.key);
+            entry
+                .key
+                .eq_ignore_ascii_case(&normalized)
+                .then(|| normalized.to_ascii_lowercase())
+        })
+        .collect::<BTreeSet<_>>();
     json!(entries
         .iter()
         .filter_map(|entry| {
-            if entry.key == LEGACY_REQUEST_LOG_LEVEL_KEY && has_request_record_level {
+            let normalized_key = normalize_admin_system_config_key(&entry.key);
+            let is_legacy = !entry.key.eq_ignore_ascii_case(&normalized_key);
+            if is_legacy && canonical_keys.contains(&normalized_key.to_ascii_lowercase()) {
                 return None;
             }
-            let key = if entry.key == LEGACY_REQUEST_LOG_LEVEL_KEY {
-                REQUEST_RECORD_LEVEL_KEY
-            } else {
-                entry.key.as_str()
-            };
             Some(build_admin_system_config_list_item(
-                key,
+                &normalized_key,
                 &entry.value,
                 entry.description.as_deref(),
                 entry.updated_at_unix_secs,
@@ -3417,6 +3421,41 @@ mod tests {
                 "module.important_notification.server_chan_send_key".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn system_config_list_normalizes_legacy_keys_and_prefers_canonical_rows() {
+        let entries = vec![
+            StoredSystemConfigEntry {
+                key: "module.important_notification.server_chan_send_key".to_string(),
+                value: json!("legacy-secret"),
+                description: None,
+                updated_at_unix_secs: None,
+            },
+            StoredSystemConfigEntry {
+                key: "module.server_chan_push.send_key".to_string(),
+                value: json!("canonical-secret"),
+                description: None,
+                updated_at_unix_secs: None,
+            },
+            StoredSystemConfigEntry {
+                key: "module.notification_email.enabled".to_string(),
+                value: json!(true),
+                description: None,
+                updated_at_unix_secs: None,
+            },
+        ];
+
+        let payload = build_admin_system_configs_payload(&entries);
+        let rows = payload.as_array().expect("config list should be an array");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row["key"] == json!("module.server_chan_push.send_key") && row["is_set"] == json!(true)
+        }));
+        assert!(rows.iter().any(|row| {
+            row["key"] == json!("module.important_notification.enabled")
+                && row["value"] == json!(true)
+        }));
     }
 
     #[test]

@@ -44,6 +44,8 @@ export interface UsageStats {
   total_cost: number
   total_actual_cost?: number
   avg_response_time: number
+  error_count?: number
+  error_rate?: number
   today?: {
     requests: number
     tokens: number
@@ -638,7 +640,44 @@ export const usageApi = {
   async getActiveRequests(
     ids?: string[],
     timeRange?: Pick<UsageFilters, 'start_date' | 'end_date' | 'preset' | 'timezone' | 'tz_offset_minutes'>
-  ): Promise<ActiveUsageRequestsResponse> {
+  ): Promise<{
+    requests: Array<{
+      id: string
+      status: 'pending' | 'streaming' | 'completed' | 'failed' | 'cancelled'
+      input_tokens: number
+      effective_input_tokens?: number | null
+      output_tokens: number
+      cache_creation_input_tokens?: number | null
+      cache_creation_ephemeral_5m_input_tokens?: number | null
+      cache_creation_ephemeral_1h_input_tokens?: number | null
+      cache_read_input_tokens?: number | null
+      cost: number
+      actual_cost?: number | null
+      rate_multiplier?: number | null
+      response_time_ms: number | null
+      first_byte_time_ms: number | null
+      updated_at?: string | null
+      response_time_updated_at?: string | null
+      status_code?: number | null
+      error_message?: string | null
+      provider?: string | null
+      api_key_name?: string | null
+      provider_key_name?: string | null
+      api_format?: string | null
+      endpoint_api_format?: string | null
+      is_stream?: boolean | null
+      upstream_is_stream?: boolean | null
+      client_requested_stream?: boolean | null
+      client_is_stream?: boolean | null
+      has_format_conversion?: boolean | null
+      has_fallback?: boolean | null
+      target_model?: string | null
+      reasoning_effort?: string | null
+      service_tier?: string | null
+      actual_service_tier?: string | null
+      image_progress?: ImageProgress | null
+    }>
+  }> {
     const params: Record<string, string | number> = {}
     if (ids?.length) {
       params.ids = ids.join(',')

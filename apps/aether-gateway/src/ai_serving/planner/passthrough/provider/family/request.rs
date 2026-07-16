@@ -531,8 +531,9 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or(prepared.mapped_model.as_str());
-    crate::ai_serving::apply_codex_openai_responses_lite_header_with_capabilities(
+    crate::ai_serving::apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
         &mut provider_request_headers,
+        Some(&provider_request_body),
         transport.provider.provider_type.as_str(),
         prepared.provider_api_format.as_str(),
         provider_model,

@@ -34,31 +34,35 @@ pub(crate) fn spawn_model_fetch_worker(state: AppState) -> Option<tokio::task::J
         return None;
     }
 
-    Some(tokio::spawn(async move {
-        if model_fetch_startup_enabled() {
-            let startup_delay = model_fetch_startup_delay_seconds();
-            if startup_delay > 0 {
-                tokio::time::sleep(Duration::from_secs(startup_delay)).await;
+    Some(crate::task_runtime::spawn_singleton_worker(
+        state,
+        crate::task_runtime::TASK_KEY_MODEL_FETCH_WORKER,
+        |state| async move {
+            if model_fetch_startup_enabled() {
+                let startup_delay = model_fetch_startup_delay_seconds();
+                if startup_delay > 0 {
+                    tokio::time::sleep(Duration::from_secs(startup_delay)).await;
+                }
+                if let Err(err) = run_model_fetch_cycle(&state, "startup").await {
+                    warn!(error = ?err, "gateway model fetch startup failed");
+                }
+            } else {
+                info!("gateway model fetch startup disabled");
             }
-            if let Err(err) = run_model_fetch_cycle(&state, "startup").await {
-                warn!(error = ?err, "gateway model fetch startup failed");
-            }
-        } else {
-            info!("gateway model fetch startup disabled");
-        }
 
-        let mut interval = tokio::time::interval(Duration::from_secs(
-            model_fetch_interval_minutes().saturating_mul(60),
-        ));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await;
-        loop {
+            let mut interval = tokio::time::interval(Duration::from_secs(
+                model_fetch_interval_minutes().saturating_mul(60),
+            ));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
-            if let Err(err) = run_model_fetch_cycle(&state, "tick").await {
-                warn!(error = ?err, "gateway model fetch tick failed");
+            loop {
+                interval.tick().await;
+                if let Err(err) = run_model_fetch_cycle(&state, "tick").await {
+                    warn!(error = ?err, "gateway model fetch tick failed");
+                }
             }
-        }
-    }))
+        },
+    ))
 }
 
 pub(crate) async fn perform_model_fetch_once(

@@ -1,8 +1,8 @@
 use super::{
     hash_api_key, sample_models_candidate_row, unrestricted_models_snapshot,
     InMemoryAuthApiKeySnapshotRepository, InMemoryMinimalCandidateSelectionReadRepository,
-    InMemoryVideoTaskRepository, UpsertVideoTask, VideoTaskLookupKey, VideoTaskReadRepository,
-    VideoTaskStatus, VideoTaskWriteRepository, DEVELOPMENT_ENCRYPTION_KEY,
+    InMemoryVideoTaskRepository, StoredAuthApiKeySnapshot, UpsertVideoTask, VideoTaskLookupKey,
+    VideoTaskReadRepository, VideoTaskStatus, VideoTaskWriteRepository, DEVELOPMENT_ENCRYPTION_KEY,
 };
 use crate::image_capabilities::openai_image_gateway_max_generation_count;
 use crate::tests::{
@@ -29,31 +29,6 @@ use async_trait::async_trait;
 use axum::response::IntoResponse;
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-fn sample_model_catalog_entry(
-    provider_id: &str,
-    provider_name: &str,
-    api_format: &str,
-    global_model_name: &str,
-) -> StoredModelCatalogEntry {
-    StoredModelCatalogEntry {
-        global_model_id: format!("global-{global_model_name}"),
-        global_model_name: global_model_name.to_string(),
-        global_model_config: None,
-        global_model_supported_capabilities: None,
-        global_model_is_active: true,
-        provider_model_id: format!("model-{provider_id}-{global_model_name}"),
-        provider_model_name: global_model_name.to_string(),
-        provider_model_mappings: Some(json!([{"api_formats": [api_format]}])),
-        provider_model_config: None,
-        provider_model_is_active: true,
-        provider_model_is_available: true,
-        provider_id: provider_id.to_string(),
-        provider_name: provider_name.to_string(),
-        provider_type: "custom".to_string(),
-        provider_is_active: true,
-    }
-}
 
 fn codex_models_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
     StoredAuthApiKeySnapshot::new(
@@ -103,28 +78,9 @@ fn sample_codex_models_candidate_row(
             priority: 1,
             api_formats: Some(vec!["openai:responses".to_string()]),
             endpoint_ids: None,
+            operations: None,
         },
     ]);
-    row
-}
-
-fn sample_codex_model_catalog_entry(
-    provider_id: &str,
-    global_model_name: &str,
-    source_model_name: &str,
-    card: serde_json::Value,
-) -> StoredModelCatalogEntry {
-    let mut row =
-        sample_model_catalog_entry(provider_id, "codex", "openai:responses", global_model_name);
-    row.provider_type = "codex".to_string();
-    row.provider_model_name = source_model_name.to_string();
-    row.provider_model_config = Some(json!({
-        "codex_models": {
-            "cards": {
-                source_model_name: card,
-            },
-        },
-    }));
     row
 }
 
@@ -161,86 +117,6 @@ fn complete_codex_model_card(source_model_name: &str) -> serde_json::Value {
         "minimal_client_version": "0.144.0",
         "future_capability": {"enabled": true}
     })
-}
-
-fn candidate_repository(
-    rows: Vec<StoredMinimalCandidateSelectionRow>,
-) -> Arc<InMemoryMinimalCandidateSelectionReadRepository> {
-    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows))
-}
-
-struct ToggleModelCatalogReadRepository {
-    row: StoredModelCatalogEntry,
-    active: AtomicBool,
-}
-
-impl ToggleModelCatalogReadRepository {
-    fn new(row: StoredModelCatalogEntry) -> Self {
-        Self {
-            row,
-            active: AtomicBool::new(true),
-        }
-    }
-
-    fn set_active(&self, active: bool) {
-        self.active.store(active, Ordering::SeqCst);
-    }
-
-    fn rows(&self) -> Vec<StoredModelCatalogEntry> {
-        let mut row = self.row.clone();
-        row.global_model_is_active = self.active.load(Ordering::SeqCst);
-        vec![row]
-    }
-}
-
-#[async_trait]
-impl ModelCatalogReadRepository for ToggleModelCatalogReadRepository {
-    async fn list_model_catalog(&self) -> Result<Vec<StoredModelCatalogEntry>, DataLayerError> {
-        Ok(self.rows())
-    }
-
-    async fn read_model_catalog_detail(
-        &self,
-        global_model_name: &str,
-    ) -> Result<Vec<StoredModelCatalogEntry>, DataLayerError> {
-        Ok(self
-            .rows()
-            .into_iter()
-            .filter(|row| row.global_model_name == global_model_name)
-            .collect())
-    }
-}
-
-fn restricted_models_snapshot(
-    api_key_id: &str,
-    user_id: &str,
-    allowed_providers: &[&str],
-    allowed_models: &[&str],
-) -> StoredAuthApiKeySnapshot {
-    StoredAuthApiKeySnapshot::new(
-        user_id.to_string(),
-        "alice".to_string(),
-        Some("alice@example.com".to_string()),
-        "user".to_string(),
-        "local".to_string(),
-        true,
-        false,
-        Some(json!(allowed_providers)),
-        None,
-        Some(json!(allowed_models)),
-        api_key_id.to_string(),
-        Some("default".to_string()),
-        true,
-        false,
-        false,
-        Some(10),
-        Some(5),
-        Some(4_102_444_800),
-        None,
-        None,
-        None,
-    )
-    .expect("restricted models snapshot should build")
 }
 
 fn gemini_operation_status_label(status: VideoTaskStatus) -> &'static str {
@@ -479,156 +355,26 @@ async fn gateway_handles_public_openai_models_without_hitting_fallback_probe() {
 }
 
 #[tokio::test]
-async fn gateway_models_catalog_keeps_model_when_later_provider_mapping_is_routable() {
-    // Given
-    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
-        Some(hash_api_key("sk-models-later-provider")),
-        unrestricted_models_snapshot("key-later-provider", "user-later-provider"),
-    )]));
-    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
-        sample_model_catalog_entry(
-            "provider-a-unroutable",
-            "provider-a",
-            "openai:chat",
-            "gpt-shared",
-        ),
-        sample_model_catalog_entry(
-            "provider-z-routable",
-            "provider-z",
-            "openai:chat",
-            "gpt-shared",
-        ),
-    ]));
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(
-                crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                    candidate_repository(vec![sample_models_candidate_row(
-                        "provider-z-routable",
-                        "provider-z",
-                        "openai:chat",
-                        "gpt-shared",
-                        10,
-                    )]),
-                    auth_repository,
-                )
-                .with_model_catalog_reader(model_catalog_repository),
-            ),
-    );
-    let (gateway_url, gateway_handle) = start_server(gateway).await;
-
-    // When
-    let response = reqwest::Client::new()
-        .get(format!("{gateway_url}/v1/models"))
-        .header("authorization", "Bearer sk-models-later-provider")
-        .send()
-        .await
-        .expect("models request should succeed");
-
-    // Then
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["data"][0]["id"], "gpt-shared");
-
-    gateway_handle.abort();
-}
-
-#[tokio::test]
-async fn gateway_models_catalog_applies_provider_and_model_permissions() {
-    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
-        Some(hash_api_key("sk-models-restricted")),
-        restricted_models_snapshot(
-            "key-models-restricted",
-            "user-models-restricted",
-            &["provider-openai-allowed"],
-            &["gpt-5"],
-        ),
-    )]));
-    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
-        sample_model_catalog_entry(
-            "provider-openai-allowed",
-            "openai-allowed",
-            "openai:chat",
-            "gpt-5",
-        ),
-        sample_model_catalog_entry(
-            "provider-openai-allowed",
-            "openai-allowed",
-            "openai:chat",
-            "gpt-4.1",
-        ),
-        sample_model_catalog_entry(
-            "provider-openai-denied",
-            "openai-denied",
-            "openai:chat",
-            "gpt-5",
-        ),
-    ]));
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(
-                crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                    candidate_repository(vec![
-                        sample_models_candidate_row(
-                            "provider-openai-allowed",
-                            "openai-allowed",
-                            "openai:chat",
-                            "gpt-5",
-                            10,
-                        ),
-                        sample_models_candidate_row(
-                            "provider-openai-allowed",
-                            "openai-allowed",
-                            "openai:chat",
-                            "gpt-4.1",
-                            10,
-                        ),
-                        sample_models_candidate_row(
-                            "provider-openai-denied",
-                            "openai-denied",
-                            "openai:chat",
-                            "gpt-5",
-                            20,
-                        ),
-                    ]),
-                    auth_repository,
-                )
-                .with_model_catalog_reader(model_catalog_repository),
-            ),
-    );
-    let (gateway_url, gateway_handle) = start_server(gateway).await;
-
-    let response = reqwest::Client::new()
-        .get(format!("{gateway_url}/v1/models"))
-        .header("authorization", "Bearer sk-models-restricted")
-        .send()
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    let model_ids = payload["data"]
-        .as_array()
-        .expect("data should be an array")
-        .iter()
-        .map(|model| model["id"].as_str().expect("model id should be text"))
-        .collect::<Vec<_>>();
-    assert_eq!(model_ids, vec!["gpt-5"]);
-
-    gateway_handle.abort();
-}
-
-#[tokio::test]
 async fn gateway_serves_codex_model_cards_for_versioned_models_requests() {
-    let complete_codex_row =
+    let codex_row =
         sample_codex_models_candidate_row("provider-codex-models", "frontier-sol", "gpt-5.6-sol");
     let incomplete_codex_row = sample_codex_models_candidate_row(
         "provider-codex-incomplete",
         "broken-luna",
         "gpt-5.6-luna",
     );
+    let candidate_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            codex_row.clone(),
+            incomplete_codex_row.clone(),
+            sample_models_candidate_row(
+                "provider-openai-responses",
+                "openai",
+                "openai:responses",
+                "custom-responses-model",
+                20,
+            ),
+        ]));
     let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![
         (
             Some(hash_api_key("sk-codex-models")),
@@ -639,49 +385,43 @@ async fn gateway_serves_codex_model_cards_for_versioned_models_requests() {
             unrestricted_models_snapshot("key-standard-models", "user-standard-models"),
         ),
     ]));
-    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
-        sample_codex_model_catalog_entry(
-            "provider-codex-models",
-            "frontier-sol",
-            "gpt-5.6-sol",
-            complete_codex_model_card("gpt-5.6-sol"),
-        ),
-        sample_codex_model_catalog_entry(
-            "provider-codex-incomplete",
-            "broken-luna",
-            "gpt-5.6-luna",
-            json!({
-                "id": "gpt-5.6-luna",
-                "slug": "gpt-5.6-luna",
-                "display_name": "GPT-5.6-Luna"
-            }),
-        ),
-        sample_model_catalog_entry(
-            "provider-openai-responses",
-            "openai",
-            "openai:responses",
-            "custom-responses-model",
-        ),
-    ]));
     let state = AppState::new()
         .expect("gateway should build")
         .with_data_state_for_tests(
             crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                candidate_repository(vec![
-                    complete_codex_row,
-                    incomplete_codex_row,
-                    sample_models_candidate_row(
-                        "provider-openai-responses",
-                        "openai",
-                        "openai:responses",
-                        "custom-responses-model",
-                        20,
-                    ),
-                ]),
+                candidate_repository,
                 auth_repository,
-            )
-            .with_model_catalog_reader(model_catalog_repository),
+            ),
         );
+    state
+        .runtime_kv_setex(
+            &format!(
+                "upstream_models:{}:{}",
+                codex_row.provider_id, codex_row.key_id
+            ),
+            &serde_json::to_string(&vec![complete_codex_model_card("gpt-5.6-sol")])
+                .expect("model cache should serialize"),
+            60,
+        )
+        .await
+        .expect("model cache should seed");
+    state
+        .runtime_kv_setex(
+            &format!(
+                "upstream_models:{}:{}",
+                incomplete_codex_row.provider_id, incomplete_codex_row.key_id
+            ),
+            &serde_json::to_string(&vec![json!({
+                "id": "gpt-5.6-luna",
+                "slug": "gpt-5.6-luna",
+                "display_name": "GPT-5.6-Luna"
+            })])
+            .expect("incomplete model cache should serialize"),
+            60,
+        )
+        .await
+        .expect("incomplete model cache should seed");
+
     let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
@@ -1710,7 +1450,7 @@ async fn gateway_does_not_locally_reject_image_model_name_on_chat_completions() 
 }
 
 #[tokio::test]
-async fn gateway_rejects_image_request_with_n_above_gateway_limit_without_hitting_fallback_probe() {
+async fn gateway_rejects_image_request_above_gateway_limit_without_hitting_fallback_probe() {
     let fallback_probe_hits = Arc::new(Mutex::new(0usize));
     let fallback_probe_hits_clone = Arc::clone(&fallback_probe_hits);
     let fallback_probe = Router::new().route(

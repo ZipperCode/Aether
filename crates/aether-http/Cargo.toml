@@ -4,8 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared HTTP client config and retry helpers for Aether Rust services"
+description = "Shared HTTP primitives, client config, and retry helpers for Aether Rust services"
 
 [dependencies]
+aether-contracts.workspace = true
+flate2.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
