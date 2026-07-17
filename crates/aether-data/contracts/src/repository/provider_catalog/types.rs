@@ -722,6 +722,14 @@ pub trait ProviderCatalogWriteRepository: Send + Sync {
         updated_at_unix_secs: Option<u64>,
     ) -> Result<bool, crate::DataLayerError>;
 
+    /// Atomically replaces only `status_snapshot.quota`, preserving all sibling fields.
+    async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota_snapshot: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, crate::DataLayerError>;
+
     async fn delete_key(&self, key_id: &str) -> Result<bool, crate::DataLayerError>;
 
     async fn clear_key_oauth_invalid_marker(

@@ -628,6 +628,26 @@ impl GatewayDataState {
         Ok(updated)
     }
 
+    pub(crate) async fn mutate_provider_catalog_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota_snapshot: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => {
+                repository
+                    .mutate_key_quota_snapshot(key_id, quota_snapshot, updated_at_unix_secs)
+                    .await
+            }
+            None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
+        }
+        Ok(updated)
+    }
+
     pub(crate) async fn delete_provider_catalog_key(
         &self,
         key_id: &str,

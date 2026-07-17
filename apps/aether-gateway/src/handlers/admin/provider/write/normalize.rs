@@ -272,7 +272,8 @@ mod tests {
         normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
         normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
         normalize_chat_pii_redaction_config, normalize_pool_advanced_config,
-        normalize_provider_type_input, normalize_rate_multipliers, validate_vertex_api_formats,
+        normalize_provider_type_input, normalize_rate_multipliers,
+        provider_conversion_endpoint_has_official_origin, validate_vertex_api_formats,
     };
     use serde_json::json;
 

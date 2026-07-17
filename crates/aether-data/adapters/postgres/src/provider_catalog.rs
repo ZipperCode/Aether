@@ -2039,6 +2039,46 @@ WHERE id = $1
         Ok(true)
     }
 
+    pub async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota_snapshot: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        if key_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog key_id is empty".to_string(),
+            ));
+        }
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET status_snapshot = jsonb_set(
+      CASE
+        WHEN json_typeof(status_snapshot) = 'object' THEN status_snapshot::jsonb
+        ELSE '{}'::jsonb
+      END,
+      '{quota}',
+      $2::jsonb,
+      true
+    )::json,
+    updated_at = CASE
+      WHEN $3::double precision IS NULL THEN NOW()
+      ELSE TO_TIMESTAMP($3::double precision)
+    END
+WHERE id = $1
+"#,
+        )
+        .bind(key_id)
+        .bind(quota_snapshot)
+        .bind(updated_at_unix_secs.map(|value| value as f64))
+        .execute(&self.pool)
+        .await
+        .map_postgres_err()?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
     pub async fn update_key_health_state(
         &self,
         key_id: &str,
@@ -2289,6 +2329,15 @@ impl ProviderCatalogWriteRepository for SqlxProviderCatalogReadRepository {
             updated_at_unix_secs,
         )
         .await
+    }
+
+    async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota_snapshot: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::mutate_key_quota_snapshot(self, key_id, quota_snapshot, updated_at_unix_secs).await
     }
 
     async fn delete_key(&self, key_id: &str) -> Result<bool, DataLayerError> {
@@ -2778,7 +2827,11 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
 #[cfg(test)]
 mod tests {
     use super::SqlxProviderCatalogReadRepository;
-    use crate::{PostgresPoolConfig, PostgresPoolFactory};
+    use crate::{run_migrations, PostgresPoolConfig, PostgresPoolFactory};
+    use aether_data_contracts::repository::provider_catalog::{
+        StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    };
+    use serde_json::json;
 
     #[tokio::test]
     async fn repository_constructs_from_lazy_pool() {

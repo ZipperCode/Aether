@@ -10,7 +10,6 @@ use crate::tests::{
     to_bytes, AppState, Arc, Body, Json, Mutex, Request, Router, StatusCode, EXECUTION_PATH_HEADER,
     EXECUTION_PATH_LOCAL_AI_PUBLIC, EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS,
 };
-use aether_data::repository::auth::StoredAuthApiKeySnapshot;
 use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::repository::model_catalog::InMemoryModelCatalogReadRepository;
 use aether_data::DataLayerError;
@@ -29,6 +28,31 @@ use async_trait::async_trait;
 use axum::response::IntoResponse;
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+fn sample_model_catalog_entry(
+    provider_id: &str,
+    provider_name: &str,
+    api_format: &str,
+    global_model_name: &str,
+) -> StoredModelCatalogEntry {
+    StoredModelCatalogEntry {
+        global_model_id: format!("global-{global_model_name}"),
+        global_model_name: global_model_name.to_string(),
+        global_model_config: None,
+        global_model_supported_capabilities: None,
+        global_model_is_active: true,
+        provider_model_id: format!("model-{provider_id}-{global_model_name}"),
+        provider_model_name: global_model_name.to_string(),
+        provider_model_mappings: Some(json!([{"api_formats": [api_format]}])),
+        provider_model_config: None,
+        provider_model_is_active: true,
+        provider_model_is_available: true,
+        provider_id: provider_id.to_string(),
+        provider_name: provider_name.to_string(),
+        provider_type: "custom".to_string(),
+        provider_is_active: true,
+    }
+}
 
 fn codex_models_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
     StoredAuthApiKeySnapshot::new(
@@ -117,6 +141,54 @@ fn complete_codex_model_card(source_model_name: &str) -> serde_json::Value {
         "minimal_client_version": "0.144.0",
         "future_capability": {"enabled": true}
     })
+}
+
+fn candidate_repository(
+    rows: Vec<StoredMinimalCandidateSelectionRow>,
+) -> Arc<InMemoryMinimalCandidateSelectionReadRepository> {
+    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows))
+}
+
+struct ToggleModelCatalogReadRepository {
+    row: StoredModelCatalogEntry,
+    active: AtomicBool,
+}
+
+impl ToggleModelCatalogReadRepository {
+    fn new(row: StoredModelCatalogEntry) -> Self {
+        Self {
+            row,
+            active: AtomicBool::new(true),
+        }
+    }
+
+    fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
+    }
+
+    fn rows(&self) -> Vec<StoredModelCatalogEntry> {
+        let mut row = self.row.clone();
+        row.global_model_is_active = self.active.load(Ordering::SeqCst);
+        vec![row]
+    }
+}
+
+#[async_trait]
+impl ModelCatalogReadRepository for ToggleModelCatalogReadRepository {
+    async fn list_model_catalog(&self) -> Result<Vec<StoredModelCatalogEntry>, DataLayerError> {
+        Ok(self.rows())
+    }
+
+    async fn read_model_catalog_detail(
+        &self,
+        global_model_name: &str,
+    ) -> Result<Vec<StoredModelCatalogEntry>, DataLayerError> {
+        Ok(self
+            .rows()
+            .into_iter()
+            .filter(|row| row.global_model_name == global_model_name)
+            .collect())
+    }
 }
 
 fn gemini_operation_status_label(status: VideoTaskStatus) -> &'static str {

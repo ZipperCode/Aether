@@ -915,6 +915,39 @@ WHERE id = ?
         Ok(true)
     }
 
+    pub async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota_snapshot: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(key_id, "provider catalog key_id")?;
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET status_snapshot = JSON_SET(
+      CASE
+        WHEN JSON_VALID(status_snapshot) AND JSON_TYPE(status_snapshot) = 'OBJECT'
+          THEN status_snapshot
+        ELSE JSON_OBJECT()
+      END,
+      '$.quota',
+      CAST(? AS JSON)
+    ),
+    updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(quota_snapshot.to_string())
+        .bind(updated_at_unix_secs.unwrap_or_else(current_unix_secs) as i64)
+        .bind(key_id)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
     pub async fn clear_key_oauth_invalid_marker(
         &self,
         key_id: &str,
@@ -1276,6 +1309,15 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
             updated_at_unix_secs,
         )
         .await
+    }
+
+    async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota_snapshot: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::mutate_key_quota_snapshot(self, key_id, quota_snapshot, updated_at_unix_secs).await
     }
 
     async fn delete_key(&self, key_id: &str) -> Result<bool, DataLayerError> {

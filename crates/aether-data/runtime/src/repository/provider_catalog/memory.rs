@@ -683,6 +683,30 @@ impl ProviderCatalogWriteRepository for InMemoryProviderCatalogReadRepository {
         Ok(true)
     }
 
+    async fn mutate_key_quota_snapshot(
+        &self,
+        key_id: &str,
+        quota_snapshot: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        let mut index = self
+            .index
+            .write()
+            .expect("provider catalog repository lock");
+        let Some(key) = index.keys.get_mut(key_id) else {
+            return Ok(false);
+        };
+        let mut snapshot = key
+            .status_snapshot
+            .take()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        snapshot["quota"] = quota_snapshot.clone();
+        key.status_snapshot = Some(snapshot);
+        key.updated_at_unix_secs = updated_at_unix_secs;
+        Ok(true)
+    }
+
     async fn delete_key(&self, key_id: &str) -> Result<bool, DataLayerError> {
         let mut index = self
             .index

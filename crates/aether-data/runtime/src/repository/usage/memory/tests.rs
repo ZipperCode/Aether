@@ -180,6 +180,8 @@ async fn provider_aggregation_skips_unknown_provider_labels() {
             created_from_unix_secs: 0,
             created_until_unix_secs: 1_000,
             group_by: UsageAuditAggregationGroupBy::Provider,
+            provider_id: None,
+            provider_name: None,
             limit: 10,
             exclude_reserved_provider_labels: false,
         })
@@ -241,6 +243,8 @@ async fn aggregation_can_skip_unknown_provider_records_for_model_and_api_format(
             created_from_unix_secs: 0,
             created_until_unix_secs: 1_000,
             group_by: UsageAuditAggregationGroupBy::Model,
+            provider_id: None,
+            provider_name: None,
             limit: 10,
             exclude_reserved_provider_labels: true,
         })
@@ -255,6 +259,8 @@ async fn aggregation_can_skip_unknown_provider_records_for_model_and_api_format(
             created_from_unix_secs: 0,
             created_until_unix_secs: 1_000,
             group_by: UsageAuditAggregationGroupBy::ApiFormat,
+            provider_id: None,
+            provider_name: None,
             limit: 10,
             exclude_reserved_provider_labels: true,
         })

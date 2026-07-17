@@ -229,38 +229,143 @@ fn row_supports_format(row: &StoredModelCatalogEntry, api_format: &str) -> bool 
     }
 }
 
-pub(super) fn filter_eligible_model_rows(
-    rows: Vec<StoredMinimalCandidateSelectionRow>,
-    auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
+pub(super) fn filter_catalog_for_models(
+    rows: Vec<StoredModelCatalogEntry>,
+    auth: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
     api_format: &str,
-) -> Vec<StoredMinimalCandidateSelectionRow> {
-    rows.into_iter()
+) -> Vec<StoredModelCatalogEntry> {
+    let mut rows = rows
+        .into_iter()
         .filter(|row| {
             row.global_model_is_active
                 && row.provider_model_is_active
                 && row.provider_model_is_available
                 && row.provider_is_active
         })
-        .filter(|row| auth_snapshot_allows_model_for_models(auth_snapshot, &row.global_model_name))
-        .filter(|row| row_exposes_global_model_for_models(row, api_format))
-        .collect()
+        .filter(|row| auth_allows_provider(auth, row))
+        .filter(|row| auth_allows_model(auth, row))
+        .filter(|row| row_supports_format(row, api_format))
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.global_model_name
+            .cmp(&right.global_model_name)
+            .then(left.provider_id.cmp(&right.provider_id))
+            .then(left.provider_model_id.cmp(&right.provider_model_id))
+    });
+    rows.dedup_by(|left, right| left.global_model_name == right.global_model_name);
+    rows
 }
 
-pub(super) fn filter_rows_for_models(
-    rows: Vec<StoredMinimalCandidateSelectionRow>,
-    auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
-    api_format: &str,
-) -> Vec<StoredMinimalCandidateSelectionRow> {
-    let mut filtered = filter_eligible_model_rows(rows, auth_snapshot, api_format);
-    filtered.sort_by(|left, right| left.global_model_name.cmp(&right.global_model_name));
-    let mut deduped = Vec::new();
-    let mut last_model_name: Option<String> = None;
-    for row in filtered {
-        if last_model_name.as_deref() == Some(row.global_model_name.as_str()) {
-            continue;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row() -> StoredModelCatalogEntry {
+        StoredModelCatalogEntry {
+            global_model_id: "g".into(),
+            global_model_name: "model".into(),
+            global_model_config: None,
+            global_model_supported_capabilities: None,
+            global_model_is_active: true,
+            provider_model_id: "m".into(),
+            provider_model_name: "model".into(),
+            provider_model_mappings: None,
+            provider_model_config: None,
+            provider_model_is_active: true,
+            provider_model_is_available: true,
+            provider_id: "p".into(),
+            provider_name: "provider".into(),
+            provider_type: "openai".into(),
+            provider_is_active: true,
         }
-        last_model_name = Some(row.global_model_name.clone());
-        deduped.push(row);
     }
-    deduped
+
+    #[test]
+    fn schema_bound_metadata_maps_each_supported_family() {
+        for (capability, format) in [
+            ("generation", "openai:chat"),
+            ("image_generation", "openai:image"),
+            ("embedding", "openai:embedding"),
+            ("rerank", "openai:rerank"),
+        ] {
+            let mut entry = row();
+            entry.global_model_supported_capabilities = Some(json!([capability]));
+            assert!(
+                row_supports_format(&entry, format),
+                "{capability} should support {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn incidental_strings_and_unknown_formats_never_grant_support() {
+        let mut entry = row();
+        entry.global_model_config = Some(json!({
+            "homepage": "https://example.test/openai:image",
+            "path": "/v1/embeddings",
+            "note": "vendor:rerank",
+            "api_format": "vendor:unknown"
+        }));
+        assert!(!row_supports_format(&entry, "openai:image"));
+        assert!(!row_supports_format(&entry, "openai:embedding"));
+        assert!(!row_supports_format(&entry, "openai:rerank"));
+        assert!(!row_supports_format(&entry, "openai:chat"));
+    }
+
+    #[test]
+    fn legacy_fallback_is_generation_only_when_metadata_is_absent() {
+        let entry = row();
+        assert!(row_supports_format(&entry, "claude:messages"));
+        assert!(!row_supports_format(&entry, "openai:image"));
+    }
+
+    #[test]
+    fn non_family_capabilities_preserve_legacy_generation_fallback() {
+        let mut entry = row();
+        entry.global_model_supported_capabilities = Some(json!(["streaming", "vision"]));
+        assert!(row_supports_format(&entry, "openai:chat"));
+        assert!(!row_supports_format(&entry, "openai:image"));
+    }
+
+    #[test]
+    fn alias_only_mapping_preserves_legacy_generation_fallback() {
+        let mut entry = row();
+        entry.provider_model_mappings =
+            Some(json!([{"name": "provider-alias", "api_formats": null}]));
+        assert!(row_supports_format(&entry, "gemini:generate_content"));
+    }
+
+    #[test]
+    fn empty_arrays_preserve_legacy_generation_fallback() {
+        let mut entry = row();
+        entry.global_model_config = Some(json!({"api_formats": [], "capabilities": []}));
+        entry.global_model_supported_capabilities = Some(json!([]));
+        entry.provider_model_mappings = Some(json!([]));
+        assert!(row_supports_format(&entry, "openai:responses"));
+    }
+
+    #[test]
+    fn invalid_explicit_format_declarations_are_unsupported() {
+        for invalid in [
+            json!({"api_format": null}),
+            json!({"api_format": 42}),
+            json!({"api_format": "vendor:unknown"}),
+            json!({"api_formats": null}),
+            json!({"api_formats": "openai:chat"}),
+            json!({"api_formats": ["openai:chat", "vendor:unknown"]}),
+        ] {
+            let mut entry = row();
+            entry.global_model_config = Some(invalid);
+            assert!(!row_supports_format(&entry, "openai:chat"));
+        }
+    }
+
+    #[test]
+    fn valid_provider_mapping_formats_select_declared_family() {
+        let mut entry = row();
+        entry.provider_model_mappings = Some(json!([{"api_formats": ["openai:embedding"]}]));
+        assert!(row_supports_format(&entry, "gemini:embedding"));
+        assert!(!row_supports_format(&entry, "openai:chat"));
+    }
 }

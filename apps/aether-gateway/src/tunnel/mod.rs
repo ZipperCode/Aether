@@ -75,22 +75,6 @@ pub(crate) async fn send_owner_forward_request(
     }
 }
 
-pub(crate) async fn send_owner_forward_request(
-    request: reqwest::RequestBuilder,
-    first_byte_timeout: Option<Duration>,
-) -> Result<reqwest::Response, String> {
-    match first_byte_timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
-            Ok(result) => result.map_err(|error| error.to_string()),
-            Err(_) => Err(format!(
-                "owner gateway first byte timeout after {} ms",
-                timeout.as_millis()
-            )),
-        },
-        None => request.send().await.map_err(|error| error.to_string()),
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct InternalTunnelHeartbeatRequest {
     node_id: String,
@@ -670,6 +654,7 @@ fn build_tunnel_probe_meta(url: &str, timeout_secs: u64) -> tunnel_protocol::Req
         stream_first_byte_timeout_ms: None,
         timeout: timeout_secs,
         follow_redirects: Some(false),
+        max_response_body_bytes: None,
         http1_only: false,
         transport_profile: None,
     }
@@ -1341,24 +1326,6 @@ mod tests {
 
         server.abort();
         let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn owner_relay_body_preparation_rejects_invalid_metadata() {
-        let mut envelope = Vec::new();
-        envelope.extend_from_slice(&1u32.to_be_bytes());
-        envelope.push(b'{');
-
-        let error = prepare_owner_relay_request_body(
-            Body::from(envelope),
-            1024,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await
-        .err()
-        .expect("invalid metadata should fail");
-
-        assert!(error.contains("invalid relay metadata"));
     }
 
     #[tokio::test]
