@@ -1058,7 +1058,7 @@ import { useI18n } from '@/i18n'
 import AlertDialog from '@/components/common/AlertDialog.vue'
 import EndpointConditionEditor from './EndpointConditionEditor.vue'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
-import { getDefaultEndpointBaseUrl, getDefaultEndpointPath } from './endpoint-default-paths'
+import { getDefaultEndpointPath, resolveNewEndpointBaseUrl } from './endpoint-default-paths'
 import { fixedEndpointUpstreamStreamPolicy } from './endpoint-protocol-policy'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import {
