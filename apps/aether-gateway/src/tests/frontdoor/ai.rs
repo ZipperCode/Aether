@@ -700,7 +700,7 @@ async fn gateway_returns_empty_openai_models_when_candidate_rows_stall() {
 }
 
 #[tokio::test]
-async fn gateway_models_catalog_excludes_catalog_only_model_when_candidate_routability_stalls() {
+async fn gateway_models_catalog_ignores_stalled_candidate_routability() {
     let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
         Some(hash_api_key("sk-models-catalog-only")),
         unrestricted_models_snapshot("key-models-catalog-only", "user-models-catalog-only"),
@@ -737,22 +737,20 @@ async fn gateway_models_catalog_excludes_catalog_only_model_when_candidate_routa
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .expect("client should build")
         .get(format!("{gateway_url}/v1/models"))
         .header("authorization", "Bearer sk-models-catalog-only")
         .send()
         .await
-        .expect("catalog request should return before candidate timeout");
+        .expect("catalog request should not wait for candidate routability");
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(
-        payload["data"]
-            .as_array()
-            .expect("data should be an array")
-            .len(),
-        0
-    );
+    assert_eq!(payload["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(payload["data"][0]["id"], "gpt-5");
 
     gateway_handle.abort();
 }

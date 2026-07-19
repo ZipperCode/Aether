@@ -326,10 +326,10 @@ async fn list_model_rows_for_client_format(
     state: &AppState,
     api_format: &str,
     auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
-    now_unix_secs: u64,
 ) -> Option<Vec<StoredModelCatalogEntry>> {
     let rows = await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
-    retain_routable_model_rows(state, rows, api_format, auth_snapshot, now_unix_secs).await
+    // 模型列表只表达配置与调用方权限；临时额度、并发和 Key 状态由实际请求调度处理。
+    Some(filter_catalog_for_models(rows, auth_snapshot, api_format))
 }
 
 async fn detail_model_rows_for_client_format(
@@ -421,22 +421,16 @@ pub(super) async fn maybe_build_local_models_route_response(
 
     match decision.route_kind.as_deref() {
         Some("list") => {
-            let rows = match list_model_rows_for_client_format(
-                state,
-                api_format,
-                auth_snapshot,
-                now_unix_secs,
-            )
-            .await
-            {
-                Some(rows) => rows,
-                None => {
-                    return Some(build_models_read_fallback_response(
-                        request_context,
-                        api_format,
-                    ))
-                }
-            };
+            let rows =
+                match list_model_rows_for_client_format(state, api_format, auth_snapshot).await {
+                    Some(rows) => rows,
+                    None => {
+                        return Some(build_models_read_fallback_response(
+                            request_context,
+                            api_format,
+                        ))
+                    }
+                };
             if rows.is_empty() {
                 return Some(build_empty_models_list_response(api_format));
             }
