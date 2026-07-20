@@ -942,6 +942,7 @@ mod tests {
                 "key-1".to_string(),
                 "key-1".to_string(),
             ],
+            selection: None,
             action: "update_settings".to_string(),
             payload: Some(settings.clone()),
         })

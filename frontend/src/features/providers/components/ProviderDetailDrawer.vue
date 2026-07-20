@@ -2762,7 +2762,7 @@ function applyQuotaResults(
   return applied
 }
 
-// 通用的自动刷新配额函数（支持 Codex、Gemini CLI、Antigravity、Kiro、Windsurf 和 ChatGPT Web）
+// 通用的自动刷新配额函数
 async function autoRefreshQuotaInBackground() {
   const providerId = props.providerId
   if (!providerId) return

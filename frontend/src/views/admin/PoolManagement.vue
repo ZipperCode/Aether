@@ -991,7 +991,6 @@
       :selected-keys="selectedPoolKeys"
       :select-all-filtered="selectAllFilteredPoolKeys"
       :selected-count="selectedKeyCount"
-      :selection-filters="poolKeySelectionFilters"
       :selection-snapshot="selectedPoolKeySnapshot"
       :initial-action="pendingAccountBatchAction"
       @changed="handleAccountBatchChanged"
@@ -1098,7 +1097,6 @@ import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import type {
   PoolOverviewItem,
   PoolKeyDetail,
-  PoolKeySelectionRequest,
   PoolKeysPageResponse,
   PoolPresetMeta,
   PoolSelectionSnapshot,
@@ -1786,6 +1784,7 @@ const {
 
 function resetPoolKeySelection(clearKnown = false): void {
   selectionSnapshotRequestId += 1
+  creatingPoolKeySelectionSnapshot.value = false
   selectedPoolKeySnapshot.value = null
   resetPoolKeySelectionState(clearKnown)
 }
@@ -1866,9 +1865,12 @@ async function toggleAllFilteredPoolKeys(): Promise<void> {
       showWarning(`筛选结果已从 ${expectedTotal} 个变为 ${snapshot.total} 个，已按最新结果全选`)
     }
   } catch (err) {
+    if (requestId !== selectionSnapshotRequestId || selectedProviderId.value !== providerId) return
     showError(parseApiError(err, '生成筛选快照失败'))
   } finally {
-    creatingPoolKeySelectionSnapshot.value = false
+    if (requestId === selectionSnapshotRequestId) {
+      creatingPoolKeySelectionSnapshot.value = false
+    }
   }
 }
 
@@ -1882,13 +1884,6 @@ function getPoolKeyRowClass(keyId: string): string {
 const refreshingCurrentPageQuota = ref(false)
 const searchQuery = ref(restoredViewState.search)
 const statusFilter = ref(restoredViewState.status)
-const poolKeySelectionFilters = computed<PoolKeySelectionRequest>(() => {
-  const search = searchQuery.value.trim()
-  return {
-    ...(search ? { search } : {}),
-    status: statusFilter.value,
-  }
-})
 const currentPage = ref(restoredViewState.page)
 const pageSize = ref(restoredViewState.pageSize)
 const sortBy = ref<PoolManagementSortBy | null>(restoredViewState.sortBy)
@@ -2361,6 +2356,11 @@ async function refreshCurrentPage() {
 
 async function loadKeys(options: { cacheTtlMs?: number } = {}) {
   if (!selectedProviderId.value) return
+  // 全选依赖创建时冻结的 selection snapshot。重新加载实时列表前必须清空该快照，
+  // 避免新列表的总数和勾选状态继续映射到旧快照的成员集合。
+  if (selectAllFilteredPoolKeys.value) {
+    resetPoolKeySelection()
+  }
   const requestId = ++keysRequestId
   const providerId = selectedProviderId.value
   const page = currentPage.value

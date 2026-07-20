@@ -327,7 +327,6 @@ import {
   getPoolBatchDeleteTask,
   resolvePoolKeySelection,
   type PoolKeyDetail,
-  type PoolKeySelectionRequest,
   type PoolKeySelectionItem,
   type PoolSelectionSnapshot,
 } from '@/api/endpoints/pool'
@@ -360,7 +359,6 @@ const props = defineProps<{
   selectedKeys: PoolKeyDetail[]
   selectAllFiltered: boolean
   selectedCount: number
-  selectionFilters: PoolKeySelectionRequest
   selectionSnapshot?: PoolSelectionSnapshot | null
   initialAction?: PoolBatchActionValue | null
 }>()

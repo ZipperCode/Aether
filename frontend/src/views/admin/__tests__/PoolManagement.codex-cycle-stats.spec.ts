@@ -383,7 +383,6 @@ vi.mock('@/features/pool/components/PoolAccountBatchDialog.vue', async () => {
         selectedKeys: { type: Array, default: () => [] },
         selectAllFiltered: Boolean,
         selectedCount: { type: Number, default: 0 },
-        selectionFilters: { type: Object, default: () => ({}) },
         selectionSnapshot: { type: Object, default: null },
         initialAction: { type: String, default: null },
       },
@@ -397,7 +396,6 @@ vi.mock('@/features/pool/components/PoolAccountBatchDialog.vue', async () => {
             .join(','),
           'data-select-all-filtered': props.selectAllFiltered ? 'true' : 'false',
           'data-selected-count': String(props.selectedCount),
-          'data-selection-filters': JSON.stringify(props.selectionFilters),
           'data-selection-snapshot-id': (props.selectionSnapshot as { id?: string } | null)?.id || '',
           'data-initial-action': props.initialAction || '',
         })
@@ -1155,10 +1153,6 @@ describe('PoolManagement Codex cycle stats mode', () => {
     expect(batchDialog?.getAttribute('data-selected-count')).toBe('37')
     expect(batchDialog?.getAttribute('data-selection-snapshot-id')).toBe('selection-snapshot')
     expect(batchDialog?.getAttribute('data-initial-action')).toBe('refresh_quota')
-    expect(JSON.parse(batchDialog?.getAttribute('data-selection-filters') || '{}')).toEqual({
-      search: 'inactive-account',
-      status: 'inactive',
-    })
   })
 
   it('disables selection while a debounced search is waiting for fresh rows', async () => {

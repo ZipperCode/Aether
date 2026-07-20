@@ -97,7 +97,6 @@ describe('PoolAccountBatchDialog initial selection', () => {
           selectedKeys,
           selectAllFiltered: false,
           selectedCount: selectedKeys.length,
-          selectionFilters: { status: 'all' },
           initialAction: 'refresh_quota',
           'onUpdate:modelValue': (value: boolean) => { open.value = value },
         })
@@ -128,7 +127,6 @@ describe('PoolAccountBatchDialog initial selection', () => {
           selectedKeys,
           selectAllFiltered: false,
           selectedCount: selectedKeys.length,
-          selectionFilters: { status: 'all' },
           initialAction: 'set_proxy',
           'onUpdate:modelValue': (value: boolean) => { open.value = value },
         })
@@ -158,7 +156,6 @@ describe('PoolAccountBatchDialog initial selection', () => {
           selectedKeys,
           selectAllFiltered: false,
           selectedCount: selectedKeys.length,
-          selectionFilters: { status: 'all' },
           'onUpdate:modelValue': (value: boolean) => { open.value = value },
         })
       },
@@ -201,7 +198,6 @@ describe('PoolAccountBatchDialog initial selection', () => {
           selectedKeys,
           selectAllFiltered: true,
           selectedCount: 2,
-          selectionFilters: { search: 'inactive', status: 'inactive' },
           selectionSnapshot: { id: 'snapshot-1', total: 2, status: 'ready' },
           'onUpdate:modelValue': (value: boolean) => { open.value = value },
         })

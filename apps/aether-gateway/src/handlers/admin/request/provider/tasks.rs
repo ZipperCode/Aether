@@ -1,5 +1,6 @@
 use super::*;
 use crate::ai_serving::provider_key_pool_score_scope;
+use aether_admin::provider::pool as admin_provider_pool_pure;
 use aether_data_contracts::repository::pool_scores::{
     ListPoolMemberScoresQuery, PoolMemberHardState, POOL_KIND_PROVIDER_KEY_POOL,
 };
