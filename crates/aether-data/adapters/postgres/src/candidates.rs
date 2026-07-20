@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use futures_util::{future::BoxFuture, stream::TryStream, TryStreamExt};
 use sqlx::{postgres::PgRow, PgPool, Postgres, QueryBuilder, Row};
+use tracing::warn;
 use uuid::Uuid;
 
 use aether_data_contracts::repository::candidates::{
@@ -413,6 +414,8 @@ INSERT INTO request_candidates (
 
 const MAX_POSTGRES_REQUEST_CANDIDATE_UPSERT_ROWS: usize = 1_000;
 
+const POSTGRES_JSON_NUL_REPLACEMENT: &str = "\u{FFFD}";
+
 const DELETE_CREATED_BEFORE_SQL: &str = r#"
 DELETE FROM request_candidates
 WHERE id IN (
@@ -688,9 +691,10 @@ impl SqlxRequestCandidateReadRepository {
 
     pub async fn upsert(
         &self,
-        candidate: UpsertRequestCandidateRecord,
+        mut candidate: UpsertRequestCandidateRecord,
     ) -> Result<StoredRequestCandidate, DataLayerError> {
         candidate.validate()?;
+        sanitize_request_candidate_json_for_postgres(&mut candidate);
         self.tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
@@ -837,8 +841,9 @@ struct BatchUpsertRequestCandidateRow {
 impl TryFrom<UpsertRequestCandidateRecord> for BatchUpsertRequestCandidateRow {
     type Error = DataLayerError;
 
-    fn try_from(candidate: UpsertRequestCandidateRecord) -> Result<Self, Self::Error> {
+    fn try_from(mut candidate: UpsertRequestCandidateRecord) -> Result<Self, Self::Error> {
         candidate.validate()?;
+        sanitize_request_candidate_json_for_postgres(&mut candidate);
         Ok(Self {
             id: if candidate.id.trim().is_empty() {
                 Uuid::new_v4().to_string()
@@ -870,6 +875,66 @@ impl TryFrom<UpsertRequestCandidateRecord> for BatchUpsertRequestCandidateRow {
             finished_at_unix_ms: candidate.finished_at_unix_ms.map(|value| value as f64),
         })
     }
+}
+
+fn sanitize_request_candidate_json_for_postgres(candidate: &mut UpsertRequestCandidateRecord) {
+    let extra_data_nul_count = candidate
+        .extra_data
+        .as_mut()
+        .map(sanitize_postgres_json_nul)
+        .unwrap_or_default();
+    let required_capabilities_nul_count = candidate
+        .required_capabilities
+        .as_mut()
+        .map(sanitize_postgres_json_nul)
+        .unwrap_or_default();
+    let nul_count = extra_data_nul_count.saturating_add(required_capabilities_nul_count);
+    if nul_count == 0 {
+        return;
+    }
+
+    warn!(
+        event_name = "request_candidate_postgres_json_nul_sanitized",
+        log_type = "event",
+        request_id = %candidate.request_id,
+        candidate_id = %candidate.id,
+        candidate_index = candidate.candidate_index,
+        retry_index = candidate.retry_index,
+        extra_data_nul_count,
+        required_capabilities_nul_count,
+        nul_count,
+        "sanitized PostgreSQL-incompatible NUL characters in request candidate JSON"
+    );
+}
+
+// PostgreSQL 的 json/jsonb 无法表示 NUL；在数据库边界替换，避免永久失败记录毒化整个异步批次。
+fn sanitize_postgres_json_nul(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(text) => replace_nul_characters(text),
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .map(sanitize_postgres_json_nul)
+            .fold(0usize, usize::saturating_add),
+        serde_json::Value::Object(object) => {
+            let original = std::mem::take(object);
+            let mut nul_count = 0usize;
+            for (mut key, mut child) in original {
+                nul_count = nul_count.saturating_add(replace_nul_characters(&mut key));
+                nul_count = nul_count.saturating_add(sanitize_postgres_json_nul(&mut child));
+                object.insert(key, child);
+            }
+            nul_count
+        }
+        _ => 0,
+    }
+}
+
+fn replace_nul_characters(text: &mut String) -> usize {
+    let nul_count = text.chars().filter(|character| *character == '\0').count();
+    if nul_count > 0 {
+        *text = text.replace('\0', POSTGRES_JSON_NUL_REPLACEMENT);
+    }
+    nul_count
 }
 
 async fn execute_upsert_many_batch(
@@ -1143,8 +1208,8 @@ fn to_i32_u64(value: u64) -> Result<i32, DataLayerError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SqlxRequestCandidateReadRepository, UPSERT_CONFLICT_INHERIT_IS_CACHED_SQL,
-        UPSERT_CONFLICT_SQL, UPSERT_SQL,
+        sanitize_postgres_json_nul, SqlxRequestCandidateReadRepository,
+        UPSERT_CONFLICT_INHERIT_IS_CACHED_SQL, UPSERT_CONFLICT_SQL, UPSERT_SQL,
     };
     use crate::{PostgresPoolConfig, PostgresPoolFactory};
 
@@ -1179,6 +1244,22 @@ mod tests {
             assert!(sql.contains("THEN request_candidates.status"));
             assert!(sql.contains("THEN request_candidates.latency_ms"));
         }
+    }
+
+    #[test]
+    fn postgres_candidate_json_replaces_nested_nul_in_keys_and_values() {
+        let mut value = serde_json::json!({
+            "plain": "kept",
+            "nested": ["before\0after", {"child\0key": "\0"}]
+        });
+
+        let replaced = sanitize_postgres_json_nul(&mut value);
+
+        assert_eq!(replaced, 3);
+        assert_eq!(value["plain"], "kept");
+        assert_eq!(value["nested"][0], "before\u{FFFD}after");
+        assert_eq!(value["nested"][1]["child\u{FFFD}key"], "\u{FFFD}");
+        assert!(!value.to_string().contains("\\u0000"));
     }
 
     #[tokio::test]
