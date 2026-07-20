@@ -104,56 +104,75 @@ describe('buildModelsDevTieredPricing', () => {
 })
 
 describe('resolveModelsDevTieredPricing', () => {
-  it.each([
-    {
-      modelId: 'gpt-5.6-sol',
-      standard: [5, 30, 6.25, 0.5],
-      longContext: [10, 45, 12.5, 1],
-    },
-    {
-      modelId: 'gpt-5.6-terra',
-      standard: [2.5, 15, 3.125, 0.25],
-      longContext: [5, 22.5, 6.25, 0.5],
-    },
-    {
-      modelId: 'gpt-5.6-luna',
-      standard: [1, 6, 1.25, 0.1],
-      longContext: [2, 9, 2.5, 0.2],
-    },
-  ])('uses the complete OpenAI catalog for $modelId', ({ modelId, standard, longContext }) => {
-    const tier = (
-      upTo: number | null,
-      prices: number[],
-      multiplier: number,
-    ) => ({
-      up_to: upTo,
-      input_price_per_1m: prices[0] * multiplier,
-      output_price_per_1m: prices[1] * multiplier,
-      cache_creation_price_per_1m: prices[2] * multiplier,
-      cache_read_price_per_1m: prices[3] * multiplier,
-    })
-
-    expect(resolveModelsDevTieredPricing('openai', modelId, { input: 999, output: 999 }))
-      .toEqual({
-        tiers: [
-          tier(272_000, standard, 1),
-          tier(null, longContext, 1),
-        ],
-        processing_tiers: {
-          flex: {
-            tiers: [
-              tier(272_000, standard, 0.5),
-              tier(null, longContext, 0.5),
-            ],
-          },
-          priority: {
-            tiers: [tier(272_000, standard, 2)],
-          },
+  it('uses the GPT-5.5 Pro context tier declared by models.dev without inventing cache prices', () => {
+    expect(resolveModelsDevTieredPricing('openai', 'gpt-5.5-pro', {
+      input: 30,
+      output: 180,
+      tiers: [{
+        input: 60,
+        output: 270,
+        tier: { type: 'context', size: 272_000 },
+      }],
+      context_over_200k: {
+        input: 60,
+        output: 270,
+      },
+    })).toEqual({
+      tiers: [
+        {
+          up_to: 271_999,
+          input_price_per_1m: 30,
+          output_price_per_1m: 180,
         },
-      })
+        {
+          up_to: null,
+          input_price_per_1m: 60,
+          output_price_per_1m: 270,
+        },
+      ],
+    })
   })
 
-  it('keeps the models.dev lower-bound conversion for models outside the catalog', () => {
+  it.each([
+    'gpt-5.6-sol',
+    'gpt-5.6-terra',
+    'gpt-5.6-luna',
+  ])('uses the fetched models.dev cost for OpenAI model %s', (modelId) => {
+    const fetchedCost = {
+      input: 7,
+      output: 11,
+      cache_read: 0.7,
+      cache_write: 8.75,
+      tiers: [{
+        input: 13,
+        output: 17,
+        cache_read: 1.3,
+        cache_write: 16.25,
+        tier: { type: 'context' as const, size: 123_000 },
+      }],
+    }
+
+    expect(resolveModelsDevTieredPricing('openai', modelId, fetchedCost)).toEqual({
+      tiers: [
+        {
+          up_to: 122_999,
+          input_price_per_1m: 7,
+          output_price_per_1m: 11,
+          cache_creation_price_per_1m: 8.75,
+          cache_read_price_per_1m: 0.7,
+        },
+        {
+          up_to: null,
+          input_price_per_1m: 13,
+          output_price_per_1m: 17,
+          cache_creation_price_per_1m: 16.25,
+          cache_read_price_per_1m: 1.3,
+        },
+      ],
+    })
+  })
+
+  it('uses the same fetched-cost conversion for every provider and model identity', () => {
     expect(resolveModelsDevTieredPricing('openai', 'other-model', {
       input: 1,
       output: 2,
@@ -161,16 +180,115 @@ describe('resolveModelsDevTieredPricing', () => {
     })?.tiers.map(tier => tier.up_to)).toEqual([271_999, null])
   })
 
-  it.each([
-    ['other-provider', 'gpt-5.6-sol'],
-    ['openai', 'GPT-5.6-SOL'],
-    ['openai', 'gpt-5.6-sol-latest'],
-    ['openai', '__proto__'],
-    ['openai', 'constructor'],
-  ])('matches provider and model identities exactly for %s/%s', (providerId, modelId) => {
-    expect(resolveModelsDevTieredPricing(providerId, modelId, { input: 1, output: 2 }))
-      .toEqual({
-        tiers: [{ up_to: null, input_price_per_1m: 1, output_price_per_1m: 2 }],
-      })
+  it('does not synthesize pricing when the fetched cost is absent', () => {
+    expect(resolveModelsDevTieredPricing('openai', 'gpt-5.6-sol', undefined)).toBeNull()
+  })
+
+  it('keeps a models.dev fast cost as an explicit Priority catalog when bands differ', () => {
+    expect(resolveModelsDevTieredPricing('openai', 'gpt-5.6-sol', {
+      input: 5,
+      output: 30,
+      tiers: [{
+        input: 10,
+        output: 45,
+        tier: { type: 'context', size: 272_000 },
+      }],
+    }, {
+      fast: {
+        cost: { input: 10, output: 60 },
+        provider: { body: { service_tier: 'priority' } },
+      },
+    })).toEqual({
+      tiers: [
+        { up_to: 271_999, input_price_per_1m: 5, output_price_per_1m: 30 },
+        { up_to: null, input_price_per_1m: 10, output_price_per_1m: 45 },
+      ],
+      processing_tiers: {
+        priority: {
+          tiers: [{ up_to: null, input_price_per_1m: 10, output_price_per_1m: 60 }],
+        },
+      },
+    })
+  })
+
+  it('uses a multiplier only when every fast price has the same ratio', () => {
+    expect(resolveModelsDevTieredPricing('anthropic', 'claude-opus-4.8', {
+      input: 5,
+      output: 25,
+      cache_read: 0.5,
+      cache_write: 6.25,
+    }, {
+      fast: {
+        cost: { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
+        provider: { body: { speed: 'fast' } },
+      },
+    })?.processing_tiers).toEqual({
+      fast: { price_multiplier: 2 },
+    })
+
+    expect(resolveModelsDevTieredPricing('anthropic', 'claude-opus-4.7', {
+      input: 5,
+      output: 25,
+    }, {
+      fast: {
+        cost: { input: 30, output: 150 },
+        provider: { body: { speed: 'fast' } },
+      },
+    })?.processing_tiers).toEqual({
+      fast: { price_multiplier: 6 },
+    })
+  })
+
+  it('uses the standard catalog when an imported tier has a zero default ratio', () => {
+    expect(resolveModelsDevTieredPricing('openai', 'gpt-5.6-sol', {
+      input: 5,
+      output: 30,
+    }, {
+      fast: {
+        cost: { input: 0, output: 0 },
+        provider: { body: { service_tier: 'priority' } },
+      },
+    })?.processing_tiers).toEqual({
+      priority: { price_multiplier: 1 },
+    })
+  })
+
+  it('prefers Anthropic speed=fast when the mode body also carries a standard service tier', () => {
+    expect(resolveModelsDevTieredPricing('anthropic', 'claude-opus-fast', {
+      input: 5,
+      output: 25,
+    }, {
+      fast: {
+        cost: { input: 10, output: 50 },
+        provider: { body: { speed: ' FAST ', service_tier: 'default' } },
+      },
+    })?.processing_tiers).toEqual({
+      fast: { price_multiplier: 2 },
+    })
+  })
+
+  it('falls back to the mode key and keeps non-uniform prices explicit', () => {
+    expect(resolveModelsDevTieredPricing('vendor', 'model', {
+      input: 2,
+      output: 4,
+    }, {
+      flex: { cost: { input: 1, output: 3 } },
+    })?.processing_tiers).toEqual({
+      flex: {
+        tiers: [{ up_to: null, input_price_per_1m: 1, output_price_per_1m: 3 }],
+      },
+    })
+  })
+
+  it('does not reinterpret unrelated or special experimental modes as processing tiers', () => {
+    const modes = JSON.parse(
+      '{"pro":{"cost":{"input":2,"output":4}},"__proto__":{"cost":{"input":2,"output":4}}}',
+    )
+    const pricing = resolveModelsDevTieredPricing('vendor', 'model', {
+      input: 1,
+      output: 2,
+    }, modes)
+
+    expect(pricing?.processing_tiers).toBeUndefined()
   })
 })

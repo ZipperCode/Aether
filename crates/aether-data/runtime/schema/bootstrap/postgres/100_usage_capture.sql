@@ -212,10 +212,35 @@ SELECT
       settlement.billing_effective_input_tokens,
       CASE
         WHEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0) <= 0 THEN 0
-        WHEN GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0) <= 0
-        THEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
         WHEN split_part(lower(COALESCE(COALESCE(usage_rows.endpoint_api_format, usage_rows.api_format), '')), ':', 1)
-             IN ('openai', 'gemini', 'google')
+             = 'openai'
+             AND (
+               GREATEST(COALESCE(usage_rows.cache_creation_input_tokens, 0), 0) > 0
+               OR GREATEST(COALESCE(usage_rows.cache_creation_input_tokens_5m, 0), 0) > 0
+               OR GREATEST(COALESCE(usage_rows.cache_creation_input_tokens_1h, 0), 0) > 0
+               OR GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0) > 0
+             )
+        THEN GREATEST(
+          GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
+            - GREATEST(
+                CASE
+                  WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
+                       AND (
+                         COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                         + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                       ) > 0
+                  THEN COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                     + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                  ELSE COALESCE(usage_rows.cache_creation_input_tokens, 0)
+                END,
+                0
+              )
+            - GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0),
+          0
+        )
+        WHEN split_part(lower(COALESCE(COALESCE(usage_rows.endpoint_api_format, usage_rows.api_format), '')), ':', 1)
+             IN ('gemini', 'google')
+             AND GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0) > 0
         THEN GREATEST(
           GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
             - GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0),
@@ -231,6 +256,12 @@ SELECT
   GREATEST(
     COALESCE(
       settlement.billing_cache_creation_tokens,
+      CASE
+        WHEN settlement.billing_cache_creation_5m_tokens IS NOT NULL
+          OR settlement.billing_cache_creation_1h_tokens IS NOT NULL
+        THEN COALESCE(settlement.billing_cache_creation_5m_tokens, 0)
+          + COALESCE(settlement.billing_cache_creation_1h_tokens, 0)
+      END,
       CASE
         WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
              AND (
@@ -266,29 +297,108 @@ SELECT
   GREATEST(
     COALESCE(
       CASE
-        WHEN settlement.billing_input_tokens IS NOT NULL
-          OR settlement.billing_output_tokens IS NOT NULL
-          OR settlement.billing_cache_creation_tokens IS NOT NULL
-          OR settlement.billing_cache_creation_5m_tokens IS NOT NULL
-          OR settlement.billing_cache_creation_1h_tokens IS NOT NULL
-          OR settlement.billing_cache_read_tokens IS NOT NULL
-        THEN COALESCE(settlement.billing_input_tokens, 0)
-          + COALESCE(settlement.billing_output_tokens, 0)
-          + COALESCE(
-              settlement.billing_cache_creation_tokens,
-              COALESCE(settlement.billing_cache_creation_5m_tokens, 0)
-                + COALESCE(settlement.billing_cache_creation_1h_tokens, 0),
+        WHEN settlement.billing_effective_input_tokens IS NOT NULL
+        THEN GREATEST(settlement.billing_effective_input_tokens, 0)
+          + GREATEST(COALESCE(settlement.billing_output_tokens, usage_rows.output_tokens, 0), 0)
+          + GREATEST(
+              COALESCE(
+                settlement.billing_cache_creation_tokens,
+                CASE
+                  WHEN settlement.billing_cache_creation_5m_tokens IS NOT NULL
+                    OR settlement.billing_cache_creation_1h_tokens IS NOT NULL
+                  THEN COALESCE(settlement.billing_cache_creation_5m_tokens, 0)
+                    + COALESCE(settlement.billing_cache_creation_1h_tokens, 0)
+                END,
+                CASE
+                  WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
+                       AND (
+                         COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                         + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                       ) > 0
+                  THEN COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                    + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                  ELSE COALESCE(usage_rows.cache_creation_input_tokens, 0)
+                END,
+                0
+              ),
               0
             )
-          + COALESCE(settlement.billing_cache_read_tokens, 0)
+          + GREATEST(
+              COALESCE(
+                settlement.billing_cache_read_tokens,
+                usage_rows.cache_read_input_tokens,
+                0
+              ),
+              0
+            )
+        WHEN settlement.billing_total_input_context IS NOT NULL
+        THEN GREATEST(settlement.billing_total_input_context, 0)
+          + GREATEST(COALESCE(settlement.billing_output_tokens, usage_rows.output_tokens, 0), 0)
       END,
-      usage_rows.total_tokens,
+      NULLIF(GREATEST(COALESCE(usage_rows.total_tokens, 0), 0), 0),
+      CASE
+        WHEN split_part(lower(COALESCE(COALESCE(usage_rows.endpoint_api_format, usage_rows.api_format), '')), ':', 1)
+             IN ('openai', 'gemini', 'google')
+        THEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
+          + GREATEST(COALESCE(usage_rows.output_tokens, 0), 0)
+        ELSE GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
+          + GREATEST(COALESCE(usage_rows.output_tokens, 0), 0)
+          + GREATEST(
+              CASE
+                WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
+                     AND (
+                       COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                       + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                     ) > 0
+                THEN COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                  + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                ELSE COALESCE(usage_rows.cache_creation_input_tokens, 0)
+              END,
+              0
+            )
+          + GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0)
+      END,
       0
     ),
     0
   )::bigint AS total_tokens,
   GREATEST(
     COALESCE(
+      CASE
+        WHEN settlement.billing_effective_input_tokens IS NOT NULL
+        THEN GREATEST(settlement.billing_effective_input_tokens, 0)
+          + GREATEST(
+              COALESCE(
+                settlement.billing_cache_creation_tokens,
+                CASE
+                  WHEN settlement.billing_cache_creation_5m_tokens IS NOT NULL
+                    OR settlement.billing_cache_creation_1h_tokens IS NOT NULL
+                  THEN COALESCE(settlement.billing_cache_creation_5m_tokens, 0)
+                    + COALESCE(settlement.billing_cache_creation_1h_tokens, 0)
+                END,
+                CASE
+                  WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
+                       AND (
+                         COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                         + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                       ) > 0
+                  THEN COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                    + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                  ELSE COALESCE(usage_rows.cache_creation_input_tokens, 0)
+                END,
+                0
+              ),
+              0
+            )
+          + GREATEST(
+              COALESCE(
+                settlement.billing_cache_read_tokens,
+                usage_rows.cache_read_input_tokens,
+                0
+              ),
+              0
+            )
+      END,
       settlement.billing_total_input_context,
       CASE
         WHEN split_part(lower(COALESCE(COALESCE(usage_rows.endpoint_api_format, usage_rows.api_format), '')), ':', 1)
@@ -306,7 +416,49 @@ SELECT
              END
            + GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0)
         WHEN split_part(lower(COALESCE(COALESCE(usage_rows.endpoint_api_format, usage_rows.api_format), '')), ':', 1)
-             IN ('openai', 'gemini', 'google')
+             = 'openai'
+        THEN CASE
+               WHEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0) <= 0 THEN 0
+               WHEN GREATEST(COALESCE(usage_rows.cache_creation_input_tokens, 0), 0) <= 0
+                    AND GREATEST(COALESCE(usage_rows.cache_creation_input_tokens_5m, 0), 0) <= 0
+                    AND GREATEST(COALESCE(usage_rows.cache_creation_input_tokens_1h, 0), 0) <= 0
+                    AND GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0) <= 0
+               THEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
+               ELSE GREATEST(
+                 GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
+                   - GREATEST(
+                       CASE
+                         WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
+                              AND (
+                                COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                                + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                              ) > 0
+                         THEN COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                           + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                         ELSE COALESCE(usage_rows.cache_creation_input_tokens, 0)
+                       END,
+                       0
+                     )
+                   - GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0),
+                 0
+               )
+             END
+           + GREATEST(
+               CASE
+                 WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
+                      AND (
+                        COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                        + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                      ) > 0
+                 THEN COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                   + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+                 ELSE COALESCE(usage_rows.cache_creation_input_tokens, 0)
+               END,
+               0
+             )
+           + GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0)
+        WHEN split_part(lower(COALESCE(COALESCE(usage_rows.endpoint_api_format, usage_rows.api_format), '')), ':', 1)
+             IN ('gemini', 'google')
         THEN CASE
                WHEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0) <= 0 THEN 0
                WHEN GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0) <= 0

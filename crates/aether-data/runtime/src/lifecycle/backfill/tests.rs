@@ -27,7 +27,8 @@ fn pending_backfills_from_applied_returns_all_versions_when_none_applied() {
             20260422120000,
             20260504120000,
             20260505120000,
-            20260517012000
+            20260517012000,
+            20260716010000
         ]
     );
 }
@@ -47,7 +48,8 @@ fn pending_backfills_from_applied_skips_versions_already_applied() {
             20260422120000,
             20260504120000,
             20260505120000,
-            20260517012000
+            20260517012000,
+            20260716010000
         ]
     );
 }
@@ -184,7 +186,7 @@ impl ManagedPostgresServer {
             .arg("-c")
             .arg("max_connections=8")
             .arg("-c")
-            .arg("dynamic_shared_memory_type=none")
+            .arg("dynamic_shared_memory_type=mmap")
             .arg("-c")
             .arg("autovacuum=off")
             .stdout(Stdio::from(stdout))
@@ -417,12 +419,13 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
     let pending_before = pending_backfills(&pool)
         .await
         .expect("pending backfills should load");
-    assert_eq!(pending_before.len(), 5);
+    assert_eq!(pending_before.len(), 6);
     assert_eq!(pending_before[0].version, 20260422110000);
     assert_eq!(pending_before[1].version, 20260422120000);
     assert_eq!(pending_before[2].version, 20260504120000);
     assert_eq!(pending_before[3].version, 20260505120000);
     assert_eq!(pending_before[4].version, 20260517012000);
+    assert_eq!(pending_before[5].version, 20260716010000);
 
     run_backfills(&pool)
         .await
@@ -445,7 +448,8 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
             20260422120000,
             20260504120000,
             20260505120000,
-            20260517012000
+            20260517012000,
+            20260716010000
         ]
     );
 
@@ -841,6 +845,25 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
         .expect("user daily model-provider stats should load");
     assert_eq!(user_daily_model_provider_requests, 1);
 
+    let canonical_rollup_totals: Vec<i64> = query_scalar(
+        r#"
+SELECT total_tokens FROM public.stats_daily_model_provider
+UNION ALL
+SELECT total_tokens FROM public.stats_user_daily_model
+UNION ALL
+SELECT total_tokens FROM public.stats_user_daily_provider
+UNION ALL
+SELECT total_tokens FROM public.stats_user_daily_api_format
+UNION ALL
+SELECT total_tokens FROM public.stats_user_daily_model_provider
+ORDER BY total_tokens
+"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("canonical persisted rollup totals should load");
+    assert_eq!(canonical_rollup_totals, vec![150, 150, 150, 150, 150]);
+
     let user_daily_ephemeral_5m_tokens: i64 = query_scalar(
             "SELECT COALESCE(SUM(cache_creation_ephemeral_5m_tokens), 0)::BIGINT FROM public.stats_user_daily",
         )
@@ -1100,5 +1123,5 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
         .fetch_one(&pool)
         .await
         .expect("backfill count should load");
-    assert_eq!(applied_count, 5);
+    assert_eq!(applied_count, 6);
 }

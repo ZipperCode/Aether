@@ -11,6 +11,7 @@ export interface S3BackupConfig {
   scope: S3BackupScope
   endpoint: string
   region: string
+  userAgent: string
   bucket: string
   prefix: string
   accessKeyId: string
@@ -34,6 +35,7 @@ const CONFIG_KEY_BY_FIELD: Record<ConfigField, string> = {
   scope: 'backup_s3_scope',
   endpoint: 'backup_s3_endpoint',
   region: 'backup_s3_region',
+  userAgent: 'backup_s3_user_agent',
   bucket: 'backup_s3_bucket',
   prefix: 'backup_s3_prefix',
   accessKeyId: 'backup_s3_access_key_id',
@@ -63,6 +65,7 @@ function defaultS3BackupConfig(): S3BackupConfig {
     scope: 'data',
     endpoint: '',
     region: 'auto',
+    userAgent: 'rclone/v1.68.0',
     bucket: '',
     prefix: 'aether/backups/',
     accessKeyId: '',
@@ -192,6 +195,7 @@ export function useS3BackupConfig() {
         { key: 'backup_s3_scope', value: config.value.scope, description: 'S3 备份范围' },
         { key: 'backup_s3_endpoint', value: config.value.endpoint.trim() || null, description: 'S3 Endpoint' },
         { key: 'backup_s3_region', value: config.value.region.trim() || 'auto', description: 'S3 Region' },
+        { key: 'backup_s3_user_agent', value: config.value.userAgent.trim() || 'rclone/v1.68.0', description: 'S3 User-Agent' },
         { key: 'backup_s3_bucket', value: config.value.bucket.trim() || null, description: 'S3 Bucket' },
         { key: 'backup_s3_prefix', value: config.value.prefix.trim() || 'aether/backups/', description: 'S3 备份前缀' },
         { key: 'backup_s3_access_key_id', value: config.value.accessKeyId.trim() || null, description: 'S3 Access Key ID' },

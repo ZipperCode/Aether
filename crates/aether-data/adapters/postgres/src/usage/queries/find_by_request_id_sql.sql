@@ -24,27 +24,92 @@ SELECT
   CAST(COALESCE(usage_settlement_snapshots.billing_output_tokens, "usage".output_tokens) AS INTEGER) AS output_tokens,
   CAST(COALESCE(
     CASE
-      WHEN usage_settlement_snapshots.billing_input_tokens IS NOT NULL
-        OR usage_settlement_snapshots.billing_output_tokens IS NOT NULL
-        OR usage_settlement_snapshots.billing_cache_creation_tokens IS NOT NULL
-        OR usage_settlement_snapshots.billing_cache_creation_5m_tokens IS NOT NULL
-        OR usage_settlement_snapshots.billing_cache_creation_1h_tokens IS NOT NULL
-        OR usage_settlement_snapshots.billing_cache_read_tokens IS NOT NULL
-      THEN COALESCE(usage_settlement_snapshots.billing_input_tokens, 0)
-        + COALESCE(usage_settlement_snapshots.billing_output_tokens, 0)
-        + COALESCE(
-            usage_settlement_snapshots.billing_cache_creation_tokens,
-            COALESCE(usage_settlement_snapshots.billing_cache_creation_5m_tokens, 0)
-              + COALESCE(usage_settlement_snapshots.billing_cache_creation_1h_tokens, 0),
+      WHEN usage_settlement_snapshots.billing_effective_input_tokens IS NOT NULL
+      THEN GREATEST(usage_settlement_snapshots.billing_effective_input_tokens, 0)
+        + GREATEST(
+            COALESCE(usage_settlement_snapshots.billing_output_tokens, "usage".output_tokens, 0),
             0
           )
-        + COALESCE(usage_settlement_snapshots.billing_cache_read_tokens, 0)
+        + GREATEST(
+            COALESCE(
+              usage_settlement_snapshots.billing_cache_creation_tokens,
+              CASE
+                WHEN usage_settlement_snapshots.billing_cache_creation_5m_tokens IS NOT NULL
+                  OR usage_settlement_snapshots.billing_cache_creation_1h_tokens IS NOT NULL
+                THEN COALESCE(usage_settlement_snapshots.billing_cache_creation_5m_tokens, 0)
+                  + COALESCE(usage_settlement_snapshots.billing_cache_creation_1h_tokens, 0)
+              END,
+              CASE
+                WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
+                     AND (
+                       COALESCE("usage".cache_creation_input_tokens_5m, 0)
+                       + COALESCE("usage".cache_creation_input_tokens_1h, 0)
+                     ) > 0
+                THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
+                  + COALESCE("usage".cache_creation_input_tokens_1h, 0)
+                ELSE COALESCE("usage".cache_creation_input_tokens, 0)
+              END,
+              0
+            ),
+            0
+          )
+        + GREATEST(
+            COALESCE(
+              usage_settlement_snapshots.billing_cache_read_tokens,
+              "usage".cache_read_input_tokens,
+              0
+            ),
+            0
+          )
+      WHEN usage_settlement_snapshots.billing_total_input_context IS NOT NULL
+      THEN GREATEST(usage_settlement_snapshots.billing_total_input_context, 0)
+        + GREATEST(
+            COALESCE(usage_settlement_snapshots.billing_output_tokens, "usage".output_tokens, 0),
+            0
+          )
     END,
-    "usage".total_tokens
+    NULLIF(GREATEST(COALESCE("usage".total_tokens, 0), 0), 0),
+    CASE
+      WHEN split_part(lower(COALESCE(COALESCE("usage".endpoint_api_format, "usage".api_format), '')), ':', 1)
+           IN ('openai', 'gemini', 'google')
+      THEN GREATEST(COALESCE("usage".input_tokens, 0), 0)
+        + GREATEST(COALESCE("usage".output_tokens, 0), 0)
+      ELSE GREATEST(COALESCE("usage".input_tokens, 0), 0)
+        + GREATEST(COALESCE("usage".output_tokens, 0), 0)
+        + GREATEST(
+            CASE
+              WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
+                   AND (
+                     COALESCE("usage".cache_creation_input_tokens_5m, 0)
+                     + COALESCE("usage".cache_creation_input_tokens_1h, 0)
+                   ) > 0
+              THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
+                + COALESCE("usage".cache_creation_input_tokens_1h, 0)
+              ELSE COALESCE("usage".cache_creation_input_tokens, 0)
+            END,
+            0
+          )
+        + GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0)
+    END
   ) AS INTEGER) AS total_tokens,
   CAST(COALESCE(
     usage_settlement_snapshots.billing_cache_creation_tokens,
-    "usage".cache_creation_input_tokens,
+    CASE
+      WHEN usage_settlement_snapshots.billing_cache_creation_5m_tokens IS NOT NULL
+        OR usage_settlement_snapshots.billing_cache_creation_1h_tokens IS NOT NULL
+      THEN COALESCE(usage_settlement_snapshots.billing_cache_creation_5m_tokens, 0)
+        + COALESCE(usage_settlement_snapshots.billing_cache_creation_1h_tokens, 0)
+    END,
+    CASE
+      WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
+           AND (
+             COALESCE("usage".cache_creation_input_tokens_5m, 0)
+             + COALESCE("usage".cache_creation_input_tokens_1h, 0)
+           ) > 0
+      THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
+        + COALESCE("usage".cache_creation_input_tokens_1h, 0)
+      ELSE COALESCE("usage".cache_creation_input_tokens, 0)
+    END,
     0
   ) AS INTEGER) AS cache_creation_input_tokens,
   CAST(COALESCE(

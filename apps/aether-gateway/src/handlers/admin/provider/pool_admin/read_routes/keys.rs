@@ -58,6 +58,8 @@ fn admin_pool_codex_default_window_minutes(code: &str) -> Option<u64> {
         Some(300)
     } else if code.eq_ignore_ascii_case("weekly") {
         Some(10_080)
+    } else if code.eq_ignore_ascii_case("monthly") {
+        Some(43_800)
     } else {
         None
     }
@@ -106,16 +108,27 @@ fn admin_pool_codex_cycle_usage_request(
     window: &serde_json::Map<String, serde_json::Value>,
     now_unix_secs: u64,
 ) -> Option<ProviderApiKeyWindowUsageRequest> {
+    let scope = window
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("account");
+    if !scope.eq_ignore_ascii_case("account") {
+        return None;
+    }
     let window_code = window
         .get("code")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|code| code.eq_ignore_ascii_case("5h") || code.eq_ignore_ascii_case("weekly"))?
+        .filter(|code| !code.is_empty() && !code.to_ascii_lowercase().starts_with("spark_"))?
         .to_ascii_lowercase();
     let reset_at = admin_pool_json_u64(window.get("reset_at"))?;
-    let window_seconds = admin_pool_json_u64(window.get("window_minutes"))
-        .or_else(|| admin_pool_codex_default_window_minutes(&window_code))?
-        .checked_mul(60)?;
+    let window_minutes = match admin_pool_json_u64(window.get("window_minutes")) {
+        Some(0) => return None,
+        Some(value) => value,
+        None => admin_pool_codex_default_window_minutes(&window_code)?,
+    };
+    let window_seconds = window_minutes.checked_mul(60)?;
     if reset_at <= now_unix_secs {
         return None;
     }
@@ -301,20 +314,6 @@ fn admin_pool_repository_key_order(sort: AdminPoolKeySort) -> ProviderCatalogKey
     }
 }
 
-fn admin_pool_key_matches_name_search(
-    key: &StoredProviderCatalogKey,
-    search: Option<&str>,
-) -> bool {
-    let Some(search) = search else {
-        return true;
-    };
-    let search = search.trim().to_ascii_lowercase();
-    if search.is_empty() {
-        return true;
-    }
-    key.name.to_ascii_lowercase().contains(&search) || key.id.to_ascii_lowercase().contains(&search)
-}
-
 fn admin_pool_normalized_expected_page_key_ids(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
@@ -343,11 +342,8 @@ fn admin_pool_effective_search_scope(
     requested_scope: AdminPoolSearchScope,
     status: &str,
     quick_selectors: &[String],
-    sort: AdminPoolKeySort,
 ) -> AdminPoolSearchScope {
-    let legacy_full_search_path = status != "all"
-        || !quick_selectors.is_empty()
-        || matches!(sort.field, AdminPoolKeySortField::Score);
+    let legacy_full_search_path = status != "all" || !quick_selectors.is_empty();
     match (requested_scope, legacy_full_search_path) {
         (AdminPoolSearchScope::Auto, true) => AdminPoolSearchScope::Full,
         (AdminPoolSearchScope::Auto, false) => AdminPoolSearchScope::Name,
@@ -686,7 +682,7 @@ fn admin_pool_key_cost_exhausted(
         >= limit
 }
 
-fn admin_pool_key_visible_status_filter(
+pub(super) fn admin_pool_key_visible_status_filter(
     state: &AdminAppState<'_>,
     key: &StoredProviderCatalogKey,
     provider_type: &str,
@@ -755,7 +751,7 @@ async fn read_admin_pool_filtered_sorted_keys(
         .into_iter()
         .filter(|key| match search_scope {
             AdminPoolSearchScope::Auto | AdminPoolSearchScope::Name => {
-                admin_pool_key_matches_name_search(key, search)
+                pool_selection::admin_pool_matches_catalog_search(key, search)
             }
             AdminPoolSearchScope::Full if search.is_some() => {
                 pool_selection::admin_pool_matches_search(
@@ -903,8 +899,7 @@ pub(super) async fn build_admin_pool_list_keys_response(
     let page_offset = page.saturating_sub(1).saturating_mul(page_size);
     let sort_by_score = matches!(sort.field, AdminPoolKeySortField::Score);
     let now_unix_secs = admin_pool_current_unix_secs();
-    let search_scope =
-        admin_pool_effective_search_scope(search_scope, &status, &quick_selectors, sort);
+    let search_scope = admin_pool_effective_search_scope(search_scope, &status, &quick_selectors);
 
     let (keys, total, preloaded_pool_scores_by_key_id) = if status != "all"
         || !quick_selectors.is_empty()
@@ -1039,17 +1034,16 @@ pub(super) async fn build_admin_pool_create_selection_snapshot_response(
     let quick_selectors =
         admin_provider_pool_pure::admin_pool_sanitize_quick_selectors(payload.quick_selectors);
     let status_value = payload.status.trim();
-    let status = match parse_admin_pool_status_filter_value(
-        (!status_value.is_empty()).then_some(status_value),
-    ) {
-        Ok(value) => value,
-        Err(detail) => {
-            return Ok(build_admin_pool_error_response(
-                http::StatusCode::BAD_REQUEST,
-                detail,
-            ));
-        }
-    };
+    let status =
+        match parse_admin_pool_status_value((!status_value.is_empty()).then_some(status_value)) {
+            Ok(value) => value,
+            Err(detail) => {
+                return Ok(build_admin_pool_error_response(
+                    http::StatusCode::BAD_REQUEST,
+                    detail,
+                ));
+            }
+        };
     let sort = match parse_admin_pool_key_sort_values(
         payload.sort_by.as_deref(),
         payload.sort_order.as_deref(),
@@ -1086,8 +1080,7 @@ pub(super) async fn build_admin_pool_create_selection_snapshot_response(
     let pool_config = admin_provider_pool_config(&provider);
     let page_offset = page.saturating_sub(1).saturating_mul(page_size);
     let now_unix_secs = admin_pool_current_unix_secs();
-    let search_scope =
-        admin_pool_effective_search_scope(search_scope, &status, &quick_selectors, sort);
+    let search_scope = admin_pool_effective_search_scope(search_scope, &status, &quick_selectors);
     let (keys, preloaded_pool_scores_by_key_id) = read_admin_pool_filtered_sorted_keys(
         state,
         &provider,
@@ -1195,6 +1188,57 @@ mod tests {
             ),
             Some("expired")
         );
+    }
+
+    #[test]
+    fn codex_cycle_usage_request_uses_actual_monthly_window_boundaries() {
+        let key = sample_key("oauth");
+        let reset_at = 5_000_000u64;
+        let now = 3_000_000u64;
+        let window = json!({
+            "code": "monthly",
+            "label": "月",
+            "scope": "account",
+            "reset_at": reset_at,
+            "window_minutes": 43_800u64
+        });
+
+        let request = admin_pool_codex_cycle_usage_request(
+            &key,
+            window.as_object().expect("window should be object"),
+            now,
+        )
+        .expect("monthly usage request should build");
+
+        assert_eq!(request.window_code, "monthly");
+        assert_eq!(request.start_unix_secs, reset_at - 43_800 * 60);
+        assert_eq!(request.end_unix_secs, now);
+    }
+
+    #[test]
+    fn codex_cycle_usage_request_ignores_zero_and_spark_windows() {
+        let key = sample_key("oauth");
+        for window in [
+            json!({
+                "code": "weekly",
+                "scope": "account",
+                "reset_at": 5_000_000u64,
+                "window_minutes": 0
+            }),
+            json!({
+                "code": "spark_weekly",
+                "scope": "account",
+                "reset_at": 5_000_000u64,
+                "window_minutes": 10_080
+            }),
+        ] {
+            assert!(admin_pool_codex_cycle_usage_request(
+                &key,
+                window.as_object().expect("window should be object"),
+                3_000_000,
+            )
+            .is_none());
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ const endpointMocks = vi.hoisted(() => ({
   getPoolOverview: vi.fn(),
   getPoolSchedulingPresets: vi.fn(),
   listPoolKeys: vi.fn(),
+  createPoolKeySelectionSnapshot: vi.fn(),
   clearPoolCooldown: vi.fn(),
   getProvider: vi.fn(),
   updateProvider: vi.fn(),
@@ -42,6 +43,7 @@ vi.mock('@/api/endpoints/pool', () => ({
   getPoolOverview: endpointMocks.getPoolOverview,
   getPoolSchedulingPresets: endpointMocks.getPoolSchedulingPresets,
   listPoolKeys: endpointMocks.listPoolKeys,
+  createPoolKeySelectionSnapshot: endpointMocks.createPoolKeySelectionSnapshot,
   clearPoolCooldown: endpointMocks.clearPoolCooldown,
 }))
 
@@ -133,7 +135,6 @@ vi.mock('lucide-vue-next', async () => {
     Copy: Icon,
     Shield: Icon,
     Globe: Icon,
-    Repeat2: Icon,
     RotateCcw: Icon,
     SquarePen: Icon,
     Trash2: Icon,
@@ -142,7 +143,9 @@ vi.mock('lucide-vue-next', async () => {
     SlidersHorizontal: Icon,
     CircleHelp: Icon,
     Edit: Icon,
-    Plug: Icon,
+    Eye: Icon,
+    ListChecks: Icon,
+    SquareCheckBig: Icon,
   }
 })
 
@@ -201,10 +204,49 @@ vi.mock('@/components/ui', async () => {
     },
   })
 
+  const Checkbox = defineComponent({
+    name: 'CheckboxStub',
+    inheritAttrs: false,
+    props: {
+      checked: Boolean,
+      modelValue: Boolean,
+      indeterminate: Boolean,
+      disabled: Boolean,
+    },
+    emits: ['update:checked', 'update:modelValue'],
+    setup(props, { attrs, emit }) {
+      return () => h('input', {
+        ...attrs,
+        type: 'checkbox',
+        checked: props.checked || props.modelValue,
+        disabled: props.disabled,
+        'data-indeterminate': props.indeterminate ? 'true' : undefined,
+        onChange: (event: Event) => {
+          const checked = (event.target as HTMLInputElement).checked
+          emit('update:checked', checked)
+          emit('update:modelValue', checked)
+        },
+      })
+    },
+  })
+
   const Pagination = defineComponent({
     name: 'PaginationStub',
     setup() {
       return () => h('nav')
+    },
+  })
+
+  const DropdownMenuItem = defineComponent({
+    name: 'DropdownMenuItemStub',
+    inheritAttrs: false,
+    emits: ['select'],
+    setup(_, { attrs, emit, slots }) {
+      return () => h('button', {
+        ...attrs,
+        type: 'button',
+        onClick: (event: Event) => emit('select', event),
+      }, slots.default?.())
     },
   })
 
@@ -259,6 +301,7 @@ vi.mock('@/components/ui', async () => {
     Card: passthrough('CardStub'),
     Badge: passthrough('BadgeStub', 'span'),
     Button,
+    Checkbox,
     Input,
     Select: passthrough('SelectStub'),
     SelectTrigger: passthrough('SelectTriggerStub', 'button'),
@@ -273,6 +316,10 @@ vi.mock('@/components/ui', async () => {
     SortableTableHead: passthrough('SortableTableHeadStub', 'th'),
     TableFilterMenu: passthrough('TableFilterMenuStub'),
     TableCell: passthrough('TableCellStub', 'td'),
+    DropdownMenu: passthrough('DropdownMenuStub'),
+    DropdownMenuTrigger: passthrough('DropdownMenuTriggerStub'),
+    DropdownMenuContent: passthrough('DropdownMenuContentStub'),
+    DropdownMenuItem,
     Switch,
     Pagination,
     Popover,
@@ -327,32 +374,42 @@ vi.mock('@/features/pool/components/PoolDemandMetricsDialog.vue', async () => {
   }
 })
 vi.mock('@/features/pool/components/PoolAccountBatchDialog.vue', async () => {
-  const { defineComponent } = await import('vue')
+  const { defineComponent, h } = await import('vue')
   return {
     default: defineComponent({
       name: 'PoolAccountBatchDialogStub',
-      setup() {
-        return () => null
+      props: {
+        modelValue: Boolean,
+        selectedKeys: { type: Array, default: () => [] },
+        selectAllFiltered: Boolean,
+        selectedCount: { type: Number, default: 0 },
+        selectionFilters: { type: Object, default: () => ({}) },
+        selectionSnapshot: { type: Object, default: null },
+        initialAction: { type: String, default: null },
+      },
+      emits: ['update:modelValue', 'changed', 'editConfig'],
+      setup(props) {
+        return () => h('div', {
+          'data-testid': 'pool-account-batch-dialog',
+          'data-open': props.modelValue ? 'true' : 'false',
+          'data-selected-ids': (props.selectedKeys as PoolKeyDetail[])
+            .map(key => key.key_id)
+            .join(','),
+          'data-select-all-filtered': props.selectAllFiltered ? 'true' : 'false',
+          'data-selected-count': String(props.selectedCount),
+          'data-selection-filters': JSON.stringify(props.selectionFilters),
+          'data-selection-snapshot-id': (props.selectionSnapshot as { id?: string } | null)?.id || '',
+          'data-initial-action': props.initialAction || '',
+        })
       },
     }),
   }
 })
-vi.mock('@/features/pool/components/ProviderProxyPopover.vue', async () => {
+vi.mock('@/features/pool/components/PoolKeyBatchEditDialog.vue', async () => {
   const { defineComponent } = await import('vue')
   return {
     default: defineComponent({
-      name: 'ProviderProxyPopoverStub',
-      setup() {
-        return () => null
-      },
-    }),
-  }
-})
-vi.mock('@/features/providers/components/EndpointFormDialog.vue', async () => {
-  const { defineComponent } = await import('vue')
-  return {
-    default: defineComponent({
-      name: 'EndpointFormDialogStub',
+      name: 'PoolKeyBatchEditDialogStub',
       setup() {
         return () => null
       },
@@ -492,7 +549,7 @@ function createPoolKey(providerType = 'codex', overrides: Partial<PoolKeyDetail>
               {
                 code: 'weekly',
                 remaining_ratio: 0.5,
-                usage: { request_count: 0, total_tokens: 0, total_cost_usd: '0.00000000' },
+                usage: { request_count: 12, total_tokens: 5000, total_cost_usd: '0.012' },
               },
             ]
           : [],
@@ -533,13 +590,6 @@ async function settle() {
   }
 }
 
-function seedStoredStatsMode(statsMode: 'current_cycle' | 'account_total') {
-  window.sessionStorage.setItem(
-    POOL_MANAGEMENT_VIEW_STORAGE_KEY,
-    JSON.stringify({ statsMode }),
-  )
-}
-
 beforeEach(() => {
   resetQuery()
   window.sessionStorage.clear()
@@ -549,6 +599,18 @@ beforeEach(() => {
   endpointMocks.getPoolOverview.mockReset()
   endpointMocks.getPoolSchedulingPresets.mockReset()
   endpointMocks.listPoolKeys.mockReset()
+  endpointMocks.createPoolKeySelectionSnapshot.mockReset().mockImplementation(
+    async (_providerId: string, request: { page?: number, page_size?: number, expected_total: number }) => ({
+      total: request.expected_total,
+      page: request.page ?? 1,
+      page_size: request.page_size ?? 50,
+      selection_snapshot: {
+        id: 'selection-snapshot',
+        total: request.expected_total,
+        status: 'ready',
+      },
+    }),
+  )
   endpointMocks.clearPoolCooldown.mockReset()
   endpointMocks.getProvider.mockReset()
   endpointMocks.updateProvider.mockReset()
@@ -655,7 +717,7 @@ describe('PoolManagement Codex cycle stats mode', () => {
     expect(root.textContent).toContain('429')
   })
 
-  it('renders Codex current-cycle stats by default with a header icon toggle', async () => {
+  it('renders current-cycle comparison text without a mode toggle', async () => {
     const codexKey = createPoolKey('codex')
     endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
     endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(codexKey))
@@ -664,19 +726,12 @@ describe('PoolManagement Codex cycle stats mode', () => {
     const root = mountPoolManagement()
     await settle()
 
-    expect(root.querySelector('[data-testid="pool-stats-mode-switch"]')).toBeNull()
-    const modeButton = root.querySelector<HTMLButtonElement>('[data-testid="pool-stats-mode-control"]')
-    expect(modeButton).not.toBeNull()
-    expect(modeButton?.getAttribute('title')).toBe('切换为总计统计')
-    expect(root.querySelectorAll('[data-testid="pool-stats-cycle-group-5h"]').length).toBeGreaterThan(0)
-    expect(root.querySelectorAll('[data-testid="pool-stats-cycle-group-weekly"]').length).toBeGreaterThan(0)
-    expect(root.querySelector('[data-testid="pool-stats-5h-request_count"]')?.textContent?.trim()).toBe('7')
-    expect(root.querySelector('[data-testid="pool-stats-weekly-total_tokens"]')?.textContent?.trim()).toBe('0')
-    expect(root.querySelector('[data-testid="pool-stats-cycle-grid"]')?.className).toContain('grid-cols-[38px_64px_10px_64px]')
-    expect(root.querySelector('[data-testid="pool-stats-cycle-grid"]')?.className).toContain('w-[188px]')
-    expect(root.querySelector('[data-testid="pool-stats-cycle-grid"]')?.className).toContain('min-h-16')
-    expect(root.querySelector('[data-testid="pool-stats-5h-request_count"]')?.className).toContain('text-center')
-    expect(root.querySelector('[data-testid="pool-stats-weekly-total_tokens"]')?.className).toContain('text-center')
+    expect(root.querySelector('[data-testid="pool-stats-mode-control"]')).toBeNull()
+    expect(root.querySelector('[data-testid="pool-stats-cycle-text"]')).not.toBeNull()
+    expect(root.querySelector('[data-testid="pool-stats-cycle-request_count"]')?.textContent?.trim()).toBe('7/12')
+    expect(root.querySelector('[data-testid="pool-stats-cycle-total_tokens"]')?.textContent?.trim()).toBe('2.5K/5K')
+    expect(root.querySelector('[data-testid="pool-stats-cycle-small-overlay"]')).toBeNull()
+    expect(root.querySelector('[data-testid="pool-stats-cycle-large-base"]')).toBeNull()
     expect(endpointMocks.listPoolKeys).toHaveBeenLastCalledWith(
       'codex-provider',
       expect.objectContaining({
@@ -763,6 +818,50 @@ describe('PoolManagement Codex cycle stats mode', () => {
       .filter(Boolean)
     expect(resetTexts).toContain('1h')
     expect(root.textContent).toContain('生图')
+  })
+
+  it('labels Codex quota by the actual refresh window duration', async () => {
+    const monthlyCodexKey = createPoolKey('codex', {
+      status_snapshot: {
+        oauth: { code: 'valid' },
+        account: { code: 'ok', blocked: false },
+        quota: {
+          code: 'ok',
+          exhausted: false,
+          provider_type: 'codex',
+          windows: [
+            {
+              code: 'weekly',
+              remaining_ratio: 0.86,
+              window_minutes: 43_800,
+              usage: { request_count: 23, total_tokens: 45_600, total_cost_usd: '0.1234' },
+            },
+            {
+              code: '5h',
+              remaining_ratio: 1,
+              window_minutes: 0,
+            },
+          ],
+        },
+      },
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(monthlyCodexKey))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    const periodLabels = Array.from(root.querySelectorAll('[data-testid="pool-quota-period-label"]'))
+      .map((element) => element.textContent?.trim())
+      .filter(Boolean)
+    expect(periodLabels).toContain('月')
+    expect(periodLabels).not.toContain('5H')
+    expect(periodLabels).not.toContain('周')
+    expect(root.querySelector('[data-testid="pool-stats-cycle-request_count"]')?.textContent?.trim()).toBe('-/23')
+    expect(root.querySelector('[data-testid="pool-stats-cycle-small-overlay"]')).toBeNull()
+    expect(root.querySelector('[data-testid="pool-stats-cycle-bar-request_count"]')).toBeNull()
+    expect(root.querySelector('[data-testid="pool-stats-cycle-single-marker"]')).toBeNull()
   })
 
   it('opens only one score popover across desktop and mobile layouts', async () => {
@@ -869,32 +968,11 @@ describe('PoolManagement Codex cycle stats mode', () => {
     )
   })
 
-  it('toggles Codex stats to account totals and persists the choice', async () => {
-    const codexKey = createPoolKey('codex')
-    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
-    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(codexKey))
-    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
-
-    const root = mountPoolManagement()
-    await settle()
-
-    const modeButton = root.querySelector<HTMLButtonElement>('[data-testid="pool-stats-mode-control"]')
-    expect(modeButton).not.toBeNull()
-    modeButton?.click()
-    await settle()
-
-    expect(root.querySelector('[data-testid="pool-stats-account-total"]')).not.toBeNull()
-    expect(root.querySelector('[data-testid="pool-stats-account-total"]')?.className).toContain('w-[188px]')
-    expect(root.querySelector('[data-testid="pool-stats-account-total"]')?.className).toContain('grid-rows-4')
-    expect(root.querySelector('[data-testid="pool-stats-account-total"]')?.className).toContain('min-h-16')
-    expect(root.querySelector('[data-testid="pool-stats-cycle-group-5h"]')).toBeNull()
-    expect(routeMocks.query.statsMode).toBe('account_total')
-    expect(window.sessionStorage.getItem(POOL_MANAGEMENT_VIEW_STORAGE_KEY)).toContain('"statsMode":"account_total"')
-    expect(modeButton?.getAttribute('title')).toBe('切换为周期统计')
-  })
-
-  it('restores stored and query account-total mode for Codex providers', async () => {
-    seedStoredStatsMode('account_total')
+  it('ignores legacy account-total mode and removes it from the route', async () => {
+    window.sessionStorage.setItem(
+      POOL_MANAGEMENT_VIEW_STORAGE_KEY,
+      JSON.stringify({ statsMode: 'account_total' }),
+    )
     routeMocks.query.statsMode = 'account_total'
     const codexKey = createPoolKey('codex')
     endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
@@ -904,10 +982,10 @@ describe('PoolManagement Codex cycle stats mode', () => {
     const root = mountPoolManagement()
     await settle()
 
-    expect(root.querySelector('[data-testid="pool-stats-account-total"]')).not.toBeNull()
-    expect(root.querySelector('[data-testid="pool-stats-cycle-group-5h"]')).toBeNull()
-    expect(routeMocks.query.statsMode).toBe('account_total')
-    expect(window.sessionStorage.getItem(POOL_MANAGEMENT_VIEW_STORAGE_KEY)).toContain('"statsMode":"account_total"')
+    expect(root.querySelector('[data-testid="pool-stats-mode-control"]')).toBeNull()
+    expect(root.querySelector('[data-testid="pool-stats-cycle-text"]')).not.toBeNull()
+    expect(root.querySelector('[data-testid="pool-stats-account-total"]')).toBeNull()
+    expect(routeMocks.query.statsMode).toBeUndefined()
   })
 
   it('resets Codex cycle stats from the action column', async () => {
@@ -942,14 +1020,168 @@ describe('PoolManagement Codex cycle stats mode', () => {
     const root = mountPoolManagement()
     await settle()
 
-    expect(root.querySelector('[data-testid="pool-stats-mode-switch"]')).toBeNull()
     expect(root.querySelector('[data-testid="pool-stats-mode-control"]')).toBeNull()
     expect(root.querySelector('[data-testid="pool-reset-cycle-stats"]')).toBeNull()
-    expect(root.querySelector('[data-testid="pool-stats-cycle-group-5h"]')).toBeNull()
+    expect(root.querySelector('[data-testid="pool-stats-cycle-text"]')).toBeNull()
     expect(root.querySelector('[data-testid="pool-stats-account-total"]')).not.toBeNull()
     expect(root.textContent).toContain('12')
     expect(root.textContent).toContain('3.5K')
     expect(root.textContent).toContain('$1.25')
+  })
+
+  it('supports page selection across desktop/mobile rows and seeds batch actions', async () => {
+    const firstKey = createPoolKey('codex', { key_id: 'codex-selection-1', key_name: 'First key' })
+    const secondKey = createPoolKey('codex', { key_id: 'codex-selection-2', key_name: 'Second key' })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue({
+      total: 2,
+      page: 1,
+      page_size: 50,
+      keys: [firstKey, secondKey],
+    })
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    let pageCheckbox = root.querySelector<HTMLInputElement>('[data-testid="pool-select-page-desktop"]')
+    const firstDesktopCheckbox = root.querySelector<HTMLInputElement>('[data-testid="pool-select-desktop-codex-selection-1"]')
+    const firstMobileCheckbox = root.querySelector<HTMLInputElement>('[data-testid="pool-select-mobile-codex-selection-1"]')
+    expect(pageCheckbox).not.toBeNull()
+    expect(firstDesktopCheckbox).not.toBeNull()
+    expect(firstMobileCheckbox).not.toBeNull()
+    expect(root.querySelector('[data-testid="pool-selected-count-desktop"]')).toBeNull()
+    expect(root.querySelector('[data-testid="pool-selected-count-mobile"]')).toBeNull()
+    expect(root.querySelector<HTMLElement>('colgroup col')?.style.width).toBe('19%')
+    expect(root.querySelectorAll('colgroup col')).toHaveLength(8)
+    expect(pageCheckbox?.closest('th')?.textContent).toContain('名称')
+    expect(firstDesktopCheckbox?.closest('td')?.textContent).toContain('First key')
+
+    firstDesktopCheckbox?.click()
+    await settle()
+
+    expect(firstDesktopCheckbox?.checked).toBe(true)
+    expect(firstMobileCheckbox?.checked).toBe(true)
+    expect(pageCheckbox?.dataset.indeterminate).toBe('true')
+    const desktopSelectedCount = root.querySelector('[data-testid="pool-selected-count-desktop"]')
+    expect(desktopSelectedCount?.textContent).toContain('已选 1 个')
+    expect(desktopSelectedCount?.closest('th')).toBe(pageCheckbox?.closest('th'))
+    expect(root.querySelector('[data-testid="pool-selected-count-mobile"]')?.textContent).toContain('已选 1 个')
+    expect(root.querySelector('[data-testid="pool-selection-toolbar"]')).toBeNull()
+    expect(root.querySelector<HTMLButtonElement>('[data-testid="pool-batch-actions-desktop"]')?.disabled).toBe(false)
+
+    pageCheckbox?.click()
+    await settle()
+    expect(root.querySelector<HTMLInputElement>('[data-testid="pool-select-desktop-codex-selection-2"]')?.checked).toBe(true)
+    expect(root.querySelector('[data-testid="pool-selected-count-desktop"]')?.textContent).toContain('已选 2 个')
+
+    pageCheckbox?.click()
+    await settle()
+    expect(root.querySelector<HTMLButtonElement>('[data-testid="pool-batch-actions-desktop"]')?.disabled).toBe(true)
+    expect(root.querySelector('[data-testid="pool-selected-count-desktop"]')).toBeNull()
+    expect(root.querySelector('[data-testid="pool-selected-count-mobile"]')).toBeNull()
+
+    pageCheckbox = root.querySelector<HTMLInputElement>('[data-testid="pool-select-page-desktop"]')
+    pageCheckbox?.click()
+    await settle()
+    root.querySelector<HTMLButtonElement>('[data-testid="pool-batch-action-refresh_quota-desktop"]')?.click()
+    await settle()
+
+    const batchDialog = root.querySelector('[data-testid="pool-account-batch-dialog"]')
+    expect(batchDialog?.getAttribute('data-open')).toBe('true')
+    expect(batchDialog?.getAttribute('data-selected-ids')).toBe('codex-selection-1,codex-selection-2')
+    expect(batchDialog?.getAttribute('data-select-all-filtered')).toBe('false')
+    expect(batchDialog?.getAttribute('data-initial-action')).toBe('refresh_quota')
+  })
+
+  it('passes the current table search and status to filtered selection actions', async () => {
+    routeMocks.query.providerId = 'codex-provider'
+    routeMocks.query.search = 'inactive-account'
+    routeMocks.query.status = 'inactive'
+    const firstKey = createPoolKey('codex', { key_id: 'codex-filtered-1', key_name: 'inactive-account one' })
+    const secondKey = createPoolKey('codex', { key_id: 'codex-filtered-2', key_name: 'inactive-account two' })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue({
+      total: 37,
+      page: 1,
+      page_size: 50,
+      keys: [firstKey, secondKey],
+    })
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    const selectAllButton = root.querySelector<HTMLButtonElement>('[data-testid="pool-select-all-desktop"]')
+    expect(selectAllButton).not.toBeNull()
+    expect(selectAllButton?.title).toBe('全选')
+    selectAllButton?.click()
+    await settle()
+
+    expect(selectAllButton?.title).toBe('取消全选')
+    expect(selectAllButton?.getAttribute('aria-pressed')).toBe('true')
+    expect(root.querySelector<HTMLInputElement>('[data-testid="pool-select-desktop-codex-filtered-1"]')?.checked).toBe(true)
+    expect(root.querySelector<HTMLInputElement>('[data-testid="pool-select-desktop-codex-filtered-1"]')?.disabled).toBe(true)
+    expect(root.querySelector('[data-testid="pool-selected-count-desktop"]')?.textContent).toContain('已选 37 个')
+    expect(root.querySelector('[data-testid="pool-selected-count-mobile"]')?.textContent).toContain('已选 37 个')
+    const batchButton = root.querySelector<HTMLButtonElement>('[data-testid="pool-batch-actions-desktop"]')
+    expect(batchButton?.disabled).toBe(false)
+    expect(endpointMocks.createPoolKeySelectionSnapshot).toHaveBeenCalledWith('codex-provider', {
+      page: 1,
+      page_size: 50,
+      search: 'inactive-account',
+      status: 'inactive',
+      sort_by: 'imported_at',
+      sort_order: 'desc',
+      expected_total: 37,
+      expected_page_key_ids: ['codex-filtered-1', 'codex-filtered-2'],
+    })
+
+    selectAllButton?.click()
+    await settle()
+    expect(selectAllButton?.title).toBe('全选')
+    expect(selectAllButton?.getAttribute('aria-pressed')).toBe('false')
+    expect(root.querySelector<HTMLInputElement>('[data-testid="pool-select-desktop-codex-filtered-1"]')?.checked).toBe(false)
+    expect(root.querySelector('[data-testid="pool-selected-count-desktop"]')).toBeNull()
+    expect(batchButton?.disabled).toBe(true)
+
+    selectAllButton?.click()
+    await settle()
+    root.querySelector<HTMLButtonElement>('[data-testid="pool-batch-action-refresh_quota-desktop"]')?.click()
+    await settle()
+
+    const batchDialog = root.querySelector('[data-testid="pool-account-batch-dialog"]')
+    expect(batchDialog?.getAttribute('data-select-all-filtered')).toBe('true')
+    expect(batchDialog?.getAttribute('data-selected-count')).toBe('37')
+    expect(batchDialog?.getAttribute('data-selection-snapshot-id')).toBe('selection-snapshot')
+    expect(batchDialog?.getAttribute('data-initial-action')).toBe('refresh_quota')
+    expect(JSON.parse(batchDialog?.getAttribute('data-selection-filters') || '{}')).toEqual({
+      search: 'inactive-account',
+      status: 'inactive',
+    })
+  })
+
+  it('disables selection while a debounced search is waiting for fresh rows', async () => {
+    const key = createPoolKey('codex', { key_id: 'codex-stale-search-row' })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(key))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    const rowCheckbox = root.querySelector<HTMLInputElement>('[data-testid="pool-select-desktop-codex-stale-search-row"]')
+    expect(rowCheckbox?.disabled).toBe(false)
+    const searchInput = root.querySelector<HTMLInputElement>('input[placeholder="搜索账号..."]')
+    expect(searchInput).not.toBeNull()
+    if (searchInput) {
+      searchInput.value = 'fresh-filter'
+      searchInput.dispatchEvent(new Event('input', { bubbles: true }))
+    }
+    await nextTick()
+
+    expect(rowCheckbox?.disabled).toBe(true)
+    expect(root.querySelector<HTMLButtonElement>('[data-testid="pool-select-all-desktop"]')?.disabled).toBe(true)
   })
 
   it('shows adaptive hot pool metrics entry only when probing is enabled', async () => {

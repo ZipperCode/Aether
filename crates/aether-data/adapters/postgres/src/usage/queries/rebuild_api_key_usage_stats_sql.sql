@@ -4,10 +4,7 @@ WITH aggregated AS (
     COUNT(*)::BIGINT AS total_requests,
     COALESCE(SUM(
       GREATEST(
-        COALESCE(
-          total_tokens,
-          COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
-        ),
+        COALESCE(total_tokens, 0),
         0
       )::BIGINT
     ), 0)::BIGINT AS total_tokens,

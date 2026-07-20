@@ -964,6 +964,7 @@ export const MOCK_SYSTEM_CONFIGS: Array<{ key: string; value: unknown; descripti
   { key: 'backup_s3_scope', value: 'data', description: 'S3 备份范围' },
   { key: 'backup_s3_endpoint', value: null, description: 'S3 Endpoint' },
   { key: 'backup_s3_region', value: 'auto', description: 'S3 Region' },
+  { key: 'backup_s3_user_agent', value: 'rclone/v1.68.0', description: 'S3 User-Agent' },
   { key: 'backup_s3_bucket', value: null, description: 'S3 Bucket' },
   { key: 'backup_s3_prefix', value: 'aether/backups/', description: 'S3 备份前缀' },
   { key: 'backup_s3_access_key_id', value: null, description: 'S3 Access Key ID' },

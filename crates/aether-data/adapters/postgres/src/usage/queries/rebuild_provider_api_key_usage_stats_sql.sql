@@ -27,10 +27,7 @@ WITH aggregated AS (
       CASE
         WHEN status IN ('pending', 'streaming') THEN 0
         ELSE GREATEST(
-          COALESCE(
-            total_tokens,
-            COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
-          ),
+          COALESCE(total_tokens, 0),
           0
         )::BIGINT
       END

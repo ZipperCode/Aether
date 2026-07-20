@@ -3194,7 +3194,7 @@ fn canonical_message_blocks_to_openai_chat(
             match message.role {
                 CanonicalRole::Assistant => "assistant",
                 CanonicalRole::System => "system",
-                CanonicalRole::Developer => "developer",
+                CanonicalRole::Developer => "system",
                 CanonicalRole::Tool => "tool",
                 CanonicalRole::Unknown | CanonicalRole::User => "user",
             }
@@ -7085,7 +7085,7 @@ mod tests {
         let rebuilt = canonical_to_openai_chat_request(&canonical).expect("openai chat request");
         assert_eq!(rebuilt["model"], "gpt-5");
         assert_eq!(rebuilt["messages"][0]["role"], "system");
-        assert_eq!(rebuilt["messages"][1]["role"], "developer");
+        assert_eq!(rebuilt["messages"][1]["role"], "system");
         assert_eq!(
             rebuilt["messages"][2]["content"][1]["image_url"]["url"],
             "data:image/png;base64,iVBORw0KGgo="

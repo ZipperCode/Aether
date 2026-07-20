@@ -49,7 +49,9 @@ use aether_data_contracts::repository::usage::{
     StoredProviderUsageSummary, StoredRequestUsageAudit, StoredUsageDailySummary,
     UpsertUsageRecord, UsageAuditListQuery, UsageCounterFlushSummary, UsageCounterHealthSnapshot,
     UsageCounterPendingHealthSnapshot, UsageDailyHeatmapQuery, UsageReadRepository,
-    UsageWriteRepository,
+    UsageWriteRepository, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY,
+    PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_SERVICE_TIER_METADATA_KEY,
+    REQUESTED_REASONING_EFFORT_METADATA_KEY,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -3180,7 +3182,14 @@ SELECT
   COALESCE(SUM(total_requests), 0)::BIGINT AS total_requests,
   COALESCE(SUM(input_tokens), 0)::BIGINT AS input_tokens,
   COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens,
-  COALESCE(SUM(input_tokens + output_tokens), 0)::BIGINT AS recorded_total_tokens,
+  COALESCE(SUM(
+    CASE
+      WHEN effective_input_tokens = 0 AND total_input_context = 0 AND input_tokens > 0
+      THEN input_tokens
+      ELSE effective_input_tokens
+    END
+    + output_tokens + cache_creation_tokens + cache_read_tokens
+  ), 0)::BIGINT AS recorded_total_tokens,
   COALESCE(SUM(cache_creation_tokens), 0)::BIGINT AS cache_creation_tokens,
   COALESCE(SUM(cache_creation_ephemeral_5m_tokens), 0)::BIGINT
     AS cache_creation_ephemeral_5m_tokens,
@@ -3212,7 +3221,14 @@ SELECT
   COALESCE(SUM(total_requests), 0)::BIGINT AS total_requests,
   COALESCE(SUM(input_tokens), 0)::BIGINT AS input_tokens,
   COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens,
-  COALESCE(SUM(input_tokens + output_tokens), 0)::BIGINT AS recorded_total_tokens,
+  COALESCE(SUM(
+    CASE
+      WHEN effective_input_tokens = 0 AND total_input_context = 0 AND input_tokens > 0
+      THEN input_tokens
+      ELSE effective_input_tokens
+    END
+    + output_tokens + cache_creation_tokens + cache_read_tokens
+  ), 0)::BIGINT AS recorded_total_tokens,
   COALESCE(SUM(cache_creation_tokens), 0)::BIGINT AS cache_creation_tokens,
   COALESCE(SUM(cache_creation_ephemeral_5m_tokens), 0)::BIGINT
     AS cache_creation_ephemeral_5m_tokens,
@@ -3259,18 +3275,8 @@ SELECT
   COALESCE(SUM(GREATEST(COALESCE("usage".input_tokens, 0), 0)), 0)::BIGINT AS input_tokens,
   COALESCE(SUM(GREATEST(COALESCE("usage".output_tokens, 0), 0)), 0)::BIGINT AS output_tokens,
   COALESCE(SUM(GREATEST(COALESCE("usage".total_tokens, 0), 0)), 0)::BIGINT AS recorded_total_tokens,
-  COALESCE(SUM(
-    CASE
-      WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
-           AND (
-             COALESCE("usage".cache_creation_input_tokens_5m, 0)
-             + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-           ) > 0
-      THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
-         + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-      ELSE COALESCE("usage".cache_creation_input_tokens, 0)
-    END
-  ), 0)::BIGINT AS cache_creation_tokens,
+  COALESCE(SUM(GREATEST(COALESCE("usage".cache_creation_input_tokens, 0), 0)), 0)::BIGINT
+    AS cache_creation_tokens,
   COALESCE(SUM(GREATEST(COALESCE("usage".cache_creation_input_tokens_5m, 0), 0)), 0)::BIGINT
     AS cache_creation_ephemeral_5m_tokens,
   COALESCE(SUM(GREATEST(COALESCE("usage".cache_creation_input_tokens_1h, 0), 0)), 0)::BIGINT
@@ -3947,80 +3953,10 @@ SELECT
   COALESCE(SUM(GREATEST(COALESCE("usage".input_tokens, 0), 0)), 0)::BIGINT AS input_tokens,
   COALESCE(SUM(GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0)), 0)::BIGINT
     AS cache_read_tokens,
-  COALESCE(SUM(
-    CASE
-      WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
-           AND (
-             COALESCE("usage".cache_creation_input_tokens_5m, 0)
-             + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-           ) > 0
-      THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
-         + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-      ELSE COALESCE("usage".cache_creation_input_tokens, 0)
-    END
-  ), 0)::BIGINT AS cache_creation_tokens,
-  COALESCE(SUM(
-    CASE
-      WHEN split_part(lower(COALESCE(COALESCE("usage".endpoint_api_format, "usage".api_format), '')), ':', 1)
-           IN ('claude', 'anthropic')
-      THEN GREATEST(COALESCE("usage".input_tokens, 0), 0)
-         + CASE
-             WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
-                  AND (
-                    COALESCE("usage".cache_creation_input_tokens_5m, 0)
-                    + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-                  ) > 0
-             THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
-                + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-             ELSE COALESCE("usage".cache_creation_input_tokens, 0)
-           END
-         + GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0)
-      WHEN split_part(lower(COALESCE(COALESCE("usage".endpoint_api_format, "usage".api_format), '')), ':', 1)
-           IN ('openai', 'gemini', 'google')
-      THEN (
-        CASE
-          WHEN GREATEST(COALESCE("usage".input_tokens, 0), 0) <= 0 THEN 0
-          WHEN GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0) <= 0
-          THEN GREATEST(COALESCE("usage".input_tokens, 0), 0)
-          ELSE GREATEST(
-            GREATEST(COALESCE("usage".input_tokens, 0), 0)
-              - GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0),
-            0
-          )
-        END
-      ) + GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0)
-      ELSE CASE
-        WHEN (
-          CASE
-            WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
-                 AND (
-                   COALESCE("usage".cache_creation_input_tokens_5m, 0)
-                   + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-                 ) > 0
-            THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
-               + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-            ELSE COALESCE("usage".cache_creation_input_tokens, 0)
-          END
-        ) > 0
-        THEN GREATEST(COALESCE("usage".input_tokens, 0), 0)
-           + (
-             CASE
-               WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
-                    AND (
-                      COALESCE("usage".cache_creation_input_tokens_5m, 0)
-                      + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-                    ) > 0
-               THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
-                  + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-               ELSE COALESCE("usage".cache_creation_input_tokens, 0)
-             END
-           )
-           + GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0)
-        ELSE GREATEST(COALESCE("usage".input_tokens, 0), 0)
-           + GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0)
-      END
-    END
-  ), 0)::BIGINT AS total_input_context,
+  COALESCE(SUM(GREATEST(COALESCE("usage".cache_creation_input_tokens, 0), 0)), 0)::BIGINT
+    AS cache_creation_tokens,
+  COALESCE(SUM(GREATEST(COALESCE("usage".total_input_context, 0), 0)), 0)::BIGINT
+    AS total_input_context,
   COALESCE(SUM(COALESCE(CAST("usage".cache_read_cost_usd AS DOUBLE PRECISION), 0)), 0)
     AS cache_read_cost_usd,
   COALESCE(SUM(COALESCE(CAST("usage".cache_creation_cost_usd AS DOUBLE PRECISION), 0)), 0)
@@ -4889,7 +4825,7 @@ SELECT
   {group_column} AS group_key,
   COALESCE(SUM(total_requests), 0)::BIGINT AS request_count,
   COALESCE(SUM(input_tokens), 0)::BIGINT AS input_tokens,
-  COALESCE(SUM(effective_input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0)::BIGINT AS total_tokens,
+  COALESCE(SUM(total_tokens), 0)::BIGINT AS total_tokens,
   COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens,
   COALESCE(SUM(effective_input_tokens), 0)::BIGINT AS effective_input_tokens,
   COALESCE(SUM(total_input_context), 0)::BIGINT AS total_input_context,
@@ -4946,18 +4882,11 @@ WITH filtered_usage AS (
   SELECT
     {group_key_expr} AS group_key,
     GREATEST(COALESCE("usage".input_tokens, 0), 0) AS input_tokens,
+    GREATEST(COALESCE("usage".effective_input_tokens, 0), 0) AS effective_input_tokens,
     GREATEST(COALESCE("usage".output_tokens, 0), 0) AS output_tokens,
     GREATEST(COALESCE("usage".total_tokens, 0), 0) AS total_tokens,
-    CASE
-      WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
-           AND (
-             COALESCE("usage".cache_creation_input_tokens_5m, 0)
-             + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-           ) > 0
-      THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
-         + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-      ELSE COALESCE("usage".cache_creation_input_tokens, 0)
-    END AS cache_creation_tokens,
+    GREATEST(COALESCE("usage".total_input_context, 0), 0) AS total_input_context,
+    GREATEST(COALESCE("usage".cache_creation_input_tokens, 0), 0) AS cache_creation_tokens,
     GREATEST(COALESCE("usage".cache_creation_input_tokens_5m, 0), 0)
       AS cache_creation_ephemeral_5m_tokens,
     GREATEST(COALESCE("usage".cache_creation_input_tokens_1h, 0), 0)
@@ -4997,8 +4926,7 @@ WITH filtered_usage AS (
            AND "usage".response_time_ms IS NOT NULL
       THEN 1
       ELSE 0
-    END AS successful_response_time_samples,
-    COALESCE(COALESCE("usage".endpoint_api_format, "usage".api_format), '') AS normalized_api_format
+    END AS successful_response_time_samples
   FROM usage_billing_facts AS "usage"
 "#,
         ));
@@ -5056,8 +4984,10 @@ normalized_usage AS (
   SELECT
     group_key,
     input_tokens,
+    effective_input_tokens,
     total_tokens,
     output_tokens,
+    total_input_context,
     cache_creation_tokens,
     cache_creation_ephemeral_5m_tokens,
     cache_creation_ephemeral_1h_tokens,
@@ -5068,49 +4998,7 @@ normalized_usage AS (
     response_time_ms,
     response_time_samples,
     successful_response_time_ms,
-    successful_response_time_samples,
-    CASE
-      WHEN input_tokens <= 0 THEN 0
-      WHEN split_part(lower(COALESCE(normalized_api_format, '')), ':', 1)
-           = 'openai'
-           AND (cache_creation_tokens > 0 OR cache_read_tokens > 0)
-      THEN GREATEST(input_tokens - cache_creation_tokens - cache_read_tokens, 0)
-      WHEN split_part(lower(COALESCE(normalized_api_format, '')), ':', 1)
-           IN ('gemini', 'google')
-           AND cache_read_tokens > 0
-      THEN GREATEST(input_tokens - cache_read_tokens, 0)
-      ELSE input_tokens
-    END AS effective_input_tokens,
-    CASE
-      WHEN split_part(lower(COALESCE(normalized_api_format, '')), ':', 1)
-           IN ('claude', 'anthropic')
-      THEN input_tokens + cache_creation_tokens + cache_read_tokens
-      WHEN split_part(lower(COALESCE(normalized_api_format, '')), ':', 1)
-           = 'openai'
-      THEN (
-        CASE
-          WHEN input_tokens <= 0 THEN 0
-          WHEN cache_creation_tokens > 0 OR cache_read_tokens > 0
-          THEN GREATEST(input_tokens - cache_creation_tokens - cache_read_tokens, 0)
-          ELSE input_tokens
-        END
-      ) + cache_creation_tokens + cache_read_tokens
-      WHEN split_part(lower(COALESCE(normalized_api_format, '')), ':', 1)
-           IN ('gemini', 'google')
-      THEN (
-        CASE
-          WHEN input_tokens <= 0 THEN 0
-          WHEN cache_read_tokens > 0
-          THEN GREATEST(input_tokens - cache_read_tokens, 0)
-          ELSE input_tokens
-        END
-      ) + cache_read_tokens
-      ELSE CASE
-        WHEN cache_creation_tokens > 0
-        THEN input_tokens + cache_creation_tokens + cache_read_tokens
-        ELSE input_tokens + cache_read_tokens
-      END
-    END AS total_input_context
+    successful_response_time_samples
   FROM filtered_usage
 )
 SELECT
@@ -6803,33 +6691,7 @@ SELECT
   {group_key_expr} AS group_key,
   MAX({legacy_name_expr}) AS legacy_name,
   COUNT(*)::BIGINT AS request_count,
-  COALESCE(SUM(
-    CASE
-      WHEN GREATEST(COALESCE("usage".input_tokens, 0), 0) <= 0 THEN 0
-      WHEN GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0) <= 0
-      THEN GREATEST(COALESCE("usage".input_tokens, 0), 0)
-      WHEN split_part(lower(COALESCE(COALESCE("usage".endpoint_api_format, "usage".api_format), '')), ':', 1)
-           IN ('openai', 'gemini', 'google')
-      THEN GREATEST(
-        GREATEST(COALESCE("usage".input_tokens, 0), 0)
-          - GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0),
-        0
-      )
-      ELSE GREATEST(COALESCE("usage".input_tokens, 0), 0)
-    END
-    + GREATEST(COALESCE("usage".output_tokens, 0), 0)
-    + CASE
-        WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
-             AND (
-               COALESCE("usage".cache_creation_input_tokens_5m, 0)
-               + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-             ) > 0
-        THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
-           + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-        ELSE COALESCE("usage".cache_creation_input_tokens, 0)
-      END
-    + GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0)
-  ), 0)::BIGINT AS total_tokens,
+  COALESCE(SUM(GREATEST(COALESCE("usage".total_tokens, 0), 0)), 0)::BIGINT AS total_tokens,
   COALESCE(SUM(COALESCE(CAST("usage".total_cost_usd AS DOUBLE PRECISION), 0)), 0)
     AS total_cost_usd
 FROM usage_billing_facts AS "usage"
@@ -6985,10 +6847,7 @@ SELECT
   user_id AS group_key,
   MAX(NULLIF(BTRIM(username), '')) AS legacy_name,
   COALESCE(SUM(total_requests), 0)::BIGINT AS request_count,
-  COALESCE(
-    SUM(effective_input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens),
-    0
-  )::BIGINT AS total_tokens,
+  COALESCE(SUM(total_tokens), 0)::BIGINT AS total_tokens,
   CAST(COALESCE(SUM(total_cost), 0) AS DOUBLE PRECISION) AS total_cost_usd
 FROM stats_user_daily_provider
 WHERE date >=
@@ -7014,10 +6873,7 @@ SELECT
   user_id AS group_key,
   MAX(NULLIF(BTRIM(username), '')) AS legacy_name,
   COALESCE(SUM(total_requests), 0)::BIGINT AS request_count,
-  COALESCE(
-    SUM(effective_input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens),
-    0
-  )::BIGINT AS total_tokens,
+  COALESCE(SUM(total_tokens), 0)::BIGINT AS total_tokens,
   CAST(COALESCE(SUM(total_cost), 0) AS DOUBLE PRECISION) AS total_cost_usd
 FROM stats_user_daily_model
 WHERE date >=
@@ -7102,8 +6958,23 @@ WHERE stats_daily_api_key.date >=
                     .push(" AND stats_daily_api_key.api_key_id IS NOT NULL");
                 if let Some(user_id) = query.user_id.as_deref() {
                     builder
-                        .push(" AND api_keys.user_id = ")
-                        .push_bind(user_id.to_string());
+                        .push(" AND (api_keys.user_id = ")
+                        .push_bind(user_id.to_string())
+                        .push(
+                            r#" OR (
+  api_keys.id IS NULL
+  AND stats_daily_api_key.api_key_id IN (
+    SELECT identity_usage.api_key_id
+    FROM usage AS identity_usage
+    WHERE identity_usage.user_id = "#,
+                        )
+                        .push_bind(user_id.to_string())
+                        .push(
+                            r#"
+      AND identity_usage.api_key_id IS NOT NULL
+    GROUP BY identity_usage.api_key_id"#,
+                        )
+                        .push(")))");
                 }
                 builder.push(
                     " GROUP BY stats_daily_api_key.api_key_id ORDER BY stats_daily_api_key.api_key_id ASC",
@@ -7315,25 +7186,16 @@ WITH filtered_usage AS (
     {provider_display_name_expr} AS provider_display_name,
     {provider_identity_source_expr} AS provider_identity_source,
     COALESCE("usage".api_format, 'unknown') AS api_format_group_key,
-    GREATEST(COALESCE("usage".input_tokens, 0), 0) AS input_tokens,
+    GREATEST(COALESCE("usage".effective_input_tokens, 0), 0) AS effective_input_tokens,
     GREATEST(COALESCE("usage".output_tokens, 0), 0) AS output_tokens,
     GREATEST(COALESCE("usage".total_tokens, 0), 0) AS total_tokens,
-    CASE
-      WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
-           AND (
-             COALESCE("usage".cache_creation_input_tokens_5m, 0)
-             + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-           ) > 0
-      THEN COALESCE("usage".cache_creation_input_tokens_5m, 0)
-         + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-      ELSE COALESCE("usage".cache_creation_input_tokens, 0)
-    END AS cache_creation_tokens,
+    GREATEST(COALESCE("usage".total_input_context, 0), 0) AS total_input_context,
+    GREATEST(COALESCE("usage".cache_creation_input_tokens, 0), 0) AS cache_creation_tokens,
     GREATEST(COALESCE("usage".cache_creation_input_tokens_5m, 0), 0)
       AS cache_creation_ephemeral_5m_tokens,
     GREATEST(COALESCE("usage".cache_creation_input_tokens_1h, 0), 0)
       AS cache_creation_ephemeral_1h_tokens,
     GREATEST(COALESCE("usage".cache_read_input_tokens, 0), 0) AS cache_read_tokens,
-    COALESCE("usage".endpoint_api_format, "usage".api_format) AS normalized_api_format,
     COALESCE(CAST("usage".total_cost_usd AS DOUBLE PRECISION), 0) AS total_cost_usd,
     COALESCE(CAST("usage".actual_total_cost_usd AS DOUBLE PRECISION), 0) AS actual_total_cost_usd,
     GREATEST(COALESCE("usage".response_time_ms, 0), 0) AS response_time_ms,
@@ -7370,6 +7232,8 @@ normalized_usage AS (
     {secondary_name_expr} AS secondary_name,
     total_tokens,
     output_tokens,
+    effective_input_tokens,
+    total_input_context,
     cache_creation_tokens,
     cache_creation_ephemeral_5m_tokens,
     cache_creation_ephemeral_1h_tokens,
@@ -7377,49 +7241,7 @@ normalized_usage AS (
     total_cost_usd,
     actual_total_cost_usd,
     response_time_ms,
-    success_flag,
-    CASE
-      WHEN input_tokens <= 0 THEN 0
-      WHEN split_part(lower(COALESCE(normalized_api_format, '')), ':', 1)
-           = 'openai'
-           AND (cache_creation_tokens > 0 OR cache_read_tokens > 0)
-      THEN GREATEST(input_tokens - cache_creation_tokens - cache_read_tokens, 0)
-      WHEN split_part(lower(COALESCE(normalized_api_format, '')), ':', 1)
-           IN ('gemini', 'google')
-           AND cache_read_tokens > 0
-      THEN GREATEST(input_tokens - cache_read_tokens, 0)
-      ELSE input_tokens
-    END AS effective_input_tokens,
-    CASE
-      WHEN split_part(lower(COALESCE(normalized_api_format, '')), ':', 1)
-           IN ('claude', 'anthropic')
-      THEN input_tokens + cache_creation_tokens + cache_read_tokens
-      WHEN split_part(lower(COALESCE(normalized_api_format, '')), ':', 1)
-           = 'openai'
-      THEN (
-        CASE
-          WHEN input_tokens <= 0 THEN 0
-          WHEN cache_creation_tokens > 0 OR cache_read_tokens > 0
-          THEN GREATEST(input_tokens - cache_creation_tokens - cache_read_tokens, 0)
-          ELSE input_tokens
-        END
-      ) + cache_creation_tokens + cache_read_tokens
-      WHEN split_part(lower(COALESCE(normalized_api_format, '')), ':', 1)
-           IN ('gemini', 'google')
-      THEN (
-        CASE
-          WHEN input_tokens <= 0 THEN 0
-          WHEN cache_read_tokens > 0
-          THEN GREATEST(input_tokens - cache_read_tokens, 0)
-          ELSE input_tokens
-        END
-      ) + cache_read_tokens
-      ELSE CASE
-        WHEN cache_creation_tokens > 0
-        THEN input_tokens + cache_creation_tokens + cache_read_tokens
-        ELSE input_tokens + cache_read_tokens
-      END
-    END AS total_input_context
+    success_flag
   FROM filtered_usage
 ),
 aggregated_usage AS (
@@ -7599,14 +7421,7 @@ ORDER BY request_count DESC, group_key ASC
             r#"SELECT
   DATE("usage".created_at) AS day,
   COUNT(*)::BIGINT AS requests,
-  COALESCE(SUM("usage".input_tokens + "usage".output_tokens
-    + CASE
-        WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
-             AND (COALESCE("usage".cache_creation_input_tokens_5m, 0) + COALESCE("usage".cache_creation_input_tokens_1h, 0)) > 0
-        THEN COALESCE("usage".cache_creation_input_tokens_5m, 0) + COALESCE("usage".cache_creation_input_tokens_1h, 0)
-        ELSE COALESCE("usage".cache_creation_input_tokens, 0)
-      END
-    + COALESCE("usage".cache_read_input_tokens, 0)), 0)::BIGINT AS total_tokens,
+  COALESCE(SUM(GREATEST(COALESCE("usage".total_tokens, 0), 0)), 0)::BIGINT AS total_tokens,
   COALESCE(SUM(CAST("usage".total_cost_usd AS DOUBLE PRECISION)), 0) AS total_cost_usd,
   COALESCE(SUM(CAST("usage".actual_total_cost_usd AS DOUBLE PRECISION)), 0) AS actual_total_cost_usd
 FROM usage_billing_facts AS "usage"
@@ -7850,14 +7665,9 @@ ORDER BY api_key_id ASC
 SELECT
   api_key_id,
   COALESCE(
-    SUM(
-      COALESCE(
-        total_tokens,
-        COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
-      )
-    ),
+    SUM(GREATEST(COALESCE(total_tokens, 0), 0)),
     0
-  ) AS total_tokens
+  )::BIGINT AS total_tokens
 FROM usage_billing_facts AS "usage"
 WHERE api_key_id = ANY(
 "#,
@@ -8248,8 +8058,14 @@ ORDER BY "usage".user_id ASC
                     http_audit_capture_mode,
                     routing_snapshot,
                     settlement_pricing_snapshot,
-                    request_metadata_value,
-                    request_metadata_json,
+                    mut request_metadata_value,
+                    mut request_metadata_json,
+                    replace_client_request_body_facts,
+                    replace_provider_request_body_facts,
+                    clear_request_body,
+                    clear_provider_request_body,
+                    clear_response_body,
+                    clear_client_response_body,
                 } = prepared;
                 Box::pin(async move {
                     lock_usage_request_id_in_tx(tx, &usage.request_id).await?;
@@ -8272,6 +8088,37 @@ ORDER BY "usage".user_id ASC
 
                     let previous_usage =
                         find_usage_by_request_id_in_tx(tx, &usage.request_id).await?;
+                    let capture_update_allowed = usage_capture_update_allowed(
+                        previous_usage
+                            .as_ref()
+                            .map(|stored| (stored.status.as_str(), stored.billing_status.as_str())),
+                        usage.status.as_str(),
+                    );
+                    let replace_terminal_snapshots =
+                        matches!(usage.status.as_str(), "completed" | "failed" | "cancelled");
+                    if capture_update_allowed
+                        && request_metadata_value.is_none()
+                        && (replace_terminal_snapshots
+                            || replace_client_request_body_facts
+                            || replace_provider_request_body_facts)
+                    {
+                        let previous_metadata = previous_usage
+                            .as_ref()
+                            .and_then(|stored| stored.request_metadata.as_ref());
+                        request_metadata_value = Some(if replace_terminal_snapshots {
+                            retain_previous_request_audit_metadata(
+                                previous_metadata,
+                                !replace_client_request_body_facts,
+                            )
+                        } else {
+                            clear_previous_request_body_facts(
+                                previous_metadata,
+                                replace_client_request_body_facts,
+                                replace_provider_request_body_facts,
+                            )
+                        });
+                        request_metadata_json = json_bind_text(request_metadata_value.as_ref())?;
+                    }
                     let _row = sqlx::query(UPSERT_SQL)
                         .bind(Uuid::new_v4().to_string())
                         .bind(&usage.request_id)
@@ -8344,72 +8191,89 @@ ORDER BY "usage".user_id ASC
                                 usage.updated_at_unix_secs
                             ))
                         })?)
-                        .bind(request_body_storage.has_detached_blob())
-                        .bind(provider_request_body_storage.has_detached_blob())
-                        .bind(response_body_storage.has_detached_blob())
-                        .bind(client_response_body_storage.has_detached_blob())
+                        .bind(request_body_storage.has_detached_blob() || clear_request_body)
+                        .bind(
+                            provider_request_body_storage.has_detached_blob()
+                                || clear_provider_request_body,
+                        )
+                        .bind(response_body_storage.has_detached_blob() || clear_response_body)
+                        .bind(
+                            client_response_body_storage.has_detached_blob()
+                                || clear_client_response_body,
+                        )
+                        .bind(capture_update_allowed)
                         .fetch_one(&mut **tx)
                         .await
                         .map_postgres_err()?;
-                    sync_usage_body_blob_storage(
-                        &mut **tx,
-                        &usage.request_id,
-                        UsageBodyField::RequestBody,
-                        usage.request_body.as_ref(),
-                        &request_body_storage,
-                    )
-                    .await?;
-                    sync_usage_body_blob_storage(
-                        &mut **tx,
-                        &usage.request_id,
-                        UsageBodyField::ProviderRequestBody,
-                        usage.provider_request_body.as_ref(),
-                        &provider_request_body_storage,
-                    )
-                    .await?;
-                    sync_usage_body_blob_storage(
-                        &mut **tx,
-                        &usage.request_id,
-                        UsageBodyField::ResponseBody,
-                        usage.response_body.as_ref(),
-                        &response_body_storage,
-                    )
-                    .await?;
-                    sync_usage_body_blob_storage(
-                        &mut **tx,
-                        &usage.request_id,
-                        UsageBodyField::ClientResponseBody,
-                        usage.client_response_body.as_ref(),
-                        &client_response_body_storage,
-                    )
-                    .await?;
-                    let http_audit_headers = UsageHttpAuditHeaders {
-                        request_headers_json: request_headers_json.as_deref(),
-                        provider_request_headers_json: provider_request_headers_json.as_deref(),
-                        response_headers_json: response_headers_json.as_deref(),
-                        client_response_headers_json: client_response_headers_json.as_deref(),
-                    };
-                    sync_usage_http_audit_storage(
-                        &mut **tx,
-                        &usage.request_id,
-                        &http_audit_headers,
-                        &http_audit_refs,
-                        &http_audit_states,
-                        http_audit_capture_mode,
-                    )
-                    .await?;
-                    sync_usage_routing_snapshot_storage(
-                        &mut **tx,
-                        &usage.request_id,
-                        &routing_snapshot,
-                    )
-                    .await?;
-                    sync_usage_settlement_pricing_snapshot_storage(
-                        &mut **tx,
-                        &usage.request_id,
-                        &settlement_pricing_snapshot,
-                    )
-                    .await?;
+                    if capture_update_allowed {
+                        sync_usage_body_blob_storage(
+                            &mut **tx,
+                            &usage.request_id,
+                            UsageBodyField::RequestBody,
+                            usage.request_body.as_ref(),
+                            &request_body_storage,
+                            clear_request_body,
+                        )
+                        .await?;
+                        sync_usage_body_blob_storage(
+                            &mut **tx,
+                            &usage.request_id,
+                            UsageBodyField::ProviderRequestBody,
+                            usage.provider_request_body.as_ref(),
+                            &provider_request_body_storage,
+                            clear_provider_request_body,
+                        )
+                        .await?;
+                        sync_usage_body_blob_storage(
+                            &mut **tx,
+                            &usage.request_id,
+                            UsageBodyField::ResponseBody,
+                            usage.response_body.as_ref(),
+                            &response_body_storage,
+                            clear_response_body,
+                        )
+                        .await?;
+                        sync_usage_body_blob_storage(
+                            &mut **tx,
+                            &usage.request_id,
+                            UsageBodyField::ClientResponseBody,
+                            usage.client_response_body.as_ref(),
+                            &client_response_body_storage,
+                            clear_client_response_body,
+                        )
+                        .await?;
+                        let http_audit_headers = UsageHttpAuditHeaders {
+                            request_headers_json: request_headers_json.as_deref(),
+                            provider_request_headers_json: provider_request_headers_json.as_deref(),
+                            response_headers_json: response_headers_json.as_deref(),
+                            client_response_headers_json: client_response_headers_json.as_deref(),
+                        };
+                        sync_usage_http_audit_storage(
+                            &mut **tx,
+                            &usage.request_id,
+                            &http_audit_headers,
+                            &http_audit_refs,
+                            &http_audit_states,
+                            http_audit_capture_mode,
+                        )
+                        .await?;
+                    }
+                    if capture_update_allowed {
+                        sync_usage_routing_snapshot_storage(
+                            &mut **tx,
+                            &usage.request_id,
+                            &routing_snapshot,
+                            replace_terminal_snapshots,
+                        )
+                        .await?;
+                        sync_usage_settlement_pricing_snapshot_storage(
+                            &mut **tx,
+                            &usage.request_id,
+                            &settlement_pricing_snapshot,
+                            replace_terminal_snapshots,
+                        )
+                        .await?;
+                    }
 
                     let mut stored = find_usage_by_request_id_in_tx(tx, &usage.request_id)
                         .await?
@@ -8419,71 +8283,79 @@ ORDER BY "usage".user_id ASC
                                 usage.request_id
                             ))
                         })?;
-                    if request_body_storage.has_detached_blob() {
-                        stored.request_body = usage.request_body.clone();
+                    if capture_update_allowed {
+                        if request_body_storage.has_detached_blob() {
+                            stored.request_body = usage.request_body.clone();
+                        }
+                        stored.request_headers = usage.request_headers.clone();
+                        stored.provider_request_headers = usage.provider_request_headers.clone();
+                        if provider_request_body_storage.has_detached_blob() {
+                            stored.provider_request_body = usage.provider_request_body.clone();
+                        }
+                        stored.response_headers = usage.response_headers.clone();
+                        if response_body_storage.has_detached_blob() {
+                            stored.response_body = usage.response_body.clone();
+                        }
+                        stored.client_response_headers = usage.client_response_headers.clone();
+                        if client_response_body_storage.has_detached_blob() {
+                            stored.client_response_body = usage.client_response_body.clone();
+                        }
+                        stored.request_body_ref = if clear_request_body {
+                            None
+                        } else {
+                            resolved_write_usage_body_ref(
+                                usage.request_body_ref.as_deref(),
+                                &usage.request_id,
+                                UsageBodyField::RequestBody,
+                                request_body_storage.has_detached_blob(),
+                                http_audit_refs.request_body_ref.as_deref(),
+                            )
+                        };
+                        stored.provider_request_body_ref = if clear_provider_request_body {
+                            None
+                        } else {
+                            resolved_write_usage_body_ref(
+                                usage.provider_request_body_ref.as_deref(),
+                                &usage.request_id,
+                                UsageBodyField::ProviderRequestBody,
+                                provider_request_body_storage.has_detached_blob(),
+                                http_audit_refs.provider_request_body_ref.as_deref(),
+                            )
+                        };
+                        stored.response_body_ref = if clear_response_body {
+                            None
+                        } else {
+                            resolved_write_usage_body_ref(
+                                usage.response_body_ref.as_deref(),
+                                &usage.request_id,
+                                UsageBodyField::ResponseBody,
+                                response_body_storage.has_detached_blob(),
+                                http_audit_refs.response_body_ref.as_deref(),
+                            )
+                        };
+                        stored.client_response_body_ref = if clear_client_response_body {
+                            None
+                        } else {
+                            resolved_write_usage_body_ref(
+                                usage.client_response_body_ref.as_deref(),
+                                &usage.request_id,
+                                UsageBodyField::ClientResponseBody,
+                                client_response_body_storage.has_detached_blob(),
+                                http_audit_refs.client_response_body_ref.as_deref(),
+                            )
+                        };
+                        stored.request_body_state =
+                            usage.request_body_state.or(stored.request_body_state);
+                        stored.provider_request_body_state = usage
+                            .provider_request_body_state
+                            .or(stored.provider_request_body_state);
+                        stored.response_body_state =
+                            usage.response_body_state.or(stored.response_body_state);
+                        stored.client_response_body_state = usage
+                            .client_response_body_state
+                            .or(stored.client_response_body_state);
+                        stored.request_metadata = request_metadata_value;
                     }
-                    stored.request_headers = usage.request_headers.clone();
-                    stored.provider_request_headers = usage.provider_request_headers.clone();
-                    if provider_request_body_storage.has_detached_blob() {
-                        stored.provider_request_body = usage.provider_request_body.clone();
-                    }
-                    stored.response_headers = usage.response_headers.clone();
-                    if response_body_storage.has_detached_blob() {
-                        stored.response_body = usage.response_body.clone();
-                    }
-                    stored.client_response_headers = usage.client_response_headers.clone();
-                    if client_response_body_storage.has_detached_blob() {
-                        stored.client_response_body = usage.client_response_body.clone();
-                    }
-                    stored.request_body_ref = resolved_write_usage_body_ref(
-                        usage.request_body_ref.as_deref(),
-                        &usage.request_id,
-                        UsageBodyField::RequestBody,
-                        request_body_storage.has_detached_blob(),
-                        http_audit_refs.request_body_ref.as_deref(),
-                    );
-                    stored.provider_request_body_ref = resolved_write_usage_body_ref(
-                        usage.provider_request_body_ref.as_deref(),
-                        &usage.request_id,
-                        UsageBodyField::ProviderRequestBody,
-                        provider_request_body_storage.has_detached_blob(),
-                        http_audit_refs.provider_request_body_ref.as_deref(),
-                    );
-                    stored.response_body_ref = resolved_write_usage_body_ref(
-                        usage.response_body_ref.as_deref(),
-                        &usage.request_id,
-                        UsageBodyField::ResponseBody,
-                        response_body_storage.has_detached_blob(),
-                        http_audit_refs.response_body_ref.as_deref(),
-                    );
-                    stored.client_response_body_ref = resolved_write_usage_body_ref(
-                        usage.client_response_body_ref.as_deref(),
-                        &usage.request_id,
-                        UsageBodyField::ClientResponseBody,
-                        client_response_body_storage.has_detached_blob(),
-                        http_audit_refs.client_response_body_ref.as_deref(),
-                    );
-                    stored.request_body_state =
-                        usage.request_body_state.or(stored.request_body_state);
-                    stored.provider_request_body_state = usage
-                        .provider_request_body_state
-                        .or(stored.provider_request_body_state);
-                    stored.response_body_state =
-                        usage.response_body_state.or(stored.response_body_state);
-                    stored.client_response_body_state = usage
-                        .client_response_body_state
-                        .or(stored.client_response_body_state);
-                    stored.candidate_id = routing_snapshot.candidate_id.clone();
-                    stored.candidate_index = routing_snapshot.candidate_index;
-                    stored.key_name = routing_snapshot.key_name.clone();
-                    stored.planner_kind = routing_snapshot.planner_kind.clone();
-                    stored.route_family = routing_snapshot.route_family.clone();
-                    stored.route_kind = routing_snapshot.route_kind.clone();
-                    stored.execution_path = routing_snapshot.execution_path.clone();
-                    stored.local_execution_runtime_miss_reason =
-                        routing_snapshot.local_execution_runtime_miss_reason.clone();
-                    stored.output_price_per_1m = settlement_pricing_snapshot.output_price_per_1m;
-                    stored.request_metadata = request_metadata_value;
 
                     let before_api_key_contribution =
                         previous_usage.as_ref().and_then(api_key_usage_contribution);
@@ -10669,6 +10541,112 @@ struct PreparedUsageUpsert {
     settlement_pricing_snapshot: UsageSettlementPricingSnapshot,
     request_metadata_value: Option<Value>,
     request_metadata_json: Option<String>,
+    replace_client_request_body_facts: bool,
+    replace_provider_request_body_facts: bool,
+    clear_request_body: bool,
+    clear_provider_request_body: bool,
+    clear_response_body: bool,
+    clear_client_response_body: bool,
+}
+
+fn request_body_capture_replaces_derived_facts(
+    request_body: Option<&Value>,
+    request_body_state: Option<UsageBodyCaptureState>,
+) -> bool {
+    // A typed capture state belongs to the incoming request snapshot. Metadata derived before a
+    // body was externalized, truncated, disabled, or found unavailable is authoritative when
+    // present; its absence must clear facts from an older candidate instead of falling through to
+    // PostgreSQL's sparse-upsert COALESCE behavior.
+    if request_body_state.is_some() {
+        return true;
+    }
+
+    let Some(request_body) = request_body else {
+        return false;
+    };
+
+    !request_body.as_object().is_some_and(|body| {
+        body.get("truncated").and_then(Value::as_bool) == Some(true)
+            && body.get("reason").and_then(Value::as_str) == Some("body_capture_limit_exceeded")
+    })
+}
+
+fn clear_previous_request_body_facts(
+    previous_metadata: Option<&Value>,
+    clear_client_request_body_facts: bool,
+    clear_provider_request_body_facts: bool,
+) -> Value {
+    let mut metadata = previous_metadata
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if clear_client_request_body_facts {
+        metadata.remove(REQUESTED_REASONING_EFFORT_METADATA_KEY);
+        metadata.remove("request_body_ref");
+    }
+    if clear_provider_request_body_facts {
+        metadata.remove(PROVIDER_REASONING_EFFORT_METADATA_KEY);
+        metadata.remove(PROVIDER_SERVICE_TIER_METADATA_KEY);
+        metadata.remove(PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY);
+        metadata.remove("provider_request_body_ref");
+    }
+    // Keep an explicit empty object as a tombstone. Binding SQL NULL here would make the upsert's
+    // COALESCE retain the previous candidate's request-derived facts.
+    Value::Object(metadata)
+}
+
+fn retain_previous_request_audit_metadata(
+    previous_metadata: Option<&Value>,
+    preserve_client_request_body_facts: bool,
+) -> Value {
+    let Some(previous_metadata) = previous_metadata.and_then(Value::as_object) else {
+        return Value::Object(Map::new());
+    };
+    let mut retained = Map::new();
+    for key in [
+        "trace_id",
+        "client_ip",
+        "user_agent",
+        "client_family",
+        "client_requested_stream",
+        "client_session_affinity",
+        "api_key_is_standalone",
+        "request_path",
+        "request_query_string",
+        "request_path_and_query",
+    ] {
+        if let Some(value) = previous_metadata.get(key) {
+            retained.insert(key.to_string(), value.clone());
+        }
+    }
+    if preserve_client_request_body_facts {
+        for key in [REQUESTED_REASONING_EFFORT_METADATA_KEY, "request_body_ref"] {
+            if let Some(value) = previous_metadata.get(key) {
+                retained.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    Value::Object(retained)
+}
+
+fn usage_capture_update_allowed(
+    previous_usage: Option<(&str, &str)>,
+    incoming_status: &str,
+) -> bool {
+    let Some((previous_status, previous_billing_status)) = previous_usage else {
+        return true;
+    };
+    if previous_billing_status != "pending" {
+        return false;
+    }
+
+    let previous_is_terminal = matches!(previous_status, "completed" | "failed" | "cancelled");
+    let incoming_is_non_terminal = matches!(incoming_status, "pending" | "streaming");
+    if previous_is_terminal && incoming_is_non_terminal {
+        return false;
+    }
+
+    !(previous_status == "streaming" && incoming_status == "pending")
 }
 
 fn prepare_usage_body_storage(value: Option<&Value>) -> Result<UsageBodyStorage, DataLayerError> {
@@ -10739,40 +10717,78 @@ fn json_bind_text(value: Option<&Value>) -> Result<Option<String>, DataLayerErro
 fn prepare_usage_upsert_context(
     usage: &UpsertUsageRecord,
 ) -> Result<PreparedUsageUpsert, DataLayerError> {
+    let replace_client_request_body_facts = request_body_capture_replaces_derived_facts(
+        usage.request_body.as_ref(),
+        usage.request_body_state,
+    );
+    let replace_provider_request_body_facts = request_body_capture_replaces_derived_facts(
+        usage.provider_request_body.as_ref(),
+        usage.provider_request_body_state,
+    );
+    let clear_request_body = usage.request_body_state == Some(UsageBodyCaptureState::None);
+    let clear_provider_request_body =
+        usage.provider_request_body_state == Some(UsageBodyCaptureState::None);
+    let clear_response_body = usage.response_body_state == Some(UsageBodyCaptureState::None);
+    let clear_client_response_body =
+        usage.client_response_body_state == Some(UsageBodyCaptureState::None);
+    // A typed `none` marker wins over residual values left on a reused event by an earlier
+    // candidate. Do not serialize those values or recreate their detached references.
+    let request_body = (!clear_request_body)
+        .then_some(usage.request_body.as_ref())
+        .flatten();
+    let provider_request_body = (!clear_provider_request_body)
+        .then_some(usage.provider_request_body.as_ref())
+        .flatten();
+    let response_body = (!clear_response_body)
+        .then_some(usage.response_body.as_ref())
+        .flatten();
+    let client_response_body = (!clear_client_response_body)
+        .then_some(usage.client_response_body.as_ref())
+        .flatten();
+    let request_body_ref = (!clear_request_body)
+        .then_some(usage.request_body_ref.as_deref())
+        .flatten();
+    let provider_request_body_ref = (!clear_provider_request_body)
+        .then_some(usage.provider_request_body_ref.as_deref())
+        .flatten();
+    let response_body_ref = (!clear_response_body)
+        .then_some(usage.response_body_ref.as_deref())
+        .flatten();
+    let client_response_body_ref = (!clear_client_response_body)
+        .then_some(usage.client_response_body_ref.as_deref())
+        .flatten();
     let request_headers_json = json_bind_text(usage.request_headers.as_ref())?;
-    let request_body_storage = prepare_usage_body_storage(usage.request_body.as_ref())?;
+    let request_body_storage = prepare_usage_body_storage(request_body)?;
     let provider_request_headers_json = json_bind_text(usage.provider_request_headers.as_ref())?;
-    let provider_request_body_storage =
-        prepare_usage_body_storage(usage.provider_request_body.as_ref())?;
+    let provider_request_body_storage = prepare_usage_body_storage(provider_request_body)?;
     let response_headers_json = json_bind_text(usage.response_headers.as_ref())?;
-    let response_body_storage = prepare_usage_body_storage(usage.response_body.as_ref())?;
+    let response_body_storage = prepare_usage_body_storage(response_body)?;
     let client_response_headers_json = json_bind_text(usage.client_response_headers.as_ref())?;
-    let client_response_body_storage =
-        prepare_usage_body_storage(usage.client_response_body.as_ref())?;
+    let client_response_body_storage = prepare_usage_body_storage(client_response_body)?;
     let http_audit_refs = UsageHttpAuditRefs {
         request_body_ref: resolved_write_usage_body_ref(
-            usage.request_body_ref.as_deref(),
+            request_body_ref,
             &usage.request_id,
             UsageBodyField::RequestBody,
             request_body_storage.has_detached_blob(),
             None,
         ),
         provider_request_body_ref: resolved_write_usage_body_ref(
-            usage.provider_request_body_ref.as_deref(),
+            provider_request_body_ref,
             &usage.request_id,
             UsageBodyField::ProviderRequestBody,
             provider_request_body_storage.has_detached_blob(),
             None,
         ),
         response_body_ref: resolved_write_usage_body_ref(
-            usage.response_body_ref.as_deref(),
+            response_body_ref,
             &usage.request_id,
             UsageBodyField::ResponseBody,
             response_body_storage.has_detached_blob(),
             None,
         ),
         client_response_body_ref: resolved_write_usage_body_ref(
-            usage.client_response_body_ref.as_deref(),
+            client_response_body_ref,
             &usage.request_id,
             UsageBodyField::ClientResponseBody,
             client_response_body_storage.has_detached_blob(),
@@ -10801,42 +10817,49 @@ fn prepare_usage_upsert_context(
             http_audit_refs.client_response_body_ref.as_deref(),
         ),
     };
-    let request_metadata_value = prepare_request_metadata_for_body_storage(
+    let mut request_metadata_value = prepare_request_metadata_for_body_storage(
         usage.request_metadata.clone(),
         [
             (
                 UsageBodyField::RequestBody,
                 &request_body_storage,
-                usage.request_body.as_ref(),
-                usage.request_body_ref.as_deref(),
+                request_body,
+                request_body_ref,
             ),
             (
                 UsageBodyField::ProviderRequestBody,
                 &provider_request_body_storage,
-                usage.provider_request_body.as_ref(),
-                usage.provider_request_body_ref.as_deref(),
+                provider_request_body,
+                provider_request_body_ref,
             ),
             (
                 UsageBodyField::ResponseBody,
                 &response_body_storage,
-                usage.response_body.as_ref(),
-                usage.response_body_ref.as_deref(),
+                response_body,
+                response_body_ref,
             ),
             (
                 UsageBodyField::ClientResponseBody,
                 &client_response_body_storage,
-                usage.client_response_body.as_ref(),
-                usage.client_response_body_ref.as_deref(),
+                client_response_body,
+                client_response_body_ref,
             ),
         ],
     );
+    if request_metadata_value.is_some() && (clear_request_body || clear_provider_request_body) {
+        request_metadata_value = Some(clear_previous_request_body_facts(
+            request_metadata_value.as_ref(),
+            clear_request_body,
+            clear_provider_request_body,
+        ));
+    }
     let http_audit_capture_mode = usage_http_audit_capture_mode(
         &http_audit_refs,
         [
-            usage.request_body.as_ref(),
-            usage.provider_request_body.as_ref(),
-            usage.response_body.as_ref(),
-            usage.client_response_body.as_ref(),
+            request_body,
+            provider_request_body,
+            response_body,
+            client_response_body,
         ],
     );
     let routing_snapshot =
@@ -10861,6 +10884,12 @@ fn prepare_usage_upsert_context(
         settlement_pricing_snapshot,
         request_metadata_value,
         request_metadata_json,
+        replace_client_request_body_facts,
+        replace_provider_request_body_facts,
+        clear_request_body,
+        clear_provider_request_body,
+        clear_response_body,
+        clear_client_response_body,
     })
 }
 
@@ -11328,9 +11357,12 @@ fn usage_total_input_context(
                 .saturating_add(cache_creation_tokens)
                 .saturating_add(cache_read_tokens),
         ),
-        "openai" | "gemini" | "google" => {
-            Some(effective_input_tokens.saturating_add(cache_read_tokens))
-        }
+        "openai" => Some(
+            effective_input_tokens
+                .saturating_add(cache_creation_tokens)
+                .saturating_add(cache_read_tokens),
+        ),
+        "gemini" | "google" => Some(effective_input_tokens.saturating_add(cache_read_tokens)),
         _ => Some(
             input_tokens
                 .saturating_add(cache_creation_tokens)
@@ -11693,11 +11725,20 @@ async fn sync_usage_body_blob_storage<'e, E>(
     field: UsageBodyField,
     value: Option<&Value>,
     storage: &UsageBodyStorage,
+    clear_existing: bool,
 ) -> Result<(), DataLayerError>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
     let body_ref = usage_body_ref(request_id, field);
+    if clear_existing {
+        sqlx::query(DELETE_USAGE_BODY_BLOB_SQL)
+            .bind(&body_ref)
+            .execute(executor)
+            .await
+            .map_postgres_err()?;
+        return Ok(());
+    }
     if let Some(payload_gzip) = storage.detached_blob_bytes.as_ref() {
         sqlx::query(UPSERT_USAGE_BODY_BLOB_SQL)
             .bind(&body_ref)
@@ -11774,11 +11815,12 @@ async fn sync_usage_routing_snapshot_storage<'e, E>(
     executor: E,
     request_id: &str,
     snapshot: &UsageRoutingSnapshot,
+    replace_existing: bool,
 ) -> Result<(), DataLayerError>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    if !snapshot.any_present() {
+    if !snapshot.any_present() && !replace_existing {
         return Ok(());
     }
 
@@ -11796,6 +11838,7 @@ where
         .bind(snapshot.selected_endpoint_id.as_deref())
         .bind(snapshot.selected_provider_api_key_id.as_deref())
         .bind(snapshot.has_format_conversion)
+        .bind(replace_existing)
         .execute(executor)
         .await
         .map_postgres_err()?;
@@ -11807,11 +11850,12 @@ async fn sync_usage_settlement_pricing_snapshot_storage<'e, E>(
     executor: E,
     request_id: &str,
     snapshot: &UsageSettlementPricingSnapshot,
+    replace_existing: bool,
 ) -> Result<(), DataLayerError>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    if !snapshot.any_present() {
+    if !snapshot.any_present() && !replace_existing {
         return Ok(());
     }
 
@@ -11845,6 +11889,7 @@ where
         .bind(snapshot.cache_creation_price_per_1m)
         .bind(snapshot.cache_read_price_per_1m)
         .bind(snapshot.price_per_request)
+        .bind(replace_existing)
         .execute(executor)
         .await
         .map_postgres_err()?;

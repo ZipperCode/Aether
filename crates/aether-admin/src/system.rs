@@ -1724,6 +1724,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "backup_s3_scope" => Some(json!("data")),
         "backup_s3_endpoint" => Some(serde_json::Value::Null),
         "backup_s3_region" => Some(json!("auto")),
+        "backup_s3_user_agent" => Some(json!("rclone/v1.68.0")),
         "backup_s3_bucket" => Some(serde_json::Value::Null),
         "backup_s3_prefix" => Some(json!("aether/backups/")),
         "backup_s3_access_key_id" => Some(serde_json::Value::Null),
@@ -1741,6 +1742,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "email_suffix_mode" => Some(json!("none")),
         "email_suffix_list" => Some(json!([])),
         "enable_format_conversion" => Some(json!(false)),
+        "cyber_continue_failover" => Some(json!(false)),
         "enable_model_directives" => Some(json!(false)),
         "model_directives" => Some(aether_ai_formats::default_model_directives_config()),
         "keep_priority_on_conversion" => Some(json!(false)),
@@ -2152,7 +2154,8 @@ pub fn parse_admin_system_config_update(
     }
 
     match normalized_key.as_str() {
-        "module.important_notification.enabled"
+        "cyber_continue_failover"
+        | "module.important_notification.enabled"
         | "module.important_notification.email_enabled"
         | "module.server_chan_push.enabled"
         | "module.bark_push.enabled" => match value.as_bool() {
@@ -3378,6 +3381,32 @@ mod tests {
             admin_system_config_default_value("backup_s3_path_style"),
             Some(json!(true))
         );
+        assert_eq!(
+            admin_system_config_default_value("backup_s3_user_agent"),
+            Some(json!("rclone/v1.68.0"))
+        );
+    }
+
+    #[test]
+    fn cyber_continue_failover_defaults_to_disabled() {
+        assert_eq!(
+            admin_system_config_default_value("cyber_continue_failover"),
+            Some(json!(false))
+        );
+    }
+
+    #[test]
+    fn cyber_continue_failover_update_requires_a_boolean() {
+        let update =
+            parse_admin_system_config_update("cyber_continue_failover", br#"{"value":true}"#)
+                .expect("boolean Cyber failover setting should parse");
+        assert_eq!(update.value, json!(true));
+
+        assert!(parse_admin_system_config_update(
+            "cyber_continue_failover",
+            br#"{"value":"true"}"#,
+        )
+        .is_err());
     }
 
     #[test]

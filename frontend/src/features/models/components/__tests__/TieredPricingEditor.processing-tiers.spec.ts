@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, defineComponent, h, nextTick, type App, type ComponentPublicInstance } from 'vue'
+import {
+  createApp,
+  defineComponent,
+  h,
+  nextTick,
+  shallowRef,
+  type App,
+  type ComponentPublicInstance,
+} from 'vue'
 
 import type { TieredPricingConfig } from '@/api/endpoints/types'
 import TieredPricingEditor from '../TieredPricingEditor.vue'
@@ -14,15 +22,20 @@ const mountedApps: Array<{ app: App, root: HTMLElement }> = []
 function mountEditor(
   modelValue: TieredPricingConfig,
   options: {
+    autoFillMissingCachePrices?: boolean
     showCache1h?: boolean
     showImagePricing?: boolean
     showTokenPricing?: boolean
     showImageEditor?: boolean
+    showProcessingTierControls?: boolean
+    showProcessingTierMultiplierControls?: boolean
   } = {},
 ) {
   const root = document.createElement('div')
   document.body.appendChild(root)
   const onUpdate = vi.fn()
+  const currentModelValue = shallowRef(modelValue)
+  const showProcessingTierControls = shallowRef(options.showProcessingTierControls)
   let editor: TieredPricingEditorExposed | null = null
 
   const app = createApp(defineComponent({
@@ -31,11 +44,14 @@ function mountEditor(
         ref: (instance: unknown) => {
           editor = instance as TieredPricingEditorExposed | null
         },
-        modelValue,
+        modelValue: currentModelValue.value,
+        autoFillMissingCachePrices: options.autoFillMissingCachePrices,
         showCache1h: options.showCache1h,
         showImagePricing: options.showImagePricing,
         showTokenPricing: options.showTokenPricing,
         showImageEditor: options.showImageEditor,
+        showProcessingTierControls: showProcessingTierControls.value,
+        showProcessingTierMultiplierControls: options.showProcessingTierMultiplierControls,
         'onUpdate:modelValue': onUpdate,
       })
     },
@@ -47,6 +63,12 @@ function mountEditor(
   return {
     root,
     onUpdate,
+    setModelValue: (value: TieredPricingConfig) => {
+      currentModelValue.value = value
+    },
+    setShowProcessingTierControls: (value: boolean) => {
+      showProcessingTierControls.value = value
+    },
     getFinalPricing: () => {
       if (!editor) throw new Error('TieredPricingEditor ref was not mounted')
       return editor.getFinalPricing()
@@ -73,6 +95,288 @@ afterEach(() => {
 })
 
 describe('TieredPricingEditor processing tiers', () => {
+  it('hides processing-tier controls while editing Standard and preserving overlays', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+      processing_tiers: {
+        priority: {
+          price_multiplier: 999,
+          tiers: [{ up_to: null, input_price_per_1m: 10, output_price_per_1m: 60 }],
+          future_overlay_option: 'keep-hidden-overlay',
+        },
+      },
+    } as TieredPricingConfig
+    const {
+      root,
+      onUpdate,
+      getFinalPricing,
+      setShowProcessingTierControls,
+    } = mountEditor(pricing)
+
+    click(root.querySelector('[data-processing-tier="priority"]'))
+    await nextTick()
+    expect(root.querySelector<HTMLInputElement>('[data-testid="tier-input-price"]')?.value)
+      .toBe('10')
+
+    setShowProcessingTierControls(false)
+    await nextTick()
+
+    expect(root.querySelector('[data-processing-tier]')).toBeNull()
+    expect(root.textContent).not.toContain('处理层级')
+
+    const input = root.querySelector('[data-testid="tier-input-price"]') as HTMLInputElement | null
+    if (!input) throw new Error('Expected the Standard input-price control')
+    input.value = '7.5'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    const emitted = onUpdate.mock.lastCall?.[0] as TieredPricingConfig
+    expect(emitted.tiers[0].input_price_per_1m).toBe(7.5)
+    expect(emitted.processing_tiers).toEqual(pricing.processing_tiers)
+    expect(getFinalPricing().processing_tiers).toEqual(pricing.processing_tiers)
+  })
+
+  it('edits compact processing-tier multipliers without writing a Standard overlay', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+    } as TieredPricingConfig
+    const { root, getFinalPricing, getValidationError } = mountEditor(pricing, {
+      showProcessingTierControls: false,
+      showProcessingTierMultiplierControls: true,
+    })
+
+    expect(root.querySelector('[data-testid="processing-tier-group-fast"]')?.textContent)
+      .toBe('Fast')
+    expect(root.querySelector('[data-processing-tier-group="fast"]')?.textContent)
+      .toContain('OpenAI')
+    expect(root.querySelector('[data-processing-tier-group="fast"]')?.textContent)
+      .toContain('Chat / Responses')
+    expect(root.querySelector('[data-processing-tier-group="fast"]')?.textContent)
+      .toContain('Claude')
+    expect(root.querySelector('[data-processing-tier-group="fast"]')?.textContent)
+      .toContain('Messages')
+
+    const priorityToggle = root.querySelector(
+      'input[aria-label="启用 Fast · OpenAI · Chat / Responses 层级倍率"]',
+    ) as HTMLInputElement
+    priorityToggle.click()
+    await nextTick()
+
+    expect(getValidationError()).toContain('请输入层级倍率')
+    expect(() => getFinalPricing()).toThrow('请输入层级倍率')
+    const multiplier = root.querySelector(
+      '[data-testid="processing-tier-multiplier-priority"]',
+    ) as HTMLInputElement
+    multiplier.value = '2.5'
+    multiplier.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    expect(getValidationError()).toBeNull()
+    expect(getFinalPricing().processing_tiers).toEqual({
+      priority: { price_multiplier: 2.5 },
+    })
+    expect(getFinalPricing().processing_tiers).not.toHaveProperty('standard')
+
+    priorityToggle.click()
+    await nextTick()
+    expect(getFinalPricing()).not.toHaveProperty('processing_tiers')
+  })
+
+  it('keeps the grouped Claude Fast option mapped to the internal fast key', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+    } as TieredPricingConfig
+    const { root, getFinalPricing } = mountEditor(pricing, {
+      showProcessingTierControls: false,
+      showProcessingTierMultiplierControls: true,
+    })
+    const fastToggle = root.querySelector(
+      'input[aria-label="启用 Fast · Claude · Messages 层级倍率"]',
+    ) as HTMLInputElement
+
+    fastToggle.click()
+    await nextTick()
+    const multiplier = root.querySelector(
+      '[data-testid="processing-tier-multiplier-fast"]',
+    ) as HTMLInputElement
+    multiplier.value = '2'
+    multiplier.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    expect(getFinalPricing().processing_tiers).toEqual({
+      fast: { price_multiplier: 2 },
+    })
+  })
+
+  it('requires an enabled processing-tier multiplier instead of clearing the saved value', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+      processing_tiers: { priority: { price_multiplier: 2.5 } },
+    } as TieredPricingConfig
+    const { root, onUpdate, getFinalPricing, getValidationError } = mountEditor(pricing, {
+      showProcessingTierControls: false,
+      showProcessingTierMultiplierControls: true,
+    })
+    const multiplier = root.querySelector(
+      '[data-testid="processing-tier-multiplier-priority"]',
+    ) as HTMLInputElement
+
+    multiplier.value = ''
+    multiplier.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    expect(getValidationError()).toContain('请输入层级倍率')
+    expect(() => getFinalPricing()).toThrow('请输入层级倍率')
+    expect(onUpdate).not.toHaveBeenCalled()
+  })
+
+  it('preserves a custom catalog until the user explicitly replaces it with a multiplier', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+      processing_tiers: {
+        priority: {
+          tiers: [{ up_to: null, input_price_per_1m: 10, output_price_per_1m: 60 }],
+          future_overlay_option: 'replace-with-catalog',
+        },
+        hyperlane: {
+          tiers: [{ up_to: null, input_price_per_1m: 7, output_price_per_1m: 42 }],
+          future_overlay_option: 'keep-unknown',
+        },
+      },
+    } as TieredPricingConfig
+    const { root, onUpdate, getFinalPricing, getValidationError } = mountEditor(pricing, {
+      showProcessingTierControls: false,
+      showProcessingTierMultiplierControls: true,
+    })
+
+    expect(root.textContent).toContain('自定义价格')
+    expect(getFinalPricing().processing_tiers).toEqual(pricing.processing_tiers)
+
+    click(root.querySelector('[data-testid="processing-tier-convert-priority"]'))
+    await nextTick()
+    expect(getValidationError()).toContain('请输入层级倍率')
+    expect(onUpdate).not.toHaveBeenCalled()
+    expect(() => getFinalPricing()).toThrow('请输入层级倍率')
+    const multiplier = root.querySelector(
+      '[data-testid="processing-tier-multiplier-priority"]',
+    ) as HTMLInputElement
+    multiplier.value = '2'
+    multiplier.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    expect(getFinalPricing().processing_tiers).toEqual({
+      priority: { price_multiplier: 2 },
+      hyperlane: pricing.processing_tiers?.hyperlane,
+    })
+  })
+
+  it('validates compact multipliers as finite non-negative numbers', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+      processing_tiers: { flex: { price_multiplier: 0.5 } },
+    } as TieredPricingConfig
+    const { root, getValidationError } = mountEditor(pricing, {
+      showProcessingTierControls: false,
+      showProcessingTierMultiplierControls: true,
+    })
+    const multiplier = root.querySelector(
+      '[data-testid="processing-tier-multiplier-flex"]',
+    ) as HTMLInputElement
+    expect(multiplier.value).toBe('0.5')
+
+    multiplier.value = '-1'
+    multiplier.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    expect(getValidationError()).toContain('必须是非负有限数值')
+  })
+
+  it('requires a full-editor multiplier before persisting the new tier', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+    } as TieredPricingConfig
+    const { root, getFinalPricing, getValidationError } = mountEditor(pricing, {
+      autoFillMissingCachePrices: false,
+      showProcessingTierMultiplierControls: true,
+    })
+
+    click(root.querySelector('[data-processing-tier="priority"]'))
+    await nextTick()
+    click(root.querySelector('[data-testid="processing-tier-add-multiplier"]'))
+    await nextTick()
+
+    const multiplier = root.querySelector(
+      '[data-testid="processing-tier-multiplier-input"]',
+    ) as HTMLInputElement
+    expect(getValidationError()).toContain('请输入层级倍率')
+    expect(() => getFinalPricing()).toThrow('请输入层级倍率')
+
+    multiplier.value = '-1'
+    multiplier.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    expect(getValidationError()).toContain('必须是非负有限数值')
+
+    multiplier.value = ''
+    multiplier.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    expect(getValidationError()).toContain('请输入层级倍率')
+    expect(() => getFinalPricing()).toThrow('请输入层级倍率')
+  })
+
+  it('restores an explicit catalog when an incomplete multiplier conversion is cancelled', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+      processing_tiers: {
+        priority: {
+          tiers: [{ up_to: null, input_price_per_1m: 11, output_price_per_1m: 66 }],
+          future_overlay_option: 'keep-on-cancel',
+        },
+      },
+    } as TieredPricingConfig
+    const { root, getFinalPricing, getValidationError } = mountEditor(pricing, {
+      autoFillMissingCachePrices: false,
+      showProcessingTierMultiplierControls: true,
+    })
+
+    click(root.querySelector('[data-testid="processing-tier-convert-priority"]'))
+    click(root.querySelector('[data-processing-tier="priority"]'))
+    await nextTick()
+    expect(getValidationError()).toContain('请输入层级倍率')
+
+    click(root.querySelector('[data-testid="processing-tier-use-custom"]'))
+    await nextTick()
+
+    expect(getValidationError()).toBeNull()
+    expect(getFinalPricing().processing_tiers?.priority).toEqual(
+      pricing.processing_tiers?.priority,
+    )
+  })
+
+  it('lets the full Provider editor edit a multiplier or replace it with explicit prices', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+      processing_tiers: { priority: { price_multiplier: 2.5 } },
+    } as TieredPricingConfig
+    const { root, getFinalPricing } = mountEditor(pricing)
+
+    click(root.querySelector('[data-processing-tier="priority"]'))
+    await nextTick()
+    const multiplier = root.querySelector(
+      '[data-testid="processing-tier-multiplier-input"]',
+    ) as HTMLInputElement
+    expect(multiplier.value).toBe('2.5')
+    multiplier.value = '3'
+    multiplier.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    expect(getFinalPricing().processing_tiers?.priority).toEqual({ price_multiplier: 3 })
+
+    click(root.querySelector('[data-testid="processing-tier-use-custom"]'))
+    await nextTick()
+    expect(getFinalPricing().processing_tiers?.priority).toMatchObject({
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+    })
+    expect(getFinalPricing().processing_tiers?.priority).not.toHaveProperty('price_multiplier')
+  })
+
   it('round-trips root, overlay and pricing-tier extension fields', () => {
     const pricing = {
       tiers: [{
@@ -126,9 +430,11 @@ describe('TieredPricingEditor processing tiers', () => {
     } as TieredPricingConfig
     const { root, onUpdate } = mountEditor(pricing)
 
-    expect(root.querySelectorAll('[data-processing-tier]')).toHaveLength(5)
+    expect(root.querySelectorAll('[data-processing-tier]')).toHaveLength(6)
     expect(root.textContent).toContain('Standard')
-    expect(root.textContent).toContain('Priority')
+    expect(root.textContent).toContain('Fast（OpenAI）')
+    expect(root.textContent).toContain('Fast（Claude）')
+    expect(root.textContent).not.toContain('Priority')
     expect(root.textContent).toContain('Flex')
     expect(root.textContent).toContain('Batch')
     expect(root.textContent).toContain('hyperlane')
@@ -269,7 +575,7 @@ describe('TieredPricingEditor processing tiers', () => {
     click(root.querySelector('[data-processing-tier="priority"]'))
     await nextTick()
     const multiplier = root.querySelector(
-      'input[aria-label="Priority 阶梯 1 缓存创建倍率"]',
+      'input[aria-label="Fast（OpenAI） 阶梯 1 缓存创建倍率"]',
     ) as HTMLInputElement
     multiplier.value = '2'
     multiplier.dispatchEvent(new Event('input', { bubbles: true }))
@@ -278,6 +584,148 @@ describe('TieredPricingEditor processing tiers', () => {
     const result = getFinalPricing()
     expect(result.tiers[0].cache_creation_price_per_1m).toBe(6.25)
     expect(result.processing_tiers?.priority.tiers?.[0].cache_creation_price_per_1m).toBe(20)
+  })
+
+  it('keeps absent cache prices empty and absent when automatic cache filling is disabled', () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+    } as TieredPricingConfig
+    const { root, getFinalPricing } = mountEditor(pricing, {
+      autoFillMissingCachePrices: false,
+    })
+
+    const creation = root.querySelector(
+      'input[aria-label="Standard 阶梯 1 缓存创建倍率"]',
+    ) as HTMLInputElement
+    const read = root.querySelector(
+      'input[aria-label="Standard 阶梯 1 缓存读取倍率"]',
+    ) as HTMLInputElement
+
+    expect(creation.value).toBe('')
+    expect(read.value).toBe('')
+    expect(getFinalPricing().tiers).toEqual([
+      { up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 },
+    ])
+  })
+
+  it('preserves only the explicitly supplied side of cache pricing when automatic filling is disabled', () => {
+    const pricing = {
+      tiers: [
+        {
+          up_to: 128_000,
+          input_price_per_1m: 5,
+          output_price_per_1m: 30,
+          cache_creation_price_per_1m: 6.25,
+        },
+        {
+          up_to: null,
+          input_price_per_1m: 7,
+          output_price_per_1m: 42,
+          cache_read_price_per_1m: 0.7,
+        },
+      ],
+    } as TieredPricingConfig
+    const { root, getFinalPricing } = mountEditor(pricing, {
+      autoFillMissingCachePrices: false,
+    })
+
+    const creationValues = [...root.querySelectorAll<HTMLInputElement>(
+      'input[aria-label*="缓存创建倍率"]',
+    )].map(input => input.value)
+    const readValues = [...root.querySelectorAll<HTMLInputElement>(
+      'input[aria-label*="缓存读取倍率"]',
+    )].map(input => input.value)
+
+    expect(creationValues).toEqual(['1.25', ''])
+    expect(readValues).toEqual(['', '0.1'])
+    expect(getFinalPricing().tiers).toEqual(pricing.tiers)
+  })
+
+  it('adds and removes only the cache price edited by the user when automatic filling is disabled', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+    } as TieredPricingConfig
+    const { root, getFinalPricing } = mountEditor(pricing, {
+      autoFillMissingCachePrices: false,
+    })
+    const read = root.querySelector(
+      'input[aria-label="Standard 阶梯 1 缓存读取倍率"]',
+    ) as HTMLInputElement
+
+    read.value = '0.2'
+    read.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    expect(getFinalPricing().tiers).toEqual([{
+      up_to: null,
+      input_price_per_1m: 5,
+      output_price_per_1m: 30,
+      cache_read_price_per_1m: 1,
+    }])
+
+    read.value = ''
+    read.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    expect(getFinalPricing().tiers).toEqual([{
+      up_to: null,
+      input_price_per_1m: 5,
+      output_price_per_1m: 30,
+    }])
+  })
+
+  it('does not turn absent cache prices into zero when switching editor modes', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+    } as TieredPricingConfig
+    const { root, getFinalPricing } = mountEditor(pricing, {
+      autoFillMissingCachePrices: false,
+    })
+
+    click(root.querySelector(
+      'button[aria-label="Standard 阶梯 1 切换缓存价格输入方式"]',
+    ))
+    await nextTick()
+
+    expect((root.querySelector(
+      'input[aria-label="Standard 阶梯 1 缓存创建价格"]',
+    ) as HTMLInputElement).value).toBe('')
+    expect((root.querySelector(
+      'input[aria-label="Standard 阶梯 1 缓存读取价格"]',
+    ) as HTMLInputElement).value).toBe('')
+    expect(getFinalPricing().tiers).toEqual(pricing.tiers)
+  })
+
+  it('rebuilds when an external model later matches an older emitted value', async () => {
+    const pricing = {
+      tiers: [{ up_to: null, input_price_per_1m: 5, output_price_per_1m: 30 }],
+    } as TieredPricingConfig
+    const { root, onUpdate, setModelValue } = mountEditor(pricing, {
+      autoFillMissingCachePrices: false,
+    })
+    const read = root.querySelector(
+      'input[aria-label="Standard 阶梯 1 缓存读取倍率"]',
+    ) as HTMLInputElement
+
+    read.value = '0.2'
+    read.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    const olderEmittedValue = onUpdate.mock.lastCall?.[0] as TieredPricingConfig
+
+    setModelValue({
+      tiers: [{ up_to: null, input_price_per_1m: 7, output_price_per_1m: 42 }],
+    })
+    await nextTick()
+    expect((root.querySelector('[data-testid="tier-input-price"]') as HTMLInputElement).value)
+      .toBe('7')
+
+    setModelValue(olderEmittedValue)
+    await nextTick()
+    expect((root.querySelector('[data-testid="tier-input-price"]') as HTMLInputElement).value)
+      .toBe('5')
+    expect((root.querySelector(
+      'input[aria-label="Standard 阶梯 1 缓存读取倍率"]',
+    ) as HTMLInputElement).value).toBe('0.2')
   })
 
   it('keeps processing image catalogs editable when token controls are hidden', async () => {
@@ -297,7 +745,8 @@ describe('TieredPricingEditor processing tiers', () => {
     await nextTick()
 
     expect(root.querySelector('[data-testid="tier-input-price"]')).toBeNull()
-    expect(root.querySelector('input[aria-label="Priority 图像输出默认价格"]')).not.toBeNull()
+    expect(root.querySelector('input[aria-label="Fast（OpenAI） 图像输出默认价格"]'))
+      .not.toBeNull()
   })
 
   it('accepts a finite terminal tier for any processing overlay', () => {
@@ -344,7 +793,7 @@ describe('TieredPricingEditor processing tiers', () => {
     await nextTick()
 
     const terminal = root.querySelector(
-      'select[aria-label="Priority 阶梯 1 上限"]',
+      'select[aria-label="Fast（OpenAI） 阶梯 1 上限"]',
     ) as HTMLSelectElement
     expect(terminal.value).toBe('272000')
 
@@ -379,7 +828,7 @@ describe('TieredPricingEditor processing tiers', () => {
     expect(getFinalPricing().processing_tiers?.priority.tiers?.map(tier => tier.up_to))
       .toEqual([272000, null])
 
-    click(root.querySelector('button[aria-label="删除 Priority 阶梯 2"]'))
+    click(root.querySelector('button[aria-label="删除 Fast（OpenAI） 阶梯 2"]'))
     await nextTick()
     expect(getFinalPricing().processing_tiers?.priority.tiers?.map(tier => tier.up_to))
       .toEqual([272000])
@@ -494,7 +943,7 @@ describe('TieredPricingEditor processing tiers', () => {
     await nextTick()
 
     const priorityDefault = root.querySelector(
-      'input[aria-label="Priority 图像输出默认价格"]',
+      'input[aria-label="Fast（OpenAI） 图像输出默认价格"]',
     ) as HTMLInputElement
     const priorityHigh = root.querySelector(
       'input[aria-label="1024x1024 high 图像输出价格"]',
@@ -598,9 +1047,9 @@ describe('TieredPricingEditor processing tiers', () => {
     await nextTick()
 
     expect(onUpdate).not.toHaveBeenCalled()
-    expect(getValidationError()).toContain('Priority')
+    expect(getValidationError()).toContain('Fast（OpenAI）')
     expect(getValidationError()).toContain('上限必须大于前一个阶梯')
-    expect(() => getFinalPricing()).toThrow('Priority')
+    expect(() => getFinalPricing()).toThrow('Fast（OpenAI）')
   })
 
   it('rejects negative known prices before they reach the billing contract', () => {
