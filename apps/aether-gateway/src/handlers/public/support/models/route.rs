@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -172,22 +172,99 @@ fn codex_catalog_card_candidates(row: &StoredModelCatalogEntry) -> Vec<Value> {
     .collect()
 }
 
-async fn load_codex_model_cards(_state: &AppState, rows: &[StoredModelCatalogEntry]) -> Vec<Value> {
+async fn load_codex_model_cards(state: &AppState, rows: &[StoredModelCatalogEntry]) -> Vec<Value> {
+    let visible_models = rows
+        .iter()
+        .filter(|row| is_codex_provider_row(row))
+        .map(|row| (row.provider_id.clone(), row.global_model_name.clone()))
+        .collect::<BTreeSet<_>>();
+    let candidate_rows = await_models_route_read(
+        "codex_models_candidates",
+        state.list_minimal_candidate_selection_rows_for_api_format("openai:responses"),
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|row| {
+        row.provider_type.trim().eq_ignore_ascii_case("codex")
+            && visible_models.contains(&(row.provider_id.clone(), row.global_model_name.clone()))
+    })
+    .collect::<Vec<_>>();
+    let cache_keys = candidate_rows
+        .iter()
+        .map(|row| format!("upstream_models:{}:{}", row.provider_id, row.key_id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let cached_values = await_models_route_read(
+        "codex_models_cache",
+        state.runtime_state.kv_get_many(&cache_keys),
+    )
+    .await
+    .unwrap_or_default();
+    let cached_models_by_key = cache_keys
+        .into_iter()
+        .zip(cached_values)
+        .filter_map(|(key, raw)| {
+            let models = serde_json::from_str::<Vec<Value>>(raw.as_deref()?).ok()?;
+            Some((key, models))
+        })
+        .collect::<BTreeMap<_, _>>();
+
     let mut seen_global_models = BTreeSet::new();
     let mut cards = Vec::new();
     for row in rows.iter().filter(|row| is_codex_provider_row(row)) {
         if seen_global_models.contains(&row.global_model_name) {
             continue;
         }
-        let cached_models = codex_catalog_card_candidates(row);
-        let source_model = row.provider_model_name.as_str();
-        let Some(card) =
-            project_codex_model_card(&cached_models, source_model, row.global_model_name.as_str())
-        else {
+
+        // Codex 卡片来自具体 Key 的上游缓存；静态 catalog 配置只作为显式兜底来源。
+        for candidate in candidate_rows.iter().filter(|candidate| {
+            candidate.provider_id == row.provider_id
+                && candidate.global_model_name == row.global_model_name
+        }) {
+            let Some((source_model, _)) =
+                aether_scheduler_core::resolve_provider_model_name_with_model_directives_and_request_operation(
+                    candidate,
+                    row.global_model_name.as_str(),
+                    "openai:responses",
+                    false,
+                    None,
+                )
+            else {
+                continue;
+            };
+            let cache_key = format!(
+                "upstream_models:{}:{}",
+                candidate.provider_id, candidate.key_id
+            );
+            let Some(cached_models) = cached_models_by_key.get(&cache_key) else {
+                continue;
+            };
+            let Some(card) = project_codex_model_card(
+                cached_models,
+                source_model.as_str(),
+                row.global_model_name.as_str(),
+            ) else {
+                continue;
+            };
+            seen_global_models.insert(row.global_model_name.clone());
+            cards.push(card);
+            break;
+        }
+        if seen_global_models.contains(&row.global_model_name) {
             continue;
-        };
-        seen_global_models.insert(row.global_model_name.clone());
-        cards.push(card);
+        }
+
+        let catalog_models = codex_catalog_card_candidates(row);
+        if let Some(card) = project_codex_model_card(
+            &catalog_models,
+            row.provider_model_name.as_str(),
+            row.global_model_name.as_str(),
+        ) {
+            seen_global_models.insert(row.global_model_name.clone());
+            cards.push(card);
+        }
     }
     cards
 }

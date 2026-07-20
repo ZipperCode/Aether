@@ -108,6 +108,18 @@ fn sample_codex_models_candidate_row(
     row
 }
 
+fn sample_codex_model_catalog_entry(
+    provider_id: &str,
+    global_model_name: &str,
+    source_model_name: &str,
+) -> StoredModelCatalogEntry {
+    let mut row =
+        sample_model_catalog_entry(provider_id, "codex", "openai:responses", global_model_name);
+    row.provider_type = "codex".to_string();
+    row.provider_model_name = source_model_name.to_string();
+    row
+}
+
 fn complete_codex_model_card(source_model_name: &str) -> serde_json::Value {
     json!({
         "id": source_model_name,
@@ -447,6 +459,20 @@ async fn gateway_serves_codex_model_cards_for_versioned_models_requests() {
                 20,
             ),
         ]));
+    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
+        sample_codex_model_catalog_entry("provider-codex-models", "frontier-sol", "gpt-5.6-sol"),
+        sample_codex_model_catalog_entry(
+            "provider-codex-incomplete",
+            "broken-luna",
+            "gpt-5.6-luna",
+        ),
+        sample_model_catalog_entry(
+            "provider-openai-responses",
+            "openai",
+            "openai:responses",
+            "custom-responses-model",
+        ),
+    ]));
     let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![
         (
             Some(hash_api_key("sk-codex-models")),
@@ -463,7 +489,8 @@ async fn gateway_serves_codex_model_cards_for_versioned_models_requests() {
             crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
                 candidate_repository,
                 auth_repository,
-            ),
+            )
+            .with_model_catalog_reader(model_catalog_repository),
         );
     state
         .runtime_kv_setex(
