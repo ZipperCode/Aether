@@ -271,7 +271,7 @@ fn gateway_stage_metric_samples_for_enabled(enabled: bool) -> Vec<MetricSample> 
     let mut samples: Vec<MetricSample> = if enabled {
         METRICS.iter().flat_map(StageMetric::samples).collect()
     } else {
-        Vec::with_capacity(10)
+        Vec::with_capacity(14)
     };
     samples.push(MetricSample::new(
         "gateway_stage_metrics_enabled",
@@ -631,7 +631,7 @@ mod tests {
         let samples = gateway_stage_metric_samples_for_enabled(false);
         let names = samples.iter().map(|sample| sample.name).collect::<Vec<_>>();
 
-        assert_eq!(samples.len(), 10);
+        assert_eq!(samples.len(), 14);
         assert!(!names
             .iter()
             .any(|name| name.starts_with("gateway_stage_latency_")));
@@ -648,6 +648,10 @@ mod tests {
             "openai_chat_model_directive_cache_miss_total",
             "chat_pii_redaction_request_cache_hit_total",
             "chat_pii_redaction_request_cache_miss_total",
+            "model_mapping_compile_cache_hit_total",
+            "model_mapping_compile_cache_miss_total",
+            "model_mapping_compile_cache_eviction_total",
+            "model_mapping_rule_compile_total",
         ] {
             assert!(names.contains(&counter), "missing full counter {counter}");
         }
