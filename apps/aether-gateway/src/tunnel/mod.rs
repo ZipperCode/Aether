@@ -78,6 +78,8 @@ pub(crate) async fn send_owner_forward_request(
 #[derive(Debug, Deserialize)]
 struct InternalTunnelHeartbeatRequest {
     node_id: String,
+    #[serde(default)]
+    heartbeat_session_id: Option<String>,
     heartbeat_id: u64,
     #[serde(default)]
     heartbeat_interval: Option<i32>,
@@ -1069,6 +1071,11 @@ async fn apply_embedded_tunnel_heartbeat(
 ) -> Result<Vec<u8>, String> {
     let payload = parse_embedded_tunnel_heartbeat_request(request_body)?;
     let node_id = payload.node_id.trim().to_string();
+    let proxy_metadata = attach_embedded_heartbeat_cursor(
+        payload.proxy_metadata,
+        payload.heartbeat_session_id.as_deref(),
+        payload.heartbeat_id,
+    );
     let mutation = ProxyNodeHeartbeatMutation {
         node_id: node_id.clone(),
         heartbeat_interval: payload.heartbeat_interval,
@@ -1078,7 +1085,7 @@ async fn apply_embedded_tunnel_heartbeat(
         failed_requests_delta: payload.window_failed_requests.or(payload.failed_requests),
         dns_failures_delta: payload.window_dns_failures.or(payload.dns_failures),
         stream_errors_delta: payload.window_stream_errors.or(payload.stream_errors),
-        proxy_metadata: payload.proxy_metadata,
+        proxy_metadata,
         proxy_version: payload.proxy_version,
     };
 
@@ -1092,6 +1099,26 @@ async fn apply_embedded_tunnel_heartbeat(
         &node,
         payload.heartbeat_id,
     ))
+}
+
+/// 为内嵌 tunnel 心跳补充进程游标，确保其与独立 tunnel 使用相同的去重语义。
+fn attach_embedded_heartbeat_cursor(
+    proxy_metadata: Option<serde_json::Value>,
+    heartbeat_session_id: Option<&str>,
+    heartbeat_id: u64,
+) -> Option<serde_json::Value> {
+    let Some(heartbeat_session_id) = heartbeat_session_id.map(str::trim) else {
+        return proxy_metadata;
+    };
+    let mut metadata = proxy_metadata
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    metadata.insert(
+        "heartbeat_session_id".to_string(),
+        serde_json::Value::String(heartbeat_session_id.to_string()),
+    );
+    metadata.insert("heartbeat_id".to_string(), heartbeat_id.into());
+    Some(serde_json::Value::Object(metadata))
 }
 
 async fn apply_embedded_tunnel_node_status(
@@ -1142,7 +1169,17 @@ fn parse_embedded_tunnel_heartbeat_request(
         .map_err(|_| "invalid heartbeat payload".to_string())?;
 
     let node_id = payload.node_id.trim();
-    if node_id.is_empty() || node_id.len() > 36 || payload.heartbeat_id == 0 {
+    let heartbeat_session_id = payload
+        .heartbeat_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if node_id.is_empty()
+        || node_id.len() > 36
+        || payload.heartbeat_id == 0
+        || payload.heartbeat_session_id.is_some() && heartbeat_session_id.is_none()
+        || heartbeat_session_id.is_some_and(|value| value.len() > 128)
+    {
         return Err("invalid heartbeat payload".to_string());
     }
     if payload

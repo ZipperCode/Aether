@@ -73,6 +73,7 @@ struct ZhipuQuotaResponse {
 
 #[derive(Debug, Deserialize)]
 struct ZhipuQuotaData {
+    level: Option<String>,
     limits: Vec<ZhipuQuotaLimit>,
 }
 
@@ -85,7 +86,11 @@ struct ZhipuQuotaLimit {
     usage: Option<DecimalInput>,
     percentage: Option<DecimalInput>,
     #[serde(rename = "resetAt")]
-    reset_at: Option<String>,
+    reset_at: Option<Value>,
+    unit: Option<Value>,
+    number: Option<Value>,
+    #[serde(rename = "nextResetTime")]
+    next_reset_time: Option<Value>,
 }
 
 pub(super) fn parse_kimi_coding_subscription(
@@ -137,9 +142,22 @@ pub(super) fn parse_kimi_coding_subscription(
 
 pub(super) fn parse_zhipu_subscription(
     value: &Value,
-) -> Result<Vec<ProviderQuotaWindow>, &'static str> {
+) -> Result<ParsedOfficialSubscription, &'static str> {
     let response: ZhipuQuotaResponse =
         serde_json::from_value(value.clone()).map_err(|_| "invalid quota response")?;
+    let mut extensions = Map::new();
+    if let Some(level) = response
+        .data
+        .level
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        extensions.insert(
+            "plan_type".into(),
+            Value::String(level.to_ascii_lowercase()),
+        );
+        extensions.insert("pool_tier".into(), Value::String(level));
+    }
     if response.success == Some(false) {
         return Err("upstream quota response was unsuccessful");
     }
@@ -152,7 +170,10 @@ pub(super) fn parse_zhipu_subscription(
     if windows.is_empty() {
         return Err("no valid quota limits");
     }
-    Ok(windows)
+    Ok(ParsedOfficialSubscription {
+        windows,
+        extensions,
+    })
 }
 
 fn kimi_window(
@@ -207,13 +228,31 @@ fn zhipu_window(limit: ZhipuQuotaLimit) -> Option<ProviderQuotaWindow> {
         .and_then(DecimalInput::finite_number)
         .filter(|percentage| *percentage >= 0.0)
         .map(|percentage| percentage / 100.0);
+    let unit = zhipu_u64(limit.unit.as_ref());
+    let number = zhipu_u64(limit.number.as_ref());
+    let (code, label, window_minutes) = match (limit_type.as_str(), unit, number) {
+        ("TOKENS_LIMIT", Some(3), Some(5)) => (
+            "tokens_5h".to_string(),
+            "5小时 Token 配额".to_string(),
+            Some(300),
+        ),
+        ("TOKENS_LIMIT", Some(6), Some(1)) => (
+            "tokens_weekly".to_string(),
+            "每周 Token 配额".to_string(),
+            Some(7 * 24 * 60),
+        ),
+        ("TOKENS_LIMIT", _, _) => ("tokens_limit".to_string(), "Token 配额".to_string(), None),
+        _ => (limit_type.to_ascii_lowercase(), limit_type.clone(), None),
+    };
+    let reset_at = zhipu_reset_at(limit.next_reset_time.as_ref().or(limit.reset_at.as_ref()));
+    let reset_at_text = limit
+        .reset_at
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     Some(ProviderQuotaWindow {
-        code: limit_type.to_ascii_lowercase(),
-        label: if limit_type == "TOKENS_LIMIT" {
-            "5小时 Token 配额".into()
-        } else {
-            limit_type
-        },
+        code,
+        label,
         scope: "account".into(),
         unit: "tokens".into(),
         used_value: limit
@@ -228,11 +267,36 @@ fn zhipu_window(limit: ZhipuQuotaLimit) -> Option<ProviderQuotaWindow> {
         },
         limit_value: limit.usage.as_ref().and_then(DecimalInput::quota_value),
         used_ratio,
-        remaining_ratio: None,
-        window_minutes: None,
-        reset_at: limit.reset_at.as_deref().and_then(rfc3339_unix_secs),
-        reset_at_text: limit.reset_at,
+        remaining_ratio: used_ratio.map(|ratio| (1.0 - ratio).clamp(0.0, 1.0)),
+        window_minutes,
+        reset_at,
+        reset_at_text,
         is_exhausted: used_ratio.is_some_and(|ratio| ratio >= 1.0),
+    })
+}
+
+/// 将智谱响应中可能为数字或字符串的整数安全归一化为 u64。
+fn zhipu_u64(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+            .or_else(|| value.as_str().and_then(|number| number.trim().parse().ok()))
+    })
+}
+
+/// 兼容 RFC3339、Unix 秒以及智谱 `nextResetTime` 的 Unix 毫秒格式。
+fn zhipu_reset_at(value: Option<&Value>) -> Option<u64> {
+    if let Some(text) = value.and_then(Value::as_str).map(str::trim) {
+        if let Some(timestamp) = rfc3339_unix_secs(text) {
+            return Some(timestamp);
+        }
+    }
+    let timestamp = zhipu_u64(value)?;
+    Some(if timestamp >= 10_000_000_000 {
+        timestamp / 1_000
+    } else {
+        timestamp
     })
 }
 

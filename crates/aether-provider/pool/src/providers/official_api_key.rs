@@ -228,11 +228,16 @@ fn parse_official_api_key_quota_at(
             }
             Ok(snapshot)
         }
-        "zhipu" | "zai" => Ok(ProviderQuotaSnapshotContract::subscription(
-            provider_type,
-            parse_zhipu_subscription(value)?,
-            now_unix_secs,
-        )),
+        "zhipu" | "zai" => {
+            let parsed = parse_zhipu_subscription(value)?;
+            let mut snapshot = ProviderQuotaSnapshotContract::subscription(
+                provider_type,
+                parsed.windows,
+                now_unix_secs,
+            );
+            snapshot.extensions = parsed.extensions;
+            Ok(snapshot)
+        }
         _ => Err("unsupported official API key quota provider"),
     }
 }

@@ -30,7 +30,7 @@ export const REASONING_EFFORTS = [
 
 export type ReasoningEffort = typeof REASONING_EFFORTS[number]
 
-export const MODEL_DIRECTIVE_SUFFIXES = [...REASONING_EFFORTS, 'ultra', 'fast'] as const
+export const MODEL_DIRECTIVE_SUFFIXES = [...REASONING_EFFORTS, 'extra', 'ultra', 'fast'] as const
 export type ModelDirectiveSuffix = typeof MODEL_DIRECTIVE_SUFFIXES[number]
 
 export const MODEL_DIRECTIVE_SUFFIX_METADATA: Readonly<
@@ -42,6 +42,7 @@ export const MODEL_DIRECTIVE_SUFFIX_METADATA: Readonly<
   medium: { label: 'medium', description: '中等推理投入' },
   high: { label: 'high', description: '高推理投入' },
   xhigh: { label: 'xhigh', description: '超高推理投入' },
+  extra: { label: 'extra', description: 'xhigh 推理投入别名' },
   max: { label: 'max', description: '模型支持时使用最大推理投入' },
   ultra: { label: 'ultra', description: 'Codex Ultra 预设，请求推理强度为 max' },
   fast: { label: 'fast', description: 'Fast 服务层级' },
@@ -85,6 +86,7 @@ const CROSS_PROVIDER_SUFFIXES: readonly ModelDirectiveSuffix[] = [
   'medium',
   'high',
   'xhigh',
+  'extra',
   'max',
 ]
 

@@ -308,7 +308,11 @@ export function compareApiFormats(a: string, b: string): number {
   return aIdx - bIdx
 }
 
-// openai family 格式只支持 bearer（Authorization header），不允许覆盖认证方式
+// openai:embedding / openai:rerank 允许按格式覆盖认证方式；其余 OpenAI 格式固定使用 bearer。
 export function formatSupportsAuthOverride(format: string): boolean {
-  return parseApiFormat(normalizeApiFormatAlias(format)).family !== 'openai'
+  const { family, kind } = parseApiFormat(normalizeApiFormatAlias(format))
+  if (family === 'openai') {
+    return kind === 'embedding' || kind === 'rerank'
+  }
+  return true
 }

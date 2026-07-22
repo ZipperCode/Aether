@@ -25,6 +25,7 @@ describe('modelDirectivesConfig', () => {
     ])
     expect(MODEL_DIRECTIVE_SUFFIXES).toEqual([
       ...REASONING_EFFORTS,
+      'extra',
       'ultra',
       'fast',
     ])

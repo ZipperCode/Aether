@@ -15,6 +15,7 @@ use aether_contracts::{
     EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER,
 };
 use aether_data_contracts::repository::provider_catalog::{
+    ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
 use aether_provider_pool::{
@@ -307,6 +308,30 @@ pub(crate) async fn persist_provider_quota_refresh_state(
     oauth_invalid_reason: Option<String>,
     encrypted_auth_config: Option<String>,
 ) -> Result<bool, GatewayError> {
+    persist_provider_quota_refresh_state_after_read(
+        state,
+        key_id,
+        metadata_update,
+        oauth_invalid_at_unix_secs,
+        oauth_invalid_reason,
+        encrypted_auth_config,
+        std::future::ready(()),
+    )
+    .await
+}
+
+async fn persist_provider_quota_refresh_state_after_read<F>(
+    state: &AdminAppState<'_>,
+    key_id: &str,
+    metadata_update: Option<&serde_json::Value>,
+    oauth_invalid_at_unix_secs: Option<u64>,
+    oauth_invalid_reason: Option<String>,
+    encrypted_auth_config: Option<String>,
+    after_read: F,
+) -> Result<bool, GatewayError>
+where
+    F: std::future::Future<Output = ()>,
+{
     let Some(mut latest_key) = state
         .read_provider_catalog_keys_by_ids(&[key_id.to_string()])
         .await?
@@ -315,7 +340,11 @@ pub(crate) async fn persist_provider_quota_refresh_state(
     else {
         return Ok(false);
     };
+    after_read.await;
 
+    // Keep the namespace values observed before applying the refresh response;
+    // each runtime metadata write uses them as its CAS expectation.
+    let observed_upstream_metadata = latest_key.upstream_metadata.clone();
     let mut quota_snapshot_provider_type = None::<String>;
     if let Some(metadata_update) = metadata_update {
         latest_key.upstream_metadata = Some(merge_upstream_metadata(
@@ -325,8 +354,8 @@ pub(crate) async fn persist_provider_quota_refresh_state(
         quota_snapshot_provider_type =
             aether_provider_pool::provider_pool_quota_metadata_provider_type(metadata_update);
     }
-    if let Some(encrypted_auth_config) = encrypted_auth_config {
-        latest_key.encrypted_auth_config = Some(encrypted_auth_config);
+    if let Some(encrypted_auth_config) = encrypted_auth_config.as_ref() {
+        latest_key.encrypted_auth_config = Some(encrypted_auth_config.clone());
     }
     latest_key.oauth_invalid_at_unix_secs = oauth_invalid_at_unix_secs;
     latest_key.oauth_invalid_reason = oauth_invalid_reason;
@@ -344,10 +373,91 @@ pub(crate) async fn persist_provider_quota_refresh_state(
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs());
-    Ok(state
-        .update_provider_catalog_key(&latest_key)
-        .await?
-        .is_some())
+    let status_patch = provider_quota_refresh_status_patch(latest_key.status_snapshot.as_ref());
+    let metadata_updates = metadata_update
+        .and_then(serde_json::Value::as_object)
+        .map(|updates| {
+            updates
+                .iter()
+                .map(|(namespace, value)| (namespace.clone(), value.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if metadata_updates.is_empty() {
+        if !state
+            .update_provider_catalog_key_oauth_runtime_state(
+                key_id,
+                latest_key.oauth_invalid_at_unix_secs,
+                latest_key.oauth_invalid_reason.as_deref(),
+                encrypted_auth_config.as_deref(),
+                latest_key.updated_at_unix_secs,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        return state
+            .update_provider_catalog_key_status_snapshot(&ProviderCatalogKeyStatusSnapshotUpdate {
+                key_id: key_id.to_string(),
+                status_snapshot_patch: status_patch,
+                updated_at_unix_secs: latest_key.updated_at_unix_secs,
+            })
+            .await;
+    }
+
+    for (index, (namespace, value)) in metadata_updates.iter().enumerate() {
+        let patch = if index + 1 == metadata_updates.len() {
+            status_patch.clone()
+        } else {
+            serde_json::json!({})
+        };
+        let mut expected = observed_upstream_metadata
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .and_then(|metadata| metadata.get(namespace))
+            .cloned();
+        let persisted = state
+            .app()
+            .update_provider_catalog_key_runtime_metadata(
+                &ProviderCatalogKeyRuntimeMetadataUpdate {
+                    key_id: key_id.to_string(),
+                    namespace: namespace.clone(),
+                    expected_upstream_metadata_value: expected.clone(),
+                    upstream_metadata_value: value.clone(),
+                    status_snapshot_patch: patch.clone(),
+                    updated_at_unix_secs: latest_key.updated_at_unix_secs,
+                },
+            )
+            .await?;
+        if !persisted {
+            // The refresh response is an authoritative snapshot.  Do not
+            // replay it over a newer namespace after a CAS conflict.
+            return Ok(false);
+        }
+    }
+    state
+        .update_provider_catalog_key_oauth_runtime_state(
+            key_id,
+            latest_key.oauth_invalid_at_unix_secs,
+            latest_key.oauth_invalid_reason.as_deref(),
+            encrypted_auth_config.as_deref(),
+            latest_key.updated_at_unix_secs,
+        )
+        .await
+}
+
+fn provider_quota_refresh_status_patch(
+    status_snapshot: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut patch = serde_json::Map::new();
+    if let Some(snapshot) = status_snapshot.and_then(serde_json::Value::as_object) {
+        for field in ["quota", "oauth"] {
+            if let Some(value) = snapshot.get(field) {
+                patch.insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(patch)
 }
 
 pub(super) async fn execute_provider_quota_plan(
@@ -358,7 +468,69 @@ pub(super) async fn execute_provider_quota_plan(
 ) -> Result<ProviderQuotaExecutionOutcome, GatewayError> {
     force_provider_quota_redirect_closed(&mut plan);
     match state.execute_execution_runtime_sync_plan(None, &plan).await {
-        Ok(result) => Ok(ProviderQuotaExecutionOutcome::Response(result)),
+        Ok(result) => {
+            if !crate::provider_transport::is_codex_agent_identity_transport(transport)
+                || !crate::provider_transport::is_codex_agent_identity_invalid_task_response(
+                    result.status_code,
+                    extract_execution_error_message(&result).as_deref(),
+                )
+            {
+                return Ok(ProviderQuotaExecutionOutcome::Response(result));
+            }
+
+            let refreshed_entry = match state.force_local_oauth_refresh_entry(transport).await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => {
+                    return Ok(ProviderQuotaExecutionOutcome::Failure(
+                        "Agent Identity 任务重注册未返回认证信息".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    warn!(
+                        key_id = %transport.key.id,
+                        endpoint_id = %transport.endpoint.id,
+                        quota_kind = %quota_kind,
+                        error = %error,
+                        "gateway Agent Identity quota task recovery failed"
+                    );
+                    return Ok(ProviderQuotaExecutionOutcome::Failure(format!(
+                        "Agent Identity 任务重注册失败: {error}"
+                    )));
+                }
+            };
+            let header_name = refreshed_entry.auth_header_name.trim().to_ascii_lowercase();
+            let header_value = refreshed_entry.auth_header_value.trim();
+            if header_name.is_empty() || header_value.is_empty() {
+                return Ok(ProviderQuotaExecutionOutcome::Failure(
+                    "Agent Identity 任务重注册未返回有效认证信息".to_string(),
+                ));
+            }
+
+            let mut retry_plan = plan.clone();
+            retry_plan
+                .headers
+                .retain(|name, _| !name.eq_ignore_ascii_case(&header_name));
+            retry_plan
+                .headers
+                .insert(header_name, header_value.to_string());
+            match state
+                .execute_execution_runtime_sync_plan(None, &retry_plan)
+                .await
+            {
+                Ok(result) => Ok(ProviderQuotaExecutionOutcome::Response(result)),
+                Err(error) => {
+                    let error = error.into_message();
+                    warn!(
+                        key_id = %transport.key.id,
+                        endpoint_id = %transport.endpoint.id,
+                        quota_kind = %quota_kind,
+                        error = %error,
+                        "gateway Agent Identity quota task recovery retry failed"
+                    );
+                    Ok(ProviderQuotaExecutionOutcome::Failure(error))
+                }
+            }
+        }
         Err(err) => {
             let error = err.into_message();
             let error_class = quota_transport_error_class(&error);
@@ -489,6 +661,98 @@ mod transport_logging_tests {
                 .get(EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER)
                 .map(String::as_str),
             Some("1048576")
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::GatewayDataState;
+    use crate::AppState;
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data_contracts::repository::provider_catalog::{
+        ProviderCatalogReadRepository, ProviderCatalogWriteRepository, StoredProviderCatalogKey,
+    };
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn metadata_cas_conflict_does_not_persist_stale_oauth_runtime_state() {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-codex-cas".to_string(),
+            "provider-codex-cas".to_string(),
+            "Codex CAS".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.encrypted_auth_config = Some("old-auth-config".to_string());
+        key.oauth_invalid_at_unix_secs = Some(100);
+        key.oauth_invalid_reason = Some("old-invalid-reason".to_string());
+        key.upstream_metadata = Some(json!({"codex":{"remaining":5}}));
+        key.status_snapshot = Some(json!({"oauth":{"invalid":true}}));
+
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![],
+            vec![],
+            vec![key],
+        ));
+        let app = AppState::new()
+            .expect("app should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                    &repository,
+                )),
+            );
+        let admin_state = AdminAppState::new(&app);
+        let concurrent_repository = Arc::clone(&repository);
+        let metadata_update = json!({"codex":{"remaining":3}});
+
+        let persisted = persist_provider_quota_refresh_state_after_read(
+            &admin_state,
+            "key-codex-cas",
+            Some(&metadata_update),
+            Some(200),
+            Some("new-invalid-reason".to_string()),
+            Some("new-auth-config".to_string()),
+            async move {
+                assert!(concurrent_repository
+                    .update_key_runtime_metadata(&ProviderCatalogKeyRuntimeMetadataUpdate {
+                        key_id: "key-codex-cas".to_string(),
+                        namespace: "codex".to_string(),
+                        expected_upstream_metadata_value: Some(json!({"remaining":5})),
+                        upstream_metadata_value: json!({"remaining":4}),
+                        status_snapshot_patch: json!({}),
+                        updated_at_unix_secs: Some(150),
+                    })
+                    .await
+                    .expect("concurrent metadata update should execute"));
+            },
+        )
+        .await
+        .expect("quota refresh persistence should not error");
+
+        assert!(!persisted, "stale namespace should report a CAS conflict");
+        let stored = repository
+            .list_keys_by_ids(&["key-codex-cas".to_string()])
+            .await
+            .expect("key should reload")
+            .pop()
+            .expect("key should remain");
+        assert_eq!(
+            stored.encrypted_auth_config.as_deref(),
+            Some("old-auth-config")
+        );
+        assert_eq!(stored.oauth_invalid_at_unix_secs, Some(100));
+        assert_eq!(
+            stored.oauth_invalid_reason.as_deref(),
+            Some("old-invalid-reason")
+        );
+        assert_eq!(
+            stored.upstream_metadata.as_ref().unwrap()["codex"],
+            json!({"remaining":4})
         );
     }
 }

@@ -18,9 +18,10 @@ use super::{
     PoolScoreReadRepository, ProviderCatalogReadRepository, ProviderCatalogWriteRepository,
     ProviderQuotaReadRepository, ProviderQuotaWriteRepository, ProxyNodeReadRepository,
     ProxyNodeWriteRepository, RequestCandidateReadRepository, RequestCandidateWriteRepository,
-    SettlementWriteRepository, StoredSystemConfigEntry, StoredUserPreferenceRecord,
-    UsageReadRepository, UsageWriteRepository, UserReadRepository, VideoTaskReadRepository,
-    VideoTaskWriteRepository, WalletReadRepository, WalletWriteRepository,
+    RoutingGroupReadRepository, RoutingGroupWriteRepository, SettlementWriteRepository,
+    StoredSystemConfigEntry, StoredUserPreferenceRecord, UsageReadRepository, UsageWriteRepository,
+    UserReadRepository, VideoTaskReadRepository, VideoTaskWriteRepository, WalletReadRepository,
+    WalletWriteRepository,
 };
 
 mod announcements;
@@ -885,6 +886,16 @@ impl GatewayDataState {
     #[cfg(test)]
     pub(crate) fn with_user_reader(mut self, repository: Arc<dyn UserReadRepository>) -> Self {
         self.user_reader = Some(repository);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_routing_group_repository_for_tests<T>(mut self, repository: Arc<T>) -> Self
+    where
+        T: RoutingGroupReadRepository + RoutingGroupWriteRepository + 'static,
+    {
+        self.routing_group_reader = Some(repository.clone());
+        self.routing_group_writer = Some(repository);
         self
     }
 

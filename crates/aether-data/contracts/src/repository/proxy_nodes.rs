@@ -361,6 +361,12 @@ pub struct TunnelMetricsSample {
     pub recent_error_events: Vec<TunnelErrorEventRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeartbeatCursor<'a> {
+    session_id: &'a str,
+    heartbeat_id: u64,
+}
+
 pub fn bucket_start_unix_secs(timestamp_unix_secs: u64, step: ProxyNodeMetricsStep) -> u64 {
     let size = step.bucket_size_secs();
     timestamp_unix_secs / size * size
@@ -375,21 +381,38 @@ pub fn build_tunnel_metrics_sample(
     let current = extract_tunnel_metrics_counters(current_proxy_metadata)?;
     let previous = extract_tunnel_metrics_counters(previous_proxy_metadata);
     let current_recent_errors = extract_recent_tunnel_errors(current_proxy_metadata);
+    let previous_cursor = extract_heartbeat_cursor(previous_proxy_metadata);
+    let current_cursor = extract_heartbeat_cursor(current_proxy_metadata);
+    // 只有同一 tunnel 进程内严格递增的心跳才能计算累计差值；旧 tunnel 两侧
+    // 都没有游标时继续沿用原行为，避免升级期间丢失指标。
+    let counters_are_comparable = match (previous_cursor, current_cursor) {
+        (None, None) => true,
+        (Some(previous), Some(current)) => {
+            previous.session_id == current.session_id
+                && current.heartbeat_id > previous.heartbeat_id
+        }
+        _ => false,
+    };
 
+    let counter_delta = |previous: Option<u64>, current: u64| {
+        if counters_are_comparable {
+            counter_delta_u64(previous, current)
+        } else {
+            0
+        }
+    };
     let connect_errors_delta =
-        counter_delta_u64(previous.map(|v| v.connect_errors), current.connect_errors);
-    let disconnects_delta = counter_delta_u64(previous.map(|v| v.disconnects), current.disconnects);
-    let error_events_delta = counter_delta_u64(
+        counter_delta(previous.map(|v| v.connect_errors), current.connect_errors);
+    let disconnects_delta = counter_delta(previous.map(|v| v.disconnects), current.disconnects);
+    let error_events_delta = counter_delta(
         previous.map(|v| v.error_events_total),
         current.error_events_total,
     );
-    let ws_in_bytes_delta = counter_delta_u64(previous.map(|v| v.ws_in_bytes), current.ws_in_bytes);
-    let ws_out_bytes_delta =
-        counter_delta_u64(previous.map(|v| v.ws_out_bytes), current.ws_out_bytes);
-    let ws_in_frames_delta =
-        counter_delta_u64(previous.map(|v| v.ws_in_frames), current.ws_in_frames);
+    let ws_in_bytes_delta = counter_delta(previous.map(|v| v.ws_in_bytes), current.ws_in_bytes);
+    let ws_out_bytes_delta = counter_delta(previous.map(|v| v.ws_out_bytes), current.ws_out_bytes);
+    let ws_in_frames_delta = counter_delta(previous.map(|v| v.ws_in_frames), current.ws_in_frames);
     let ws_out_frames_delta =
-        counter_delta_u64(previous.map(|v| v.ws_out_frames), current.ws_out_frames);
+        counter_delta(previous.map(|v| v.ws_out_frames), current.ws_out_frames);
 
     let take_recent = usize::try_from(error_events_delta).unwrap_or(usize::MAX);
     let recent_error_events = if take_recent == 0 {
@@ -508,6 +531,18 @@ fn extract_tunnel_metrics_counters(
         ws_in_frames: json_u64(tunnel_metrics.get("ws_in_frames")).unwrap_or(0),
         ws_out_frames: json_u64(tunnel_metrics.get("ws_out_frames")).unwrap_or(0),
         heartbeat_rtt_last_ms: json_u64(tunnel_metrics.get("heartbeat_rtt_last_ms")).unwrap_or(0),
+    })
+}
+
+fn extract_heartbeat_cursor(proxy_metadata: Option<&Value>) -> Option<HeartbeatCursor<'_>> {
+    let metadata = proxy_metadata.and_then(Value::as_object)?;
+    let session_id = metadata
+        .get("heartbeat_session_id")
+        .and_then(Value::as_str)?;
+    let heartbeat_id = json_u64(metadata.get("heartbeat_id"))?;
+    Some(HeartbeatCursor {
+        session_id,
+        heartbeat_id,
     })
 }
 

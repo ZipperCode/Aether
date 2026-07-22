@@ -8,11 +8,11 @@ pub const MODEL_DIRECTIVE_API_FORMATS: [&str; 6] = [
     "claude:messages",
     "gemini:generate_content",
 ];
-pub const OPENAI_MODEL_DIRECTIVE_SUFFIXES: [&str; 9] = [
-    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "fast",
+pub const OPENAI_MODEL_DIRECTIVE_SUFFIXES: [&str; 10] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "extra", "max", "ultra", "fast",
 ];
-pub const CROSS_PROVIDER_MODEL_DIRECTIVE_SUFFIXES: [&str; 5] =
-    ["low", "medium", "high", "xhigh", "max"];
+pub const CROSS_PROVIDER_MODEL_DIRECTIVE_SUFFIXES: [&str; 6] =
+    ["low", "medium", "high", "xhigh", "extra", "max"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDirective {
@@ -72,7 +72,7 @@ impl ReasoningEffort {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
-            "xhigh" => Some(Self::XHigh),
+            "xhigh" | "extra" => Some(Self::XHigh),
             "max" => Some(Self::Max),
             _ => None,
         }
