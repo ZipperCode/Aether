@@ -22,4 +22,5 @@ export {
   batchAssignToProviders,
   getGlobalModelProviders,
   getGlobalModelRoutingPreview,
+  getGlobalModelMappingPreview,
 } from './endpoints/global-models'

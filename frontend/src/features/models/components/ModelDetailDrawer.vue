@@ -517,8 +517,7 @@
                 :global-model-id="model.id"
                 :model-name="model.name"
                 :mappings="model.config?.model_mappings || []"
-                :routing-data="routingData"
-                :loading-preview="routingLoading"
+                :active="detailTab === 'mappings'"
                 @update="handleMappingsUpdate"
                 @refresh="loadRoutingData"
                 @link-provider="(providerId) => $emit('linkProvider', providerId)"
@@ -601,20 +600,28 @@ const modelMappingsTabRef = ref<InstanceType<typeof ModelMappingsTab> | null>(nu
 const routingData = ref<ModelRoutingPreviewResponse | null>(null)
 const routingLoading = ref(false)
 const routingError = ref<string | null>(null)
+const routingLoadedModelId = ref<string | null>(null)
+let routingRequestSequence = 0
 
 // 加载 routing 数据（统一入口）
 async function loadRoutingData() {
   if (!props.model?.id) return
 
+  const modelId = props.model.id
+  const sequence = ++routingRequestSequence
   routingLoading.value = true
   routingError.value = null
 
   try {
-    routingData.value = await getGlobalModelRoutingPreview(props.model.id)
+    const response = await getGlobalModelRoutingPreview(modelId)
+    if (sequence !== routingRequestSequence || props.model?.id !== modelId) return
+    routingData.value = response
+    routingLoadedModelId.value = modelId
   } catch (err: unknown) {
+    if (sequence !== routingRequestSequence) return
     routingError.value = parseApiError(err, '加载失败')
   } finally {
-    routingLoading.value = false
+    if (sequence === routingRequestSequence) routingLoading.value = false
   }
 }
 
@@ -810,13 +817,30 @@ watch(() => props.open, (newOpen) => {
   if (newOpen) {
     // 直接设置为 basic，不需要先重置为空
     detailTab.value = 'basic'
-    // 加载 routing 数据
-    loadRoutingData()
   } else {
     // 关闭时清空数据
     routingData.value = null
     routingError.value = null
+    routingLoadedModelId.value = null
+    routingRequestSequence++
+    routingLoading.value = false
   }
+})
+
+watch(detailTab, tab => {
+  if (tab === 'routing' && props.model?.id && routingLoadedModelId.value !== props.model.id) {
+    void loadRoutingData()
+  }
+})
+
+watch(() => props.model?.id, modelId => {
+  if (routingLoadedModelId.value !== modelId) {
+    routingData.value = null
+    routingError.value = null
+    routingLoadedModelId.value = null
+    routingRequestSequence++
+  }
+  if (props.open && detailTab.value === 'routing' && modelId) void loadRoutingData()
 })
 
 // 添加 ESC 键监听

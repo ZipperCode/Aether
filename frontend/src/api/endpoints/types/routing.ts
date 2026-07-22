@@ -17,6 +17,7 @@ export interface RoutingKeyInfo {
   is_active: boolean
   api_formats: string[]
   allowed_models?: string[] | null  // 允许的模型列表，null 表示不限制
+  matched_models?: string[]
   circuit_breaker_open: boolean
   circuit_breaker_formats: string[]
   next_probe_at?: string | null  // 下次探测时间（ISO格式）
@@ -99,5 +100,40 @@ export interface ModelRoutingPreviewResponse {
   scheduling_mode: string
   priority_mode: string
   keep_priority_on_conversion?: boolean
-  all_keys_whitelist: GlobalKeyWhitelistItem[]
+  all_keys_whitelist?: GlobalKeyWhitelistItem[]
+}
+
+export interface ModelMappingPreviewRule {
+  index: number
+  pattern: string
+  valid: boolean
+  matched_key_count: number
+  matched_model_count: number
+  matched_provider_count: number
+  matched_provider_ids: string[]
+  unlinked_provider_ids: string[]
+}
+
+export interface ModelMappingPreviewKey {
+  key_id: string
+  key_name: string
+  masked_key: string
+  provider_id: string
+  provider_name: string
+  is_linked: boolean
+  matched_models: string[]
+}
+
+export interface ModelMappingPreviewExpanded {
+  rule_index: number
+  page: number
+  page_size: number
+  total_keys: number
+  keys: ModelMappingPreviewKey[]
+}
+
+export interface ModelMappingPreviewResponse {
+  global_model_id: string
+  rules: ModelMappingPreviewRule[]
+  expanded: ModelMappingPreviewExpanded | null
 }

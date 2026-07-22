@@ -8,6 +8,7 @@ import type {
   GlobalModelListResponse,
   ModelCatalogProviderDetail,
   ModelRoutingPreviewResponse,
+  ModelMappingPreviewResponse,
 } from './types'
 
 // 重新导出路由相关类型供外部使用
@@ -17,6 +18,7 @@ export type {
   RoutingModelMapping,
   RoutingProviderInfo,
   ModelRoutingPreviewResponse,
+  ModelMappingPreviewResponse,
 } from './types'
 
 /**
@@ -141,8 +143,40 @@ export async function getGlobalModelProviders(globalModelId: string): Promise<{
 export async function getGlobalModelRoutingPreview(
   globalModelId: string
 ): Promise<ModelRoutingPreviewResponse> {
-  const response = await client.get(
-    `/api/admin/models/global/${globalModelId}/routing`
+  return dedupedRequest(`global-models:routing:${globalModelId}:light`, async () => {
+    const response = await client.get(
+      `/api/admin/models/global/${globalModelId}/routing`,
+      { params: { include_whitelist: false } },
+    )
+    return response.data
+  })
+}
+
+export interface ModelMappingPreviewRequest {
+  mappings: string[]
+  expanded_rule_index?: number | null
+  page?: number
+  page_size?: number
+}
+
+export async function getGlobalModelMappingPreview(
+  globalModelId: string,
+  request: ModelMappingPreviewRequest,
+): Promise<ModelMappingPreviewResponse> {
+  const normalized = {
+    mappings: request.mappings.map(mapping => mapping.trim()),
+    expanded_rule_index: request.expanded_rule_index ?? null,
+    page: request.page ?? 1,
+    page_size: request.page_size ?? 25,
+  }
+  return dedupedRequest(
+    `global-models:mapping-preview:${globalModelId}:${JSON.stringify(normalized)}`,
+    async () => {
+      const response = await client.post(
+        `/api/admin/models/global/${globalModelId}/mapping-preview`,
+        normalized,
+      )
+      return response.data
+    },
   )
-  return response.data
 }
