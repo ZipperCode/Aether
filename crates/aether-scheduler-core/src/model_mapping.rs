@@ -250,6 +250,6 @@ mod tests {
 
         assert!(std::sync::Arc::ptr_eq(&first, &second));
         assert!(after_first.rule_compiles >= before.rule_compiles + 2);
-        assert!(after_second.hits >= after_first.hits + 1);
+        assert!(after_second.hits > after_first.hits);
     }
 }
