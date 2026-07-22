@@ -1085,18 +1085,12 @@ mod tests {
             requests[0].url,
             "https://auth.test/api/accounts/v1/agent/runtime-test/task/register"
         );
-        assert_eq!(
-            requests[0].json_body.as_ref().unwrap()["timestamp"]
-                .as_str()
-                .is_some(),
-            true
-        );
-        assert_eq!(
-            requests[0].json_body.as_ref().unwrap()["signature"]
-                .as_str()
-                .is_some(),
-            true
-        );
+        assert!(requests[0].json_body.as_ref().unwrap()["timestamp"]
+            .as_str()
+            .is_some());
+        assert!(requests[0].json_body.as_ref().unwrap()["signature"]
+            .as_str()
+            .is_some());
     }
 
     #[test]
