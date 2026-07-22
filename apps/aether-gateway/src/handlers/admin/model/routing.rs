@@ -8,17 +8,20 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
 use aether_scheduler_core::{
-    is_provider_key_circuit_open_at, matches_model_mapping,
+    compiled_model_mappings, is_provider_key_circuit_open_at,
     provider_key_circuit_payload_is_active_open_at, provider_key_health_score,
+    CompiledModelMappings,
 };
+use serde::Deserialize;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub(crate) async fn build_admin_global_model_routing_payload(
     state: &AdminAppState<'_>,
     global_model_id: &str,
+    include_whitelist: bool,
 ) -> Option<serde_json::Value> {
     if !state.has_global_model_data_reader() || !state.has_provider_catalog_data_reader() {
         return None;
@@ -106,6 +109,7 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let compiled_global_model_mappings = compiled_model_mappings(&global_model_mappings);
 
     let mut providers_payload = Vec::new();
     let mut all_keys_whitelist = Vec::new();
@@ -146,7 +150,7 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                     key_allowed_models_match_global_model_for_routing(
                         key.allowed_models.as_ref(),
                         &key_match_model_names,
-                        &global_model_mappings,
+                        &compiled_global_model_mappings,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -161,6 +165,11 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                     let effective_rpm = key.learned_rpm_limit.or(key.rpm_limit);
                     let is_adaptive = key.rpm_limit.is_none();
                     let allowed_models = json_string_list(key.allowed_models.as_ref());
+                    let matched_models = matched_model_names_for_routing(
+                        key.allowed_models.as_ref(),
+                        &global_model.name,
+                        &compiled_global_model_mappings,
+                    );
                     let circuit_breaker_formats = key
                         .circuit_breaker_by_format
                         .as_ref()
@@ -195,6 +204,7 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                         "is_adaptive": is_adaptive,
                         "effective_rpm": effective_rpm,
                         "allowed_models": allowed_models,
+                        "matched_models": matched_models,
                         "health_score": provider_key_health_score(key, &endpoint.api_format),
                         "circuit_breaker_open": is_provider_key_circuit_open_at(key, &endpoint.api_format, now_unix_secs),
                         "circuit_breaker_formats": circuit_breaker_formats,
@@ -243,48 +253,30 @@ pub(crate) async fn build_admin_global_model_routing_payload(
 
     // 与 Python 逻辑对齐：供前端实时匹配的白名单数据来自“全站活跃 Provider 的活跃 Key”
     // （仅保留配置了非空 allowed_models 的 Key），而不是仅当前 GlobalModel 关联 Provider。
-    let active_providers = state
-        .list_provider_catalog_providers(true)
-        .await
-        .ok()
-        .unwrap_or_default();
-    let active_provider_ids = active_providers
-        .iter()
-        .map(|provider| provider.id.clone())
-        .collect::<Vec<_>>();
-    let active_provider_name_by_id = active_providers
-        .into_iter()
-        .map(|provider| (provider.id, provider.name))
-        .collect::<BTreeMap<_, _>>();
-    let active_keys = if active_provider_ids.is_empty() {
-        Vec::new()
-    } else {
-        state
-            .list_provider_catalog_keys_by_provider_ids(&active_provider_ids)
-            .await
-            .ok()
-            .unwrap_or_default()
-    };
-    for key in active_keys {
-        if !key.is_active {
-            continue;
+    if include_whitelist {
+        let (active_provider_name_by_id, active_keys) =
+            load_active_provider_names_and_keys(state).await;
+        for key in active_keys {
+            if !key.is_active {
+                continue;
+            }
+            let allowed_models = normalized_allowed_models(key.allowed_models.as_ref());
+            if allowed_models.is_empty() {
+                continue;
+            }
+            let provider_name = active_provider_name_by_id
+                .get(&key.provider_id)
+                .cloned()
+                .unwrap_or_default();
+            all_keys_whitelist.push(json!({
+                "key_id": key.id,
+                "key_name": key.name,
+                "masked_key": state.masked_catalog_api_key(&key),
+                "provider_id": key.provider_id,
+                "provider_name": provider_name,
+                "allowed_models": allowed_models,
+            }));
         }
-        let allowed_models = json_string_list(key.allowed_models.as_ref());
-        if allowed_models.is_empty() {
-            continue;
-        }
-        let provider_name = active_provider_name_by_id
-            .get(&key.provider_id)
-            .cloned()
-            .unwrap_or_default();
-        all_keys_whitelist.push(json!({
-            "key_id": key.id,
-            "key_name": key.name,
-            "masked_key": state.masked_catalog_api_key(&key),
-            "provider_id": key.provider_id,
-            "provider_name": provider_name,
-            "allowed_models": allowed_models,
-        }));
     }
 
     providers_payload.sort_by(|left, right| {
@@ -329,7 +321,7 @@ pub(crate) async fn build_admin_global_model_routing_payload(
 fn key_allowed_models_match_global_model_for_routing(
     raw_allowed_models: Option<&serde_json::Value>,
     model_names: &[String],
-    global_model_mappings: &[String],
+    global_model_mappings: &CompiledModelMappings,
 ) -> bool {
     // 兼容 Python 预览逻辑：None/[] 视为“不限制”，在链路预览中保留该 Key。
     let allowed_models = json_string_list(raw_allowed_models);
@@ -347,14 +339,220 @@ fn key_allowed_models_match_global_model_for_routing(
         {
             return true;
         }
-        for pattern in global_model_mappings {
-            if matches_model_mapping(pattern, allowed_model) {
-                return true;
-            }
+        if global_model_mappings.matches_any(allowed_model) {
+            return true;
         }
     }
 
     false
+}
+
+fn matched_model_names_for_routing(
+    raw_allowed_models: Option<&serde_json::Value>,
+    global_model_name: &str,
+    global_model_mappings: &CompiledModelMappings,
+) -> Vec<String> {
+    normalized_allowed_models(raw_allowed_models)
+        .into_iter()
+        .filter(|allowed_model| {
+            !allowed_model.eq_ignore_ascii_case(global_model_name)
+                && global_model_mappings.matches_any(allowed_model)
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AdminGlobalModelMappingPreviewRequest {
+    #[serde(default)]
+    pub(crate) mappings: Vec<String>,
+    pub(crate) expanded_rule_index: Option<usize>,
+    #[serde(default = "default_mapping_preview_page")]
+    pub(crate) page: usize,
+    #[serde(default = "default_mapping_preview_page_size")]
+    pub(crate) page_size: usize,
+}
+
+fn default_mapping_preview_page() -> usize {
+    1
+}
+
+fn default_mapping_preview_page_size() -> usize {
+    25
+}
+
+#[derive(Default)]
+struct MappingRuleMatchSummary {
+    key_ids: BTreeSet<String>,
+    model_names: BTreeSet<String>,
+    provider_ids: BTreeSet<String>,
+}
+
+struct MappingPreviewKeyDetail {
+    key_id: String,
+    key_name: String,
+    masked_key: String,
+    provider_id: String,
+    provider_name: String,
+    matched_models: BTreeSet<String>,
+}
+
+pub(crate) async fn build_admin_global_model_mapping_preview_payload(
+    state: &AdminAppState<'_>,
+    global_model_id: &str,
+    request: AdminGlobalModelMappingPreviewRequest,
+) -> Option<serde_json::Value> {
+    if !state.has_global_model_data_reader() || !state.has_provider_catalog_data_reader() {
+        return None;
+    }
+    state
+        .get_admin_global_model_by_id(global_model_id)
+        .await
+        .ok()??;
+    let linked_provider_ids = state
+        .list_admin_provider_models_by_global_model_id(global_model_id)
+        .await
+        .ok()?
+        .into_iter()
+        .map(|model| model.provider_id)
+        .collect::<BTreeSet<_>>();
+    let mappings = request
+        .mappings
+        .into_iter()
+        .map(|mapping| mapping.trim().to_string())
+        .collect::<Vec<_>>();
+    let compiled = compiled_model_mappings(&mappings);
+    let mut summaries = (0..mappings.len())
+        .map(|_| MappingRuleMatchSummary::default())
+        .collect::<Vec<_>>();
+    let mut expanded_details = BTreeMap::<String, MappingPreviewKeyDetail>::new();
+    let expanded_rule_index = request
+        .expanded_rule_index
+        .filter(|index| *index < mappings.len() && compiled.rule_is_valid(*index));
+    let (provider_names, keys) = load_active_provider_names_and_keys(state).await;
+
+    for key in keys.into_iter().filter(|key| key.is_active) {
+        let allowed_models = normalized_allowed_models(key.allowed_models.as_ref());
+        if allowed_models.is_empty() {
+            continue;
+        }
+        for allowed_model in allowed_models {
+            for rule_index in compiled.matching_rule_indexes(&allowed_model) {
+                if !compiled.rule_is_valid(rule_index) {
+                    continue;
+                }
+                let summary = &mut summaries[rule_index];
+                summary.key_ids.insert(key.id.clone());
+                summary.model_names.insert(allowed_model.clone());
+                summary.provider_ids.insert(key.provider_id.clone());
+                if expanded_rule_index == Some(rule_index) {
+                    expanded_details
+                        .entry(key.id.clone())
+                        .or_insert_with(|| MappingPreviewKeyDetail {
+                            key_id: key.id.clone(),
+                            key_name: key.name.clone(),
+                            masked_key: state.masked_catalog_api_key(&key),
+                            provider_id: key.provider_id.clone(),
+                            provider_name: provider_names
+                                .get(&key.provider_id)
+                                .cloned()
+                                .unwrap_or_default(),
+                            matched_models: BTreeSet::new(),
+                        })
+                        .matched_models
+                        .insert(allowed_model.clone());
+                }
+            }
+        }
+    }
+
+    let rules = mappings
+        .iter()
+        .enumerate()
+        .map(|(index, pattern)| {
+            let summary = &summaries[index];
+            json!({
+                "index": index,
+                "pattern": pattern,
+                "valid": compiled.rule_is_valid(index),
+                "matched_key_count": summary.key_ids.len(),
+                "matched_model_count": summary.model_names.len(),
+                "matched_provider_count": summary.provider_ids.len(),
+                "matched_provider_ids": summary.provider_ids.iter().collect::<Vec<_>>(),
+                "unlinked_provider_ids": summary.provider_ids.difference(&linked_provider_ids).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let page = request.page.max(1);
+    let page_size = request.page_size.clamp(1, 100);
+    let total_keys = expanded_details.len();
+    let offset = (page - 1).saturating_mul(page_size);
+    let keys = expanded_details
+        .into_values()
+        .skip(offset)
+        .take(page_size)
+        .map(|detail| {
+            json!({
+                "key_id": detail.key_id,
+                "key_name": detail.key_name,
+                "masked_key": detail.masked_key,
+                "provider_id": detail.provider_id,
+                "provider_name": detail.provider_name,
+                "is_linked": linked_provider_ids.contains(&detail.provider_id),
+                "matched_models": detail.matched_models.into_iter().collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Some(json!({
+        "global_model_id": global_model_id,
+        "rules": rules,
+        "expanded": expanded_rule_index.map(|rule_index| json!({
+            "rule_index": rule_index,
+            "page": page,
+            "page_size": page_size,
+            "total_keys": total_keys,
+            "keys": keys,
+        })),
+    }))
+}
+
+async fn load_active_provider_names_and_keys(
+    state: &AdminAppState<'_>,
+) -> (BTreeMap<String, String>, Vec<StoredProviderCatalogKey>) {
+    let active_providers = state
+        .list_provider_catalog_providers(true)
+        .await
+        .ok()
+        .unwrap_or_default();
+    let provider_ids = active_providers
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect::<Vec<_>>();
+    let provider_names = active_providers
+        .into_iter()
+        .map(|provider| (provider.id, provider.name))
+        .collect::<BTreeMap<_, _>>();
+    let keys = if provider_ids.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .list_provider_catalog_keys_by_provider_ids(&provider_ids)
+            .await
+            .ok()
+            .unwrap_or_default()
+    };
+    (provider_names, keys)
+}
+
+fn normalized_allowed_models(raw: Option<&serde_json::Value>) -> Vec<String> {
+    let mut models = json_string_list(raw)
+        .into_iter()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .collect::<Vec<_>>();
+    models.sort_unstable();
+    models.dedup();
+    models
 }
 
 fn provider_model_mapping_names_for_routing(

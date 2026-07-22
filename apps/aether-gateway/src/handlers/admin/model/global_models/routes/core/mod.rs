@@ -1,3 +1,4 @@
+mod previews;
 mod reads;
 mod shared;
 mod writes;
@@ -16,6 +17,16 @@ pub(crate) async fn maybe_build_local_admin_global_models_response(
 ) -> Result<Option<Response<Body>>, GatewayError> {
     if let Some(response) =
         reads::maybe_build_local_admin_global_models_read_response(state, request_context).await?
+    {
+        return Ok(Some(response));
+    }
+
+    if let Some(response) = previews::maybe_build_local_admin_global_models_preview_response(
+        state,
+        request_context,
+        request_body,
+    )
+    .await?
     {
         return Ok(Some(response));
     }

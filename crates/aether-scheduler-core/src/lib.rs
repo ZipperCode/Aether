@@ -3,6 +3,7 @@ mod auth;
 mod candidate;
 mod health;
 mod model;
+mod model_mapping;
 mod provider;
 mod ranking;
 mod request_candidate;
@@ -47,6 +48,10 @@ pub use model::{
     row_supports_requested_model, row_supports_requested_model_with_model_directives,
     row_supports_requested_model_with_model_directives_and_request_operation,
     row_supports_required_capability, select_provider_model_name,
+};
+pub use model_mapping::{
+    compiled_model_mappings, model_mapping_cache_stats, CompiledModelMappings,
+    ModelMappingCacheStats,
 };
 pub use provider::{build_provider_concurrent_limit_map, should_skip_provider_quota};
 pub use ranking::{

@@ -533,6 +533,22 @@ fn classifies_admin_global_model_routing_as_admin_proxy_route() {
 }
 
 #[test]
+fn classifies_admin_global_model_mapping_preview_as_admin_proxy_route() {
+    let headers = headers(&[]);
+    let uri: Uri = "/api/admin/models/global/global-gpt-5/mapping-preview"
+        .parse()
+        .expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::POST, &uri, &headers).expect("route should classify");
+
+    assert_eq!(
+        decision.route_family.as_deref(),
+        Some("global_models_manage")
+    );
+    assert_eq!(decision.route_kind.as_deref(), Some("mapping_preview"));
+}
+
+#[test]
 fn classifies_admin_get_global_model_as_admin_proxy_route() {
     let headers = headers(&[]);
     let uri: Uri = "/api/admin/models/global/global-gpt-5"

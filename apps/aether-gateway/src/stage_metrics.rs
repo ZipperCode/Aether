@@ -69,6 +69,11 @@ const STAGES: &[&str] = &[
     "openai_chat_payload_body_build",
     "candidate_page_load",
     "candidate_page_resolve",
+    "candidate_database_read",
+    "candidate_global_model_resolve",
+    "candidate_mapping_match",
+    "candidate_enumeration",
+    "candidate_dynamic_eligibility",
     "pool_cursor_next_key",
     "pool_score_load",
     "pool_score_key_rows",
@@ -327,6 +332,31 @@ fn gateway_stage_metric_samples_for_enabled(enabled: bool) -> Vec<MetricSample> 
         "Number of chat PII redaction request-cache misses.",
         MetricKind::Counter,
         CHAT_PII_REDACTION_REQUEST_CACHE_MISS_TOTAL.load(Ordering::Relaxed),
+    ));
+    let mapping_cache = aether_scheduler_core::model_mapping_cache_stats();
+    samples.push(MetricSample::new(
+        "model_mapping_compile_cache_hit_total",
+        "Number of compiled model mapping cache hits.",
+        MetricKind::Counter,
+        mapping_cache.hits,
+    ));
+    samples.push(MetricSample::new(
+        "model_mapping_compile_cache_miss_total",
+        "Number of compiled model mapping cache misses.",
+        MetricKind::Counter,
+        mapping_cache.misses,
+    ));
+    samples.push(MetricSample::new(
+        "model_mapping_compile_cache_eviction_total",
+        "Number of compiled model mapping cache evictions.",
+        MetricKind::Counter,
+        mapping_cache.evictions,
+    ));
+    samples.push(MetricSample::new(
+        "model_mapping_rule_compile_total",
+        "Number of model mapping rules compiled.",
+        MetricKind::Counter,
+        mapping_cache.rule_compiles,
     ));
     samples
 }

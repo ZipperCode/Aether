@@ -916,6 +916,7 @@ async fn gateway_handles_admin_global_model_routing_locally_with_trusted_admin_p
     let alt_keys = alt_endpoints[0]["keys"].as_array().expect("keys array");
     assert_eq!(alt_keys.len(), 1);
     assert_eq!(alt_keys[0]["allowed_models"], json!(["gpt-5-upstream"]));
+    assert_eq!(alt_keys[0]["matched_models"], json!(["gpt-5-upstream"]));
 
     let whitelist = payload["all_keys_whitelist"]
         .as_array()
@@ -930,6 +931,66 @@ async fn gateway_handles_admin_global_model_routing_locally_with_trusted_admin_p
     assert!(whitelist
         .iter()
         .any(|item| item["key_id"] == "key-unlinked-routing"));
+
+    let lightweight_response = reqwest::Client::new()
+        .get(format!(
+            "{gateway_url}/api/admin/models/global/global-gpt-5/routing?include_whitelist=false"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("lightweight routing request should succeed");
+    assert_eq!(lightweight_response.status(), StatusCode::OK);
+    let lightweight_payload: serde_json::Value = lightweight_response
+        .json()
+        .await
+        .expect("lightweight routing json should parse");
+    assert_eq!(lightweight_payload["all_keys_whitelist"], json!([]));
+
+    let preview_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/models/global/global-gpt-5/mapping-preview"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "mappings": ["gpt-5-upstream.*", "([bad"],
+            "expanded_rule_index": 0,
+            "page": 1,
+            "page_size": 1
+        }))
+        .send()
+        .await
+        .expect("mapping preview request should succeed");
+    let preview_status = preview_response.status();
+    let preview_text = preview_response
+        .text()
+        .await
+        .expect("mapping preview body should read");
+    assert_eq!(preview_status, StatusCode::OK, "{preview_text}");
+    let preview_payload: serde_json::Value =
+        serde_json::from_str(&preview_text).expect("mapping preview json should parse");
+    assert_eq!(preview_payload["rules"][0]["matched_key_count"], 2);
+    assert_eq!(preview_payload["rules"][0]["matched_model_count"], 2);
+    assert_eq!(preview_payload["rules"][0]["matched_provider_count"], 2);
+    assert_eq!(
+        preview_payload["rules"][0]["unlinked_provider_ids"],
+        json!(["provider-unlinked"])
+    );
+    assert_eq!(preview_payload["rules"][1]["valid"], false);
+    assert_eq!(preview_payload["expanded"]["total_keys"], 2);
+    assert_eq!(
+        preview_payload["expanded"]["keys"]
+            .as_array()
+            .expect("expanded keys array")
+            .len(),
+        1
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

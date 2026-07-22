@@ -394,6 +394,7 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                     Some("batch_delete_global_models"),
                 )
                 | (Some("global_models_manage"), http::Method::POST, Some("assign_to_providers"))
+                | (Some("global_models_manage"), http::Method::POST, Some("mapping_preview"))
                 | (Some("providers_manage"), http::Method::POST, Some("create_provider"))
                 | (Some("providers_manage"), http::Method::PATCH, Some("update_provider")) => true,
                 _ => false,

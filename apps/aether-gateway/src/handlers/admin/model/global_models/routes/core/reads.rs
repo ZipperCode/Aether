@@ -77,7 +77,14 @@ async fn build_routing_preview_response(
         return Ok(global_model_missing_response());
     };
     Ok(
-        match build_admin_global_model_routing_payload(state, &global_model_id).await {
+        match build_admin_global_model_routing_payload(
+            state,
+            &global_model_id,
+            query_param_optional_bool(request_context.query_string(), "include_whitelist")
+                .unwrap_or(true),
+        )
+        .await
+        {
             Some(payload) => Json::<serde_json::Value>(payload).into_response(),
             None => global_model_not_found_response(&global_model_id),
         },

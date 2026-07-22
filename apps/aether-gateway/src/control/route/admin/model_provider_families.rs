@@ -315,6 +315,17 @@ pub(super) fn classify_admin_model_provider_family_route(
             "admin:models",
             false,
         ))
+    } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/models/global/")
+        && normalized_path.ends_with("/mapping-preview")
+    {
+        Some(classified(
+            "admin_proxy",
+            "global_models_manage",
+            "mapping_preview",
+            "admin:models",
+            false,
+        ))
     } else if method == http::Method::GET
         && normalized_path.starts_with("/api/admin/models/global/")
         && normalized_path.matches('/').count() == 5

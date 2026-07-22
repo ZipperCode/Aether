@@ -21,7 +21,9 @@ pub(super) use self::global::{
 pub(super) use self::global_models::maybe_build_local_admin_global_models_response;
 pub(super) use self::routes::maybe_build_local_admin_model_response;
 pub(super) use self::routing::{
-    build_admin_assign_global_model_to_providers_payload, build_admin_global_model_routing_payload,
+    build_admin_assign_global_model_to_providers_payload,
+    build_admin_global_model_mapping_preview_payload, build_admin_global_model_routing_payload,
+    AdminGlobalModelMappingPreviewRequest,
 };
 pub(super) use self::write::{
     build_admin_global_model_create_record, build_admin_global_model_update_record,

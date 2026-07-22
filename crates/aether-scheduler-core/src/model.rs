@@ -1,11 +1,11 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
+use crate::compiled_model_mappings;
 use aether_data_contracts::repository::candidate_selection::{
     StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
 };
 use aether_data_contracts::DataLayerError;
-use regex::RegexBuilder;
 
 pub fn resolve_requested_global_model_name(
     rows: &[StoredMinimalCandidateSelectionRow],
@@ -71,9 +71,7 @@ pub fn resolve_requested_global_model_name_with_model_directives_and_request_ope
                 resolve_global_model_name_by(rows, |row| {
                     row_has_available_provider_model(row, api_format, request_operation)
                         && row.global_model_mappings.as_ref().is_some_and(|patterns| {
-                            patterns
-                                .iter()
-                                .any(|pattern| matches_model_mapping(pattern, requested_model_name))
+                            compiled_model_mappings(patterns).matches_any(requested_model_name)
                         })
                 })
             })
@@ -134,9 +132,7 @@ fn row_supports_requested_model_exact(
             || (row_default_provider_model_name_available(row, api_format, request_operation)
                 && row.model_provider_model_name == requested_model_name)
             || row.global_model_mappings.as_ref().is_some_and(|patterns| {
-                patterns
-                    .iter()
-                    .any(|pattern| matches_model_mapping(pattern, requested_model_name))
+                compiled_model_mappings(patterns).matches_any(requested_model_name)
             }))
         || row
             .model_provider_model_mappings
@@ -199,6 +195,24 @@ pub fn resolve_provider_model_name_with_model_directives_and_request_operation(
     enable_model_directives: bool,
     request_operation: Option<&str>,
 ) -> Option<(String, Option<String>)> {
+    resolve_provider_model_name_with_prepared_allowed_models(
+        row,
+        requested_model_name,
+        api_format,
+        enable_model_directives,
+        request_operation,
+        None,
+    )
+}
+
+pub(crate) fn resolve_provider_model_name_with_prepared_allowed_models(
+    row: &StoredMinimalCandidateSelectionRow,
+    requested_model_name: &str,
+    api_format: &str,
+    enable_model_directives: bool,
+    request_operation: Option<&str>,
+    prepared_allowed_models: Option<&[String]>,
+) -> Option<(String, Option<String>)> {
     let selected_provider_model_name =
         resolve_selected_provider_model_name(row, api_format, request_operation)?;
     let Some(key_allowed_models) = row.key_allowed_models.as_ref() else {
@@ -221,15 +235,21 @@ pub fn resolve_provider_model_name_with_model_directives_and_request_operation(
         }
     }
 
-    let mut sorted_allowed_models = key_allowed_models
-        .iter()
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    sorted_allowed_models.sort_unstable();
+    let sorted_allowed_models = prepared_allowed_models.map_or_else(
+        || {
+            let mut models = key_allowed_models
+                .iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            models.sort_unstable();
+            models.dedup();
+            Cow::Owned(models)
+        },
+        Cow::Borrowed,
+    );
 
-    for &allowed_model in &sorted_allowed_models {
+    for allowed_model in sorted_allowed_models.iter().map(String::as_str) {
         if row_has_candidate_model_name(row, api_format, request_operation, allowed_model) {
             let allowed_model = allowed_model.to_owned();
             return Some((selected_provider_model_name.clone(), Some(allowed_model)));
@@ -237,12 +257,11 @@ pub fn resolve_provider_model_name_with_model_directives_and_request_operation(
     }
 
     let global_model_mappings = row.global_model_mappings.as_ref()?;
-    for &allowed_model in &sorted_allowed_models {
-        for pattern in global_model_mappings {
-            if matches_model_mapping(pattern, allowed_model) {
-                let allowed_model = allowed_model.to_owned();
-                return Some((allowed_model.clone(), Some(allowed_model)));
-            }
+    let compiled_global_model_mappings = compiled_model_mappings(global_model_mappings);
+    for allowed_model in sorted_allowed_models.iter().map(String::as_str) {
+        if compiled_global_model_mappings.matches_any(allowed_model) {
+            let allowed_model = allowed_model.to_owned();
+            return Some((allowed_model.clone(), Some(allowed_model)));
         }
     }
 
@@ -414,18 +433,7 @@ fn capabilities_support_required_capability(
 }
 
 pub fn matches_model_mapping(pattern: &str, model_name: &str) -> bool {
-    if pattern.eq_ignore_ascii_case(model_name) {
-        return true;
-    }
-
-    let regex_pattern = format!("^(?:{pattern})$");
-    let Ok(compiled) = RegexBuilder::new(&regex_pattern)
-        .case_insensitive(true)
-        .build()
-    else {
-        return false;
-    };
-    compiled.is_match(model_name)
+    compiled_model_mappings(&[pattern.to_string()]).matches_any(model_name)
 }
 
 pub fn extract_global_priority_for_format(

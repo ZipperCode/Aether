@@ -14,6 +14,7 @@ pub(crate) fn admin_global_model_id_from_path(request_path: &str) -> Option<Stri
         || normalized.ends_with("/providers")
         || normalized.ends_with("/assign-to-providers")
         || normalized.ends_with("/routing")
+        || normalized.ends_with("/mapping-preview")
     {
         None
     } else {
@@ -33,6 +34,14 @@ pub(crate) fn admin_global_model_routing_id(request_path: &str) -> Option<String
     request_path
         .strip_prefix("/api/admin/models/global/")?
         .strip_suffix("/routing")
+        .map(|value| value.trim().trim_matches('/').to_string())
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+}
+
+pub(crate) fn admin_global_model_mapping_preview_id(request_path: &str) -> Option<String> {
+    request_path
+        .strip_prefix("/api/admin/models/global/")?
+        .strip_suffix("/mapping-preview")
         .map(|value| value.trim().trim_matches('/').to_string())
         .filter(|value| !value.is_empty() && !value.contains('/'))
 }

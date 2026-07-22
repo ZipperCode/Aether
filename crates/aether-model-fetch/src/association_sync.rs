@@ -5,7 +5,7 @@ use aether_data_contracts::repository::global_models::{
     StoredAdminProviderModel, UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
-use aether_scheduler_core::matches_model_mapping;
+use aether_scheduler_core::compiled_model_mappings;
 use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
@@ -105,11 +105,11 @@ where
         if mappings.is_empty() {
             continue;
         }
-        if !allowed_models.iter().any(|allowed_model| {
-            mappings
-                .iter()
-                .any(|pattern| matches_model_mapping(pattern, allowed_model))
-        }) {
+        let compiled_mappings = compiled_model_mappings(&mappings);
+        if !allowed_models
+            .iter()
+            .any(|allowed_model| compiled_mappings.matches_any(allowed_model))
+        {
             continue;
         }
 

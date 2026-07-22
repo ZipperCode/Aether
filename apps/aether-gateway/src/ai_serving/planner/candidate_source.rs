@@ -859,6 +859,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 return Ok(None);
             }
             let limit = REQUESTED_MODEL_CANDIDATE_PAGE_SIZE.min(remaining);
+            let database_read_started_at = std::time::Instant::now();
             let page = self
                 .read_requested_model_rows_fast_path_page_cached(
                     &normalized_api_format,
@@ -868,6 +869,10 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                     limit,
                 )
                 .await?;
+            observe_gateway_stage_ms(
+                "candidate_database_read",
+                database_read_started_at.elapsed().as_millis() as u64,
+            );
             self.scanned_rows_by_format.insert(
                 normalized_api_format.clone(),
                 scanned.saturating_add(page.scanned_rows),
@@ -990,6 +995,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         }
 
         let routing_model = self.routing_model(candidate_api_format).to_string();
+        let database_read_started_at = std::time::Instant::now();
         let rows = self
             .state
             .app()
@@ -1008,6 +1014,10 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 )
             })
             .collect::<Vec<_>>();
+        observe_gateway_stage_ms(
+            "candidate_database_read",
+            database_read_started_at.elapsed().as_millis() as u64,
+        );
 
         let outcome = self
             .build_page_outcome_from_rows(candidate_api_format, normalized_api_format, rows)
@@ -1039,6 +1049,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         >,
         GatewayError,
     > {
+        let enumeration_started_at = std::time::Instant::now();
         let mut rows = rows
             .into_iter()
             .filter(|row| {
@@ -1048,10 +1059,15 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 ))
             })
             .collect::<Vec<_>>();
+        observe_gateway_stage_ms(
+            "candidate_enumeration",
+            enumeration_started_at.elapsed().as_millis() as u64,
+        );
         if rows.is_empty() {
             return Ok(None);
         }
         let routing_model = self.routing_model(candidate_api_format).to_string();
+        let global_model_resolve_started_at = std::time::Instant::now();
         let resolved_global_model_name =
             if let Some(value) = self.resolved_global_model_names.get(normalized_api_format) {
                 value.clone()
@@ -1071,6 +1087,10 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                     .insert(normalized_api_format.to_string(), value.clone());
                 value
             };
+        observe_gateway_stage_ms(
+            "candidate_global_model_resolve",
+            global_model_resolve_started_at.elapsed().as_millis() as u64,
+        );
         rows.retain(|row| row.global_model_name == resolved_global_model_name);
         if rows.is_empty() {
             return Ok(None);
@@ -1083,6 +1103,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         )
         .then_some(&self.auth_snapshot)
         .map(crate::data::candidate_selection::auth_snapshot_constraints);
+        let mapping_match_started_at = std::time::Instant::now();
         let enumerated_candidates = enumerate_minimal_candidate_selection_with_model_directives(
             EnumerateMinimalCandidateSelectionInput {
                 rows,
@@ -1097,6 +1118,11 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             false,
         )
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        observe_gateway_stage_ms(
+            "candidate_mapping_match",
+            mapping_match_started_at.elapsed().as_millis() as u64,
+        );
+        let dynamic_eligibility_started_at = std::time::Instant::now();
         let mut candidates = Vec::new();
         for candidate in enumerated_candidates {
             if !self.candidate_allowed_for_page(&candidate, candidate_api_format) {
@@ -1110,6 +1136,10 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             }
             candidates.push(candidate);
         }
+        observe_gateway_stage_ms(
+            "candidate_dynamic_eligibility",
+            dynamic_eligibility_started_at.elapsed().as_millis() as u64,
+        );
 
         let matches_client_format = matches_client_api_format(
             self.use_api_format_alias_match,

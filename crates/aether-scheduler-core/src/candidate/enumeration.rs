@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
 use aether_data_contracts::DataLayerError;
@@ -51,6 +51,7 @@ fn enumerate_minimal_candidate_selection_inner(
     }
 
     let mut candidates = Vec::with_capacity(rows.len());
+    let mut allowed_models_by_key = HashMap::<String, Vec<String>>::new();
     for row in rows {
         if !crate::auth_constraints_allow_provider(
             auth_constraints,
@@ -63,13 +64,34 @@ fn enumerate_minimal_candidate_selection_inner(
         if require_streaming && !row.supports_streaming() {
             continue;
         }
+        let prepared_allowed_models = if let Some(allowed_models) = row.key_allowed_models.as_ref()
+        {
+            Some(
+                allowed_models_by_key
+                    .entry(row.key_id.clone())
+                    .or_insert_with(|| {
+                        let mut models = allowed_models
+                            .iter()
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .collect::<Vec<_>>();
+                        models.sort_unstable();
+                        models.dedup();
+                        models
+                    })
+                    .as_slice(),
+            )
+        } else {
+            None
+        };
         let Some((selected_provider_model_name, mapping_matched_model)) =
-            crate::resolve_provider_model_name_with_model_directives_and_request_operation(
+            crate::model::resolve_provider_model_name_with_prepared_allowed_models(
                 &row,
                 requested_model_name,
                 normalized_api_format,
                 enable_model_directives,
                 request_operation,
+                prepared_allowed_models,
             )
         else {
             continue;
