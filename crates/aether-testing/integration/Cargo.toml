@@ -14,7 +14,7 @@ aether-data-contracts.workspace = true
 aether-gateway = { workspace = true, features = ["testkit"] }
 aether-runtime-state.workspace = true
 aether-testkit = { workspace = true, features = ["gateway", "postgres"] }
-axum.workspace = true
+axum = { workspace = true, features = ["http2"] }
 futures-util.workspace = true
 http.workspace = true
 reqwest.workspace = true

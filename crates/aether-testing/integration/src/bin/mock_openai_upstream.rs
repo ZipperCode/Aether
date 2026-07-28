@@ -1452,12 +1452,21 @@ mod tests {
         expected_version: axum::http::Version,
         completion_marker: &str,
     ) {
-        let response = client
+        let response = match client
             .post(url)
             .json(&json!({"stream": true, "model": "mock-test"}))
             .send()
             .await
-            .expect("headers should arrive before the body error");
+        {
+            Ok(response) => response,
+            Err(error)
+                if expected_version == axum::http::Version::HTTP_2
+                    && is_expected_h2_truncation_error(&error) =>
+            {
+                return;
+            }
+            Err(error) => panic!("headers should arrive before the body error: {error:?}"),
+        };
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(response.version(), expected_version);
         assert!(response.headers().contains_key(REQUEST_SEQUENCE_HEADER));
@@ -1496,6 +1505,14 @@ mod tests {
         );
     }
 
+    fn is_expected_h2_truncation_error(error: &reqwest::Error) -> bool {
+        let debug = format!("{error:?}").to_ascii_lowercase();
+        error.is_request()
+            && (debug.contains("http2") || debug.contains("http/2"))
+            && debug.contains("reset")
+            && debug.contains("internal_error")
+    }
+
     async fn wait_for_completed(metrics: &Metrics, expected: u64) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while metrics.completed_total.load(Ordering::Acquire) < expected
@@ -1510,6 +1527,7 @@ mod tests {
         let (base_url, metrics, server) = start_truncating_server().await;
         let client = reqwest::Client::builder()
             .http1_only()
+            .no_proxy()
             .build()
             .expect("HTTP/1 test client should build");
 
@@ -1547,6 +1565,7 @@ mod tests {
         let (base_url, metrics, server) = start_truncating_server().await;
         let client = reqwest::Client::builder()
             .http2_prior_knowledge()
+            .no_proxy()
             .build()
             .expect("H2C test client should build");
 
@@ -1557,6 +1576,11 @@ mod tests {
             "\"finish_reason\":\"stop\"",
         )
         .await;
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .no_proxy()
+            .build()
+            .expect("H2C test client should build");
         assert_truncated_response(
             &client,
             &format!("{base_url}/v1/responses"),

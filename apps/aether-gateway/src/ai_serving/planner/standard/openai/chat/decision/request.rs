@@ -2307,19 +2307,15 @@ mod tests {
         transport.provider.provider_type = "antigravity".to_string();
         transport.endpoint.base_url = "https://antigravity.googleapis.com".to_string();
         transport.endpoint.custom_path = None;
-        transport.key.auth_type = "oauth".to_string();
-        transport.key.decrypted_api_key = "__placeholder__".to_string();
+        transport.key.auth_type = "bearer".to_string();
+        transport.key.decrypted_api_key = "imported-antigravity-token".to_string();
         transport.key.upstream_metadata = None;
         transport.key.decrypted_auth_config = Some(
             json!({
                 "provider_type": "antigravity",
                 "project_id": "test-antigravity-project",
                 "client_version": "1.2.3",
-                "session_id": "sess-antigravity-chat",
-                "access_token_import_temporary": true,
-                "headers": {
-                    "Authorization": "Bearer imported-antigravity-token"
-                }
+                "session_id": "sess-antigravity-chat"
             })
             .to_string(),
         );

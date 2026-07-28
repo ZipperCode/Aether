@@ -379,7 +379,8 @@ mod tests {
                 "access_token": "fresh-kiro-access-token",
                 "expires_at": u64::MAX,
                 "machine_id": "123e4567-e89b-12d3-a456-426614174000",
-                "kiro_version": "1.2.3"
+                "kiro_version": "1.2.3",
+                "profile_arn": "arn:aws:bedrock:demo"
             })
             .to_string(),
         ))
