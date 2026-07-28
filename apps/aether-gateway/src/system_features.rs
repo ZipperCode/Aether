@@ -120,7 +120,7 @@ impl ModelDirectivePolicySnapshot {
             .as_ref()
             .and_then(|settings| settings.api_format_mappings(&api_format));
         let default_suffixes;
-        let suffixes = match enabled_suffixes {
+        let mut suffixes = match enabled_suffixes {
             Some(suffixes) => suffixes
                 .iter()
                 .filter(|suffix| {
@@ -137,11 +137,28 @@ impl ModelDirectivePolicySnapshot {
                 default_suffixes.to_vec()
             }
         };
-        let Some(directive) = requested_model
+        let search_fast_is_routing_only = api_format == "openai:search";
+        if search_fast_is_routing_only
+            && !suffixes
+                .iter()
+                .any(|suffix| suffix.eq_ignore_ascii_case("fast"))
+        {
+            suffixes.push("fast");
+        }
+        let Some(mut directive) = requested_model
             .and_then(|model| parse_model_directive_with_suffixes(model, suffixes.iter().copied()))
         else {
             return ReasoningModelDirectiveResolution::default();
         };
+        if search_fast_is_routing_only {
+            // Search 不接收 service_tier，但 fast 仍需从候选匹配模型中剥离。
+            directive
+                .suffixes
+                .retain(|suffix| ServiceTier::parse(suffix).is_none());
+            if directive.suffixes.is_empty() {
+                return ReasoningModelDirectiveResolution::default();
+            }
+        }
         if directive.suffixes.iter().any(|suffix| {
             model_directive_suffix_has_builtin_mapping(suffix)
                 && !model_directive_builtin_suffix_supported_for_source_model(
@@ -724,7 +741,7 @@ mod tests {
         );
         assert_eq!(
             default_reasoning_mapping_for_model("openai:responses", "gpt-5.4", "max"),
-            None
+            Some(json!({ "reasoning": { "effort": "max" } }))
         );
     }
 
@@ -774,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn mapped_model_controls_builtin_reasoning_capability() {
+    fn unprofiled_models_preserve_builtin_reasoning_directives() {
         let snapshot = ModelDirectivePolicySnapshot::from_config_values(Some(&json!(true)), None);
         let resolution =
             snapshot.resolve_reasoning("openai:responses", Some("deployment-alias-max"));
@@ -786,7 +803,7 @@ mod tests {
         );
         assert_eq!(
             resolution.mapping_patch_for_mapped_model("gpt-5.4"),
-            Err("model_directive_target_unsupported")
+            Ok(Some(json!({ "reasoning": { "effort": "max" } })))
         );
 
         let known_source = snapshot.resolve_reasoning("openai:responses", Some("gpt-5.6-sol-max"));
@@ -799,7 +816,7 @@ mod tests {
             snapshot.resolve_reasoning("openai:responses", Some("gpt-5.4-max"));
         assert_eq!(
             unsupported_source.mapping_patch_for_mapped_model("azure-production"),
-            Err("model_directive_target_unsupported")
+            Ok(Some(json!({ "reasoning": { "effort": "max" } })))
         );
     }
 

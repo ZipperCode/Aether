@@ -14,6 +14,7 @@ pub(crate) use crate::ai_serving::finalize::standard::{
 pub(crate) use crate::ai_serving::{
     aggregate_claude_stream_sync_response, aggregate_gemini_stream_sync_response,
     aggregate_openai_chat_stream_sync_response, aggregate_openai_responses_stream_sync_response,
+    apply_agent_bridge_response_carriers_from_report_context,
     maybe_build_openai_image_sync_finalize_product,
 };
 pub(crate) use crate::ai_serving::{
@@ -72,7 +73,7 @@ pub(crate) fn maybe_build_local_core_sync_finalize_response(
             else {
                 return Ok(None);
             };
-            aether_ai_formats::apply_agent_bridge_response_carriers_from_report_context(
+            apply_agent_bridge_response_carriers_from_report_context(
                 &mut product.client_body_json,
                 report_context,
             );

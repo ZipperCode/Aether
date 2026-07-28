@@ -2094,6 +2094,7 @@ fn admin_provider_oauth_dispatch_batch_mod_stays_thin() {
         "mod parse;",
         "mod task;",
         "pub(super) use orchestration::handle_admin_provider_oauth_batch_import;",
+        "pub(super) use task::handle_admin_provider_oauth_start_agent_identity_import_task;",
         "pub(super) use task::handle_admin_provider_oauth_start_batch_import_task;",
     ] {
         assert!(
@@ -2133,7 +2134,7 @@ fn admin_provider_oauth_dispatch_batch_mod_stays_thin() {
         "pub(super) fn apply_admin_provider_oauth_batch_import_hints(",
         "pub(super) async fn extract_admin_provider_oauth_batch_error_detail(",
         "pub(super) fn build_admin_provider_oauth_batch_import_response(",
-        "pub(super) fn build_admin_provider_oauth_batch_task_state(",
+        "pub(in super::super) fn build_admin_provider_oauth_batch_task_state(",
     ] {
         assert!(
             batch_parse.contains(pattern),

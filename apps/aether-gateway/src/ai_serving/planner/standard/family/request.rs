@@ -620,7 +620,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
                 transport.endpoint.base_url.as_str(),
                 transport.key.capabilities.as_ref(),
             );
-        aether_ai_formats::sanitize_claude_request_for_agent_bridge_conversion_with_prompt_cache(
+        crate::ai_serving::sanitize_claude_request_for_agent_bridge_conversion_with_prompt_cache(
             body_json,
             supports_explicit_prompt_cache,
         )

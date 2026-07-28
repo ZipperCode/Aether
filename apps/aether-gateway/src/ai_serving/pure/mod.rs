@@ -169,9 +169,18 @@ pub(crate) use aether_ai_formats::api::{
     OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
 pub(crate) use aether_ai_formats::{
-    api_format_defaults_to_client_error_failover, api_format_defaults_to_non_stream,
-    api_format_permission_covers, intersect_api_format_allowed_lists, is_embedding_api_format,
-    is_rerank_api_format, openai_responses_request_operation, ApiOperation, ClientSurface,
+    agent_bridge_prompt_cache_identity, api_format_defaults_to_client_error_failover,
+    api_format_defaults_to_non_stream, api_format_permission_covers,
+    apply_agent_bridge_codex_overlay_with_report,
+    apply_agent_bridge_response_carriers_from_report_context, infer_agent_bridge_message_phase,
+    intersect_api_format_allowed_lists, is_embedding_api_format, is_rerank_api_format,
+    openai_model_supports_prompt_cache_options, openai_responses_request_operation,
+    sanitize_claude_request_for_agent_bridge_conversion,
+    sanitize_claude_request_for_agent_bridge_conversion_with_prompt_cache,
+    sanitize_openai_responses_for_claude_projection, scan_claude_agent_bridge_history,
+    validate_agent_bridge_function_call_arguments, AgentBridgeCompatibilityReport,
+    AgentBridgePrimaryState, AgentBridgeRequestSanitizeReport, ApiOperation, ClientSurface,
+    AGENT_BRIDGE_HANDLE_PREFIX, AGENT_BRIDGE_REASONING_PREFIX, AGENT_BRIDGE_REPORT_CONTEXT_FIELD,
 };
 
 pub(crate) fn plan_kind_matches_api_operation(

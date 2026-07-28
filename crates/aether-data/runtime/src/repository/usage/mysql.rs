@@ -24,8 +24,9 @@ use super::InMemoryUsageReadRepository;
 use crate::driver::mysql::MysqlPool;
 use crate::DataLayerError;
 
+use aether_data_mysql::MysqlUsageReadFilter;
+use aether_data_mysql::MysqlUsageStorage;
 pub use aether_data_mysql::MysqlUsageWriteRepository;
-use aether_data_mysql::{MysqlUsageReadFilter, MysqlUsageStorage};
 
 #[derive(Debug, Clone)]
 pub struct MysqlUsageReadRepository {

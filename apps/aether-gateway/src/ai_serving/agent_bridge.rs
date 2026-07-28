@@ -2,15 +2,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::time::Duration;
 
-use aes_gcm::aead::{Aead, AeadCore, OsRng, Payload};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use aether_ai_formats::{
+use super::{
     agent_bridge_prompt_cache_identity, apply_agent_bridge_codex_overlay_with_report,
-    infer_agent_bridge_message_phase, sanitize_openai_responses_for_claude_projection,
+    infer_agent_bridge_message_phase, normalize_api_format_alias,
+    openai_model_supports_prompt_cache_options, sanitize_openai_responses_for_claude_projection,
     scan_claude_agent_bridge_history, validate_agent_bridge_function_call_arguments,
     AgentBridgeCompatibilityReport, AgentBridgePrimaryState, AgentBridgeRequestSanitizeReport,
     AGENT_BRIDGE_HANDLE_PREFIX, AGENT_BRIDGE_REASONING_PREFIX, AGENT_BRIDGE_REPORT_CONTEXT_FIELD,
 };
+use aes_gcm::aead::{Aead, AeadCore, OsRng, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aether_runtime_state::RuntimeState;
 use aether_scheduler_core::ClientSessionAffinity;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -121,7 +122,7 @@ pub(crate) async fn prepare_agent_bridge_request(
         provider_id: input.provider_id.trim().to_string(),
         endpoint_id: input.endpoint_id.trim().to_string(),
         provider_key_id: input.provider_key_id.trim().to_string(),
-        target_format: aether_ai_formats::normalize_api_format_alias(input.provider_api_format),
+        target_format: normalize_api_format_alias(input.provider_api_format),
         mapped_model: input.mapped_model.trim().to_string(),
     };
     let mut report = AgentBridgeCompatibilityReport::default();
@@ -172,9 +173,8 @@ pub(crate) async fn agent_bridge_request_is_eligible(
     state: &AppState,
     input: AgentBridgeRequestInput<'_>,
 ) -> bool {
-    if aether_ai_formats::normalize_api_format_alias(input.client_api_format) != "claude:messages"
-        || aether_ai_formats::normalize_api_format_alias(input.provider_api_format)
-            != "openai:responses"
+    if normalize_api_format_alias(input.client_api_format) != "claude:messages"
+        || normalize_api_format_alias(input.provider_api_format) != "openai:responses"
     {
         return false;
     }
@@ -206,7 +206,7 @@ pub(crate) fn agent_bridge_supports_explicit_prompt_cache(
     endpoint_base_url: &str,
     provider_key_capabilities: Option<&Value>,
 ) -> bool {
-    if !aether_ai_formats::openai_model_supports_prompt_cache_options(mapped_model) {
+    if !openai_model_supports_prompt_cache_options(mapped_model) {
         return false;
     }
     if let Some(enabled) = explicit_prompt_cache_capability(provider_key_capabilities) {
@@ -1259,6 +1259,9 @@ fn encode_internal_sse_event(event_type: &str, value: &Value) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_serving::{
+        convert_request, sanitize_claude_request_for_agent_bridge_conversion, FormatContext,
+    };
     use crate::data::GatewayDataState;
     use aether_runtime_state::MemoryRuntimeStateConfig;
 
@@ -1650,12 +1653,12 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "WebFetch"}
         });
         let (conversion_body, sanitize_report) =
-            aether_ai_formats::sanitize_claude_request_for_agent_bridge_conversion(&claude_body);
-        let mut provider_body = aether_ai_formats::formats::registry::convert_request(
+            sanitize_claude_request_for_agent_bridge_conversion(&claude_body);
+        let mut provider_body = convert_request(
             "claude:messages",
             "openai:responses",
             &conversion_body,
-            &aether_ai_formats::FormatContext::default().with_mapped_model("gpt-5.4"),
+            &FormatContext::default().with_mapped_model("gpt-5.4"),
         )
         .unwrap();
         assert_eq!(provider_body["tools"][0]["name"], "WebFetch");
@@ -1764,12 +1767,12 @@ mod tests {
             ]
         });
         let (conversion_body, sanitize_report) =
-            aether_ai_formats::sanitize_claude_request_for_agent_bridge_conversion(&claude_body);
-        let mut provider_body = aether_ai_formats::formats::registry::convert_request(
+            sanitize_claude_request_for_agent_bridge_conversion(&claude_body);
+        let mut provider_body = convert_request(
             "claude:messages",
             "openai:responses",
             &conversion_body,
-            &aether_ai_formats::FormatContext::default().with_mapped_model("gpt-5.3-codex"),
+            &FormatContext::default().with_mapped_model("gpt-5.3-codex"),
         )
         .unwrap();
         let bridge = prepare_agent_bridge_request(
@@ -1881,12 +1884,12 @@ mod tests {
             }]
         });
         let (conversion_body, sanitize_report) =
-            aether_ai_formats::sanitize_claude_request_for_agent_bridge_conversion(&claude_body);
-        let mut provider_body = aether_ai_formats::formats::registry::convert_request(
+            sanitize_claude_request_for_agent_bridge_conversion(&claude_body);
+        let mut provider_body = convert_request(
             "claude:messages",
             "openai:responses",
             &conversion_body,
-            &aether_ai_formats::FormatContext::default().with_mapped_model("gpt-5.3-codex"),
+            &FormatContext::default().with_mapped_model("gpt-5.3-codex"),
         )
         .unwrap();
         let bridge = prepare_agent_bridge_request(
@@ -1944,12 +1947,12 @@ mod tests {
             }]
         });
         let (conversion_body, sanitize_report) =
-            aether_ai_formats::sanitize_claude_request_for_agent_bridge_conversion(&claude_body);
-        let mut provider_body = aether_ai_formats::formats::registry::convert_request(
+            sanitize_claude_request_for_agent_bridge_conversion(&claude_body);
+        let mut provider_body = convert_request(
             "claude:messages",
             "openai:responses",
             &conversion_body,
-            &aether_ai_formats::FormatContext::default().with_mapped_model("gpt-5.3-codex"),
+            &FormatContext::default().with_mapped_model("gpt-5.3-codex"),
         )
         .unwrap();
         let bridge = prepare_agent_bridge_request(
