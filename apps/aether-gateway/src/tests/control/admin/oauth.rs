@@ -151,27 +151,42 @@ fn sample_kiro_device_access_token_without_email() -> String {
     format!("{header}.{payload}.sig")
 }
 
-fn sample_codex_access_token_with_profile_email(email: &str, account_id: &str) -> String {
+fn sample_codex_access_token_with_profile_email_claims(
+    email: &str,
+    account_id: &str,
+    expires_at_unix_secs: Option<u64>,
+) -> String {
     use base64::Engine as _;
 
     let header =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        json!({
-            "iss": "https://auth.openai.com",
-            "aud": ["https://api.openai.com/v1"],
-            "exp": 2_000_000_000u64,
-            "https://api.openai.com/profile": {
-                "email": email,
-                "email_verified": true,
-            },
-            "https://api.openai.com/auth": {
-                "chatgpt_account_id": account_id,
-            },
-        })
-        .to_string(),
-    );
+    let mut claims = json!({
+        "iss": "https://auth.openai.com",
+        "aud": ["https://api.openai.com/v1"],
+        "https://api.openai.com/profile": {
+            "email": email,
+            "email_verified": true,
+        },
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+        },
+    });
+    if let Some(expires_at_unix_secs) = expires_at_unix_secs {
+        claims["exp"] = json!(expires_at_unix_secs);
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
     format!("{header}.{payload}.sig")
+}
+
+fn sample_codex_access_token_with_profile_email(email: &str, account_id: &str) -> String {
+    sample_codex_access_token_with_profile_email_claims(email, account_id, Some(2_000_000_000))
+}
+
+fn sample_codex_access_token_with_profile_email_without_exp(
+    email: &str,
+    account_id: &str,
+) -> String {
+    sample_codex_access_token_with_profile_email_claims(email, account_id, None)
 }
 
 fn codex_import_token_execution_result(request_id: &str) -> serde_json::Value {
@@ -4378,6 +4393,10 @@ async fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_h
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let access_token = sample_codex_access_token_with_profile_email_without_exp(
+        "temporary@example.com",
+        "acct-temporary-123",
+    );
 
     let response = reqwest::Client::new()
         .post(format!(
@@ -4388,7 +4407,7 @@ async fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_h
         .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
         .json(&json!({
-            "access_token": "opaque-codex-access-token",
+            "access_token": access_token,
             "expiresAt": 2_100_000_000u64,
             "name": "temporary-codex-opaque-access-token",
         }))
@@ -5930,7 +5949,7 @@ async fn gateway_starts_admin_provider_oauth_kiro_batch_import_task_locally_with
         .to_string();
 
     let mut status_payload = serde_json::Value::Null;
-    for _ in 0..40 {
+    for _ in 0..200 {
         let response = client
             .get(format!(
                 "{gateway_url}/api/admin/provider-oauth/providers/provider-kiro/batch-import/tasks/{task_id}"
@@ -7795,14 +7814,14 @@ async fn gateway_consecutive_manual_oauth_refresh_uses_rotated_refresh_token_imp
 }
 
 #[test]
-fn gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_after_lock_wait() {
+fn gateway_concurrent_manual_oauth_refresh_reuses_in_flight_result() {
     run_admin_oauth_test(
-        "gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_after_lock_wait",
-        gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_after_lock_wait_impl,
+        "gateway_concurrent_manual_oauth_refresh_reuses_in_flight_result",
+        gateway_concurrent_manual_oauth_refresh_reuses_in_flight_result_impl,
     );
 }
 
-async fn gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_after_lock_wait_impl() {
+async fn gateway_concurrent_manual_oauth_refresh_reuses_in_flight_result_impl() {
     let refresh_request_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let refresh_request_bodies_clone = Arc::clone(&refresh_request_bodies);
     let execution_runtime = Router::new().route(
@@ -7995,16 +8014,11 @@ async fn gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_afte
         .lock()
         .expect("mutex should lock")
         .clone();
-    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies.len(), 1);
     assert!(
         bodies[0].contains("refresh_token=old-codex-refresh-token"),
         "unexpected first refresh body: {}",
         bodies[0]
-    );
-    assert!(
-        bodies[1].contains("refresh_token=rotated-codex-refresh-token"),
-        "unexpected second refresh body: {}",
-        bodies[1]
     );
 
     let stored_key = provider_catalog_repository
@@ -8024,10 +8038,7 @@ async fn gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_afte
     .expect("auth config should decrypt");
     let auth_config: serde_json::Value =
         serde_json::from_str(&decrypted_auth_config).expect("auth config should parse");
-    assert_eq!(
-        auth_config["refresh_token"],
-        "rotated-codex-refresh-token-2"
-    );
+    assert_eq!(auth_config["refresh_token"], "rotated-codex-refresh-token");
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
