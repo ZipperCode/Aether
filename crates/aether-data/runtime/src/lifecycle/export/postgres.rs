@@ -488,6 +488,10 @@ fn normalize_postgres_import_value(
     if is_postgres_boolean_column(target_column) {
         return normalize_postgres_boolean_value(column_name, value);
     }
+    if is_postgres_integer_column(target_column) && import_column_stores_timestamp(column_name) {
+        return normalize_imported_integer_timestamp("postgres", table_name, column_name, value)
+            .map(|value| value.map(Value::from).unwrap_or(Value::Null));
+    }
     if is_postgres_timestamp_column(target_column) {
         return normalize_postgres_timestamp_value(table_name, column_name, value);
     }
@@ -503,6 +507,13 @@ fn normalize_postgres_import_value(
 
 pub(super) fn is_postgres_boolean_column(target_column: &PostgresImportColumn) -> bool {
     target_column.data_type == "boolean" || target_column.udt_name == "bool"
+}
+
+fn is_postgres_integer_column(target_column: &PostgresImportColumn) -> bool {
+    matches!(
+        target_column.data_type.as_str(),
+        "smallint" | "integer" | "bigint"
+    ) || matches!(target_column.udt_name.as_str(), "int2" | "int4" | "int8")
 }
 
 pub(super) fn is_postgres_timestamp_column(target_column: &PostgresImportColumn) -> bool {

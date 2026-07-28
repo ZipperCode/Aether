@@ -494,19 +494,20 @@ WHERE table_schema = DATABASE()
     let mut primary_key = BTreeMap::new();
     for row in rows {
         let name = row.try_get::<String, _>("column_name").map_sql_err()?;
+        // MySQL 8 会把 DATA_TYPE/COLUMN_KEY 元数据标记为 LONGBLOB/BINARY，实际值仍是文本。
         let data_type = row
-            .try_get::<String, _>("data_type")
+            .try_get_unchecked::<String, _>("data_type")
             .map_sql_err()?
             .to_ascii_lowercase();
         columns.names.insert(name.clone());
         columns.data_types.insert(name.clone(), data_type);
         if row
-            .try_get::<String, _>("column_key")
+            .try_get_unchecked::<String, _>("column_key")
             .map_sql_err()?
             .eq_ignore_ascii_case("PRI")
         {
             primary_key.insert(
-                row.try_get::<i64, _>("ordinal_position").map_sql_err()?,
+                row.try_get::<u32, _>("ordinal_position").map_sql_err()?,
                 name,
             );
         }
