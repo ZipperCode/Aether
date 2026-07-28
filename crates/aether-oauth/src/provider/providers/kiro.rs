@@ -584,6 +584,7 @@ async fn discover_kiro_profile_arn_in_region(
                 json_body: Some(Value::Object(body)),
                 body_bytes: None,
                 network: ctx.network.clone(),
+                transport_profile: None,
             })
             .await?;
         if !(200..300).contains(&response.status_code) {

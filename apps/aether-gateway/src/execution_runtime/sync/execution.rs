@@ -2521,6 +2521,19 @@ async fn execute_execution_runtime_sync_impl(
     let has_body_bytes = body_base64.is_some();
     let mut report_context =
         attach_provider_response_headers_to_report_context(report_context, &headers);
+    let mut body_json = body_json;
+    if (200..300).contains(&status_code) {
+        if let Some(response_body) = body_json.take() {
+            body_json = Some(
+                crate::ai_serving::agent_bridge::finalize_agent_bridge_sync_response(
+                    state,
+                    &mut report_context,
+                    response_body,
+                )
+                .await?,
+            );
+        }
+    }
     if (200..300).contains(&status_code) {
         seed_kiro_sync_simulated_cache_enabled(state, &plan, &mut report_context).await;
         if kiro_simulated_cache_enabled_from_report_context(report_context.as_ref()) {

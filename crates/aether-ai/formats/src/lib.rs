@@ -8,6 +8,19 @@ pub mod provider_compat;
 
 pub use contracts::{ApiOperation, ClientSurface};
 
+pub use formats::agent_bridge::{
+    agent_bridge_prompt_cache_identity, agent_bridge_response_handle_from_report_context,
+    apply_agent_bridge_codex_overlay, apply_agent_bridge_codex_overlay_with_report,
+    apply_agent_bridge_response_carriers_from_report_context, infer_agent_bridge_message_phase,
+    project_claude_message_to_openai_responses_input,
+    sanitize_claude_request_for_agent_bridge_conversion,
+    sanitize_claude_request_for_agent_bridge_conversion_with_prompt_cache,
+    sanitize_openai_responses_for_claude_projection, scan_claude_agent_bridge_history,
+    validate_agent_bridge_function_call_arguments, AgentBridgeCodexOverlayReport,
+    AgentBridgeCompatibilityReport, AgentBridgeHistoryMessage, AgentBridgePrimaryState,
+    AgentBridgeProjectionSanitizeReport, AgentBridgeRequestSanitizeReport,
+    AGENT_BRIDGE_HANDLE_PREFIX, AGENT_BRIDGE_REASONING_PREFIX, AGENT_BRIDGE_REPORT_CONTEXT_FIELD,
+};
 pub use formats::context::{
     ConversionFieldRecord, ConversionFieldStatus, ConversionReport, Converted, FormatContext,
     FormatError,

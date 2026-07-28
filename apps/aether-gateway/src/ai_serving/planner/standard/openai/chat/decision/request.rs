@@ -2408,7 +2408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alias_reasoning_directive_is_constrained_by_the_mapped_openai_model() {
+    async fn alias_reasoning_directive_is_preserved_without_a_model_profile() {
         let state = AppState::new().expect("state should build");
         let request = http::Request::builder()
             .method("POST")
@@ -2443,8 +2443,8 @@ mod tests {
         .expect("GPT-5.6 candidate should build a payload");
         assert_eq!(payload.provider_request_body["reasoning_effort"], "max");
 
-        let mut unsupported = sample_openai_chat_eligible("custom");
-        unsupported.candidate.selected_provider_model_name = "gpt-5.4".to_string();
+        let mut unprofiled = sample_openai_chat_eligible("custom");
+        unprofiled.candidate.selected_provider_model_name = "gpt-5.4-mini".to_string();
         let payload = resolve_local_openai_chat_candidate_payload_parts(
             &state,
             &parts,
@@ -2452,7 +2452,7 @@ mod tests {
             &body_json,
             &sample_alias_max_directive_input(),
             None,
-            &unsupported,
+            &unprofiled,
             0,
             "candidate-0",
             "openai_chat_sync",
@@ -2460,8 +2460,9 @@ mod tests {
             false,
         )
         .await
-        .expect("candidate resolution should not fail");
-        assert!(payload.is_none(), "GPT-5.4 must reject the max directive");
+        .expect("candidate resolution should not fail")
+        .expect("an unprofiled mapped model must preserve a valid wire effort");
+        assert_eq!(payload.provider_request_body["reasoning_effort"], "max");
     }
 
     #[tokio::test]

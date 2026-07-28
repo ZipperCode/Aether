@@ -194,6 +194,324 @@ fn http_failure_uses_execution_headers_for_bounded_delta_and_date_retry_after() 
 }
 
 #[test]
+fn http_200_business_error_preserves_zhipu_reason_instead_of_parse_failed() {
+    let result = ExecutionResult {
+        request_id: "zhipu-business-error".into(),
+        candidate_id: None,
+        status_code: 200,
+        headers: BTreeMap::new(),
+        body: Some(ResponseBody {
+            json_body: Some(json!({
+                "code": 1315,
+                "msg": "该 API Key 仅限企业编程套餐场景使用",
+                "success": false
+            })),
+            body_bytes_b64: None,
+        }),
+        telemetry: None,
+        error: None,
+    };
+
+    let attempt = execution_result_to_attempt(result, QuotaKind::Subscription, "zhipu");
+    let AttemptResult::BusinessFailure {
+        status_code,
+        class,
+        upstream_code,
+        detail,
+        ..
+    } = &attempt
+    else {
+        panic!("expected typed business failure, got {attempt:?}");
+    };
+    assert_eq!(*status_code, 200);
+    assert_eq!(*class, StableErrorClass::HttpClient);
+    assert_eq!(*upstream_code, Some(1315));
+    assert!(should_fallback_to_zhipu_balance(&attempt));
+    assert_eq!(
+        detail,
+        "upstream business code 1315: API key product type does not match the selected endpoint"
+    );
+
+    let persisted = build_persisted_snapshot(SnapshotUpdate {
+        key: &key("key-1", "Zhipu", None),
+        provider_type: "zhipu",
+        attempt: &attempt,
+        now_unix_secs: 100,
+    })
+    .expect("business failure snapshot");
+    assert_eq!(persisted.snapshot["code"], "http_client_error");
+    assert_eq!(
+        persisted.refresh_state.error.as_deref(),
+        Some(
+            "http_client_error: upstream business code 1315: API key product type does not match the selected endpoint"
+        )
+    );
+}
+
+#[test]
+fn http_200_zhipu_business_auth_error_maps_to_unauthorized() {
+    let result = ExecutionResult {
+        request_id: "zhipu-business-auth".into(),
+        candidate_id: None,
+        status_code: 200,
+        headers: BTreeMap::new(),
+        body: Some(ResponseBody {
+            json_body: Some(json!({
+                "code": 1001,
+                "msg": "must not be copied into the persisted diagnostic",
+                "success": false
+            })),
+            body_bytes_b64: None,
+        }),
+        telemetry: None,
+        error: None,
+    };
+
+    let attempt = execution_result_to_attempt(result, QuotaKind::Balance, "zhipu");
+    let AttemptResult::BusinessFailure {
+        class,
+        upstream_code,
+        detail,
+        ..
+    } = &attempt
+    else {
+        panic!("expected typed business failure");
+    };
+    assert_eq!(*class, StableErrorClass::HttpUnauthorized);
+    assert_eq!(*upstream_code, Some(1001));
+    assert_eq!(
+        detail,
+        "upstream business code 1001: authentication rejected"
+    );
+    assert!(!should_fallback_to_zhipu_balance(&attempt));
+}
+
+#[test]
+fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
+    for code in [1220, 1309, 1315] {
+        let attempt = execution_result_to_attempt(
+            ExecutionResult {
+                request_id: format!("zhipu-no-plan-{code}"),
+                candidate_id: None,
+                status_code: 200,
+                headers: BTreeMap::new(),
+                body: Some(ResponseBody {
+                    json_body: Some(json!({"code": code, "success": false})),
+                    body_bytes_b64: None,
+                }),
+                telemetry: None,
+                error: None,
+            },
+            QuotaKind::Subscription,
+            "zhipu",
+        );
+        assert!(
+            should_fallback_to_zhipu_balance(&attempt),
+            "code {code} should use account balance"
+        );
+    }
+
+    let limited = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "zhipu-rate-limited".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body: Some(ResponseBody {
+                json_body: Some(json!({"code": 1305, "success": false})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Subscription,
+        "zhipu",
+    );
+    assert!(!should_fallback_to_zhipu_balance(&limited));
+
+    let empty_plan = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "zhipu-empty-plan".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body: Some(ResponseBody {
+                json_body: Some(json!({"success": true, "data": {"limits": []}})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Subscription,
+        "zhipu",
+    );
+    assert!(matches!(empty_plan, AttemptResult::ParseFailure { .. }));
+    assert!(should_fallback_to_zhipu_balance(&empty_plan));
+
+    let unknown_business_error = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "zhipu-unknown-business-error".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body: Some(ResponseBody {
+                json_body: Some(json!({"success": false})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Subscription,
+        "zhipu",
+    );
+    assert!(matches!(
+        unknown_business_error,
+        AttemptResult::BusinessFailure {
+            class: StableErrorClass::HttpClient,
+            upstream_code: None,
+            ..
+        }
+    ));
+    assert!(should_fallback_to_zhipu_balance(&unknown_business_error));
+
+    let decorated = apply_zhipu_token_plan_fallback_policy(
+        &unknown_business_error,
+        AttemptResult::Success {
+            snapshot: ProviderQuotaSnapshotContract::balance("zhipu", Vec::new()),
+            status_code: 200,
+            quota_kind: QuotaKind::Balance,
+        },
+    );
+    let AttemptResult::Success { snapshot, .. } = decorated else {
+        panic!("expected decorated balance fallback");
+    };
+    assert!(snapshot.exhausted);
+    assert_eq!(snapshot.extensions["token_plan_status"], "business_error");
+    assert_eq!(snapshot.extensions["token_plan_scheduling_blocked"], true);
+}
+
+#[test]
+fn zhipu_balance_kind_uses_standard_account_parser() {
+    let result = ExecutionResult {
+        request_id: "zhipu-standard-balance".into(),
+        candidate_id: None,
+        status_code: 200,
+        headers: BTreeMap::new(),
+        body: Some(ResponseBody {
+            json_body: Some(json!({
+                "success": true,
+                "data": {
+                    "availableBalance": "12.50",
+                    "rechargeAmount": "20",
+                    "giveAmount": "5",
+                    "totalSpendAmount": "12.50"
+                }
+            })),
+            body_bytes_b64: None,
+        }),
+        telemetry: None,
+        error: None,
+    };
+
+    let attempt = execution_result_to_attempt(result, QuotaKind::Balance, "zhipu");
+    let AttemptResult::Success {
+        snapshot,
+        quota_kind,
+        ..
+    } = attempt
+    else {
+        panic!("expected standard balance success");
+    };
+    assert_eq!(quota_kind, QuotaKind::Balance);
+    assert_eq!(snapshot.kind, ProviderQuotaSnapshotKind::Balance);
+    assert_eq!(snapshot.balances[0].available.as_deref(), Some("12.50"));
+    assert_eq!(snapshot.extensions["balance_source"], "standard_api");
+}
+
+#[test]
+fn zhipu_balance_fallback_keeps_balance_but_marks_missing_plan_as_exhausted() {
+    let primary = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "zhipu-expired-plan".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body: Some(ResponseBody {
+                json_body: Some(json!({"code": 1309, "success": false})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Subscription,
+        "zhipu",
+    );
+    let fallback = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "zhipu-balance-fallback".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body: Some(ResponseBody {
+                json_body: Some(json!({
+                    "success": true,
+                    "data": {"availableBalance": "12.50"}
+                })),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Balance,
+        "zhipu",
+    );
+
+    let attempt = apply_zhipu_token_plan_fallback_policy(&primary, fallback);
+    let AttemptResult::Success {
+        snapshot,
+        quota_kind,
+        ..
+    } = &attempt
+    else {
+        panic!("expected successful balance fallback");
+    };
+    assert_eq!(*quota_kind, QuotaKind::Balance);
+    assert_eq!(snapshot.kind, ProviderQuotaSnapshotKind::Balance);
+    assert_eq!(snapshot.balances[0].available.as_deref(), Some("12.50"));
+    assert!(snapshot.exhausted);
+    assert_eq!(snapshot.extensions["token_plan_status"], "expired");
+    assert_eq!(snapshot.extensions["token_plan_scheduling_blocked"], true);
+
+    let scope = quota_cache_invalidation_scope(&SnapshotUpdate {
+        key: &key("key-1", "Zhipu expired", None),
+        provider_type: "zhipu",
+        attempt: &attempt,
+        now_unix_secs: 100,
+    });
+    assert_eq!(scope, QuotaCacheInvalidationScope::CandidateRouting);
+
+    let blocked_key = key(
+        "key-1",
+        "Zhipu expired",
+        Some(serde_json::to_value(snapshot).expect("blocked balance snapshot")),
+    );
+    let recovered = AttemptResult::Success {
+        snapshot: ProviderQuotaSnapshotContract::subscription("zhipu", Vec::new(), 100),
+        status_code: 200,
+        quota_kind: QuotaKind::Subscription,
+    };
+    assert_eq!(
+        quota_cache_invalidation_scope(&SnapshotUpdate {
+            key: &blocked_key,
+            provider_type: "zhipu",
+            attempt: &recovered,
+            now_unix_secs: 100,
+        }),
+        QuotaCacheInvalidationScope::CandidateRouting
+    );
+}
+
+#[test]
 fn first_subscription_failure_builds_schema_v1_subscription_snapshot() {
     // Given
     let key = key("key-1", "Subscription", None);

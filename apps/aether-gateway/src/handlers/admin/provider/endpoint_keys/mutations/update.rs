@@ -1,3 +1,4 @@
+use crate::ai_serving::build_provider_key_pool_score_upsert;
 use crate::handlers::admin::admin_provider_pool_config;
 use crate::handlers::admin::provider::shared::paths::admin_update_key_id;
 use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyUpdatePatch;
@@ -6,6 +7,7 @@ use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::maintenance::ensure_provider_key_pool_scores_for_keys;
 use crate::provider_key_auth::provider_key_effective_api_formats;
 use crate::{model_fetch::perform_model_fetch_for_key, GatewayError};
+use aether_data_contracts::repository::pool_scores::PoolMemberScoreUpsertMode;
 use axum::{
     body::{Body, Bytes},
     http,
@@ -134,24 +136,49 @@ pub(super) async fn maybe_handle(
         .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
         .await?;
     if let Some(pool_config) = admin_provider_pool_config(&provider) {
-        let score_ensure_budget = (pool_config.score_fallback_scan_limit as usize).clamp(1, 50_000);
-        if let Err(err) = ensure_provider_key_pool_scores_for_keys(
-            state.as_ref(),
-            &provider,
-            &pool_config,
-            &endpoints,
-            std::slice::from_ref(&updated),
-            now_unix_secs,
-            score_ensure_budget,
-        )
-        .await
-        {
-            tracing::debug!(
-                provider_id = %provider.id,
-                key_id = %updated.id,
-                error = ?err,
-                "gateway admin provider key update: failed to seed pool score rows"
+        if provider_key_update_requires_pool_score_recovery(&existing_key, &updated) {
+            let upsert = build_provider_key_pool_score_upsert(
+                &updated,
+                provider.provider_type.as_str(),
+                None,
+                now_unix_secs,
+                pool_config.score_rules,
             );
+            state
+                .as_ref()
+                .data
+                .upsert_pool_member_score_with_mode(
+                    upsert,
+                    PoolMemberScoreUpsertMode::OAuthRecovery,
+                )
+                .await
+                .map_err(|err| {
+                    GatewayError::Internal(format!(
+                        "failed to recover pool score for updated provider key '{}': {err}",
+                        updated.id
+                    ))
+                })?;
+        } else {
+            let score_ensure_budget =
+                (pool_config.score_fallback_scan_limit as usize).clamp(1, 50_000);
+            if let Err(err) = ensure_provider_key_pool_scores_for_keys(
+                state.as_ref(),
+                &provider,
+                &pool_config,
+                &endpoints,
+                std::slice::from_ref(&updated),
+                now_unix_secs,
+                score_ensure_budget,
+            )
+            .await
+            {
+                tracing::debug!(
+                    provider_id = %provider.id,
+                    key_id = %updated.id,
+                    error = ?err,
+                    "gateway admin provider key update: failed to seed pool score rows"
+                );
+            }
         }
     }
     let api_formats =
@@ -166,6 +193,42 @@ pub(super) async fn maybe_handle(
         ))
         .into_response(),
     ))
+}
+
+fn provider_key_update_requires_pool_score_recovery(
+    existing: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+    updated: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+) -> bool {
+    if !updated.is_active || !provider_key_has_credential(updated) {
+        return false;
+    }
+
+    !existing
+        .auth_type
+        .trim()
+        .eq_ignore_ascii_case(updated.auth_type.trim())
+        || existing.encrypted_api_key != updated.encrypted_api_key
+        || existing.encrypted_auth_config != updated.encrypted_auth_config
+}
+
+fn provider_key_has_credential(
+    key: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+) -> bool {
+    let has_api_key = key
+        .encrypted_api_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_auth_config = key
+        .encrypted_auth_config
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    match key.auth_type.trim().to_ascii_lowercase().as_str() {
+        "api_key" | "bearer" => has_api_key,
+        "service_account" | "vertex_ai" => has_auth_config,
+        "oauth" => has_api_key || has_auth_config,
+        _ => has_api_key || has_auth_config,
+    }
 }
 
 fn bad_request_response(detail: impl Into<String>) -> Response<Body> {

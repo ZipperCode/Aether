@@ -1,4 +1,5 @@
 mod adaptation;
+pub(crate) mod agent_bridge;
 pub(crate) mod api;
 mod finalize;
 mod planner;

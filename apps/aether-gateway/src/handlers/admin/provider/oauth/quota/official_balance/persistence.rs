@@ -5,7 +5,7 @@ use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKe
 use aether_provider_pool::{
     official_balance_backoff_with_jitter_secs, ProviderQuotaRefreshState,
     ProviderQuotaSnapshotContract, ProviderQuotaSnapshotKind,
-    PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
+    PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION, ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD,
 };
 use serde_json::{json, Value};
 
@@ -73,7 +73,15 @@ pub(super) fn quota_cache_invalidation_scope(
         return QuotaCacheInvalidationScope::CatalogOnly;
     };
     match quota_kind {
-        QuotaKind::Balance => QuotaCacheInvalidationScope::CatalogOnly,
+        QuotaKind::Balance => {
+            let previous = subscription_routing_state(typed_snapshot(update.key).as_ref());
+            let next = subscription_routing_state_for_attempt(update.attempt, previous);
+            if next == SubscriptionRoutingState::Exhausted && previous != next {
+                QuotaCacheInvalidationScope::CandidateRouting
+            } else {
+                QuotaCacheInvalidationScope::CatalogOnly
+            }
+        }
         QuotaKind::Subscription => {
             let previous = subscription_routing_state(typed_snapshot(update.key).as_ref());
             let next = subscription_routing_state_for_attempt(update.attempt, previous);
@@ -89,6 +97,17 @@ pub(super) fn quota_cache_invalidation_scope(
 fn subscription_routing_state(
     snapshot: Option<&ProviderQuotaSnapshotContract>,
 ) -> SubscriptionRoutingState {
+    if snapshot.is_some_and(|snapshot| {
+        snapshot.provider_type.eq_ignore_ascii_case("zhipu")
+            && snapshot.exhausted
+            && snapshot
+                .extensions
+                .get(ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD)
+                .and_then(Value::as_bool)
+                == Some(true)
+    }) {
+        return SubscriptionRoutingState::Exhausted;
+    }
     match snapshot.map(|snapshot| (snapshot.kind, snapshot.exhausted)) {
         Some((ProviderQuotaSnapshotKind::Subscription, exhausted)) => {
             SubscriptionRoutingState::from_exhausted(exhausted)
@@ -105,6 +124,7 @@ fn subscription_routing_state_for_attempt(
         AttemptResult::Success { snapshot, .. } => subscription_routing_state(Some(snapshot)),
         AttemptResult::HttpFailure { .. }
         | AttemptResult::ParseFailure { .. }
+        | AttemptResult::BusinessFailure { .. }
         | AttemptResult::TransportFailure { .. } => match previous {
             SubscriptionRoutingState::Unknown => SubscriptionRoutingState::Active,
             SubscriptionRoutingState::Active => SubscriptionRoutingState::Active,
@@ -121,6 +141,7 @@ pub(super) fn build_persisted_snapshot(
         AttemptResult::Success { snapshot, .. } => (snapshot.clone(), "ok", "fresh"),
         AttemptResult::HttpFailure { class, .. }
         | AttemptResult::ParseFailure { class, .. }
+        | AttemptResult::BusinessFailure { class, .. }
         | AttemptResult::TransportFailure { class, .. } => {
             let quota_kind = update
                 .attempt
@@ -175,7 +196,7 @@ pub(super) fn failure_refresh_state(
     class: StableErrorClass,
     now_unix_secs: u64,
 ) -> ProviderQuotaRefreshState {
-    build_failure_refresh_state(key, class, None, now_unix_secs)
+    build_failure_refresh_state(key, class, None, None, now_unix_secs)
 }
 
 fn refresh_state_for_attempt(
@@ -194,12 +215,16 @@ fn refresh_state_for_attempt(
         AttemptResult::HttpFailure { headers, class, .. } => build_failure_refresh_state(
             key,
             *class,
+            None,
             retry_after_eligibility(headers, now_unix_secs),
             now_unix_secs,
         ),
+        AttemptResult::BusinessFailure { class, detail, .. } => {
+            build_failure_refresh_state(key, *class, Some(detail.as_str()), None, now_unix_secs)
+        }
         AttemptResult::ParseFailure { class, .. }
         | AttemptResult::TransportFailure { class, .. } => {
-            build_failure_refresh_state(key, *class, None, now_unix_secs)
+            build_failure_refresh_state(key, *class, None, None, now_unix_secs)
         }
     }
 }
@@ -207,6 +232,7 @@ fn refresh_state_for_attempt(
 fn build_failure_refresh_state(
     key: &StoredProviderCatalogKey,
     class: StableErrorClass,
+    detail: Option<&str>,
     retry_at: Option<u64>,
     now_unix_secs: u64,
 ) -> ProviderQuotaRefreshState {
@@ -223,7 +249,10 @@ fn build_failure_refresh_state(
     ProviderQuotaRefreshState {
         last_attempt_at: Some(now_unix_secs),
         last_success_at: previous.last_success_at,
-        error: Some(class.persisted_error()),
+        error: Some(match detail {
+            Some(detail) => format!("{}: {detail}", class.code()),
+            None => class.persisted_error(),
+        }),
         next_eligible_at: Some(retry_at.unwrap_or_else(|| {
             now_unix_secs.saturating_add(official_balance_backoff_with_jitter_secs(
                 failure_count,

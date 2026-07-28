@@ -140,6 +140,13 @@ pub(super) enum AttemptResult {
         class: StableErrorClass,
         quota_kind: QuotaKind,
     },
+    BusinessFailure {
+        status_code: u16,
+        class: StableErrorClass,
+        quota_kind: QuotaKind,
+        upstream_code: Option<u16>,
+        detail: String,
+    },
     TransportFailure {
         class: StableErrorClass,
         quota_kind: Option<QuotaKind>,
@@ -151,7 +158,8 @@ impl AttemptResult {
         match self {
             Self::Success { quota_kind, .. }
             | Self::HttpFailure { quota_kind, .. }
-            | Self::ParseFailure { quota_kind, .. } => Some(*quota_kind),
+            | Self::ParseFailure { quota_kind, .. }
+            | Self::BusinessFailure { quota_kind, .. } => Some(*quota_kind),
             Self::TransportFailure { quota_kind, .. } => *quota_kind,
         }
     }
@@ -161,16 +169,27 @@ impl AttemptResult {
             Self::Success { .. } => None,
             Self::HttpFailure { class, .. }
             | Self::ParseFailure { class, .. }
+            | Self::BusinessFailure { class, .. }
             | Self::TransportFailure { class, .. } => Some(*class),
         }
     }
 
     pub(super) const fn status_code(&self) -> Option<u16> {
         match self {
-            Self::Success { status_code, .. } | Self::HttpFailure { status_code, .. } => {
-                Some(*status_code)
-            }
+            Self::Success { status_code, .. }
+            | Self::HttpFailure { status_code, .. }
+            | Self::BusinessFailure { status_code, .. } => Some(*status_code),
             Self::ParseFailure { .. } | Self::TransportFailure { .. } => None,
+        }
+    }
+
+    pub(super) fn failure_message(&self) -> Option<&str> {
+        match self {
+            Self::Success { .. } => None,
+            Self::BusinessFailure { detail, .. } => Some(detail.as_str()),
+            Self::HttpFailure { class, .. }
+            | Self::ParseFailure { class, .. }
+            | Self::TransportFailure { class, .. } => Some(class.message()),
         }
     }
 }

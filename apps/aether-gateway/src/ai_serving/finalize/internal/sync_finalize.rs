@@ -66,12 +66,16 @@ pub(crate) fn maybe_build_local_core_sync_finalize_response(
                 trace_id, decision, payload, body_json,
             )?))
         }
-        StandardSyncFinalizeNormalizedProduct::CrossFormat(product) => {
+        StandardSyncFinalizeNormalizedProduct::CrossFormat(mut product) => {
             let Some(provider_body_json) =
                 unwrap_local_finalize_response_value(product.provider_body_json, report_context)
             else {
                 return Ok(None);
             };
+            aether_ai_formats::apply_agent_bridge_response_carriers_from_report_context(
+                &mut product.client_body_json,
+                report_context,
+            );
             Ok(Some(build_local_success_outcome_with_conversion_report(
                 trace_id,
                 decision,

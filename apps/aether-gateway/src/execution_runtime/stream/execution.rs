@@ -4041,8 +4041,8 @@ async fn execute_execution_runtime_stream_inner(
             frame_stream,
             stream_precommit_committed,
             provider_pool_in_flight_guard.take(),
-            retry_scope_out.as_deref_mut(),
-            retry_fallback_out.as_deref_mut(),
+            retry_scope_out,
+            retry_fallback_out,
         )
         .await;
     }
@@ -5754,9 +5754,16 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     let direct_stream_finalize_kind = resolve_core_stream_direct_finalize_report_kind(plan_kind);
     let normalized_stream_report_context =
         normalize_provider_private_report_context(report_context.as_ref());
+    let mut agent_bridge_stream_capture =
+        crate::ai_serving::agent_bridge::AgentBridgeStreamCapture::from_report_context(
+            state,
+            normalized_stream_report_context.as_ref(),
+        );
+    let mut agent_bridge_prefetched_rewrite_body = Vec::new();
     let upstream_headers = headers.clone();
+    let private_stream_normalizer_context = report_context.clone();
     let mut private_stream_normalizer =
-        maybe_build_provider_private_stream_normalizer(report_context.as_ref());
+        maybe_build_provider_private_stream_normalizer(private_stream_normalizer_context.as_ref());
     let mut local_stream_rewriter =
         maybe_build_stream_response_rewriter(normalized_stream_report_context.as_ref());
     if private_stream_normalizer.is_some() || local_stream_rewriter.is_some() {
@@ -6147,6 +6154,12 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                         if let Some(body_json) =
                             parse_prefetched_sync_json_body(&prefetched_inspection_body)
                         {
+                            let body_json = crate::ai_serving::agent_bridge::finalize_agent_bridge_sync_response(
+                                state,
+                                &mut report_context,
+                                body_json,
+                            )
+                            .await?;
                             match maybe_bridge_standard_sync_json_to_stream(
                                 &body_json,
                                 plan.provider_api_format.as_str(),
@@ -6164,6 +6177,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                     prefetched_body.extend_from_slice(&outcome.sse_body);
                                     prefetched_chunks.push(Bytes::from(outcome.sse_body));
                                     sync_json_stream_bridge_active = true;
+                                    agent_bridge_stream_capture = None;
                                     break;
                                 }
                                 Ok(None) => {}
@@ -6228,8 +6242,40 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     } else {
                         chunk
                     };
+                    let bridge_chunk = if let Some(capture) = agent_bridge_stream_capture.as_mut() {
+                        match capture.push_chunk(&normalized_chunk) {
+                            Ok(bridge_chunk) => bridge_chunk,
+                            Err(err) => {
+                                let failure = build_stream_failure_report(
+                                    "execution_runtime_agent_bridge_stream_error",
+                                    format!(
+                                        "failed to capture Agent Bridge prefetch state: {err:?}"
+                                    ),
+                                    502,
+                                );
+                                return handle_prefetch_stream_failure(
+                                    state,
+                                    trace_id,
+                                    decision,
+                                    &plan,
+                                    report_context,
+                                    request_id,
+                                    candidate_id,
+                                    report_kind,
+                                    headers,
+                                    prefetched_usage_telemetry.clone(),
+                                    &provider_prefetched_body,
+                                    failure,
+                                )
+                                .await;
+                            }
+                        }
+                    } else {
+                        normalized_chunk
+                    };
+                    agent_bridge_prefetched_rewrite_body.extend_from_slice(&bridge_chunk);
                     let rewritten_chunk = if let Some(rewriter) = local_stream_rewriter.as_mut() {
-                        match rewriter.push_chunk(&normalized_chunk) {
+                        match rewriter.push_chunk(&bridge_chunk) {
                             Ok(rewritten_chunk) => rewritten_chunk,
                             Err(err) => {
                                 let failure = build_stream_failure_report(
@@ -6257,7 +6303,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                             }
                         }
                     } else {
-                        normalized_chunk
+                        bridge_chunk
                     };
                     if !rewritten_chunk.is_empty() {
                         prefetched_body.extend_from_slice(&rewritten_chunk);
@@ -6389,8 +6435,10 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     let trace_id_owned = trace_id.to_string();
     let headers_for_report = headers.clone();
     let report_kind_owned = report_kind;
-    let report_context_owned = report_context;
+    let mut report_context_owned = report_context;
     let normalized_stream_report_context_owned = normalized_stream_report_context;
+    let mut agent_bridge_stream_capture_for_report = agent_bridge_stream_capture;
+    let agent_bridge_prefetched_rewrite_body_for_report = agent_bridge_prefetched_rewrite_body;
     let lifecycle_seed_for_report = lifecycle_seed;
     let provider_prefetched_body_for_report = provider_prefetched_body;
     let prefetched_body_for_report = prefetched_body;
@@ -6444,6 +6492,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         } else {
             maybe_build_stream_response_rewriter(normalized_stream_report_context_owned.as_ref())
         };
+        let mut agent_bridge_stream_capture = agent_bridge_stream_capture_for_report.take();
         let stream_usage_report_context =
             normalized_stream_report_context_owned.clone().or_else(|| {
                 Some(serde_json::json!({
@@ -6633,9 +6682,13 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             } else {
                 None
             };
-            let replay_chunk = normalized_prefetched_chunk
-                .as_deref()
-                .unwrap_or(provider_prefetched_body_for_report.as_slice());
+            let replay_chunk = if agent_bridge_stream_capture.is_some() {
+                agent_bridge_prefetched_rewrite_body_for_report.as_slice()
+            } else {
+                normalized_prefetched_chunk
+                    .as_deref()
+                    .unwrap_or(provider_prefetched_body_for_report.as_slice())
+            };
             if let Some(error_body_json) = provider_error_inspection
                 .observe(stream_usage_report_context.as_ref(), replay_chunk)
             {
@@ -6910,9 +6963,37 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 &normalized_chunk,
                             );
                         }
+                        let bridge_chunk = if let Some(capture) =
+                            agent_bridge_stream_capture.as_mut()
+                        {
+                            match capture.push_chunk(&normalized_chunk) {
+                                Ok(bridge_chunk) => bridge_chunk,
+                                Err(err) => {
+                                    warn!(
+                                        event_name = "stream_execution_agent_bridge_capture_failed",
+                                        log_type = "ops",
+                                        trace_id = %trace_id_owned,
+                                        request_id = %request_id_for_report_log,
+                                        candidate_id = ?candidate_id_for_report.as_deref(),
+                                        error = ?err,
+                                        "gateway rejected invalid Agent Bridge stream state"
+                                    );
+                                    terminal_failure = Some(build_stream_failure_report(
+                                        "execution_runtime_agent_bridge_stream_error",
+                                        format!(
+                                            "failed to capture Agent Bridge stream state: {err:?}"
+                                        ),
+                                        502,
+                                    ));
+                                    break;
+                                }
+                            }
+                        } else {
+                            normalized_chunk
+                        };
                         let rewritten_chunk = if let Some(rewriter) = local_stream_rewriter.as_mut()
                         {
-                            match rewriter.push_chunk(&normalized_chunk) {
+                            match rewriter.push_chunk(&bridge_chunk) {
                                 Ok(rewritten_chunk) => rewritten_chunk,
                                 Err(err) => {
                                     warn!(
@@ -6933,7 +7014,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 }
                             }
                         } else {
-                            normalized_chunk
+                            bridge_chunk
                         };
 
                         if rewritten_chunk.is_empty() {
@@ -7100,10 +7181,29 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                             &normalized_chunk,
                         );
                     }
+                    let bridge_chunk = if let Some(capture) = agent_bridge_stream_capture.as_mut() {
+                        match capture.push_chunk(&normalized_chunk) {
+                            Ok(bridge_chunk) => bridge_chunk,
+                            Err(err) => {
+                                terminal_failure.get_or_insert_with(|| {
+                                    build_stream_failure_report(
+                                        "execution_runtime_agent_bridge_stream_error",
+                                        format!(
+                                            "failed to flush Agent Bridge stream state: {err:?}"
+                                        ),
+                                        502,
+                                    )
+                                });
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        normalized_chunk
+                    };
                     if !downstream_dropped {
                         let rewritten_chunk = if let Some(rewriter) = local_stream_rewriter.as_mut()
                         {
-                            match rewriter.push_chunk(&normalized_chunk) {
+                            match rewriter.push_chunk(&bridge_chunk) {
                                 Ok(rewritten_chunk) => rewritten_chunk,
                                 Err(err) => {
                                     warn!(
@@ -7125,7 +7225,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 }
                             }
                         } else {
-                            normalized_chunk
+                            bridge_chunk
                         };
                         if !rewritten_chunk.is_empty() {
                             append_stream_capture_bytes(
@@ -7195,6 +7295,65 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                             502,
                         )
                     });
+                }
+            }
+        }
+        if !downstream_dropped && terminal_failure.is_none() {
+            if let Some(capture) = agent_bridge_stream_capture.as_mut() {
+                match capture.finish() {
+                    Ok(bridge_chunk) if !bridge_chunk.is_empty() => {
+                        let rewritten_chunk = if let Some(rewriter) = local_stream_rewriter.as_mut()
+                        {
+                            match rewriter.push_chunk(&bridge_chunk) {
+                                Ok(rewritten_chunk) => rewritten_chunk,
+                                Err(err) => {
+                                    terminal_failure = Some(build_stream_failure_report(
+                                        "execution_runtime_agent_bridge_stream_error",
+                                        format!("failed to rewrite final Agent Bridge stream state: {err:?}"),
+                                        502,
+                                    ));
+                                    Vec::new()
+                                }
+                            }
+                        } else {
+                            bridge_chunk
+                        };
+                        if !rewritten_chunk.is_empty() {
+                            append_stream_capture_bytes(
+                                &mut buffered_body,
+                                &rewritten_chunk,
+                                max_stream_body_buffer_bytes,
+                                &mut client_body_truncated,
+                            );
+                            let rewritten_chunk_len =
+                                u64::try_from(rewritten_chunk.len()).unwrap_or(u64::MAX);
+                            let rewritten_chunk = Bytes::from(rewritten_chunk);
+                            if tx.send(Ok(rewritten_chunk.clone())).await.is_err() {
+                                downstream_dropped = true;
+                            } else {
+                                client_visible_stream_completed |= client_stream_completion_tracker
+                                    .observe_chunk(rewritten_chunk.as_ref());
+                                client_stream_bytes
+                                    .fetch_add(rewritten_chunk_len, Ordering::Relaxed);
+                                last_client_chunk_elapsed_ms.store(
+                                    stream_started_at_for_report
+                                        .elapsed()
+                                        .as_millis()
+                                        .min(u128::from(u64::MAX))
+                                        as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        terminal_failure = Some(build_stream_failure_report(
+                            "execution_runtime_agent_bridge_stream_error",
+                            format!("failed to finish Agent Bridge stream state: {err:?}"),
+                            502,
+                        ));
+                    }
                 }
             }
         }
@@ -7323,7 +7482,6 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             }
         }
 
-        drop(tx);
         idle_monitor_done.store(true, Ordering::Relaxed);
         idle_monitor_handle.abort();
 
@@ -7349,6 +7507,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         }
 
         if downstream_dropped {
+            drop(tx);
             debug!(
                 event_name = "execution_runtime_stream_report_skipped",
                 log_type = "debug",
@@ -7417,6 +7576,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         }
 
         if let Some(failure) = terminal_failure {
+            drop(tx);
             record_manual_proxy_stream_error(&state_for_report, &plan_for_report).await;
             let terminal_telemetry = Some(build_terminal_stream_telemetry(
                 stream_started_at_for_report,
@@ -7490,6 +7650,13 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     "execution runtime stream ended before provider terminal event".to_string()
                 })
             });
+        if let Some(capture) = agent_bridge_stream_capture.as_ref() {
+            capture
+                .persist_if_complete(&state_for_report, &mut report_context_owned, stream_failed)
+                .await;
+        }
+        // 客户端看到 EOF 后可能立即发起下一轮；完整状态必须先于流关闭可见。
+        drop(tx);
         let report_context_for_payload = report_context_with_stage_trace(
             report_context_owned,
             stage_trace_for_report,

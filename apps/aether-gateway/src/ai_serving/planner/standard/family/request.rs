@@ -71,6 +71,7 @@ pub(crate) struct LocalStandardCandidatePayloadParts {
     pub(super) transport: Arc<GatewayProviderTransportSnapshot>,
     pub(super) transport_profile: Option<ResolvedTransportProfile>,
     pub(super) request_redacted: bool,
+    pub(super) agent_bridge: Option<Value>,
 }
 
 fn is_grok_text_provider_api_format(provider_api_format: &str) -> bool {
@@ -438,6 +439,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             transport: Arc::clone(transport),
             transport_profile,
             request_redacted: redaction.redacted,
+            agent_bridge: None,
         }));
     }
 
@@ -594,9 +596,66 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     )
     .await?;
     let body_json = redaction.body_json.as_ref();
+    let agent_bridge_input = crate::ai_serving::agent_bridge::AgentBridgeRequestInput {
+        client_api_format: spec_metadata.api_format,
+        provider_api_format,
+        mapped_model: prepared_candidate.mapped_model.as_str(),
+        user_id: input.auth_context.user_id.as_str(),
+        api_key_id: input.auth_context.api_key_id.as_str(),
+        provider_id: candidate.provider_id.as_str(),
+        endpoint_id: candidate.endpoint_id.as_str(),
+        provider_key_id: candidate.key_id.as_str(),
+        client_session_affinity: input.client_session_affinity.as_ref(),
+    };
+    let agent_bridge_enabled = crate::ai_serving::agent_bridge::agent_bridge_request_is_eligible(
+        state,
+        agent_bridge_input,
+    )
+    .await;
+    let agent_bridge_conversion = agent_bridge_enabled.then(|| {
+        let supports_explicit_prompt_cache =
+            crate::ai_serving::agent_bridge::agent_bridge_supports_explicit_prompt_cache(
+                prepared_candidate.mapped_model.as_str(),
+                transport.provider.provider_type.as_str(),
+                transport.endpoint.base_url.as_str(),
+                transport.key.capabilities.as_ref(),
+            );
+        aether_ai_formats::sanitize_claude_request_for_agent_bridge_conversion_with_prompt_cache(
+            body_json,
+            supports_explicit_prompt_cache,
+        )
+    });
+    if let Some((sanitized_body, report)) = agent_bridge_conversion.as_ref() {
+        if report.unsupported_tool_result_content_arrays > 0 {
+            mark_skipped_local_standard_candidate_with_extra_data(
+                state,
+                input,
+                trace_id,
+                candidate,
+                attempt.candidate_index,
+                &attempt.candidate_id,
+                "provider_request_body_build_failed",
+                request_conversion_failure_extra_data(
+                    sanitized_body,
+                    spec_metadata.api_format,
+                    provider_api_format,
+                    Some(prepared_candidate.mapped_model.as_str()),
+                    Some(parts.uri.path()),
+                    upstream_is_stream,
+                    "agent_bridge_unsupported_history",
+                ),
+            )
+            .await;
+            return Ok(None);
+        }
+    }
+    let conversion_body_json = agent_bridge_conversion
+        .as_ref()
+        .map(|(body, _)| body)
+        .unwrap_or(body_json);
     let mut provider_request_body =
         match crate::ai_serving::planner::standard::build_standard_request_body_with_model_directives_and_request_headers(
-            body_json,
+            conversion_body_json,
             spec_metadata.api_format,
             &prepared_candidate.mapped_model,
             transport.provider.provider_type.as_str(),
@@ -845,6 +904,22 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         .await);
     }
 
+    let agent_bridge = if agent_bridge_enabled {
+        crate::ai_serving::agent_bridge::prepare_agent_bridge_request(
+            state,
+            body_json,
+            &mut provider_request_body,
+            agent_bridge_input,
+            agent_bridge_conversion
+                .as_ref()
+                .map(|(_, report)| *report)
+                .unwrap_or_default(),
+        )
+        .await
+    } else {
+        None
+    };
+
     let upstream_url = match crate::ai_serving::planner::standard::build_standard_upstream_url(
         parts,
         transport,
@@ -933,6 +1008,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         transport: Arc::clone(transport),
         transport_profile: None,
         request_redacted: redaction.redacted,
+        agent_bridge,
     }))
 }
 
@@ -1083,6 +1159,7 @@ async fn build_gemini_cli_cross_format_payload_parts(
         transport: resolved.transport,
         transport_profile: None,
         request_redacted,
+        agent_bridge: None,
     })
 }
 
@@ -1204,6 +1281,7 @@ async fn build_windsurf_cross_format_payload_parts(
         transport: Arc::clone(transport),
         transport_profile: None,
         request_redacted,
+        agent_bridge: None,
     })
 }
 
@@ -1387,6 +1465,7 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
         transport: Arc::clone(transport),
         transport_profile: None,
         request_redacted: false,
+        agent_bridge: None,
     })
 }
 
@@ -1513,6 +1592,7 @@ async fn build_kiro_cross_format_payload_parts(
         transport: Arc::clone(transport),
         transport_profile: None,
         request_redacted,
+        agent_bridge: None,
     })
 }
 

@@ -21,7 +21,8 @@ use crate::{
         openai_responses_tools_to_canonical, openai_tool_choice_raw_to_responses,
         strip_claude_billing_header, CanonicalContentBlock, CanonicalInstruction, CanonicalRequest,
         CanonicalRole, CanonicalThinkingConfig, CanonicalToolChoice, CanonicalToolDefinition,
-        OPENAI_RESPONSES_EXTENSION_NAMESPACE, OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
+        AETHER_AGENT_BRIDGE_PROMPT_CACHE_BREAKPOINT_FIELD, OPENAI_RESPONSES_EXTENSION_NAMESPACE,
+        OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
     },
 };
 
@@ -384,11 +385,11 @@ fn claude_system_instruction_to_responses_part(
     let mut part = Map::new();
     part.insert("type".to_string(), Value::String("input_text".to_string()));
     part.insert("text".to_string(), Value::String(instruction.text.clone()));
-    part.extend(namespace_extension_object(
-        &instruction.extensions,
-        "claude",
-        &part,
-    ));
+    insert_prompt_cache_breakpoint(&mut part, &instruction.extensions);
+    let mut claude_extensions =
+        namespace_extension_object(&instruction.extensions, "claude", &part);
+    claude_extensions.remove(AETHER_AGENT_BRIDGE_PROMPT_CACHE_BREAKPOINT_FIELD);
+    part.extend(claude_extensions);
     Some(Value::Object(part))
 }
 

@@ -1,6 +1,6 @@
 use aether_data_contracts::repository::pool_scores::{
-    PoolMemberIdentity, PoolMemberProbeStatus, PoolScoreScope, UpsertPoolMemberScore,
-    POOL_SCORE_CAPABILITY_ACCOUNT, POOL_SCORE_SCOPE_KIND_ACCOUNT,
+    PoolMemberHardState, PoolMemberIdentity, PoolMemberProbeStatus, PoolScoreScope,
+    UpsertPoolMemberScore, POOL_SCORE_CAPABILITY_ACCOUNT, POOL_SCORE_SCOPE_KIND_ACCOUNT,
 };
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_pool_core::{
@@ -27,7 +27,23 @@ pub(crate) fn build_provider_key_pool_score_upsert(
         existing,
         now_unix_secs,
     );
-    let output = score_pool_member_with_rules(&input, score_rules);
+    let mut output = score_pool_member_with_rules(&input, score_rules);
+    if should_preserve_existing_auth_invalid(key, existing, output.hard_state) {
+        output.hard_state = PoolMemberHardState::AuthInvalid;
+        output.score = output
+            .score
+            .min(score_rules.effective().unschedulable_score_cap);
+        if let Some(reason) = output.score_reason.as_object_mut() {
+            reason.insert(
+                "hard_state".to_string(),
+                Value::String(PoolMemberHardState::AuthInvalid.as_database().to_string()),
+            );
+            reason.insert(
+                "hard_state_source".to_string(),
+                Value::String("existing_request_feedback".to_string()),
+            );
+        }
+    }
     UpsertPoolMemberScore {
         id: provider_key_pool_score_id(&identity, &scope),
         identity,
@@ -50,6 +66,22 @@ pub(crate) fn build_provider_key_pool_score_upsert(
             .unwrap_or(PoolMemberProbeStatus::Never),
         updated_at: now_unix_secs,
     }
+}
+
+fn should_preserve_existing_auth_invalid(
+    key: &StoredProviderCatalogKey,
+    existing: Option<&aether_data_contracts::repository::pool_scores::StoredPoolMemberScore>,
+    rebuilt_hard_state: PoolMemberHardState,
+) -> bool {
+    !key.auth_type.trim().eq_ignore_ascii_case("oauth")
+        && existing.is_some_and(|score| score.hard_state == PoolMemberHardState::AuthInvalid)
+        && matches!(
+            rebuilt_hard_state,
+            PoolMemberHardState::Available
+                | PoolMemberHardState::Unknown
+                | PoolMemberHardState::Cooldown
+                | PoolMemberHardState::QuotaExhausted
+        )
 }
 
 pub(crate) fn provider_key_pool_score_scope() -> PoolScoreScope {
@@ -162,7 +194,6 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aether_data_contracts::repository::pool_scores::PoolMemberHardState;
     use serde_json::json;
 
     fn sample_key_with_circuit_next_probe(
@@ -223,5 +254,77 @@ mod tests {
         );
 
         assert_eq!(score.hard_state, PoolMemberHardState::Available);
+    }
+
+    #[test]
+    fn raw_api_key_auth_invalid_survives_periodic_score_rebuild() {
+        let now_unix_secs = 1_000;
+        let mut key = StoredProviderCatalogKey::new(
+            "key-zai-1".to_string(),
+            "provider-zai".to_string(),
+            "Z.AI key".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("sample key should be valid");
+        key.health_by_format = Some(json!({
+            "openai:chat": {
+                "health_score": 0.8,
+                "consecutive_failures": 0
+            }
+        }));
+        let rules = PoolMemberScoreRules::default();
+        let mut existing =
+            build_provider_key_pool_score_upsert(&key, "custom", None, now_unix_secs - 1, rules)
+                .into_stored();
+        assert_eq!(existing.hard_state, PoolMemberHardState::Available);
+        existing.hard_state = PoolMemberHardState::AuthInvalid;
+        existing.score = 0.01;
+
+        let rebuilt = build_provider_key_pool_score_upsert(
+            &key,
+            "custom",
+            Some(&existing),
+            now_unix_secs,
+            rules,
+        );
+
+        assert_eq!(rebuilt.hard_state, PoolMemberHardState::AuthInvalid);
+        assert!(rebuilt.score <= rules.effective().unschedulable_score_cap);
+        assert_eq!(
+            rebuilt.score_reason["hard_state_source"],
+            "existing_request_feedback"
+        );
+    }
+
+    #[test]
+    fn inactive_directory_state_overrides_preserved_auth_invalid() {
+        let now_unix_secs = 1_000;
+        let mut key = StoredProviderCatalogKey::new(
+            "key-zai-2".to_string(),
+            "provider-zai".to_string(),
+            "disabled Z.AI key".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("sample key should be valid");
+        let rules = PoolMemberScoreRules::default();
+        let mut existing =
+            build_provider_key_pool_score_upsert(&key, "custom", None, now_unix_secs - 1, rules)
+                .into_stored();
+        existing.hard_state = PoolMemberHardState::AuthInvalid;
+        key.is_active = false;
+
+        let rebuilt = build_provider_key_pool_score_upsert(
+            &key,
+            "custom",
+            Some(&existing),
+            now_unix_secs,
+            rules,
+        );
+
+        assert_eq!(rebuilt.hard_state, PoolMemberHardState::Inactive);
     }
 }

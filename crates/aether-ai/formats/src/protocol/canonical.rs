@@ -11,6 +11,8 @@ pub use crate::protocol::stream::{CanonicalStreamEvent, CanonicalStreamFrame};
 
 pub(crate) const OPENAI_RESPONSES_EXTENSION_NAMESPACE: &str = "openai_responses";
 pub(crate) const OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE: &str = "openai_cli";
+pub(crate) const AETHER_AGENT_BRIDGE_PROMPT_CACHE_BREAKPOINT_FIELD: &str =
+    "aether_agent_bridge_prompt_cache_breakpoint";
 const AETHER_EXTENSION_NAMESPACE: &str = "aether";
 const CLAUDE_MESSAGES_REQUEST_SOURCE_MARKER: &str = "claude_messages_request";
 const CLAUDE_SYSTEM_SOURCE_MARKER: &str = "claude_system";
@@ -3807,6 +3809,12 @@ pub(crate) fn openai_prompt_cache_breakpoint_from_extensions(
         extensions
             .get(namespace)
             .and_then(|value| value.get("prompt_cache_breakpoint"))
+            .cloned()
+    })
+    .or_else(|| {
+        extensions
+            .get("claude")
+            .and_then(|value| value.get(AETHER_AGENT_BRIDGE_PROMPT_CACHE_BREAKPOINT_FIELD))
             .cloned()
     })
 }

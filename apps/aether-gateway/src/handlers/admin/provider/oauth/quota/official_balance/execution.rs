@@ -11,8 +11,9 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use aether_provider_pool::{
     build_deepseek_balance_request, build_official_api_key_quota_request,
-    build_openrouter_credits_request, parse_deepseek_balance, parse_official_api_key_quota,
-    parse_openrouter_credits,
+    build_openrouter_credits_request, build_zhipu_account_balance_request, parse_deepseek_balance,
+    parse_official_api_key_quota, parse_openrouter_credits, parse_zhipu_standard_balance,
+    ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD, ZHIPU_TOKEN_PLAN_STATUS_FIELD,
 };
 
 pub(super) struct PrepareInput<'a> {
@@ -26,6 +27,7 @@ pub(super) struct PrepareInput<'a> {
 pub(super) struct PreparedAttempt {
     transport: AdminGatewayProviderTransportSnapshot,
     plan: ExecutionPlan,
+    fallback_plan: Option<ExecutionPlan>,
     provider_type: String,
     pub(super) route: ExecutionRoute,
     pub(super) quota_kind: QuotaKind,
@@ -58,6 +60,7 @@ pub(super) async fn prepare_attempt(
     };
     let provider_type = input.provider.provider_type.trim().to_ascii_lowercase();
     let secret = transport.key.decrypted_api_key.trim().to_owned();
+    let fallback_secret = secret.clone();
     let spec = match provider_type.as_str() {
         "deepseek" => build_deepseek_balance_request(&input.key.id, input.endpoint, move || secret),
         "openrouter" => {
@@ -76,6 +79,15 @@ pub(super) async fn prepare_attempt(
     .map_err(|_| PreparationFailure {
         class: StableErrorClass::RequestInvalid,
     })?;
+    let fallback_spec = (provider_type == "zhipu")
+        .then(|| {
+            build_zhipu_account_balance_request(&input.key.id, input.endpoint, move || {
+                fallback_secret
+            })
+        })
+        .transpose()
+        .ok()
+        .flatten();
     let quota_kind =
         QuotaKind::from_spec(&spec.quota_kind).map_err(|class| PreparationFailure { class })?;
     let route = resolve_execution_route(input.proxy_override, || async {
@@ -94,16 +106,27 @@ pub(super) async fn prepare_attempt(
         input.state.resolve_transport_execution_timeouts(&transport),
         route.proxy.as_ref(),
     ));
+    let transport_profile = input.state.resolve_transport_profile(&transport);
+    let fallback_plan = fallback_spec.map(|fallback_spec| {
+        build_provider_quota_execution_plan(
+            &transport,
+            fallback_spec,
+            route.proxy.clone(),
+            transport_profile.clone(),
+            timeouts.clone(),
+        )
+    });
     let plan = build_provider_quota_execution_plan(
         &transport,
         spec,
         route.proxy.clone(),
-        input.state.resolve_transport_profile(&transport),
+        transport_profile,
         timeouts,
     );
     Ok(PreparedAttempt {
         transport,
         plan,
+        fallback_plan,
         provider_type,
         route,
         quota_kind,
@@ -117,19 +140,112 @@ pub(super) async fn execute_prepared(
     let PreparedAttempt {
         transport,
         plan,
+        fallback_plan,
         provider_type,
         quota_kind,
         ..
     } = prepared;
-    match execute_provider_quota_plan(state, &transport, plan, quota_kind.as_str()).await {
+    let attempt = execute_plan(state, &transport, plan, quota_kind, &provider_type).await;
+    if should_fallback_to_zhipu_balance(&attempt) {
+        if let Some(fallback_plan) = fallback_plan {
+            let fallback = execute_plan(
+                state,
+                &transport,
+                fallback_plan,
+                QuotaKind::Balance,
+                &provider_type,
+            )
+            .await;
+            return apply_zhipu_token_plan_fallback_policy(&attempt, fallback);
+        }
+    }
+    attempt
+}
+
+pub(super) fn apply_zhipu_token_plan_fallback_policy(
+    primary: &AttemptResult,
+    mut fallback: AttemptResult,
+) -> AttemptResult {
+    let status = match primary {
+        AttemptResult::BusinessFailure {
+            quota_kind: QuotaKind::Subscription,
+            upstream_code: Some(1220),
+            ..
+        } => "not_permitted",
+        AttemptResult::BusinessFailure {
+            quota_kind: QuotaKind::Subscription,
+            upstream_code: Some(1309),
+            ..
+        } => "expired",
+        AttemptResult::BusinessFailure {
+            quota_kind: QuotaKind::Subscription,
+            upstream_code: Some(1315),
+            ..
+        } => "product_mismatch",
+        AttemptResult::BusinessFailure {
+            quota_kind: QuotaKind::Subscription,
+            class: StableErrorClass::HttpClient | StableErrorClass::HttpForbidden,
+            ..
+        } => "business_error",
+        AttemptResult::ParseFailure {
+            quota_kind: QuotaKind::Subscription,
+            ..
+        } => "unverified",
+        _ => return fallback,
+    };
+    if let AttemptResult::Success {
+        snapshot,
+        quota_kind: QuotaKind::Balance,
+        ..
+    } = &mut fallback
+    {
+        snapshot.exhausted = true;
+        snapshot.extensions.insert(
+            ZHIPU_TOKEN_PLAN_STATUS_FIELD.into(),
+            serde_json::Value::String(status.into()),
+        );
+        snapshot.extensions.insert(
+            ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD.into(),
+            serde_json::Value::Bool(true),
+        );
+        snapshot.extensions.insert(
+            "scheduling_block_reason".into(),
+            serde_json::Value::String("token_plan_unavailable".into()),
+        );
+    }
+    fallback
+}
+
+async fn execute_plan(
+    state: &AdminAppState<'_>,
+    transport: &AdminGatewayProviderTransportSnapshot,
+    plan: ExecutionPlan,
+    quota_kind: QuotaKind,
+    provider_type: &str,
+) -> AttemptResult {
+    match execute_provider_quota_plan(state, transport, plan, quota_kind.as_str()).await {
         Ok(ProviderQuotaExecutionOutcome::Response(result)) => {
-            execution_result_to_attempt(result, quota_kind, &provider_type)
+            execution_result_to_attempt(result, quota_kind, provider_type)
         }
         Ok(ProviderQuotaExecutionOutcome::Failure(_)) | Err(_) => AttemptResult::TransportFailure {
             class: StableErrorClass::TransportFailed,
             quota_kind: Some(quota_kind),
         },
     }
+}
+
+pub(super) fn should_fallback_to_zhipu_balance(attempt: &AttemptResult) -> bool {
+    matches!(
+        attempt,
+        AttemptResult::ParseFailure {
+            quota_kind: QuotaKind::Subscription,
+            ..
+        } | AttemptResult::BusinessFailure {
+            quota_kind: QuotaKind::Subscription,
+            class: StableErrorClass::HttpClient | StableErrorClass::HttpForbidden,
+            ..
+        }
+    )
 }
 
 pub(super) fn execution_result_to_attempt(
@@ -151,9 +267,21 @@ pub(super) fn execution_result_to_attempt(
             quota_kind,
         };
     };
+    if matches!(provider_type, "zhipu" | "zai") {
+        if let Some((class, upstream_code, detail)) = zhipu_business_failure(&body) {
+            return AttemptResult::BusinessFailure {
+                status_code: result.status_code,
+                class,
+                quota_kind,
+                upstream_code,
+                detail,
+            };
+        }
+    }
     let parsed = match provider_type {
         "deepseek" => parse_deepseek_balance(&body),
         "openrouter" => parse_openrouter_credits(&body),
+        "zhipu" if quota_kind == QuotaKind::Balance => parse_zhipu_standard_balance(&body),
         "moonshot" | "kimi_coding" | "siliconflow" | "zhipu" | "zai" => {
             parse_official_api_key_quota(provider_type, &body)
         }
@@ -170,4 +298,49 @@ pub(super) fn execution_result_to_attempt(
             quota_kind,
         },
     }
+}
+
+fn zhipu_business_failure(
+    body: &serde_json::Value,
+) -> Option<(StableErrorClass, Option<u16>, String)> {
+    let code = body.get("code").and_then(|value| match value {
+        serde_json::Value::String(value) => Some(value.trim().to_owned()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    });
+    let unsuccessful = body.get("success").and_then(serde_json::Value::as_bool) == Some(false);
+    let code_is_success = code
+        .as_deref()
+        .is_some_and(|code| matches!(code, "0" | "200"));
+    if !unsuccessful && (code.is_none() || code_is_success) {
+        return None;
+    }
+
+    let code = code.unwrap_or_else(|| "unknown".into());
+    let numeric_code = code.parse::<u16>().ok();
+    let class = match numeric_code {
+        Some(401 | 1000 | 1001 | 1003) => StableErrorClass::HttpUnauthorized,
+        Some(403 | 1220) => StableErrorClass::HttpForbidden,
+        Some(429 | 1302 | 1305 | 1308 | 1310 | 1313 | 1316..=1321) => {
+            StableErrorClass::HttpRateLimited
+        }
+        Some(500 | 1200 | 1230 | 1234) => StableErrorClass::HttpServer,
+        _ => StableErrorClass::HttpClient,
+    };
+    let reason = match numeric_code {
+        Some(1000 | 1001) => "authentication rejected",
+        Some(1003) => "authentication token expired",
+        Some(1113) => "account balance is insufficient",
+        Some(1220) => "quota endpoint is not permitted for this API key",
+        Some(1308 | 1310 | 1316..=1321) => "quota limit reached",
+        Some(1309) => "GLM Coding Plan subscription expired",
+        Some(1315) => "API key product type does not match the selected endpoint",
+        Some(1302 | 1305 | 1313) => "quota request was rate limited",
+        _ => "quota upstream returned a business error",
+    };
+    Some((
+        class,
+        numeric_code,
+        format!("upstream business code {code}: {reason}"),
+    ))
 }

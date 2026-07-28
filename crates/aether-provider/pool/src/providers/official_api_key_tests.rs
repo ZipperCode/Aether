@@ -35,6 +35,92 @@ fn kimi_coding_endpoint_selects_fixed_usage_request() {
 }
 
 #[test]
+fn zhipu_standard_endpoint_prefers_token_plan_with_account_balance_fallback() {
+    let standard = build_official_api_key_quota_request(
+        "zhipu",
+        "standard-key",
+        &endpoint("https://open.bigmodel.cn/api/paas/v4"),
+        || "standard-secret".into(),
+    )
+    .unwrap();
+    assert_eq!(standard.url, ZHIPU_QUOTA_URL);
+    assert_eq!(standard.quota_kind, "subscription");
+    assert_eq!(standard.headers["authorization"], "standard-secret");
+
+    let balance = build_zhipu_account_balance_request(
+        "standard-key",
+        &endpoint("https://open.bigmodel.cn/api/paas/v4"),
+        || "standard-secret".into(),
+    )
+    .unwrap();
+    assert_eq!(balance.url, ZHIPU_ACCOUNT_REPORT_URL);
+    assert_eq!(balance.quota_kind, "balance");
+    assert_eq!(balance.headers["authorization"], "standard-secret");
+
+    let coding = build_official_api_key_quota_request(
+        "zhipu",
+        "coding-key",
+        &endpoint("https://open.bigmodel.cn/api/coding/paas/v4"),
+        || "coding-secret".into(),
+    )
+    .unwrap();
+    assert_eq!(coding.url, ZHIPU_QUOTA_URL);
+    assert_eq!(coding.quota_kind, "subscription");
+    assert_eq!(coding.headers["authorization"], "coding-secret");
+
+    let mut custom_path_standard = endpoint("https://open.bigmodel.cn");
+    custom_path_standard.custom_path = Some("/api/paas/v4".into());
+    let custom_path_request = build_official_api_key_quota_request(
+        "zhipu",
+        "custom-path-key",
+        &custom_path_standard,
+        || "custom-path-secret".into(),
+    )
+    .unwrap();
+    assert_eq!(custom_path_request.url, ZHIPU_QUOTA_URL);
+    assert_eq!(custom_path_request.quota_kind, "subscription");
+    assert!(
+        build_zhipu_account_balance_request("custom-path-key", &custom_path_standard, || {
+            "custom-path-secret".into()
+        },)
+        .is_ok()
+    );
+
+    assert!(build_zhipu_account_balance_request(
+        "coding-key",
+        &endpoint("https://open.bigmodel.cn/api/coding/paas/v4"),
+        || "coding-secret".into(),
+    )
+    .is_err());
+}
+
+#[test]
+fn parses_zhipu_standard_account_balance_without_subscription_limits() {
+    let parsed = parse_zhipu_standard_balance(&json!({
+        "success": true,
+        "data": {
+            "balance": 42.5,
+            "availableBalance": 40.25,
+            "rechargeAmount": 100,
+            "giveAmount": 10,
+            "totalSpendAmount": 69.75,
+            "frozenBalance": 2.25
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(parsed.kind, ProviderQuotaSnapshotKind::Balance);
+    assert_eq!(parsed.provider_type, "zhipu");
+    assert_eq!(parsed.balances[0].unit, "CNY");
+    assert_eq!(parsed.balances[0].available.as_deref(), Some("40.25"));
+    assert_eq!(parsed.balances[0].granted.as_deref(), Some("10"));
+    assert_eq!(parsed.balances[0].topped_up.as_deref(), Some("100"));
+    assert_eq!(parsed.balances[0].used.as_deref(), Some("69.75"));
+    assert_eq!(parsed.extensions["balance_source"], "standard_api");
+    assert_eq!(parsed.extensions["frozen_balance"], "2.25");
+}
+
+#[test]
 fn balance_and_subscription_are_not_conflated() {
     let moonshot = parse_official_api_key_quota(
         "moonshot",

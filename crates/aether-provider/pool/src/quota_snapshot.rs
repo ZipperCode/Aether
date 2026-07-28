@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const ZHIPU_TOKEN_PLAN_STATUS_FIELD: &str = "token_plan_status";
+pub const ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD: &str = "token_plan_scheduling_blocked";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

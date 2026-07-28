@@ -3,7 +3,10 @@ use super::{
         AttemptResult, ExecutionRoute, FlightScope, ItemStatus, OfficialQuotaItem, QuotaKind,
         RouteSource, StableErrorClass,
     },
-    execution::execution_result_to_attempt,
+    execution::{
+        apply_zhipu_token_plan_fallback_policy, execution_result_to_attempt,
+        should_fallback_to_zhipu_balance,
+    },
     persisted_backoff_applies,
     persistence::{
         build_persisted_snapshot, quota_cache_invalidation_scope, QuotaCacheInvalidationScope,

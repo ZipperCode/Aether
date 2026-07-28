@@ -1742,6 +1742,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "email_suffix_mode" => Some(json!("none")),
         "email_suffix_list" => Some(json!([])),
         "enable_format_conversion" => Some(json!(false)),
+        "agent_format_bridge_mode" => Some(json!("auto")),
         "cyber_continue_failover" => Some(json!(false)),
         "enable_model_directives" => Some(json!(false)),
         "model_directives" => Some(aether_ai_formats::default_model_directives_config()),
@@ -2223,6 +2224,16 @@ pub fn parse_admin_system_config_update(
     }
 
     match normalized_key.as_str() {
+        "agent_format_bridge_mode" => match value.as_str().map(str::trim) {
+            Some("auto" | "off") => value = json!(value.as_str().unwrap().trim()),
+            None if value.is_null() => value = json!("auto"),
+            _ => {
+                return Err((
+                    http::StatusCode::BAD_REQUEST,
+                    json!({ "detail": "请求数据验证失败" }),
+                ));
+            }
+        },
         "cyber_continue_failover"
         | "enable_model_directives"
         | "module.important_notification.enabled"
@@ -3474,6 +3485,30 @@ mod tests {
         assert_eq!(
             admin_system_config_default_value("cyber_continue_failover"),
             Some(json!(false))
+        );
+    }
+
+    #[test]
+    fn agent_bridge_mode_defaults_to_auto_and_accepts_only_auto_or_off() {
+        assert_eq!(
+            admin_system_config_default_value("agent_format_bridge_mode"),
+            Some(json!("auto"))
+        );
+        assert_eq!(
+            parse_admin_system_config_update("agent_format_bridge_mode", br#"{"value":"off"}"#,)
+                .unwrap()
+                .value,
+            json!("off")
+        );
+        assert_eq!(
+            parse_admin_system_config_update("agent_format_bridge_mode", br#"{"value":null}"#,)
+                .unwrap()
+                .value,
+            json!("auto")
+        );
+        assert!(
+            parse_admin_system_config_update("agent_format_bridge_mode", br#"{"value":"on"}"#,)
+                .is_err()
         );
     }
 

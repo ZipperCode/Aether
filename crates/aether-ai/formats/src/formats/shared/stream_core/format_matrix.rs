@@ -95,7 +95,8 @@ impl StreamingStandardFormatMatrix {
         let client_api_format = client_api_format_for_context(report_context);
 
         self.provider = ProviderStreamParser::for_api_format(provider_api_format.as_str());
-        self.client = ClientStreamEmitter::for_api_format(client_api_format.as_str());
+        self.client =
+            ClientStreamEmitter::for_api_format(client_api_format.as_str(), report_context);
     }
 
     fn emit_frames(
@@ -401,13 +402,19 @@ fn standardized_usage_from_canonical(usage: CanonicalUsage) -> StandardizedUsage
 }
 
 impl ClientStreamEmitter {
-    fn for_api_format(client_api_format: &str) -> Option<Self> {
+    fn for_api_format(client_api_format: &str, report_context: &Value) -> Option<Self> {
         Some(match FormatId::parse(client_api_format)? {
             FormatId::OpenAiChat => Self::OpenAIChat(OpenAIChatClientEmitter::default()),
             FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact => {
                 Self::OpenAIResponses(Box::default())
             }
-            FormatId::ClaudeMessages => Self::Claude(ClaudeClientEmitter::default()),
+            FormatId::ClaudeMessages => {
+                Self::Claude(ClaudeClientEmitter::default().with_agent_bridge_handle(
+                    crate::formats::agent_bridge::agent_bridge_response_handle_from_report_context(
+                        report_context,
+                    ),
+                ))
+            }
             FormatId::GeminiGenerateContent => Self::Gemini(GeminiClientEmitter::default()),
             FormatId::OpenAiEmbedding
             | FormatId::OpenAiSearch
@@ -2193,5 +2200,114 @@ mod tests {
             usage.dimensions.get("image_quality"),
             Some(&json!("medium"))
         );
+    }
+
+    fn agent_bridge_report_context() -> Value {
+        json!({
+            "provider_api_format": "openai:responses",
+            "client_api_format": "claude:messages",
+            "mapped_model": "gpt-5.3-codex",
+            "agent_bridge": {
+                "enabled": true,
+                "response_handle": "aether-abr1.00000000-0000-4000-8000-000000000001"
+            }
+        })
+    }
+
+    #[test]
+    fn agent_bridge_stream_uses_authoritative_function_arguments_once() {
+        let report_context = agent_bridge_report_context();
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = Vec::new();
+        for event in [
+            json!({"type":"response.created","response":{"id":"resp_1","model":"gpt-5.3-codex"}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"Read","arguments":""}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","call_id":"call_1","delta":"{\"path\":"}),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","call_id":"call_1","delta":"\"a.rs\"}"}),
+            json!({"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","call_id":"call_1","name":"Read","arguments":"{\"path\":\"a.rs\"}"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"Read","arguments":"{\"path\":\"a.rs\"}"}}),
+            json!({"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.3-codex","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"Read","arguments":"{\"path\":\"a.rs\"}"}]}}),
+        ] {
+            output.extend(
+                matrix
+                    .transform_line(&report_context, data_line(event))
+                    .unwrap(),
+            );
+        }
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("aether-abr1.00000000-0000-4000-8000-000000000001"));
+        assert_eq!(output.matches("\"type\":\"input_json_delta\"").count(), 1);
+        assert_eq!(output.matches("\\\"path\\\":\\\"a.rs\\\"").count(), 1);
+        assert!(output.find("redacted_thinking").unwrap() < output.find("tool_use").unwrap());
+    }
+
+    #[test]
+    fn agent_bridge_stream_preserves_parallel_tool_order() {
+        let report_context = agent_bridge_report_context();
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = Vec::new();
+        for event in [
+            json!({"type":"response.created","response":{"id":"resp_parallel","model":"gpt-5.3-codex"}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_0","call_id":"call_0","name":"Read","arguments":""}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"Read","arguments":""}}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"Read","arguments":"{\"path\":\"b.rs\"}"}}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_0","call_id":"call_0","name":"Read","arguments":"{\"path\":\"a.rs\"}"}}),
+            json!({"type":"response.completed","response":{"id":"resp_parallel","model":"gpt-5.3-codex","status":"completed","output":[
+                {"type":"function_call","id":"fc_0","call_id":"call_0","name":"Read","arguments":"{\"path\":\"a.rs\"}"},
+                {"type":"function_call","id":"fc_1","call_id":"call_1","name":"Read","arguments":"{\"path\":\"b.rs\"}"}
+            ]}}),
+        ] {
+            output.extend(
+                matrix
+                    .transform_line(&report_context, data_line(event))
+                    .unwrap(),
+            );
+        }
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.find("\"id\":\"call_0\"").unwrap() < output.find("\"id\":\"call_1\"").unwrap()
+        );
+        assert_eq!(output.matches("\"type\":\"input_json_delta\"").count(), 2);
+        assert_eq!(output.matches("\\\"path\\\":\\\"a.rs\\\"").count(), 1);
+        assert_eq!(output.matches("\\\"path\\\":\\\"b.rs\\\"").count(), 1);
+    }
+
+    #[test]
+    fn agent_bridge_stream_places_reasoning_signature_before_visible_text() {
+        let report_context = agent_bridge_report_context();
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = Vec::new();
+        for event in [
+            json!({"type":"response.reasoning_summary_text.delta","response_id":"resp_1","delta":"inspect first"}),
+            json!({"type":"response.aether_reasoning_fallback","signature":"aether-ars1.sealed"}),
+            json!({"type":"response.output_text.delta","response_id":"resp_1","output_index":1,"content_index":0,"delta":"done"}),
+            json!({"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.3-codex","status":"completed","output":[]}}),
+        ] {
+            output.extend(
+                matrix
+                    .transform_line(&report_context, data_line(event))
+                    .unwrap(),
+            );
+        }
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.find("signature_delta").unwrap() < output.find("text_delta").unwrap());
+        assert!(output.contains("aether-ars1.sealed"));
+    }
+
+    #[test]
+    fn agent_bridge_stream_rejects_empty_or_invalid_function_arguments() {
+        let report_context = agent_bridge_report_context();
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let error = matrix
+            .transform_line(
+                &report_context,
+                data_line(json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":""}
+                })),
+            )
+            .expect_err("empty function arguments must fail closed");
+        assert!(error.to_string().contains("empty arguments"));
     }
 }

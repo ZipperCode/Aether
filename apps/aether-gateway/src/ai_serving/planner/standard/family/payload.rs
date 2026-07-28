@@ -101,6 +101,10 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         );
         insert_native_client_envelope_name(&mut extra_fields, envelope_name, parts.uri.path());
     }
+    crate::ai_serving::agent_bridge::insert_agent_bridge_report_context(
+        &mut extra_fields,
+        resolved.agent_bridge.clone(),
+    );
     let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
         spec_metadata.api_format,
         resolved.provider_api_format.as_str(),
@@ -176,6 +180,7 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         transport,
         transport_profile: _,
         request_redacted: _,
+        agent_bridge: _,
     } = resolved;
     let request_encoding = resolve_transport_request_encoding_policy(&transport);
 

@@ -2449,7 +2449,9 @@ fn validate_claude_cross_format_request(body: &Value, target: FormatId) -> Resul
                     reason: "OpenAI Responses request input cannot losslessly preserve Claude thinking blocks".to_string(),
                 });
             }
-            if claude_request_contains_tool_result_content_array(body) {
+            if claude_request_contains_unrepresentable_tool_result_content_for_openai_responses(
+                body,
+            ) {
                 return Err(FormatError::LossyConversionBlocked {
                     source_format: FormatId::ClaudeMessages.as_str().to_string(),
                     target_format: target.as_str().to_string(),
@@ -4720,7 +4722,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_reasoning_effort_uses_concrete_mapped_model_as_authoritative_capability() {
+    fn runtime_reasoning_effort_preserves_valid_wire_effort_for_unprofiled_model() {
         let alias_to_gpt_5_6 = json!({
             "model": "deployment-alias",
             "messages": [{"role": "user", "content": "hello"}],
@@ -4736,27 +4738,24 @@ mod tests {
         assert_eq!(converted["model"], "gpt-5.6-sol");
         assert_eq!(converted["reasoning"]["effort"], "max");
 
-        let gpt_5_6_to_gpt_5_4 = json!({
+        let gpt_5_6_to_gpt_5_4_mini = json!({
             "model": "gpt-5.6-sol",
             "messages": [{"role": "user", "content": "hello"}],
             "reasoning_effort": "max"
         });
-        let error = convert_request(
+        let converted = convert_request(
             "openai:chat",
             "openai:responses",
-            &gpt_5_6_to_gpt_5_4,
-            &FormatContext::default().with_mapped_model("gpt-5.4"),
+            &gpt_5_6_to_gpt_5_4_mini,
+            &FormatContext::default().with_mapped_model("gpt-5.4-mini"),
         )
-        .expect_err("a concrete GPT-5.4 mapped target must reject max");
-        assert!(matches!(
-            error,
-            super::FormatError::InvalidTargetField { ref field, .. }
-                if field == "reasoning_effort"
-        ));
+        .expect("an unprofiled concrete target must preserve a valid wire effort");
+        assert_eq!(converted["model"], "gpt-5.4-mini");
+        assert_eq!(converted["reasoning"]["effort"], "max");
     }
 
     #[test]
-    fn pure_conversion_reasoning_effort_uses_the_concrete_mapped_model() {
+    fn pure_conversion_preserves_valid_wire_effort_for_unprofiled_model() {
         let alias_to_gpt_5_6 = json!({
             "model": "deployment-alias",
             "messages": [{"role": "user", "content": "hello"}],
@@ -4771,23 +4770,40 @@ mod tests {
         .expect("a concrete GPT-5.6 target should accept max");
         assert_eq!(converted.value["reasoning"]["effort"], "max");
 
-        let gpt_5_6_to_gpt_5_4 = json!({
+        let gpt_5_6_to_gpt_5_4_mini = json!({
             "model": "gpt-5.6-sol",
             "messages": [{"role": "user", "content": "hello"}],
             "reasoning_effort": "max"
         });
-        let error = convert_request_pure_with_context(
+        let converted = convert_request_pure_with_context(
             "openai:chat",
             "openai:responses",
-            &gpt_5_6_to_gpt_5_4,
-            &FormatContext::default().with_mapped_model("gpt-5.4"),
+            &gpt_5_6_to_gpt_5_4_mini,
+            &FormatContext::default().with_mapped_model("gpt-5.4-mini"),
         )
-        .expect_err("a concrete GPT-5.4 target must reject max");
-        assert!(matches!(
-            error,
-            super::FormatError::InvalidTargetField { ref field, .. }
-                if field == "reasoning_effort"
-        ));
+        .expect("an unprofiled concrete target must preserve a valid wire effort");
+        assert_eq!(converted.value["reasoning"]["effort"], "max");
+    }
+
+    #[test]
+    fn runtime_claude_max_effort_converts_to_unprofiled_openai_responses_model() {
+        let claude = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 256,
+            "output_config": {"effort": "max"}
+        });
+
+        let converted = convert_request(
+            "claude:messages",
+            "openai:responses",
+            &claude,
+            &FormatContext::default().with_mapped_model("gpt-5.4-mini"),
+        )
+        .expect("Claude max must reach an unprofiled OpenAI Responses model");
+
+        assert_eq!(converted["model"], "gpt-5.4-mini");
+        assert_eq!(converted["reasoning"]["effort"], "max");
     }
 
     #[test]

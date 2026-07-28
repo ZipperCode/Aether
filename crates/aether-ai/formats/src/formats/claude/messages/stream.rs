@@ -422,9 +422,15 @@ pub struct ClaudeClientEmitter {
     open_block: Option<ClaudeOpenBlock>,
     tool_block_indices: BTreeMap<usize, usize>,
     tool_states: BTreeMap<usize, ClaudeClientToolState>,
+    agent_bridge_handle: Option<String>,
 }
 
 impl ClaudeClientEmitter {
+    pub fn with_agent_bridge_handle(mut self, handle: Option<&str>) -> Self {
+        self.agent_bridge_handle = handle.map(ToOwned::to_owned);
+        self
+    }
+
     fn update_identity(&mut self, frame: &CanonicalStreamFrame) {
         self.message_id = Some(frame.id.clone());
         self.model = Some(frame.model.clone());
@@ -435,7 +441,7 @@ impl ClaudeClientEmitter {
             return Ok(Vec::new());
         }
         self.started = true;
-        encode_json_sse(
+        let mut out = encode_json_sse(
             Some("message_start"),
             &json!({
                 "type": "message_start",
@@ -453,7 +459,30 @@ impl ClaudeClientEmitter {
                     },
                 }
             }),
-        )
+        )?;
+        if let Some(handle) = self.agent_bridge_handle.as_deref() {
+            let block_index = self.next_block_index;
+            self.next_block_index += 1;
+            out.extend(encode_json_sse(
+                Some("content_block_start"),
+                &json!({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "redacted_thinking",
+                        "data": handle,
+                    }
+                }),
+            )?);
+            out.extend(encode_json_sse(
+                Some("content_block_stop"),
+                &json!({
+                    "type": "content_block_stop",
+                    "index": block_index,
+                }),
+            )?);
+        }
+        Ok(out)
     }
 
     fn close_open_block(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {

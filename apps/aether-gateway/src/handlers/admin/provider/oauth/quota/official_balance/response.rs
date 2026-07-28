@@ -36,7 +36,7 @@ pub(super) fn persisted_item(
         Some(class) => (
             ItemStatus::Error,
             Some(class),
-            Some(class.message().to_owned()),
+            attempt.failure_message().map(str::to_owned),
         ),
         None => (ItemStatus::Success, None, None),
     };

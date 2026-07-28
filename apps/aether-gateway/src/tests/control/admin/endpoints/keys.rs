@@ -4,7 +4,11 @@ use aether_contracts::ExecutionPlan;
 use aether_crypto::{
     decrypt_python_fernet_ciphertext, encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY,
 };
+use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+use aether_data_contracts::repository::pool_scores::{
+    GetPoolMemberScoresByIdsQuery, PoolMemberHardState, PoolMemberIdentity, PoolScoreReadRepository,
+};
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, StoredProviderCatalogEndpoint,
     StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
@@ -20,6 +24,9 @@ use serde_json::json;
 use super::super::super::{
     build_router_with_state, build_state_with_execution_runtime_override, sample_endpoint,
     sample_key, sample_provider, start_server, AppState,
+};
+use crate::ai_serving::{
+    build_provider_key_pool_score_upsert, provider_key_pool_score_id, provider_key_pool_score_scope,
 };
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
@@ -1874,6 +1881,97 @@ async fn gateway_updates_admin_provider_key_locally_with_trusted_admin_principal
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn provider_key_credential_update_recovers_auth_invalid_pool_score() {
+    let mut provider = sample_provider("provider-zai", "Z.AI", 10);
+    provider.provider_type = "custom".to_string();
+    provider.config = Some(json!({"pool_advanced": {}}));
+    let key = sample_key(
+        "key-zai-a",
+        "provider-zai",
+        "openai:chat",
+        "zai-invalid-key",
+    );
+    let identity = PoolMemberIdentity::provider_api_key("provider-zai", "key-zai-a");
+    let scope = provider_key_pool_score_scope();
+    let score_id = provider_key_pool_score_id(&identity, &scope);
+    let mut invalid_score = build_provider_key_pool_score_upsert(
+        &key,
+        "custom",
+        None,
+        1,
+        aether_pool_core::PoolMemberScoreRules::default(),
+    )
+    .into_stored();
+    invalid_score.hard_state = PoolMemberHardState::AuthInvalid;
+    invalid_score.last_failure_at = Some(1);
+    invalid_score.failure_count = 3;
+    invalid_score.updated_at = 1;
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![],
+        vec![key],
+    ));
+    let pool_score_repository =
+        Arc::new(InMemoryPoolMemberScoreRepository::seed(vec![invalid_score]));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                    &provider_catalog_repository,
+                ))
+                .with_pool_score_repository_for_tests(Arc::clone(&pool_score_repository))
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+
+    let metadata_response = client
+        .put(format!("{gateway_url}/api/admin/endpoints/keys/key-zai-a"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({"name": "renamed Z.AI key"}))
+        .send()
+        .await
+        .expect("metadata update should succeed");
+    assert_eq!(metadata_response.status(), StatusCode::OK);
+    let scores = pool_score_repository
+        .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+            ids: vec![score_id.clone()],
+        })
+        .await
+        .expect("pool score should load after metadata update");
+    assert_eq!(scores[0].hard_state, PoolMemberHardState::AuthInvalid);
+
+    let credential_response = client
+        .put(format!("{gateway_url}/api/admin/endpoints/keys/key-zai-a"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({"api_key": "zai-replacement-key"}))
+        .send()
+        .await
+        .expect("credential update should succeed");
+    assert_eq!(credential_response.status(), StatusCode::OK);
+    let scores = pool_score_repository
+        .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+            ids: vec![score_id],
+        })
+        .await
+        .expect("pool score should load after credential update");
+    assert!(scores[0].hard_state.schedulable());
+    assert_eq!(scores[0].last_failure_at, None);
+    assert_eq!(scores[0].failure_count, 0);
+
+    gateway_handle.abort();
 }
 
 #[tokio::test]

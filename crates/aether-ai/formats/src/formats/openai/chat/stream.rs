@@ -10,6 +10,45 @@ use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
 use crate::formats::shared::stream_core::common::*;
 use crate::formats::shared::AiSurfaceFinalizeError;
 
+fn agent_bridge_stream_enabled(report_context: &Value) -> bool {
+    report_context
+        .get(crate::formats::agent_bridge::AGENT_BRIDGE_REPORT_CONTEXT_FIELD)
+        .and_then(Value::as_object)
+        .is_some_and(|bridge| {
+            bridge.get("enabled").and_then(Value::as_bool) == Some(true)
+                || bridge
+                    .get("response_handle")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| {
+                        value.starts_with(crate::formats::agent_bridge::AGENT_BRIDGE_HANDLE_PREFIX)
+                    })
+        })
+}
+
+fn validate_agent_bridge_stream_function_call(
+    item: &Map<String, Value>,
+) -> Result<(), AiSurfaceFinalizeError> {
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return Ok(());
+    }
+    let arguments = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AiSurfaceFinalizeError::new("Agent Bridge function call has empty arguments")
+        })?;
+    let parsed = serde_json::from_str::<Value>(arguments).map_err(|_| {
+        AiSurfaceFinalizeError::new("Agent Bridge function call arguments are not valid JSON")
+    })?;
+    if !parsed.is_object() {
+        return Err(AiSurfaceFinalizeError::new(
+            "Agent Bridge function call arguments must be a JSON object",
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_openai_service_tier(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -66,6 +105,9 @@ pub struct OpenAIResponsesProviderState {
     image_item_keys: BTreeSet<String>,
     opaque_completed_item_keys: BTreeSet<String>,
     last_tool_index: Option<usize>,
+    agent_bridge_function_order: Vec<usize>,
+    agent_bridge_completed_functions: BTreeMap<usize, Map<String, Value>>,
+    agent_bridge_emitted_functions: BTreeSet<usize>,
 }
 
 impl OpenAIChatProviderState {
@@ -651,6 +693,57 @@ impl OpenAIResponsesProviderState {
         });
     }
 
+    fn agent_bridge_function_index(
+        &mut self,
+        item: &Map<String, Value>,
+        output_index: Option<usize>,
+    ) -> usize {
+        let key = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let index = self.tool_index_for_key(key, output_index);
+        if !self.agent_bridge_function_order.contains(&index) {
+            self.agent_bridge_function_order.push(index);
+        }
+        index
+    }
+
+    fn buffer_agent_bridge_function(
+        &mut self,
+        item: &Map<String, Value>,
+        output_index: Option<usize>,
+        authoritative: bool,
+    ) {
+        let index = self.agent_bridge_function_index(item, output_index);
+        if authoritative {
+            self.agent_bridge_completed_functions
+                .insert(index, item.clone());
+        } else {
+            self.agent_bridge_completed_functions
+                .entry(index)
+                .or_insert_with(|| item.clone());
+        }
+    }
+
+    fn flush_agent_bridge_functions(
+        &mut self,
+        report_context: &Value,
+        out: &mut Vec<CanonicalStreamFrame>,
+    ) {
+        for index in self.agent_bridge_function_order.clone() {
+            if self.agent_bridge_emitted_functions.contains(&index) {
+                continue;
+            }
+            let Some(item) = self.agent_bridge_completed_functions.get(&index).cloned() else {
+                break;
+            };
+            self.emit_tool_call_item(report_context, out, &item, Some(index));
+            self.agent_bridge_emitted_functions.insert(index);
+        }
+    }
+
     fn merge_tool_call_arguments(state: &mut OpenAIResponsesProviderToolState, arguments: &str) {
         if arguments.is_empty() {
             return;
@@ -729,7 +822,15 @@ impl OpenAIResponsesProviderState {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        Self::merge_tool_call_arguments(state, &completed_arguments);
+        if agent_bridge_stream_enabled(report_context) {
+            if state.started_emitted && state.emitted_arguments_len > 0 {
+                return;
+            }
+            state.arguments = completed_arguments;
+            state.emitted_arguments_len = 0;
+        } else {
+            Self::merge_tool_call_arguments(state, &completed_arguments);
+        }
         self.emit_ready_tool_call(report_context, out, index);
     }
 
@@ -1122,6 +1223,16 @@ impl OpenAIResponsesProviderState {
     ) -> bool {
         match item.get("type").and_then(Value::as_str).unwrap_or_default() {
             "function_call" => {
+                if agent_bridge_stream_enabled(report_context) {
+                    self.ensure_started(report_context, out);
+                    if final_item {
+                        self.buffer_agent_bridge_function(item, output_index, true);
+                        self.flush_agent_bridge_functions(report_context, out);
+                    } else {
+                        self.agent_bridge_function_index(item, output_index);
+                    }
+                    return true;
+                }
                 self.emit_tool_call_item(report_context, out, item, output_index);
                 true
             }
@@ -1162,6 +1273,12 @@ impl OpenAIResponsesProviderState {
                 true
             }
             "reasoning" => {
+                self.ensure_started(report_context, out);
+                true
+            }
+            "compaction" | "context_compaction" | "response.compaction"
+                if agent_bridge_stream_enabled(report_context) =>
+            {
                 self.ensure_started(report_context, out);
                 true
             }
@@ -1247,6 +1364,33 @@ impl OpenAIResponsesProviderState {
             {
                 out.push(self.unknown_frame(report_context, Value::Object(item.clone())));
             }
+        }
+    }
+
+    fn emit_agent_bridge_reasoning_fallbacks(
+        &mut self,
+        report_context: &Value,
+        out: &mut Vec<CanonicalStreamFrame>,
+        event: &Value,
+    ) {
+        if !agent_bridge_stream_enabled(report_context) {
+            return;
+        }
+        for signature in event
+            .get("aether_reasoning_fallbacks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|signature| !signature.is_empty())
+        {
+            self.ensure_started(report_context, out);
+            let (id, model) = self.identity(report_context);
+            out.push(CanonicalStreamFrame {
+                id,
+                model,
+                event: CanonicalStreamEvent::ReasoningSignature(signature.to_string()),
+            });
         }
     }
 
@@ -1567,7 +1711,9 @@ impl OpenAIResponsesProviderState {
                         .to_string();
                 }
                 state.arguments.push_str(delta);
-                self.emit_ready_tool_call(report_context, &mut out, index);
+                if !agent_bridge_stream_enabled(report_context) {
+                    self.emit_ready_tool_call(report_context, &mut out, index);
+                }
             }
             "response.function_call_arguments.done" => {
                 let arguments = value
@@ -1628,8 +1774,10 @@ impl OpenAIResponsesProviderState {
                     })
                     .unwrap_or(state.name.as_str())
                     .to_string();
-                Self::merge_tool_call_arguments(state, arguments);
-                self.emit_ready_tool_call(report_context, &mut out, index);
+                if !agent_bridge_stream_enabled(report_context) {
+                    Self::merge_tool_call_arguments(state, arguments);
+                    self.emit_ready_tool_call(report_context, &mut out, index);
+                }
             }
             "response.function_call_output.delta" | "response.function_call_output.done" => {
                 let tool_use_id = value
@@ -1715,6 +1863,9 @@ impl OpenAIResponsesProviderState {
                 let Some(item) = value.get("item").and_then(Value::as_object) else {
                     return Ok(out);
                 };
+                if agent_bridge_stream_enabled(report_context) {
+                    validate_agent_bridge_stream_function_call(item)?;
+                }
                 let output_index = value
                     .get("output_index")
                     .and_then(Value::as_u64)
@@ -1728,13 +1879,40 @@ impl OpenAIResponsesProviderState {
                     true,
                 );
             }
+            "response.aether_reasoning_fallback" if agent_bridge_stream_enabled(report_context) => {
+                let Some(signature) = value.get("signature").and_then(Value::as_str) else {
+                    return Ok(out);
+                };
+                if signature.is_empty() {
+                    return Ok(out);
+                }
+                self.ensure_started(report_context, &mut out);
+                let (id, model) = self.identity(report_context);
+                out.push(CanonicalStreamFrame {
+                    id,
+                    model,
+                    event: CanonicalStreamEvent::ReasoningSignature(signature.to_string()),
+                });
+            }
             "response.incomplete" => {
                 let Some(response) = value.get("response").and_then(Value::as_object) else {
                     return Ok(out);
                 };
+                if agent_bridge_stream_enabled(report_context) {
+                    for item in response
+                        .get("output")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_object)
+                    {
+                        validate_agent_bridge_stream_function_call(item)?;
+                    }
+                }
                 self.ensure_started(report_context, &mut out);
                 let (id, model) = self.identity(report_context);
                 self.emit_response_output_items(report_context, &mut out, response);
+                self.emit_agent_bridge_reasoning_fallbacks(report_context, &mut out, &value);
 
                 out.push(CanonicalStreamFrame {
                     id,
@@ -1771,9 +1949,21 @@ impl OpenAIResponsesProviderState {
                 let Some(response) = value.get("response").and_then(Value::as_object) else {
                     return Ok(out);
                 };
+                if agent_bridge_stream_enabled(report_context) {
+                    for item in response
+                        .get("output")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_object)
+                    {
+                        validate_agent_bridge_stream_function_call(item)?;
+                    }
+                }
                 self.ensure_started(report_context, &mut out);
                 let (id, model) = self.identity(report_context);
                 self.emit_response_output_items(report_context, &mut out, response);
+                self.emit_agent_bridge_reasoning_fallbacks(report_context, &mut out, &value);
 
                 let finish_reason = if self.tool_calls.is_empty() {
                     Some("stop".to_string())

@@ -718,8 +718,8 @@ pub fn reasoning_effort_supported_for_model(
         "openai:chat" | "openai:responses" | "openai:responses:compact" | "openai:search" => {
             match resolved_openai_model_identity(provider_model, source_model).0 {
                 OpenAiModelIdentity::Gpt56 => effort != ReasoningEffort::Minimal,
-                OpenAiModelIdentity::ConcreteOther => effort != ReasoningEffort::Max,
-                OpenAiModelIdentity::Opaque => true,
+                // 没有模型卡时，模型名称不能作为“不支持”的证据；合法 wire 值交给上游校验。
+                OpenAiModelIdentity::ConcreteOther | OpenAiModelIdentity::Opaque => true,
             }
         }
         "claude:messages" | "gemini:generate_content" => matches!(
@@ -1115,8 +1115,16 @@ mod tests {
     }
 
     #[test]
-    fn max_suffix_is_capability_aware_for_openai_models() {
-        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+    fn max_suffix_is_preserved_without_an_explicit_openai_model_profile() {
+        for model in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-6.0",
+        ] {
             let mut body = json!({"model": model});
             apply_model_directive_overrides_from_model(
                 &mut body,
@@ -1128,17 +1136,6 @@ mod tests {
             assert_eq!(body["reasoning"]["effort"], "max", "model: {model}");
         }
 
-        let mut unsupported_model = json!({"model": "gpt-5.4"});
-        let original = unsupported_model.clone();
-        assert!(apply_model_directive_overrides_from_model(
-            &mut unsupported_model,
-            "openai:responses",
-            "gpt-5.4",
-            "gpt-5.4-max",
-        )
-        .is_none());
-        assert_eq!(unsupported_model, original);
-
         let mut mapped_deployment = json!({"model": "azure-production"});
         apply_model_directive_overrides_from_model(
             &mut mapped_deployment,
@@ -1149,27 +1146,15 @@ mod tests {
         .expect("source model capability should survive provider model mapping");
         assert_eq!(mapped_deployment["reasoning"]["effort"], "max");
 
-        let mut explicit_unsupported_target = json!({"model": "gpt-5.4"});
-        let original = explicit_unsupported_target.clone();
-        assert!(apply_model_directive_overrides_from_model(
-            &mut explicit_unsupported_target,
+        let mut concrete_unprofiled_target = json!({"model": "gpt-5.4-mini"});
+        apply_model_directive_overrides_from_model(
+            &mut concrete_unprofiled_target,
             "openai:responses",
-            "gpt-5.4",
+            "gpt-5.4-mini",
             "gpt-5.6-sol-max",
         )
-        .is_none());
-        assert_eq!(explicit_unsupported_target, original);
-
-        let mut unknown_future = json!({"model": "gpt-6.0"});
-        let original = unknown_future.clone();
-        assert!(apply_model_directive_overrides_from_model(
-            &mut unknown_future,
-            "openai:responses",
-            "gpt-6.0",
-            "gpt-6.0-max",
-        )
-        .is_none());
-        assert_eq!(unknown_future, original);
+        .expect("an unprofiled concrete target must not be rejected by name");
+        assert_eq!(concrete_unprofiled_target["reasoning"]["effort"], "max");
     }
 
     #[test]

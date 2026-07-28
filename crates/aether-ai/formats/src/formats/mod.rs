@@ -1,3 +1,4 @@
+pub mod agent_bridge;
 pub mod aliyun;
 pub mod claude;
 pub mod context;

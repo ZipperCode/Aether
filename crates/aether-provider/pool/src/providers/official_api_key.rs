@@ -8,6 +8,7 @@ use crate::provider::{provider_pool_matching_endpoint, ProviderPoolAdapter};
 use crate::quota::provider_pool_current_unix_secs;
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
 use crate::quota_snapshot::{ProviderQuotaBalance, ProviderQuotaSnapshotContract};
+use url::Url;
 
 use super::official_balance::{decimal_string, endpoint_has_official_origin};
 use super::official_subscription::{parse_kimi_coding_subscription, parse_zhipu_subscription};
@@ -16,8 +17,27 @@ pub const MOONSHOT_BALANCE_URL: &str = "https://api.moonshot.cn/v1/users/me/bala
 pub const KIMI_CODING_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 pub const SILICONFLOW_CN_BALANCE_URL: &str = "https://api.siliconflow.cn/v1/user/info";
 pub const SILICONFLOW_GLOBAL_BALANCE_URL: &str = "https://api.siliconflow.com/v1/user/info";
-pub const ZHIPU_QUOTA_URL: &str = "https://bigmodel.cn/api/monitor/usage/quota/limit";
+pub const ZHIPU_QUOTA_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
+pub const ZHIPU_ACCOUNT_REPORT_URL: &str =
+    "https://open.bigmodel.cn/api/biz/account/query-customer-account-report";
 pub const ZAI_QUOTA_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
+
+fn zhipu_uses_standard_api_balance(endpoint: &StoredProviderCatalogEndpoint) -> bool {
+    if !official_host("zhipu", endpoint) {
+        return false;
+    }
+    let Ok(url) = Url::parse(endpoint.base_url.trim()) else {
+        return false;
+    };
+    let standard = [
+        url.path(),
+        endpoint.custom_path.as_deref().unwrap_or_default(),
+    ]
+    .into_iter()
+    .map(|path| path.trim_end_matches('/').to_ascii_lowercase())
+    .any(|path| path == "/api/paas/v4" || path.starts_with("/api/paas/v4/"));
+    standard
+}
 
 fn official_host(provider_type: &str, endpoint: &StoredProviderCatalogEndpoint) -> bool {
     match provider_type {
@@ -154,6 +174,78 @@ where
         model_name: None,
         accept_invalid_certs: false,
     })
+}
+
+pub fn build_zhipu_account_balance_request<F>(
+    key_id: &str,
+    endpoint: &StoredProviderCatalogEndpoint,
+    read_secret: F,
+) -> Result<ProviderPoolQuotaRequestSpec, &'static str>
+where
+    F: FnOnce() -> String,
+{
+    if !zhipu_uses_standard_api_balance(endpoint) {
+        return Err("account balance fallback requires the standard Zhipu API endpoint");
+    }
+    let authorization = read_secret().trim().to_owned();
+    Ok(ProviderPoolQuotaRequestSpec {
+        request_id: format!("zhipu-balance-{key_id}"),
+        provider_name: "zhipu".into(),
+        quota_kind: "balance".into(),
+        method: "GET".into(),
+        url: ZHIPU_ACCOUNT_REPORT_URL.into(),
+        headers: BTreeMap::from([
+            ("accept".into(), "application/json".into()),
+            ("authorization".into(), authorization),
+        ]),
+        content_type: None,
+        json_body: None,
+        client_api_format: "openai:chat".into(),
+        provider_api_format: "openai:chat".into(),
+        model_name: None,
+        accept_invalid_certs: false,
+    })
+}
+
+pub fn parse_zhipu_standard_balance(
+    value: &Value,
+) -> Result<ProviderQuotaSnapshotContract, &'static str> {
+    if value.get("success").and_then(Value::as_bool) == Some(false) {
+        return Err("upstream balance response was unsuccessful");
+    }
+    let data = value.get("data").ok_or("missing account balance data")?;
+    let available = data
+        .get("availableBalance")
+        .and_then(decimal_string)
+        .or_else(|| data.get("balance").and_then(decimal_string));
+    let granted = data.get("giveAmount").and_then(decimal_string);
+    let topped_up = data.get("rechargeAmount").and_then(decimal_string);
+    let used = data.get("totalSpendAmount").and_then(decimal_string);
+    if available.is_none() && granted.is_none() && topped_up.is_none() && used.is_none() {
+        return Err("no valid account balance fields");
+    }
+
+    let mut snapshot = ProviderQuotaSnapshotContract::balance(
+        "zhipu",
+        vec![ProviderQuotaBalance {
+            unit: "CNY".into(),
+            available,
+            total: None,
+            granted,
+            topped_up,
+            used,
+        }],
+    );
+    snapshot.extensions.insert(
+        "balance_source".into(),
+        Value::String("standard_api".into()),
+    );
+    if let Some(frozen) = data.get("frozenBalance").and_then(decimal_string) {
+        snapshot
+            .extensions
+            .insert("frozen_balance".into(), Value::String(frozen));
+    }
+    Ok(snapshot)
 }
 
 pub fn parse_official_api_key_quota(

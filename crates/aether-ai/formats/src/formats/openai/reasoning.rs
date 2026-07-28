@@ -300,10 +300,13 @@ fn validate_reasoning_summary(value: &Value) -> Result<(), OpenAiReasoningContra
 mod tests {
     use serde_json::json;
 
-    use super::{validate_openai_reasoning_request, OpenAiReasoningViolationKind};
+    use super::{
+        validate_openai_reasoning_request, validate_openai_reasoning_request_with_model_profile,
+        OpenAiReasoningViolationKind,
+    };
 
     #[test]
-    fn mapped_model_is_authoritative_for_openai_reasoning_effort() {
+    fn valid_wire_effort_without_model_card_is_not_rejected_by_model_name() {
         let alias = json!({
             "model": "deployment-alias",
             "reasoning": {"effort": "max"}
@@ -311,18 +314,22 @@ mod tests {
         validate_openai_reasoning_request(
             "openai:responses",
             "openai:responses",
-            "gpt-5.6-sol",
+            "gpt-5.4-mini",
             &alias,
         )
-        .expect("GPT-5.6 should accept max");
+        .expect("an unprofiled OpenAI model must preserve a valid wire effort");
 
-        let error = validate_openai_reasoning_request(
+        let supported_efforts = ["low", "medium", "high", "xhigh"].map(str::to_string);
+        let error = validate_openai_reasoning_request_with_model_profile(
             "openai:responses",
             "openai:responses",
-            "gpt-5.4",
+            "gpt-5.4-mini",
+            "deployment-alias",
             &alias,
+            Some(&supported_efforts),
+            None,
         )
-        .expect_err("GPT-5.4 should reject max");
+        .expect_err("an explicit model card remains authoritative");
         assert_eq!(
             error.kind,
             OpenAiReasoningViolationKind::UnsupportedForModel

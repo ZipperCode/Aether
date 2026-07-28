@@ -53,9 +53,9 @@ pub use nous::{
     NOUS_ACCOUNT_PATH, NOUS_BILLING_PATH, NOUS_PORTAL_BASE_URL,
 };
 pub use official_api_key::{
-    build_official_api_key_quota_request, is_official_api_key_quota_endpoint,
-    parse_official_api_key_quota, OfficialApiKeyQuotaProvider,
-    OfficialApiKeyQuotaProviderPoolAdapter,
+    build_official_api_key_quota_request, build_zhipu_account_balance_request,
+    is_official_api_key_quota_endpoint, parse_official_api_key_quota, parse_zhipu_standard_balance,
+    OfficialApiKeyQuotaProvider, OfficialApiKeyQuotaProviderPoolAdapter, ZHIPU_ACCOUNT_REPORT_URL,
 };
 pub use official_balance::clamp_official_balance_execution_timeouts;
 pub use openrouter::{

@@ -118,6 +118,7 @@ pub fn maybe_bridge_standard_sync_json_to_stream(
             canonical_frames,
             client_api_format.as_str(),
             provider_actual_service_tier.as_deref(),
+            &bridge_context,
         )?
     };
 
@@ -1031,9 +1032,10 @@ fn openai_responses_terminal_event_type(response: &Value) -> Option<&'static str
 }
 
 fn emit_client_stream_from_canonical_frames(
-    canonical_frames: Vec<CanonicalStreamFrame>,
+    mut canonical_frames: Vec<CanonicalStreamFrame>,
     client_api_format: &str,
     provider_actual_service_tier: Option<&str>,
+    report_context: &Value,
 ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
     match client_api_format {
         "openai:chat" => {
@@ -1047,7 +1049,12 @@ fn emit_client_stream_from_canonical_frames(
             emit_with_openai_responses_emitter(&mut emitter, canonical_frames)
         }
         "claude:messages" => {
-            let mut emitter = ClaudeClientEmitter::default();
+            insert_agent_bridge_reasoning_signatures(&mut canonical_frames, report_context);
+            let mut emitter = ClaudeClientEmitter::default().with_agent_bridge_handle(
+                crate::formats::agent_bridge::agent_bridge_response_handle_from_report_context(
+                    report_context,
+                ),
+            );
             emit_with_claude_emitter(&mut emitter, canonical_frames)
         }
         "gemini:generate_content" => {
@@ -1056,6 +1063,56 @@ fn emit_client_stream_from_canonical_frames(
         }
         _ => Ok(Vec::new()),
     }
+}
+
+fn insert_agent_bridge_reasoning_signatures(
+    frames: &mut Vec<CanonicalStreamFrame>,
+    report_context: &Value,
+) {
+    let signatures = report_context
+        .get(crate::formats::agent_bridge::AGENT_BRIDGE_REPORT_CONTEXT_FIELD)
+        .and_then(Value::as_object)
+        .and_then(|bridge| bridge.get("response_reasoning_fallbacks"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|signature| {
+            signature.starts_with(crate::formats::agent_bridge::AGENT_BRIDGE_REASONING_PREFIX)
+        })
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if signatures.is_empty() {
+        return;
+    }
+    let Some(identity) = frames.first().cloned() else {
+        return;
+    };
+    let insert_at = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame.event,
+                CanonicalStreamEvent::TextDelta(_)
+                    | CanonicalStreamEvent::ContentPart(_)
+                    | CanonicalStreamEvent::ImageGenerationCall { .. }
+                    | CanonicalStreamEvent::ToolCallStart { .. }
+                    | CanonicalStreamEvent::ToolCallArgumentsDelta { .. }
+                    | CanonicalStreamEvent::ToolResultDelta { .. }
+                    | CanonicalStreamEvent::Finish { .. }
+            )
+        })
+        .unwrap_or(frames.len());
+    frames.splice(
+        insert_at..insert_at,
+        signatures
+            .into_iter()
+            .map(|signature| CanonicalStreamFrame {
+                id: identity.id.clone(),
+                model: identity.model.clone(),
+                event: CanonicalStreamEvent::ReasoningSignature(signature),
+            }),
+    );
 }
 
 fn emit_with_openai_chat_emitter(

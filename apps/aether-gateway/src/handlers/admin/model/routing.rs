@@ -451,7 +451,7 @@ pub(crate) async fn build_admin_global_model_mapping_preview_payload(
     let expanded_rule_index = request
         .expanded_rule_index
         .filter(|index| *index < mappings.len() && compiled.rule_is_valid(*index));
-    let (provider_names, keys) = load_active_provider_names_and_keys(state).await;
+    let (provider_metadata, keys) = load_active_provider_metadata_and_keys(state).await;
 
     for key in keys.into_iter().filter(|key| key.is_active) {
         let allowed_models = normalized_allowed_models(key.allowed_models.as_ref());
@@ -473,11 +473,17 @@ pub(crate) async fn build_admin_global_model_mapping_preview_payload(
                         .or_insert_with(|| MappingPreviewKeyDetail {
                             key_id: key.id.clone(),
                             key_name: key.name.clone(),
-                            masked_key: state.masked_catalog_api_key(&key),
+                            masked_key: state.masked_catalog_api_key_for_provider(
+                                &key,
+                                provider_metadata
+                                    .get(&key.provider_id)
+                                    .map(|(_, provider_type)| provider_type.as_str())
+                                    .unwrap_or_default(),
+                            ),
                             provider_id: key.provider_id.clone(),
-                            provider_name: provider_names
+                            provider_name: provider_metadata
                                 .get(&key.provider_id)
-                                .cloned()
+                                .map(|(provider_name, _)| provider_name.clone())
                                 .unwrap_or_default(),
                             matched_models: BTreeSet::new(),
                         })
@@ -539,9 +545,12 @@ pub(crate) async fn build_admin_global_model_mapping_preview_payload(
     }))
 }
 
-async fn load_active_provider_names_and_keys(
+async fn load_active_provider_metadata_and_keys(
     state: &AdminAppState<'_>,
-) -> (BTreeMap<String, String>, Vec<StoredProviderCatalogKey>) {
+) -> (
+    BTreeMap<String, (String, String)>,
+    Vec<StoredProviderCatalogKey>,
+) {
     let active_providers = state
         .list_provider_catalog_providers(true)
         .await
@@ -551,9 +560,9 @@ async fn load_active_provider_names_and_keys(
         .iter()
         .map(|provider| provider.id.clone())
         .collect::<Vec<_>>();
-    let provider_names = active_providers
+    let provider_metadata = active_providers
         .into_iter()
-        .map(|provider| (provider.id, provider.name))
+        .map(|provider| (provider.id, (provider.name, provider.provider_type)))
         .collect::<BTreeMap<_, _>>();
     let keys = if provider_ids.is_empty() {
         Vec::new()
@@ -564,7 +573,7 @@ async fn load_active_provider_names_and_keys(
             .ok()
             .unwrap_or_default()
     };
-    (provider_names, keys)
+    (provider_metadata, keys)
 }
 
 fn normalized_allowed_models(raw: Option<&serde_json::Value>) -> Vec<String> {

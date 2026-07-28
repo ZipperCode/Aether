@@ -4,6 +4,7 @@ use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKe
 use serde_json::{json, Map, Value};
 
 use crate::provider::ProviderPoolMemberInput;
+use crate::quota_snapshot::ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD;
 use crate::service::ProviderPoolService;
 
 pub fn provider_pool_key_account_quota_exhausted(
@@ -245,6 +246,13 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
         .and_then(Value::as_object)?;
     if !provider_pool_quota_snapshot_matches_provider(quota_snapshot, provider_type) {
         return None;
+    }
+    if provider_type.trim().eq_ignore_ascii_case("zhipu")
+        && provider_pool_json_bool(quota_snapshot.get(ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD))
+            == Some(true)
+        && provider_pool_json_bool(quota_snapshot.get("exhausted")) == Some(true)
+    {
+        return Some(true);
     }
     if quota_snapshot
         .get("kind")
