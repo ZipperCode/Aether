@@ -10,7 +10,10 @@ use aether_contracts::{
 /// headers that must never be forwarded to an upstream provider or tunnel
 /// destination.
 pub fn should_skip_request_header(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase();
+    let normalized = name.trim().to_ascii_lowercase();
+    if normalized.starts_with("x-aether-") {
+        return true;
+    }
     matches!(
         normalized.as_str(),
         "connection"
@@ -30,4 +33,26 @@ pub fn should_skip_request_header(name: &str) -> bool {
             | EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER
             | USAGE_SERVER_NOW_UNIX_MS_HEADER
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_skip_request_header;
+
+    #[test]
+    fn strips_all_aether_internal_request_headers() {
+        for header in [
+            "x-aether-grok-runtime",
+            "x-aether-future-control",
+            "X-Aether-Tunnel-Forwarded-By",
+            "  x-aether-spaced-control  ",
+        ] {
+            assert!(should_skip_request_header(header), "should skip {header}");
+        }
+    }
+
+    #[test]
+    fn keeps_non_aether_application_headers() {
+        assert!(!should_skip_request_header("x-custom-header"));
+    }
 }

@@ -373,6 +373,7 @@ pub fn apply_model_directive_overrides_from_model(
     source_model: &str,
 ) -> Option<ModelDirective> {
     let directive = parse_model_directive(source_model)?;
+    let normalized_provider_api_format = crate::normalize_api_format_alias(provider_api_format);
     let mut patched_body = provider_request_body.clone();
     for override_item in &directive.overrides {
         match override_item {
@@ -393,6 +394,10 @@ pub fn apply_model_directive_overrides_from_model(
                 )?;
             }
             ModelOverride::ServiceTier(tier) => {
+                if normalized_provider_api_format == "openai:search" {
+                    // Search 不接收 service_tier；fast 只参与路由，不能回滚同模型上的推理指令。
+                    continue;
+                }
                 apply_service_tier_override(&mut patched_body, provider_api_format, *tier)?;
             }
         }
@@ -1259,13 +1264,13 @@ mod tests {
 
         let mut search = json!({"model": "gpt-5-upstream"});
         let original = search.clone();
-        assert!(apply_model_directive_overrides_from_model(
+        apply_model_directive_overrides_from_model(
             &mut search,
             "openai:search",
             "gpt-5-upstream",
             "gpt-5.4-fast",
         )
-        .is_none());
+        .expect("Search fast directive should remain routing-only");
         assert_eq!(search, original);
     }
 
