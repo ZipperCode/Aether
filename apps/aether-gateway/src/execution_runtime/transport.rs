@@ -581,7 +581,7 @@ pub(crate) enum ExecutionRuntimeTransportError {
     UpstreamRequest(String),
     #[error("response_too_large")]
     ResponseTooLarge,
-    #[error("upstream response {phase} body exceeds {limit_bytes} bytes")]
+    #[error("response_too_large")]
     UpstreamResponseTooLarge {
         phase: UpstreamResponseBodyPhase,
         limit_bytes: usize,

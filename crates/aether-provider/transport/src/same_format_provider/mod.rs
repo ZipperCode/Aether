@@ -1581,7 +1581,7 @@ mod tests {
         let body_json = json!({
             "model": "deployment-alias",
             "input": "hello",
-            "reasoning": {"effort": "max"}
+            "reasoning": {"effort": "minimal"}
         });
         let build = |mapped_model: &str| {
             build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
@@ -1601,8 +1601,8 @@ mod tests {
             })
         };
 
-        assert!(build("gpt-5.6-sol").is_some());
-        assert!(build("gpt-5.4").is_none());
+        assert!(build("gpt-5.6-sol").is_none());
+        assert!(build("gpt-5.4").is_some());
     }
 
     #[test]
