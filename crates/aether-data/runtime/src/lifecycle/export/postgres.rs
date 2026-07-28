@@ -655,20 +655,6 @@ fn postgres_billing_table_name(
     }
 }
 
-#[cfg(test)]
-mod billing_table_tests {
-    use super::postgres_billing_table_name;
-
-    #[test]
-    fn settlement_snapshot_import_uses_request_id_conflict_key() {
-        assert_eq!(
-            postgres_billing_table_name("usage_settlement_snapshots")
-                .expect("settlement snapshot table should be supported"),
-            ("public.usage_settlement_snapshots", "request_id")
-        );
-    }
-}
-
 async fn import_postgres_wallet_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: &ExportRow,
@@ -720,4 +706,18 @@ fn postgres_wallet_table_name(
                 "unsupported postgres wallet export table '{table_name}'"
             ))
         })
+}
+
+#[cfg(test)]
+mod billing_table_tests {
+    use super::postgres_billing_table_name;
+
+    #[test]
+    fn settlement_snapshot_import_uses_request_id_conflict_key() {
+        assert_eq!(
+            postgres_billing_table_name("usage_settlement_snapshots")
+                .expect("settlement snapshot table should be supported"),
+            ("public.usage_settlement_snapshots", "request_id")
+        );
+    }
 }

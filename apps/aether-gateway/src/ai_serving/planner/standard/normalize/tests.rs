@@ -296,7 +296,7 @@ fn local_openai_responses_wrapper_applies_model_directive_before_body_rules() {
 }
 
 #[test]
-fn final_openai_provider_contract_uses_the_mapped_model_for_reasoning() {
+fn final_openai_provider_contract_preserves_valid_reasoning_without_model_profile() {
     let alias = json!({
         "model": "deployment-alias",
         "input": "hello",
@@ -315,7 +315,7 @@ fn final_openai_provider_contract_uses_the_mapped_model_for_reasoning() {
         false,
     )
     .is_some());
-    assert!(build_local_openai_responses_request_body(
+    let unprofiled = build_local_openai_responses_request_body(
         &alias,
         "gpt-5.4",
         false,
@@ -327,7 +327,8 @@ fn final_openai_provider_contract_uses_the_mapped_model_for_reasoning() {
         &http::HeaderMap::new(),
         false,
     )
-    .is_none());
+    .expect("an unprofiled mapped model must preserve a valid wire effort");
+    assert_eq!(unprofiled["reasoning"]["effort"], "max");
 
     let minimal = json!({
         "model": "deployment-alias",
@@ -389,7 +390,7 @@ fn final_openai_provider_contract_validates_body_rule_output() {
     let model_override = json!([
         {"action":"set","path":"model","value":"gpt-5.4"}
     ]);
-    assert!(build_local_openai_responses_request_body(
+    let overridden = build_local_openai_responses_request_body(
         &body,
         "gpt-5.6-sol",
         false,
@@ -401,7 +402,9 @@ fn final_openai_provider_contract_validates_body_rule_output() {
         &http::HeaderMap::new(),
         false,
     )
-    .is_none());
+    .expect("an unprofiled body-rule target must preserve a valid wire effort");
+    assert_eq!(overridden["model"], "gpt-5.4");
+    assert_eq!(overridden["reasoning"]["effort"], "max");
 
     let cache_override = json!([
         {"action":"set","path":"prompt_cache_options.ttl","value":"1h"}

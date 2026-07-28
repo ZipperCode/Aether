@@ -551,6 +551,7 @@ fn empty_database_snapshot_covers_current_cutoff_versions() {
             20260718000000,
             20260718010000,
             20260720000000,
+            20260727000000,
         ]
     );
 }
@@ -569,6 +570,19 @@ fn empty_database_snapshot_includes_tables_created_by_stamped_migrations() {
         missing_tables.is_empty(),
         "empty database snapshot is missing tables created by stamped migrations: {missing_tables:?}"
     );
+}
+
+#[test]
+fn empty_database_snapshot_includes_routing_default_uniqueness_indexes() {
+    for index_name in [
+        "routing_groups_one_system_default_key",
+        "routing_group_bindings_subject_default_key",
+    ] {
+        assert!(
+            EMPTY_DATABASE_SNAPSHOT_SQL.contains(index_name),
+            "empty database snapshot is missing stamped routing index {index_name}"
+        );
+    }
 }
 
 #[test]
@@ -1165,6 +1179,7 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260725010000,
             20260725020000,
             20260725030000,
+            20260727000000,
         ]
     );
     assert_eq!(
@@ -1197,6 +1212,7 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260725020000,
             20260725030000,
             20260725040000,
+            20260727000000,
         ]
     );
 }
@@ -2301,6 +2317,7 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260718000000,
             20260718010000,
             20260720000000,
+            20260727000000,
         ]
     );
 }
