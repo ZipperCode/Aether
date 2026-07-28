@@ -1324,6 +1324,45 @@ async fn mysql_core_export_reads_migrated_database_rows_when_url_is_set() {
             .await
             .expect("imported mysql api key should load");
     assert_eq!(imported_api_key.0, "ciphertext-1");
+
+    for (sql, id) in [
+        (
+            "DELETE FROM `usage` WHERE request_id = ?",
+            request_id.as_str(),
+        ),
+        ("DELETE FROM wallets WHERE id = ?", wallet_id.as_str()),
+        ("DELETE FROM api_keys WHERE id = ?", api_key_id.as_str()),
+        (
+            "DELETE FROM user_group_members WHERE group_id = ?",
+            group_id.as_str(),
+        ),
+        ("DELETE FROM user_groups WHERE id = ?", group_id.as_str()),
+        ("DELETE FROM models WHERE id = ?", model_id.as_str()),
+        (
+            "DELETE FROM global_models WHERE id = ?",
+            global_model_id.as_str(),
+        ),
+        (
+            "DELETE FROM provider_endpoints WHERE id = ?",
+            endpoint_id.as_str(),
+        ),
+        (
+            "DELETE FROM provider_api_keys WHERE id = ?",
+            provider_key_id.as_str(),
+        ),
+        ("DELETE FROM providers WHERE id = ?", provider_id.as_str()),
+        (
+            "DELETE FROM system_configs WHERE id = ?",
+            config_id.as_str(),
+        ),
+        ("DELETE FROM users WHERE id = ?", user_id.as_str()),
+    ] {
+        sqlx::query(sql)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("mysql core export fixture should clean up");
+    }
 }
 
 fn unique_suffix() -> String {
