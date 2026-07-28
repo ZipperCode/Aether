@@ -69,11 +69,16 @@ impl<'a> AdminAppState<'a> {
         )
     }
 
-    pub(crate) fn masked_catalog_api_key(
+    pub(crate) fn masked_catalog_api_key_for_provider(
         &self,
         key: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+        provider_type: &str,
     ) -> String {
-        crate::handlers::admin::shared::masked_catalog_api_key(self.app, key)
+        crate::handlers::admin::shared::masked_catalog_api_key_for_provider(
+            self.app,
+            key,
+            provider_type,
+        )
     }
 
     pub(crate) async fn build_admin_provider_keys_payload(
@@ -254,6 +259,10 @@ impl<'a> AdminAppState<'a> {
             admin_endpoint_signature_parts(&payload.api_format)
                 .ok_or_else(|| format!("无效的 api_format: {}", payload.api_format))?;
         validate_admin_endpoint_stream_policy(normalized_api_format, payload.config.as_ref())?;
+        crate::provider_transport::validate_anthropic_compatibility_profile_config(
+            payload.config.as_ref(),
+        )
+        .map_err(|_| "无效的 Anthropic compatibility profile".to_string())?;
         let base_url = normalize_admin_base_url(&payload.base_url)?;
 
         let existing_endpoints = self
@@ -364,6 +373,10 @@ impl<'a> AdminAppState<'a> {
                 existing_endpoint.api_format.as_str(),
                 updated.config.as_ref(),
             )?;
+            crate::provider_transport::validate_anthropic_compatibility_profile_config(
+                updated.config.as_ref(),
+            )
+            .map_err(|_| "无效的 Anthropic compatibility profile".to_string())?;
         }
 
         if provider_type == "codex"

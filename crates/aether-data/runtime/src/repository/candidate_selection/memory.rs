@@ -3,9 +3,10 @@ use std::sync::RwLock;
 use async_trait::async_trait;
 
 use super::{
-    MinimalCandidateSelectionReadRepository, StoredMinimalCandidateSelectionRow,
-    StoredPoolKeyCandidateOrder, StoredPoolKeyCandidateRowsByKeyIdsQuery,
-    StoredPoolKeyCandidateRowsQuery, StoredRequestedModelCandidateRowsQuery,
+    MinimalCandidateSelectionReadRepository, StoredApiFormatCandidateRowsQuery,
+    StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateOrder,
+    StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
+    StoredRequestedModelCandidateRowsQuery,
 };
 use crate::DataLayerError;
 
@@ -59,6 +60,19 @@ impl MinimalCandidateSelectionReadRepository for InMemoryMinimalCandidateSelecti
                 .then(left.model_id.cmp(&right.model_id))
         });
         Ok(rows)
+    }
+
+    async fn list_for_exact_api_format_page(
+        &self,
+        query: &StoredApiFormatCandidateRowsQuery,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+        Ok(self
+            .list_for_exact_api_format(&query.api_format)
+            .await?
+            .into_iter()
+            .skip(query.offset as usize)
+            .take(query.limit as usize)
+            .collect())
     }
 
     async fn list_for_exact_api_format_and_global_model(
@@ -335,16 +349,13 @@ fn key_auth_channel_matches(row: &StoredMinimalCandidateSelectionRow, api_format
                 && api_format == "openai:chat"
         }
         "vertex_ai" => {
-            (auth_type == "api_key"
-                && matches!(
-                    api_format.as_str(),
-                    "gemini:generate_content" | "gemini:embedding"
-                ))
-                || (matches!(auth_type.as_str(), "service_account" | "vertex_ai")
-                    && matches!(
-                        api_format.as_str(),
-                        "claude:messages" | "gemini:generate_content" | "gemini:embedding"
-                    ))
+            matches!(
+                auth_type.as_str(),
+                "api_key" | "service_account" | "vertex_ai"
+            ) && matches!(
+                api_format.as_str(),
+                "gemini:generate_content" | "gemini:embedding"
+            )
         }
         _ => auth_type != "oauth",
     }
@@ -354,8 +365,9 @@ fn key_auth_channel_matches(row: &StoredMinimalCandidateSelectionRow, api_format
 mod tests {
     use super::InMemoryMinimalCandidateSelectionReadRepository;
     use crate::repository::candidate_selection::{
-        MinimalCandidateSelectionReadRepository, StoredMinimalCandidateSelectionRow,
-        StoredPoolKeyCandidateOrder, StoredPoolKeyCandidateRowsQuery, StoredProviderModelMapping,
+        MinimalCandidateSelectionReadRepository, StoredApiFormatCandidateRowsQuery,
+        StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateOrder,
+        StoredPoolKeyCandidateRowsQuery, StoredProviderModelMapping,
         StoredRequestedModelCandidateRowsQuery,
     };
 
@@ -641,6 +653,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vertex_auth_matrix_rejects_claude_and_keeps_gemini_candidates() {
+        let mut candidates = Vec::new();
+        for auth_type in ["api_key", "service_account", "vertex_ai"] {
+            for api_format in [
+                "claude:messages",
+                "gemini:generate_content",
+                "gemini:embedding",
+            ] {
+                let provider_id = format!(
+                    "vertex-{}-{}",
+                    auth_type,
+                    api_format.replace(':', "-").replace('_', "-")
+                );
+                let mut row = sample_row(&provider_id, api_format, "vertex-model", 10);
+                row.provider_type = "vertex_ai".to_string();
+                row.key_auth_type = auth_type.to_string();
+                candidates.push(row);
+            }
+        }
+        let repository = InMemoryMinimalCandidateSelectionReadRepository::seed(candidates);
+
+        let claude_rows = repository
+            .list_for_exact_api_format("claude:messages")
+            .await
+            .expect("list should succeed");
+        assert!(claude_rows.is_empty());
+
+        for api_format in ["gemini:generate_content", "gemini:embedding"] {
+            let rows = repository
+                .list_for_exact_api_format(api_format)
+                .await
+                .expect("list should succeed");
+            let mut auth_types = rows
+                .into_iter()
+                .map(|row| row.key_auth_type)
+                .collect::<Vec<_>>();
+            auth_types.sort();
+            assert_eq!(auth_types, ["api_key", "service_account", "vertex_ai"]);
+        }
+    }
+
+    #[tokio::test]
     async fn filters_by_exact_api_format_only() {
         let repository = InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
             sample_row("provider-2", "openai:chat", "gpt-4.1", 20),
@@ -656,6 +710,27 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].provider_id, "provider-1");
         assert_eq!(rows[1].provider_id, "provider-2");
+    }
+
+    #[tokio::test]
+    async fn lists_exact_api_format_in_stable_pages() {
+        let repository = InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_row("provider-3", "openai:chat", "gpt-4.1", 30),
+            sample_row("provider-1", "openai:chat", "gpt-4.1", 10),
+            sample_row("provider-2", "openai:chat", "gpt-4.1", 20),
+        ]);
+
+        let page = repository
+            .list_for_exact_api_format_page(&StoredApiFormatCandidateRowsQuery {
+                api_format: "openai:chat".to_string(),
+                offset: 1,
+                limit: 1,
+            })
+            .await
+            .expect("API-format page should load");
+
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].provider_id, "provider-2");
     }
 
     #[tokio::test]

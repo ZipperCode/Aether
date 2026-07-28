@@ -199,7 +199,10 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                     let payload = json!({
                         "id": key.id,
                         "name": key.name,
-                        "masked_key": state.masked_catalog_api_key(key),
+                        "masked_key": state.masked_catalog_api_key_for_provider(
+                            key,
+                            &provider.provider_type,
+                        ),
                         "is_active": key.is_active,
                         "is_adaptive": is_adaptive,
                         "effective_rpm": effective_rpm,
@@ -254,24 +257,44 @@ pub(crate) async fn build_admin_global_model_routing_payload(
     // 与 Python 逻辑对齐：供前端实时匹配的白名单数据来自“全站活跃 Provider 的活跃 Key”
     // （仅保留配置了非空 allowed_models 的 Key），而不是仅当前 GlobalModel 关联 Provider。
     if include_whitelist {
-        let (active_provider_name_by_id, active_keys) =
-            load_active_provider_names_and_keys(state).await;
+        let active_providers = state
+            .list_provider_catalog_providers(true)
+            .await
+            .ok()
+            .unwrap_or_default();
+        let active_provider_ids = active_providers
+            .iter()
+            .map(|provider| provider.id.clone())
+            .collect::<Vec<_>>();
+        let active_provider_metadata_by_id = active_providers
+            .into_iter()
+            .map(|provider| (provider.id, (provider.name, provider.provider_type)))
+            .collect::<BTreeMap<_, _>>();
+        let active_keys = if active_provider_ids.is_empty() {
+            Vec::new()
+        } else {
+            state
+                .list_provider_catalog_keys_by_provider_ids(&active_provider_ids)
+                .await
+                .ok()
+                .unwrap_or_default()
+        };
         for key in active_keys {
             if !key.is_active {
                 continue;
             }
-            let allowed_models = normalized_allowed_models(key.allowed_models.as_ref());
+            let allowed_models = json_string_list(key.allowed_models.as_ref());
             if allowed_models.is_empty() {
                 continue;
             }
-            let provider_name = active_provider_name_by_id
+            let (provider_name, provider_type) = active_provider_metadata_by_id
                 .get(&key.provider_id)
                 .cloned()
                 .unwrap_or_default();
             all_keys_whitelist.push(json!({
                 "key_id": key.id,
                 "key_name": key.name,
-                "masked_key": state.masked_catalog_api_key(&key),
+                "masked_key": state.masked_catalog_api_key_for_provider(&key, &provider_type),
                 "provider_id": key.provider_id,
                 "provider_name": provider_name,
                 "allowed_models": allowed_models,

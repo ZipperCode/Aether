@@ -313,6 +313,7 @@ impl KiroProviderOAuthAdapter {
                 })),
                 body_bytes: None,
                 network: ctx.network.clone(),
+                transport_profile: None,
             })
             .await?;
         if !(200..300).contains(&response.status_code) {
@@ -391,6 +392,7 @@ impl KiroProviderOAuthAdapter {
                 })),
                 body_bytes: None,
                 network: ctx.network.clone(),
+                transport_profile: None,
             })
             .await?;
         if !(200..300).contains(&response.status_code) {
@@ -435,6 +437,7 @@ impl ProviderOAuthAdapter for KiroProviderOAuthAdapter {
     fn capabilities(&self) -> ProviderOAuthCapabilities {
         ProviderOAuthCapabilities {
             supports_authorization_code: false,
+            supports_cookie_authorization: false,
             supports_refresh_token_import: true,
             supports_batch_import: true,
             supports_device_flow: true,

@@ -16,7 +16,7 @@ use aether_scheduler_core::{
 };
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::ai_serving::planner::candidate_affinity_cache::remember_scheduler_affinity_for_candidate_at_epoch;
+use crate::ai_serving::planner::candidate_affinity_cache::remember_scheduler_affinity_for_candidate_with_routing_policy_at_epoch;
 use crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy;
 use crate::ai_serving::planner::candidate_resolution::{
     resolve_and_rank_logical_local_execution_candidates, EligibleLocalExecutionCandidate,
@@ -67,6 +67,9 @@ pub(crate) struct LocalExecutionCandidateAttempt {
 
 pub(crate) struct LocalExecutionCandidateAttemptSource<'a> {
     items: VecDeque<LocalExecutionCandidateAttemptSourceItem<'a>>,
+    skipped_provider_ids: BTreeSet<String>,
+    skipped_endpoint_ids: BTreeSet<String>,
+    skipped_credential_ids: BTreeSet<String>,
 }
 
 type DecorateSkippedCandidateFn<'a> = Arc<
@@ -78,6 +81,12 @@ pub(crate) trait LocalExecutionAttemptSource<T>: Send {
     async fn next_execution_attempt(&mut self) -> Result<Option<T>, GatewayError>;
 
     async fn drain_execution_attempts(&mut self) -> Result<Vec<T>, GatewayError>;
+
+    async fn skip_credential(&mut self, key_id: &str) -> Result<(), GatewayError>;
+
+    async fn skip_endpoint(&mut self, endpoint_id: &str) -> Result<(), GatewayError>;
+
+    async fn skip_provider(&mut self, provider_id: &str) -> Result<(), GatewayError>;
 }
 
 enum LocalExecutionCandidateAttemptSourceItem<'a> {
@@ -105,7 +114,12 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                 attempts: dispatch_sequence_from_attempts(attempts),
             });
         }
-        Self { items }
+        Self {
+            items,
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        }
     }
 
     pub(crate) async fn next_attempt(
@@ -117,6 +131,15 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
             };
             match front {
                 LocalExecutionCandidateAttemptSourceItem::Static { attempts } => {
+                    if dispatch_sequence_candidate_is_skipped(
+                        attempts,
+                        &self.skipped_provider_ids,
+                        &self.skipped_endpoint_ids,
+                        &self.skipped_credential_ids,
+                    ) {
+                        self.items.pop_front();
+                        continue;
+                    }
                     if let Some(attempt) = next_attempt_from_dispatch_sequence(attempts) {
                         if dispatch_sequence_exhausted(attempts) {
                             self.items.pop_front();
@@ -131,6 +154,20 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                     pending_attempts,
                     pool_exhaustion_persistence,
                 } => {
+                    if self.skipped_provider_ids.contains(cursor.provider_id())
+                        || self.skipped_endpoint_ids.contains(cursor.endpoint_id())
+                    {
+                        self.items.pop_front();
+                        continue;
+                    }
+                    if dispatch_sequence_candidate_is_skipped(
+                        pending_attempts,
+                        &self.skipped_provider_ids,
+                        &self.skipped_endpoint_ids,
+                        &self.skipped_credential_ids,
+                    ) {
+                        *pending_attempts = DispatchSequence::new(Vec::new());
+                    }
                     if let Some(attempt) = next_attempt_from_dispatch_sequence(pending_attempts) {
                         return Ok(Some(attempt));
                     }
@@ -148,6 +185,14 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                         self.items.pop_front();
                         continue;
                     };
+                    if candidate_is_skipped(
+                        &candidate,
+                        &self.skipped_provider_ids,
+                        &self.skipped_endpoint_ids,
+                        &self.skipped_credential_ids,
+                    ) {
+                        continue;
+                    }
                     *pending_attempts = dispatch_sequence_from_attempts(
                         build_unpersisted_local_execution_candidate_attempts(
                             candidate,
@@ -157,6 +202,15 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                     );
                 }
                 LocalExecutionCandidateAttemptSourceItem::RequestedModelPage { cursor } => {
+                    for provider_id in &self.skipped_provider_ids {
+                        cursor.skip_provider(provider_id);
+                    }
+                    for endpoint_id in &self.skipped_endpoint_ids {
+                        cursor.skip_endpoint(endpoint_id);
+                    }
+                    for key_id in &self.skipped_credential_ids {
+                        cursor.skip_credential(key_id);
+                    }
                     let Some(attempt) = cursor.next_attempt().await? else {
                         self.items.pop_front();
                         continue;
@@ -170,6 +224,45 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
     pub(crate) fn drain_static_attempts(&mut self) -> Vec<LocalExecutionCandidateAttempt> {
         self.items.clear();
         Vec::new()
+    }
+
+    pub(crate) fn skip_provider(&mut self, provider_id: &str) {
+        let provider_id = provider_id.trim();
+        if provider_id.is_empty() {
+            return;
+        }
+        self.skipped_provider_ids.insert(provider_id.to_string());
+        for item in &mut self.items {
+            if let LocalExecutionCandidateAttemptSourceItem::RequestedModelPage { cursor } = item {
+                cursor.skip_provider(provider_id);
+            }
+        }
+    }
+
+    pub(crate) fn skip_endpoint(&mut self, endpoint_id: &str) {
+        let endpoint_id = endpoint_id.trim();
+        if endpoint_id.is_empty() {
+            return;
+        }
+        self.skipped_endpoint_ids.insert(endpoint_id.to_string());
+        for item in &mut self.items {
+            if let LocalExecutionCandidateAttemptSourceItem::RequestedModelPage { cursor } = item {
+                cursor.skip_endpoint(endpoint_id);
+            }
+        }
+    }
+
+    pub(crate) fn skip_credential(&mut self, key_id: &str) {
+        let key_id = key_id.trim();
+        if key_id.is_empty() {
+            return;
+        }
+        self.skipped_credential_ids.insert(key_id.to_string());
+        for item in &mut self.items {
+            if let LocalExecutionCandidateAttemptSourceItem::RequestedModelPage { cursor } = item {
+                cursor.skip_credential(key_id);
+            }
+        }
     }
 }
 
@@ -328,6 +421,7 @@ where
             self.client_session_affinity,
             self.client_api_format,
             self.requested_model,
+            self.routing_policy,
             candidates,
         );
     }
@@ -598,6 +692,7 @@ where
             client_session_affinity,
             client_api_format,
             requested_model,
+            routing_policy,
             &candidates,
         );
     }
@@ -635,7 +730,12 @@ where
     );
 
     (
-        LocalExecutionCandidateAttemptSource { items },
+        LocalExecutionCandidateAttemptSource {
+            items,
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        },
         candidate_count,
     )
 }
@@ -768,6 +868,9 @@ where
         decorate_skipped_candidate,
         page_cursor,
         pending_items: VecDeque::new(),
+        skipped_provider_ids: BTreeSet::new(),
+        skipped_endpoint_ids: BTreeSet::new(),
+        skipped_credential_ids: BTreeSet::new(),
         candidate_count: 0,
         next_candidate_index: 0,
         remembered_affinity: false,
@@ -788,7 +891,12 @@ where
         );
     }
     (
-        LocalExecutionCandidateAttemptSource { items },
+        LocalExecutionCandidateAttemptSource {
+            items,
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        },
         candidate_count,
     )
 }
@@ -813,6 +921,9 @@ struct RequestedModelAttemptPageCursor<'a> {
     decorate_skipped_candidate: DecorateSkippedCandidateFn<'a>,
     page_cursor: LocalCandidatePreselectionPageCursor<'a>,
     pending_items: VecDeque<LocalExecutionCandidateAttemptSourceItem<'a>>,
+    skipped_provider_ids: BTreeSet<String>,
+    skipped_endpoint_ids: BTreeSet<String>,
+    skipped_credential_ids: BTreeSet<String>,
     candidate_count: usize,
     next_candidate_index: u32,
     remembered_affinity: bool,
@@ -822,6 +933,18 @@ struct RequestedModelAttemptPageCursor<'a> {
 }
 
 impl<'a> RequestedModelAttemptPageCursor<'a> {
+    fn skip_provider(&mut self, provider_id: &str) {
+        self.skipped_provider_ids.insert(provider_id.to_string());
+    }
+
+    fn skip_endpoint(&mut self, endpoint_id: &str) {
+        self.skipped_endpoint_ids.insert(endpoint_id.to_string());
+    }
+
+    fn skip_credential(&mut self, key_id: &str) {
+        self.skipped_credential_ids.insert(key_id.to_string());
+    }
+
     async fn next_attempt(
         &mut self,
     ) -> Result<Option<LocalExecutionCandidateAttempt>, GatewayError> {
@@ -829,7 +952,14 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
             return Err(error);
         }
         loop {
-            if let Some(attempt) = pop_attempt_from_items(&mut self.pending_items).await {
+            if let Some(attempt) = pop_attempt_from_items(
+                &mut self.pending_items,
+                &self.skipped_provider_ids,
+                &self.skipped_endpoint_ids,
+                &self.skipped_credential_ids,
+            )
+            .await
+            {
                 return Ok(Some(attempt));
             }
             if !self.load_next_page().await? {
@@ -855,15 +985,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                         "candidate_page_load",
                         page_started_at.elapsed().as_millis() as u64,
                     );
-                    if matches!(error, GatewayError::AdmissionTimeout { .. }) {
-                        return Err(error);
-                    }
-                    warn!(
-                        trace_id = %self.trace_id,
-                        error = ?error,
-                        "gateway lazy requested-model candidate page read failed"
-                    );
-                    return Ok(false);
+                    return Err(error);
                 }
             };
             observe_gateway_stage_ms(
@@ -907,6 +1029,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                     self.client_session_affinity.as_ref(),
                     &self.client_api_format,
                     Some(&self.requested_model),
+                    self.routing_policy.as_ref(),
                     &candidates,
                 );
                 self.remembered_affinity = true;
@@ -1030,11 +1153,23 @@ fn page_is_exact_auth_api_key_concurrency_limited(
 
 async fn pop_attempt_from_items(
     items: &mut VecDeque<LocalExecutionCandidateAttemptSourceItem<'_>>,
+    skipped_provider_ids: &BTreeSet<String>,
+    skipped_endpoint_ids: &BTreeSet<String>,
+    skipped_credential_ids: &BTreeSet<String>,
 ) -> Option<LocalExecutionCandidateAttempt> {
     loop {
         let front = items.front_mut()?;
         match front {
             LocalExecutionCandidateAttemptSourceItem::Static { attempts } => {
+                if dispatch_sequence_candidate_is_skipped(
+                    attempts,
+                    skipped_provider_ids,
+                    skipped_endpoint_ids,
+                    skipped_credential_ids,
+                ) {
+                    items.pop_front();
+                    continue;
+                }
                 if let Some(attempt) = next_attempt_from_dispatch_sequence(attempts) {
                     if dispatch_sequence_exhausted(attempts) {
                         items.pop_front();
@@ -1049,6 +1184,20 @@ async fn pop_attempt_from_items(
                 pending_attempts,
                 pool_exhaustion_persistence,
             } => {
+                if skipped_provider_ids.contains(cursor.provider_id())
+                    || skipped_endpoint_ids.contains(cursor.endpoint_id())
+                {
+                    items.pop_front();
+                    continue;
+                }
+                if dispatch_sequence_candidate_is_skipped(
+                    pending_attempts,
+                    skipped_provider_ids,
+                    skipped_endpoint_ids,
+                    skipped_credential_ids,
+                ) {
+                    *pending_attempts = DispatchSequence::new(Vec::new());
+                }
                 if let Some(attempt) = next_attempt_from_dispatch_sequence(pending_attempts) {
                     return Some(attempt);
                 }
@@ -1066,6 +1215,14 @@ async fn pop_attempt_from_items(
                     items.pop_front();
                     continue;
                 };
+                if candidate_is_skipped(
+                    &candidate,
+                    skipped_provider_ids,
+                    skipped_endpoint_ids,
+                    skipped_credential_ids,
+                ) {
+                    continue;
+                }
                 *pending_attempts = dispatch_sequence_from_attempts(
                     build_unpersisted_local_execution_candidate_attempts(
                         candidate,
@@ -1097,6 +1254,7 @@ pub(crate) fn remember_first_local_candidate_affinity(
     client_session_affinity: Option<&ClientSessionAffinity>,
     client_api_format: &str,
     requested_model: Option<&str>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     candidates: &[EligibleLocalExecutionCandidate],
 ) {
     let Some(first_candidate) = candidates.first() else {
@@ -1106,13 +1264,14 @@ pub(crate) fn remember_first_local_candidate_affinity(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(first_candidate.candidate.global_model_name.as_str());
-    remember_scheduler_affinity_for_candidate_at_epoch(
+    remember_scheduler_affinity_for_candidate_with_routing_policy_at_epoch(
         state,
         auth_snapshot,
         client_session_affinity,
         client_api_format,
         affinity_requested_model,
         &first_candidate.candidate,
+        routing_policy,
         first_candidate.orchestration.scheduler_affinity_epoch,
     );
 }
@@ -1727,6 +1886,33 @@ fn next_attempt_from_dispatch_sequence(
     Some(attempt)
 }
 
+fn dispatch_sequence_candidate_is_skipped(
+    sequence: &DispatchSequence<LocalExecutionCandidateAttempt>,
+    skipped_provider_ids: &BTreeSet<String>,
+    skipped_endpoint_ids: &BTreeSet<String>,
+    skipped_credential_ids: &BTreeSet<String>,
+) -> bool {
+    sequence.peek_current().is_some_and(|item| {
+        candidate_is_skipped(
+            &item.candidate.eligible,
+            skipped_provider_ids,
+            skipped_endpoint_ids,
+            skipped_credential_ids,
+        )
+    })
+}
+
+fn candidate_is_skipped(
+    candidate: &EligibleLocalExecutionCandidate,
+    skipped_provider_ids: &BTreeSet<String>,
+    skipped_endpoint_ids: &BTreeSet<String>,
+    skipped_credential_ids: &BTreeSet<String>,
+) -> bool {
+    skipped_provider_ids.contains(&candidate.candidate.provider_id)
+        || skipped_endpoint_ids.contains(&candidate.candidate.endpoint_id)
+        || skipped_credential_ids.contains(&candidate.candidate.key_id)
+}
+
 fn dispatch_sequence_exhausted(
     sequence: &mut DispatchSequence<LocalExecutionCandidateAttempt>,
 ) -> bool {
@@ -2278,6 +2464,9 @@ mod tests {
             decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
             page_cursor,
             pending_items: VecDeque::new(),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
             candidate_count: 0,
             next_candidate_index: 0,
             remembered_affinity: false,
@@ -2372,6 +2561,9 @@ mod tests {
             decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
             page_cursor,
             pending_items: VecDeque::new(),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
             candidate_count: 0,
             next_candidate_index: 0,
             remembered_affinity: false,
@@ -2569,6 +2761,9 @@ mod tests {
                     .into(),
                 ),
             }]),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
         };
 
         let first = source
@@ -2585,6 +2780,160 @@ mod tests {
             .await
             .expect("remaining attempt read should succeed")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn dynamic_attempt_source_skips_credentials_and_endpoints_across_static_candidates() {
+        let key_a = sample_eligible("key-a", None);
+        let key_b = sample_eligible("key-b", None);
+        let mut key_c = sample_eligible("key-c", None);
+        key_c.candidate.endpoint_id = "endpoint-2".to_string();
+        Arc::make_mut(&mut key_c.transport).endpoint.id = "endpoint-2".to_string();
+
+        let static_item =
+            |candidate, candidate_index| LocalExecutionCandidateAttemptSourceItem::Static {
+                attempts: dispatch_sequence_from_attempts(
+                    build_unpersisted_local_execution_candidate_attempts(
+                        candidate,
+                        candidate_index,
+                    )
+                    .into(),
+                ),
+            };
+        let mut source = LocalExecutionCandidateAttemptSource {
+            items: VecDeque::from([
+                static_item(key_a, 0),
+                static_item(key_b, 1),
+                static_item(key_c, 2),
+            ]),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        };
+
+        source.skip_credential("key-a");
+        let key_b_attempt = source
+            .next_attempt()
+            .await
+            .expect("candidate source should succeed")
+            .expect("a different credential should remain");
+        assert_eq!(key_b_attempt.eligible.candidate.key_id, "key-b");
+
+        source.skip_endpoint("endpoint-1");
+        let endpoint_2_attempt = source
+            .next_attempt()
+            .await
+            .expect("candidate source should succeed")
+            .expect("a different endpoint should remain");
+        assert_eq!(endpoint_2_attempt.eligible.candidate.key_id, "key-c");
+        assert_eq!(
+            endpoint_2_attempt.eligible.candidate.endpoint_id,
+            "endpoint-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_attempt_source_filters_skipped_pool_pending_credential() {
+        let app = AppState::new().expect("state should build");
+        let mut pool_group = sample_eligible("pool-group", None);
+        pool_group.kind = LocalExecutionCandidateKind::PoolGroup;
+        pool_group.transport = sample_transport("pool-group", Some(json!({ "pool_advanced": {} })));
+        let pool_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            pool_group,
+            None,
+            Some("gpt-5"),
+            None,
+        );
+        let pool_key_attempts = dispatch_sequence_from_attempts(
+            build_unpersisted_local_execution_candidate_attempts(
+                sample_eligible("pool-key-a", None),
+                0,
+            )
+            .into(),
+        );
+        let mut fallback = sample_eligible("fallback-key", None);
+        fallback.candidate.provider_id = "provider-b".to_string();
+        Arc::make_mut(&mut fallback.transport).provider.id = "provider-b".to_string();
+        Arc::make_mut(&mut fallback.transport).key.provider_id = "provider-b".to_string();
+        let fallback_attempts = dispatch_sequence_from_attempts(
+            build_unpersisted_local_execution_candidate_attempts(fallback, 1).into(),
+        );
+        let mut source = LocalExecutionCandidateAttemptSource {
+            items: VecDeque::from([
+                LocalExecutionCandidateAttemptSourceItem::Pool {
+                    cursor: pool_cursor,
+                    candidate_index: 0,
+                    pending_attempts: pool_key_attempts,
+                    pool_exhaustion_persistence: None,
+                },
+                LocalExecutionCandidateAttemptSourceItem::Static {
+                    attempts: fallback_attempts,
+                },
+            ]),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        };
+
+        source.skip_credential("pool-key-a");
+        let attempt = source
+            .next_attempt()
+            .await
+            .expect("candidate source should succeed")
+            .expect("fallback credential should remain");
+
+        assert_eq!(attempt.eligible.candidate.provider_id, "provider-b");
+        assert_eq!(attempt.eligible.candidate.key_id, "fallback-key");
+    }
+
+    #[tokio::test]
+    async fn skipped_provider_discards_pool_cursor_and_continues_with_next_provider() {
+        let app = AppState::new().expect("state should build");
+        let mut pool_group = sample_eligible("pool-group", None);
+        pool_group.kind = LocalExecutionCandidateKind::PoolGroup;
+        pool_group.transport = sample_transport("pool-group", Some(json!({ "pool_advanced": {} })));
+        let pool_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            pool_group,
+            None,
+            Some("gpt-5"),
+            None,
+        );
+
+        let mut fallback = sample_eligible("fallback-key", None);
+        fallback.candidate.provider_id = "provider-b".to_string();
+        Arc::make_mut(&mut fallback.transport).provider.id = "provider-b".to_string();
+        Arc::make_mut(&mut fallback.transport).key.provider_id = "provider-b".to_string();
+        let fallback_attempts = dispatch_sequence_from_attempts(
+            build_unpersisted_local_execution_candidate_attempts(fallback, 1).into(),
+        );
+        let mut source = LocalExecutionCandidateAttemptSource {
+            items: VecDeque::from([
+                LocalExecutionCandidateAttemptSourceItem::Pool {
+                    cursor: pool_cursor,
+                    candidate_index: 0,
+                    pending_attempts: DispatchSequence::new(Vec::new()),
+                    pool_exhaustion_persistence: None,
+                },
+                LocalExecutionCandidateAttemptSourceItem::Static {
+                    attempts: fallback_attempts,
+                },
+            ]),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        };
+
+        source.skip_provider("provider-1");
+        let attempt = source
+            .next_attempt()
+            .await
+            .expect("candidate source should succeed")
+            .expect("fallback provider should remain");
+
+        assert_eq!(attempt.eligible.candidate.provider_id, "provider-b");
+        assert_eq!(attempt.eligible.candidate.key_id, "fallback-key");
     }
 
     #[tokio::test]
@@ -2639,6 +2988,9 @@ mod tests {
                 pending_attempts: DispatchSequence::new(Vec::new()),
                 pool_exhaustion_persistence: Some(pool_exhaustion_persistence),
             }]),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
         };
 
         assert!(source

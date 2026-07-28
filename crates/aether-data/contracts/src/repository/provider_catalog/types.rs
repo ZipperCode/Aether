@@ -31,6 +31,9 @@ impl ProviderCatalogKeyAdaptiveState {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderCatalogKeyAdaptiveStateUpdate {
     pub key_id: String,
+    /// Optional auth_config fence for request-owned adaptive feedback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_encrypted_auth_config: Option<String>,
     pub expected: ProviderCatalogKeyAdaptiveState,
     pub next: ProviderCatalogKeyAdaptiveState,
     /// Top-level status fields owned by adaptive rate-limit learning.
@@ -64,9 +67,61 @@ pub struct ProviderCatalogKeyStatusSnapshotUpdate {
     pub updated_at_unix_secs: Option<u64>,
 }
 
+/// Credential context observed before an OAuth refresh started. Repositories
+/// compare every field atomically with the runtime-state update so an
+/// administrator replacement cannot be overwritten by an older refresh.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderCatalogKeyOAuthCredentialFence {
+    /// Exact nullable ciphertext stored in `provider_api_keys.api_key`.
+    pub encrypted_api_key: Option<String>,
+    pub auth_type: String,
+    pub provider_id: String,
+    pub provider_type: String,
+}
+
+/// Atomic key deletion fenced by the exact OAuth credential generation that
+/// produced the terminal failure.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderCatalogKeyOAuthCredentialCasDelete {
+    pub key_id: String,
+    pub expected_encrypted_auth_config: Option<String>,
+    pub expected_credential: ProviderCatalogKeyOAuthCredentialFence,
+}
+
+/// Agent/runtime-owned OAuth state update fenced by the exact encrypted
+/// auth_config and, when supplied, credential context observed before the
+/// refresh started. Repositories must update only these fields and return
+/// `false` when an expected value changed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderCatalogKeyOAuthRuntimeStateCasUpdate {
+    pub key_id: String,
+    pub expected_encrypted_auth_config: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_credential: Option<ProviderCatalogKeyOAuthCredentialFence>,
+    pub encrypted_auth_config: String,
+    /// Optional access-token ciphertext replacement owned by refresh success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_api_key_update: Option<String>,
+    /// `None` preserves expiry; `Some(None)` clears it; `Some(Some(_))` replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_secs_update: Option<Option<u64>>,
+    pub oauth_invalid_at_unix_secs: Option<u64>,
+    pub oauth_invalid_reason: Option<String>,
+    /// Top-level runtime metadata namespaces to merge in the same fenced write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_metadata_patch: Option<serde_json::Value>,
+    pub status_snapshot_patch: serde_json::Value,
+    #[serde(default)]
+    pub reset_error_count: bool,
+    pub updated_at_unix_secs: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderCatalogKeyHealthStateUpdate {
     pub key_id: String,
+    /// Optional auth_config fence for lifecycle-owned health recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_encrypted_auth_config: Option<String>,
     pub expected_health_by_format: Option<serde_json::Value>,
     pub expected_circuit_breaker_by_format: Option<serde_json::Value>,
     pub health_by_format: Option<serde_json::Value>,
@@ -815,6 +870,16 @@ pub trait ProviderCatalogWriteRepository: Send + Sync {
 
     async fn delete_key(&self, key_id: &str) -> Result<bool, crate::DataLayerError>;
 
+    async fn compare_and_delete_key_oauth_credential(
+        &self,
+        _delete: &ProviderCatalogKeyOAuthCredentialCasDelete,
+    ) -> Result<bool, crate::DataLayerError> {
+        Err(crate::DataLayerError::InvalidConfiguration(
+            "provider catalog OAuth credential CAS deletes are not supported by this repository"
+                .to_string(),
+        ))
+    }
+
     async fn clear_key_oauth_invalid_marker(
         &self,
         key_id: &str,
@@ -836,6 +901,18 @@ pub trait ProviderCatalogWriteRepository: Send + Sync {
         encrypted_auth_config_update: Option<&str>,
         updated_at_unix_secs: Option<u64>,
     ) -> Result<bool, crate::DataLayerError>;
+
+    /// Compare-and-swap OAuth runtime credentials/status without replacing any
+    /// administrator-owned key fields.
+    async fn compare_and_update_key_oauth_runtime_state(
+        &self,
+        _update: &ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
+    ) -> Result<bool, crate::DataLayerError> {
+        Err(crate::DataLayerError::InvalidConfiguration(
+            "provider catalog OAuth runtime CAS updates are not supported by this repository"
+                .to_string(),
+        ))
+    }
 
     async fn update_key_health_state(
         &self,

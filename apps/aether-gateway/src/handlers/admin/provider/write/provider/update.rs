@@ -1,6 +1,8 @@
 use crate::handlers::admin::provider::shared::payloads::AdminProviderUpdatePatch;
 use crate::handlers::admin::provider::shared::support::{
-    normalize_provider_billing_type, parse_optional_rfc3339_unix_secs,
+    normalize_provider_billing_type, normalize_provider_transfer_limit,
+    normalize_provider_transfer_limit_json, parse_optional_rfc3339_unix_secs,
+    PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY, PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY,
 };
 use crate::handlers::admin::provider::write::normalize::normalize_chat_pii_redaction_config;
 use crate::handlers::admin::provider::write::normalize::normalize_pool_advanced_config;
@@ -263,6 +265,30 @@ pub(crate) async fn build_admin_update_provider_record(
         }
     }
 
+    for (field_name, payload_value) in [
+        (
+            PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY,
+            payload.max_transfer_count,
+        ),
+        (
+            PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY,
+            payload.max_transfer_timeout_seconds,
+        ),
+    ] {
+        if fields.contains(field_name) {
+            let value = payload_value
+                .map(|value| normalize_provider_transfer_limit(value, field_name))
+                .transpose()?
+                .unwrap_or(0);
+            config_map.insert(field_name.to_string(), json!(value));
+        } else if fields.contains("config") {
+            if let Some(value) = config_map.get(field_name) {
+                let value = normalize_provider_transfer_limit_json(value, field_name)?;
+                config_map.insert(field_name.to_string(), json!(value));
+            }
+        }
+    }
+
     if fields.contains("claude_code_advanced") {
         if fields.is_null("claude_code_advanced") {
             config_map.remove("claude_code_advanced");
@@ -307,6 +333,10 @@ pub(crate) async fn build_admin_update_provider_record(
     }
 
     updated.config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
+    crate::provider_transport::validate_anthropic_compatibility_profile_config(
+        updated.config.as_ref(),
+    )
+    .map_err(|_| "无效的 Anthropic compatibility profile".to_string())?;
     updated.updated_at_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()

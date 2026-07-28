@@ -221,7 +221,7 @@
   />
 
   <ProviderDetailDrawer
-    v-if="providerDrawerOpen"
+    v-if="providerDrawerMounted"
     :open="providerDrawerOpen"
     :provider-id="selectedProviderId"
     :initial-provider="selectedProvider"
@@ -310,6 +310,7 @@ const providerToEdit = ref<ProviderWithEndpointsSummary | null>(null)
 const priorityDialogOpen = ref(false)
 const priorityMode = ref<'provider' | 'global_key'>('provider')
 const providerDrawerOpen = ref(false)
+const providerDrawerMounted = ref(false)
 const selectedProviderId = ref<string | null>(null)
 const selectedProvider = computed<ProviderWithEndpointsSummary | null>(() => {
   if (!selectedProviderId.value) return null
@@ -568,7 +569,13 @@ async function loadProviders(options: { cacheTtlMs?: number } = {}) {
       cacheTtlMs: options.cacheTtlMs ?? 0,
     })
     if (requestId !== providersRequestId) return
-    providers.value = response.items
+    const existingProviders = new Map(providers.value.map(provider => [provider.id, provider]))
+    providers.value = response.items.map((item) => {
+      const existing = existingProviders.get(item.id)
+      if (!existing) return item
+      Object.assign(existing, item)
+      return existing
+    })
     total.value = response.total
     // 异步加载配置了 ops 的 provider 的余额数据
     loadBalances(providers.value)
@@ -633,14 +640,15 @@ async function handleProviderBatchChanged() {
 // 打开提供商详情抽屉
 function openProviderDrawer(providerId: string) {
   selectedProviderId.value = providerId
+  providerDrawerMounted.value = true
   providerDrawerOpen.value = true
 }
 
 function mergeUpdatedProvider(updated: ProviderWithEndpointsSummary) {
   const index = providers.value.findIndex(p => p.id === updated.id)
   if (index !== -1) {
-    providers.value[index] = updated
-    loadBalances([updated], false)
+    Object.assign(providers.value[index], updated)
+    loadBalances([providers.value[index]], false)
   }
 }
 

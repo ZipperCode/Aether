@@ -5,8 +5,11 @@
 
 import api from './client'
 import {
+  getModelsDevUnsupportedPricingFields,
   resolveModelsDevTieredPricing,
   type ModelsDevCost,
+  type ModelsDevTokenCost,
+  type ModelsDevUnsupportedPricingField,
 } from './models-dev-pricing'
 import type { TieredPricingConfig } from './endpoints/types'
 
@@ -44,7 +47,9 @@ export interface ModelsDevModel {
   cost?: ModelsDevCost
   experimental?: {
     modes?: Record<string, {
-      cost?: ModelsDevCost
+      // models.dev experimental modes use the flat Cost shape; context tiers
+      // belong to the parent model cost only.
+      cost?: ModelsDevTokenCost
       provider?: {
         body?: Record<string, unknown>
         headers?: Record<string, string>
@@ -78,6 +83,7 @@ export interface ModelsDevModelItem {
   inputPrice?: number
   outputPrice?: number
   tieredPricing?: TieredPricingConfig
+  pricingUnsupportedFields?: ModelsDevUnsupportedPricingField[]
   contextLimit?: number
   outputLimit?: number
   supportsVision?: boolean
@@ -187,6 +193,11 @@ export async function getModelsDevList(officialOnly: boolean = true): Promise<Mo
           model.cost,
           model.experimental?.modes,
         )
+        const pricingUnsupportedFields = [...new Set([
+          ...getModelsDevUnsupportedPricingFields(model.cost),
+          ...Object.values(model.experimental?.modes ?? {})
+            .flatMap(mode => getModelsDevUnsupportedPricingFields(mode.cost)),
+        ])]
         const basePricingTier = tieredPricing?.tiers[0]
         items.push({
           providerId,
@@ -197,6 +208,9 @@ export async function getModelsDevList(officialOnly: boolean = true): Promise<Mo
           inputPrice: basePricingTier?.input_price_per_1m ?? model.cost?.input,
           outputPrice: basePricingTier?.output_price_per_1m ?? model.cost?.output,
           tieredPricing: tieredPricing ?? undefined,
+          pricingUnsupportedFields: pricingUnsupportedFields.length > 0
+            ? pricingUnsupportedFields
+            : undefined,
           contextLimit: model.limit?.context,
           outputLimit: model.limit?.output,
           supportsVision: inputModalities?.includes('image'),
@@ -243,6 +257,18 @@ export async function getModelsDevList(officialOnly: boolean = true): Promise<Mo
     return modelsListCache.filter(m => m.official)
   }
   return modelsListCache
+}
+
+/**
+ * 清理前后端 models.dev 缓存后重新获取模型目录。
+ * 编辑模型的价格同步使用此入口，避免只命中浏览器或网关的旧缓存。
+ */
+export async function refreshModelsDevList(
+  officialOnly: boolean = true,
+): Promise<ModelsDevModelItem[]> {
+  await api.delete('/api/admin/models/external/cache')
+  clearModelsDevCache()
+  return getModelsDevList(officialOnly)
 }
 
 /**

@@ -230,11 +230,7 @@ pub(crate) fn validate_vertex_api_formats(
 
     let allowed = match auth_type {
         "api_key" => &["gemini:generate_content", "gemini:embedding"][..],
-        "service_account" | "vertex_ai" => &[
-            "claude:messages",
-            "gemini:generate_content",
-            "gemini:embedding",
-        ][..],
+        "service_account" | "vertex_ai" => &["gemini:generate_content", "gemini:embedding"][..],
         _ => return Ok(()),
     };
     let invalid = api_formats
@@ -488,20 +484,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_vertex_api_formats_uses_canonical_message_formats() {
+    fn validate_vertex_api_formats_rejects_unimplemented_anthropic_transport() {
         assert!(validate_vertex_api_formats(
             "vertex_ai",
             "service_account",
-            &[
-                "claude:messages".to_string(),
-                "gemini:generate_content".to_string()
-            ],
-        )
-        .is_ok());
-        assert!(validate_vertex_api_formats(
-            "vertex_ai",
-            "service_account",
-            &["claude:chat".to_string()],
+            &["claude:messages".to_string()],
         )
         .is_err());
     }
@@ -521,7 +508,6 @@ mod tests {
             "vertex_ai",
             "service_account",
             &[
-                "claude:messages".to_string(),
                 "gemini:generate_content".to_string(),
                 "gemini:embedding".to_string()
             ],

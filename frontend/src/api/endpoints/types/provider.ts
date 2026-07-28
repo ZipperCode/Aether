@@ -237,6 +237,7 @@ export interface EndpointAPIKey {
   credential_kind?: 'raw_secret' | 'oauth_session' | 'service_account' | string | null
   runtime_auth_kind?: 'api_key' | 'bearer' | 'service_account' | 'mixed' | 'unknown' | string | null
   oauth_managed?: boolean
+  agent_identity?: boolean
   oauth_header_auth?: boolean
   can_refresh_oauth?: boolean
   can_export_oauth?: boolean
@@ -874,6 +875,8 @@ export interface ProviderWithEndpointsSummary {
   quota_expires_at?: string
   // 请求配置（从 Endpoint 迁移）
   max_retries?: number  // 最大重试次数
+  max_transfer_count?: number  // 提供商内最大转移次数，0 表示不限制
+  max_transfer_timeout_seconds?: number  // 提供商内最大转移时长，0 表示不限制
   proxy?: ProxyConfig | null  // 代理配置
   // 超时配置（秒），为空时使用全局配置
   stream_first_byte_timeout?: number  // 流式请求首字节超时

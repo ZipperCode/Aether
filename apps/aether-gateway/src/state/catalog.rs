@@ -909,6 +909,38 @@ impl AppState {
         Ok(deleted)
     }
 
+    pub(crate) async fn compare_and_delete_provider_catalog_key_oauth_credential(
+        &self,
+        delete: &provider_catalog::ProviderCatalogKeyOAuthCredentialCasDelete,
+    ) -> Result<bool, GatewayError> {
+        let deleted = self
+            .data
+            .compare_and_delete_provider_catalog_key_oauth_credential(delete)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if deleted {
+            if let Err(err) = self
+                .data
+                .delete_pool_member_scores_for_member(
+                    &pool_scores::PoolMemberIdentity::provider_api_key(
+                        delete.expected_credential.provider_id.clone(),
+                        delete.key_id.clone(),
+                    ),
+                )
+                .await
+            {
+                warn!(
+                    provider_id = %delete.expected_credential.provider_id,
+                    key_id = %delete.key_id,
+                    error = ?err,
+                    "gateway provider catalog OAuth credential CAS delete: failed to delete pool member scores"
+                );
+            }
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(deleted)
+    }
+
     pub(crate) async fn clear_provider_catalog_key_oauth_invalid_marker(
         &self,
         key_id: &str,
@@ -1486,6 +1518,7 @@ mod tests {
             .compare_and_update_provider_catalog_key_health_state(
                 &aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyHealthStateUpdate {
                     key_id: "key-1".to_string(),
+                    expected_encrypted_auth_config: None,
                     expected_health_by_format: None,
                     expected_circuit_breaker_by_format: None,
                     health_by_format: Some(health_by_format),

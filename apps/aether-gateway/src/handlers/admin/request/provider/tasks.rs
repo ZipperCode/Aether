@@ -19,6 +19,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ADMIN_POOL_BATCH_KEY_FETCH_CHUNK_SIZE: usize = 500;
 
+fn provider_requires_credential_cas_cleanup(provider: &StoredProviderCatalogProvider) -> bool {
+    provider.provider_type.trim().eq_ignore_ascii_case("codex")
+}
+
 impl<'a> AdminAppState<'a> {
     pub(crate) async fn clear_admin_provider_pool_cooldown(&self, provider_id: &str, key_id: &str) {
         crate::handlers::admin::provider::pool::runtime::clear_admin_provider_pool_cooldown(
@@ -381,27 +385,25 @@ impl<'a> AdminAppState<'a> {
             return Ok(0);
         }
 
-        let deleted_key_ids = banned_keys
-            .iter()
-            .map(|key| key.id.clone())
-            .collect::<Vec<_>>();
+        let mut deleted_key_ids = Vec::new();
         for key in &banned_keys {
-            self.clear_admin_provider_pool_cooldown(&provider.id, &key.id)
-                .await;
-            self.reset_admin_provider_pool_cost(&provider.id, &key.id)
-                .await;
-        }
-
-        let mut affected = 0usize;
-        for key_id in &deleted_key_ids {
-            if self.delete_provider_catalog_key(key_id).await? {
-                affected += 1;
+            if self
+                .delete_provider_catalog_key_for_automatic_cleanup(provider, key)
+                .await?
+            {
+                self.clear_admin_provider_pool_cooldown(&provider.id, &key.id)
+                    .await;
+                self.reset_admin_provider_pool_cost(&provider.id, &key.id)
+                    .await;
+                deleted_key_ids.push(key.id.clone());
             }
         }
-        self.cleanup_deleted_provider_catalog_refs(&provider.id, false, &[], &deleted_key_ids)
-            .await?;
+        if !deleted_key_ids.is_empty() {
+            self.cleanup_deleted_provider_catalog_refs(&provider.id, false, &[], &deleted_key_ids)
+                .await?;
+        }
 
-        Ok(affected)
+        Ok(deleted_key_ids.len())
     }
 
     pub(crate) async fn cleanup_quota_exhausted_provider_catalog_keys(
@@ -475,27 +477,48 @@ impl<'a> AdminAppState<'a> {
             return Ok(0);
         }
 
-        let deleted_key_ids = exhausted_keys
-            .iter()
-            .map(|key| key.id.clone())
-            .collect::<Vec<_>>();
+        let mut deleted_key_ids = Vec::new();
         for key in exhausted_keys {
-            self.clear_admin_provider_pool_cooldown(&provider.id, &key.id)
-                .await;
-            self.reset_admin_provider_pool_cost(&provider.id, &key.id)
-                .await;
-        }
-
-        let mut affected = 0usize;
-        for key_id in &deleted_key_ids {
-            if self.delete_provider_catalog_key(key_id).await? {
-                affected += 1;
+            if self
+                .delete_provider_catalog_key_for_automatic_cleanup(provider, key)
+                .await?
+            {
+                self.clear_admin_provider_pool_cooldown(&provider.id, &key.id)
+                    .await;
+                self.reset_admin_provider_pool_cost(&provider.id, &key.id)
+                    .await;
+                deleted_key_ids.push(key.id.clone());
             }
         }
-        self.cleanup_deleted_provider_catalog_refs(&provider.id, false, &[], &deleted_key_ids)
-            .await?;
+        if !deleted_key_ids.is_empty() {
+            self.cleanup_deleted_provider_catalog_refs(&provider.id, false, &[], &deleted_key_ids)
+                .await?;
+        }
 
-        Ok(affected)
+        Ok(deleted_key_ids.len())
+    }
+
+    async fn delete_provider_catalog_key_for_automatic_cleanup(
+        &self,
+        provider: &StoredProviderCatalogProvider,
+        key: &StoredProviderCatalogKey,
+    ) -> Result<bool, GatewayError> {
+        if !provider_requires_credential_cas_cleanup(provider) {
+            return self.delete_provider_catalog_key(&key.id).await;
+        }
+        self.compare_and_delete_provider_catalog_key_oauth_credential(
+            &aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyOAuthCredentialCasDelete {
+                key_id: key.id.clone(),
+                expected_encrypted_auth_config: key.encrypted_auth_config.clone(),
+                expected_credential: aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyOAuthCredentialFence {
+                    encrypted_api_key: key.encrypted_api_key.clone(),
+                    auth_type: key.auth_type.clone(),
+                    provider_id: key.provider_id.clone(),
+                    provider_type: provider.provider_type.clone(),
+                },
+            },
+        )
+        .await
     }
 
     pub(crate) async fn cleanup_provider_catalog_key_if_current<F>(
@@ -860,5 +883,88 @@ impl<'a> AdminAppState<'a> {
             "model_sync": model_sync,
         }))
         .into_response())
+    }
+}
+
+#[cfg(test)]
+mod automatic_cleanup_tests {
+    use super::{provider_requires_credential_cas_cleanup, AdminAppState};
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data_contracts::repository::provider_catalog::{
+        ProviderCatalogReadRepository, StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    };
+    use std::sync::Arc;
+
+    fn provider(provider_type: &str) -> StoredProviderCatalogProvider {
+        StoredProviderCatalogProvider::new(
+            format!("provider-{provider_type}"),
+            provider_type.to_string(),
+            None,
+            provider_type.to_string(),
+        )
+        .expect("provider should build")
+    }
+
+    #[test]
+    fn codex_automatic_cleanup_uses_credential_cas() {
+        assert!(provider_requires_credential_cas_cleanup(&provider("codex")));
+        assert!(provider_requires_credential_cas_cleanup(&provider("CoDeX")));
+        assert!(!provider_requires_credential_cas_cleanup(&provider("kiro")));
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_existing_hard_invalid_codex_key() {
+        let provider = provider("codex");
+        let mut key = StoredProviderCatalogKey::new(
+            "key-codex-invalid".to_string(),
+            provider.id.clone(),
+            "Invalid Codex OAuth".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            None,
+            "encrypted-api-key".to_string(),
+            Some("encrypted-auth-config".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build");
+        key.oauth_invalid_at_unix_secs = Some(1);
+        key.oauth_invalid_reason = Some(
+            "[OAUTH_EXPIRED] Your authentication token has been invalidated. Please try signing in again."
+                .to_string(),
+        );
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider.clone()],
+            vec![],
+            vec![key],
+        ));
+        let state = crate::AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_repository_for_tests(
+                    repository.clone(),
+                ),
+            );
+        let admin_state = AdminAppState::new(&state);
+
+        let affected = admin_state
+            .cleanup_known_banned_provider_catalog_keys(&provider)
+            .await
+            .expect("cleanup should succeed");
+
+        assert_eq!(affected, 1);
+        assert!(repository
+            .list_keys_by_ids(&["key-codex-invalid".to_string()])
+            .await
+            .expect("keys should read")
+            .is_empty());
     }
 }

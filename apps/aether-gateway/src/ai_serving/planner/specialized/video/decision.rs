@@ -12,7 +12,7 @@ use crate::ai_serving::transport::{
     resolve_transport_execution_timeouts, resolve_transport_profile,
 };
 use crate::ai_serving::{ai_local_execution_contract_for_formats, PlannerAppState};
-use crate::{AiExecutionDecision, AppState, GatewayError};
+use crate::{append_local_failover_policy_to_value, AiExecutionDecision, AppState, GatewayError};
 
 use super::request::resolve_local_video_create_candidate_payload_parts;
 use super::support::{LocalVideoCreateCandidateAttempt, LocalVideoCreateDecisionInput};
@@ -88,6 +88,7 @@ pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidat
         original_request_body_json: Some(body_json),
         original_request_body_base64: None,
         client_session_affinity: input.client_session_affinity.as_ref(),
+        routing_policy: input.routing_policy.as_ref(),
         scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
         client_requested_stream: false,
         upstream_is_stream: false,
@@ -95,6 +96,7 @@ pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidat
         needs_conversion: false,
         extra_fields,
     });
+    let report_context = append_local_failover_policy_to_value(report_context, &transport);
     let super::request::LocalVideoCreateCandidatePayloadParts {
         transport: _,
         auth_header,

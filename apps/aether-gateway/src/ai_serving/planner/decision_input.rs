@@ -11,12 +11,12 @@ use async_trait::async_trait;
 use http::StatusCode;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
-use tracing::warn;
 
 use crate::ai_serving::planner::common::extract_standard_requested_model;
 use crate::ai_serving::{
-    ExecutionRuntimeAuthContext, GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot,
-    PlannerAppState, CODEX_RESPONSES_LITE_HEADER,
+    ClientSurface, ExecutionRuntimeAuthContext, GatewayAuthApiKeySnapshot,
+    GatewayCredentialCarrier, GatewayProviderTransportSnapshot, PlannerAppState,
+    CODEX_RESPONSES_LITE_HEADER,
 };
 use crate::cache::CacheLoadObserver;
 use crate::client_session_affinity::client_session_affinity_from_api_request;
@@ -52,6 +52,8 @@ pub(crate) struct LocalRequestedModelDecisionInput {
     pub(crate) auth_snapshot: GatewayAuthApiKeySnapshot,
     pub(crate) required_capabilities: Option<serde_json::Value>,
     pub(crate) request_auth_channel: Option<String>,
+    pub(crate) client_surface: Option<ClientSurface>,
+    pub(crate) gateway_credential_carrier: Option<GatewayCredentialCarrier>,
     pub(crate) client_session_affinity: Option<ClientSessionAffinity>,
     pub(crate) routing_policy: Option<ResolvedRoutingPolicy>,
     pub(crate) routing_trace_seed: Option<RoutingDecisionTrace>,
@@ -378,6 +380,8 @@ pub(crate) fn build_local_requested_model_decision_input(
         auth_snapshot: resolved_input.auth_snapshot,
         required_capabilities: resolved_input.required_capabilities,
         request_auth_channel: None,
+        client_surface: None,
+        gateway_credential_carrier: None,
         client_session_affinity: None,
         routing_policy: None,
         routing_trace_seed: None,
@@ -403,29 +407,28 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
             let principal_context_required = if explicit_group.is_some() {
                 true
             } else {
-                !matches!(repository.has_any_routing_group_binding().await, Ok(false))
+                repository
+                    .has_any_routing_group_binding()
+                    .await
+                    .map_err(|error| {
+                        routing_selection_error(GatewayRoutingSelectionError::Repository(
+                            error.to_string(),
+                        ))
+                    })?
             };
             let user_group_ids = if principal_context_required {
                 let user_groups_lookup_started_at = std::time::Instant::now();
-                let user_group_ids = match state
+                let user_groups = state
                     .list_user_groups_for_user(&input.auth_context.user_id)
-                    .await
-                {
-                    Ok(groups) => groups.into_iter().map(|group| group.id).collect::<Vec<_>>(),
-                    Err(error) => {
-                        warn!(
-                            user_id = %input.auth_context.user_id,
-                            error = ?error,
-                            "gateway routing profile user group lookup failed"
-                        );
-                        Vec::new()
-                    }
-                };
+                    .await;
                 observe_gateway_stage_ms(
                     "routing_user_groups_lookup",
                     user_groups_lookup_started_at.elapsed().as_millis() as u64,
                 );
-                user_group_ids
+                user_groups?
+                    .into_iter()
+                    .map(|group| group.id)
+                    .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
@@ -730,9 +733,14 @@ pub(crate) async fn resolve_local_authenticated_decision_input(
 }
 
 fn routing_selection_error(error: GatewayRoutingSelectionError) -> GatewayError {
-    GatewayError::Client {
-        status: StatusCode::FORBIDDEN,
-        message: error.to_string(),
+    match error {
+        GatewayRoutingSelectionError::Repository(message) => {
+            GatewayError::Internal(format!("routing group repository lookup failed: {message}"))
+        }
+        error => GatewayError::Client {
+            status: StatusCode::FORBIDDEN,
+            message: error.to_string(),
+        },
     }
 }
 
@@ -1001,6 +1009,21 @@ mod tests {
         assert!(first.contains("groups=team-1"));
     }
 
+    #[test]
+    fn routing_repository_failure_maps_to_internal_gateway_error() {
+        let error = routing_selection_error(GatewayRoutingSelectionError::Repository(
+            "sql error: database unavailable".to_string(),
+        ));
+
+        match error {
+            GatewayError::Internal(message) => {
+                assert!(message.contains("routing group repository lookup failed"));
+                assert!(message.contains("database unavailable"));
+            }
+            other => panic!("unexpected routing repository error mapping: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn explicit_routing_attachment_authorizes_and_caches_per_principal() {
         let repository = Arc::new(InMemoryRoutingGroupRepository::default());
@@ -1128,6 +1151,8 @@ mod tests {
             auth_snapshot: sample_auth_snapshot(),
             required_capabilities: None,
             request_auth_channel: None,
+            client_surface: None,
+            gateway_credential_carrier: None,
             client_session_affinity: None,
             routing_policy: None,
             routing_trace_seed: None,
@@ -1323,6 +1348,8 @@ mod tests {
             auth_snapshot: sample_auth_snapshot(),
             required_capabilities: None,
             request_auth_channel: None,
+            client_surface: None,
+            gateway_credential_carrier: None,
             client_session_affinity: None,
             routing_policy: None,
             routing_trace_seed: None,
@@ -1390,6 +1417,8 @@ mod tests {
             auth_snapshot: sample_auth_snapshot(),
             required_capabilities: None,
             request_auth_channel: None,
+            client_surface: None,
+            gateway_credential_carrier: None,
             client_session_affinity: None,
             routing_policy: None,
             routing_trace_seed: None,
@@ -1457,6 +1486,59 @@ mod tests {
             report_context["routing_trace"]["global_candidates"][0]["provider_id"],
             json!("provider-1")
         );
+    }
+
+    #[test]
+    fn provider_request_routing_policy_cannot_restore_credentials_or_aether_internal_headers() {
+        for header_name in [
+            "authorization",
+            "proxy-authorization",
+            "api-key",
+            "x-api-key",
+            "x-goog-api-key",
+            "cookie",
+            "cookie2",
+            "set-cookie",
+            "x-aether-auth-user-id",
+            "x-aether-control-future",
+        ] {
+            let mut input = sample_decision_input();
+            set_provider_request_rules(
+                &mut input,
+                &["gpt-5"],
+                json!([{
+                    "type": "patch_headers",
+                    "patch": [{
+                        "op": "set",
+                        "name": header_name,
+                        "value": "must-not-reach-upstream"
+                    }]
+                }]),
+            );
+            let mut decision = sample_decision();
+
+            let error =
+                apply_provider_request_routing_policy_to_decision(&input, &mut decision, None)
+                    .expect_err("reserved provider header mutation should fail closed");
+
+            assert!(
+                matches!(
+                    &error,
+                    GatewayError::Client {
+                        status: StatusCode::BAD_REQUEST,
+                        ..
+                    }
+                ),
+                "unexpected error for {header_name}: {error:?}"
+            );
+            assert!(
+                !decision
+                    .provider_request_headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(header_name)),
+                "reserved header reached the provider decision: {header_name}"
+            );
+        }
     }
 
     #[test]

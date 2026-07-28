@@ -193,6 +193,21 @@ impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalGeminiFilesSyncAttemptS
         }
         Ok(drained)
     }
+
+    async fn skip_credential(&mut self, key_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_credential(key_id);
+        Ok(())
+    }
+
+    async fn skip_endpoint(&mut self, endpoint_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_endpoint(endpoint_id);
+        Ok(())
+    }
+
+    async fn skip_provider(&mut self, provider_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_provider(provider_id);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -215,6 +230,21 @@ impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalGeminiFilesStreamAtte
             }
         }
         Ok(drained)
+    }
+
+    async fn skip_credential(&mut self, key_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_credential(key_id);
+        Ok(())
+    }
+
+    async fn skip_endpoint(&mut self, endpoint_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_endpoint(endpoint_id);
+        Ok(())
+    }
+
+    async fn skip_provider(&mut self, provider_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_provider(provider_id);
+        Ok(())
     }
 }
 

@@ -2,6 +2,7 @@ use super::{
     ApiKeyLastUsedDelta, DataLayerError, GatewayDataState, GeminiFileMappingListQuery,
     GeminiFileMappingStats, ProviderCatalogKeyAdaptiveStateUpdate,
     ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListQuery,
+    ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
     PublicHealthStatusCount, PublicHealthTimelineBucket, StoredGeminiFileMapping,
     StoredGeminiFileMappingListPage, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
@@ -400,6 +401,24 @@ impl GatewayDataState {
         Ok(updated)
     }
 
+    pub(crate) async fn compare_and_update_provider_catalog_key_oauth_runtime_state(
+        &self,
+        update: &ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => {
+                repository
+                    .compare_and_update_key_oauth_runtime_state(update)
+                    .await
+            }
+            None => Ok(false),
+        }?;
+        // A false result is a credential CAS conflict. Clear cached snapshots
+        // either way so the next read observes the authoritative row.
+        self.clear_provider_catalog_cache();
+        Ok(updated)
+    }
+
     pub(crate) async fn create_provider_catalog_key(
         &self,
         key: &StoredProviderCatalogKey,
@@ -689,6 +708,22 @@ impl GatewayDataState {
         if deleted {
             self.clear_provider_catalog_cache();
         }
+        Ok(deleted)
+    }
+
+    pub(crate) async fn compare_and_delete_provider_catalog_key_oauth_credential(
+        &self,
+        delete: &ProviderCatalogKeyOAuthCredentialCasDelete,
+    ) -> Result<bool, DataLayerError> {
+        let deleted = match &self.provider_catalog_writer {
+            Some(repository) => {
+                repository
+                    .compare_and_delete_key_oauth_credential(delete)
+                    .await
+            }
+            None => Ok(false),
+        }?;
+        self.clear_provider_catalog_cache();
         Ok(deleted)
     }
 

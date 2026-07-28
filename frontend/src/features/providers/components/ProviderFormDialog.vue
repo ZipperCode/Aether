@@ -56,11 +56,8 @@
                   <SelectItem value="vertex_ai">
                     Vertex AI
                   </SelectItem>
-                  <SelectItem
-                    value="claude_code"
-                    disabled
-                  >
-                    {{ legacyT('ClaudeCode（暂不可用）') }}
+                  <SelectItem value="claude_code">
+                    {{ legacyT('Claude Code（实验性功能）') }}
                   </SelectItem>
                   <SelectItem value="codex">
                     Codex
@@ -107,7 +104,7 @@
                     Vertex AI
                   </SelectItem>
                   <SelectItem value="claude_code">
-                    ClaudeCode
+                    {{ legacyT('Claude Code（实验性功能）') }}
                   </SelectItem>
                   <SelectItem value="codex">
                     Codex
@@ -232,6 +229,46 @@
               step="1"
               placeholder="300"
               @update:model-value="(v) => form.request_timeout = parseNumberInput(v)"
+            />
+          </div>
+        </div>
+
+        <!-- 提供商内转移限制（仅编辑模式） -->
+        <div
+          v-if="isEditMode"
+          class="grid grid-cols-2 gap-2 sm:gap-4"
+        >
+          <div class="min-w-0 space-y-1.5">
+            <Label
+              for="max-transfer-count"
+              class="whitespace-nowrap text-xs sm:text-sm"
+            >
+              {{ legacyT('最大转移次数') }}
+            </Label>
+            <Input
+              id="max-transfer-count"
+              :model-value="form.max_transfer_count"
+              type="number"
+              min="0"
+              step="1"
+              @update:model-value="(v) => form.max_transfer_count = parseNumberInput(v, { min: 0 }) ?? 0"
+            />
+          </div>
+          <div class="min-w-0 space-y-1.5">
+            <Label
+              for="max-transfer-timeout-seconds"
+              class="whitespace-nowrap text-xs sm:text-sm"
+            >
+              {{ legacyT('最大转移超时') }}
+              <span class="text-xs text-muted-foreground">{{ legacyT('(秒)') }}</span>
+            </Label>
+            <Input
+              id="max-transfer-timeout-seconds"
+              :model-value="form.max_transfer_timeout_seconds"
+              type="number"
+              min="0"
+              step="1"
+              @update:model-value="(v) => form.max_transfer_timeout_seconds = parseNumberInput(v, { min: 0 }) ?? 0"
             />
           </div>
         </div>
@@ -447,6 +484,8 @@ const form = ref({
   concurrent_limit: undefined as number | undefined,
   // 请求配置
   max_retries: undefined as number | undefined,
+  max_transfer_count: 0,
+  max_transfer_timeout_seconds: 0,
   // 超时配置（秒）
   stream_first_byte_timeout: undefined as number | undefined,
   request_timeout: undefined as number | undefined,
@@ -509,6 +548,8 @@ function resetForm() {
     concurrent_limit: undefined,
     // 请求配置
     max_retries: undefined,
+    max_transfer_count: 0,
+    max_transfer_timeout_seconds: 0,
     // 超时配置
     stream_first_byte_timeout: undefined,
     request_timeout: undefined,
@@ -541,6 +582,8 @@ function loadProviderData() {
     concurrent_limit: undefined,
     // 请求配置
     max_retries: props.provider.max_retries ?? undefined,
+    max_transfer_count: props.provider.max_transfer_count ?? 0,
+    max_transfer_timeout_seconds: props.provider.max_transfer_timeout_seconds ?? 0,
     // 超时配置
     stream_first_byte_timeout: props.provider.stream_first_byte_timeout ?? undefined,
     request_timeout: props.provider.request_timeout ?? undefined,
@@ -578,11 +621,6 @@ watch(() => form.value.provider_type, () => {
 
 // 提交表单
 const handleSubmit = async () => {
-  if (!isEditMode.value && form.value.provider_type === 'claude_code') {
-    showError(legacyT('ClaudeCode 提供商类型暂时禁用'), legacyT('验证失败'))
-    return
-  }
-
   // 月卡类型必须设置周期开始时间
   if (form.value.billing_type === 'monthly_quota' && !form.value.quota_last_reset_at) {
     showError(legacyT('月卡类型必须设置周期开始时间'), legacyT('验证失败'))
@@ -634,6 +672,8 @@ const handleSubmit = async () => {
       is_active: form.value.is_active,
       // 请求配置
       max_retries: form.value.max_retries ?? undefined,
+      max_transfer_count: form.value.max_transfer_count,
+      max_transfer_timeout_seconds: form.value.max_transfer_timeout_seconds,
       // 超时配置（null 表示清除，使用全局配置）
       stream_first_byte_timeout: form.value.stream_first_byte_timeout ?? null,
       request_timeout: form.value.request_timeout ?? null,

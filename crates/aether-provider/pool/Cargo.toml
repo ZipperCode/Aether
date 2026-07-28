@@ -10,6 +10,7 @@ description = "Provider-specific pool behavior adapters for Aether"
 aether-contracts.workspace = true
 aether-data-contracts.workspace = true
 aether-pool-core.workspace = true
+aether-provider-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

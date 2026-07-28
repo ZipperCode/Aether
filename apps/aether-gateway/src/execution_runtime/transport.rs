@@ -1,27 +1,29 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error as _;
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use aether_contracts::{
-    ExecutionPlan, ExecutionResult, ExecutionTelemetry, ProxySnapshot, ResolvedTransportProfile,
-    ResponseBody, EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER,
+    ExecutionPlan, ExecutionResponseBodyMode, ExecutionResult, ExecutionTelemetry, ProxySnapshot,
+    ResolvedTransportProfile, ResponseBody, EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER,
     EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
-    EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER, TRANSPORT_BACKEND_BROWSER_WREQ,
-    TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE,
-    TRANSPORT_HTTP_MODE_HTTP1_ONLY,
+    EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER, EXECUTION_RESPONSE_BODY_MODE_HEADER,
+    TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_BACKEND_REQWEST_RUSTLS,
+    TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE, TRANSPORT_HTTP_MODE_HTTP1_ONLY,
 };
 use aether_data::repository::proxy_nodes::ProxyNodeTrafficMutation;
 use aether_http::{
-    apply_http_client_config, collect_reqwest_body_bounded, decode_response_body_bounded,
-    BoundedBodyCollector, BoundedBodyError, BoundedBodyReadError, HttpClientConfig,
+    apply_http_client_config, collect_reqwest_body_bounded, BoundedBodyCollector, BoundedBodyError,
+    BoundedBodyReadError, HttpClientConfig,
 };
 use aether_runtime::{MetricKind, MetricSample};
 use axum::body::Bytes;
 use base64::Engine as _;
+use flate2::read::{DeflateDecoder, GzDecoder};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures_util::stream::FuturesUnordered;
@@ -37,6 +39,7 @@ use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
+use sha2::Digest as _;
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::sync::OnceCell as TokioOnceCell;
@@ -109,6 +112,7 @@ type DirectHyperH2cSenderCacheCell = TokioOnceCell<Arc<DirectHyperH2cSenderCache
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DirectReqwestClientCacheKey {
     upstream_origin: Option<String>,
+    pool_partition: Option<String>,
     connect_timeout_ms: Option<u64>,
     proxy_url: Option<String>,
     follow_redirects: bool,
@@ -446,8 +450,11 @@ pub(crate) fn format_upstream_request_error(err: &reqwest::Error) -> String {
     }
 
     if let Some(url) = err.url() {
+        let (sanitized_detail, sanitized_url) =
+            sanitize_upstream_request_error_detail(&detail, url.as_str());
+        detail = sanitized_detail;
         detail.push_str(" [url=");
-        detail.push_str(url.as_str());
+        detail.push_str(&sanitized_url);
         detail.push(']');
     }
     if !kinds.is_empty() {
@@ -457,6 +464,25 @@ pub(crate) fn format_upstream_request_error(err: &reqwest::Error) -> String {
     }
 
     detail
+}
+
+fn sanitize_upstream_request_error_detail(detail: &str, upstream_url: &str) -> (String, String) {
+    let sanitized_url = sanitize_upstream_url_text(upstream_url);
+    (detail.replace(upstream_url, &sanitized_url), sanitized_url)
+}
+
+fn sanitize_upstream_url_text(upstream_url: &str) -> String {
+    if let Ok(mut parsed_url) = reqwest::Url::parse(upstream_url) {
+        parsed_url.set_query(None);
+        parsed_url.set_fragment(None);
+        return parsed_url.to_string();
+    }
+
+    let suffix_offset = upstream_url
+        .char_indices()
+        .find_map(|(offset, character)| matches!(character, '?' | '#').then_some(offset))
+        .unwrap_or(upstream_url.len());
+    upstream_url[..suffix_offset].to_string()
 }
 
 pub(crate) fn format_wreq_upstream_request_error(err: &wreq::Error) -> String {
@@ -492,8 +518,12 @@ pub(crate) fn format_wreq_upstream_request_error(err: &wreq::Error) -> String {
     }
 
     if let Some(uri) = err.uri() {
+        let uri = uri.to_string();
+        let (sanitized_detail, sanitized_uri) =
+            sanitize_upstream_request_error_detail(&detail, &uri);
+        detail = sanitized_detail;
         detail.push_str(" [uri=");
-        detail.push_str(&uri.to_string());
+        detail.push_str(&sanitized_uri);
         detail.push(']');
     }
     if !kinds.is_empty() {
@@ -551,10 +581,58 @@ pub(crate) enum ExecutionRuntimeTransportError {
     UpstreamRequest(String),
     #[error("response_too_large")]
     ResponseTooLarge,
+    #[error("upstream response {phase} body exceeds {limit_bytes} bytes")]
+    UpstreamResponseTooLarge {
+        phase: UpstreamResponseBodyPhase,
+        limit_bytes: usize,
+    },
+    #[error("failed to decode upstream response body with content-encoding {encoding}: {message}")]
+    UpstreamResponseDecode { encoding: String, message: String },
     #[error("hub relay request failed: {0}")]
     RelayError(String),
     #[error("upstream response is not valid JSON: {0}")]
     InvalidJson(serde_json::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamResponseBodyPhase {
+    Wire,
+    Decoded,
+}
+
+impl std::fmt::Display for UpstreamResponseBodyPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Wire => "wire",
+            Self::Decoded => "decoded",
+        })
+    }
+}
+
+pub(crate) fn append_upstream_response_body_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Result<(), ExecutionRuntimeTransportError> {
+    append_upstream_response_body_chunk_with_limit(
+        body,
+        chunk,
+        crate::headers::max_internal_buffered_body_bytes(),
+    )
+}
+
+fn append_upstream_response_body_chunk_with_limit(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    limit_bytes: usize,
+) -> Result<(), ExecutionRuntimeTransportError> {
+    if body.len() > limit_bytes || chunk.len() > limit_bytes.saturating_sub(body.len()) {
+        return Err(ExecutionRuntimeTransportError::UpstreamResponseTooLarge {
+            phase: UpstreamResponseBodyPhase::Wire,
+            limit_bytes,
+        });
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -613,6 +691,8 @@ pub(crate) struct DirectUpstreamStreamExecution {
     pub(crate) headers: BTreeMap<String, String>,
     pub(crate) provider_api_format: String,
     pub(crate) stream_summary_report_context: Value,
+    pub(crate) prefetched_body: VecDeque<Result<Bytes, String>>,
+    pub(crate) stream_precommit_committed: bool,
     pub(crate) response: DirectUpstreamResponse,
     pub(crate) started_at: Instant,
     pub(crate) stream_first_byte_timeout: Option<Duration>,
@@ -662,16 +742,16 @@ impl DirectSyncExecutionRuntime {
                 .bytes_with_stream_timeout(plan, started_at, response_body_limit)
                 .await?;
             let decoded_body_bytes =
-                decode_response_body_bytes_bounded(&headers, &body_bytes, response_body_limit)?
-                    .unwrap_or_else(|| body_bytes.to_vec());
+                decode_response_body_bytes_with_limit(&headers, &body_bytes, response_body_limit)?;
             let elapsed_ms = started_at.elapsed().as_millis() as u64;
             let upstream_bytes = body_bytes.len() as u64;
 
             let body = build_execution_response_body(
                 &headers,
                 &body_bytes,
-                &decoded_body_bytes,
+                decoded_body_bytes.as_ref(),
                 plan.stream,
+                execution_response_body_mode(plan),
             )?;
 
             Ok(ExecutionResult {
@@ -720,6 +800,8 @@ impl DirectSyncExecutionRuntime {
             headers,
             provider_api_format: plan.provider_api_format.clone(),
             stream_summary_report_context,
+            prefetched_body: VecDeque::new(),
+            stream_precommit_committed: false,
             response: response.into_direct_upstream_response(),
             started_at,
             stream_first_byte_timeout: resolve_stream_first_byte_timeout(plan),
@@ -833,6 +915,8 @@ pub(crate) async fn execute_stream_plan_via_local_tunnel(
         headers,
         provider_api_format: plan.provider_api_format.clone(),
         stream_summary_report_context: build_stream_summary_report_context(plan),
+        prefetched_body: VecDeque::new(),
+        stream_precommit_committed: false,
         response: DirectUpstreamResponse::LocalTunnel(response),
         started_at,
         stream_first_byte_timeout: resolve_stream_first_byte_timeout(plan),
@@ -976,8 +1060,7 @@ async fn execute_sync_plan_via_local_tunnel_inner(
     )
     .await?;
     let decoded_body_bytes =
-        decode_response_body_bytes_bounded(&headers, &body_bytes, response_body_limit)?
-            .unwrap_or_else(|| body_bytes.clone());
+        decode_response_body_bytes_with_limit(&headers, &body_bytes, response_body_limit)?;
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
     let upstream_bytes = body_bytes.len() as u64;
     if status_code >= 400 {
@@ -1014,8 +1097,13 @@ async fn execute_sync_plan_via_local_tunnel_inner(
         );
     }
 
-    let body =
-        build_execution_response_body(&headers, &body_bytes, &decoded_body_bytes, plan.stream)?;
+    let body = build_execution_response_body(
+        &headers,
+        &body_bytes,
+        decoded_body_bytes.as_ref(),
+        plan.stream,
+        execution_response_body_mode(plan),
+    )?;
 
     Ok(ExecutionResult {
         request_id: plan.request_id.clone(),
@@ -1173,6 +1261,7 @@ async fn send_request_inner(
     let client_select_started_at = Instant::now();
     let client = build_client(
         &plan.url,
+        &plan.key_id,
         plan.timeouts.as_ref(),
         plan.proxy.as_ref(),
         plan.transport_profile.as_ref(),
@@ -2597,6 +2686,7 @@ fn resolve_local_tunnel_node_id(state: &AppState, proxy: Option<&ProxySnapshot>)
 
 fn build_client(
     request_url: &str,
+    key_id: &str,
     timeouts: Option<&aether_contracts::ExecutionTimeouts>,
     proxy: Option<&ProxySnapshot>,
     transport_profile: Option<&ResolvedTransportProfile>,
@@ -2606,6 +2696,7 @@ fn build_client(
     let resolved_proxy_url = resolve_proxy_url(proxy)?;
     let cache_key = direct_reqwest_client_cache_key(
         request_url,
+        key_id,
         timeouts,
         resolved_proxy_url,
         transport_profile,
@@ -2652,7 +2743,10 @@ pub(crate) fn prewarm_direct_reqwest_client_cache_for_plan(plan: &ExecutionPlan)
                 candidate_id = ?plan.candidate_id,
                 provider_id = %plan.provider_id,
                 endpoint_id = %plan.endpoint_id,
-                key_id = %plan.key_id,
+                key_partition = ?direct_reqwest_pool_partition(
+                    plan.transport_profile.as_ref(),
+                    &plan.key_id,
+                ),
                 "gateway direct reqwest client prewarm skipped"
             );
         }
@@ -2680,6 +2774,7 @@ fn try_prewarm_direct_reqwest_client_cache_for_plan(
     let resolved_proxy_url = resolve_proxy_url(plan.proxy.as_ref())?;
     let cache_key = direct_reqwest_client_cache_key(
         &plan.url,
+        &plan.key_id,
         plan.timeouts.as_ref(),
         resolved_proxy_url,
         plan.transport_profile.as_ref(),
@@ -2919,6 +3014,7 @@ fn mark_direct_reqwest_client_cache_not_warming(cache_key: &DirectReqwestClientC
 
 fn direct_reqwest_client_cache_key(
     request_url: &str,
+    key_id: &str,
     timeouts: Option<&aether_contracts::ExecutionTimeouts>,
     proxy_url: Option<String>,
     transport_profile: Option<&ResolvedTransportProfile>,
@@ -2928,6 +3024,7 @@ fn direct_reqwest_client_cache_key(
         upstream_origin: direct_reqwest_cache_per_origin()
             .then(|| direct_reqwest_upstream_origin(request_url))
             .flatten(),
+        pool_partition: direct_reqwest_pool_partition(transport_profile, key_id),
         connect_timeout_ms: timeouts.and_then(|timeouts| timeouts.connect_ms),
         proxy_url,
         follow_redirects: transport_controls.follow_redirects == Some(true),
@@ -2935,6 +3032,17 @@ fn direct_reqwest_client_cache_key(
         accept_invalid_certs: transport_controls.accept_invalid_certs,
         transport_profile: transport_profile.map(direct_reqwest_transport_profile_cache_key),
     }
+}
+
+fn direct_reqwest_pool_partition(
+    transport_profile: Option<&ResolvedTransportProfile>,
+    key_id: &str,
+) -> Option<String> {
+    let key_id = key_id.trim();
+    transport_profile
+        .filter(|profile| profile.pool_scope.trim().eq_ignore_ascii_case("key"))
+        .filter(|_| !key_id.is_empty())
+        .map(|_| format!("{:x}", sha2::Sha256::digest(key_id.as_bytes())))
 }
 
 fn direct_reqwest_cache_per_origin() -> bool {
@@ -3761,12 +3869,14 @@ pub(crate) fn build_request_headers(
     }
     for (key, value) in headers {
         let normalized_key = key.trim().to_ascii_lowercase();
-        if is_hop_by_hop_header(&normalized_key)
+        if crate::headers::should_skip_request_header(&normalized_key)
+            || is_hop_by_hop_header(&normalized_key)
             || normalized_key == "content-encoding"
             || normalized_key == EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER
             || normalized_key == EXECUTION_REQUEST_HTTP1_ONLY_HEADER
             || normalized_key == EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER
             || normalized_key == EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER
+            || normalized_key == EXECUTION_RESPONSE_BODY_MODE_HEADER
         {
             continue;
         }
@@ -3807,6 +3917,23 @@ fn resolve_execution_transport_controls(
         .and_then(|value| parse_execution_transport_bool(value))
         .unwrap_or(false),
     }
+}
+
+pub(crate) fn execution_response_body_mode(plan: &ExecutionPlan) -> ExecutionResponseBodyMode {
+    if plan.stream
+        || plan.body.body_bytes_b64.is_none()
+        || !plan
+            .client_api_format
+            .trim()
+            .eq_ignore_ascii_case(plan.provider_api_format.trim())
+    {
+        return ExecutionResponseBodyMode::StructuredJson;
+    }
+
+    ExecutionResponseBodyMode::from_header_value(execution_transport_header_value(
+        &plan.headers,
+        EXECUTION_RESPONSE_BODY_MODE_HEADER,
+    ))
 }
 
 fn execution_transport_header_value<'a>(
@@ -3915,32 +4042,66 @@ fn execution_log_url_host(url: &str) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-pub(crate) fn decode_response_body_bytes(
+pub(crate) fn decode_response_body_bytes<'a>(
     headers: &BTreeMap<String, String>,
-    body_bytes: &[u8],
-) -> Option<Vec<u8>> {
-    decode_response_body_bytes_bounded(
+    body_bytes: &'a [u8],
+) -> Result<Cow<'a, [u8]>, ExecutionRuntimeTransportError> {
+    decode_response_body_bytes_with_limit(
         headers,
         body_bytes,
         crate::headers::max_internal_buffered_body_bytes(),
     )
-    .ok()
-    .flatten()
 }
 
-fn decode_response_body_bytes_bounded(
+fn decode_response_body_bytes_with_limit<'a>(
     headers: &BTreeMap<String, String>,
-    body_bytes: &[u8],
-    limit: usize,
-) -> Result<Option<Vec<u8>>, ExecutionRuntimeTransportError> {
+    body_bytes: &'a [u8],
+    limit_bytes: usize,
+) -> Result<Cow<'a, [u8]>, ExecutionRuntimeTransportError> {
     let encoding = headers
         .get("content-encoding")
         .map(String::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase());
-    decode_response_body_bounded(encoding.as_deref(), body_bytes, limit)
-        .map_err(map_bounded_body_error)
+    match encoding.as_deref() {
+        Some("gzip") => {
+            let mut decoder = GzDecoder::new(body_bytes);
+            read_upstream_response_decoder_with_limit("gzip", &mut decoder, limit_bytes)
+                .map(Cow::Owned)
+        }
+        Some("deflate") => {
+            let mut decoder = DeflateDecoder::new(body_bytes);
+            read_upstream_response_decoder_with_limit("deflate", &mut decoder, limit_bytes)
+                .map(Cow::Owned)
+        }
+        _ => Ok(Cow::Borrowed(body_bytes)),
+    }
+}
+
+fn read_upstream_response_decoder_with_limit(
+    encoding: &str,
+    decoder: &mut impl Read,
+    limit_bytes: usize,
+) -> Result<Vec<u8>, ExecutionRuntimeTransportError> {
+    let read_limit = u64::try_from(limit_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut limited = decoder.take(read_limit);
+    let mut out = Vec::new();
+    limited.read_to_end(&mut out).map_err(|error| {
+        ExecutionRuntimeTransportError::UpstreamResponseDecode {
+            encoding: encoding.to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    if out.len() > limit_bytes {
+        return Err(ExecutionRuntimeTransportError::UpstreamResponseTooLarge {
+            phase: UpstreamResponseBodyPhase::Decoded,
+            limit_bytes,
+        });
+    }
+    Ok(out)
 }
 
 pub(crate) fn response_body_is_json(headers: &BTreeMap<String, String>, body_bytes: &[u8]) -> bool {
@@ -3965,6 +4126,7 @@ pub(crate) fn build_execution_response_body(
     body_bytes: &[u8],
     decoded_body_bytes: &[u8],
     stream: bool,
+    response_body_mode: ExecutionResponseBodyMode,
 ) -> Result<Option<ResponseBody>, ExecutionRuntimeTransportError> {
     if body_bytes.is_empty() {
         return Ok(None);
@@ -3975,7 +4137,8 @@ pub(crate) fn build_execution_response_body(
             .map_err(ExecutionRuntimeTransportError::InvalidJson)?;
         return Ok(Some(ResponseBody {
             json_body: Some(body_json),
-            body_bytes_b64: None,
+            body_bytes_b64: (response_body_mode == ExecutionResponseBodyMode::PreserveBytes)
+                .then(|| base64::engine::general_purpose::STANDARD.encode(body_bytes)),
         }));
     }
 
@@ -4004,13 +4167,14 @@ pub(crate) fn build_execution_response_body(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
     use aether_contracts::{
-        ExecutionPlan, ExecutionTimeouts, ProxySnapshot, RequestBody, ResolvedTransportProfile,
-        EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
-        EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER, TRANSPORT_BACKEND_BROWSER_WREQ,
+        ExecutionPlan, ExecutionResponseBodyMode, ExecutionTimeouts, ProxySnapshot, RequestBody,
+        ResolvedTransportProfile, EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
+        EXECUTION_REQUEST_HTTP1_ONLY_HEADER, EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER,
+        EXECUTION_RESPONSE_BODY_MODE_HEADER, TRANSPORT_BACKEND_BROWSER_WREQ,
         TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_AUTO,
         TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE, TRANSPORT_HTTP_MODE_HTTP1_ONLY,
     };
@@ -4027,18 +4191,18 @@ mod tests {
     use flate2::{write::GzEncoder, Compression};
     use futures_util::stream;
     use serde_json::json;
-    use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
 
     use super::{
-        build_browser_wreq_client, build_client, build_direct_tunnel_request_meta,
-        build_execution_response_body, build_request_headers, execute_sync_plan,
+        append_upstream_response_body_chunk_with_limit, build_browser_wreq_client, build_client,
+        build_direct_tunnel_request_meta, build_execution_response_body, build_request_headers,
+        decode_response_body_bytes_with_limit, execute_sync_plan, execution_response_body_mode,
         record_manual_proxy_request_failure, record_manual_proxy_request_outcome,
         record_manual_proxy_request_success, record_manual_proxy_stream_error,
         resolve_execution_transport_controls, resolve_non_stream_total_timeout,
         resolve_stream_first_byte_timeout, response_body_is_json, DirectSyncExecutionRuntime,
-        ExecutionRuntimeTransportError, ExecutionTransportControls,
+        ExecutionRuntimeTransportError, ExecutionTransportControls, UpstreamResponseBodyPhase,
     };
     use crate::constants::{
         EXECUTION_RUNTIME_LOOP_GUARD_HEADER, EXECUTION_RUNTIME_LOOP_GUARD_VIA_TOKEN,
@@ -4051,6 +4215,106 @@ mod tests {
     use crate::AppState;
 
     const LOCAL_HTTP_SUCCESS_TIMEOUT_MS: u64 = 15_000;
+
+    #[test]
+    fn upstream_error_url_sanitization_removes_secrets_everywhere() {
+        let upstream_url =
+            "https://api.example.test/v1/messages?key=query-secret&alt=sse#fragment-secret";
+        let detail = format!(
+            "error sending request for url ({upstream_url}); source repeated {upstream_url}"
+        );
+
+        let (sanitized_detail, sanitized_url) =
+            super::sanitize_upstream_request_error_detail(&detail, upstream_url);
+
+        assert_eq!(sanitized_url, "https://api.example.test/v1/messages");
+        assert_eq!(
+            sanitized_detail,
+            "error sending request for url (https://api.example.test/v1/messages); source repeated https://api.example.test/v1/messages"
+        );
+        assert!(!sanitized_detail.contains("query-secret"));
+        assert!(!sanitized_detail.contains("fragment-secret"));
+    }
+
+    #[test]
+    fn request_header_materialization_strips_all_aether_internal_headers() {
+        let headers = BTreeMap::from([
+            ("authorization".to_string(), "Bearer upstream".to_string()),
+            ("x-aether-grok-runtime".to_string(), "1".to_string()),
+            ("x-aether-future-control".to_string(), "private".to_string()),
+        ]);
+
+        let materialized = build_request_headers(&headers, None, false)
+            .expect("provider request headers should materialize");
+
+        assert_eq!(
+            materialized
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer upstream")
+        );
+        assert!(!materialized.contains_key("x-aether-grok-runtime"));
+        assert!(!materialized.contains_key("x-aether-future-control"));
+    }
+
+    #[test]
+    fn upstream_response_wire_limit_allows_exact_body_and_rejects_next_byte() {
+        let mut body = Vec::new();
+        append_upstream_response_body_chunk_with_limit(&mut body, b"1234", 5)
+            .expect("chunk below limit should append");
+        append_upstream_response_body_chunk_with_limit(&mut body, b"5", 5)
+            .expect("body exactly at limit should append");
+
+        let error = append_upstream_response_body_chunk_with_limit(&mut body, b"6", 5)
+            .expect_err("body above limit should fail");
+
+        assert_eq!(body, b"12345");
+        assert!(matches!(
+            error,
+            ExecutionRuntimeTransportError::UpstreamResponseTooLarge {
+                phase: UpstreamResponseBodyPhase::Wire,
+                limit_bytes: 5,
+            }
+        ));
+    }
+
+    #[test]
+    fn upstream_response_gzip_decode_limit_rejects_decompression_bomb() {
+        let payload = vec![b'x'; 9];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&payload)
+            .expect("gzip payload should encode");
+        let encoded = encoder.finish().expect("gzip payload should finish");
+        let headers = BTreeMap::from([("content-encoding".to_string(), "gzip".to_string())]);
+
+        let error = decode_response_body_bytes_with_limit(&headers, &encoded, 8)
+            .expect_err("decoded body above limit should fail");
+
+        assert!(matches!(
+            error,
+            ExecutionRuntimeTransportError::UpstreamResponseTooLarge {
+                phase: UpstreamResponseBodyPhase::Decoded,
+                limit_bytes: 8,
+            }
+        ));
+    }
+
+    #[test]
+    fn upstream_response_gzip_decode_limit_allows_exact_body() {
+        let payload = b"12345678";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(payload)
+            .expect("gzip payload should encode");
+        let encoded = encoder.finish().expect("gzip payload should finish");
+        let headers = BTreeMap::from([("content-encoding".to_string(), "gzip".to_string())]);
+
+        let decoded = decode_response_body_bytes_with_limit(&headers, &encoded, payload.len())
+            .expect("decoded body exactly at limit should pass");
+
+        assert_eq!(decoded.as_ref(), payload);
+    }
 
     #[test]
     fn gateway_frontdoor_self_loop_guard_matches_loopback_public_ai_route() {
@@ -4110,6 +4374,7 @@ mod tests {
         for proxy_url in ["socks5://127.0.0.1:1080", "socks5h://127.0.0.1:1080"] {
             build_client(
                 "https://api.example.test/v1/chat/completions",
+                "key-test",
                 Some(&timeouts),
                 Some(&aether_contracts::ProxySnapshot {
                     enabled: Some(true),
@@ -4179,6 +4444,7 @@ mod tests {
 
         let left = super::direct_reqwest_client_cache_key(
             "http://127.0.0.1:18184/v1/chat/completions",
+            "key-1",
             Some(&timeouts),
             None,
             Some(&h2c_profile),
@@ -4186,6 +4452,7 @@ mod tests {
         );
         let right = super::direct_reqwest_client_cache_key(
             "http://127.0.0.1:18184/v1/responses",
+            "key-1",
             Some(&timeouts),
             None,
             Some(&same_h2c_profile),
@@ -4193,6 +4460,7 @@ mod tests {
         );
         let different_mode = super::direct_reqwest_client_cache_key(
             "http://127.0.0.1:18184/v1/chat/completions",
+            "key-1",
             Some(&timeouts),
             None,
             Some(&http1_profile),
@@ -4200,6 +4468,7 @@ mod tests {
         );
         let different_proxy = super::direct_reqwest_client_cache_key(
             "http://127.0.0.1:18184/v1/chat/completions",
+            "key-1",
             Some(&timeouts),
             Some("http://127.0.0.1:8080".into()),
             Some(&h2c_profile),
@@ -4212,6 +4481,72 @@ mod tests {
         assert!(!super::direct_reqwest_client_cache_key_uses_http2(
             &different_mode
         ));
+    }
+
+    #[test]
+    fn direct_reqwest_client_cache_key_partitions_key_scoped_pools_by_hashed_key_id() {
+        let profile = ResolvedTransportProfile {
+            profile_id: "key-scoped-profile".into(),
+            backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.into(),
+            http_mode: TRANSPORT_HTTP_MODE_AUTO.into(),
+            pool_scope: " key ".into(),
+            header_fingerprint: None,
+            extra: None,
+        };
+        let first_key_id = "plain-key-identity-alpha";
+        let second_key_id = "plain-key-identity-beta";
+        let cache_key = |key_id| {
+            super::direct_reqwest_client_cache_key(
+                "https://api.example.test/v1/messages",
+                key_id,
+                None,
+                None,
+                Some(&profile),
+                ExecutionTransportControls::default(),
+            )
+        };
+
+        let first = cache_key(first_key_id);
+        let first_key_id_with_whitespace = format!("  {first_key_id}  ");
+        let first_with_whitespace = cache_key(&first_key_id_with_whitespace);
+        let second = cache_key(second_key_id);
+        let empty = cache_key("   ");
+
+        assert_eq!(first, first_with_whitespace);
+        assert_ne!(first, second);
+        assert_eq!(first.pool_partition.as_deref().map(str::len), Some(64));
+        assert!(empty.pool_partition.is_none());
+        let debug = format!("{first:?} {second:?}");
+        assert!(!debug.contains(first_key_id));
+        assert!(!debug.contains(second_key_id));
+    }
+
+    #[test]
+    fn direct_reqwest_client_cache_key_shares_non_key_scoped_pools() {
+        let profile = ResolvedTransportProfile {
+            profile_id: "provider-scoped-profile".into(),
+            backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.into(),
+            http_mode: TRANSPORT_HTTP_MODE_AUTO.into(),
+            pool_scope: "provider".into(),
+            header_fingerprint: None,
+            extra: None,
+        };
+        let cache_key = |key_id| {
+            super::direct_reqwest_client_cache_key(
+                "https://api.example.test/v1/messages",
+                key_id,
+                None,
+                None,
+                Some(&profile),
+                ExecutionTransportControls::default(),
+            )
+        };
+
+        let first = cache_key("plain-key-identity-alpha");
+        let second = cache_key("plain-key-identity-beta");
+
+        assert_eq!(first, second);
+        assert!(first.pool_partition.is_none());
     }
 
     #[test]
@@ -4228,6 +4563,7 @@ mod tests {
 
         let shared_left = super::direct_reqwest_client_cache_key(
             "http://127.0.0.1:18184/v1/chat/completions",
+            "key-1",
             None,
             None,
             Some(&profile),
@@ -4235,6 +4571,7 @@ mod tests {
         );
         let shared_right = super::direct_reqwest_client_cache_key(
             "http://127.0.0.1:18185/v1/chat/completions",
+            "key-1",
             None,
             None,
             Some(&profile),
@@ -4245,6 +4582,7 @@ mod tests {
         let _per_origin = set_test_env_var(super::DIRECT_REQWEST_CACHE_PER_ORIGIN_ENV, "true");
         let split_left = super::direct_reqwest_client_cache_key(
             "http://127.0.0.1:18184/v1/chat/completions",
+            "key-1",
             None,
             None,
             Some(&profile),
@@ -4252,6 +4590,7 @@ mod tests {
         );
         let split_right = super::direct_reqwest_client_cache_key(
             "http://127.0.0.1:18185/v1/chat/completions",
+            "key-1",
             None,
             None,
             Some(&profile),
@@ -4277,6 +4616,7 @@ mod tests {
 
         let auto_key = super::direct_reqwest_client_cache_key(
             "http://127.0.0.1:18184/v1/chat/completions",
+            "key-1",
             None,
             None,
             Some(&auto_profile),
@@ -4284,6 +4624,7 @@ mod tests {
         );
         let h2c_key = super::direct_reqwest_client_cache_key(
             "http://127.0.0.1:18184/v1/chat/completions",
+            "key-1",
             None,
             None,
             Some(&h2c_profile),
@@ -4623,6 +4964,7 @@ mod tests {
 
         let cache_key = super::direct_reqwest_client_cache_key(
             &plan.url,
+            &plan.key_id,
             plan.timeouts.as_ref(),
             None,
             Some(&profile),
@@ -4686,6 +5028,7 @@ mod tests {
 
         let cache_key = super::direct_reqwest_client_cache_key(
             &plan.url,
+            &plan.key_id,
             plan.timeouts.as_ref(),
             None,
             Some(&profile),
@@ -4740,6 +5083,7 @@ mod tests {
 
         let cache_key = super::direct_reqwest_client_cache_key(
             &plan.url,
+            &plan.key_id,
             plan.timeouts.as_ref(),
             None,
             Some(&profile),
@@ -4878,6 +5222,57 @@ mod tests {
         assert!(forwarded
             .get("x-aether-execution-max-response-body-bytes")
             .is_none());
+    }
+
+    #[test]
+    fn response_body_mode_control_header_is_never_forwarded_upstream() {
+        let headers = BTreeMap::from([
+            ("content-type".into(), "application/json".into()),
+            (
+                EXECUTION_RESPONSE_BODY_MODE_HEADER.into(),
+                ExecutionResponseBodyMode::PreserveBytes
+                    .as_str()
+                    .to_string(),
+            ),
+        ]);
+
+        let forwarded = build_request_headers(&headers, None, true)
+            .expect("headers should build after stripping internal controls");
+
+        assert!(forwarded.get("content-type").is_some());
+        assert!(forwarded.get(EXECUTION_RESPONSE_BODY_MODE_HEADER).is_none());
+    }
+
+    #[test]
+    fn response_body_mode_requires_same_format_raw_sync_plan() {
+        let mut plan = tunnel_timeout_plan(false);
+        plan.headers.insert(
+            EXECUTION_RESPONSE_BODY_MODE_HEADER.to_string(),
+            ExecutionResponseBodyMode::PreserveBytes
+                .as_str()
+                .to_string(),
+        );
+
+        assert_eq!(
+            execution_response_body_mode(&plan),
+            ExecutionResponseBodyMode::StructuredJson
+        );
+
+        plan.body = RequestBody {
+            json_body: None,
+            body_bytes_b64: Some("e30=".to_string()),
+            body_ref: None,
+        };
+        assert_eq!(
+            execution_response_body_mode(&plan),
+            ExecutionResponseBodyMode::PreserveBytes
+        );
+
+        plan.provider_api_format = "claude:messages".to_string();
+        assert_eq!(
+            execution_response_body_mode(&plan),
+            ExecutionResponseBodyMode::StructuredJson
+        );
     }
 
     #[test]
@@ -6703,6 +7098,7 @@ mod tests {
         );
         let cache_key = super::direct_reqwest_client_cache_key(
             &plan.url,
+            &plan.key_id,
             plan.timeouts.as_ref(),
             None,
             Some(&profile),
@@ -6884,6 +7280,7 @@ mod tests {
 
         let error = match build_client(
             "https://api.example.test/v1/chat/completions",
+            "key-test",
             None,
             None,
             Some(&profile),
@@ -6912,6 +7309,51 @@ mod tests {
     }
 
     #[test]
+    fn structured_json_response_does_not_duplicate_body_bytes() {
+        let headers =
+            BTreeMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let body_bytes = br#"{ "unknown": true, "ok": true }"#;
+
+        let body = build_execution_response_body(
+            &headers,
+            body_bytes,
+            body_bytes,
+            false,
+            ExecutionResponseBodyMode::StructuredJson,
+        )
+        .expect("body should build")
+        .expect("body should be present");
+
+        assert!(body.json_body.is_some());
+        assert!(body.body_bytes_b64.is_none());
+    }
+
+    #[test]
+    fn preserve_bytes_json_response_keeps_parsed_and_wire_representations() {
+        let headers =
+            BTreeMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let body_bytes = br#"{ "unknown": true, "ok": true }"#;
+
+        let body = build_execution_response_body(
+            &headers,
+            body_bytes,
+            body_bytes,
+            false,
+            ExecutionResponseBodyMode::PreserveBytes,
+        )
+        .expect("body should build")
+        .expect("body should be present");
+
+        assert_eq!(body.json_body, Some(json!({"unknown": true, "ok": true})));
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(body.body_bytes_b64.expect("wire bytes should be present"))
+                .expect("wire body should decode"),
+            body_bytes
+        );
+    }
+
+    #[test]
     fn connect_json_error_response_is_decoded_for_stream_sync_body() {
         let headers = BTreeMap::from([(
             "content-type".to_string(),
@@ -6922,9 +7364,15 @@ mod tests {
         body_bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         body_bytes.extend_from_slice(payload);
 
-        let body = build_execution_response_body(&headers, &body_bytes, &body_bytes, true)
-            .expect("body should build")
-            .expect("body should be present");
+        let body = build_execution_response_body(
+            &headers,
+            &body_bytes,
+            &body_bytes,
+            true,
+            ExecutionResponseBodyMode::StructuredJson,
+        )
+        .expect("body should build")
+        .expect("body should be present");
 
         assert_eq!(
             body.json_body

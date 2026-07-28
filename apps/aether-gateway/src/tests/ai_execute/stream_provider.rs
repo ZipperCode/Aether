@@ -517,6 +517,7 @@ async fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_cand
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::USER_AGENT, "Claude-Code/2.1.0")
         .header(
             http::header::AUTHORIZATION,
             "Bearer sk-client-kiro-cli-local-stream",
@@ -929,6 +930,9 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
                     ));
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                        b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: message_stop\\ndata: {\\\"type\\\":\\\"message_stop\\\"}\\n\\n\"}}\n"
+                    ));
+                    yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
                         b"{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":31,\"ttfb_ms\":11,\"upstream_bytes\":37}}}\n"
                     ));
                     yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
@@ -981,6 +985,7 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
     let mut response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::USER_AGENT, "Claude-Code/2.1.0")
         .header(
             http::header::AUTHORIZATION,
             "Bearer sk-client-claude-cli-local",
@@ -1005,7 +1010,7 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
     );
     assert_eq!(
         response.text().await.expect("remaining body should read"),
-        ""
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
     );
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -1439,6 +1444,7 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
                 let frames = concat!(
                     "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
                     "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: message_start\\ndata: {\\\"type\\\":\\\"message_start\\\"}\\n\\n\"}}\n",
+                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: message_stop\\ndata: {\\\"type\\\":\\\"message_stop\\\"}\\n\\n\"}}\n",
                     "{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":31,\"ttfb_ms\":11,\"upstream_bytes\":37}}}\n",
                     "{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n"
                 );
@@ -1491,6 +1497,7 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::USER_AGENT, "Claude-Code/2.1.0")
         .header(
             http::header::AUTHORIZATION,
             "Bearer sk-client-claude-code-cli-local",
@@ -1523,7 +1530,10 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         strip_sse_keepalive_comments(&response.text().await.expect("body should read")),
-        "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+        concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )
     );
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -1552,14 +1562,17 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
     );
     assert_eq!(
         seen_execution_runtime_request.anthropic_beta,
-        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,custom-beta"
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11,context-1m-2025-08-07,custom-beta"
     );
     assert_eq!(seen_execution_runtime_request.x_app, "cli");
     assert_eq!(
         seen_execution_runtime_request.x_stainless_helper_method,
         "stream"
     );
-    assert_eq!(seen_execution_runtime_request.user_agent, "Claude-Code/9.9");
+    assert_eq!(
+        seen_execution_runtime_request.user_agent,
+        "claude-cli/2.1.161 (external, cli)"
+    );
     assert_eq!(
         seen_execution_runtime_request.endpoint_tag,
         "claude-code-cli-local"
@@ -1922,6 +1935,7 @@ async fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_
                 let frames = concat!(
                     "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
                     "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: message_start\\ndata: {\\\"type\\\":\\\"message_start\\\"}\\n\\n\"}}\n",
+                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: message_stop\\ndata: {\\\"type\\\":\\\"message_stop\\\"}\\n\\n\"}}\n",
                     "{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":31,\"ttfb_ms\":11,\"upstream_bytes\":37}}}\n",
                     "{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n"
                 );
@@ -1986,7 +2000,10 @@ async fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         strip_sse_keepalive_comments(&response.text().await.expect("body should read")),
-        "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+        concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )
     );
 
     let seen_execution_runtime_request = seen_execution_runtime

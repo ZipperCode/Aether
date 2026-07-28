@@ -17,8 +17,8 @@ use crate::ai_serving::api::{
 };
 use crate::api::response::{
     build_client_response, build_client_response_from_parts, build_local_auth_rejection_response,
-    build_local_http_error_response, build_local_overloaded_response,
-    build_local_user_rpm_limited_response,
+    build_local_http_error_response, build_local_http_error_response_with_request_path,
+    build_local_overloaded_response, build_local_user_rpm_limited_response,
 };
 use crate::constants::{
     CONTROL_CANDIDATE_ID_HEADER, DEPENDENCY_REASON_HEADER, EXECUTION_PATH_CONTROL_EXECUTE_STREAM,
@@ -346,20 +346,6 @@ async fn maybe_forward_public_request_to_tunnel_owner(
     }) else {
         return Ok(None);
     };
-    let cache_affinity_enabled = match read_scheduler_ordering_config(state).await {
-        Ok(config) => config.scheduling_mode == SchedulerSchedulingMode::CacheAffinity,
-        Err(err) => {
-            warn!(
-                trace_id = %request_context.trace_id,
-                error = ?err,
-                "gateway failed to load scheduler config while checking tunnel affinity forwarding mode"
-            );
-            SchedulerSchedulingMode::default() == SchedulerSchedulingMode::CacheAffinity
-        }
-    };
-    if !cache_affinity_enabled {
-        return Ok(None);
-    }
     let Some(api_format) = decision
         .auth_endpoint_signature
         .as_deref()
@@ -382,21 +368,66 @@ async fn maybe_forward_public_request_to_tunnel_owner(
             crate::headers::decoded_request_body_bytes(&parts.headers, body.as_ref()).ok()?;
         serde_json::from_slice::<serde_json::Value>(body.as_ref()).ok()
     });
-    let client_session_affinity =
-        crate::client_session_affinity::client_session_affinity_from_api_request(
-            api_format,
-            &parts.headers,
-            body_json.as_ref(),
-        );
-    let Some(target) = crate::scheduler::affinity::read_cached_scheduler_affinity_target(
+    let empty_body_json = serde_json::Value::Null;
+    let affinity_context = match crate::ai_serving::resolve_tunnel_scheduler_affinity_context(
         state,
-        &auth_context.api_key_id,
-        client_session_affinity.as_ref(),
+        parts,
+        decision,
+        requested_model,
+        body_json.as_ref().unwrap_or(&empty_body_json),
         api_format,
-        &requested_model,
-    ) else {
+    )
+    .await
+    {
+        Ok(Some(context)) => context,
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            warn!(
+                trace_id = %request_context.trace_id,
+                error = ?err,
+                "gateway failed to resolve routing policy while checking tunnel affinity forwarding"
+            );
+            return Ok(None);
+        }
+    };
+    let target = if let Some(policy_context) = affinity_context.policy_context.as_ref() {
+        crate::scheduler::affinity::read_cached_scheduler_affinity_target_with_policy_context(
+            state,
+            &auth_context.api_key_id,
+            affinity_context.client_session_affinity.as_ref(),
+            api_format,
+            &affinity_context.requested_model,
+            policy_context,
+        )
+    } else {
+        let cache_affinity_enabled = match read_scheduler_ordering_config(state).await {
+            Ok(config) => config.scheduling_mode == SchedulerSchedulingMode::CacheAffinity,
+            Err(err) => {
+                warn!(
+                    trace_id = %request_context.trace_id,
+                    error = ?err,
+                    "gateway failed to load scheduler config while checking tunnel affinity forwarding mode"
+                );
+                SchedulerSchedulingMode::default() == SchedulerSchedulingMode::CacheAffinity
+            }
+        };
+        if !cache_affinity_enabled {
+            return Ok(None);
+        }
+        crate::scheduler::affinity::read_cached_scheduler_affinity_target(
+            state,
+            &auth_context.api_key_id,
+            affinity_context.client_session_affinity.as_ref(),
+            api_format,
+            &affinity_context.requested_model,
+        )
+    };
+    let Some(target) = target else {
         return Ok(None);
     };
+    if !routing_overlay_allows_affinity_target(affinity_context.routing_overlay.as_ref(), &target) {
+        return Ok(None);
+    }
 
     let transport = match state
         .read_provider_transport_snapshot(&target.provider_id, &target.endpoint_id, &target.key_id)
@@ -545,6 +576,16 @@ async fn maybe_forward_public_request_to_tunnel_owner(
             .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
     Ok(Some(response))
+}
+
+fn routing_overlay_allows_affinity_target(
+    routing_overlay: Option<&aether_routing_core::RankingOverlay>,
+    target: &aether_scheduler_core::SchedulerAffinityTarget,
+) -> bool {
+    routing_overlay.is_none_or(|overlay| {
+        overlay.provider_allowed(target.provider_id.as_str())
+            && overlay.key_allowed(target.key_id.as_str())
+    })
 }
 
 fn owner_forward_request_is_stream(
@@ -935,7 +976,13 @@ async fn proxy_request_inner(
             limit,
         })) => {
             let trace_id = extract_or_generate_trace_id(request.headers());
-            let response = build_local_overloaded_response(&trace_id, None, gate, limit)?;
+            let response = build_local_overloaded_response(
+                &trace_id,
+                None,
+                Some(request.uri().path()),
+                gate,
+                limit,
+            )?;
             return Ok(finalize_gateway_response(
                 &state,
                 response,
@@ -965,7 +1012,13 @@ async fn proxy_request_inner(
             aether_runtime_state::RuntimeSemaphoreError::Unavailable { gate, limit, .. },
         )) => {
             let trace_id = extract_or_generate_trace_id(request.headers());
-            let response = build_local_overloaded_response(&trace_id, None, gate, limit)?;
+            let response = build_local_overloaded_response(
+                &trace_id,
+                None,
+                Some(request.uri().path()),
+                gate,
+                limit,
+            )?;
             return Ok(finalize_gateway_response(
                 &state,
                 response,
@@ -999,9 +1052,10 @@ async fn proxy_request_inner(
                 path = %request.uri().path(),
                 "gateway rejected blacklisted client IP"
             );
-            let response = build_local_http_error_response(
+            let response = build_local_http_error_response_with_request_path(
                 &trace_id,
                 None,
+                Some(request.uri().path()),
                 http::StatusCode::FORBIDDEN,
                 "当前 IP 已被禁止访问",
             )?;
@@ -1057,9 +1111,10 @@ async fn proxy_request_inner(
             loop_guard_header = EXECUTION_RUNTIME_LOOP_GUARD_HEADER,
             "gateway rejected execution runtime request loop into frontdoor"
         );
-        let response = build_local_http_error_response(
+        let response = build_local_http_error_response_with_request_path(
             &trace_id,
             None,
+            Some(parts.uri.path()),
             http::StatusCode::LOOP_DETECTED,
             LOCAL_EXECUTION_LOOP_DETECTED_DETAIL,
         )?;
@@ -1534,9 +1589,10 @@ async fn proxy_request_inner(
     }
 
     if control_decision.is_none() {
-        let response = build_local_http_error_response(
+        let response = build_local_http_error_response_with_request_path(
             &trace_id,
             None,
+            Some(request_context.request_path.as_str()),
             http::StatusCode::NOT_FOUND,
             LOCAL_ROUTE_NOT_FOUND_DETAIL,
         )?;
@@ -2312,13 +2368,50 @@ mod tests {
         api_key_remote_ip_allowed, buffer_and_normalize_request_body,
         diagnostic_is_auth_api_key_concurrency_limited, local_execution_runtime_miss_detail,
         owner_forward_request_is_stream, restore_redacted_stream_execution_response,
-        restore_redacted_sync_execution_response, GatewayControlDecision,
-        LocalExecutionRuntimeMissDiagnostic, RequestBodyBufferError, RequestBodyBufferPolicy,
+        restore_redacted_sync_execution_response, routing_overlay_allows_affinity_target,
+        GatewayControlDecision, LocalExecutionRuntimeMissDiagnostic, RequestBodyBufferError,
+        RequestBodyBufferPolicy,
     };
     use axum::body::{to_bytes, Body, Bytes};
     use axum::http::{header, HeaderMap, HeaderValue, Method, Response};
     use serde_json::json;
     use tokio::sync::Semaphore;
+
+    #[test]
+    fn routing_overlay_blocks_disallowed_tunnel_affinity_target() {
+        let target = aether_scheduler_core::SchedulerAffinityTarget {
+            provider_id: "provider-allowed".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-allowed".to_string(),
+        };
+        let matching = aether_routing_core::RankingOverlay {
+            allowed_providers: vec!["provider-allowed".to_string()],
+            allowed_keys: vec!["key-allowed".to_string()],
+            ..aether_routing_core::RankingOverlay::default()
+        };
+        let wrong_provider = aether_routing_core::RankingOverlay {
+            allowed_providers: vec!["provider-other".to_string()],
+            ..matching.clone()
+        };
+        let wrong_key = aether_routing_core::RankingOverlay {
+            allowed_keys: vec!["key-other".to_string()],
+            ..matching.clone()
+        };
+
+        assert!(routing_overlay_allows_affinity_target(None, &target));
+        assert!(routing_overlay_allows_affinity_target(
+            Some(&matching),
+            &target
+        ));
+        assert!(!routing_overlay_allows_affinity_target(
+            Some(&wrong_provider),
+            &target
+        ));
+        assert!(!routing_overlay_allows_affinity_target(
+            Some(&wrong_key),
+            &target
+        ));
+    }
 
     #[test]
     fn owner_forward_uses_search_protocol_timeout_semantics() {

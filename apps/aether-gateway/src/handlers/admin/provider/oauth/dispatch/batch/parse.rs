@@ -1,6 +1,6 @@
 use super::super::token_import::{
-    import_tokens_from_raw_token, normalize_provider_import_tokens,
-    normalize_provider_oauth_import_headers_from_object,
+    flatten_claude_code_credentials_payload, import_tokens_from_raw_token,
+    normalize_provider_import_tokens, normalize_provider_oauth_import_headers_from_object,
     provider_oauth_import_authorization_bearer_token,
 };
 use crate::handlers::admin::provider::oauth::errors::build_internal_control_error_response;
@@ -46,6 +46,10 @@ pub(super) struct AdminProviderOAuthBatchImportEntry {
     pub request_headers: Option<BTreeMap<String, String>>,
     pub user_agent: Option<String>,
     pub browser_profile: Option<String>,
+    pub organization_uuid: Option<String>,
+    pub scopes: Option<serde_json::Value>,
+    pub subscription_type: Option<String>,
+    pub rate_limit_tier: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +80,36 @@ pub(super) fn parse_admin_provider_oauth_batch_import_request(
             ),
         ),
     }
+}
+
+fn json_value_contains_agent_identity(value: &serde_json::Value) -> bool {
+    if value.as_object().is_some_and(|_| {
+        aether_provider_transport::is_codex_agent_identity_auth_config_value(value)
+    }) {
+        return true;
+    }
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(json_value_contains_agent_identity),
+        serde_json::Value::Object(object) => {
+            object.values().any(json_value_contains_agent_identity)
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn admin_provider_oauth_batch_contains_agent_identity(raw_credentials: &str) -> bool {
+    let raw = raw_credentials.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+        return json_value_contains_agent_identity(&value);
+    }
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|value| json_value_contains_agent_identity(&value))
 }
 
 fn coerce_admin_provider_oauth_import_str(value: Option<&serde_json::Value>) -> Option<String> {
@@ -209,10 +243,23 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     request_headers: None,
                     user_agent: None,
                     browser_profile: None,
+                    organization_uuid: None,
+                    scopes: None,
+                    subscription_type: None,
+                    rate_limit_tier: None,
                 })
             }
         }
         serde_json::Value::Object(object) => {
+            let is_claude = provider_type.trim().eq_ignore_ascii_case("claude_code");
+            let normalized_claude_object = if is_claude {
+                let mut normalized = object.clone();
+                flatten_claude_code_credentials_payload(&mut normalized);
+                Some(normalized)
+            } else {
+                None
+            };
+            let object = normalized_claude_object.as_ref().unwrap_or(object);
             let is_grok = provider_type.trim().eq_ignore_ascii_case("grok");
             let is_windsurf = provider_type.trim().eq_ignore_ascii_case("windsurf");
             let is_codex_agent_identity = provider_type.trim().eq_ignore_ascii_case("codex")
@@ -241,6 +288,10 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     request_headers: None,
                     user_agent: None,
                     browser_profile: None,
+                    organization_uuid: None,
+                    scopes: None,
+                    subscription_type: None,
+                    rate_limit_tier: None,
                 });
             }
             let refresh_token = coerce_admin_provider_oauth_import_str(
@@ -433,6 +484,39 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     .or_else(|| object.get("browser"))
                     .or_else(|| object.get("impersonate")),
             );
+            let organization_uuid = is_claude
+                .then(|| {
+                    coerce_admin_provider_oauth_import_str(
+                        object
+                            .get("organization_uuid")
+                            .or_else(|| object.get("organizationUuid"))
+                            .or_else(|| object.get("org_uuid")),
+                    )
+                })
+                .flatten();
+            let scopes = is_claude
+                .then(|| object.get("scopes"))
+                .flatten()
+                .filter(|value| value.is_array() || value.is_string())
+                .cloned();
+            let subscription_type = is_claude
+                .then(|| {
+                    coerce_admin_provider_oauth_import_str(
+                        object
+                            .get("subscription_type")
+                            .or_else(|| object.get("subscriptionType")),
+                    )
+                })
+                .flatten();
+            let rate_limit_tier = is_claude
+                .then(|| {
+                    coerce_admin_provider_oauth_import_str(
+                        object
+                            .get("rate_limit_tier")
+                            .or_else(|| object.get("rateLimitTier")),
+                    )
+                })
+                .flatten();
             Some(AdminProviderOAuthBatchImportEntry {
                 parse_error: None,
                 refresh_token,
@@ -456,6 +540,10 @@ fn extract_admin_provider_oauth_batch_import_entry(
                 request_headers,
                 user_agent,
                 browser_profile,
+                organization_uuid,
+                scopes,
+                subscription_type,
+                rate_limit_tier,
             })
         }
         _ => None,
@@ -623,6 +711,47 @@ pub(super) fn parse_admin_provider_oauth_batch_import_entries(
         .collect()
 }
 
+pub(super) fn parse_admin_provider_oauth_agent_identity_import_entries(
+    raw_credentials: &str,
+) -> Result<Vec<AdminProviderOAuthBatchImportEntry>, String> {
+    let raw = raw_credentials.trim();
+    if raw.is_empty() {
+        return Err("Agent Identity 凭据不能为空".to_string());
+    }
+    let value = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|error| format!("Agent Identity JSON 解析失败: {error}"))?;
+    let entries = match &value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                extract_admin_provider_oauth_batch_import_entry("codex", item).unwrap_or_else(
+                    || {
+                        parse_error_entry(format!(
+                            "第 {} 个条目没有可导入的 Agent Identity 凭据",
+                            index + 1
+                        ))
+                    },
+                )
+            })
+            .collect(),
+        serde_json::Value::Object(object) => parse_sub2api_export_accounts("codex", object)
+            .unwrap_or_else(|| {
+                vec![
+                    extract_admin_provider_oauth_batch_import_entry("codex", &value)
+                        .unwrap_or_else(|| {
+                            parse_error_entry("没有可导入的 Agent Identity 凭据".to_string())
+                        }),
+                ]
+            }),
+        _ => return Err("Agent Identity 凭据必须是 JSON 对象、数组或 sub2api 导出".to_string()),
+    };
+    if entries.is_empty() {
+        return Err("Agent Identity 凭据不能为空".to_string());
+    }
+    Ok(entries)
+}
+
 fn parse_error_entry(error: String) -> AdminProviderOAuthBatchImportEntry {
     AdminProviderOAuthBatchImportEntry {
         parse_error: Some(error),
@@ -647,6 +776,10 @@ fn parse_error_entry(error: String) -> AdminProviderOAuthBatchImportEntry {
         request_headers: None,
         user_agent: None,
         browser_profile: None,
+        organization_uuid: None,
+        scopes: None,
+        subscription_type: None,
+        rate_limit_tier: None,
     }
 }
 
@@ -694,6 +827,29 @@ pub(super) fn apply_admin_provider_oauth_batch_import_hints(
             auth_config
                 .entry("user_agent".to_string())
                 .or_insert_with(|| json!(user_agent));
+        }
+        return;
+    }
+    if provider_type == "claude_code" {
+        if let Some(organization_uuid) = entry.organization_uuid.as_ref() {
+            auth_config
+                .entry("org_uuid".to_string())
+                .or_insert_with(|| json!(organization_uuid));
+        }
+        if let Some(scopes) = entry.scopes.as_ref() {
+            auth_config
+                .entry("scopes".to_string())
+                .or_insert_with(|| scopes.clone());
+        }
+        if let Some(subscription_type) = entry.subscription_type.as_ref() {
+            auth_config
+                .entry("subscription_type".to_string())
+                .or_insert_with(|| json!(subscription_type));
+        }
+        if let Some(rate_limit_tier) = entry.rate_limit_tier.as_ref() {
+            auth_config
+                .entry("rate_limit_tier".to_string())
+                .or_insert_with(|| json!(rate_limit_tier));
         }
         return;
     }
@@ -807,10 +963,11 @@ pub(super) fn build_admin_provider_oauth_batch_import_response(
     }))
 }
 
-pub(super) fn build_admin_provider_oauth_batch_task_state(
+pub(in super::super) fn build_admin_provider_oauth_batch_task_state(
     task_id: &str,
     provider_id: &str,
     provider_type: &str,
+    import_kind: &str,
     status: &str,
     total: usize,
     processed: usize,
@@ -839,6 +996,7 @@ pub(super) fn build_admin_provider_oauth_batch_task_state(
         "task_id": task_id,
         "provider_id": provider_id,
         "provider_type": provider_type,
+        "import_kind": import_kind,
         "status": status,
         "total": total,
         "processed": processed,
@@ -860,6 +1018,7 @@ pub(super) fn build_admin_provider_oauth_batch_task_state(
 #[cfg(test)]
 mod tests {
     use super::{
+        admin_provider_oauth_batch_contains_agent_identity,
         apply_admin_provider_oauth_batch_import_hints,
         parse_admin_provider_oauth_batch_import_entries,
     };
@@ -872,6 +1031,37 @@ mod tests {
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).expect("jwt json should serialize"))
         };
         format!("{}.{}.signature", encode(header), encode(payload))
+    }
+
+    #[test]
+    fn ordinary_batch_guard_detects_agent_identity_in_all_json_shapes() {
+        let single = json!({
+            "auth_mode": "agentIdentity",
+            "agent_runtime_id": "runtime-1",
+            "agent_private_key": "private-key"
+        });
+        assert!(admin_provider_oauth_batch_contains_agent_identity(
+            &single.to_string()
+        ));
+        assert!(admin_provider_oauth_batch_contains_agent_identity(
+            &json!([{"refresh_token":"ordinary"}, single.clone()]).to_string()
+        ));
+        assert!(admin_provider_oauth_batch_contains_agent_identity(
+            &format!("ordinary-token\n{}", single)
+        ));
+        assert!(admin_provider_oauth_batch_contains_agent_identity(
+            &json!({
+                "type": "sub2api-data",
+                "accounts": [{"credentials": single.clone()}]
+            })
+            .to_string()
+        ));
+        assert!(!admin_provider_oauth_batch_contains_agent_identity(
+            &json!([{"refresh_token":"ordinary"}]).to_string()
+        ));
+        assert!(!admin_provider_oauth_batch_contains_agent_identity(
+            "ordinary-token"
+        ));
     }
 
     #[test]
@@ -888,6 +1078,46 @@ mod tests {
         assert_eq!(entries[0].expires_at, Some(2_100_000_000));
         assert_eq!(entries[0].account_id.as_deref(), Some("acc-1"));
         assert_eq!(entries[0].email.as_deref(), Some("u@example.com"));
+    }
+
+    #[test]
+    fn parses_claude_credentials_json_and_ignores_mcp_oauth() {
+        let entries = parse_admin_provider_oauth_batch_import_entries(
+            "claude_code",
+            r#"{
+                "claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-access",
+                    "refreshToken": "sk-ant-ort01-refresh",
+                    "expiresAt": 2100000000123,
+                    "scopes": ["user:profile"],
+                    "subscriptionType": "pro",
+                    "rateLimitTier": "tier_1",
+                    "organizationUuid": "org-123"
+                },
+                "mcpOAuth": {"accessToken": "must-not-be-imported"}
+            }"#,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].access_token.as_deref(),
+            Some("sk-ant-oat01-access")
+        );
+        assert_eq!(
+            entries[0].refresh_token.as_deref(),
+            Some("sk-ant-ort01-refresh")
+        );
+        assert_eq!(entries[0].expires_at, Some(2_100_000_000));
+        assert_eq!(entries[0].organization_uuid.as_deref(), Some("org-123"));
+        assert_eq!(entries[0].scopes, Some(json!(["user:profile"])));
+        assert_eq!(entries[0].subscription_type.as_deref(), Some("pro"));
+        assert_eq!(entries[0].rate_limit_tier.as_deref(), Some("tier_1"));
+
+        let ignored = parse_admin_provider_oauth_batch_import_entries(
+            "claude_code",
+            r#"{"mcpOAuth":{"accessToken":"must-not-be-imported"}}"#,
+        );
+        assert!(ignored.is_empty());
     }
 
     #[test]
