@@ -577,6 +577,8 @@ pub(crate) enum ExecutionRuntimeTransportError {
     BrowserClientBuild(wreq::Error),
     #[error("browser impersonation response body failed: {0}")]
     BrowserBody(String),
+    #[error("{message}")]
+    UpstreamHttpStatus { status_code: u16, message: String },
     #[error("failed to execute upstream request: {0}")]
     UpstreamRequest(String),
     #[error("response_too_large")]

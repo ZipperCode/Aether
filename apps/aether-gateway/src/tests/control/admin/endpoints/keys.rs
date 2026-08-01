@@ -2925,15 +2925,14 @@ async fn gateway_handles_admin_keys_grouped_by_format_locally_with_trusted_admin
         )
         .expect("Agent Identity auth config should encrypt"),
     );
-    let mut provider_codex = sample_provider("provider-codex", "codex", 30);
-    provider_codex.provider_type = "codex".to_string();
-
+    let mut codex_provider = sample_provider("provider-codex", "codex", 30);
+    codex_provider.provider_type = "codex".to_string();
     let provider_catalog_repository = Arc::new(SummaryNullingProviderCatalogReadRepository::seed(
         vec![
             sample_provider("provider-openai", "openai", 10),
             sample_provider("provider-claude", "claude", 20)
                 .with_transport_fields(false, false, true, None, None, None, None, None, None),
-            provider_codex,
+            codex_provider,
         ],
         vec![
             sample_endpoint(

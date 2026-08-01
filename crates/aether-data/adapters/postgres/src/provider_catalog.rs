@@ -3382,7 +3382,7 @@ mod tests {
             assert!(sql.contains("concurrent_limit"));
         }
 
-        let source = include_str!("provider_catalog.rs");
+        let source = include_str!("provider_catalog.rs").replace("\r\n", "\n");
         assert!(source.contains("concurrent_limit,"));
         assert!(source.contains("concurrent_limit = $13"));
         assert!(source.contains(".bind(key.concurrent_limit)"));
@@ -3418,7 +3418,7 @@ mod tests {
             assert!(sql.contains("allow_auth_channel_mismatch_formats"));
         }
 
-        let source = include_str!("provider_catalog.rs");
+        let source = include_str!("provider_catalog.rs").replace("\r\n", "\n");
         assert!(
             source
                 .matches(
@@ -3434,7 +3434,7 @@ mod tests {
 
     #[test]
     fn provider_api_keys_create_key_insert_placeholders_match_bind_order() {
-        let source = include_str!("provider_catalog.rs");
+        let source = include_str!("provider_catalog.rs").replace("\r\n", "\n");
         assert!(source.contains(
             "  $24,\n  $25,\n  $26,\n  CASE\n    WHEN $27::double precision IS NULL THEN NULL"
         ));

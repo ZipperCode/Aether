@@ -1691,8 +1691,8 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "default_user_initial_gift_usd" => Some(json!(10.0)),
         "password_policy_level" => Some(json!("weak")),
         REQUEST_RECORD_LEVEL_KEY => Some(json!("full")),
-        "max_request_body_size" => Some(json!(5_242_880)),
-        "max_response_body_size" => Some(json!(5_242_880)),
+        "max_request_body_size" => Some(json!(0)),
+        "max_response_body_size" => Some(json!(0)),
         "sensitive_headers" => Some(json!([
             "authorization",
             "x-api-key",
@@ -1750,6 +1750,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "audit_log_retention_days" => Some(json!(30)),
         "enable_db_maintenance" => Some(json!(true)),
         "system_proxy_node_id" => Some(serde_json::Value::Null),
+        "external_models_proxy_node_id" => Some(serde_json::Value::Null),
         "smtp_host" => Some(serde_json::Value::Null),
         "smtp_port" => Some(json!(587)),
         "smtp_user" => Some(serde_json::Value::Null),

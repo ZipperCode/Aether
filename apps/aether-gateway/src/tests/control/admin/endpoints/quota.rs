@@ -616,7 +616,7 @@ async fn gateway_auto_removes_codex_key_when_quota_proves_oauth_invalid() {
         "stale-access-token",
     );
     key.auth_type = "oauth".to_string();
-    key.expires_at_unix_secs = Some(4_000_000_000);
+    key.expires_at_unix_secs = Some(4_102_444_800);
     key.oauth_invalid_at_unix_secs = Some(1);
     key.oauth_invalid_reason = Some(
         "[REFRESH_FAILED] Token 续期失败 (401): refresh_token 无效、已过期或已撤销，请重新登录授权"
@@ -625,15 +625,9 @@ async fn gateway_auto_removes_codex_key_when_quota_proves_oauth_invalid() {
     key.encrypted_auth_config = Some(
         encrypt_python_fernet_plaintext(
             DEVELOPMENT_ENCRYPTION_KEY,
-            &json!({
-                "provider_type": "codex",
-                "access_token": "stale-access-token",
-                "refresh_token": "invalid-refresh-token",
-                "expires_at": 4_000_000_000u64,
-            })
-            .to_string(),
+            r#"{"provider_type":"codex","refresh_token":"invalid-refresh-token","expires_at":4102444800}"#,
         )
-        .expect("OAuth auth config should encrypt"),
+        .expect("auth config should encrypt"),
     );
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(

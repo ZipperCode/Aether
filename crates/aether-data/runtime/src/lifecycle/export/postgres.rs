@@ -490,7 +490,7 @@ fn normalize_postgres_import_value(
     }
     if is_postgres_integer_column(target_column) && import_column_stores_timestamp(column_name) {
         return normalize_imported_integer_timestamp("postgres", table_name, column_name, value)
-            .map(|value| value.map(Value::from).unwrap_or(Value::Null));
+            .map(|timestamp| timestamp.map_or(Value::Null, |value| Value::Number(value.into())));
     }
     if is_postgres_timestamp_column(target_column) {
         return normalize_postgres_timestamp_value(table_name, column_name, value);

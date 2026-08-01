@@ -233,11 +233,8 @@
           </div>
         </div>
 
-        <!-- 提供商内转移限制（仅编辑模式） -->
-        <div
-          v-if="isEditMode"
-          class="grid grid-cols-2 gap-2 sm:gap-4"
-        >
+        <!-- 提供商内转移限制 -->
+        <div class="grid grid-cols-2 gap-2 sm:gap-4">
           <div class="min-w-0 space-y-1.5">
             <Label
               for="max-transfer-count"
@@ -247,10 +244,11 @@
             </Label>
             <Input
               id="max-transfer-count"
-              :model-value="form.max_transfer_count"
+              :model-value="form.max_transfer_count === 0 ? '' : form.max_transfer_count"
               type="number"
               min="0"
               step="1"
+              :placeholder="legacyT('0 (不限制)')"
               @update:model-value="(v) => form.max_transfer_count = parseNumberInput(v, { min: 0 }) ?? 0"
             />
           </div>
@@ -264,10 +262,11 @@
             </Label>
             <Input
               id="max-transfer-timeout-seconds"
-              :model-value="form.max_transfer_timeout_seconds"
+              :model-value="form.max_transfer_timeout_seconds === 0 ? '' : form.max_transfer_timeout_seconds"
               type="number"
               min="0"
               step="1"
+              :placeholder="legacyT('0 (不限制)')"
               @update:model-value="(v) => form.max_transfer_timeout_seconds = parseNumberInput(v, { min: 0 }) ?? 0"
             />
           </div>

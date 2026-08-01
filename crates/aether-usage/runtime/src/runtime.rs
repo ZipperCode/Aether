@@ -39,27 +39,23 @@ pub trait UsageBillingEventEnricher: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UsageRequestRecordLevel {
-    #[default]
     Basic,
+    #[default]
     Full,
 }
 
-pub const DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
-pub const DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+pub const DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES: usize = usize::MAX;
+pub const DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES: usize = usize::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageBodyCapturePolicy {
     pub record_level: UsageRequestRecordLevel,
-    pub max_request_body_bytes: Option<usize>,
-    pub max_response_body_bytes: Option<usize>,
 }
 
 impl Default for UsageBodyCapturePolicy {
     fn default() -> Self {
         Self {
-            record_level: UsageRequestRecordLevel::Basic,
-            max_request_body_bytes: Some(DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES),
-            max_response_body_bytes: Some(DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES),
+            record_level: UsageRequestRecordLevel::Full,
         }
     }
 }
@@ -6372,6 +6368,7 @@ mod tests {
 
     #[derive(Clone)]
     struct BlockingWriteQueueConfiguredUsageStore {
+        records: Arc<Mutex<Vec<UpsertUsageRecord>>>,
         queue: Arc<dyn RuntimeQueueStore>,
         write_started: Arc<tokio::sync::Notify>,
         release_writes: Arc<tokio::sync::Notify>,
@@ -7278,10 +7275,11 @@ mod tests {
     impl UsageRecordWriter for BlockingWriteQueueConfiguredUsageStore {
         async fn upsert_usage_record(
             &self,
-            _record: UpsertUsageRecord,
+            record: UpsertUsageRecord,
         ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
             self.write_started.notify_one();
             self.release_writes.notified().await;
+            self.records.lock().expect("records lock").push(record);
             self.writes_completed.fetch_add(1, Ordering::AcqRel);
             Ok(None)
         }
@@ -10281,6 +10279,7 @@ mod tests {
         let release_writes = Arc::new(tokio::sync::Notify::new());
         let writes_completed = Arc::new(AtomicUsize::new(0));
         let store = BlockingWriteQueueConfiguredUsageStore {
+            records: Arc::new(Mutex::new(Vec::new())),
             queue: queue_runner,
             write_started: Arc::clone(&write_started),
             release_writes: Arc::clone(&release_writes),
@@ -10353,6 +10352,7 @@ mod tests {
         let release_writes = Arc::new(tokio::sync::Notify::new());
         let writes_completed = Arc::new(AtomicUsize::new(0));
         let store = BlockingWriteQueueConfiguredUsageStore {
+            records: Arc::new(Mutex::new(Vec::new())),
             queue: queue_runner,
             write_started: Arc::clone(&write_started),
             release_writes: Arc::clone(&release_writes),
@@ -11483,6 +11483,7 @@ mod tests {
         ));
         let queue: Arc<dyn RuntimeQueueStore> = flaky_queue.clone();
         let store = BlockingWriteQueueConfiguredUsageStore {
+            records: Arc::new(Mutex::new(Vec::new())),
             queue,
             write_started: Arc::new(tokio::sync::Notify::new()),
             release_writes: Arc::new(tokio::sync::Notify::new()),
@@ -11680,9 +11681,12 @@ mod tests {
         };
         let queue: Arc<dyn RuntimeQueueStore> =
             Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
-        let store = CloneQueueConfiguredUsageStore {
+        let store = BlockingWriteQueueConfiguredUsageStore {
             records: Arc::new(Mutex::new(Vec::new())),
             queue,
+            write_started: Arc::new(tokio::sync::Notify::new()),
+            release_writes: Arc::new(tokio::sync::Notify::new()),
+            writes_completed: Arc::new(AtomicUsize::new(0)),
         };
         let runtime = UsageRuntime::new(config).expect("usage runtime should build");
         let blocker_started = Arc::new(tokio::sync::Notify::new());
@@ -11737,7 +11741,25 @@ mod tests {
         .expect("terminal seed and awaited barrier should queue behind the blocker");
         assert_eq!(runtime.metrics_snapshot().terminal_submission_pending, 0);
 
-        release_blocker.notify_waiters();
+        let first_write_started = store.write_started.notified();
+        release_blocker.notify_one();
+        timeout(Duration::from_secs(1), first_write_started)
+            .await
+            .expect("terminal seed write should start");
+        timeout(Duration::from_secs(1), async {
+            while runtime.metrics_snapshot().terminal_submission_pending != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("awaited terminal should queue behind the terminal seed permit");
+
+        let second_write_started = store.write_started.notified();
+        store.release_writes.notify_one();
+        timeout(Duration::from_secs(1), second_write_started)
+            .await
+            .expect("awaited terminal write should start after the seed completes");
+        store.release_writes.notify_one();
         timeout(Duration::from_secs(2), awaited_terminal)
             .await
             .expect("awaited terminal must not deadlock behind the queued seed")
@@ -11745,6 +11767,7 @@ mod tests {
         timeout(Duration::from_secs(2), async {
             while store.records.lock().expect("records lock").len() != 2
                 || runtime.metrics_snapshot().lifecycle_submission_pending != 0
+                || store.writes_completed.load(Ordering::Acquire) != 2
             {
                 tokio::task::yield_now().await;
             }
@@ -11775,9 +11798,12 @@ mod tests {
         };
         let queue: Arc<dyn RuntimeQueueStore> =
             Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
-        let store = CloneQueueConfiguredUsageStore {
+        let store = BlockingWriteQueueConfiguredUsageStore {
             records: Arc::new(Mutex::new(Vec::new())),
             queue,
+            write_started: Arc::new(tokio::sync::Notify::new()),
+            release_writes: Arc::new(tokio::sync::Notify::new()),
+            writes_completed: Arc::new(AtomicUsize::new(0)),
         };
         let runtime = UsageRuntime::new(config).expect("usage runtime should build");
         let blocker_started = Arc::new(tokio::sync::Notify::new());
@@ -11819,10 +11845,30 @@ mod tests {
 
         assert_eq!(runtime.metrics_snapshot().terminal_submission_pending, 0);
         assert!(runtime.metrics_snapshot().lifecycle_submission_pending >= 3);
-        release_blocker.notify_waiters();
+
+        let first_write_started = store.write_started.notified();
+        release_blocker.notify_one();
+        timeout(Duration::from_secs(1), first_write_started)
+            .await
+            .expect("terminal seed write should start");
+        timeout(Duration::from_secs(1), async {
+            while runtime.metrics_snapshot().terminal_submission_pending != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("submitted terminal should queue behind the terminal seed permit");
+
+        let second_write_started = store.write_started.notified();
+        store.release_writes.notify_one();
+        timeout(Duration::from_secs(1), second_write_started)
+            .await
+            .expect("submitted terminal write should start after the seed completes");
+        store.release_writes.notify_one();
         timeout(Duration::from_secs(2), async {
             while store.records.lock().expect("records lock").len() != 2
                 || runtime.metrics_snapshot().lifecycle_submission_pending != 0
+                || store.writes_completed.load(Ordering::Acquire) != 2
             {
                 tokio::task::yield_now().await;
             }
@@ -12223,6 +12269,7 @@ mod tests {
             ..UsageRuntimeConfig::default()
         };
         let store = BlockingWriteQueueConfiguredUsageStore {
+            records: Arc::new(Mutex::new(Vec::new())),
             queue: Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default())),
             write_started: Arc::new(tokio::sync::Notify::new()),
             release_writes: Arc::new(tokio::sync::Notify::new()),
@@ -12651,7 +12698,7 @@ mod tests {
     }
 
     #[test]
-    fn default_body_capture_policy_strips_body_capture_but_preserves_derived_fields() {
+    fn basic_request_record_level_strips_body_capture_but_preserves_derived_fields() {
         let mut event = UsageEvent::new(
             UsageEventType::Failed,
             "req-basic-1",
@@ -12696,7 +12743,6 @@ mod tests {
         apply_usage_body_capture_policy_to_event(
             UsageBodyCapturePolicy {
                 record_level: UsageRequestRecordLevel::Basic,
-                ..UsageBodyCapturePolicy::default()
             },
             &mut event,
         );

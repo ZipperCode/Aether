@@ -635,17 +635,17 @@ fn assert_native_gemini_embedding_execution_plan(plan: &ExecutionPlan) {
         Some("gemini-embedding-2-preview")
     );
     assert!(!plan.stream);
-    let body = plan.body.json_body.clone().unwrap_or_else(|| {
-        let encoded = plan
-            .body
-            .body_bytes_b64
-            .as_deref()
-            .expect("encoded json request body");
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .expect("request body should decode");
-        serde_json::from_slice(&bytes).expect("request body should contain json")
-    });
+    assert!(plan.body.json_body.is_none());
+    let body_bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            plan.body
+                .body_bytes_b64
+                .as_deref()
+                .expect("original request body bytes"),
+        )
+        .expect("request body should decode");
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("request body should parse");
     assert_eq!(body["content"]["parts"][0]["text"], "hello");
     assert!(body.get("input").is_none());
     assert!(body.get("messages").is_none());

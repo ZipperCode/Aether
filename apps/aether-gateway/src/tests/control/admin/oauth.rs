@@ -182,11 +182,12 @@ fn sample_codex_access_token_with_profile_email(email: &str, account_id: &str) -
     sample_codex_access_token_with_profile_email_claims(email, account_id, Some(2_000_000_000))
 }
 
-fn sample_codex_access_token_with_profile_email_without_exp(
+fn sample_codex_access_token_with_profile_email_and_expiry(
     email: &str,
     account_id: &str,
+    expires_at_unix_secs: Option<u64>,
 ) -> String {
-    sample_codex_access_token_with_profile_email_claims(email, account_id, None)
+    sample_codex_access_token_with_profile_email_claims(email, account_id, expires_at_unix_secs)
 }
 
 fn codex_import_token_execution_result(request_id: &str) -> serde_json::Value {
@@ -4368,6 +4369,11 @@ fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_has_no_
 }
 
 async fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_has_no_exp_impl() {
+    let access_token = sample_codex_access_token_with_profile_email_and_expiry(
+        "opaque@example.com",
+        "acct-opaque-123",
+        None,
+    );
     let mut provider = sample_provider("provider-codex", "codex", 10);
     provider.provider_type = "codex".to_string();
     let endpoint = sample_endpoint(
@@ -4393,10 +4399,6 @@ async fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_h
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
-    let access_token = sample_codex_access_token_with_profile_email_without_exp(
-        "temporary@example.com",
-        "acct-temporary-123",
-    );
 
     let response = reqwest::Client::new()
         .post(format!(
@@ -7814,14 +7816,14 @@ async fn gateway_consecutive_manual_oauth_refresh_uses_rotated_refresh_token_imp
 }
 
 #[test]
-fn gateway_concurrent_manual_oauth_refresh_reuses_in_flight_result() {
+fn gateway_concurrent_manual_oauth_refresh_reuses_winner_after_lock_wait() {
     run_admin_oauth_test(
-        "gateway_concurrent_manual_oauth_refresh_reuses_in_flight_result",
-        gateway_concurrent_manual_oauth_refresh_reuses_in_flight_result_impl,
+        "gateway_concurrent_manual_oauth_refresh_reuses_winner_after_lock_wait",
+        gateway_concurrent_manual_oauth_refresh_reuses_winner_after_lock_wait_impl,
     );
 }
 
-async fn gateway_concurrent_manual_oauth_refresh_reuses_in_flight_result_impl() {
+async fn gateway_concurrent_manual_oauth_refresh_reuses_winner_after_lock_wait_impl() {
     let refresh_request_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let refresh_request_bodies_clone = Arc::clone(&refresh_request_bodies);
     let execution_runtime = Router::new().route(

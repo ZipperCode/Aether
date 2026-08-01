@@ -476,9 +476,9 @@ async fn load_mysql_import_columns(
     let rows = sqlx::query(
         r#"
 SELECT
-  COLUMN_NAME AS column_name,
-  DATA_TYPE AS data_type,
-  COLUMN_KEY AS column_key,
+    CAST(COLUMN_NAME AS CHAR) AS column_name,
+    CAST(DATA_TYPE AS CHAR) AS data_type,
+    CAST(COLUMN_KEY AS CHAR) AS column_key,
   ORDINAL_POSITION AS ordinal_position
 FROM information_schema.columns
 WHERE table_schema = DATABASE()
@@ -662,12 +662,11 @@ fn mysql_value_to_json(row: &sqlx::mysql::MySqlRow, index: usize) -> Result<Valu
                     ))
                 })
         }
-        "DECIMAL" | "NEWDECIMAL" => {
-            // MySQL 二进制协议以文本传输 DECIMAL，但 SQLx 不把它标记为 String 兼容类型。
-            Ok(Value::String(
-                row.try_get_unchecked::<String, _>(index).map_sql_err()?,
-            ))
-        }
+        "DECIMAL" | "NEWDECIMAL" => Ok(Value::String(
+            row.try_get::<sqlx::types::BigDecimal, _>(index)
+                .map_sql_err()?
+                .to_string(),
+        )),
         "VARCHAR" | "VAR_STRING" | "STRING" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT"
         | "JSON" | "ENUM" | "SET" | "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" => Ok(
             Value::String(row.try_get::<String, _>(index).map_sql_err()?),
