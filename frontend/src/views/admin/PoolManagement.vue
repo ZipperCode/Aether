@@ -338,6 +338,7 @@
                   <PoolKeyQuotaPanel
                     :items="quotaProgressDisplayMap[key.key_id] || []"
                     :quota="getQuotaSnapshot(key)"
+                    :model-probe="key.status_snapshot?.model_probe"
                     :provider-type="selectedProviderType"
                     :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
                     :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
@@ -727,6 +728,7 @@
                 v-if="showAccountQuotaColumn"
                 :items="quotaProgressDisplayMap[key.key_id] || []"
                 :quota="getQuotaSnapshot(key)"
+                :model-probe="key.status_snapshot?.model_probe"
                 :provider-type="selectedProviderType"
                 :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
                 :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
@@ -4176,7 +4178,7 @@ function getQuotaRemainingBarColorByRemaining(remaining: number): string {
 }
 
 function getQuotaTextClass(quotaText: string): string {
-  if (quotaText.includes('封禁') || quotaText.includes('受限')) {
+  if (quotaText.includes('封禁') || quotaText.includes('受限') || quotaText.includes('不可用')) {
     return 'text-[11px] text-destructive leading-4'
   }
   return 'text-[11px] text-foreground/90 leading-4'

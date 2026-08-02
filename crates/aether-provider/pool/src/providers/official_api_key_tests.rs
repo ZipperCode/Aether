@@ -35,7 +35,7 @@ fn kimi_coding_endpoint_selects_fixed_usage_request() {
 }
 
 #[test]
-fn zhipu_standard_endpoint_prefers_token_plan_with_account_balance_fallback() {
+fn zhipu_supports_personal_team_and_account_balance_queries() {
     let standard = build_official_api_key_quota_request(
         "zhipu",
         "standard-key",
@@ -68,6 +68,16 @@ fn zhipu_standard_endpoint_prefers_token_plan_with_account_balance_fallback() {
     assert_eq!(coding.quota_kind, "subscription");
     assert_eq!(coding.headers["authorization"], "coding-secret");
 
+    let team = build_zhipu_team_quota_request(
+        "team-key",
+        &endpoint("https://open.bigmodel.cn/api/coding/paas/v4"),
+        || "team-secret".into(),
+    )
+    .unwrap();
+    assert_eq!(team.url, ZHIPU_TEAM_QUOTA_URL);
+    assert_eq!(team.quota_kind, "subscription");
+    assert_eq!(team.headers["authorization"], "team-secret");
+
     let mut custom_path_standard = endpoint("https://open.bigmodel.cn");
     custom_path_standard.custom_path = Some("/api/paas/v4".into());
     let custom_path_request = build_official_api_key_quota_request(
@@ -86,12 +96,14 @@ fn zhipu_standard_endpoint_prefers_token_plan_with_account_balance_fallback() {
         .is_ok()
     );
 
-    assert!(build_zhipu_account_balance_request(
+    let coding_balance = build_zhipu_account_balance_request(
         "coding-key",
         &endpoint("https://open.bigmodel.cn/api/coding/paas/v4"),
         || "coding-secret".into(),
     )
-    .is_err());
+    .unwrap();
+    assert_eq!(coding_balance.url, ZHIPU_ACCOUNT_REPORT_URL);
+    assert_eq!(coding_balance.headers["authorization"], "coding-secret");
 }
 
 #[test]
@@ -117,7 +129,26 @@ fn parses_zhipu_standard_account_balance_without_subscription_limits() {
     assert_eq!(parsed.balances[0].topped_up.as_deref(), Some("100"));
     assert_eq!(parsed.balances[0].used.as_deref(), Some("69.75"));
     assert_eq!(parsed.extensions["balance_source"], "standard_api");
+    assert_eq!(parsed.extensions["balance_status"], "available");
+    assert_eq!(parsed.extensions["balance_insufficient"], false);
     assert_eq!(parsed.extensions["frozen_balance"], "2.25");
+}
+
+#[test]
+fn parses_zhipu_zero_and_business_1113_as_insufficient_balance() {
+    for fixture in [
+        json!({"success": true, "data": {"availableBalance": "0.00"}}),
+        json!({"success": false, "code": 1113, "msg": "余额不足"}),
+    ] {
+        let parsed = parse_zhipu_standard_balance(&fixture).unwrap();
+        assert_eq!(parsed.kind, ProviderQuotaSnapshotKind::Balance);
+        assert!(matches!(
+            parsed.balances[0].available.as_deref(),
+            Some("0.00" | "0")
+        ));
+        assert_eq!(parsed.extensions["balance_status"], "insufficient");
+        assert_eq!(parsed.extensions["balance_insufficient"], true);
+    }
 }
 
 #[test]
@@ -140,6 +171,27 @@ fn balance_and_subscription_are_not_conflated() {
         serde_json::to_value(&glm.windows[0]).unwrap()["remaining_value"],
         380.0
     );
+}
+
+#[test]
+fn parses_zhipu_credit_limits_for_personal_and_team_plans() {
+    let parsed = parse_at(
+        "zhipu",
+        json!({"success":true,"data":{"level":"TEAM_PRO","limits":[
+            {"type":"CREDIT_LIMIT","unit":3,"currentValue":250,"usage":2000,"percentage":12.5,"nextResetTime":1_900_000_000_000u64},
+            {"type":"CREDIT_LIMIT","unit":6,"currentValue":1000,"usage":10000,"percentage":10,"nextResetTime":1_900_100_000_000u64}
+        ]}}),
+    );
+
+    assert_eq!(parsed.windows[0].code, "credits_5h");
+    assert_eq!(parsed.windows[0].label, "5小时积分");
+    assert_eq!(parsed.windows[0].unit, "credits");
+    assert_eq!(parsed.windows[0].window_minutes, Some(300));
+    assert_eq!(parsed.windows[1].code, "credits_weekly");
+    assert_eq!(parsed.windows[1].label, "每周积分");
+    assert_eq!(parsed.windows[1].unit, "credits");
+    assert_eq!(parsed.windows[1].window_minutes, Some(7 * 24 * 60));
+    assert_eq!(parsed.extensions["plan_type"], "team_pro");
 }
 
 #[test]

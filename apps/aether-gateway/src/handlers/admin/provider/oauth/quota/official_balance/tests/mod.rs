@@ -4,8 +4,9 @@ use super::{
         RouteSource, StableErrorClass,
     },
     execution::{
-        apply_zhipu_token_plan_fallback_policy, execution_result_to_attempt,
-        should_fallback_to_zhipu_balance,
+        apply_zhipu_plan_scope, apply_zhipu_token_plan_fallback_policy,
+        execution_result_to_attempt, should_fallback_to_zhipu_balance,
+        should_retry_zhipu_team_quota,
     },
     persisted_backoff_applies,
     persistence::{

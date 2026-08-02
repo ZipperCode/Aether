@@ -4,6 +4,30 @@
     class="mt-2 rounded-md bg-muted/30 p-2"
     data-testid="provider-generic-quota"
   >
+      <ProviderQuotaSectionHeader
+        :title="legacyT('账号配额')"
+        :loading="loading"
+        :updated-text="updatedText"
+        :refreshable="refreshable"
+        :refresh-disabled="refreshDisabled"
+        :refresh-title="legacyT('刷新额度')"
+        @refresh="$emit('refresh')"
+      />
+      <div
+        v-if="modelAvailability"
+        class="mt-1.5 rounded border px-2 py-1.5 text-[10px]"
+        :class="modelAvailability.status === 'ok'
+          ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300'
+          : modelAvailability.status === 'failed'
+            ? 'border-red-500/30 bg-red-500/5 text-red-700 dark:text-red-300'
+            : 'border-amber-500/30 bg-amber-500/5 text-amber-700 dark:text-amber-300'"
+        data-testid="provider-model-availability"
+      >
+        <div class="font-medium">{{ legacyT(modelAvailability.title) }}</div>
+        <div v-if="modelAvailability.detail" class="mt-0.5 opacity-80">
+          {{ legacyT(modelAvailability.detail) }}
+        </div>
+      </div>
       <div
         v-if="balanceItems.length"
         class="mt-1.5 space-y-1.5"
@@ -16,7 +40,7 @@
         >
           <template v-if="balance.showProgress">
             <ProviderQuotaProgressRow
-              :label="balance.unlimited ? legacyT('累计已用') : legacyT('剩余余额')"
+              :label="balance.insufficient ? legacyT(balance.informational ? '标准余额不足' : '余额不足') : balance.unlimited ? legacyT('累计已用') : legacyT(balance.informational ? '标准余额' : '剩余余额')"
               :remaining-percent="balance.remainingPercent"
               :meter-class="balance.meterClass"
               :bar-class="balance.barClass"
@@ -31,11 +55,12 @@
           </template>
           <div v-else class="flex items-center justify-between gap-3">
             <div class="flex min-w-0 items-center gap-1.5">
-              <WalletCards class="h-3.5 w-3.5 shrink-0 text-emerald-500" />
+              <WalletCards class="h-3.5 w-3.5 shrink-0" :class="balance.insufficient ? balance.informational ? 'text-amber-500' : 'text-red-500' : 'text-emerald-500'" />
               <div class="min-w-0">
-                <div class="text-[9px] text-muted-foreground">{{ legacyT('可用余额') }}</div>
+                <div class="text-[9px] text-muted-foreground">{{ legacyT(balance.insufficient ? balance.informational ? '标准余额不足' : '余额不足' : balance.informational ? '标准余额' : '可用余额') }}</div>
                 <div
-                  class="break-all text-sm font-semibold leading-4 text-foreground"
+                  class="break-all text-sm font-semibold leading-4"
+                  :class="balance.insufficient ? balance.informational ? 'text-amber-600 dark:text-amber-400' : 'text-red-600 dark:text-red-400' : 'text-foreground'"
                   data-testid="provider-quota-available"
                 >
                   {{ balance.available || legacyT('无限制') }}
@@ -87,8 +112,9 @@
       </div>
 
       <div
-        v-if="sections.status.length"
-        class="mt-1.5 text-[10px] text-red-600 dark:text-red-400"
+        v-if="sections.status.length && !quotaUnavailable"
+        class="mt-1.5 text-[10px]"
+        :class="informationalBalanceFallback ? 'text-amber-600 dark:text-amber-400' : 'text-red-600 dark:text-red-400'"
         data-testid="provider-generic-quota-status"
       >
         {{ sections.status.join(' · ') }}
@@ -100,34 +126,67 @@
       >
         {{ loading ? legacyT('正在查询额度') : legacyT('暂无额度数据，点击刷新后重试') }}
       </div>
-      <div
-        v-if="updatedText"
-        class="mt-1 text-right text-[9px] leading-none text-muted-foreground/60"
-        data-testid="provider-quota-balance-updated"
-      >
-        {{ legacyT('更新') }} {{ updatedText }}
-      </div>
       </div>
 </template>
 
 <script setup lang="ts">
 import { computed } from 'vue'
 import { CreditCard, Gift, WalletCards } from 'lucide-vue-next'
-import type { QuotaStatusSnapshot, QuotaWindowSnapshot } from '@/api/endpoints/types'
+import type {
+  ModelProbeStatusSnapshot,
+  QuotaStatusSnapshot,
+  QuotaWindowSnapshot,
+} from '@/api/endpoints/types'
 import Badge from '@/components/ui/badge.vue'
 import { useI18n } from '@/i18n'
-import { formatDecimalDisplay, getGenericQuotaSections } from '@/utils/providerKeyQuota'
+import {
+  formatDecimalDisplay,
+  getGenericQuotaSections,
+  getZhipuModelAvailabilityDisplay,
+  isGenericQuotaUnavailable,
+  isZhipuAmbiguousQuotaFallback,
+  isZhipuInformationalBalanceFallback,
+} from '@/utils/providerKeyQuota'
 import ProviderQuotaProgressRow from './ProviderQuotaProgressRow.vue'
+import ProviderQuotaSectionHeader from './ProviderQuotaSectionHeader.vue'
 
 const props = withDefaults(defineProps<{
   quota?: QuotaStatusSnapshot | null
+  modelProbe?: ModelProbeStatusSnapshot | null
   loading?: boolean
   providerType?: string | null
-}>(), { quota: null, loading: false, providerType: null })
+  refreshable?: boolean
+  refreshDisabled?: boolean
+}>(), {
+  quota: null,
+  modelProbe: null,
+  loading: false,
+  providerType: null,
+  refreshable: false,
+  refreshDisabled: false,
+})
+
+defineEmits<{
+  (e: 'refresh'): void
+}>()
 
 const { legacyT } = useI18n()
-const sections = computed(() => getGenericQuotaSections(props.quota))
+const sections = computed(() => getGenericQuotaSections(props.quota, props.providerType))
 const normalizedProviderType = computed(() => props.providerType?.trim().toLowerCase() || '')
+const quotaUnavailable = computed(() => (
+  isGenericQuotaUnavailable(props.quota, props.providerType)
+))
+const informationalBalanceFallback = computed(() => (
+  isZhipuInformationalBalanceFallback(props.quota, props.providerType)
+))
+const ambiguousQuotaFallback = computed(() => (
+  isZhipuAmbiguousQuotaFallback(props.quota, props.providerType)
+))
+const modelAvailability = computed(() => getZhipuModelAvailabilityDisplay(
+  props.quota,
+  props.modelProbe,
+  props.providerType,
+))
 
 function number(value: unknown): number | null {
   if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '') return null
@@ -144,11 +203,15 @@ function amount(value: unknown, unit: string): string | null {
 }
 
 const balanceItems = computed(() => (props.quota?.balances ?? []).flatMap((balance) => {
+  if (quotaUnavailable.value) return []
+  if (ambiguousQuotaFallback.value) return []
   const available = amount(balance.available, balance.unit)
   const total = amount(balance.total, balance.unit)
   const used = amount(balance.used, balance.unit)
   const totalNumber = number(balance.total)
   const availableNumber = number(balance.available)
+  const insufficient = props.quota?.balance_insufficient === true
+    || (availableNumber != null && availableNumber <= 0)
   const unlimited = props.quota?.unlimited === true
   if (!available && !used && !unlimited) return []
   const parts = [
@@ -167,6 +230,8 @@ const balanceItems = computed(() => (props.quota?.balances ?? []).flatMap((balan
     available,
     parts,
     unlimited,
+    insufficient,
+    informational: informationalBalanceFallback.value,
     showProgress: !unlimited && remainingPercent != null,
     remainingPercent,
     usageDetail: `${used || amount(0, balance.unit)} / ${unlimited ? legacyT('无限制') : total || '-'}`,
@@ -182,7 +247,8 @@ function dateTime(value: unknown): string | null {
 }
 
 const metadataItems = computed(() => [
-  { label: legacyT('方案'), value: props.quota?.membership_level?.replace(/^LEVEL_/, '').replaceAll('_', ' ') || null },
+  { label: legacyT('方案'), value: (props.quota?.membership_level || props.quota?.plan_type)?.replace(/^LEVEL_/, '').replaceAll('_', ' ') || null },
+  { label: legacyT('套餐类型'), value: props.quota?.token_plan_scope === 'team' ? legacyT('团队版') : props.quota?.token_plan_scope === 'personal' ? legacyT('个人版') : null },
   { label: legacyT('并发'), value: props.quota?.parallel_limit != null ? String(props.quota.parallel_limit) : null },
   { label: legacyT('过期'), value: dateTime(props.quota?.expires_at) },
   { label: legacyT('限额重置'), value: dateTime(props.quota?.limit_reset) },
@@ -204,6 +270,7 @@ function compactValue(value: unknown): string | null {
 }
 
 const quotaWindows = computed(() => (props.quota?.windows ?? []).flatMap((window) => {
+  if (quotaUnavailable.value) return []
   const remaining = remainingPercent(window)
   const remainingValue = compactValue(window.remaining_value)
   const limitValue = compactValue(window.limit_value)
@@ -220,7 +287,7 @@ const quotaWindows = computed(() => (props.quota?.windows ?? []).flatMap((window
   }]
 }))
 
-const hasStructuredContent = computed(() => balanceItems.value.length > 0 || quotaWindows.value.length > 0 || sections.value.rateLimits.length > 0)
+const hasStructuredContent = computed(() => quotaUnavailable.value || Boolean(modelAvailability.value) || balanceItems.value.length > 0 || quotaWindows.value.length > 0 || sections.value.rateLimits.length > 0)
 const hasContent = computed(() => Boolean(props.providerType || props.quota || props.loading))
 const updatedText = computed(() => {
   const timestamp = props.quota?.refresh_state?.last_success_at ?? props.quota?.observed_at ?? props.quota?.updated_at

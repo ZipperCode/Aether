@@ -16,7 +16,7 @@ use crate::ai_serving::{
     ANTIGRAVITY_V1INTERNAL_ENVELOPE_NAME, GEMINI_CHAT_SYNC_FINALIZE_REPORT_KIND,
     OPENAI_CHAT_SYNC_FINALIZE_REPORT_KIND, OPENAI_IMAGE_SYNC_FINALIZE_REPORT_KIND,
 };
-use crate::clock::current_unix_ms;
+use crate::clock::{current_unix_ms, current_unix_secs};
 use crate::execution_runtime;
 use crate::handlers::admin::provider::write::provider::reconcile_admin_fixed_provider_template_endpoints;
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
@@ -59,7 +59,8 @@ use aether_data_contracts::repository::global_models::{
     AdminProviderModelListQuery, StoredAdminProviderModel,
 };
 use aether_data_contracts::repository::provider_catalog::{
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    ProviderCatalogKeyStatusSnapshotUpdate, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_model_fetch::{
     aggregate_models_for_cache, fetch_models_from_transports, json_string_list,
@@ -125,6 +126,7 @@ const ADMIN_PROVIDER_QUERY_INVALID_MAPPED_MODEL_DETAIL: &str =
 const PROVIDER_QUERY_KEY_MODEL_NOT_ALLOWED_SKIP_REASON: &str = "key_model_not_allowed";
 const ANTIGRAVITY_PROVIDER_CACHE_KEY_PREFIX: &str = "upstream_models_provider:";
 const DEFAULT_PROVIDER_QUERY_TEST_MESSAGE: &str = "Hello! This is a test message.";
+const PROVIDER_QUERY_MODEL_PROBE_MAX_ERROR_CHARS: usize = 512;
 static PROVIDER_QUERY_POOL_LOAD_BALANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 struct ProviderQueryTestCandidate {
     endpoint: StoredProviderCatalogEndpoint,
@@ -403,6 +405,96 @@ async fn provider_query_finish_test_candidate_trace(
         },
     )
     .await;
+}
+
+fn provider_query_model_probe_error(error_message: Option<&str>) -> Option<String> {
+    let normalized = error_message?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(
+        normalized
+            .chars()
+            .take(PROVIDER_QUERY_MODEL_PROBE_MAX_ERROR_CHARS)
+            .collect(),
+    )
+}
+
+fn provider_query_model_probe_status_patch(
+    model: &str,
+    api_format: &str,
+    execution: &ProviderQueryExecutionOutcome,
+    tested_at_unix_secs: u64,
+) -> Value {
+    json!({
+        "model_probe": {
+            "status": if execution.status == "success" { "ok" } else { "failed" },
+            "model": model,
+            "api_format": api_format,
+            "tested_at": tested_at_unix_secs,
+            "status_code": execution.status_code,
+            "error": provider_query_model_probe_error(execution.error_message.as_deref()),
+            "source": "admin_model_test",
+        }
+    })
+}
+
+async fn provider_query_persist_model_probe(
+    state: &AppState,
+    candidate: &ProviderQueryTestCandidate,
+    execution: &ProviderQueryExecutionOutcome,
+) {
+    if execution.status == "skipped" {
+        return;
+    }
+    let tested_at_unix_secs = current_unix_secs();
+    let update = ProviderCatalogKeyStatusSnapshotUpdate {
+        key_id: candidate.key.id.clone(),
+        status_snapshot_patch: provider_query_model_probe_status_patch(
+            &candidate.effective_model,
+            &candidate.endpoint.api_format,
+            execution,
+            tested_at_unix_secs,
+        ),
+        updated_at_unix_secs: Some(tested_at_unix_secs),
+    };
+    match state
+        .update_provider_catalog_key_status_snapshot(&update)
+        .await
+    {
+        Ok(true) => {
+            debug!(
+                event_name = "provider_query_model_probe_persisted",
+                log_type = "event",
+                key_id = %candidate.key.id,
+                endpoint_id = %candidate.endpoint.id,
+                probe_status = if execution.status == "success" { "ok" } else { "failed" },
+                "gateway persisted admin model-test availability evidence"
+            );
+        }
+        Ok(false) => {
+            warn!(
+                event_name = "provider_query_model_probe_key_not_found",
+                log_type = "event",
+                key_id = %candidate.key.id,
+                endpoint_id = %candidate.endpoint.id,
+                "gateway could not persist admin model-test availability evidence because the key no longer exists"
+            );
+        }
+        Err(error) => {
+            warn!(
+                event_name = "provider_query_model_probe_persist_failed",
+                log_type = "event",
+                key_id = %candidate.key.id,
+                endpoint_id = %candidate.endpoint.id,
+                error = ?error,
+                "gateway failed to persist admin model-test availability evidence"
+            );
+        }
+    }
 }
 
 fn provider_query_skipped_execution_outcome(
@@ -3924,6 +4016,7 @@ async fn build_admin_provider_query_kiro_failover_response(
             &execution,
         )
         .await;
+        provider_query_persist_model_probe(app_state, candidate, &execution).await;
         if execution.status != "skipped" {
             total_attempts += 1;
         }

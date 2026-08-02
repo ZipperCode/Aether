@@ -2,6 +2,72 @@ use super::*;
 use crate::handlers::admin::request::AdminGatewayProviderTransportSnapshot;
 use serde_json::json;
 
+fn sample_model_probe_execution(
+    status: &'static str,
+    status_code: Option<u16>,
+    error_message: Option<String>,
+) -> ProviderQueryExecutionOutcome {
+    ProviderQueryExecutionOutcome {
+        status,
+        skip_reason: None,
+        error_message,
+        status_code,
+        latency_ms: Some(12),
+        request_url: "https://example.com/v1/chat/completions?credential=secret".to_string(),
+        request_headers: BTreeMap::from([("authorization".to_string(), "secret".to_string())]),
+        request_body: json!({"secret": "request-secret"}),
+        response_headers: BTreeMap::new(),
+        response_body: Some(json!({"secret": "response-secret"})),
+    }
+}
+
+#[test]
+fn provider_query_model_probe_success_patch_contains_only_safe_availability_evidence() {
+    let execution = sample_model_probe_execution("success", Some(200), None);
+
+    let patch =
+        provider_query_model_probe_status_patch("glm-5", "openai:chat", &execution, 1_700_000_000);
+    let probe = &patch["model_probe"];
+
+    assert_eq!(probe["status"], "ok");
+    assert_eq!(probe["model"], "glm-5");
+    assert_eq!(probe["api_format"], "openai:chat");
+    assert_eq!(probe["tested_at"], 1_700_000_000_u64);
+    assert_eq!(probe["status_code"], 200);
+    assert!(probe["error"].is_null());
+    assert_eq!(probe["source"], "admin_model_test");
+    let serialized = patch.to_string();
+    assert!(!serialized.contains("credential=secret"));
+    assert!(!serialized.contains("request-secret"));
+    assert!(!serialized.contains("response-secret"));
+    assert!(!serialized.contains("authorization"));
+}
+
+#[test]
+fn provider_query_model_probe_failure_patch_normalizes_and_bounds_upstream_error() {
+    let execution = sample_model_probe_execution(
+        "failed",
+        Some(429),
+        Some(format!("余额不足或无可用资源包\n{}", "x".repeat(700))),
+    );
+
+    let patch =
+        provider_query_model_probe_status_patch("glm-5", "openai:chat", &execution, 1_700_000_001);
+    let probe = &patch["model_probe"];
+    let error = probe["error"]
+        .as_str()
+        .expect("failed probe should retain a bounded error summary");
+
+    assert_eq!(probe["status"], "failed");
+    assert_eq!(probe["status_code"], 429);
+    assert!(error.starts_with("余额不足或无可用资源包 "));
+    assert!(!error.contains('\n'));
+    assert_eq!(
+        error.chars().count(),
+        PROVIDER_QUERY_MODEL_PROBE_MAX_ERROR_CHARS
+    );
+}
+
 fn sample_openai_image_transport(provider_type: &str) -> AdminGatewayProviderTransportSnapshot {
     let base_url = if provider_type == "custom" {
         "https://grok.com/v1/"

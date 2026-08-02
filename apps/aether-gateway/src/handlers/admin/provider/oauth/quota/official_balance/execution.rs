@@ -11,8 +11,9 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use aether_provider_pool::{
     build_deepseek_balance_request, build_official_api_key_quota_request,
-    build_openrouter_credits_request, build_zhipu_account_balance_request, parse_deepseek_balance,
-    parse_official_api_key_quota, parse_openrouter_credits, parse_zhipu_standard_balance,
+    build_openrouter_credits_request, build_zhipu_account_balance_request,
+    build_zhipu_team_quota_request, parse_deepseek_balance, parse_official_api_key_quota,
+    parse_openrouter_credits, parse_zhipu_standard_balance,
     ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD, ZHIPU_TOKEN_PLAN_STATUS_FIELD,
 };
 
@@ -27,7 +28,8 @@ pub(super) struct PrepareInput<'a> {
 pub(super) struct PreparedAttempt {
     transport: AdminGatewayProviderTransportSnapshot,
     plan: ExecutionPlan,
-    fallback_plan: Option<ExecutionPlan>,
+    team_plan: Option<ExecutionPlan>,
+    balance_plan: Option<ExecutionPlan>,
     provider_type: String,
     pub(super) route: ExecutionRoute,
     pub(super) quota_kind: QuotaKind,
@@ -60,7 +62,8 @@ pub(super) async fn prepare_attempt(
     };
     let provider_type = input.provider.provider_type.trim().to_ascii_lowercase();
     let secret = transport.key.decrypted_api_key.trim().to_owned();
-    let fallback_secret = secret.clone();
+    let team_secret = secret.clone();
+    let balance_secret = secret.clone();
     let spec = match provider_type.as_str() {
         "deepseek" => build_deepseek_balance_request(&input.key.id, input.endpoint, move || secret),
         "openrouter" => {
@@ -79,10 +82,15 @@ pub(super) async fn prepare_attempt(
     .map_err(|_| PreparationFailure {
         class: StableErrorClass::RequestInvalid,
     })?;
-    let fallback_spec = (provider_type == "zhipu")
+    let team_spec = (provider_type == "zhipu")
+        .then(|| build_zhipu_team_quota_request(&input.key.id, input.endpoint, move || team_secret))
+        .transpose()
+        .ok()
+        .flatten();
+    let balance_spec = (provider_type == "zhipu")
         .then(|| {
             build_zhipu_account_balance_request(&input.key.id, input.endpoint, move || {
-                fallback_secret
+                balance_secret
             })
         })
         .transpose()
@@ -107,10 +115,19 @@ pub(super) async fn prepare_attempt(
         route.proxy.as_ref(),
     ));
     let transport_profile = input.state.resolve_transport_profile(&transport);
-    let fallback_plan = fallback_spec.map(|fallback_spec| {
+    let team_plan = team_spec.map(|team_spec| {
         build_provider_quota_execution_plan(
             &transport,
-            fallback_spec,
+            team_spec,
+            route.proxy.clone(),
+            transport_profile.clone(),
+            timeouts.clone(),
+        )
+    });
+    let balance_plan = balance_spec.map(|balance_spec| {
+        build_provider_quota_execution_plan(
+            &transport,
+            balance_spec,
             route.proxy.clone(),
             transport_profile.clone(),
             timeouts.clone(),
@@ -126,7 +143,8 @@ pub(super) async fn prepare_attempt(
     Ok(PreparedAttempt {
         transport,
         plan,
-        fallback_plan,
+        team_plan,
+        balance_plan,
         provider_type,
         route,
         quota_kind,
@@ -140,18 +158,38 @@ pub(super) async fn execute_prepared(
     let PreparedAttempt {
         transport,
         plan,
-        fallback_plan,
+        team_plan,
+        balance_plan,
         provider_type,
         quota_kind,
         ..
     } = prepared;
-    let attempt = execute_plan(state, &transport, plan, quota_kind, &provider_type).await;
+    let mut attempt = execute_plan(state, &transport, plan, quota_kind, &provider_type).await;
+    if provider_type == "zhipu" {
+        if should_retry_zhipu_team_quota(&attempt) {
+            if let Some(team_plan) = team_plan {
+                attempt = execute_plan(
+                    state,
+                    &transport,
+                    team_plan,
+                    QuotaKind::Subscription,
+                    &provider_type,
+                )
+                .await;
+                if matches!(attempt, AttemptResult::Success { .. }) {
+                    return apply_zhipu_plan_scope(attempt, "team");
+                }
+            }
+        } else if matches!(attempt, AttemptResult::Success { .. }) {
+            return apply_zhipu_plan_scope(attempt, "personal");
+        }
+    }
     if should_fallback_to_zhipu_balance(&attempt) {
-        if let Some(fallback_plan) = fallback_plan {
+        if let Some(balance_plan) = balance_plan {
             let fallback = execute_plan(
                 state,
                 &transport,
-                fallback_plan,
+                balance_plan,
                 QuotaKind::Balance,
                 &provider_type,
             )
@@ -162,35 +200,77 @@ pub(super) async fn execute_prepared(
     attempt
 }
 
+pub(super) fn should_retry_zhipu_team_quota(attempt: &AttemptResult) -> bool {
+    matches!(
+        attempt,
+        AttemptResult::ParseFailure {
+            quota_kind: QuotaKind::Subscription,
+            ..
+        } | AttemptResult::BusinessFailure {
+            quota_kind: QuotaKind::Subscription,
+            upstream_code: Some(500 | 1315),
+            ..
+        }
+    )
+}
+
+pub(super) fn apply_zhipu_plan_scope(
+    mut attempt: AttemptResult,
+    scope: &'static str,
+) -> AttemptResult {
+    if let AttemptResult::Success {
+        snapshot,
+        quota_kind: QuotaKind::Subscription,
+        ..
+    } = &mut attempt
+    {
+        snapshot.extensions.insert(
+            "token_plan_scope".into(),
+            serde_json::Value::String(scope.into()),
+        );
+    }
+    attempt
+}
+
 pub(super) fn apply_zhipu_token_plan_fallback_policy(
     primary: &AttemptResult,
     mut fallback: AttemptResult,
 ) -> AttemptResult {
-    let status = match primary {
+    let (status, block_scheduling) = match primary {
+        AttemptResult::BusinessFailure {
+            quota_kind: QuotaKind::Subscription,
+            upstream_code: Some(1113),
+            ..
+        } => ("balance_insufficient", true),
         AttemptResult::BusinessFailure {
             quota_kind: QuotaKind::Subscription,
             upstream_code: Some(1220),
             ..
-        } => "not_permitted",
+        } => ("not_permitted", true),
         AttemptResult::BusinessFailure {
             quota_kind: QuotaKind::Subscription,
             upstream_code: Some(1309),
             ..
-        } => "expired",
+        } => ("expired", true),
         AttemptResult::BusinessFailure {
             quota_kind: QuotaKind::Subscription,
             upstream_code: Some(1315),
             ..
-        } => "product_mismatch",
+        } => ("product_mismatch", true),
+        AttemptResult::BusinessFailure {
+            quota_kind: QuotaKind::Subscription,
+            class: StableErrorClass::HttpServer,
+            ..
+        } => ("query_failed", false),
         AttemptResult::BusinessFailure {
             quota_kind: QuotaKind::Subscription,
             class: StableErrorClass::HttpClient | StableErrorClass::HttpForbidden,
             ..
-        } => "business_error",
+        } => ("business_error", false),
         AttemptResult::ParseFailure {
             quota_kind: QuotaKind::Subscription,
             ..
-        } => "unverified",
+        } => ("query_failed", false),
         _ => return fallback,
     };
     if let AttemptResult::Success {
@@ -199,19 +279,27 @@ pub(super) fn apply_zhipu_token_plan_fallback_policy(
         ..
     } = &mut fallback
     {
-        snapshot.exhausted = true;
+        snapshot.exhausted = block_scheduling;
         snapshot.extensions.insert(
             ZHIPU_TOKEN_PLAN_STATUS_FIELD.into(),
             serde_json::Value::String(status.into()),
         );
         snapshot.extensions.insert(
             ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD.into(),
-            serde_json::Value::Bool(true),
+            serde_json::Value::Bool(block_scheduling),
         );
-        snapshot.extensions.insert(
-            "scheduling_block_reason".into(),
-            serde_json::Value::String("token_plan_unavailable".into()),
-        );
+        if let Some(error) = primary.failure_message() {
+            snapshot.extensions.insert(
+                "token_plan_error".into(),
+                serde_json::Value::String(error.into()),
+            );
+        }
+        if block_scheduling {
+            snapshot.extensions.insert(
+                "scheduling_block_reason".into(),
+                serde_json::Value::String("token_plan_unavailable".into()),
+            );
+        }
     }
     fallback
 }
@@ -244,6 +332,10 @@ pub(super) fn should_fallback_to_zhipu_balance(attempt: &AttemptResult) -> bool 
             quota_kind: QuotaKind::Subscription,
             class: StableErrorClass::HttpClient | StableErrorClass::HttpForbidden,
             ..
+        } | AttemptResult::BusinessFailure {
+            quota_kind: QuotaKind::Subscription,
+            upstream_code: Some(500),
+            ..
         }
     )
 }
@@ -269,6 +361,22 @@ pub(super) fn execution_result_to_attempt(
     };
     if matches!(provider_type, "zhipu" | "zai") {
         if let Some((class, upstream_code, detail)) = zhipu_business_failure(&body) {
+            if provider_type == "zhipu"
+                && quota_kind == QuotaKind::Balance
+                && upstream_code == Some(1113)
+            {
+                return match parse_zhipu_standard_balance(&body) {
+                    Ok(snapshot) => AttemptResult::Success {
+                        snapshot,
+                        status_code: result.status_code,
+                        quota_kind,
+                    },
+                    Err(_) => AttemptResult::ParseFailure {
+                        class: StableErrorClass::ParseFailed,
+                        quota_kind,
+                    },
+                };
+            }
             return AttemptResult::BusinessFailure {
                 status_code: result.status_code,
                 class,

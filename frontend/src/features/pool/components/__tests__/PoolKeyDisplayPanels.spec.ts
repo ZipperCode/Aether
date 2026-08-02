@@ -170,6 +170,124 @@ describe('pool key display panels', () => {
     root.remove()
   })
 
+  it('shows DeepSeek quota failures as unavailable on desktop and mobile', () => {
+    for (const variant of ['desktop', 'mobile'] as const) {
+      const root = document.createElement('div')
+      document.body.appendChild(root)
+      const app = createApp(PoolKeyQuotaPanel, {
+        items: [], providerType: 'deepseek', variant,
+        fallbackText: '可用 9.25 USD',
+        quota: {
+          provider_type: 'deepseek', kind: 'balance', code: 'http_server_error',
+          exhausted: false, freshness: 'stale',
+          balances: [{ unit: 'USD', available: '9.25' }],
+          refresh_state: { error: 'http_server_error: quota upstream returned an error' },
+        },
+      })
+      app.use(createI18n())
+      app.mount(root)
+
+      const unavailable = root.querySelector('[data-testid="pool-quota-unavailable"]')
+      expect(unavailable?.textContent?.trim()).toBe('不可用')
+      expect(unavailable?.classList).toContain('text-red-700')
+      expect(root.querySelector('[data-testid="pool-quota-balance"]')).toBeNull()
+      expect(root.textContent).not.toContain('9.25')
+      app.unmount()
+      root.remove()
+    }
+  })
+
+  it('hides retained balances after generic quota authentication rejection', () => {
+    for (const variant of ['desktop', 'mobile'] as const) {
+      const root = document.createElement('div')
+      document.body.appendChild(root)
+      const app = createApp(PoolKeyQuotaPanel, {
+        items: [], providerType: 'openrouter', variant,
+        fallbackText: '可用 18.50 CNY',
+        quota: {
+          provider_type: 'openrouter', kind: 'balance', code: 'http_unauthorized',
+          exhausted: false, freshness: 'stale',
+          balances: [{ unit: 'CNY', available: '18.50' }],
+          refresh_state: { error: 'http_unauthorized: quota upstream rejected authentication' },
+        },
+      })
+      app.use(createI18n())
+      app.mount(root)
+
+      expect(root.querySelector('[data-testid="pool-quota-unavailable"]')?.textContent?.trim())
+        .toBe('不可用')
+      expect(root.querySelector('[data-testid="pool-quota-balance"]')).toBeNull()
+      expect(root.textContent).not.toContain('http_unauthorized')
+      expect(root.textContent).not.toContain('18.50')
+      app.unmount()
+      root.remove()
+    }
+  })
+
+  it('labels a zero Zhipu balance as insufficient', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [], providerType: 'zhipu',
+      quota: {
+        code: 'ok', exhausted: false, balance_insufficient: true,
+        balances: [{ unit: 'CNY', available: '0' }],
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    expect(root.querySelector('[data-testid="pool-quota-balance"]')?.textContent).toContain('余额不足')
+    expect(root.querySelector('[data-testid="pool-quota-available"]')?.classList).toContain('text-red-600')
+    app.unmount()
+    root.remove()
+  })
+
+  it('hides an ambiguous Zhipu zero balance when no model probe exists', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [], providerType: 'zhipu',
+      quota: {
+        kind: 'balance', code: 'ok', exhausted: false, balance_insufficient: true,
+        token_plan_status: 'query_failed', token_plan_scheduling_blocked: false,
+        balances: [{ unit: 'CNY', available: '0' }],
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    expect(root.querySelector('[data-testid="pool-quota-balance"]')).toBeNull()
+    expect(root.querySelector('[data-testid="pool-model-availability"]')?.textContent)
+      .toContain('额度未知，继续参与模型调度')
+    expect(root.querySelector('[data-testid="pool-model-availability"]')?.classList).toContain('text-amber-700')
+    app.unmount()
+    root.remove()
+  })
+
+  it('shows successful model-probe evidence for an ambiguous Zhipu quota', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [], providerType: 'zhipu',
+      modelProbe: { status: 'ok', model: 'glm-5', status_code: 200 },
+      quota: {
+        kind: 'balance', code: 'ok', exhausted: false, balance_insufficient: true,
+        token_plan_status: 'query_failed', token_plan_scheduling_blocked: false,
+        balances: [{ unit: 'CNY', available: '0' }],
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    const availability = root.querySelector('[data-testid="pool-model-availability"]')
+    expect(availability?.textContent).toContain('模型调用已验证可用')
+    expect(availability?.textContent).toContain('额度查询失败，额度未知')
+    expect(availability?.classList).toContain('text-emerald-700')
+    app.unmount()
+    root.remove()
+  })
+
   it('does not render a percentage meter for unlimited balances', () => {
     const root = document.createElement('div')
     document.body.appendChild(root)

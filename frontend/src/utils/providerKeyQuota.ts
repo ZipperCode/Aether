@@ -1,4 +1,5 @@
 import type {
+  ModelProbeStatusSnapshot,
   ProviderKeyStatusSnapshot,
   QuotaStatusSnapshot,
   QuotaWindowSnapshot,
@@ -10,6 +11,15 @@ export interface ProviderKeyQuotaCarrier {
   account_quota?: string | null
   status_snapshot?: ProviderKeyStatusSnapshot | null
   upstream_metadata?: UpstreamMetadata | null
+}
+
+export interface ProviderModelAvailabilityDisplay {
+  status: 'ok' | 'failed' | 'unknown'
+  title: string
+  detail: string | null
+  text: string
+  model: string | null
+  testedAt: number | null
 }
 
 function normalizeText(value: unknown): string | null {
@@ -42,6 +52,52 @@ function getQuotaProviderType(
   const snapshotProviderType = normalizeText(quota?.provider_type)?.toLowerCase()
   if (snapshotProviderType) return snapshotProviderType
   return normalizeText(fallbackProviderType)?.toLowerCase() || ''
+}
+
+/** 智谱套餐查询失败后的标准余额仅供参考，不能据此判定模型不可调用。 */
+export function isZhipuInformationalBalanceFallback(
+  quota: QuotaStatusSnapshot | null | undefined,
+  fallbackProviderType?: string | null,
+): boolean {
+  if (getQuotaProviderType(quota, fallbackProviderType) !== 'zhipu') return false
+  if (normalizeText(quota?.kind)?.toLowerCase() !== 'balance') return false
+  if (quota?.token_plan_scheduling_blocked !== false) return false
+  const status = normalizeText(quota.token_plan_status)?.toLowerCase()
+  return status === 'query_failed' || status === 'business_error'
+}
+
+/** DeepSeek 额度刷新失败时，保留的旧余额不能继续作为当前可用余额展示。 */
+export function isDeepSeekQuotaUnavailable(
+  quota: QuotaStatusSnapshot | null | undefined,
+  fallbackProviderType?: string | null,
+): boolean {
+  if (getQuotaProviderType(quota, fallbackProviderType) !== 'deepseek') return false
+  const freshness = normalizeText(quota?.freshness)?.toLowerCase()
+  if (freshness === 'stale' || freshness === 'error') return true
+  const code = normalizeText(quota?.code)?.toLowerCase()
+  return code !== 'ok' && normalizeText(quota?.refresh_state?.error) != null
+}
+
+/** 官方额度接口明确拒绝鉴权时，Key 的额度快照与保留余额都不再可信。 */
+export function isQuotaAuthenticationExpired(
+  quota: QuotaStatusSnapshot | null | undefined,
+): boolean {
+  const code = normalizeText(quota?.code)?.toLowerCase()
+  if (code === 'http_unauthorized') return true
+
+  const error = normalizeText(quota?.refresh_state?.error)?.toLowerCase()
+  return error?.startsWith('http_unauthorized:') === true
+    || error === 'http_unauthorized'
+    || error?.includes('quota upstream rejected authentication') === true
+}
+
+/** 通用额度区域应隐藏旧数据并展示账号级失效标记的场景。 */
+export function isGenericQuotaUnavailable(
+  quota: QuotaStatusSnapshot | null | undefined,
+  fallbackProviderType?: string | null,
+): boolean {
+  return isQuotaAuthenticationExpired(quota)
+    || isDeepSeekQuotaUnavailable(quota, fallbackProviderType)
 }
 
 function getQuotaWindows(
@@ -88,6 +144,54 @@ function finiteNumber(value: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null
   }
   return null
+}
+
+/** Plan 查询失败且没有正标准余额时，额度接口无法判断智谱 Key 是否可调用。 */
+export function isZhipuAmbiguousQuotaFallback(
+  quota: QuotaStatusSnapshot | null | undefined,
+  fallbackProviderType?: string | null,
+): boolean {
+  if (!isZhipuInformationalBalanceFallback(quota, fallbackProviderType)) return false
+  if (quota?.balance_insufficient === true) return true
+  if (normalizeText(quota?.balance_status)?.toLowerCase() === 'insufficient') return true
+  const availableBalances = (quota?.balances ?? [])
+    .map(balance => finiteNumber(balance.available))
+    .filter((value): value is number => value != null)
+  return !availableBalances.some(value => value > 0)
+}
+
+export function getZhipuModelAvailabilityDisplay(
+  quota: QuotaStatusSnapshot | null | undefined,
+  modelProbe?: ModelProbeStatusSnapshot | null,
+  fallbackProviderType?: string | null,
+): ProviderModelAvailabilityDisplay | null {
+  if (!isZhipuAmbiguousQuotaFallback(quota, fallbackProviderType)) return null
+
+  const probeStatus = normalizeText(modelProbe?.status)?.toLowerCase()
+  const model = normalizeText(modelProbe?.model)
+  const testedAt = finiteNumber(modelProbe?.tested_at)
+  if (probeStatus === 'ok') {
+    const title = '模型调用已验证可用'
+    const detail = '额度查询失败，额度未知'
+    return { status: 'ok', title, detail, text: `${title} · ${detail}`, model, testedAt }
+  }
+  if (probeStatus === 'failed') {
+    const title = '模型调用验证失败'
+    const statusCode = finiteNumber(modelProbe?.status_code)
+    const detail = normalizeText(modelProbe?.error)
+      || (statusCode != null ? `上游 HTTP ${statusCode}` : null)
+    return {
+      status: 'failed',
+      title,
+      detail,
+      text: detail ? `${title}：${detail}` : title,
+      model,
+      testedAt,
+    }
+  }
+
+  const title = '额度未知，继续参与模型调度'
+  return { status: 'unknown', title, detail: null, text: title, model: null, testedAt: null }
 }
 
 export function formatDecimalDisplay(value: unknown): string | null {
@@ -163,7 +267,10 @@ function formatBalanceValue(value: unknown, unit: string): string | null {
 }
 
 /** Provider-neutral quota text. Structured snapshots take precedence over legacy labels. */
-export function getGenericQuotaSections(quota: QuotaStatusSnapshot | null | undefined): {
+export function getGenericQuotaSections(
+  quota: QuotaStatusSnapshot | null | undefined,
+  fallbackProviderType?: string | null,
+): {
   balances: string[]
   windows: string[]
   rateLimits: string[]
@@ -171,11 +278,28 @@ export function getGenericQuotaSections(quota: QuotaStatusSnapshot | null | unde
 } {
   if (!quota) return { balances: [], windows: [], rateLimits: [], status: [] }
 
+  if (isGenericQuotaUnavailable(quota, fallbackProviderType)) {
+    return { balances: [], windows: [], rateLimits: [], status: ['不可用'] }
+  }
+
+  const informationalZhipuBalance = isZhipuInformationalBalanceFallback(
+    quota,
+    fallbackProviderType,
+  )
+  const ambiguousZhipuQuota = isZhipuAmbiguousQuotaFallback(quota, fallbackProviderType)
+
   const balances = (Array.isArray(quota.balances) ? quota.balances : []).flatMap((balance) => {
+    if (ambiguousZhipuQuota) return []
     const available = formatBalanceValue(balance.available, balance.unit)
     if (!available) return []
     const total = formatBalanceValue(balance.total ?? balance.granted, balance.unit)
-    return [`可用 ${available}${total ? ` / 总额 ${total}` : ''}`]
+    const availableNumber = finiteNumber(balance.available)
+    const insufficient = quota.balance_insufficient === true
+      || (availableNumber != null && availableNumber <= 0)
+    const label = insufficient
+      ? informationalZhipuBalance ? '标准余额不足' : '余额不足'
+      : informationalZhipuBalance ? '标准余额可用' : '可用'
+    return [`${label} ${available}${total ? ` / 总额 ${total}` : ''}`]
   })
   if (quota.unlimited === true && balances.length === 0) balances.push('无限制')
   const windows = getQuotaWindows(quota).flatMap((window) => {
@@ -192,11 +316,49 @@ export function getGenericQuotaSections(quota: QuotaStatusSnapshot | null | unde
     return limit == null ? [] : [`${key.toUpperCase()} ${formatQuotaValue(limit)}`]
   })
   const status: string[] = []
-  if (quota.freshness === 'stale') status.push('数据已过期')
-  else if (quota.freshness === 'error') status.push('刷新失败')
-  else if (quota.freshness === 'unknown') status.push('更新时间未知')
+  const appendStatus = (value: string | null) => {
+    if (value && !status.includes(value)) status.push(value)
+  }
+  if (ambiguousZhipuQuota) {
+    appendStatus('额度查询失败，额度未知')
+    return { balances, windows, rateLimits, status }
+  }
+  if (quota.freshness === 'stale') appendStatus('数据已过期')
+  else if (quota.freshness === 'error') appendStatus('刷新失败')
+  else if (quota.freshness === 'unknown') appendStatus('更新时间未知')
+
   const error = normalizeText(quota.refresh_state?.error)
-  if (error) status.push(error)
+  const tokenPlanError = normalizeText(quota.token_plan_error) || error
+  const tokenPlanStatus = normalizeText(quota.token_plan_status)?.toLowerCase()
+  if (getQuotaProviderType(quota) === 'zhipu') {
+    if (tokenPlanStatus === 'expired') appendStatus('Coding Plan 已过期')
+    else if (tokenPlanStatus === 'not_permitted') appendStatus('无 Coding Plan 权限')
+    else if (tokenPlanStatus === 'product_mismatch') appendStatus('Coding Plan 类型不匹配')
+    else if (tokenPlanStatus === 'balance_insufficient') appendStatus('余额不足')
+    else if (tokenPlanStatus === 'query_failed' || tokenPlanStatus === 'business_error') {
+      appendStatus(tokenPlanError?.includes('business code 500')
+        ? 'Coding Plan 查询失败（上游 500）'
+        : 'Coding Plan 查询失败')
+    }
+    if (quota.balance_insufficient === true
+      || quota.balances?.some(balance => {
+        const available = finiteNumber(balance.available)
+        return available != null && available <= 0
+      })) {
+      appendStatus(informationalZhipuBalance
+        ? '标准余额不足（不阻断模型调用）'
+        : '余额不足')
+    }
+  }
+  if (error?.includes('business code 1113')) {
+    appendStatus(informationalZhipuBalance
+      ? '标准余额不足（不阻断模型调用）'
+      : '余额不足')
+  }
+  else if (getQuotaProviderType(quota) === 'zhipu' && error?.includes('business code 500')) {
+    appendStatus('Coding Plan 查询失败（上游 500）')
+  } else if (error && error !== tokenPlanError) appendStatus(error)
+  else if (error && !tokenPlanStatus) appendStatus(error)
   return { balances, windows, rateLimits, status }
 }
 
@@ -533,8 +695,15 @@ export function getQuotaDisplayText(
   fallbackProviderType?: string | null,
 ): string | null {
   const quota = getQuotaSnapshot(input)
+  if (isGenericQuotaUnavailable(quota, fallbackProviderType)) return '不可用'
+  const availability = getZhipuModelAvailabilityDisplay(
+    quota,
+    input.status_snapshot?.model_probe,
+    fallbackProviderType,
+  )
+  if (availability) return availability.text
   if (quota && (quota.kind || (quota.balances?.length ?? 0) > 0)) {
-    const sections = getGenericQuotaSections(quota)
+    const sections = getGenericQuotaSections(quota, fallbackProviderType)
     const structured = [...sections.balances, ...sections.windows, ...sections.rateLimits]
     if (structured.length > 0) return structured.join(' | ')
   }

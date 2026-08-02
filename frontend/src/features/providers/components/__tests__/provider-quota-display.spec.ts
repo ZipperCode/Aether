@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h } from 'vue'
 
 import ProviderMonthlyQuotaCard from '@/features/providers/components/ProviderMonthlyQuotaCard.vue'
@@ -42,7 +42,7 @@ describe('provider quota display components', () => {
     expect(root.textContent).toContain('RPM 20')
     expect(root.querySelector('[data-testid="provider-generic-quota-status"]')?.textContent).toContain('数据已过期')
     expect(root.textContent).toContain('sanitized upstream error')
-    expect(root.querySelector('[data-testid="provider-quota-header-loading"]')).toBeNull()
+    expect(root.querySelector('[data-testid="provider-quota-header-loading"]')).toBeTruthy()
     unmount()
   })
 
@@ -60,6 +60,89 @@ describe('provider quota display components', () => {
     expect(root.querySelector('[data-testid="provider-balance-panel"]')?.textContent).toContain('88.88 CNY')
     expect(root.textContent).toContain('赠送 0.88 CNY')
     expect(root.textContent).toContain('充值 88 CNY')
+    unmount()
+  })
+
+  it('renders a Zhipu query fallback without probe evidence as unknown', () => {
+    const { root, unmount } = mount(ProviderGenericQuotaCard, {
+      providerType: 'zhipu',
+      quota: {
+        provider_type: 'zhipu', kind: 'balance', code: 'ok', exhausted: false,
+        token_plan_scope: 'team', token_plan_status: 'query_failed',
+        token_plan_scheduling_blocked: false,
+        token_plan_error: 'upstream business code 500: quota upstream returned a business error',
+        balance_insufficient: true,
+        balances: [{ unit: 'CNY', available: '0' }],
+      },
+    })
+
+    expect(root.querySelector('[data-testid="provider-balance-panel"]')).toBeNull()
+    expect(root.querySelector('[data-testid="provider-model-availability"]')?.textContent)
+      .toContain('额度未知，继续参与模型调度')
+    expect(root.querySelector('[data-testid="provider-model-availability"]')?.classList).toContain('text-amber-700')
+    expect(root.querySelector('[data-testid="provider-generic-quota-status"]')?.textContent)
+      .toContain('额度查询失败，额度未知')
+    expect(root.textContent).toContain('套餐类型 团队版')
+    unmount()
+  })
+
+  it('renders successful model-probe evidence for an ambiguous Zhipu quota', () => {
+    const { root, unmount } = mount(ProviderGenericQuotaCard, {
+      providerType: 'zhipu',
+      modelProbe: { status: 'ok', model: 'glm-5', status_code: 200 },
+      quota: {
+        provider_type: 'zhipu', kind: 'balance', code: 'ok', exhausted: false,
+        token_plan_status: 'query_failed', token_plan_scheduling_blocked: false,
+        balance_insufficient: true, balances: [{ unit: 'CNY', available: '0' }],
+      },
+    })
+
+    const availability = root.querySelector('[data-testid="provider-model-availability"]')
+    expect(availability?.textContent).toContain('模型调用已验证可用')
+    expect(availability?.textContent).toContain('额度查询失败，额度未知')
+    expect(availability?.classList).toContain('text-emerald-700')
+    expect(root.querySelector('[data-testid="provider-balance-panel"]')).toBeNull()
+    unmount()
+  })
+
+  it('renders failed model-probe evidence for an unavailable Zhipu key', () => {
+    const { root, unmount } = mount(ProviderGenericQuotaCard, {
+      providerType: 'zhipu',
+      modelProbe: {
+        status: 'failed', model: 'glm-5', status_code: 429,
+        error: '余额不足或无可用资源包',
+      },
+      quota: {
+        provider_type: 'zhipu', kind: 'balance', code: 'ok', exhausted: false,
+        token_plan_status: 'query_failed', token_plan_scheduling_blocked: false,
+        balance_insufficient: true, balances: [{ unit: 'CNY', available: '0' }],
+      },
+    })
+
+    const availability = root.querySelector('[data-testid="provider-model-availability"]')
+    expect(availability?.textContent).toContain('模型调用验证失败')
+    expect(availability?.textContent).toContain('余额不足或无可用资源包')
+    expect(availability?.classList).toContain('text-red-700')
+    unmount()
+  })
+
+  it('emits a manual refresh from the generic quota header', () => {
+    const onRefresh = vi.fn()
+    const { root, unmount } = mount(ProviderGenericQuotaCard, {
+      providerType: 'zhipu',
+      refreshable: true,
+      onRefresh,
+      quota: {
+        provider_type: 'zhipu', kind: 'balance', code: 'ok', exhausted: false,
+        balances: [{ unit: 'CNY', available: '12.5' }],
+      },
+    })
+
+    const refresh = root.querySelector<HTMLButtonElement>('[data-testid="provider-quota-header-refresh"]')
+    expect(refresh?.getAttribute('aria-label')).toBe('刷新额度')
+    expect(refresh?.disabled).toBe(false)
+    refresh?.click()
+    expect(onRefresh).toHaveBeenCalledTimes(1)
     unmount()
   })
 
@@ -83,7 +166,7 @@ describe('provider quota display components', () => {
     unmount()
   })
 
-  it('retains last-good balance while reporting a refresh failure', () => {
+  it('hides a retained DeepSeek balance after a refresh failure', () => {
     const { root, unmount } = mount(ProviderGenericQuotaCard, {
       providerType: 'deepseek',
       quota: {
@@ -93,8 +176,11 @@ describe('provider quota display components', () => {
       },
     })
 
-    expect(root.textContent).toContain('47.730000000000000001 CNY')
-    expect(root.textContent).toContain('temporary upstream failure')
+    expect(root.querySelector('[data-testid="provider-quota-header-status"]')).toBeNull()
+    expect(root.querySelector('[data-testid="provider-generic-quota-status"]')).toBeNull()
+    expect(root.textContent).not.toContain('47.730000000000000001 CNY')
+    expect(root.textContent).not.toContain('temporary upstream failure')
+    expect(root.textContent).not.toContain('数据已过期')
     unmount()
   })
 
@@ -154,6 +240,46 @@ describe('provider quota display components', () => {
     expect(root.querySelector('[data-testid="provider-balance-panel"]')?.textContent).toContain('可用余额$9.25')
     expect(root.querySelector('[data-testid="provider-quota-progress-row"]')).toBeFalsy()
     unmount()
+  })
+
+  it('renders DeepSeek as unavailable without a retained balance after quota failure', () => {
+    const { root, unmount } = mount(ProviderGenericQuotaCard, {
+      providerType: 'deepseek',
+      quota: {
+        provider_type: 'deepseek', kind: 'balance', code: 'transport_failed',
+        exhausted: false, freshness: 'stale',
+        balances: [{ unit: 'USD', available: '9.25' }],
+        refresh_state: { error: 'transport_failed: quota upstream transport failed' },
+      },
+    })
+
+    expect(root.querySelector('[data-testid="provider-balance-panel"]')).toBeNull()
+    expect(root.querySelector('[data-testid="provider-quota-header-status"]')).toBeNull()
+    expect(root.querySelector('[data-testid="provider-generic-quota-status"]')).toBeNull()
+    expect(root.textContent).not.toContain('数据已过期')
+    expect(root.textContent).not.toContain('$9.25')
+    unmount()
+  })
+
+  it('hides retained balances and raw authentication errors for generic providers', () => {
+    for (const providerType of ['openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai']) {
+      const { root, unmount } = mount(ProviderGenericQuotaCard, {
+        providerType,
+        quota: {
+          provider_type: providerType, kind: 'balance', code: 'http_unauthorized',
+          exhausted: false, freshness: 'stale',
+          balances: [{ unit: 'CNY', available: '88.5' }],
+          refresh_state: { error: 'http_unauthorized: quota upstream rejected authentication' },
+        },
+      })
+
+      expect(root.querySelector('[data-testid="provider-balance-panel"]')).toBeNull()
+      expect(root.querySelector('[data-testid="provider-generic-quota-status"]')).toBeNull()
+      expect(root.textContent).not.toContain('数据已过期')
+      expect(root.textContent).not.toContain('http_unauthorized')
+      expect(root.textContent).not.toContain('88.5 CNY')
+      unmount()
+    }
   })
 
   for (const providerType of ['deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai']) {
@@ -275,6 +401,7 @@ describe('provider quota display components', () => {
           title: 'Account quota',
           loading: true,
           updatedText: '10:30',
+          refreshable: true,
         })
       },
     })
@@ -284,6 +411,8 @@ describe('provider quota display components', () => {
     expect(root.textContent).toContain('Account quota')
     expect(root.querySelector('[data-testid="provider-quota-header-loading"]')).toBeTruthy()
     expect(root.querySelector('[data-testid="provider-quota-header-updated"]')?.textContent).toBe('10:30')
+    expect(root.querySelector('[data-testid="provider-quota-header-status"]')).toBeNull()
+    expect(root.querySelector<HTMLButtonElement>('[data-testid="provider-quota-header-refresh"]')?.disabled).toBe(true)
 
     unmount()
   })

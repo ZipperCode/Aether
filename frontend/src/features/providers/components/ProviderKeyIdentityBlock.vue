@@ -49,6 +49,15 @@
       >
         {{ quotaTypeLabel }}
       </Badge>
+
+      <Badge
+        v-if="quotaStatusLabel"
+        variant="destructive"
+        class="h-4 shrink-0 px-1.5 py-0 text-[9px] font-semibold"
+        data-testid="provider-key-quota-status"
+      >
+        {{ quotaStatusLabel }}
+      </Badge>
     </div>
 
     <div class="flex items-center gap-1">
@@ -172,6 +181,7 @@ const props = withDefaults(defineProps<{
   kiroSubscriptionLabel?: string | null
   kiroSubscriptionClass?: string
   quotaTypeLabel?: string | null
+  quotaStatusLabel?: string | null
   canExportCredential?: boolean
   showOAuthRefreshControl?: boolean
   accountLevelBlock?: boolean
@@ -189,6 +199,7 @@ const props = withDefaults(defineProps<{
   kiroSubscriptionLabel: null,
   kiroSubscriptionClass: '',
   quotaTypeLabel: null,
+  quotaStatusLabel: null,
   canExportCredential: false,
   showOAuthRefreshControl: false,
   accountLevelBlock: false,

@@ -25,8 +25,58 @@ describe('providerKeyQuota', () => {
       rateLimits: ['RPM 60', 'TPM 100000'],
       status: ['数据已过期', '上游暂时不可用'],
     })
-    expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'deepseek'))
+    expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'siliconflow'))
       .toBe('可用 $12.50 / 总额 $20 | 月度 剩余 800/1000 | RPM 60 | TPM 100000')
+  })
+
+  it('shows DeepSeek as unavailable without retained balance when quota refresh fails', () => {
+    const quota = {
+      provider_type: 'deepseek',
+      kind: 'balance',
+      code: 'http_server_error',
+      exhausted: false,
+      freshness: 'stale',
+      balances: [{ unit: 'CNY', available: '88.5', total: '88.5' }],
+      refresh_state: {
+        last_attempt_at: 1_700_000_100,
+        last_success_at: 1_700_000_000,
+        error: 'http_server_error: quota upstream returned an error',
+      },
+    } as const
+
+    expect(getGenericQuotaSections(quota)).toEqual({
+      balances: [],
+      windows: [],
+      rateLimits: [],
+      status: ['不可用'],
+    })
+    expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'deepseek'))
+      .toBe('不可用')
+  })
+
+  it('treats quota authentication rejection as expired for every generic provider', () => {
+    for (const providerType of ['openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai']) {
+      const quota = {
+        provider_type: providerType,
+        kind: 'balance',
+        code: 'http_unauthorized',
+        exhausted: false,
+        freshness: 'stale',
+        balances: [{ unit: 'CNY', available: '88.5' }],
+        refresh_state: {
+          error: 'http_unauthorized: quota upstream rejected authentication',
+        },
+      } as const
+
+      expect(getGenericQuotaSections(quota, providerType)).toEqual({
+        balances: [],
+        windows: [],
+        rateLimits: [],
+        status: ['不可用'],
+      })
+      expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, providerType))
+        .toBe('不可用')
+    }
   })
 
   it('preserves decimal strings beyond Number precision', () => {
@@ -43,6 +93,81 @@ describe('providerKeyQuota', () => {
     expect(getGenericQuotaSections(quota).balances).toEqual([
       '可用 9,007,199,254,740,993.123456789012345678 CNY / 总额 9,007,199,254,740,994.000000000000000001 CNY',
     ])
+  })
+
+  it('treats a Zhipu zero-balance fallback as unknown without model-probe evidence', () => {
+    const quota = {
+      provider_type: 'zhipu',
+      kind: 'balance',
+      code: 'ok',
+      exhausted: false,
+      balance_insufficient: true,
+      token_plan_status: 'query_failed',
+      token_plan_scheduling_blocked: false,
+      token_plan_error: 'upstream business code 500: quota upstream returned a business error',
+      balances: [{ unit: 'CNY', available: '0' }],
+    } as const
+
+    expect(getGenericQuotaSections(quota)).toEqual({
+      balances: [],
+      windows: [],
+      rateLimits: [],
+      status: ['额度查询失败，额度未知'],
+    })
+    expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'zhipu'))
+      .toBe('额度未知，继续参与模型调度')
+  })
+
+  it('uses a successful model probe to distinguish a callable Zhipu key', () => {
+    const quota = {
+      provider_type: 'zhipu', kind: 'balance', code: 'ok', exhausted: false,
+      balance_insufficient: true, balance_status: 'insufficient',
+      token_plan_status: 'query_failed', token_plan_scheduling_blocked: false,
+      balances: [{ unit: 'CNY', available: '0' }],
+    } as const
+
+    expect(getQuotaDisplayText({
+      status_snapshot: {
+        quota,
+        model_probe: {
+          status: 'ok', model: 'glm-5', tested_at: 1_700_000_000,
+          status_code: 200, source: 'admin_model_test',
+        },
+      },
+    } as never, 'zhipu')).toBe('模型调用已验证可用 · 额度查询失败，额度未知')
+  })
+
+  it('uses a failed model probe to distinguish a truly unavailable Zhipu key', () => {
+    const quota = {
+      provider_type: 'zhipu', kind: 'balance', code: 'ok', exhausted: false,
+      balance_insufficient: true, balance_status: 'insufficient',
+      token_plan_status: 'query_failed', token_plan_scheduling_blocked: false,
+      balances: [{ unit: 'CNY', available: '0' }],
+    } as const
+
+    expect(getQuotaDisplayText({
+      status_snapshot: {
+        quota,
+        model_probe: {
+          status: 'failed', model: 'glm-5', tested_at: 1_700_000_001,
+          status_code: 429, error: '余额不足或无可用资源包', source: 'admin_model_test',
+        },
+      },
+    } as never, 'zhipu')).toBe('模型调用验证失败：余额不足或无可用资源包')
+  })
+
+  it('translates a stale Zhipu 1113 error into an actionable balance status', () => {
+    const quota = {
+      provider_type: 'zhipu',
+      code: 'http_client_error',
+      exhausted: false,
+      freshness: 'stale',
+      refresh_state: {
+        error: 'http_client_error: upstream business code 1113: account balance is insufficient',
+      },
+    } as const
+
+    expect(getGenericQuotaSections(quota).status).toEqual(['数据已过期', '余额不足'])
   })
 
   it('includes Codex Spark quota windows in display text', () => {

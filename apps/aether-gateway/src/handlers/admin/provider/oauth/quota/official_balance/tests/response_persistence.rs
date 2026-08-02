@@ -226,6 +226,7 @@ fn http_200_business_error_preserves_zhipu_reason_instead_of_parse_failed() {
     assert_eq!(*status_code, 200);
     assert_eq!(*class, StableErrorClass::HttpClient);
     assert_eq!(*upstream_code, Some(1315));
+    assert!(should_retry_zhipu_team_quota(&attempt));
     assert!(should_fallback_to_zhipu_balance(&attempt));
     assert_eq!(
         detail,
@@ -385,9 +386,66 @@ fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
     let AttemptResult::Success { snapshot, .. } = decorated else {
         panic!("expected decorated balance fallback");
     };
-    assert!(snapshot.exhausted);
+    assert!(!snapshot.exhausted);
     assert_eq!(snapshot.extensions["token_plan_status"], "business_error");
-    assert_eq!(snapshot.extensions["token_plan_scheduling_blocked"], true);
+    assert_eq!(snapshot.extensions["token_plan_scheduling_blocked"], false);
+}
+
+#[test]
+fn zhipu_business_500_retries_team_quota_then_uses_informational_balance() {
+    let primary = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "zhipu-personal-plan-500".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body: Some(ResponseBody {
+                json_body: Some(json!({"code": 500, "success": false})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Subscription,
+        "zhipu",
+    );
+    assert!(should_retry_zhipu_team_quota(&primary));
+    assert!(should_fallback_to_zhipu_balance(&primary));
+
+    let decorated = apply_zhipu_token_plan_fallback_policy(
+        &primary,
+        AttemptResult::Success {
+            snapshot: ProviderQuotaSnapshotContract::balance("zhipu", Vec::new()),
+            status_code: 200,
+            quota_kind: QuotaKind::Balance,
+        },
+    );
+    let AttemptResult::Success { snapshot, .. } = decorated else {
+        panic!("expected informational balance fallback");
+    };
+    assert!(!snapshot.exhausted);
+    assert_eq!(snapshot.extensions["token_plan_status"], "query_failed");
+    assert_eq!(snapshot.extensions["token_plan_scheduling_blocked"], false);
+    assert_eq!(
+        snapshot.extensions["token_plan_error"],
+        "upstream business code 500: quota upstream returned a business error"
+    );
+}
+
+#[test]
+fn zhipu_team_quota_success_records_scope() {
+    let attempt = apply_zhipu_plan_scope(
+        AttemptResult::Success {
+            snapshot: ProviderQuotaSnapshotContract::subscription("zhipu", Vec::new(), 100),
+            status_code: 200,
+            quota_kind: QuotaKind::Subscription,
+        },
+        "team",
+    );
+    let AttemptResult::Success { snapshot, .. } = attempt else {
+        panic!("expected team quota success");
+    };
+    assert_eq!(snapshot.extensions["token_plan_scope"], "team");
 }
 
 #[test]
@@ -426,6 +484,34 @@ fn zhipu_balance_kind_uses_standard_account_parser() {
     assert_eq!(snapshot.kind, ProviderQuotaSnapshotKind::Balance);
     assert_eq!(snapshot.balances[0].available.as_deref(), Some("12.50"));
     assert_eq!(snapshot.extensions["balance_source"], "standard_api");
+    assert_eq!(snapshot.extensions["balance_insufficient"], false);
+}
+
+#[test]
+fn zhipu_balance_business_1113_becomes_a_structured_insufficient_balance() {
+    let attempt = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "zhipu-balance-insufficient".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body: Some(ResponseBody {
+                json_body: Some(json!({"code": 1113, "success": false})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Balance,
+        "zhipu",
+    );
+
+    let AttemptResult::Success { snapshot, .. } = attempt else {
+        panic!("expected structured insufficient balance");
+    };
+    assert_eq!(snapshot.balances[0].available.as_deref(), Some("0"));
+    assert_eq!(snapshot.extensions["balance_insufficient"], true);
+    assert_eq!(snapshot.extensions["balance_status"], "insufficient");
 }
 
 #[test]

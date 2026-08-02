@@ -125,6 +125,12 @@ export interface QuotaStatusSnapshot {
   reset_seconds?: number | null
   plan_type?: string | null
   pool_tier?: string | null
+  token_plan_scope?: 'personal' | 'team' | string | null
+  token_plan_status?: string | null
+  token_plan_error?: string | null
+  token_plan_scheduling_blocked?: boolean | null
+  balance_status?: string | null
+  balance_insufficient?: boolean | null
   credits?: QuotaCreditsSnapshot | null
   reset_credits?: QuotaResetCreditsSnapshot | null
   allowed_models_count?: number | null
@@ -150,8 +156,19 @@ export interface QuotaStatusSnapshot {
   windows?: QuotaWindowSnapshot[] | null
 }
 
+export interface ModelProbeStatusSnapshot {
+  status: 'ok' | 'failed' | string
+  model?: string | null
+  api_format?: string | null
+  tested_at?: number | null
+  status_code?: number | null
+  error?: string | null
+  source?: 'admin_model_test' | string | null
+}
+
 export interface ProviderKeyStatusSnapshot {
   oauth: OAuthStatusSnapshot
   account: AccountStatusSnapshot
   quota: QuotaStatusSnapshot
+  model_probe?: ModelProbeStatusSnapshot | null
 }

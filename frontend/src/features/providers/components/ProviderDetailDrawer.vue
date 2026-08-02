@@ -134,6 +134,7 @@
                           :kiro-subscription-label="shouldShowKiroSubscriptionBadge(key) ? getKiroSubscriptionBadgeLabel(key) : null"
                           :kiro-subscription-class="shouldShowKiroSubscriptionBadge(key) ? getOAuthPlanTypeClass(getKiroSubscriptionBadgeLabel(key)) : ''"
                           :quota-type-label="getGenericQuotaTypeLabel(key)"
+                          :quota-status-label="getGenericQuotaStatusLabel(key)"
                           :can-export-credential="canExportOAuthCredential(key)"
                           :show-o-auth-refresh-control="shouldShowOAuthRefreshControl(key, provider.provider_type)"
                           :account-level-block="isAccountLevelBlock(key)"
@@ -178,8 +179,12 @@
                     <ProviderGenericQuotaCard
                       v-if="shouldShowGenericQuotaCard(key)"
                       :quota="key.status_snapshot?.quota"
-                      :loading="refreshingQuota"
+                      :model-probe="key.status_snapshot?.model_probe"
+                      :loading="isQuotaRefreshingForKey(key)"
                       :provider-type="getGenericQuotaProviderType(key)"
+                      :refreshable="key.is_active"
+                      :refresh-disabled="refreshingQuota && !isQuotaRefreshingForKey(key)"
+                      @refresh="handleManualQuotaRefresh(key)"
                     />
                     <!-- Codex 上游额度信息（仅当有元数据时显示） -->
                     <div
@@ -1055,7 +1060,10 @@ import {
   getOAuthStatusDisplayWithFallback,
   getOAuthStatusTitle as resolveOAuthStatusTitle,
 } from '@/utils/providerKeyStatus'
-import { getGeminiCliAccountCreditsText } from '@/utils/providerKeyQuota'
+import {
+  getGeminiCliAccountCreditsText,
+  isGenericQuotaUnavailable,
+} from '@/utils/providerKeyQuota'
 import { selectOpenProviderSnapshot } from '@/features/providers/utils/providerOpenState'
 import ProviderGenericQuotaCard from './ProviderGenericQuotaCard.vue'
 import {
@@ -1177,8 +1185,9 @@ const clearingOAuthInvalidKeyId = ref<string | null>(null)
 // Codex reset credit 消费状态
 const consumingCodexResetCreditKeyId = ref<string | null>(null)
 
-// 限额刷新状态（Codex / Antigravity）
+// 限额刷新状态
 const refreshingQuota = ref(false)
+const refreshingQuotaKeyId = ref<string | null>(null)
 
 // Antigravity 配额详情弹窗状态
 const antigravityQuotaDialogOpen = ref(false)
@@ -1856,6 +1865,13 @@ function getGenericQuotaTypeLabel(key: EndpointAPIKey): string | null {
   const quota = key.status_snapshot?.quota
   if (quota?.kind === 'subscription' || (quota?.windows?.length ?? 0) > 0) return 'Token'
   return quota?.balances?.[0]?.unit?.trim().toUpperCase() || null
+}
+
+function getGenericQuotaStatusLabel(key: EndpointAPIKey): string | null {
+  return isGenericQuotaUnavailable(
+    key.status_snapshot?.quota,
+    getGenericQuotaProviderType(key),
+  ) ? 'Expired' : null
 }
 
 function getQuotaSnapshotForProvider(
@@ -2786,6 +2802,7 @@ function applyQuotaResults(
           ...(target.status_snapshot?.quota ?? {}),
           ...r.quota_snapshot,
         },
+        model_probe: target.status_snapshot?.model_probe ?? null,
       }
       changed = true
     }
@@ -2795,6 +2812,38 @@ function applyQuotaResults(
     }
   }
   return applied
+}
+
+function isQuotaRefreshingForKey(key: EndpointAPIKey): boolean {
+  return refreshingQuota.value
+    && (refreshingQuotaKeyId.value == null || refreshingQuotaKeyId.value === key.id)
+}
+
+async function handleManualQuotaRefresh(key: EndpointAPIKey): Promise<void> {
+  const providerId = props.providerId
+  if (!providerId || !key.is_active || refreshingQuota.value) return
+
+  refreshingQuota.value = true
+  refreshingQuotaKeyId.value = key.id
+  try {
+    // 手动刷新只请求当前 Key；后端 Manual source 会绕过后台刷新退避。
+    const result = await refreshProviderQuota(providerId, [key.id])
+    applyQuotaResults(result.results)
+    emit('refresh')
+
+    if (result.success > 0) {
+      showSuccess(legacyT('额度已刷新'))
+      return
+    }
+    const detail = result.results.find(item => item.key_id === key.id)?.message?.trim()
+      || '没有获取到额度信息，请检查 Key 和官方 Endpoint'
+    showError(legacyT(detail), legacyT('额度刷新失败'))
+  } catch (err: unknown) {
+    showError(localizedApiError(err, '额度刷新失败'), legacyT('错误'))
+  } finally {
+    refreshingQuotaKeyId.value = null
+    refreshingQuota.value = false
+  }
 }
 
 // 通用的自动刷新配额函数，覆盖 OAuth 账号和支持额度查询的 Key 型提供商。
@@ -2858,6 +2907,7 @@ async function autoRefreshQuotaInBackground(): Promise<boolean> {
     hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && quotaSnapshotHasDisplayData(key.status_snapshot?.quota))
   }
 
+  refreshingQuotaKeyId.value = null
   refreshingQuota.value = true
   try {
     const result = await refreshProviderQuota(providerId)

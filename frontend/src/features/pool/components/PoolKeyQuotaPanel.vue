@@ -7,13 +7,31 @@
       {{ legacyT('配额') }}
     </div>
     <div
-      v-if="balanceSummaries.length || effectiveItems.length"
+      v-if="modelAvailability"
+      class="mb-2 rounded-md border px-2 py-1.5 text-[10px] leading-4"
+      :class="modelAvailabilityClass"
+      data-testid="pool-model-availability"
+    >
+      <div class="font-medium">{{ legacyT(modelAvailability.title) }}</div>
+      <div v-if="modelAvailability.detail" class="mt-0.5 opacity-80">
+        {{ legacyT(modelAvailability.detail) }}
+      </div>
+    </div>
+    <div
+      v-if="quotaUnavailable"
+      class="rounded-md border border-red-500/30 bg-red-500/5 px-2 py-1.5 text-[10px] font-medium text-red-700 dark:text-red-300"
+      data-testid="pool-quota-unavailable"
+    >
+      {{ legacyT('不可用') }}
+    </div>
+    <div
+      v-else-if="balanceSummaries.length || effectiveItems.length"
       class="space-y-2"
     >
       <div v-for="balance in balanceSummaries" :key="balance.unit" class="rounded-md border border-border/50 bg-background/50 px-2 py-1.5" data-testid="pool-quota-balance">
         <div class="flex items-center justify-between gap-2 text-[10px]">
-          <span class="text-muted-foreground">{{ legacyT('可用余额') }}</span>
-          <span data-testid="pool-quota-available" class="min-w-0 text-right text-sm font-semibold tabular-nums" :class="[balance.isNegative ? 'text-red-600 dark:text-red-400' : 'text-foreground', balance.wrapClass]">{{ balance.available }}</span>
+          <span class="text-muted-foreground">{{ legacyT(balance.insufficient ? balance.informational ? '标准余额不足' : '余额不足' : balance.informational ? '标准余额' : '可用余额') }}</span>
+          <span data-testid="pool-quota-available" class="min-w-0 text-right text-sm font-semibold tabular-nums" :class="[balance.insufficient ? balance.informational ? 'text-amber-600 dark:text-amber-400' : 'text-red-600 dark:text-red-400' : 'text-foreground', balance.wrapClass]">{{ balance.available }}</span>
         </div>
         <div v-if="balance.remainingPercent != null" class="mt-1 flex items-center gap-1.5">
           <div class="relative h-1.5 flex-1 overflow-hidden rounded-full bg-border">
@@ -36,13 +54,13 @@
       </div>
     </div>
     <div
-      v-else-if="accountQuotaText || fallbackText"
+      v-else-if="!modelAvailability && (accountQuotaText || fallbackText)"
       :class="textClass"
     >
       {{ accountQuotaText || fallbackText }}
     </div>
     <div
-      v-else
+      v-else-if="!modelAvailability"
       class="text-muted-foreground"
     >
       {{ supportsStructuredQuota ? legacyT('暂无额度数据') : '-' }}
@@ -51,13 +69,30 @@
 
   <template v-else>
     <div
-      v-if="balanceSummaries.length || effectiveItems.length"
+      v-if="modelAvailability"
+      class="max-w-[208px] rounded-md border px-2 py-1.5 text-[10px] leading-4"
+      :class="modelAvailabilityClass"
+      data-testid="pool-model-availability"
+    >
+      <div class="font-medium">{{ legacyT(modelAvailability.title) }}</div>
+      <div v-if="modelAvailability.detail" class="mt-0.5 opacity-80">
+        {{ legacyT(modelAvailability.detail) }}
+      </div>
+    </div>
+    <span
+      v-if="quotaUnavailable"
+      class="inline-flex rounded-md border border-red-500/30 bg-red-500/5 px-2 py-1 text-[10px] font-medium text-red-700 dark:text-red-300"
+      data-testid="pool-quota-unavailable"
+    >{{ legacyT('不可用') }}</span>
+    <div
+      v-else-if="balanceSummaries.length || effectiveItems.length"
       class="max-w-[208px] space-y-2"
+      :class="modelAvailability ? 'mt-2' : ''"
     >
       <div v-for="balance in balanceSummaries" :key="balance.unit" class="rounded-md border border-border/50 bg-muted/20 px-2 py-1.5" data-testid="pool-quota-balance">
         <div class="flex items-center justify-between gap-2 text-[10px] leading-none">
-          <span class="text-muted-foreground">{{ legacyT('余额') }}</span>
-          <span data-testid="pool-quota-available" class="min-w-0 text-right text-sm font-semibold tabular-nums" :class="[balance.isNegative ? 'text-red-600 dark:text-red-400' : 'text-foreground', balance.wrapClass]">{{ balance.available }}</span>
+          <span class="text-muted-foreground">{{ legacyT(balance.insufficient ? balance.informational ? '标准余额不足' : '余额不足' : balance.informational ? '标准余额' : '余额') }}</span>
+          <span data-testid="pool-quota-available" class="min-w-0 text-right text-sm font-semibold tabular-nums" :class="[balance.insufficient ? balance.informational ? 'text-amber-600 dark:text-amber-400' : 'text-red-600 dark:text-red-400' : 'text-foreground', balance.wrapClass]">{{ balance.available }}</span>
         </div>
         <div v-if="balance.remainingPercent != null" class="mt-1.5 flex items-center gap-1.5">
           <div class="relative h-1.5 flex-1 overflow-hidden rounded-full bg-border">
@@ -76,13 +111,13 @@
       </div>
     </div>
     <span
-      v-else-if="accountQuotaText || fallbackText"
+      v-else-if="!modelAvailability && (accountQuotaText || fallbackText)"
       :class="textClass"
     >
       {{ accountQuotaText || fallbackText }}
     </span>
     <span
-      v-else
+      v-else-if="!modelAvailability"
       class="text-xs text-muted-foreground"
     >{{ supportsStructuredQuota ? legacyT('待刷新') : '-' }}</span>
   </template>
@@ -91,8 +126,14 @@
 <script setup lang="ts">
 import { computed, defineComponent, h, type PropType } from 'vue'
 import { useI18n } from '@/i18n'
-import type { QuotaStatusSnapshot } from '@/api/endpoints/types'
-import { formatDecimalDisplay } from '@/utils/providerKeyQuota'
+import type { ModelProbeStatusSnapshot, QuotaStatusSnapshot } from '@/api/endpoints/types'
+import {
+  formatDecimalDisplay,
+  getZhipuModelAvailabilityDisplay,
+  isGenericQuotaUnavailable,
+  isZhipuAmbiguousQuotaFallback,
+  isZhipuInformationalBalanceFallback,
+} from '@/utils/providerKeyQuota'
 
 export interface PoolQuotaProgressDisplayItem {
   label: string
@@ -107,6 +148,7 @@ export interface PoolQuotaProgressDisplayItem {
 const props = withDefaults(defineProps<{
   items: PoolQuotaProgressDisplayItem[]
   quota?: QuotaStatusSnapshot | null
+  modelProbe?: ModelProbeStatusSnapshot | null
   providerType?: string | null
   accountQuotaText?: string | null
   fallbackText?: string | null
@@ -115,6 +157,7 @@ const props = withDefaults(defineProps<{
 }>(), {
   accountQuotaText: null,
   quota: null,
+  modelProbe: null,
   providerType: null,
   fallbackText: null,
   textClass: '',
@@ -125,6 +168,29 @@ const { legacyT } = useI18n()
 const supportsStructuredQuota = computed(() => [
   'deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai',
 ].includes(props.providerType?.trim().toLowerCase() || ''))
+const informationalBalanceFallback = computed(() => (
+  isZhipuInformationalBalanceFallback(props.quota, props.providerType)
+))
+const quotaUnavailable = computed(() => (
+  isGenericQuotaUnavailable(props.quota, props.providerType)
+))
+const ambiguousQuotaFallback = computed(() => (
+  isZhipuAmbiguousQuotaFallback(props.quota, props.providerType)
+))
+const modelAvailability = computed(() => getZhipuModelAvailabilityDisplay(
+  props.quota,
+  props.modelProbe,
+  props.providerType,
+))
+const modelAvailabilityClass = computed(() => {
+  if (modelAvailability.value?.status === 'ok') {
+    return 'border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300'
+  }
+  if (modelAvailability.value?.status === 'failed') {
+    return 'border-red-500/30 bg-red-500/5 text-red-700 dark:text-red-300'
+  }
+  return 'border-amber-500/30 bg-amber-500/5 text-amber-700 dark:text-amber-300'
+})
 
 function number(value: unknown): number | null {
   if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '') return null
@@ -148,6 +214,8 @@ function remainingTone(remaining: number): { barClass: string; meterClass: strin
 
 const balanceSummaries = computed(() => {
   if (!supportsStructuredQuota.value) return []
+  if (quotaUnavailable.value) return []
+  if (ambiguousQuotaFallback.value) return []
   return (props.quota?.balances ?? []).flatMap((balance) => {
     const available = amount(balance.available, balance.unit)
     const used = amount(balance.used, balance.unit)
@@ -166,7 +234,9 @@ const balanceSummaries = computed(() => {
     return [{
       unit: balance.unit,
       available: available || legacyT('无限制'),
-      isNegative: availableNumber != null && availableNumber < 0,
+      insufficient: props.quota?.balance_insufficient === true
+        || (availableNumber != null && availableNumber <= 0),
+      informational: informationalBalanceFallback.value,
       wrapClass: (available || legacyT('无限制')).length <= 24
         ? 'whitespace-nowrap'
         : 'break-all',
@@ -178,6 +248,7 @@ const balanceSummaries = computed(() => {
 })
 
 const effectiveItems = computed<PoolQuotaProgressDisplayItem[]>(() => {
+  if (quotaUnavailable.value) return []
   if (props.items.length) return props.items
   if (!supportsStructuredQuota.value) return []
   return (props.quota?.windows ?? []).flatMap((window) => {

@@ -58,4 +58,30 @@ describe('ProviderDetailDrawer loading priorities', () => {
   it('marks a transport-error stop policy as a configured failover rule', () => {
     expect(source).toContain('rules.stop_on_transport_errors === true')
   })
+
+  it('wires generic quota cards to a single-key manual refresh', () => {
+    expect(source).toContain(':loading="isQuotaRefreshingForKey(key)"')
+    expect(source).toContain(':refreshable="key.is_active"')
+    expect(source).toContain(':model-probe="key.status_snapshot?.model_probe"')
+    expect(source).toContain('@refresh="handleManualQuotaRefresh(key)"')
+
+    const handler = source
+      .split('async function handleManualQuotaRefresh(key: EndpointAPIKey): Promise<void> {')[1]
+      ?.split('// 通用的自动刷新配额函数')[0]
+    expect(handler).toBeTruthy()
+    expect(handler).toContain('refreshProviderQuota(providerId, [key.id])')
+    expect(handler).toContain('applyQuotaResults(result.results)')
+    expect(source).toContain('model_probe: target.status_snapshot?.model_probe ?? null')
+  })
+
+  it('moves generic quota-unavailable markers beside the key name', () => {
+    expect(source).toContain(':quota-status-label="getGenericQuotaStatusLabel(key)"')
+
+    const helper = source
+      .split('function getGenericQuotaStatusLabel(key: EndpointAPIKey): string | null {')[1]
+      ?.split('function getQuotaSnapshotForProvider')[0]
+    expect(helper).toBeTruthy()
+    expect(helper).toContain('isGenericQuotaUnavailable(')
+    expect(helper).toContain("? 'Expired' : null")
+  })
 })

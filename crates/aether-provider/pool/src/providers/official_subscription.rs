@@ -230,19 +230,55 @@ fn zhipu_window(limit: ZhipuQuotaLimit) -> Option<ProviderQuotaWindow> {
         .map(|percentage| percentage / 100.0);
     let unit = zhipu_u64(limit.unit.as_ref());
     let number = zhipu_u64(limit.number.as_ref());
-    let (code, label, window_minutes) = match (limit_type.as_str(), unit, number) {
+    let (code, label, quota_unit, window_minutes) = match (limit_type.as_str(), unit, number) {
         ("TOKENS_LIMIT", Some(3), Some(5)) => (
             "tokens_5h".to_string(),
             "5小时 Token 配额".to_string(),
+            "tokens".to_string(),
             Some(300),
         ),
         ("TOKENS_LIMIT", Some(6), Some(1)) => (
             "tokens_weekly".to_string(),
             "每周 Token 配额".to_string(),
+            "tokens".to_string(),
             Some(7 * 24 * 60),
         ),
-        ("TOKENS_LIMIT", _, _) => ("tokens_limit".to_string(), "Token 配额".to_string(), None),
-        _ => (limit_type.to_ascii_lowercase(), limit_type.clone(), None),
+        ("TOKENS_LIMIT", _, _) => (
+            "tokens_limit".to_string(),
+            "Token 配额".to_string(),
+            "tokens".to_string(),
+            None,
+        ),
+        ("CREDIT_LIMIT", Some(3), _) => (
+            "credits_5h".to_string(),
+            "5小时积分".to_string(),
+            "credits".to_string(),
+            Some(300),
+        ),
+        ("CREDIT_LIMIT", Some(6), _) => (
+            "credits_weekly".to_string(),
+            "每周积分".to_string(),
+            "credits".to_string(),
+            Some(7 * 24 * 60),
+        ),
+        ("CREDIT_LIMIT", _, _) => (
+            "credits_limit".to_string(),
+            "积分额度".to_string(),
+            "credits".to_string(),
+            None,
+        ),
+        ("TIME_LIMIT", _, _) => (
+            "time_limit".to_string(),
+            "MCP 月度额度".to_string(),
+            "count".to_string(),
+            None,
+        ),
+        _ => (
+            limit_type.to_ascii_lowercase(),
+            limit_type.clone(),
+            "count".to_string(),
+            None,
+        ),
     };
     let reset_at = zhipu_reset_at(limit.next_reset_time.as_ref().or(limit.reset_at.as_ref()));
     let reset_at_text = limit
@@ -254,7 +290,7 @@ fn zhipu_window(limit: ZhipuQuotaLimit) -> Option<ProviderQuotaWindow> {
         code,
         label,
         scope: "account".into(),
-        unit: "tokens".into(),
+        unit: quota_unit,
         used_value: limit
             .current_value
             .as_ref()
