@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,12 +7,13 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_model_fetch::{
-    apply_model_filters, fetch_models_from_transports, json_string_list,
-    model_catalog_upstream_metadata, model_fetch_interval_minutes,
+    apply_model_filters, fetch_models_from_transports, global_model_matches_allowed_models,
+    json_string_list, model_catalog_upstream_metadata, model_fetch_interval_minutes,
     model_fetch_startup_delay_seconds, model_fetch_startup_enabled, preset_models_for_provider,
     selected_models_fetch_endpoints, sync_provider_model_whitelist_associations,
     upstream_metadata_namespace_updates, ModelFetchAssociationStore, ModelFetchRunSummary,
 };
+use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
@@ -86,6 +87,85 @@ pub(crate) async fn perform_model_fetch_for_keys(
     key_ids: &BTreeSet<String>,
 ) -> Result<ModelFetchRunSummary, GatewayError> {
     perform_model_fetch_for_keys_with_state(state, provider_id, key_ids).await
+}
+
+pub(crate) async fn sync_global_model_provider_associations(
+    state: &AppState,
+    global_model_id: &str,
+) -> Result<(), GatewayError> {
+    if !state.has_provider_catalog_data_reader()
+        || !state.has_global_model_data_reader()
+        || !state.has_global_model_data_writer()
+    {
+        return Ok(());
+    }
+
+    let Some(global_model) = state.get_admin_global_model_by_id(global_model_id).await? else {
+        return Ok(());
+    };
+    if !global_model.is_active {
+        return Ok(());
+    }
+
+    let providers = state.list_provider_catalog_providers(true).await?;
+    if providers.is_empty() {
+        return Ok(());
+    }
+    let provider_ids = providers
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect::<Vec<_>>();
+    let active_provider_ids = provider_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let linked_provider_ids = state
+        .list_admin_provider_models_by_global_model_id(global_model_id)
+        .await?
+        .into_iter()
+        .map(|model| model.provider_id)
+        .collect::<BTreeSet<_>>();
+
+    let mut allowed_models_by_provider = BTreeMap::<String, BTreeSet<String>>::new();
+    for key in state
+        .list_provider_catalog_keys_by_provider_ids(&provider_ids)
+        .await?
+        .into_iter()
+        .filter(|key| key.is_active && active_provider_ids.contains(&key.provider_id))
+    {
+        allowed_models_by_provider
+            .entry(key.provider_id)
+            .or_default()
+            .extend(json_string_list(key.allowed_models.as_ref()));
+    }
+
+    let targets = providers
+        .into_iter()
+        .filter_map(|provider| {
+            let allowed_models = allowed_models_by_provider
+                .remove(&provider.id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let should_sync = linked_provider_ids.contains(&provider.id)
+                || global_model_matches_allowed_models(
+                    &global_model.name,
+                    global_model.config.as_ref(),
+                    &allowed_models,
+                );
+            should_sync.then_some((provider.id, allowed_models))
+        })
+        .collect::<Vec<_>>();
+
+    let results = stream::iter(targets.into_iter().map(
+        |(provider_id, allowed_models)| async move {
+            sync_provider_model_whitelist_associations(state, &provider_id, &allowed_models).await
+        },
+    ))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    for result in results {
+        result.map_err(GatewayError::Internal)?;
+    }
+    Ok(())
 }
 
 async fn perform_model_fetch_once_with_state<S>(
@@ -393,11 +473,8 @@ async fn persist_key_fetch_success(
     allowed_models: &[String],
     upstream_metadata: Option<&Value>,
 ) -> Result<(), GatewayError> {
-    let allowed_models = if allowed_models.is_empty() {
-        None
-    } else {
-        Some(json!(allowed_models))
-    };
+    // 自动获取成功后的空列表表示上游当前没有模型，不能降级成“不限模型”。
+    let allowed_models = json!(allowed_models);
     let upstream_metadata_updates = upstream_metadata
         .map(|upstream_metadata| {
             upstream_metadata_namespace_updates(key.upstream_metadata.as_ref(), upstream_metadata)
@@ -414,7 +491,7 @@ async fn persist_key_fetch_success(
     state
         .update_provider_catalog_key_model_fetch_success(
             &key.id,
-            allowed_models.as_ref(),
+            Some(&allowed_models),
             now_unix_secs,
             &upstream_metadata_updates,
             Some(now_unix_secs),
@@ -572,6 +649,13 @@ mod tests {
         }
 
         async fn create_admin_provider_model(
+            &self,
+            _record: &UpsertAdminProviderModelRecord,
+        ) -> Result<Option<StoredAdminProviderModel>, Self::Error> {
+            Ok(None)
+        }
+
+        async fn update_admin_provider_model(
             &self,
             _record: &UpsertAdminProviderModelRecord,
         ) -> Result<Option<StoredAdminProviderModel>, Self::Error> {
@@ -1213,5 +1297,49 @@ mod tests {
             updated.last_models_fetch_error.as_deref(),
             Some("Provider transport snapshot unavailable")
         );
+    }
+
+    #[tokio::test]
+    async fn model_fetch_success_with_empty_catalog_persists_empty_whitelist() {
+        let provider = sample_provider("provider-openai", "openai");
+        let endpoint = sample_endpoint("endpoint-openai-chat", "provider-openai", "openai:chat");
+        let key = sample_key(
+            "key-openai-chat",
+            "provider-openai",
+            "api_key",
+            &["openai:chat"],
+        );
+        let transport = sample_transport(
+            "openai",
+            "provider-openai",
+            "endpoint-openai-chat",
+            "key-openai-chat",
+            "openai:chat",
+            "api_key",
+            None,
+        );
+        let state = TestState::new(
+            vec![provider],
+            vec![endpoint],
+            vec![key],
+            HashMap::from([(
+                (
+                    "provider-openai".to_string(),
+                    "endpoint-openai-chat".to_string(),
+                    "key-openai-chat".to_string(),
+                ),
+                transport,
+            )]),
+            vec![execution_result(json!({ "data": [] }))],
+        );
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("empty upstream catalog should still be a successful fetch");
+
+        assert_eq!(summary.succeeded, 1);
+        let updated = state.key("key-openai-chat");
+        assert_eq!(updated.allowed_models, Some(json!([])));
+        assert_eq!(updated.last_models_fetch_error, None);
     }
 }

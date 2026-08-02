@@ -812,7 +812,7 @@ async fn gateway_handles_admin_global_model_routing_locally_with_trusted_admin_p
             );
             unlinked_key.name = "unlinked".to_string();
             unlinked_key.internal_priority = 40;
-            unlinked_key.allowed_models = Some(json!(["gpt-5-upstream-shadow"]));
+            unlinked_key.allowed_models = Some(json!(["gpt-5-upstream", "gpt-5-upstream-shadow"]));
 
             vec![primary_key, mapped_key, unlinked_key]
         },
@@ -977,6 +977,7 @@ async fn gateway_handles_admin_global_model_routing_locally_with_trusted_admin_p
         serde_json::from_str(&preview_text).expect("mapping preview json should parse");
     assert_eq!(preview_payload["rules"][0]["matched_key_count"], 2);
     assert_eq!(preview_payload["rules"][0]["matched_model_count"], 2);
+    assert_eq!(preview_payload["rules"][0]["matched_mapping_count"], 3);
     assert_eq!(preview_payload["rules"][0]["matched_provider_count"], 2);
     assert_eq!(
         preview_payload["rules"][0]["unlinked_provider_ids"],
@@ -1148,6 +1149,13 @@ async fn gateway_creates_admin_global_model_locally_with_trusted_admin_principal
         }),
     );
 
+    let mut key = sample_key("key-openai", "provider-openai", "openai:chat", "sk-openai");
+    key.allowed_models = Some(json!(["gpt-5-pro"]));
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-openai", "openai", 10)],
+        Vec::new(),
+        vec![key],
+    ));
     let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(Vec::new()));
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
@@ -1156,6 +1164,7 @@ async fn gateway_creates_admin_global_model_locally_with_trusted_admin_principal
             .expect("gateway should build")
             .with_data_state_for_tests(
                 GatewayDataState::disabled()
+                    .attach_provider_catalog_repository_for_tests(provider_catalog_repository)
                     .with_global_model_repository_for_tests(global_model_repository.clone()),
             ),
     );
@@ -1209,6 +1218,20 @@ async fn gateway_creates_admin_global_model_locally_with_trusted_admin_principal
         created.supported_capabilities,
         Some(json!(["streaming", "vision", "embedding"]))
     );
+    let provider_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-openai".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 10_000,
+        })
+        .await
+        .expect("provider models should load");
+    assert!(provider_models.iter().any(|model| {
+        model.global_model_id == created.id
+            && model.provider_model_name == "gpt-5-pro"
+            && model.is_available
+    }));
 
     gateway_handle.abort();
     upstream_handle.abort();

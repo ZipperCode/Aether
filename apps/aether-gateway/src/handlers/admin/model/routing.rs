@@ -408,6 +408,7 @@ struct MappingRuleMatchSummary {
     key_ids: BTreeSet<String>,
     model_names: BTreeSet<String>,
     provider_ids: BTreeSet<String>,
+    mapping_count: usize,
 }
 
 struct MappingPreviewKeyDetail {
@@ -467,6 +468,7 @@ pub(crate) async fn build_admin_global_model_mapping_preview_payload(
                 summary.key_ids.insert(key.id.clone());
                 summary.model_names.insert(allowed_model.clone());
                 summary.provider_ids.insert(key.provider_id.clone());
+                summary.mapping_count += 1;
                 if expanded_rule_index == Some(rule_index) {
                     expanded_details
                         .entry(key.id.clone())
@@ -505,6 +507,7 @@ pub(crate) async fn build_admin_global_model_mapping_preview_payload(
                 "valid": compiled.rule_is_valid(index),
                 "matched_key_count": summary.key_ids.len(),
                 "matched_model_count": summary.model_names.len(),
+                "matched_mapping_count": summary.mapping_count,
                 "matched_provider_count": summary.provider_ids.len(),
                 "matched_provider_ids": summary.provider_ids.iter().collect::<Vec<_>>(),
                 "unlinked_provider_ids": summary.provider_ids.difference(&linked_provider_ids).collect::<Vec<_>>(),

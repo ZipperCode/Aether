@@ -29,4 +29,10 @@ describe('ModelDetailDrawer lazy loading', () => {
     expect(mappingsSource).toContain('expandedTotalPages > 1')
     expect(mappingsSource).toContain('sequence !== previewSequence')
   })
+
+  it('shows key-model mapping occurrences instead of collapsing duplicate model names', () => {
+    expect(mappingsSource).toContain('matched_mapping_count')
+    expect(mappingsSource).toContain('{{ mappingMatchCounts[index] }} 匹配')
+    expect(mappingsSource).toContain('个上游模型名')
+  })
 })

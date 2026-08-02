@@ -4,7 +4,8 @@
     <div class="p-4 border-b border-border/60">
       <div class="flex items-center justify-between">
         <h3 class="text-sm font-semibold flex items-center gap-2">
-          模型列表
+          已关联模型
+          <span class="text-xs font-normal text-muted-foreground">({{ sortedModels.length }})</span>
         </h3>
         <Button
           variant="outline"
@@ -171,7 +172,7 @@
         v-if="shouldPaginateModels"
         class="px-4 py-2 border-t border-border/40 flex items-center justify-between text-xs text-muted-foreground"
       >
-        <span>共 {{ sortedModels.length }} 个模型</span>
+        <span>共 {{ sortedModels.length }} 个已关联模型</span>
         <div class="flex items-center gap-1.5">
           <Button
             variant="ghost"
@@ -203,7 +204,7 @@
     >
       <Box class="w-12 h-12 mx-auto mb-3 opacity-50" />
       <p class="text-sm">
-        暂无模型
+        暂无已关联模型
       </p>
       <p class="text-xs mt-1">
         请前往"模型目录"页面添加模型

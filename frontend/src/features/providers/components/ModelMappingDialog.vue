@@ -70,7 +70,7 @@
             class="p-2 hover:bg-muted rounded-md transition-colors shrink-0"
             :disabled="fetchingUpstreamModels"
             title="刷新上游模型"
-            @click="fetchUpstreamModels()"
+            @click="fetchUpstreamModels(true)"
           >
             <RefreshCw
               class="w-4 h-4"
@@ -82,7 +82,7 @@
             type="button"
             class="p-2 hover:bg-muted rounded-md transition-colors shrink-0"
             title="从提供商获取模型"
-            @click="fetchUpstreamModels()"
+            @click="fetchUpstreamModels(true)"
           >
             <Zap class="w-4 h-4" />
           </button>
@@ -677,14 +677,16 @@ function toggleGroupCollapse(group: string) {
   collapsedGroups.value = new Set(collapsedGroups.value)
 }
 
-// 从提供商获取模型（使用缓存）
-async function fetchUpstreamModels() {
+// 自动加载可复用缓存；用户主动获取或刷新时绕过缓存。
+async function fetchUpstreamModels(forceRefresh = false) {
   if (!props.providerId) return
   try {
     loadingModels.value = true
     fetchingUpstreamModels.value = true
-    const result = await fetchCachedModels(props.providerId)
-    if (result.models.length > 0) {
+    const result = forceRefresh
+      ? await fetchCachedModels(props.providerId, undefined, true)
+      : await fetchCachedModels(props.providerId)
+    if (!result.error) {
       upstreamModels.value = result.models
       upstreamModelsLoaded.value = true
       // 获取上游模型后，将不在上游列表中的已选名称添加到自定义列表

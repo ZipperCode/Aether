@@ -156,6 +156,53 @@ describe('ModelMappingDialog', () => {
     expect(upstreamModelMocks.fetchModels).toHaveBeenCalledWith('provider-1')
   })
 
+  it('bypasses the backend cache when the refresh button is clicked', async () => {
+    upstreamModelMocks.fetchModels
+      .mockResolvedValueOnce({
+        models: [{ id: 'cached-model', api_formats: [] }],
+        error: null,
+        warning: null,
+      })
+      .mockResolvedValueOnce({
+        models: [{ id: 'fresh-model', api_formats: [] }],
+        error: null,
+        warning: null,
+      })
+    const model = {
+      id: 'model-1',
+      provider_model_name: 'provider-model-1',
+      provider_model_mappings: [],
+    } as Model
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(defineComponent({
+      setup() {
+        return () => h(ModelMappingDialog, {
+          open: true,
+          providerId: 'provider-1',
+          models: [model],
+          hasAutoFetchKey: true,
+        })
+      },
+    }))
+    app.mount(root)
+    mountedApps.push({ app, root })
+
+    await vi.waitFor(() => expect(upstreamModelMocks.fetchModels).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(root.querySelector('[title="刷新上游模型"]')).not.toBeNull())
+    root.querySelector<HTMLButtonElement>('[title="刷新上游模型"]')?.click()
+
+    await vi.waitFor(() => expect(upstreamModelMocks.fetchModels).toHaveBeenCalledTimes(2))
+    expect(upstreamModelMocks.fetchModels).toHaveBeenNthCalledWith(
+      2,
+      'provider-1',
+      undefined,
+      true,
+    )
+    await vi.waitFor(() => expect(root.textContent).toContain('fresh-model'))
+    expect(root.textContent).not.toContain('cached-model')
+  })
+
   it('offers session compaction only for an explicitly selected Responses endpoint', async () => {
     const chatEndpoint = {
       id: 'endpoint-chat',

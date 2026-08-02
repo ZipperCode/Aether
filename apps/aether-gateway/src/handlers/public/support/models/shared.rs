@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+
+use aether_data_contracts::repository::global_models::StoredPublicGlobalModel;
 use aether_data_contracts::repository::model_catalog::StoredModelCatalogEntry;
 
 use super::GatewayPublicRequestContext;
@@ -64,12 +67,19 @@ fn auth_allows_provider(
         })
 }
 
+fn auth_allows_model_name(
+    auth: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
+    model_name: &str,
+) -> bool {
+    auth.and_then(crate::data::auth::GatewayAuthApiKeySnapshot::effective_allowed_models)
+        .is_none_or(|allowed| allowed.iter().any(|value| value == model_name))
+}
+
 fn auth_allows_model(
     auth: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
     row: &StoredModelCatalogEntry,
 ) -> bool {
-    auth.and_then(crate::data::auth::GatewayAuthApiKeySnapshot::effective_allowed_models)
-        .is_none_or(|allowed| allowed.iter().any(|value| value == &row.global_model_name))
+    auth_allows_model_name(auth, &row.global_model_name)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -229,6 +239,35 @@ fn row_supports_format(row: &StoredModelCatalogEntry, api_format: &str) -> bool 
     }
 }
 
+fn global_model_supports_format(model: &StoredPublicGlobalModel, api_format: &str) -> bool {
+    let mut declared = DeclaredFamilies::Absent;
+    if let Some(config) = model.config.as_ref() {
+        merge_declared(&mut declared, declared_families(config, false));
+    }
+    if let Some(capabilities) = model
+        .supported_capabilities
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+    {
+        let families = capabilities
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter_map(capability_family)
+            .collect::<Vec<_>>();
+        if !families.is_empty() {
+            merge_declared(&mut declared, DeclaredFamilies::Valid(families));
+        }
+    }
+    let Some(requested_family) = known_format_family(api_format) else {
+        return false;
+    };
+    match declared {
+        DeclaredFamilies::Absent => requested_family == ModelFamily::Generation,
+        DeclaredFamilies::Valid(families) => families.contains(&requested_family),
+        DeclaredFamilies::Invalid => false,
+    }
+}
+
 pub(super) fn filter_catalog_for_models(
     rows: Vec<StoredModelCatalogEntry>,
     auth: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
@@ -254,6 +293,26 @@ pub(super) fn filter_catalog_for_models(
     });
     rows.dedup_by(|left, right| left.global_model_name == right.global_model_name);
     rows
+}
+
+pub(super) fn filter_global_models_for_models(
+    models: Vec<StoredPublicGlobalModel>,
+    auth: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
+    api_format: &str,
+    allowed_global_model_ids: Option<&BTreeSet<String>>,
+) -> Vec<StoredPublicGlobalModel> {
+    let mut models = models
+        .into_iter()
+        .filter(|model| model.is_active)
+        .filter(|model| auth_allows_model_name(auth, &model.name))
+        .filter(|model| global_model_supports_format(model, api_format))
+        .filter(|model| {
+            allowed_global_model_ids.is_none_or(|allowed_ids| allowed_ids.contains(&model.id))
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    models.dedup_by(|left, right| left.name == right.name);
+    models
 }
 
 #[cfg(test)]

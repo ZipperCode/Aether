@@ -233,7 +233,7 @@ async fn gateway_model_fetch_updates_key_and_syncs_provider_model_whitelist_asso
     let global_model_repository = Arc::new(
         InMemoryGlobalModelReadRepository::seed(Vec::new())
             .with_admin_global_models(vec![
-                sample_global_model("global-model-gpt5", "gpt-5", &["gpt-5"]),
+                sample_global_model("global-model-gpt5", "gpt-5", &[]),
                 sample_global_model("global-model-gpt4", "gpt-4.1", &["gpt-4\\.1"]),
             ])
             .with_admin_provider_models(vec![sample_provider_model(
@@ -306,6 +306,12 @@ async fn gateway_model_fetch_updates_key_and_syncs_provider_model_whitelist_asso
         .collect::<Vec<_>>();
     provider_model_names.sort_unstable();
     assert_eq!(provider_model_names, vec!["gpt-4.1", "gpt-5"]);
+    assert!(provider_models
+        .iter()
+        .any(|model| model.provider_model_name == "gpt-4.1" && !model.is_available));
+    assert!(provider_models
+        .iter()
+        .any(|model| model.provider_model_name == "gpt-5" && model.is_available));
 
     execution_runtime_handle.abort();
 }
@@ -615,6 +621,12 @@ async fn gateway_background_model_fetch_updates_key_and_syncs_provider_model_whi
         .collect::<Vec<_>>();
     provider_model_names.sort_unstable();
     assert_eq!(provider_model_names, vec!["gpt-4.1", "gpt-5"]);
+    assert!(provider_models
+        .iter()
+        .any(|model| model.provider_model_name == "gpt-4.1" && !model.is_available));
+    assert!(provider_models
+        .iter()
+        .any(|model| model.provider_model_name == "gpt-5" && model.is_available));
 
     let seen_plan = seen_execution_runtime_plan
         .lock()

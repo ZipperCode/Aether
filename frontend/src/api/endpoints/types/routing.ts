@@ -109,6 +109,7 @@ export interface ModelMappingPreviewRule {
   valid: boolean
   matched_key_count: number
   matched_model_count: number
+  matched_mapping_count?: number
   matched_provider_count: number
   matched_provider_ids: string[]
   unlinked_provider_ids: string[]

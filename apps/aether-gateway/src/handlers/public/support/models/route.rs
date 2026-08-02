@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aether_data_contracts::repository::global_models::PublicGlobalModelQuery;
 use aether_data_contracts::repository::model_catalog::StoredModelCatalogEntry;
 use axum::{
     body::Body,
@@ -18,7 +19,9 @@ use super::models_responses::{
     build_codex_models_list_response, build_empty_models_list_response,
     build_models_auth_error_response, build_models_not_found_response,
 };
-use super::models_shared::{filter_catalog_for_models, models_api_format, models_detail_id};
+use super::models_shared::{
+    filter_catalog_for_models, filter_global_models_for_models, models_api_format, models_detail_id,
+};
 use super::{query_param_value, AppState, GatewayPublicRequestContext};
 
 #[cfg(not(test))]
@@ -26,6 +29,7 @@ const MODELS_ROUTE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const MODELS_ROUTE_READ_TIMEOUT: Duration = Duration::from_millis(50);
 const PUBLIC_MODELS_OWNER: &str = "aether";
+const PUBLIC_MODELS_FETCH_LIMIT: usize = 10_000;
 
 async fn await_models_route_read<T, E, Fut>(operation: &'static str, future: Fut) -> Option<T>
 where
@@ -269,12 +273,12 @@ async fn load_codex_model_cards(state: &AppState, rows: &[StoredModelCatalogEntr
     cards
 }
 
-fn build_openai_catalog_models_list_response(rows: &[StoredModelCatalogEntry]) -> Response<Body> {
+fn build_openai_catalog_models_list_response(model_names: &[String]) -> Response<Body> {
     Json(json!({
         "object": "list",
-        "data": rows.iter().map(|row| {
+        "data": model_names.iter().map(|model_name| {
             json!({
-                "id": row.global_model_name,
+                "id": model_name,
                 "object": "model",
                 "created": 0,
                 "owned_by": PUBLIC_MODELS_OWNER,
@@ -295,18 +299,18 @@ fn build_openai_catalog_model_detail_response(row: &StoredModelCatalogEntry) -> 
 }
 
 fn build_claude_catalog_models_list_response(
-    rows: &[StoredModelCatalogEntry],
+    model_names: &[String],
     before_id: Option<&str>,
     after_id: Option<&str>,
     limit: usize,
 ) -> Response<Body> {
-    let model_data = rows
+    let model_data = model_names
         .iter()
-        .map(|row| {
+        .map(|model_name| {
             json!({
-                "id": row.global_model_name,
+                "id": model_name,
                 "type": "model",
-                "display_name": row.global_model_name,
+                "display_name": model_name,
                 "created_at": Value::Null,
             })
         })
@@ -356,13 +360,13 @@ fn build_claude_catalog_model_detail_response(row: &StoredModelCatalogEntry) -> 
     .into_response()
 }
 
-fn build_gemini_catalog_model_value(row: &StoredModelCatalogEntry) -> Value {
+fn build_gemini_catalog_model_value(model_name: &str) -> Value {
     json!({
-        "name": format!("models/{}", row.global_model_name),
-        "baseModelId": row.global_model_name,
+        "name": format!("models/{model_name}"),
+        "baseModelId": model_name,
         "version": "001",
-        "displayName": row.global_model_name,
-        "description": format!("Model {}", row.global_model_name),
+        "displayName": model_name,
+        "description": format!("Model {model_name}"),
         "inputTokenLimit": 128000,
         "outputTokenLimit": 8192,
         "supportedGenerationMethods": ["generateContent", "countTokens"],
@@ -374,7 +378,7 @@ fn build_gemini_catalog_model_value(row: &StoredModelCatalogEntry) -> Value {
 }
 
 fn build_gemini_catalog_models_list_response(
-    rows: &[StoredModelCatalogEntry],
+    model_names: &[String],
     page_size: usize,
     page_token: Option<&str>,
 ) -> Response<Body> {
@@ -382,31 +386,106 @@ fn build_gemini_catalog_models_list_response(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
     let end_idx = start_idx.saturating_add(page_size);
-    let window = rows
+    let window = model_names
         .iter()
         .skip(start_idx)
         .take(page_size)
-        .map(build_gemini_catalog_model_value)
+        .map(|model_name| build_gemini_catalog_model_value(model_name))
         .collect::<Vec<_>>();
     let mut payload = json!({ "models": window });
-    if end_idx < rows.len() {
+    if end_idx < model_names.len() {
         payload["nextPageToken"] = Value::String(end_idx.to_string());
     }
     Json(payload).into_response()
 }
 
 fn build_gemini_catalog_model_detail_response(row: &StoredModelCatalogEntry) -> Response<Body> {
-    Json(build_gemini_catalog_model_value(row)).into_response()
+    Json(build_gemini_catalog_model_value(&row.global_model_name)).into_response()
 }
 
-async fn list_model_rows_for_client_format(
+struct PublishedModelsList {
+    model_names: Vec<String>,
+    catalog_rows: Vec<StoredModelCatalogEntry>,
+}
+
+async fn list_models_for_client_format(
     state: &AppState,
     api_format: &str,
     auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
-) -> Option<Vec<StoredModelCatalogEntry>> {
-    let rows = await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
-    // 模型列表只表达配置与调用方权限；临时额度、并发和 Key 状态由实际请求调度处理。
-    Some(filter_catalog_for_models(rows, auth_snapshot, api_format))
+) -> Option<PublishedModelsList> {
+    if !state.has_global_model_data_reader() {
+        let rows =
+            await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
+        let rows = filter_catalog_for_models(rows, auth_snapshot, api_format);
+        return Some(PublishedModelsList {
+            model_names: rows
+                .iter()
+                .map(|row| row.global_model_name.clone())
+                .collect(),
+            catalog_rows: rows,
+        });
+    }
+
+    let provider_restricted = auth_snapshot
+        .and_then(crate::data::auth::GatewayAuthApiKeySnapshot::effective_allowed_providers)
+        .is_some();
+    let needs_catalog = provider_restricted || is_codex_models_api_format(api_format);
+    let catalog_rows = if needs_catalog {
+        let rows =
+            await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
+        filter_catalog_for_models(rows, auth_snapshot, api_format)
+    } else {
+        Vec::new()
+    };
+    let allowed_global_model_ids = provider_restricted.then(|| {
+        catalog_rows
+            .iter()
+            .map(|row| row.global_model_id.clone())
+            .collect::<BTreeSet<_>>()
+    });
+    let page = await_models_route_read(
+        "published_global_models",
+        state.list_public_global_models(&PublicGlobalModelQuery {
+            offset: 0,
+            limit: PUBLIC_MODELS_FETCH_LIMIT,
+            is_active: Some(true),
+            search: None,
+        }),
+    )
+    .await?;
+    if page.items.is_empty() {
+        let rows = if needs_catalog {
+            catalog_rows
+        } else {
+            let rows =
+                await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
+            filter_catalog_for_models(rows, auth_snapshot, api_format)
+        };
+        return Some(PublishedModelsList {
+            model_names: rows
+                .iter()
+                .map(|row| row.global_model_name.clone())
+                .collect(),
+            catalog_rows: rows,
+        });
+    }
+    let models = filter_global_models_for_models(
+        page.items,
+        auth_snapshot,
+        api_format,
+        allowed_global_model_ids.as_ref(),
+    );
+    let visible_names = models
+        .iter()
+        .map(|model| model.name.clone())
+        .collect::<BTreeSet<_>>();
+    Some(PublishedModelsList {
+        model_names: visible_names.iter().cloned().collect(),
+        catalog_rows: catalog_rows
+            .into_iter()
+            .filter(|row| visible_names.contains(&row.global_model_name))
+            .collect(),
+    })
 }
 
 async fn detail_model_rows_for_client_format(
@@ -498,9 +577,9 @@ pub(super) async fn maybe_build_local_models_route_response(
 
     match decision.route_kind.as_deref() {
         Some("list") => {
-            let rows =
-                match list_model_rows_for_client_format(state, api_format, auth_snapshot).await {
-                    Some(rows) => rows,
+            let published =
+                match list_models_for_client_format(state, api_format, auth_snapshot).await {
+                    Some(published) => published,
                     None => {
                         return Some(build_models_read_fallback_response(
                             request_context,
@@ -508,11 +587,11 @@ pub(super) async fn maybe_build_local_models_route_response(
                         ))
                     }
                 };
-            if rows.is_empty() {
+            if published.model_names.is_empty() {
                 return Some(build_empty_models_list_response(api_format));
             }
             if is_codex_models_api_format(api_format) {
-                let models = load_codex_model_cards(state, &rows).await;
+                let models = load_codex_model_cards(state, &published.catalog_rows).await;
                 return Some(build_codex_models_list_response(models));
             }
             let response = match api_format {
@@ -531,7 +610,7 @@ pub(super) async fn maybe_build_local_models_route_response(
                             .filter(|value| *value > 0)
                             .unwrap_or(20);
                     build_claude_catalog_models_list_response(
-                        &rows,
+                        &published.model_names,
                         before_id.as_deref(),
                         after_id.as_deref(),
                         limit,
@@ -550,12 +629,12 @@ pub(super) async fn maybe_build_local_models_route_response(
                         "pageToken",
                     );
                     build_gemini_catalog_models_list_response(
-                        &rows,
+                        &published.model_names,
                         page_size,
                         page_token.as_deref(),
                     )
                 }
-                _ => build_openai_catalog_models_list_response(&rows),
+                _ => build_openai_catalog_models_list_response(&published.model_names),
             };
             Some(response)
         }

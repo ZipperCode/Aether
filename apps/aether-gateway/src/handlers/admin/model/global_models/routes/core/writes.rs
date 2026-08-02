@@ -19,7 +19,9 @@ use crate::handlers::admin::model::shared::{
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::attach_admin_audit_response;
+use crate::model_fetch::sync_global_model_provider_associations;
 use crate::GatewayError;
+use aether_data_contracts::repository::global_models::StoredAdminGlobalModel;
 use axum::{
     body::{Body, Bytes},
     http,
@@ -103,27 +105,28 @@ async fn build_create_global_model_response(
         Err(detail) => return Ok(bad_request_response(detail)),
     };
 
-    Ok(match state.create_admin_global_model(&record).await? {
-        Some(created) => attach_admin_audit_response(
-            (
-                http::StatusCode::CREATED,
-                Json(build_admin_global_model_response(
-                    &created,
-                    current_unix_secs(),
-                )),
-            )
-                .into_response(),
-            "admin_global_model_created",
-            "create_global_model",
-            "global_model",
-            &created.id,
-        ),
-        None => (
+    let Some(created) = state.create_admin_global_model(&record).await? else {
+        return Ok((
             http::StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "detail": ADMIN_GLOBAL_MODELS_DATA_UNAVAILABLE_DETAIL })),
         )
+            .into_response());
+    };
+    let created = sync_enabled_global_model_associations(state, created).await?;
+    Ok(attach_admin_audit_response(
+        (
+            http::StatusCode::CREATED,
+            Json(build_admin_global_model_response(
+                &created,
+                current_unix_secs(),
+            )),
+        )
             .into_response(),
-    })
+        "admin_global_model_created",
+        "create_global_model",
+        "global_model",
+        &created.id,
+    ))
 }
 
 async fn build_update_global_model_response(
@@ -159,20 +162,35 @@ async fn build_update_global_model_response(
         Err(detail) => return Ok(bad_request_response(detail)),
     };
 
-    Ok(match state.update_admin_global_model(&record).await? {
-        Some(updated) => attach_admin_audit_response(
-            Json(build_admin_global_model_response(
-                &updated,
-                current_unix_secs(),
-            ))
-            .into_response(),
-            "admin_global_model_updated",
-            "update_global_model",
-            "global_model",
-            &updated.id,
-        ),
-        None => global_model_not_found_response(&existing.id),
-    })
+    let Some(updated) = state.update_admin_global_model(&record).await? else {
+        return Ok(global_model_not_found_response(&existing.id));
+    };
+    let updated = sync_enabled_global_model_associations(state, updated).await?;
+    Ok(attach_admin_audit_response(
+        Json(build_admin_global_model_response(
+            &updated,
+            current_unix_secs(),
+        ))
+        .into_response(),
+        "admin_global_model_updated",
+        "update_global_model",
+        "global_model",
+        &updated.id,
+    ))
+}
+
+async fn sync_enabled_global_model_associations(
+    state: &AdminAppState<'_>,
+    model: StoredAdminGlobalModel,
+) -> Result<StoredAdminGlobalModel, GatewayError> {
+    if !model.is_active {
+        return Ok(model);
+    }
+    sync_global_model_provider_associations(state.app(), &model.id).await?;
+    Ok(state
+        .get_admin_global_model_by_id(&model.id)
+        .await?
+        .unwrap_or(model))
 }
 
 async fn build_delete_global_model_response(

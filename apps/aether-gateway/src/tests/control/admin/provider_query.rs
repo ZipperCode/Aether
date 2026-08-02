@@ -8,6 +8,9 @@ use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadReposi
 use aether_data_contracts::repository::candidates::{
     RequestCandidateReadRepository, RequestCandidateStatus,
 };
+use aether_data_contracts::repository::global_models::{
+    AdminProviderModelListQuery, GlobalModelReadRepository,
+};
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, StoredProviderCatalogEndpoint,
 };
@@ -20,8 +23,8 @@ use serde_json::json;
 
 use super::super::{
     build_router_with_state, build_state_with_execution_runtime_override,
-    sample_admin_provider_model, sample_endpoint, sample_key, sample_provider, start_server,
-    AppState,
+    sample_admin_global_model, sample_admin_provider_model, sample_endpoint, sample_key,
+    sample_provider, start_server, AppState,
 };
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
@@ -194,6 +197,13 @@ async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_select
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-openai", "OpenAI", 10);
     provider.provider_type = "openai".to_string();
+    let mut selected_key = sample_key(
+        "key-openai-selected",
+        "provider-openai",
+        "openai:chat",
+        "sk-test",
+    );
+    selected_key.auto_fetch_models = true;
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![StoredProviderCatalogEndpoint::new(
@@ -216,20 +226,27 @@ async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_select
             None,
         )
         .expect("endpoint transport should build")],
-        vec![sample_key(
-            "key-openai-selected",
-            "provider-openai",
-            "openai:chat",
-            "sk-test",
-        )],
+        vec![selected_key],
     ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new()).with_admin_global_models(vec![
+            sample_admin_global_model(
+                "global-llama-maverick",
+                "LLM-Research/Llama-4-Maverick-17B-128E-Instruct",
+                "Llama 4 Maverick",
+            ),
+        ]),
+    );
 
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(execution_runtime_url)
-            .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
-                provider_catalog_repository,
-                DEVELOPMENT_ENCRYPTION_KEY.to_string(),
-            )),
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                    &provider_catalog_repository,
+                ))
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY)
+                .with_global_model_repository_for_tests(Arc::clone(&global_model_repository)),
+            ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -241,7 +258,8 @@ async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_select
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
         .json(&json!({
             "provider_id": "provider-openai",
-            "api_key_id": "key-openai-selected"
+            "api_key_id": "key-openai-selected",
+            "force_refresh": true
         }))
         .send()
         .await
@@ -270,6 +288,31 @@ async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_select
         *execution_runtime_hits.lock().expect("mutex should lock"),
         1
     );
+    let refreshed_key = provider_catalog_repository
+        .list_keys_by_ids(&["key-openai-selected".to_string()])
+        .await
+        .expect("keys should load")
+        .into_iter()
+        .next()
+        .expect("refreshed key should exist");
+    assert_eq!(
+        refreshed_key.allowed_models,
+        Some(json!(["LLM-Research/Llama-4-Maverick-17B-128E-Instruct"]))
+    );
+    let provider_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-openai".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 10_000,
+        })
+        .await
+        .expect("provider models should load");
+    assert!(provider_models.iter().any(|model| {
+        model.global_model_id == "global-llama-maverick"
+            && model.provider_model_name == "LLM-Research/Llama-4-Maverick-17B-128E-Instruct"
+            && model.is_available
+    }));
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

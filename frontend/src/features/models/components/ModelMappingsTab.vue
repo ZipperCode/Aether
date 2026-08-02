@@ -85,7 +85,8 @@
             "
             variant="secondary"
             class="text-xs flex-shrink-0 h-6 leading-none"
-            >{{ mappingMatchCounts[index] }} 模型</Badge
+            :title="getMappingMatchTitle(index)"
+            >{{ mappingMatchCounts[index] }} 匹配</Badge
           >
           <Badge
             v-else-if="
@@ -334,10 +335,17 @@ const mappingMatchCounts = computed(() =>
   normalizedMappings.value.map((pattern, index) =>
     previewRules.value[index]?.pattern === pattern &&
     previewRules.value[index]?.valid
-      ? previewRules.value[index].matched_model_count
+      ? previewRules.value[index].matched_mapping_count ??
+        previewRules.value[index].matched_model_count
       : 0,
   ),
 );
+
+function getMappingMatchTitle(index: number): string {
+  const rule = previewRules.value[index];
+  if (!rule) return "";
+  return `${rule.matched_model_count} 个上游模型名 · ${rule.matched_key_count} Key · ${rule.matched_provider_count} 个提供商`;
+}
 const expandedTotalPages = computed(() =>
   Math.max(
     1,

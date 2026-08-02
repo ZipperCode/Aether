@@ -5,7 +5,8 @@ mod strategy;
 mod transport;
 
 pub use association_sync::{
-    sync_provider_model_whitelist_associations, ModelFetchAssociationStore,
+    global_model_matches_allowed_models, sync_provider_model_whitelist_associations,
+    ModelFetchAssociationStore,
 };
 pub use config::{
     model_fetch_interval_minutes, model_fetch_startup_delay_seconds, model_fetch_startup_enabled,

@@ -1,8 +1,9 @@
 use super::{
-    hash_api_key, sample_models_candidate_row, unrestricted_models_snapshot,
-    InMemoryAuthApiKeySnapshotRepository, InMemoryMinimalCandidateSelectionReadRepository,
-    InMemoryVideoTaskRepository, StoredAuthApiKeySnapshot, UpsertVideoTask, VideoTaskLookupKey,
-    VideoTaskReadRepository, VideoTaskStatus, VideoTaskWriteRepository, DEVELOPMENT_ENCRYPTION_KEY,
+    hash_api_key, sample_models_candidate_row, sample_public_global_model,
+    unrestricted_models_snapshot, InMemoryAuthApiKeySnapshotRepository,
+    InMemoryMinimalCandidateSelectionReadRepository, InMemoryVideoTaskRepository,
+    StoredAuthApiKeySnapshot, UpsertVideoTask, VideoTaskLookupKey, VideoTaskReadRepository,
+    VideoTaskStatus, VideoTaskWriteRepository, DEVELOPMENT_ENCRYPTION_KEY,
 };
 use crate::image_capabilities::openai_image_gateway_max_generation_count;
 use crate::tests::{
@@ -436,6 +437,138 @@ async fn gateway_handles_public_openai_models_without_hitting_fallback_probe() {
 
     gateway_handle.abort();
     fallback_probe_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_models_list_publishes_enabled_global_models_without_provider_model_rows() {
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key("sk-global-models")),
+        unrestricted_models_snapshot("key-global-models", "user-global-models"),
+    )]));
+    let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(vec![
+        sample_public_global_model(
+            "global-new-model",
+            "newly-enabled-model",
+            "Newly Enabled Model",
+            true,
+        ),
+        sample_public_global_model(
+            "global-disabled-model",
+            "disabled-model",
+            "Disabled Model",
+            false,
+        ),
+    ]));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
+                    candidate_repository(Vec::new()),
+                    auth_repository,
+                )
+                .with_model_catalog_reader(Arc::new(InMemoryModelCatalogReadRepository::new(
+                    Vec::new(),
+                )))
+                .with_global_model_repository_for_tests(global_model_repository),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{gateway_url}/v1/models"))
+        .header("authorization", "Bearer sk-global-models")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(payload["data"][0]["id"], "newly-enabled-model");
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_models_list_keeps_provider_restricted_keys_within_static_associations() {
+    let restricted_snapshot = StoredAuthApiKeySnapshot::new(
+        "user-provider-restricted".to_string(),
+        "alice".to_string(),
+        Some("alice@example.com".to_string()),
+        "user".to_string(),
+        "local".to_string(),
+        true,
+        false,
+        Some(json!(["provider-allowed"])),
+        None,
+        None,
+        "key-provider-restricted".to_string(),
+        Some("provider-restricted".to_string()),
+        true,
+        false,
+        false,
+        Some(10),
+        Some(5),
+        Some(4_102_444_800),
+        Some(json!(["provider-allowed"])),
+        None,
+        None,
+    )
+    .expect("provider-restricted snapshot should build");
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key("sk-provider-restricted")),
+        restricted_snapshot,
+    )]));
+    let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(vec![
+        sample_public_global_model(
+            "global-visible-model",
+            "visible-model",
+            "Visible Model",
+            true,
+        ),
+        sample_public_global_model(
+            "global-unassociated-model",
+            "unassociated-model",
+            "Unassociated Model",
+            true,
+        ),
+    ]));
+    let model_catalog_repository = Arc::new(InMemoryModelCatalogReadRepository::new(vec![
+        sample_model_catalog_entry(
+            "provider-allowed",
+            "allowed",
+            "openai:chat",
+            "visible-model",
+        ),
+    ]));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
+                    candidate_repository(Vec::new()),
+                    auth_repository,
+                )
+                .with_model_catalog_reader(model_catalog_repository)
+                .with_global_model_repository_for_tests(global_model_repository),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{gateway_url}/v1/models"))
+        .header("authorization", "Bearer sk-provider-restricted")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(payload["data"][0]["id"], "visible-model");
+
+    gateway_handle.abort();
 }
 
 #[tokio::test]

@@ -29,7 +29,7 @@ use crate::handlers::shared::{
     parse_catalog_auth_config_json, provider_key_health_summary,
     provider_key_status_snapshot_payload,
 };
-use crate::model_fetch::ModelFetchRuntimeState;
+use crate::model_fetch::{perform_model_fetch_for_key, ModelFetchRuntimeState};
 use crate::provider_key_auth::{
     provider_key_auth_semantics, provider_key_configured_api_formats,
     provider_key_inherits_provider_api_formats,
@@ -490,6 +490,44 @@ async fn provider_query_fetch_models_for_key(
     key: &StoredProviderCatalogKey,
     force_refresh: bool,
 ) -> Result<ProviderQueryKeyFetchResult, GatewayError> {
+    if force_refresh && key.auto_fetch_models {
+        let summary = perform_model_fetch_for_key(state.app(), &provider.id, &key.id).await?;
+        if summary.attempted > 0 {
+            if summary.succeeded > 0 {
+                let models = provider_query_read_cached_models(state, &provider.id, &key.id)
+                    .await
+                    .unwrap_or_default();
+                let models = provider_query_filter_models_for_key(provider, key, models);
+                let error = models
+                    .is_empty()
+                    .then(|| ADMIN_PROVIDER_QUERY_NO_MODELS_FROM_ENDPOINT_DETAIL.to_string());
+                return Ok(ProviderQueryKeyFetchResult {
+                    models,
+                    error,
+                    warning: None,
+                    from_cache: false,
+                    has_success: true,
+                });
+            }
+
+            let error = state
+                .app()
+                .read_provider_catalog_keys_by_ids(std::slice::from_ref(&key.id))
+                .await?
+                .into_iter()
+                .next()
+                .and_then(|key| key.last_models_fetch_error)
+                .unwrap_or_else(|| "自动获取上游模型失败".to_string());
+            return Ok(ProviderQueryKeyFetchResult {
+                models: Vec::new(),
+                error: Some(error),
+                warning: None,
+                from_cache: false,
+                has_success: false,
+            });
+        }
+    }
+
     if !force_refresh {
         if let Some(cached_models) =
             provider_query_read_cached_models(state, &provider.id, &key.id).await
