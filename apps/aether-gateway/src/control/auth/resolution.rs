@@ -16,9 +16,10 @@ use crate::wallet_runtime::{
 use crate::{AppState, GatewayError};
 
 use super::super::GatewayControlDecision;
+#[cfg(test)]
+use super::credentials::extract_trusted_admin_headers;
 use super::credentials::{
-    build_auth_context_cache_key, current_unix_secs, extract_request_credentials,
-    extract_trusted_admin_headers, hash_api_key,
+    build_auth_context_cache_key, current_unix_secs, extract_request_credentials, hash_api_key,
 };
 use super::gate::GatewayLocalAuthRejection;
 use super::principal::derive_principal_candidate;
@@ -115,21 +116,28 @@ pub(in super::super) async fn resolve_control_decision_auth(
     trace_id: &str,
     mut decision: GatewayControlDecision,
 ) -> Result<ControlDecisionAuthResolution, GatewayError> {
+    // Legacy trusted administrator headers are a test fixture only. Production
+    // builds never compile this branch and always use the signed session path.
+    #[cfg(test)]
     if let Some(admin_principal) =
         resolve_trusted_admin_principal(headers, decision.auth_endpoint_signature.as_deref())
     {
         log_admin_principal_resolution(trace_id, &decision, "trusted_headers", &admin_principal);
         decision.admin_principal = Some(admin_principal);
-    } else if let Some(admin_principal) = resolve_local_admin_principal(
-        state,
-        headers,
-        uri,
-        decision.auth_endpoint_signature.as_deref(),
-    )
-    .await?
-    {
-        log_admin_principal_resolution(trace_id, &decision, "local_session", &admin_principal);
-        decision.admin_principal = Some(admin_principal);
+    }
+
+    if decision.admin_principal.is_none() {
+        if let Some(admin_principal) = resolve_local_admin_principal(
+            state,
+            headers,
+            uri,
+            decision.auth_endpoint_signature.as_deref(),
+        )
+        .await?
+        {
+            log_admin_principal_resolution(trace_id, &decision, "local_session", &admin_principal);
+            decision.admin_principal = Some(admin_principal);
+        }
     }
 
     let auth_context_cache_key = decision
@@ -299,6 +307,7 @@ fn allows_missing_data_backed_auth_context(decision: &GatewayControlDecision) ->
     )
 }
 
+#[cfg(test)]
 fn resolve_trusted_admin_principal(
     headers: &http::HeaderMap,
     auth_endpoint_signature: Option<&str>,

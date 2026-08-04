@@ -37,6 +37,7 @@ pub(super) struct GatewayTrustedAuthHeaders {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(super) struct GatewayTrustedAdminHeaders {
     pub(super) user_id: String,
     pub(super) user_role: String,
@@ -73,6 +74,7 @@ pub(super) enum GatewayPrimaryCredential {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct GatewayExtractedCredentials {
     pub(super) trusted_headers: Option<GatewayTrustedAuthHeaders>,
+    #[cfg(test)]
     pub(super) trusted_admin_headers: Option<GatewayTrustedAdminHeaders>,
     pub(super) bundle: GatewayCredentialBundle,
     pub(super) primary: Option<GatewayPrimaryCredential>,

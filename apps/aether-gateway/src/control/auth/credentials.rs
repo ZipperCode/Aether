@@ -11,9 +11,11 @@ use crate::{
 };
 
 use super::super::GatewayControlDecision;
+#[cfg(test)]
+use super::types::GatewayTrustedAdminHeaders;
 use super::types::{
     GatewayCredentialBundle, GatewayCredentialCarrier, GatewayExtractedCredentials,
-    GatewayPrimaryCredential, GatewayTrustedAdminHeaders, GatewayTrustedAuthHeaders,
+    GatewayPrimaryCredential, GatewayTrustedAuthHeaders,
 };
 
 pub(crate) fn extract_requested_model(
@@ -60,11 +62,13 @@ pub(super) fn extract_request_credentials(
         cookie_header: header_value_str(headers, http::header::COOKIE.as_str()),
     };
     let trusted_headers = extract_trusted_auth_headers(headers);
+    #[cfg(test)]
     let trusted_admin_headers = extract_trusted_admin_headers(headers);
     let primary = select_primary_credential(auth_endpoint_signature, &bundle);
 
     GatewayExtractedCredentials {
         trusted_headers,
+        #[cfg(test)]
         trusted_admin_headers,
         bundle,
         primary,
@@ -177,6 +181,12 @@ fn extract_trusted_auth_headers(headers: &http::HeaderMap) -> Option<GatewayTrus
     })
 }
 
+/// Parses the legacy administrator identity headers used by control-route tests.
+///
+/// Production requests must authenticate through a signed local access token and
+/// a live server-side session. Compiling this helper only for tests prevents a
+/// client-controlled gateway marker from becoming an administrator credential.
+#[cfg(test)]
 pub(super) fn extract_trusted_admin_headers(
     headers: &http::HeaderMap,
 ) -> Option<GatewayTrustedAdminHeaders> {
