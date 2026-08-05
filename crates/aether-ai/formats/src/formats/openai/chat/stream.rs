@@ -872,6 +872,27 @@ impl OpenAIResponsesProviderState {
         self.emit_generic_tool_call_item(report_context, out, item, output_index, name, arguments);
     }
 
+    fn emit_tool_search_call_item(
+        &mut self,
+        report_context: &Value,
+        out: &mut Vec<CanonicalStreamFrame>,
+        item: &Map<String, Value>,
+        output_index: Option<usize>,
+    ) {
+        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
+            return;
+        }
+        let arguments = tool_arguments_from_maybe_json_string(item.get("arguments"), "query");
+        self.emit_generic_tool_call_item(
+            report_context,
+            out,
+            item,
+            output_index,
+            "tool_search".to_string(),
+            arguments,
+        );
+    }
+
     fn emit_shell_tool_call_item(
         &mut self,
         report_context: &Value,
@@ -1062,6 +1083,7 @@ impl OpenAIResponsesProviderState {
         let is_supported_result = matches!(
             item_type,
             "custom_tool_call_output"
+                | "tool_search_output"
                 | "local_shell_call_output"
                 | "shell_call_output"
                 | "apply_patch_call_output"
@@ -1082,6 +1104,7 @@ impl OpenAIResponsesProviderState {
             self.tool_index_for_key(Some(format!("{item_type}:{tool_use_id}")), output_index);
         let content = openai_tool_result_content_from_value(
             item.get("output")
+                .or_else(|| item.get("tools"))
                 .or_else(|| item.get("content"))
                 .or_else(|| item.get("delta")),
         );
@@ -1090,6 +1113,7 @@ impl OpenAIResponsesProviderState {
             "shell_call_output" => Some("shell".to_string()),
             "apply_patch_call_output" => Some("apply_patch".to_string()),
             "computer_call_output" => Some("computer".to_string()),
+            "tool_search_output" => Some("tool_search".to_string()),
             _ => item
                 .get("name")
                 .and_then(Value::as_str)
@@ -1258,6 +1282,10 @@ impl OpenAIResponsesProviderState {
                 self.emit_custom_tool_call_item(report_context, out, item, output_index);
                 true
             }
+            "tool_search_call" => {
+                self.emit_tool_search_call_item(report_context, out, item, output_index);
+                true
+            }
             "local_shell_call" | "shell_call" => {
                 self.emit_shell_tool_call_item(report_context, out, item, output_index);
                 true
@@ -1271,6 +1299,7 @@ impl OpenAIResponsesProviderState {
                 true
             }
             "custom_tool_call_output"
+            | "tool_search_output"
             | "local_shell_call_output"
             | "shell_call_output"
             | "apply_patch_call_output"
@@ -3992,6 +4021,73 @@ mod tests {
         assert!(!terminal
             .iter()
             .any(|frame| matches!(frame.event, CanonicalStreamEvent::UnknownEvent(_))));
+    }
+
+    #[test]
+    fn openai_responses_provider_state_maps_tool_search_output_items() {
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let mut frames = Vec::new();
+
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "response_id": "resp_tool_search",
+                "output_index": 0,
+                "item": {
+                    "type": "tool_search_call",
+                    "id": "tsc_123",
+                    "call_id": "call_123",
+                    "execution": "client",
+                    "arguments": {"goal": "find shipping tools"},
+                    "status": "completed"
+                }
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "response_id": "resp_tool_search",
+                "output_index": 1,
+                "item": {
+                    "type": "tool_search_output",
+                    "id": "tso_123",
+                    "call_id": "call_123",
+                    "execution": "client",
+                    "tools": [{"type": "function", "name": "get_shipping_eta"}],
+                    "status": "completed"
+                }
+            }),
+        ] {
+            frames.extend(
+                state
+                    .push_line(&report_context, data_line(event))
+                    .expect("tool search output item should parse"),
+            );
+        }
+
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ToolCallStart {
+                ref call_id,
+                ref name,
+                ..
+            } if call_id == "call_123" && name == "tool_search"
+        )));
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ToolCallArgumentsDelta { ref arguments, .. }
+                if arguments == "{\"goal\":\"find shipping tools\"}"
+        )));
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ToolResultDelta {
+                ref tool_use_id,
+                name: Some(ref name),
+                ref content,
+                ..
+            } if tool_use_id == "call_123"
+                && name == "tool_search"
+                && content.contains("get_shipping_eta")
+        )));
     }
 
     #[test]

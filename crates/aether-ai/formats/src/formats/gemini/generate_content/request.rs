@@ -345,17 +345,52 @@ fn canonical_block_to_gemini_part(
             name,
             output,
             content_text,
+            extensions,
             ..
-        } => Some(Some(json!({
-            "functionResponse": {
-                "id": tool_use_id,
-                "name": name.clone()
-                    .or_else(|| tool_name_by_id.get(tool_use_id).cloned())
-                    .unwrap_or_else(|| tool_use_id.clone()),
-                "response": gemini_function_response(output.as_ref(), content_text.as_deref()),
-            }
-        }))),
-        CanonicalContentBlock::Unknown { .. } => Some(None),
+        } => {
+            let mut function_response = extensions
+                .get("gemini")
+                .and_then(|value| value.get("raw_function_response"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            function_response
+                .entry("id".to_string())
+                .or_insert_with(|| Value::String(tool_use_id.clone()));
+            function_response
+                .entry("name".to_string())
+                .or_insert_with(|| {
+                    Value::String(
+                        name.clone()
+                            .or_else(|| tool_name_by_id.get(tool_use_id).cloned())
+                            .unwrap_or_else(|| tool_use_id.clone()),
+                    )
+                });
+            function_response
+                .entry("response".to_string())
+                .or_insert_with(|| {
+                    gemini_function_response(output.as_ref(), content_text.as_deref())
+                });
+            let mut part = Map::new();
+            part.insert(
+                "functionResponse".to_string(),
+                Value::Object(function_response),
+            );
+            let mut extra =
+                crate::protocol::canonical::namespace_extension_object(extensions, "gemini", &part);
+            extra.remove("raw_function_response");
+            part.extend(extra);
+            Some(Some(Value::Object(part)))
+        }
+        CanonicalContentBlock::Unknown {
+            payload,
+            extensions,
+            ..
+        } => extensions
+            .get("gemini")
+            .and_then(Value::as_object)
+            .map(|_| Some(payload.clone()))
+            .or(Some(None)),
     }
 }
 
@@ -473,9 +508,33 @@ fn apply_response_format_to_gemini_generation_config(
                 .cloned()
                 .or_else(|| response_format.json_schema.clone())
             {
-                let mut schema = schema;
-                clean_gemini_schema(&mut schema);
-                generation_config.insert("responseSchema".to_string(), schema);
+                let gemini_extensions = response_format
+                    .extensions
+                    .get("gemini")
+                    .and_then(Value::as_object);
+                let schema_field = gemini_extensions
+                    .and_then(|value| value.get("schema_field"))
+                    .and_then(Value::as_str)
+                    .filter(|field| {
+                        matches!(
+                            *field,
+                            "responseJsonSchema"
+                                | "response_json_schema"
+                                | "_responseJsonSchema"
+                                | "_response_json_schema"
+                                | "responseSchema"
+                                | "response_schema"
+                        )
+                    })
+                    .unwrap_or("responseSchema");
+                let raw_schema = gemini_extensions
+                    .and_then(|value| value.get("raw_schema"))
+                    .cloned();
+                let mut schema = raw_schema.clone().unwrap_or(schema);
+                if raw_schema.is_none() {
+                    clean_gemini_schema(&mut schema);
+                }
+                generation_config.insert(schema_field.to_string(), schema);
             }
         }
         "json_object" => {

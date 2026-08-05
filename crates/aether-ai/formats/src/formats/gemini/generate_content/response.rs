@@ -281,14 +281,15 @@ fn canonical_block_to_gemini_part(block: &CanonicalContentBlock) -> Option<Optio
             name,
             output,
             content_text,
+            extensions,
             ..
-        } => Some(Some(json!({
-            "functionResponse": {
-                "id": tool_use_id,
-                "name": name.clone().unwrap_or_else(|| tool_use_id.clone()),
-                "response": gemini_function_response(output.as_ref(), content_text.as_deref()),
-            }
-        }))),
+        } => Some(Some(gemini_function_response_part(
+            tool_use_id,
+            name.as_deref().unwrap_or(tool_use_id),
+            output.as_ref(),
+            content_text.as_deref(),
+            extensions,
+        ))),
         CanonicalContentBlock::Image {
             data,
             url,
@@ -319,7 +320,15 @@ fn canonical_block_to_gemini_part(block: &CanonicalContentBlock) -> Option<Optio
                 }
             })
         })),
-        CanonicalContentBlock::Unknown { .. } => Some(None),
+        CanonicalContentBlock::Unknown {
+            payload,
+            extensions,
+            ..
+        } => extensions
+            .get("gemini")
+            .and_then(Value::as_object)
+            .map(|_| Some(payload.clone()))
+            .or(Some(None)),
     }
 }
 
@@ -358,6 +367,40 @@ fn gemini_function_response(output: Option<&Value>, content_text: Option<&str>) 
         Some(value) => json!({ "result": value }),
         None => json!({ "result": content_text.unwrap_or_default() }),
     }
+}
+
+fn gemini_function_response_part(
+    tool_use_id: &str,
+    name: &str,
+    output: Option<&Value>,
+    content_text: Option<&str>,
+    extensions: &std::collections::BTreeMap<String, Value>,
+) -> Value {
+    let mut function_response = extensions
+        .get("gemini")
+        .and_then(|value| value.get("raw_function_response"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    function_response
+        .entry("id".to_string())
+        .or_insert_with(|| Value::String(tool_use_id.to_string()));
+    function_response
+        .entry("name".to_string())
+        .or_insert_with(|| Value::String(name.to_string()));
+    function_response
+        .entry("response".to_string())
+        .or_insert_with(|| gemini_function_response(output, content_text));
+    let mut part = Map::new();
+    part.insert(
+        "functionResponse".to_string(),
+        Value::Object(function_response),
+    );
+    let mut extra =
+        crate::protocol::canonical::namespace_extension_object(extensions, "gemini", &part);
+    extra.remove("raw_function_response");
+    part.extend(extra);
+    Value::Object(part)
 }
 
 fn canonical_stop_reason_to_gemini(reason: Option<&CanonicalStopReason>) -> Value {

@@ -17,10 +17,11 @@ use crate::{
         openai_content_text, openai_extensions, openai_prompt_cache_breakpoint_from_extensions,
         openai_response_format_to_canonical, openai_responses_extension,
         openai_responses_generation_config, openai_responses_input_to_canonical_messages,
-        openai_responses_item_extension_object, openai_responses_tool_choice_to_canonical,
-        openai_responses_tools_to_canonical, openai_tool_choice_raw_to_responses,
-        strip_claude_billing_header, CanonicalContentBlock, CanonicalInstruction, CanonicalRequest,
-        CanonicalRole, CanonicalThinkingConfig, CanonicalToolChoice, CanonicalToolDefinition,
+        openai_responses_item_extension_object, openai_responses_result_item_extension_object,
+        openai_responses_tool_choice_to_canonical, openai_responses_tools_to_canonical,
+        openai_tool_choice_raw_to_responses, strip_claude_billing_header, CanonicalContentBlock,
+        CanonicalInstruction, CanonicalRequest, CanonicalRole, CanonicalThinkingConfig,
+        CanonicalToolChoice, CanonicalToolDefinition,
         AETHER_AGENT_BRIDGE_PROMPT_CACHE_BREAKPOINT_FIELD, OPENAI_RESPONSES_EXTENSION_NAMESPACE,
         OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
     },
@@ -467,9 +468,16 @@ fn canonical_messages_to_responses_input(canonical: &CanonicalRequest) -> Option
                         ),
                     );
                     item.insert("call_id".to_string(), Value::String(call_id));
-                    item.insert("output".to_string(), tool_output);
+                    let output_field = if responses_tool_result_item_type(extensions)
+                        == Some("tool_search_output")
+                    {
+                        "tools"
+                    } else {
+                        "output"
+                    };
+                    item.insert(output_field.to_string(), tool_output);
                     let extension_fields =
-                        openai_responses_item_extension_object(extensions, &item);
+                        openai_responses_result_item_extension_object(extensions, &item);
                     item.extend(extension_fields);
                     input.push(Value::Object(item));
                     if !extra_user_content.is_empty() {
@@ -1137,6 +1145,13 @@ fn responses_tool_result_payload(
     is_error: bool,
     extensions: &BTreeMap<String, Value>,
 ) -> Option<(Value, Vec<Value>)> {
+    if responses_tool_result_item_type(extensions) == Some("tool_search_output") {
+        let tools = output
+            .cloned()
+            .or_else(|| content_text.and_then(|text| serde_json::from_str(text).ok()))
+            .unwrap_or(Value::Array(Vec::new()));
+        return tools.is_array().then_some((tools, Vec::new()));
+    }
     if let Some(Value::Array(parts)) = output {
         if is_claude_tool_result(extensions) {
             return claude_tool_result_parts_to_responses_payload(parts, is_error);
@@ -1160,6 +1175,7 @@ fn responses_tool_result_item_type(extensions: &BTreeMap<String, Value>) -> Opti
     matches!(
         item_type,
         "custom_tool_call_output"
+            | "tool_search_output"
             | "local_shell_call_output"
             | "shell_call_output"
             | "apply_patch_call_output"
@@ -1748,6 +1764,43 @@ mod tests {
         assert_eq!(body["input"][0]["arguments"], "{\"q\":\"rust\"}");
         assert_eq!(body["input"][1]["type"], "function_call_output");
         assert_eq!(body["input"][1]["call_id"], "call_auto_0");
+    }
+
+    #[test]
+    fn responses_request_roundtrips_tool_search_items_without_conflating_ids() {
+        let source = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "id": "tsc_123",
+                    "call_id": "call_123",
+                    "execution": "client",
+                    "arguments": {"goal": "find shipping tools"},
+                    "status": "completed",
+                    "created_by": "model"
+                },
+                {
+                    "type": "tool_search_output",
+                    "id": "tso_123",
+                    "call_id": "call_123",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "function",
+                        "name": "get_shipping_eta",
+                        "parameters": {"type": "object", "properties": {}}
+                    }],
+                    "status": "completed",
+                    "created_by": "application"
+                }
+            ]
+        });
+
+        let canonical = from_raw(&source).expect("tool search request should parse");
+        let body =
+            to_raw(&canonical, "gpt-5.6", false, false).expect("tool search request should emit");
+
+        assert_eq!(body["input"], source["input"]);
     }
 
     #[test]

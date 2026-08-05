@@ -176,6 +176,13 @@ impl GeminiProviderState {
                     .or_else(|| part_object.get("function_response"))
                     .and_then(Value::as_object)
                 {
+                    if function_response
+                        .keys()
+                        .any(|field| !matches!(field.as_str(), "id" | "name" | "response"))
+                    {
+                        out.push(self.unknown_frame(report_context, part.clone()));
+                        continue;
+                    }
                     let tool_use_id = function_response
                         .get("id")
                         .and_then(Value::as_str)
@@ -339,10 +346,11 @@ impl GeminiProviderState {
 }
 
 fn map_gemini_stream_finish_reason(value: &str) -> Option<&str> {
-    match value {
+    match value.trim().to_ascii_uppercase().as_str() {
         "STOP" => Some("stop"),
         "MAX_TOKENS" => Some("length"),
         "SAFETY"
+        | "ESCALATION"
         | "RECITATION"
         | "LANGUAGE"
         | "BLOCKLIST"
@@ -351,7 +359,7 @@ fn map_gemini_stream_finish_reason(value: &str) -> Option<&str> {
         | "IMAGE_SAFETY"
         | "IMAGE_PROHIBITED_CONTENT"
         | "IMAGE_RECITATION" => Some("content_filter"),
-        other => Some(other),
+        _ => Some(value),
     }
 }
 
@@ -970,6 +978,44 @@ mod tests {
                 ref content,
             } if tool_use_id == "call_123" && name == "lookup" && content == "{\"ok\":true}"
         )));
+    }
+
+    #[test]
+    fn gemini_provider_state_rejects_extended_function_response_in_cross_format_streams() {
+        let mut state = GeminiProviderState::default();
+        let report_context = json!({});
+        let frames = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "responseId": "resp_extended_tool_result",
+                    "modelVersion": "gemini-3-pro",
+                    "candidates": [{
+                        "index": 0,
+                        "content": {
+                            "parts": [{
+                                "functionResponse": {
+                                    "id": "call_123",
+                                    "name": "lookup",
+                                    "response": {"ok": true},
+                                    "scheduling": "INTERRUPT",
+                                    "willContinue": true
+                                }
+                            }]
+                        }
+                    }]
+                })),
+            )
+            .expect("extended function response should produce a visible unsupported frame");
+
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::UnknownEvent(ref payload)
+                if payload.get("functionResponse").is_some()
+        )));
+        assert!(!frames
+            .iter()
+            .any(|frame| matches!(frame.event, CanonicalStreamEvent::ToolResultDelta { .. })));
     }
 
     #[test]

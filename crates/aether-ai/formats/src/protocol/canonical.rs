@@ -756,6 +756,12 @@ fn canonical_tool_use_to_openai_chat_tool_call(
             "custom": Value::Object(custom),
         });
     }
+    let input =
+        if openai_responses_hosted_tool_call_item_type(extensions) == Some("tool_search_call") {
+            input.get("arguments").unwrap_or(input)
+        } else {
+            input
+        };
     json!({
         "id": id,
         "type": "function",
@@ -775,7 +781,11 @@ pub(crate) fn canonical_tool_use_to_openai_responses_item(
     if let Some(item_type) = openai_responses_hosted_tool_call_item_type(extensions) {
         let mut item = Map::new();
         item.insert("type".to_string(), Value::String(item_type.to_string()));
-        item.insert("id".to_string(), Value::String(id.to_string()));
+        if let Some(item_id) = openai_responses_tool_call_item_id_from_extensions(extensions) {
+            item.insert("id".to_string(), Value::String(item_id));
+        } else {
+            item.insert("id".to_string(), Value::String(id.to_string()));
+        }
         item.insert("call_id".to_string(), Value::String(id.to_string()));
         item.insert("status".to_string(), Value::String("completed".to_string()));
         if let Some(input_object) = input.as_object() {
@@ -839,7 +849,9 @@ pub(crate) fn canonical_tool_use_to_openai_responses_input_item(
     if let Some(item_type) = openai_responses_hosted_tool_call_item_type(extensions) {
         let mut item = Map::new();
         item.insert("type".to_string(), Value::String(item_type.to_string()));
-        item.insert("id".to_string(), Value::String(id.to_string()));
+        if let Some(item_id) = openai_responses_tool_call_item_id_from_extensions(extensions) {
+            item.insert("id".to_string(), Value::String(item_id));
+        }
         item.insert("call_id".to_string(), Value::String(id.to_string()));
         item.insert("status".to_string(), Value::String("completed".to_string()));
         if let Some(input_object) = input.as_object() {
@@ -916,6 +928,17 @@ fn openai_responses_tool_call_item_id(
     }
 }
 
+fn openai_responses_tool_call_item_id_from_extensions(
+    extensions: &BTreeMap<String, Value>,
+) -> Option<String> {
+    openai_responses_extension(extensions)
+        .and_then(|value| value.get("item_id").or_else(|| value.get("id")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 fn openai_responses_request_tool_call_item_id(
     extensions: &BTreeMap<String, Value>,
     prefix: &str,
@@ -948,6 +971,7 @@ fn openai_responses_hosted_tool_input_fields(item_type: &str) -> &'static [&'sta
         ],
         "apply_patch_call" => &["operation", "status"],
         "computer_call" => &["action", "actions", "pending_safety_checks", "status"],
+        "tool_search_call" => &["arguments", "execution", "status", "created_by"],
         _ => &[],
     }
 }
@@ -1253,13 +1277,19 @@ pub(crate) fn gemini_part_to_canonical_block(
                 .unwrap_or_else(|| Value::Object(object)),
             other => other,
         };
+        let mut extensions =
+            gemini_extensions(part_object, &["functionResponse", "function_response"]);
+        canonical_extension_object_mut(&mut extensions, "gemini").insert(
+            "raw_function_response".to_string(),
+            Value::Object(function_response.clone()),
+        );
         return Some(CanonicalContentBlock::ToolResult {
             tool_use_id,
             name,
             output: Some(output.clone()),
             content_text: Some(openai_responses_tool_output_text(&output)),
             is_error: false,
-            extensions: gemini_extensions(part_object, &["functionResponse", "function_response"]),
+            extensions,
         });
     }
     Some(CanonicalContentBlock::Unknown {
@@ -1355,6 +1385,10 @@ pub(crate) fn gemini_file_data_to_canonical_block(
 
 pub(crate) fn gemini_raw_part_type(part: &Map<String, Value>) -> String {
     for key in [
+        "toolCall",
+        "tool_call",
+        "toolResponse",
+        "tool_response",
         "executableCode",
         "executable_code",
         "codeExecutionResult",
@@ -2100,6 +2134,56 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             &mut pending_reasoning,
                         );
                     }
+                    "tool_search_call" => {
+                        let id = item_object
+                            .get("call_id")
+                            .or_else(|| item_object.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| {
+                                let generated =
+                                    format!("call_auto_{next_generated_tool_call_index}");
+                                next_generated_tool_call_index += 1;
+                                generated
+                            });
+                        let mut extensions = openai_responses_extensions(
+                            item_object,
+                            &[
+                                "type",
+                                "id",
+                                "call_id",
+                                "execution",
+                                "arguments",
+                                "status",
+                                "created_by",
+                            ],
+                        );
+                        remember_openai_responses_tool_call_item_id(&mut extensions, item_object);
+                        canonical_extension_object_mut(
+                            &mut extensions,
+                            OPENAI_RESPONSES_EXTENSION_NAMESPACE,
+                        )
+                        .insert(
+                            "item_type".to_string(),
+                            Value::String("tool_search_call".to_string()),
+                        );
+                        let tool_use = CanonicalContentBlock::ToolUse {
+                            id,
+                            name: "tool_search".to_string(),
+                            input: openai_responses_hosted_tool_input(
+                                item_object,
+                                "tool_search_call",
+                            ),
+                            extensions,
+                        };
+                        append_openai_responses_tool_use(
+                            &mut messages,
+                            tool_use,
+                            &mut pending_reasoning,
+                        );
+                    }
                     "function_call_output" => {
                         let id = item_object
                             .get("call_id")
@@ -2150,6 +2234,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                         pending_reasoning = None;
                     }
                     "custom_tool_call_output"
+                    | "tool_search_output"
                     | "local_shell_call_output"
                     | "shell_call_output"
                     | "apply_patch_call_output"
@@ -2510,6 +2595,13 @@ pub(crate) fn openai_responses_output_to_canonical(
                     extensions,
                 });
             }
+            "tool_search_call" => {
+                blocks.push(openai_responses_hosted_tool_call_to_block(
+                    item_object,
+                    item_type.as_str(),
+                    index,
+                )?);
+            }
             "web_search_call" => {
                 let id = item_object
                     .get("id")
@@ -2581,6 +2673,7 @@ pub(crate) fn openai_responses_output_to_canonical(
                 });
             }
             "custom_tool_call_output"
+            | "tool_search_output"
             | "local_shell_call_output"
             | "shell_call_output"
             | "apply_patch_call_output"
@@ -2636,11 +2729,12 @@ fn openai_responses_hosted_tool_call_to_block(
         item_object,
         &[
             "type",
-            "id",
             "call_id",
             "status",
             "action",
             "actions",
+            "arguments",
+            "execution",
             "environment",
             "created_by",
             "max_output_length",
@@ -2648,6 +2742,7 @@ fn openai_responses_hosted_tool_call_to_block(
             "pending_safety_checks",
         ],
     );
+    remember_openai_responses_tool_call_item_id(&mut extensions, item_object);
     canonical_extension_object_mut(&mut extensions, OPENAI_RESPONSES_EXTENSION_NAMESPACE).insert(
         "item_type".to_string(),
         Value::String(item_type.to_string()),
@@ -2676,6 +2771,7 @@ fn openai_responses_hosted_tool_result_to_block(
         .unwrap_or_else(|| format!("call_auto_{index}"));
     let raw_output = item_object
         .get("output")
+        .or_else(|| item_object.get("tools"))
         .or_else(|| item_object.get("content"));
     let mut extensions = openai_responses_extensions(
         item_object,
@@ -2685,10 +2781,12 @@ fn openai_responses_hosted_tool_result_to_block(
             "call_id",
             "tool_call_id",
             "output",
+            "tools",
             "content",
             "is_error",
         ],
     );
+    remember_openai_responses_tool_call_item_id(&mut extensions, item_object);
     extensions.insert(
         AETHER_EXTENSION_NAMESPACE.to_string(),
         json!({ "source": OPENAI_RESPONSES_TOOL_RESULT_SOURCE_MARKER }),
@@ -2716,6 +2814,7 @@ fn openai_responses_hosted_tool_name(item_type: &str) -> Option<&'static str> {
         "shell_call" => Some("shell"),
         "apply_patch_call" => Some("apply_patch"),
         "computer_call" => Some("computer"),
+        "tool_search_call" => Some("tool_search"),
         _ => None,
     }
 }
@@ -2726,6 +2825,7 @@ fn openai_responses_hosted_tool_result_name(item_type: &str) -> Option<&'static 
         "shell_call_output" => Some("shell"),
         "apply_patch_call_output" => Some("apply_patch"),
         "computer_call_output" => Some("computer"),
+        "tool_search_output" => Some("tool_search"),
         _ => None,
     }
 }
@@ -2741,6 +2841,7 @@ fn openai_responses_hosted_tool_input(item_object: &Map<String, Value>, item_typ
         ][..],
         "apply_patch_call" => &["operation", "status"][..],
         "computer_call" => &["action", "actions", "pending_safety_checks", "status"][..],
+        "tool_search_call" => &["arguments", "execution", "status", "created_by"][..],
         _ => &[][..],
     };
     let mut input = Map::new();
@@ -4262,7 +4363,12 @@ pub(crate) fn claude_thinking_to_canonical(
         enabled: thinking
             .and_then(|value| value.get("type"))
             .and_then(Value::as_str)
-            .is_none_or(|value| value == "enabled"),
+            .is_none_or(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "enabled" | "adaptive"
+                )
+            }),
         budget_tokens: thinking
             .and_then(|value| value.get("budget_tokens"))
             .and_then(Value::as_u64),
@@ -4360,13 +4466,33 @@ pub(crate) fn gemini_response_format_to_canonical(
     if response_mime_type != "application/json" {
         return None;
     }
-    let json_schema = gemini_value_by_case(generation_config, "responseSchema", "response_schema")
-        .map(|schema| {
+    let (schema_field, schema) = [
+        "responseJsonSchema",
+        "response_json_schema",
+        "_responseJsonSchema",
+        "_response_json_schema",
+        "responseSchema",
+        "response_schema",
+    ]
+    .into_iter()
+    .find_map(|field| generation_config.get(field).map(|schema| (field, schema)))
+    .unzip();
+    let json_schema = schema.map(|schema| {
+        json!({
+            "name": "response_schema",
+            "schema": schema,
+        })
+    });
+    let mut extensions = BTreeMap::new();
+    if let Some(schema_field) = schema_field {
+        extensions.insert(
+            "gemini".to_string(),
             json!({
-                "name": "response_schema",
-                "schema": schema,
-            })
-        });
+                "schema_field": schema_field,
+                "raw_schema": schema,
+            }),
+        );
+    }
     Some(CanonicalResponseFormat {
         format_type: if json_schema.is_some() {
             "json_schema".to_string()
@@ -4374,7 +4500,7 @@ pub(crate) fn gemini_response_format_to_canonical(
             "json_object".to_string()
         },
         json_schema,
-        extensions: BTreeMap::new(),
+        extensions,
     })
 }
 
@@ -6273,7 +6399,7 @@ pub(crate) fn openai_finish_reason_to_canonical(
 pub(crate) fn claude_stop_reason_to_canonical(value: Option<&str>) -> Option<CanonicalStopReason> {
     Some(match value? {
         "end_turn" => CanonicalStopReason::EndTurn,
-        "max_tokens" => CanonicalStopReason::MaxTokens,
+        "max_tokens" | "model_context_window_exceeded" => CanonicalStopReason::MaxTokens,
         "stop_sequence" => CanonicalStopReason::StopSequence,
         "tool_use" => CanonicalStopReason::ToolUse,
         "pause_turn" => CanonicalStopReason::PauseTurn,
@@ -6288,6 +6414,7 @@ pub(crate) fn gemini_stop_reason_to_canonical(value: &str) -> Option<CanonicalSt
         "STOP" => CanonicalStopReason::EndTurn,
         "MAX_TOKENS" => CanonicalStopReason::MaxTokens,
         "SAFETY"
+        | "ESCALATION"
         | "RECITATION"
         | "LANGUAGE"
         | "BLOCKLIST"
@@ -6509,6 +6636,10 @@ const GEMINI_MAPPED_GENERATION_CONFIG_KEYS: &[&str] = &[
     "response_mime_type",
     "responseSchema",
     "response_schema",
+    "responseJsonSchema",
+    "response_json_schema",
+    "_responseJsonSchema",
+    "_response_json_schema",
     "responseModalities",
     "response_modalities",
 ];
@@ -6618,6 +6749,22 @@ pub(crate) fn openai_responses_item_extension_object(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+pub(crate) fn openai_responses_result_item_extension_object(
+    extensions: &BTreeMap<String, Value>,
+    existing: &Map<String, Value>,
+) -> Map<String, Value> {
+    let mut fields = openai_responses_item_extension_object(extensions, existing);
+    if !existing.contains_key("id") {
+        if let Some(item_id) = openai_responses_extension(extensions)
+            .and_then(|value| value.get("item_id").or_else(|| value.get("id")))
+            .cloned()
+        {
+            fields.insert("id".to_string(), item_id);
+        }
+    }
+    fields
 }
 
 pub(crate) fn strip_claude_billing_header(text: &str) -> String {
@@ -8467,6 +8614,95 @@ mod tests {
     }
 
     #[test]
+    fn claude_adaptive_thinking_and_context_window_stop_reason_are_canonicalized() {
+        let request = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64,
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "high"}
+        });
+        let canonical = from_claude_to_canonical_request(&request).expect("canonical request");
+        let thinking = canonical.thinking.as_ref().expect("thinking config");
+        assert!(thinking.enabled);
+        assert_eq!(
+            thinking
+                .extensions
+                .get("claude")
+                .and_then(|value| value.get("display")),
+            Some(&json!("omitted"))
+        );
+        let rebuilt = canonical_to_claude_request(&canonical, "claude-opus-4-7", false)
+            .expect("Claude request");
+        assert_eq!(rebuilt["thinking"], request["thinking"]);
+
+        let response = json!({
+            "id": "msg_context_limit",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-7",
+            "content": [{"type": "text", "text": "partial"}],
+            "stop_reason": "model_context_window_exceeded",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let canonical = from_claude_to_canonical_response(&response).expect("canonical response");
+        assert_eq!(
+            canonical.stop_reason,
+            Some(super::CanonicalStopReason::MaxTokens)
+        );
+        let openai = canonical_to_openai_chat_response(&canonical);
+        assert_eq!(openai["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn gemini_latest_schema_function_response_and_server_tool_parts_roundtrip() {
+        let request = json!({
+            "model": "gemini-3-pro",
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "id": "call_1",
+                            "name": "lookup",
+                            "response": {"ok": true},
+                            "parts": [{"inlineData": {"mimeType": "text/plain", "data": "b2s="}}],
+                            "scheduling": "INTERRUPT",
+                            "willContinue": true
+                        },
+                        "partMetadata": {"source": "test"}
+                    },
+                    {"toolCall": {"name": "server_search", "args": {"q": "rust"}}},
+                    {"toolResponse": {"name": "server_search", "response": {"ok": true}}}
+                ]
+            }],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseJsonSchema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}}
+                }
+            }
+        });
+        let canonical = from_gemini_to_canonical_request(
+            &request,
+            "/v1beta/models/gemini-3-pro:generateContent",
+        )
+        .expect("canonical request");
+        let rebuilt =
+            canonical_to_gemini_request(&canonical, "gemini-3-pro", false).expect("Gemini request");
+        assert_eq!(
+            rebuilt["generationConfig"]["responseJsonSchema"],
+            request["generationConfig"]["responseJsonSchema"]
+        );
+        assert_eq!(
+            rebuilt["contents"][0]["parts"],
+            request["contents"][0]["parts"]
+        );
+    }
+
+    #[test]
     fn gemini_request_adapter_preserves_thinking_tools_media_and_extensions() {
         let request = json!({
             "systemInstruction": {
@@ -8906,12 +9142,45 @@ mod tests {
         );
         assert_eq!(
             rebuilt["candidates"][0]["content"]["parts"][3]["functionResponse"]["response"],
-            json!({"ok": true})
+            response["candidates"][0]["content"]["parts"][3]["functionResponse"]["response"]
         );
         assert_eq!(rebuilt["usageMetadata"]["promptTokenCount"], 10);
         assert_eq!(rebuilt["usageMetadata"]["cachedContentTokenCount"], 4);
         assert_eq!(rebuilt["usageMetadata"]["totalTokenCount"], 17);
         assert_eq!(rebuilt["usageMetadata"]["thoughtsTokenCount"], 2);
+    }
+
+    #[test]
+    fn gemini_response_adapter_preserves_extended_function_response_same_format() {
+        let response = json!({
+            "responseId": "resp_extended_tool_result",
+            "modelVersion": "gemini-3-pro",
+            "candidates": [{
+                "index": 0,
+                "finishReason": "STOP",
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionResponse": {
+                            "id": "call_1",
+                            "name": "lookup",
+                            "response": {"ok": true},
+                            "parts": [{"inlineData": {"mimeType": "text/plain", "data": "b2s="}}],
+                            "scheduling": "INTERRUPT",
+                            "willContinue": true
+                        },
+                        "partMetadata": {"source": "test"}
+                    }]
+                }
+            }]
+        });
+
+        let canonical = from_gemini_to_canonical_response(&response).expect("canonical response");
+        let rebuilt = canonical_to_gemini_response(&canonical, &json!({})).expect("Gemini");
+        assert_eq!(
+            rebuilt["candidates"][0]["content"]["parts"],
+            response["candidates"][0]["content"]["parts"]
+        );
     }
 
     #[test]

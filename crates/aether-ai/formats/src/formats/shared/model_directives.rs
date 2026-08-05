@@ -118,7 +118,8 @@ impl ReasoningEffort {
 
     pub fn as_gemini_level_value(self) -> &'static str {
         match self {
-            Self::None | Self::Minimal | Self::Low => "low",
+            Self::None | Self::Low => "low",
+            Self::Minimal => "minimal",
             Self::Medium => "medium",
             Self::High | Self::XHigh | Self::Max => "high",
         }
@@ -971,6 +972,12 @@ mod tests {
                 overrides: vec![ModelOverride::ReasoningEffort(ReasoningEffort::Max)],
             })
         );
+    }
+
+    #[test]
+    fn gemini_thinking_level_preserves_minimal_effort() {
+        assert_eq!(ReasoningEffort::Minimal.as_gemini_level_value(), "minimal");
+        assert_eq!(ReasoningEffort::Low.as_gemini_level_value(), "low");
     }
 
     #[test]

@@ -89,6 +89,11 @@ pub fn finalize_openai_provider_request_with_codex_model_capabilities(
         body,
         finalization.provider_api_format,
     );
+    super::responses::strip_incompatible_openai_responses_input_item_ids(
+        body,
+        finalization.provider_type,
+        finalization.provider_api_format,
+    );
     crate::enforce_request_body_stream_field(
         body,
         finalization.provider_api_format,
@@ -334,6 +339,95 @@ mod tests {
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["id"], "rs_provider_123");
         assert_eq!(input[1]["type"], "message");
+    }
+
+    #[test]
+    fn finalization_strips_invalid_official_openai_input_item_ids() {
+        let mut body = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "message",
+                    "id": "item_e19637e60faa53da843e731c",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_valid",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                },
+                {
+                    "type": "function_call",
+                    "id": "item_bad_call",
+                    "call_id": "call_123",
+                    "name": "exec_command",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "item_output",
+                    "call_id": "call_123",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        finalize_openai_provider_request(
+            &mut body,
+            OpenAiProviderRequestFinalization {
+                source_api_format: "openai:responses",
+                provider_api_format: "openai:responses",
+                provider_type: "openai",
+                provider_model: "gpt-5.4",
+                source_model: "gpt-5.4",
+                body_rules: None,
+                upstream_is_stream: false,
+                require_body_stream_field: false,
+            },
+        )
+        .expect("invalid official OpenAI item IDs should be sanitized before validation");
+
+        let input = body["input"].as_array().expect("input array");
+        assert!(input[0].get("id").is_none());
+        assert_eq!(input[0]["content"][0]["text"], "done");
+        assert_eq!(input[1]["id"], "msg_valid");
+        assert!(input[2].get("id").is_none());
+        assert_eq!(input[2]["call_id"], "call_123");
+        assert_eq!(input[2]["name"], "exec_command");
+        assert_eq!(input[3]["id"], "item_output");
+        assert_eq!(input[3]["call_id"], "call_123");
+    }
+
+    #[test]
+    fn finalization_preserves_private_responses_item_ids() {
+        let mut body = json!({
+            "model": "compatible-model",
+            "input": [{
+                "type": "message",
+                "id": "item_private",
+                "role": "user",
+                "content": "continue"
+            }]
+        });
+
+        finalize_openai_provider_request(
+            &mut body,
+            OpenAiProviderRequestFinalization {
+                source_api_format: "openai:responses",
+                provider_api_format: "openai:responses",
+                provider_type: "openai_compatible",
+                provider_model: "compatible-model",
+                source_model: "compatible-model",
+                body_rules: None,
+                upstream_is_stream: false,
+                require_body_stream_field: false,
+            },
+        )
+        .expect("private Responses-compatible request should remain valid");
+
+        assert_eq!(body["input"][0]["id"], "item_private");
     }
 
     #[test]

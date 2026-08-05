@@ -180,6 +180,7 @@ pub(crate) use aether_ai_formats::{
     sanitize_claude_request_for_agent_bridge_conversion,
     sanitize_claude_request_for_agent_bridge_conversion_with_prompt_cache,
     sanitize_openai_responses_for_claude_projection, scan_claude_agent_bridge_history,
+    strip_incompatible_openai_responses_input_item_ids,
     strip_incompatible_openai_responses_reasoning_items,
     validate_agent_bridge_function_call_arguments, AgentBridgeCompatibilityReport,
     AgentBridgePrimaryState, AgentBridgeRequestSanitizeReport, ApiOperation, ClientSurface,

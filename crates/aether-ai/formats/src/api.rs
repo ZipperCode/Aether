@@ -77,6 +77,7 @@ pub use crate::formats::openai::{
     },
     responses::{
         openai_responses_synthetic_reasoning_item_id,
+        strip_incompatible_openai_responses_input_item_ids,
         strip_incompatible_openai_responses_reasoning_items,
     },
 };

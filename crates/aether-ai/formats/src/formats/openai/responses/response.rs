@@ -17,7 +17,7 @@ use crate::{
         canonical_tool_use_to_openai_responses_item, canonical_usage_to_openai_responses_usage,
         flush_openai_responses_message_item, is_openai_responses_raw_block,
         is_openai_thinking_block, namespace_extension_object, openai_responses_extensions,
-        openai_responses_item_extension_object, openai_responses_output_to_canonical,
+        openai_responses_output_to_canonical, openai_responses_result_item_extension_object,
         openai_responses_usage_to_canonical, openai_service_tier_extension, CanonicalContentBlock,
         CanonicalResponse, CanonicalResponseOutput, CanonicalRole, CanonicalStopReason,
         OPENAI_RESPONSES_EXTENSION_NAMESPACE, OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
@@ -279,16 +279,23 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bo
                     ),
                 );
                 item.insert("call_id".to_string(), Value::String(tool_use_id.clone()));
-                item.insert(
-                    "output".to_string(),
-                    encode_tool_result_error(
-                        result_output.clone().unwrap_or_else(|| {
-                            Value::String(content_text.clone().unwrap_or_default())
-                        }),
-                        *is_error,
-                    ),
-                );
-                let extension_fields = openai_responses_item_extension_object(extensions, &item);
+                let output_field =
+                    if responses_tool_result_item_type(extensions) == Some("tool_search_output") {
+                        "tools"
+                    } else {
+                        "output"
+                    };
+                let result_output = result_output
+                    .clone()
+                    .unwrap_or_else(|| Value::String(content_text.clone().unwrap_or_default()));
+                let result_output = if output_field == "tools" {
+                    result_output
+                } else {
+                    encode_tool_result_error(result_output, *is_error)
+                };
+                item.insert(output_field.to_string(), result_output);
+                let extension_fields =
+                    openai_responses_result_item_extension_object(extensions, &item);
                 item.extend(extension_fields);
                 output.push(Value::Object(item));
             }
@@ -413,6 +420,7 @@ fn responses_tool_result_item_type(extensions: &BTreeMap<String, Value>) -> Opti
     matches!(
         item_type,
         "custom_tool_call_output"
+            | "tool_search_output"
             | "local_shell_call_output"
             | "shell_call_output"
             | "apply_patch_call_output"
@@ -779,5 +787,42 @@ mod tests {
             ..
         }) if id == "call_ws_1" && name == "web_search" && input["query"] == "today tech")
         );
+    }
+
+    #[test]
+    fn responses_response_roundtrips_tool_search_call_and_output() {
+        let body = json!({
+            "id": "resp_tool_search",
+            "object": "response",
+            "model": "gpt-5.6",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "tool_search_call",
+                    "id": "tsc_123",
+                    "call_id": "call_123",
+                    "execution": "client",
+                    "arguments": {"goal": "find shipping tools"},
+                    "status": "completed"
+                },
+                {
+                    "type": "tool_search_output",
+                    "id": "tso_123",
+                    "call_id": "call_123",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "function",
+                        "name": "get_shipping_eta",
+                        "parameters": {"type": "object", "properties": {}}
+                    }],
+                    "status": "completed"
+                }
+            ]
+        });
+
+        let canonical = from_raw(&body).expect("tool search response should parse");
+        let rebuilt = to_raw(&canonical, &json!({}), false);
+
+        assert_eq!(rebuilt["output"], body["output"]);
     }
 }

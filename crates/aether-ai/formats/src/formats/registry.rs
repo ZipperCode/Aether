@@ -182,6 +182,17 @@ fn validate_runtime_request_conversion(
     validate_openai_reasoning_effort(source, target, body, mapped_model)?;
     validate_openai_responses_cross_format_input(source, target, body)?;
     validate_openai_responses_runtime_reasoning(source, target, body)?;
+    if source != target {
+        match source {
+            FormatId::ClaudeMessages => {
+                validate_runtime_claude_latest_cross_format_fields(body, target)?
+            }
+            FormatId::GeminiGenerateContent => {
+                validate_runtime_gemini_latest_cross_format_fields(body, target)?
+            }
+            _ => {}
+        }
+    }
     if matches!(source, FormatId::OpenAiChat)
         && matches!(
             target,
@@ -225,6 +236,73 @@ fn validate_runtime_request_conversion(
                 });
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_claude_latest_cross_format_fields(
+    body: &Value,
+    target: FormatId,
+) -> Result<(), FormatError> {
+    if let Some(output_effort) = body
+        .get("output_config")
+        .and_then(Value::as_object)
+        .and_then(|output_config| output_config.get("effort"))
+    {
+        validate_claude_output_effort_value(output_effort)?;
+    }
+    if body
+        .get("thinking")
+        .and_then(Value::as_object)
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("adaptive"))
+        && body
+            .get("output_config")
+            .and_then(Value::as_object)
+            .and_then(|output_config| output_config.get("effort"))
+            .is_none()
+    {
+        return Err(FormatError::LossyConversionBlocked {
+            source_format: FormatId::ClaudeMessages.as_str().to_string(),
+            target_format: target.as_str().to_string(),
+            field: "thinking.type".to_string(),
+            reason: "adaptive Claude thinking has no lossless cross-format effort without output_config.effort".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_runtime_gemini_latest_cross_format_fields(
+    body: &Value,
+    target: FormatId,
+) -> Result<(), FormatError> {
+    validate_gemini_extended_function_responses(body, target)?;
+    if let Some(thinking_config) = body
+        .as_object()
+        .and_then(|object| object_by_case(object, "generationConfig", "generation_config"))
+        .and_then(|generation_config| {
+            object_by_case(generation_config, "thinkingConfig", "thinking_config")
+        })
+    {
+        validate_gemini_cross_format_thinking_config(thinking_config, target)?;
+    }
+    for (camel, snake) in [
+        ("computerUse", "computer_use"),
+        ("fileSearch", "file_search"),
+        ("googleMaps", "google_maps"),
+        ("mcpServers", "mcp_servers"),
+    ] {
+        if gemini_request_contains_builtin_tool(body, camel, snake) {
+            return Err(FormatError::LossyConversionBlocked {
+                source_format: FormatId::GeminiGenerateContent.as_str().to_string(),
+                target_format: target.as_str().to_string(),
+                field: format!("tools[].{camel}"),
+                reason: format!(
+                    "target format has no audited lossless equivalent for Gemini {camel}"
+                ),
+            });
         }
     }
     Ok(())
@@ -514,8 +592,10 @@ fn validate_openai_responses_cross_format_input(
                 | "reasoning"
                 | "function_call"
                 | "custom_tool_call"
+                | "tool_search_call"
                 | "function_call_output"
                 | "custom_tool_call_output"
+                | "tool_search_output"
                 | "local_shell_call_output"
                 | "shell_call_output"
                 | "apply_patch_call_output"
@@ -607,9 +687,60 @@ fn validate_response_conversion(
     }
 
     validate_source_response_stop_enums(source, target, body)?;
+    validate_gemini_cross_format_response(source, target, body)?;
     validate_response_content_has_no_unknown_blocks(source, target, response)?;
     validate_openai_responses_cross_format_response_extensions(source, target, response)?;
     validate_canonical_response_stop_reasons(source, target, response)
+}
+
+fn validate_gemini_cross_format_response(
+    source: FormatId,
+    target: FormatId,
+    body: &Value,
+) -> Result<(), FormatError> {
+    if source != FormatId::GeminiGenerateContent || target == FormatId::GeminiGenerateContent {
+        return Ok(());
+    }
+    for (candidate_index, candidate) in body
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (part_index, part) in candidate
+            .get("content")
+            .and_then(Value::as_object)
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let Some(function_response) = part
+                .get("functionResponse")
+                .or_else(|| part.get("function_response"))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            if let Some(field) = function_response
+                .keys()
+                .find(|field| !matches!(field.as_str(), "id" | "name" | "response"))
+            {
+                return Err(FormatError::LossyConversionBlocked {
+                    source_format: source.as_str().to_string(),
+                    target_format: target.as_str().to_string(),
+                    field: format!(
+                        "candidates[{candidate_index}].content.parts[{part_index}].functionResponse.{field}"
+                    ),
+                    reason: "target format cannot preserve this Gemini FunctionResponse field"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_openai_responses_cross_format_response_extensions(
@@ -1404,6 +1535,20 @@ fn request_extension_key_is_cross_format_safe(
     {
         return true;
     }
+    if location == "messages[].content[]"
+        && matches!(
+            source,
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+        )
+        && target == FormatId::OpenAiChat
+        && matches!(namespace, "openai_responses" | "openai_cli")
+        && matches!(
+            key,
+            "item_id" | "item_type" | "execution" | "status" | "created_by"
+        )
+    {
+        return true;
+    }
     if location == "tools[]" {
         return tool_extension_key_is_cross_format_safe(source, target, namespace, key);
     }
@@ -1412,6 +1557,13 @@ fn request_extension_key_is_cross_format_safe(
     }
     if location == "response_format" {
         return response_format_extension_key_is_cross_format_safe(namespace, key);
+    }
+    if location == "messages[].content[]"
+        && source == FormatId::GeminiGenerateContent
+        && namespace == "gemini"
+        && key == "raw_function_response"
+    {
+        return true;
     }
     matches!(
         (source, target, namespace, key),
@@ -1529,7 +1681,7 @@ fn thinking_extension_key_is_cross_format_safe(
             FormatId::ClaudeMessages,
             _,
             "claude",
-            "type" | "budget_tokens" | "output_config",
+            "type" | "budget_tokens" | "display" | "output_config",
         ) | (
             FormatId::ClaudeMessages,
             FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
@@ -1539,7 +1691,11 @@ fn thinking_extension_key_is_cross_format_safe(
             FormatId::GeminiGenerateContent,
             _,
             "gemini",
-            "thinking_config" | "includeThoughts" | "thinkingBudget" | "thinkingLevel",
+            "thinking_config"
+                | "includeThoughts"
+                | "thinkingBudget"
+                | "thinkingLevel"
+                | "schema_field",
         ) | (
             FormatId::GeminiGenerateContent,
             FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
@@ -1550,7 +1706,10 @@ fn thinking_extension_key_is_cross_format_safe(
 }
 
 fn response_format_extension_key_is_cross_format_safe(namespace: &str, key: &str) -> bool {
-    matches!((namespace, key), ("openai", _) | ("gemini", "raw_schema"))
+    matches!(
+        (namespace, key),
+        ("openai", _) | ("gemini", "raw_schema" | "schema_field")
+    )
 }
 
 fn extension_field_path(location: &str, namespace: &str, key: &str) -> String {
@@ -1680,6 +1839,7 @@ fn validate_claude_response_stop_reason(body: &Value) -> Result<(), FormatError>
             | "pause_turn"
             | "refusal"
             | "content_filtered"
+            | "model_context_window_exceeded"
     ) {
         return Err(FormatError::InvalidEnumValue {
             format: FormatId::ClaudeMessages.as_str().to_string(),
@@ -1758,6 +1918,7 @@ fn gemini_finish_reason_is_cross_format_mappable(value: &str) -> bool {
         value,
         "STOP"
             | "MAX_TOKENS"
+            | "ESCALATION"
             | "SAFETY"
             | "RECITATION"
             | "LANGUAGE"
@@ -1783,7 +1944,6 @@ fn gemini_finish_reason_is_known(value: &str) -> bool {
                 | "TOO_MANY_TOOL_CALLS"
                 | "MISSING_THOUGHT_SIGNATURE"
                 | "MALFORMED_RESPONSE"
-                | "ESCALATION"
         )
 }
 
@@ -2452,6 +2612,25 @@ fn validate_claude_cross_format_request(body: &Value, target: FormatId) -> Resul
     {
         validate_claude_output_effort_value(output_effort)?;
     }
+    if body
+        .get("thinking")
+        .and_then(Value::as_object)
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("adaptive"))
+        && body
+            .get("output_config")
+            .and_then(Value::as_object)
+            .and_then(|output_config| output_config.get("effort"))
+            .is_none()
+    {
+        return Err(FormatError::LossyConversionBlocked {
+            source_format: FormatId::ClaudeMessages.as_str().to_string(),
+            target_format: target.as_str().to_string(),
+            field: "thinking.type".to_string(),
+            reason: "adaptive Claude thinking has no lossless cross-format effort without output_config.effort".to_string(),
+        });
+    }
 
     match target {
         FormatId::OpenAiChat if claude_request_contains_tool_result_content_array(body) => {
@@ -2540,6 +2719,7 @@ fn validate_gemini_cross_format_request(body: &Value, target: FormatId) -> Resul
             reason: "target format has no lossless equivalent for Gemini cachedContent".to_string(),
         });
     }
+    validate_gemini_extended_function_responses(body, target)?;
     if let Some(generation_config) = object_by_case(object, "generationConfig", "generation_config")
     {
         if generation_config.contains_key("responseModalities")
@@ -2556,7 +2736,7 @@ fn validate_gemini_cross_format_request(body: &Value, target: FormatId) -> Resul
         if let Some(thinking_config) =
             object_by_case(generation_config, "thinkingConfig", "thinking_config")
         {
-            validate_gemini_cross_format_thinking_config(thinking_config)?;
+            validate_gemini_cross_format_thinking_config(thinking_config, target)?;
         }
     }
     if let Some(tool_config) = object_by_case(object, "toolConfig", "tool_config") {
@@ -2578,6 +2758,23 @@ fn validate_gemini_cross_format_request(body: &Value, target: FormatId) -> Resul
             reason: "target format has no lossless equivalent for Gemini urlContext".to_string(),
         });
     }
+    for (camel, snake) in [
+        ("computerUse", "computer_use"),
+        ("fileSearch", "file_search"),
+        ("googleMaps", "google_maps"),
+        ("mcpServers", "mcp_servers"),
+    ] {
+        if gemini_request_contains_builtin_tool(body, camel, snake) {
+            return Err(FormatError::LossyConversionBlocked {
+                source_format: FormatId::GeminiGenerateContent.as_str().to_string(),
+                target_format: target.as_str().to_string(),
+                field: format!("tools[].{camel}"),
+                reason: format!(
+                    "target format has no audited lossless equivalent for Gemini {camel}"
+                ),
+            });
+        }
+    }
     if matches!(
         target,
         FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
@@ -2595,8 +2792,54 @@ fn validate_gemini_cross_format_request(body: &Value, target: FormatId) -> Resul
     Ok(())
 }
 
+fn validate_gemini_extended_function_responses(
+    body: &Value,
+    target: FormatId,
+) -> Result<(), FormatError> {
+    for (content_index, content) in body
+        .as_object()
+        .and_then(|object| object.get("contents"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (part_index, part) in content
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let Some(function_response) = part
+                .get("functionResponse")
+                .or_else(|| part.get("function_response"))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            if let Some(field) = function_response
+                .keys()
+                .find(|field| !matches!(field.as_str(), "id" | "name" | "response"))
+            {
+                return Err(FormatError::LossyConversionBlocked {
+                    source_format: FormatId::GeminiGenerateContent.as_str().to_string(),
+                    target_format: target.as_str().to_string(),
+                    field: format!(
+                        "contents[{content_index}].parts[{part_index}].functionResponse.{field}"
+                    ),
+                    reason: "target format cannot preserve this Gemini FunctionResponse field"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_gemini_cross_format_thinking_config(
     thinking_config: &Map<String, Value>,
+    target: FormatId,
 ) -> Result<(), FormatError> {
     if let Some(value) = thinking_config
         .get("thinkingLevel")
@@ -2609,10 +2852,18 @@ fn validate_gemini_cross_format_thinking_config(
                 reason: "Gemini thinkingLevel must be a string".to_string(),
             });
         };
-        if !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "low" | "medium" | "high"
-        ) {
+        let normalized = raw.trim().to_ascii_lowercase();
+        if normalized == "thinking_level_unspecified" {
+            return Err(FormatError::LossyConversionBlocked {
+                source_format: FormatId::GeminiGenerateContent.as_str().to_string(),
+                target_format: target.as_str().to_string(),
+                field: "generationConfig.thinkingConfig.thinkingLevel".to_string(),
+                reason:
+                    "Gemini model-default thinking level has no lossless cross-format equivalent"
+                        .to_string(),
+            });
+        }
+        if !matches!(normalized.as_str(), "minimal" | "low" | "medium" | "high") {
             return Err(FormatError::InvalidEnumValue {
                 format: FormatId::GeminiGenerateContent.as_str().to_string(),
                 field: "generationConfig.thinkingConfig.thinkingLevel".to_string(),
@@ -3441,6 +3692,31 @@ mod tests {
     }
 
     #[test]
+    fn pure_claude_adaptive_thinking_requires_explicit_cross_format_effort() {
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64,
+            "thinking": {"type": "adaptive", "display": "summarized"}
+        });
+
+        let error = convert_request_pure("claude:messages", "openai:chat", &body)
+            .expect_err("adaptive thinking without effort must fail closed");
+        assert!(matches!(
+            error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "thinking.type"
+        ));
+
+        let mut with_effort = body;
+        with_effort["output_config"] = json!({"effort": "high"});
+        let converted = convert_request_pure("claude:messages", "openai:chat", &with_effort)
+            .expect("adaptive thinking with effort should map")
+            .value;
+        assert_eq!(converted["reasoning_effort"], "high");
+    }
+
+    #[test]
     fn pure_openai_chat_to_claude_maps_parallel_tool_calls() {
         let body = json!({
             "model": "gpt-source",
@@ -3576,6 +3852,42 @@ mod tests {
     }
 
     #[test]
+    fn pure_gemini_minimal_thinking_level_maps_case_insensitively() {
+        for level in ["MINIMAL", "minimal"] {
+            let body = json!({
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                "generationConfig": {
+                    "thinkingConfig": {
+                        "includeThoughts": true,
+                        "thinkingLevel": level
+                    }
+                }
+            });
+            let converted = convert_request_pure("gemini:generate_content", "openai:chat", &body)
+                .expect("minimal Gemini thinking should map")
+                .value;
+            assert_eq!(converted["reasoning_effort"], "minimal");
+        }
+    }
+
+    #[test]
+    fn pure_gemini_unspecified_thinking_level_fails_closed() {
+        let body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {
+                "thinkingConfig": {"thinkingLevel": "THINKING_LEVEL_UNSPECIFIED"}
+            }
+        });
+        let error = convert_request_pure("gemini:generate_content", "openai:chat", &body)
+            .expect_err("model-default Gemini thinking has no lossless target value");
+        assert!(matches!(
+            error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "generationConfig.thinkingConfig.thinkingLevel"
+        ));
+    }
+
+    #[test]
     fn pure_openai_chat_to_gemini_maps_named_tool_choice_to_allowed_function_names() {
         let body = json!({
             "model": "gpt-source",
@@ -3656,6 +3968,99 @@ mod tests {
             super::FormatError::LossyConversionBlocked { ref field, .. }
                 if field == "generationConfig.responseModalities"
         ));
+    }
+
+    #[test]
+    fn pure_gemini_new_builtin_tools_fail_closed_cross_format() {
+        for (field, payload) in [
+            ("computerUse", json!({})),
+            ("fileSearch", json!({"fileSearchStoreNames": ["stores/1"]})),
+            ("googleMaps", json!({})),
+            ("mcpServers", json!([{"name": "server"}])),
+        ] {
+            let body = json!({
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                "tools": [{field: payload}]
+            });
+            let error = convert_request_pure("gemini:generate_content", "openai:chat", &body)
+                .expect_err("provider-only Gemini tool should fail closed");
+            assert!(matches!(
+                error,
+                super::FormatError::LossyConversionBlocked { field: ref error_field, .. }
+                    if error_field == &format!("tools[].{field}")
+            ));
+        }
+    }
+
+    #[test]
+    fn pure_gemini_extended_function_response_fails_closed_cross_format() {
+        let body = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "id": "call_1",
+                        "name": "lookup",
+                        "response": {"ok": true},
+                        "scheduling": "INTERRUPT",
+                        "willContinue": true
+                    }
+                }]
+            }]
+        });
+        let error = convert_request_pure("gemini:generate_content", "openai:chat", &body)
+            .expect_err("extended FunctionResponse fields must fail closed");
+        assert!(matches!(
+            error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field.ends_with("functionResponse.scheduling")
+                    || field.ends_with("functionResponse.willContinue")
+        ));
+    }
+
+    #[test]
+    fn runtime_gemini_extended_function_response_fails_closed_cross_format() {
+        let body = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "id": "call_1",
+                        "name": "lookup",
+                        "response": {"ok": true},
+                        "parts": [{"inlineData": {"mimeType": "text/plain", "data": "b2s="}}]
+                    }
+                }]
+            }]
+        });
+        let error = convert_request(
+            "gemini:generate_content",
+            "openai:chat",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect_err("runtime conversion must enforce Gemini FunctionResponse fidelity");
+        assert!(matches!(
+            error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field.ends_with("functionResponse.parts")
+        ));
+    }
+
+    #[test]
+    fn runtime_openai_minimal_effort_maps_to_gemini_thinking_level_model() {
+        let body = json!({
+            "model": "gpt-source",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "minimal"
+        });
+        let ctx = FormatContext::default().with_mapped_model("gemini-3-pro");
+        let converted = convert_request("openai:chat", "gemini:generate_content", &body, &ctx)
+            .expect("minimal effort should map to a Gemini thinking-level model");
+        assert_eq!(
+            converted["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "minimal"
+        );
     }
 
     #[test]
@@ -4074,6 +4479,55 @@ mod tests {
             .value;
 
         assert_eq!(converted["input"], body["input"]);
+    }
+
+    #[test]
+    fn pure_openai_responses_tool_search_history_maps_to_chat_call_and_result() {
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "id": "tsc_123",
+                    "call_id": "call_123",
+                    "execution": "client",
+                    "arguments": {"goal": "find shipping tools"},
+                    "status": "completed"
+                },
+                {
+                    "type": "tool_search_output",
+                    "id": "tso_123",
+                    "call_id": "call_123",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "function",
+                        "name": "get_shipping_eta",
+                        "parameters": {"type": "object", "properties": {}}
+                    }],
+                    "status": "completed"
+                }
+            ]
+        });
+
+        let converted = convert_request_pure("openai:responses", "openai:chat", &body)
+            .expect("tool search history should map to Chat function call history")
+            .value;
+
+        assert_eq!(converted["messages"][0]["role"], "assistant");
+        assert_eq!(converted["messages"][0]["tool_calls"][0]["id"], "call_123");
+        assert_eq!(
+            converted["messages"][0]["tool_calls"][0]["function"]["name"],
+            "tool_search"
+        );
+        assert_eq!(
+            converted["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{\"goal\":\"find shipping tools\"}"
+        );
+        assert_eq!(converted["messages"][1]["role"], "tool");
+        assert_eq!(converted["messages"][1]["tool_call_id"], "call_123");
+        assert!(converted["messages"][1]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("get_shipping_eta")));
     }
 
     #[test]
@@ -5011,6 +5465,86 @@ mod tests {
             error,
             super::FormatError::LossyConversionBlocked { ref field, .. }
                 if field == "candidates[].finishReason"
+        ));
+    }
+
+    #[test]
+    fn pure_response_conversion_maps_latest_provider_finish_reasons() {
+        let claude = json!({
+            "id": "msg_context_limit",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-7",
+            "content": [{"type": "text", "text": "partial"}],
+            "stop_reason": "model_context_window_exceeded",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let openai = convert_response_pure("claude:messages", "openai:chat", &claude)
+            .expect("Claude context limit should map to length")
+            .value;
+        assert_eq!(openai["choices"][0]["finish_reason"], "length");
+
+        let gemini = json!({
+            "responseId": "resp_escalation",
+            "modelVersion": "gemini-3-pro",
+            "candidates": [{
+                "index": 0,
+                "content": {"role": "model", "parts": [{"text": "filtered"}]},
+                "finishReason": "ESCALATION"
+            }]
+        });
+        let openai = convert_response_pure("gemini:generate_content", "openai:chat", &gemini)
+            .expect("Gemini escalation should map to content filtering")
+            .value;
+        assert_eq!(openai["choices"][0]["finish_reason"], "content_filter");
+
+        for reason in [
+            "MALFORMED_RESPONSE",
+            "MISSING_THOUGHT_SIGNATURE",
+            "TOO_MANY_TOOL_CALLS",
+            "UNEXPECTED_TOOL_CALL",
+        ] {
+            let mut body = gemini.clone();
+            body["candidates"][0]["finishReason"] = json!(reason);
+            let error = convert_response_pure("gemini:generate_content", "openai:chat", &body)
+                .expect_err("known unmappable finish reason must fail closed");
+            assert!(matches!(
+                error,
+                super::FormatError::LossyConversionBlocked { ref field, .. }
+                    if field == "candidates[].finishReason"
+            ));
+        }
+    }
+
+    #[test]
+    fn pure_gemini_response_extended_function_response_fails_closed_cross_format() {
+        let response = json!({
+            "responseId": "resp_function_response",
+            "modelVersion": "gemini-3-pro",
+            "candidates": [{
+                "index": 0,
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionResponse": {
+                            "id": "call_1",
+                            "name": "lookup",
+                            "response": {"ok": true},
+                            "scheduling": "INTERRUPT",
+                            "willContinue": true
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let error = convert_response_pure("gemini:generate_content", "openai:chat", &response)
+            .expect_err("extended response FunctionResponse fields must fail closed");
+        assert!(matches!(
+            error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field.ends_with("functionResponse.scheduling")
+                    || field.ends_with("functionResponse.willContinue")
         ));
     }
 

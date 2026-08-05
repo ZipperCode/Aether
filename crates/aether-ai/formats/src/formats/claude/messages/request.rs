@@ -162,8 +162,22 @@ pub fn to_raw(
         let uses_adaptive = claude_model_uses_adaptive_effort(mapped_model)
             || claude_model_uses_adaptive_effort(canonical.model.as_str());
         if thinking.enabled || budget_tokens.is_some() {
-            let thinking_config = if uses_adaptive {
-                json!({"type": "adaptive"})
+            let original_claude_thinking =
+                thinking.extensions.get("claude").and_then(Value::as_object);
+            let source_is_adaptive = original_claude_thinking
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case("adaptive"));
+            let thinking_config = if uses_adaptive || source_is_adaptive {
+                let mut config = Map::new();
+                config.insert("type".to_string(), Value::String("adaptive".to_string()));
+                if let Some(display) = original_claude_thinking
+                    .and_then(|value| value.get("display"))
+                    .cloned()
+                {
+                    config.insert("display".to_string(), display);
+                }
+                Value::Object(config)
             } else {
                 json!({
                     "type": "enabled",

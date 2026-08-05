@@ -258,6 +258,22 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         }
     }
 
+    let stripped_input_item_ids =
+        crate::ai_serving::strip_incompatible_openai_responses_input_item_ids(
+            &mut base_provider_request_body,
+            transport.provider.provider_type.as_str(),
+            prepared.provider_api_format.as_str(),
+        );
+    if stripped_input_item_ids > 0 {
+        compatibility_edits.push(SameFormatProviderCompatibilityEdit {
+            field: "input[].id".to_string(),
+            action: SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite,
+            detail: format!(
+                "stripped {stripped_input_item_ids} incompatible OpenAI Responses input item id field(s)"
+            ),
+        });
+    }
+
     let source_model = body_json
         .get("model")
         .and_then(Value::as_str)

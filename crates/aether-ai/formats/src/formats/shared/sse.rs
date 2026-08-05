@@ -5,7 +5,7 @@ use crate::formats::shared::AiSurfaceFinalizeError;
 pub fn map_claude_stop_reason(stop_reason: Option<&str>, has_tool_calls: bool) -> Option<String> {
     let mapped = match stop_reason {
         Some("end_turn") | Some("stop_sequence") => Some("stop".to_string()),
-        Some("max_tokens") => Some("length".to_string()),
+        Some("max_tokens") | Some("model_context_window_exceeded") => Some("length".to_string()),
         Some("tool_use") => Some("tool_calls".to_string()),
         Some("pause_turn") => Some("stop".to_string()),
         Some(other) if !other.trim().is_empty() => Some(other.to_string()),
@@ -36,4 +36,17 @@ pub fn encode_json_sse(
     out.extend(serde_json::to_vec(value).map_err(AiSurfaceFinalizeError::from)?);
     out.extend_from_slice(b"\n\n");
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_claude_stop_reason;
+
+    #[test]
+    fn claude_context_window_stop_reason_maps_to_length() {
+        assert_eq!(
+            map_claude_stop_reason(Some("model_context_window_exceeded"), false).as_deref(),
+            Some("length")
+        );
+    }
 }

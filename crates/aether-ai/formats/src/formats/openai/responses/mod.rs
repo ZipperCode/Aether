@@ -71,6 +71,57 @@ fn openai_responses_reasoning_item_is_replayable(item: &Value) -> bool {
         .is_some_and(|encrypted_content| !encrypted_content.trim().is_empty())
 }
 
+/// 删除官方 OpenAI Responses 上游会拒绝的类型化输入 Item ID。
+///
+/// Item ID 是不透明的上游引用，前缀不兼容时只能删除，不能伪造新前缀。`call_id` 不属于
+/// Item ID，因此保持原样以维持工具调用与结果的配对。
+pub fn strip_incompatible_openai_responses_input_item_ids(
+    body: &mut Value,
+    provider_type: &str,
+    provider_api_format: &str,
+) -> usize {
+    if !provider_type.trim().eq_ignore_ascii_case("openai")
+        || !aether_ai_formats::is_openai_responses_family_format(provider_api_format)
+    {
+        return 0;
+    }
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    let mut stripped = 0;
+    for item in items {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(expected_prefix) = object
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(openai_responses_input_item_id_prefix)
+        else {
+            continue;
+        };
+        let incompatible = object
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.starts_with(expected_prefix));
+        if incompatible {
+            object.remove("id");
+            stripped += 1;
+        }
+    }
+    stripped
+}
+
+fn openai_responses_input_item_id_prefix(item_type: &str) -> Option<&'static str> {
+    match item_type {
+        "message" => Some("msg"),
+        "function_call" | "tool_call" | "local_shell_call" | "custom_tool_call"
+        | "mcp_tool_call" => Some("fc"),
+        _ => None,
+    }
+}
+
 /// Semantic operation carried by an OpenAI Responses request that asks the
 /// service to compact a thread. The request still uses the Responses wire
 /// contract and transport endpoint.
@@ -121,6 +172,7 @@ mod tests {
 
     use super::{
         openai_responses_request_operation, openai_responses_synthetic_reasoning_item_id,
+        strip_incompatible_openai_responses_input_item_ids,
         strip_incompatible_openai_responses_reasoning_items, OPENAI_RESPONSES_OPERATION_COMPACT,
     };
 
@@ -209,5 +261,93 @@ mod tests {
             0
         );
         assert_eq!(body["input"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn strips_invalid_typed_input_item_ids_without_breaking_tool_pairing() {
+        let mut body = json!({
+            "input": [
+                {"type": "message", "id": "item_message", "role": "assistant", "content": []},
+                {"type": "message", "id": "msg_valid", "role": "user", "content": "continue"},
+                {
+                    "type": "function_call",
+                    "id": "item_call",
+                    "call_id": "call_123",
+                    "name": "exec_command",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_valid",
+                    "call_id": "call_456",
+                    "name": "apply_patch",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "tool_search_call",
+                    "id": "tsc_valid",
+                    "call_id": "call_search",
+                    "execution": "client",
+                    "arguments": {"query": "tools"}
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "item_output",
+                    "call_id": "call_123",
+                    "output": "done"
+                },
+                {"type": "web_search_call", "id": "item_search"},
+                {"type": "reasoning", "id": "rs_valid", "summary": []}
+            ]
+        });
+
+        assert_eq!(
+            strip_incompatible_openai_responses_input_item_ids(
+                &mut body,
+                "openai",
+                "openai:responses"
+            ),
+            2
+        );
+        let input = body["input"].as_array().expect("input array");
+        assert!(input[0].get("id").is_none());
+        assert_eq!(input[1]["id"], "msg_valid");
+        assert!(input[2].get("id").is_none());
+        assert_eq!(input[2]["call_id"], "call_123");
+        assert_eq!(input[3]["id"], "fc_valid");
+        assert_eq!(input[4]["id"], "tsc_valid");
+        assert_eq!(input[4]["call_id"], "call_search");
+        assert_eq!(input[5]["id"], "item_output");
+        assert_eq!(input[5]["call_id"], "call_123");
+        assert_eq!(input[6]["id"], "item_search");
+        assert_eq!(input[7]["id"], "rs_valid");
+    }
+
+    #[test]
+    fn input_item_id_sanitizer_is_scoped_to_official_openai_responses_targets() {
+        let original = json!({
+            "input": [{"type": "message", "id": "item_foreign", "role": "user"}]
+        });
+        let mut chat_body = original.clone();
+        let mut compatible_body = original.clone();
+
+        assert_eq!(
+            strip_incompatible_openai_responses_input_item_ids(
+                &mut chat_body,
+                "openai",
+                "openai:chat"
+            ),
+            0
+        );
+        assert_eq!(chat_body, original);
+        assert_eq!(
+            strip_incompatible_openai_responses_input_item_ids(
+                &mut compatible_body,
+                "openai_compatible",
+                "openai:responses"
+            ),
+            0
+        );
+        assert_eq!(compatible_body, original);
     }
 }

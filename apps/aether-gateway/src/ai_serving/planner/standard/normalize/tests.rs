@@ -190,6 +190,58 @@ fn local_openai_responses_wrapper_strips_foreign_reasoning_item_ids() {
 }
 
 #[test]
+fn local_openai_responses_wrapper_strips_invalid_typed_item_ids() {
+    let body_json = json!({
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "type": "message",
+                "id": "item_e19637e60faa53da843e731c",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            },
+            {
+                "type": "function_call",
+                "id": "item_bad_call",
+                "call_id": "call_123",
+                "name": "exec_command",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "id": "item_output",
+                "call_id": "call_123",
+                "output": "ok"
+            }
+        ]
+    });
+
+    let provider_request_body = build_local_openai_responses_request_body(
+        &body_json,
+        "gpt-5.4",
+        false,
+        false,
+        "openai",
+        "openai:responses",
+        None,
+        None,
+        &http::HeaderMap::new(),
+        false,
+    )
+    .expect("local OpenAI Responses body should build");
+
+    let input = provider_request_body["input"]
+        .as_array()
+        .expect("input array");
+    assert!(input[0].get("id").is_none());
+    assert_eq!(input[0]["content"][0]["text"], "done");
+    assert!(input[1].get("id").is_none());
+    assert_eq!(input[1]["call_id"], "call_123");
+    assert_eq!(input[2]["id"], "item_output");
+    assert_eq!(input[2]["call_id"], "call_123");
+}
+
+#[test]
 fn local_openai_responses_compact_wrapper_strips_store_for_same_format_requests() {
     let body_json = json!({
         "model": "gpt-5.4",
