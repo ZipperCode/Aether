@@ -31,9 +31,7 @@ Aether 是一个自托管的 AI API 网关，为团队和个人提供多租户�
   </picture>
 </p>
 
-页面预览: https://zippercode.github.io/Aether/
-
-本项目延续自上游 [fawney19/Aether](https://github.com/fawney19/Aether)，感谢原作者和贡献者奠定的基础。
+本项目延续自上游 Aether，感谢原作者和贡献者奠定的基础。
 
 ## 部署
 
