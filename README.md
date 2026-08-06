@@ -112,7 +112,7 @@ docker compose -f docker-compose.release-local.yml down -v
 ```bash
 git clone https://github.com/ZipperCode/Aether.git
 cd Aether
-curl -fsSL https://raw.githubusercontent.com/ZipperCode/Aether/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/ZipperCode/Aether/master/install.sh | sudo bash
 ```
 
 ## 本地开发

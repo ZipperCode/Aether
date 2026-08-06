@@ -37,19 +37,19 @@ Tunnel 模式下代理节点**无需对外监听端口**，仅需出站连接到
 macOS / Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ZipperCode/Aether/main/apps/aether-tunnel/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ZipperCode/Aether/master/apps/aether-tunnel/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/ZipperCode/Aether/main/apps/aether-tunnel/install.ps1 | iex
+irm https://raw.githubusercontent.com/ZipperCode/Aether/master/apps/aether-tunnel/install.ps1 | iex
 ```
 
 也可以用环境变量非交互式执行，适合在控制台“添加隧道节点”时生成命令：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ZipperCode/Aether/main/apps/aether-tunnel/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/ZipperCode/Aether/master/apps/aether-tunnel/install.sh | \
   AETHER_TUNNEL_AETHER_URL="https://aether.example.com" \
   AETHER_TUNNEL_MANAGEMENT_TOKEN="ae_xxx" \
   AETHER_TUNNEL_NODE_NAME="jp-proxy-01" \
@@ -62,7 +62,7 @@ $env:AETHER_TUNNEL_AETHER_URL = "https://aether.example.com"
 $env:AETHER_TUNNEL_MANAGEMENT_TOKEN = "ae_xxx"
 $env:AETHER_TUNNEL_NODE_NAME = "jp-proxy-01"
 $env:AETHER_TUNNEL_SECURITY = "off"
-irm https://raw.githubusercontent.com/ZipperCode/Aether/main/apps/aether-tunnel/install.ps1 | iex
+irm https://raw.githubusercontent.com/ZipperCode/Aether/master/apps/aether-tunnel/install.ps1 | iex
 ```
 
 可选变量：`AETHER_TUNNEL_RELEASE_TAG` 固定安装某个 `tunnel-v*` tag，`AETHER_TUNNEL_CONFIG` 指定配置文件路径，`AETHER_TUNNEL_INSTALL_DIR` 指定二进制安装目录。
