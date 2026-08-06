@@ -71,7 +71,7 @@ fn openai_responses_reasoning_item_is_replayable(item: &Value) -> bool {
         .is_some_and(|encrypted_content| !encrypted_content.trim().is_empty())
 }
 
-/// 删除官方 OpenAI Responses 上游会拒绝的类型化输入 Item ID。
+/// 删除官方 OpenAI/Codex Responses 上游会拒绝的类型化输入 Item ID。
 ///
 /// Item ID 是不透明的上游引用，前缀不兼容时只能删除，不能伪造新前缀。`call_id` 不属于
 /// Item ID，因此保持原样以维持工具调用与结果的配对。
@@ -80,7 +80,11 @@ pub fn strip_incompatible_openai_responses_input_item_ids(
     provider_type: &str,
     provider_api_format: &str,
 ) -> usize {
-    if !provider_type.trim().eq_ignore_ascii_case("openai")
+    let is_official_responses_provider = provider_type
+        .trim()
+        .eq_ignore_ascii_case("openai")
+        || provider_type.trim().eq_ignore_ascii_case("codex");
+    if !is_official_responses_provider
         || !aether_ai_formats::is_openai_responses_family_format(provider_api_format)
     {
         return 0;
@@ -349,5 +353,41 @@ mod tests {
             0
         );
         assert_eq!(compatible_body, original);
+    }
+
+    #[test]
+    fn codex_responses_targets_strip_foreign_typed_item_ids() {
+        let mut body = json!({
+            "input": [
+                {"type": "message", "id": "item_message", "role": "user"},
+                {
+                    "type": "function_call",
+                    "id": "item_call",
+                    "call_id": "call_123",
+                    "name": "exec_command",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fco_123",
+                    "call_id": "call_123",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        assert_eq!(
+            strip_incompatible_openai_responses_input_item_ids(
+                &mut body,
+                "codex",
+                "openai:responses"
+            ),
+            2
+        );
+        let input = body["input"].as_array().expect("input array");
+        assert!(input[0].get("id").is_none());
+        assert!(input[1].get("id").is_none());
+        assert_eq!(input[1]["call_id"], "call_123");
+        assert_eq!(input[2]["id"], "fco_123");
     }
 }

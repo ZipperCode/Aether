@@ -190,7 +190,7 @@ fn local_openai_responses_wrapper_strips_foreign_reasoning_item_ids() {
 }
 
 #[test]
-fn local_openai_responses_wrapper_strips_invalid_typed_item_ids() {
+fn local_codex_responses_wrapper_strips_invalid_typed_item_ids() {
     let body_json = json!({
         "model": "gpt-5.4",
         "input": [
@@ -221,7 +221,7 @@ fn local_openai_responses_wrapper_strips_invalid_typed_item_ids() {
         "gpt-5.4",
         false,
         false,
-        "openai",
+        "codex",
         "openai:responses",
         None,
         None,
