@@ -80,9 +80,7 @@ pub fn strip_incompatible_openai_responses_input_item_ids(
     provider_type: &str,
     provider_api_format: &str,
 ) -> usize {
-    let is_official_responses_provider = provider_type
-        .trim()
-        .eq_ignore_ascii_case("openai")
+    let is_official_responses_provider = provider_type.trim().eq_ignore_ascii_case("openai")
         || provider_type.trim().eq_ignore_ascii_case("codex");
     if !is_official_responses_provider
         || !aether_ai_formats::is_openai_responses_family_format(provider_api_format)
