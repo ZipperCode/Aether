@@ -5219,7 +5219,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_reasoning_effort_preserves_valid_wire_effort_for_unprofiled_model() {
+    fn runtime_reasoning_effort_is_preserved_across_concrete_model_mapping() {
         let alias_to_gpt_5_6 = json!({
             "model": "deployment-alias",
             "messages": [{"role": "user", "content": "hello"}],
@@ -5252,7 +5252,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_conversion_preserves_valid_wire_effort_for_unprofiled_model() {
+    fn pure_conversion_preserves_effort_across_concrete_model_mapping() {
         let alias_to_gpt_5_6 = json!({
             "model": "deployment-alias",
             "messages": [{"role": "user", "content": "hello"}],
@@ -5304,25 +5304,21 @@ mod tests {
     }
 
     #[test]
-    fn runtime_openai_cross_format_enforces_known_efforts_and_preserves_custom_efforts() {
+    fn runtime_openai_cross_format_preserves_explicit_efforts() {
         let alias_minimal = json!({
             "model": "deployment-alias",
             "messages": [{"role": "user", "content": "hello"}],
             "reasoning_effort": "minimal"
         });
         for target in ["openai:responses", "openai:responses:compact"] {
-            let error = convert_request(
+            let converted = convert_request(
                 "openai:chat",
                 target,
                 &alias_minimal,
                 &FormatContext::default().with_mapped_model("gpt-5.6-terra"),
             )
-            .expect_err("mapped GPT-5.6 deployments must reject minimal effort");
-            assert!(matches!(
-                error,
-                super::FormatError::InvalidTargetField { ref field, .. }
-                    if field == "reasoning_effort"
-            ));
+            .expect("mapped model capability cards must not reject explicit efforts");
+            assert_eq!(converted["reasoning"]["effort"], "minimal");
         }
 
         let custom = json!({
@@ -5347,18 +5343,14 @@ mod tests {
             "reasoning": {"effort": "ultra"}
         });
         for source in ["openai:responses", "openai:responses:compact"] {
-            let error = convert_request(
+            let converted = convert_request(
                 source,
                 "openai:chat",
                 &ultra,
                 &FormatContext::default().with_mapped_model("gpt-5.6-sol"),
             )
-            .expect_err("Codex local ultra preset should not enter the OpenAI wire contract");
-            assert!(matches!(
-                error,
-                super::FormatError::InvalidEnumValue { ref field, ref value, .. }
-                    if field == "reasoning.effort" && value == "ultra"
-            ));
+            .expect("explicit effort support should be validated by the upstream");
+            assert_eq!(converted["reasoning_effort"], "ultra");
         }
     }
 
@@ -5379,42 +5371,30 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}],
             "reasoning_effort": "ultra"
         });
-        let error = convert_request_pure("openai:chat", "openai:responses", &ultra)
-            .expect_err("Codex local ultra preset should not enter the OpenAI wire contract");
-        assert!(matches!(
-            error,
-            super::FormatError::InvalidEnumValue { ref field, ref value, .. }
-                if field == "reasoning_effort" && value == "ultra"
-        ));
+        let converted = convert_request_pure("openai:chat", "openai:responses", &ultra)
+            .expect("explicit effort support should be validated by the upstream");
+        assert_eq!(converted.value["reasoning"]["effort"], "ultra");
     }
 
     #[test]
-    fn pure_openai_cross_format_rejects_gpt_5_6_minimal_effort() {
+    fn pure_openai_cross_format_preserves_unpublished_effort() {
         let chat = json!({
             "model": "gpt-5.6-sol",
             "messages": [{"role": "user", "content": "hello"}],
             "reasoning_effort": "minimal"
         });
-        let error = convert_request_pure("openai:chat", "openai:responses", &chat)
-            .expect_err("GPT-5.6 does not publish minimal as a supported effort");
-        assert!(matches!(
-            error,
-            super::FormatError::InvalidTargetField { ref field, .. }
-                if field == "reasoning_effort"
-        ));
+        let converted = convert_request_pure("openai:chat", "openai:responses", &chat)
+            .expect("upstream should validate unpublished reasoning efforts");
+        assert_eq!(converted.value["reasoning"]["effort"], "minimal");
 
         let responses = json!({
             "model": "gpt-5.6-terra",
             "input": [{"role": "user", "content": "hello"}],
             "reasoning": {"effort": "minimal"}
         });
-        let error = convert_request_pure("openai:responses", "openai:chat", &responses)
-            .expect_err("GPT-5.6 does not publish minimal as a supported effort");
-        assert!(matches!(
-            error,
-            super::FormatError::InvalidTargetField { ref field, .. }
-                if field == "reasoning.effort"
-        ));
+        let converted = convert_request_pure("openai:responses", "openai:chat", &responses)
+            .expect("upstream should validate unpublished reasoning efforts");
+        assert_eq!(converted.value["reasoning_effort"], "minimal");
     }
 
     #[test]

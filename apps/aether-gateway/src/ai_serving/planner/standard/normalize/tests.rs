@@ -424,7 +424,7 @@ fn final_openai_provider_contract_preserves_valid_reasoning_without_model_profil
         "messages": [{"role": "user", "content": "hello"}],
         "reasoning_effort": "minimal"
     });
-    assert!(build_local_openai_chat_request_body(
+    let minimal = build_local_openai_chat_request_body(
         &minimal,
         "gpt-5.6-terra",
         false,
@@ -433,7 +433,8 @@ fn final_openai_provider_contract_preserves_valid_reasoning_without_model_profil
         &http::HeaderMap::new(),
         false,
     )
-    .is_none());
+    .expect("explicit chat reasoning effort should be validated by the upstream");
+    assert_eq!(minimal["reasoning_effort"], "minimal");
 
     let opaque_mapping = json!({
         "model": "gpt-5.6-sol-max",
