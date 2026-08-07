@@ -195,6 +195,14 @@
                 </div>
               </div>
 
+              <ClaudeEndpointOperationSupport
+                v-if="isClaudeMessagesEndpoint(endpoint.api_format)"
+                :model-value="endpointSupportsClaudeCountTokens(endpoint.config, provider?.provider_type)"
+                :disabled="savingEndpointId === endpoint.id || isEndpointConfigReadOnly"
+                :locked="isClaudeCountTokensSupportLocked(provider?.provider_type)"
+                @update:model-value="(enabled) => handleClaudeCountTokensSupportChange(endpoint, enabled)"
+              />
+
               <!-- 请求/响应规则（请求头、请求体和响应头规则） -->
               <Collapsible
                 v-if="!isEndpointConfigReadOnly"
@@ -992,6 +1000,12 @@
               </div>
             </div>
           </div>
+          <ClaudeEndpointOperationSupport
+            v-if="isClaudeMessagesEndpoint(newEndpoint.api_format)"
+            v-model="newEndpoint.supports_count_tokens"
+            class="mt-4"
+            :disabled="addingEndpoint"
+          />
         </div>
       </div>
 
@@ -1058,8 +1072,15 @@ import { useI18n } from '@/i18n'
 import AlertDialog from '@/components/common/AlertDialog.vue'
 import EndpointConditionEditor from './EndpointConditionEditor.vue'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
+import ClaudeEndpointOperationSupport from './ClaudeEndpointOperationSupport.vue'
 import { getDefaultEndpointPath, resolveNewEndpointBaseUrl } from './endpoint-default-paths'
 import { fixedEndpointUpstreamStreamPolicy } from './endpoint-protocol-policy'
+import {
+  endpointConfigWithClaudeCountTokensSupport,
+  endpointSupportsClaudeCountTokens,
+  isClaudeCountTokensSupportLocked,
+  isClaudeMessagesEndpoint,
+} from './endpoint-anthropic-operations'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import {
   createEndpoint,
@@ -1897,6 +1918,7 @@ const newEndpoint = ref({
   api_format: '',
   base_url: '',
   custom_path: '',
+  supports_count_tokens: true,
 })
 
 // API 格式列表
@@ -3289,7 +3311,7 @@ watch(() => props.modelValue, (open) => {
     void preloadDefaultBodyRules(localEndpoints.value)
   } else {
     // 关闭对话框时完全清空新端点表单
-    newEndpoint.value = { api_format: '', base_url: '', custom_path: '' }
+    newEndpoint.value = { api_format: '', base_url: '', custom_path: '', supports_count_tokens: true }
   }
 }, { immediate: true })
 
@@ -3394,6 +3416,24 @@ async function handleToggleFormatConversion(endpoint: ProviderEndpoint) {
     showError(localizedApiError(error, '操作失败'), legacyT('错误'))
   } finally {
     togglingFormatEndpointId.value = null
+  }
+}
+
+async function handleClaudeCountTokensSupportChange(endpoint: ProviderEndpoint, enabled: boolean) {
+  if (isEndpointConfigReadOnly.value || isClaudeCountTokensSupportLocked(props.provider?.provider_type)) return
+
+  savingEndpointId.value = endpoint.id
+  try {
+    const updated = await updateEndpoint(endpoint.id, {
+      config: endpointConfigWithClaudeCountTokensSupport(endpoint.config, enabled),
+    })
+    replaceLocalEndpoint(updated)
+    success(legacyT(enabled ? '已启用 Token 计数操作' : '已关闭 Token 计数操作'))
+    emit('endpointUpdated')
+  } catch (error: unknown) {
+    showError(localizedApiError(error, '更新操作支持失败'), legacyT('错误'))
+  } finally {
+    savingEndpointId.value = null
   }
 }
 
@@ -3507,12 +3547,20 @@ async function handleAddEndpoint() {
       base_url: baseUrl,
       custom_path: newEndpoint.value.custom_path || undefined,
       is_active: true,
+      config: isClaudeMessagesEndpoint(newEndpoint.value.api_format)
+        ? endpointConfigWithClaudeCountTokensSupport(null, newEndpoint.value.supports_count_tokens)
+        : undefined,
     })
     success(locale.value === 'en-US'
       ? `Added ${formatApiFormat(newEndpoint.value.api_format)} endpoint`
       : `已添加 ${formatApiFormat(newEndpoint.value.api_format)} 端点`)
     // 重置表单，保留 URL
-    newEndpoint.value = { api_format: '', base_url: baseUrl, custom_path: '' }
+    newEndpoint.value = {
+      api_format: '',
+      base_url: baseUrl,
+      custom_path: '',
+      supports_count_tokens: true,
+    }
     emit('endpointCreated')
   } catch (error: unknown) {
     showError(localizedApiError(error, '添加失败'), legacyT('错误'))
