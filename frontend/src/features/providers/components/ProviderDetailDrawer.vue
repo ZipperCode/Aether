@@ -65,7 +65,7 @@
                     </h3>
                     <div class="flex flex-wrap items-center justify-end gap-2">
                       <Button
-                        v-if="endpoints.length > 0 && provider.provider_type === 'custom'"
+                        v-if="endpoints.length > 0 && isKeyManagedProviderType(provider.provider_type)"
                         variant="outline"
                         size="sm"
                         class="h-9"
@@ -854,7 +854,7 @@
   />
 
   <ProviderKeyBatchImportDialog
-    v-if="open && keyBatchImportDialogOpen && provider?.provider_type === 'custom'"
+    v-if="open && keyBatchImportDialogOpen && isKeyManagedProviderType(provider?.provider_type)"
     :open="keyBatchImportDialogOpen"
     :provider-id="provider.id"
     :provider-name="provider.name"
@@ -1516,7 +1516,7 @@ function handleAddKeyToFirstEndpoint() {
   if (isOAuthAccountProviderType(provider.value?.provider_type)) {
     oauthAccountDialogOpen.value = true
   } else {
-    // 密钥型提供商（custom/vertex_ai）：打开密钥表单对话框
+    // 密钥型提供商：打开密钥表单对话框
     handleAddKey(endpoints.value[0])
   }
 }

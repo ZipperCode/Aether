@@ -7,10 +7,12 @@ function readSource(path: string): string {
 }
 
 describe('provider key batch import UI contract', () => {
-  it('shows the entry only for custom providers', () => {
+  it('shows the entry for every key-managed provider', () => {
     const source = readSource('src/features/providers/components/ProviderDetailDrawer.vue')
 
-    expect(source).toContain("provider.provider_type === 'custom'")
+    expect(source).toContain('isKeyManagedProviderType(provider.provider_type)')
+    expect(source).toContain('isKeyManagedProviderType(provider?.provider_type)')
+    expect(source).not.toContain("provider.provider_type === 'custom'")
     expect(source).toContain('<ProviderKeyBatchImportDialog')
     expect(source).toContain('keyBatchImportDialogOpen')
   })
