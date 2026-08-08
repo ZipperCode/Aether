@@ -127,6 +127,9 @@ pub fn infer_internal_finalize_signature(payload: &GatewaySyncReportRequest) -> 
     if report_kind.starts_with("gemini_chat_") {
         return Some("gemini:generate_content".to_string());
     }
+    if report_kind.starts_with("gemini_count_tokens_") {
+        return Some("gemini:generate_content".to_string());
+    }
     if report_kind.starts_with("gemini_cli_") {
         return Some("gemini:generate_content".to_string());
     }
@@ -245,6 +248,7 @@ pub fn is_local_ai_sync_report_kind(report_kind: &str) -> bool {
         "openai_chat_sync_success"
             | "claude_chat_sync_success"
             | "gemini_chat_sync_success"
+            | "gemini_count_tokens_sync_success"
             | "openai_chat_sync_error"
             | "claude_chat_sync_error"
             | "gemini_chat_sync_error"
@@ -889,6 +893,9 @@ mod tests {
         assert!(is_local_ai_sync_report_kind("openai_embedding_sync_error"));
         assert!(is_local_ai_sync_report_kind(
             "gemini_embedding_sync_success"
+        ));
+        assert!(is_local_ai_sync_report_kind(
+            "gemini_count_tokens_sync_success"
         ));
         assert!(is_local_ai_sync_report_kind("gemini_files_delete_mapping"));
         assert!(!is_local_ai_sync_report_kind("unknown_sync_kind"));

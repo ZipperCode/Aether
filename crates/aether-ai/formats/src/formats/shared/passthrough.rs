@@ -3,6 +3,7 @@ use crate::contracts::{
     CLAUDE_CLI_STREAM_PLAN_KIND, CLAUDE_CLI_SYNC_PLAN_KIND, CLAUDE_COUNT_TOKENS_SYNC_PLAN_KIND,
     CLAUDE_COUNT_TOKENS_SYNC_SUCCESS_REPORT_KIND, GEMINI_CHAT_STREAM_PLAN_KIND,
     GEMINI_CHAT_SYNC_PLAN_KIND, GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_CLI_SYNC_PLAN_KIND,
+    GEMINI_COUNT_TOKENS_SYNC_PLAN_KIND, GEMINI_COUNT_TOKENS_SYNC_SUCCESS_REPORT_KIND,
     GEMINI_EMBEDDING_SYNC_PLAN_KIND, GEMINI_EMBEDDING_SYNC_SUCCESS_REPORT_KIND,
     GEMINI_INTERACTIONS_STREAM_PLAN_KIND, GEMINI_INTERACTIONS_STREAM_SUCCESS_REPORT_KIND,
     GEMINI_INTERACTIONS_SYNC_PLAN_KIND, GEMINI_INTERACTIONS_SYNC_SUCCESS_REPORT_KIND,
@@ -59,6 +60,14 @@ pub fn resolve_sync_spec(plan_kind: &str) -> Option<LocalSameFormatProviderSpec>
             family: LocalSameFormatProviderFamily::Gemini,
             require_streaming: false,
             operation: None,
+        }),
+        GEMINI_COUNT_TOKENS_SYNC_PLAN_KIND => Some(LocalSameFormatProviderSpec {
+            api_format: "gemini:generate_content",
+            decision_kind: GEMINI_COUNT_TOKENS_SYNC_PLAN_KIND,
+            report_kind: GEMINI_COUNT_TOKENS_SYNC_SUCCESS_REPORT_KIND,
+            family: LocalSameFormatProviderFamily::Gemini,
+            require_streaming: false,
+            operation: Some(ApiOperation::GeminiCountTokens),
         }),
         GEMINI_CLI_SYNC_PLAN_KIND => Some(LocalSameFormatProviderSpec {
             api_format: "gemini:generate_content",

@@ -144,6 +144,13 @@ pub enum FormatError {
     ResponseParseFailed {
         format: String,
     },
+    ResponseBlocked {
+        format: String,
+        reason: String,
+    },
+    EmptyResponse {
+        format: String,
+    },
     ResponseEmitFailed {
         format: String,
     },
@@ -187,6 +194,10 @@ impl fmt::Display for FormatError {
             Self::ResponseParseFailed { format } => {
                 write!(f, "failed to parse {format} response")
             }
+            Self::ResponseBlocked { format, reason } => {
+                write!(f, "{format} response blocked: {reason}")
+            }
+            Self::EmptyResponse { format } => write!(f, "{format} response contains no candidates"),
             Self::ResponseEmitFailed { format } => {
                 write!(f, "failed to emit {format} response")
             }

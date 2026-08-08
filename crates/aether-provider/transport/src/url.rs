@@ -155,6 +155,32 @@ pub fn build_gemini_content_url(
     stream: bool,
     query: Option<&str>,
 ) -> Option<String> {
+    build_gemini_content_operation_url(
+        upstream_base_url,
+        model,
+        if stream {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        },
+        query,
+    )
+}
+
+pub fn build_gemini_count_tokens_url(
+    upstream_base_url: &str,
+    model: &str,
+    query: Option<&str>,
+) -> Option<String> {
+    build_gemini_content_operation_url(upstream_base_url, model, "countTokens", query)
+}
+
+fn build_gemini_content_operation_url(
+    upstream_base_url: &str,
+    model: &str,
+    operation: &str,
+    query: Option<&str>,
+) -> Option<String> {
     let (trimmed_base_url, base_query) = split_base_url_query(upstream_base_url);
     let trimmed_base_url = trimmed_base_url.trim_end_matches('/');
     let trimmed_model = model.trim();
@@ -162,11 +188,6 @@ pub fn build_gemini_content_url(
         return None;
     }
 
-    let operation = if stream {
-        "streamGenerateContent"
-    } else {
-        "generateContent"
-    };
     let mut url = if trimmed_base_url.ends_with("/v1") || trimmed_base_url.ends_with("/v1beta") {
         format!("{trimmed_base_url}/models/{trimmed_model}:{operation}")
     } else if gemini_content_base_url_contains_model_path(trimmed_base_url) {
@@ -180,13 +201,23 @@ pub fn build_gemini_content_url(
 }
 
 pub fn normalize_gemini_content_action_path(path: &str, stream: bool) -> String {
+    normalize_gemini_content_operation_path(
+        path,
+        if stream {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        },
+    )
+}
+
+pub fn normalize_gemini_count_tokens_path(path: &str) -> String {
+    normalize_gemini_content_operation_path(path, "countTokens")
+}
+
+fn normalize_gemini_content_operation_path(path: &str, action: &str) -> String {
     let trimmed = path.trim();
     let (path, query) = split_path_query(trimmed);
-    let action = if stream {
-        "streamGenerateContent"
-    } else {
-        "generateContent"
-    };
     let normalized = strip_gemini_content_action(path);
     let normalized = if normalized.len() == path.len() {
         path.to_string()
@@ -203,6 +234,7 @@ fn strip_gemini_content_action(value: &str) -> &str {
     value
         .strip_suffix(":streamGenerateContent")
         .or_else(|| value.strip_suffix(":generateContent"))
+        .or_else(|| value.strip_suffix(":countTokens"))
         .unwrap_or(value)
 }
 

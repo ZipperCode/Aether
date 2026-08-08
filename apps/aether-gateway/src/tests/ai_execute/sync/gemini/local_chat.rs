@@ -48,7 +48,12 @@ async fn gateway_executes_gemini_chat_sync_via_local_decision_gate_with_local_sy
         trace_id: String,
         url: String,
         has_model_field: bool,
+        stream: Option<bool>,
+        nested_stream: Option<bool>,
+        nested_model: Option<String>,
         auth_header_value: String,
+        accept: String,
+        content_type: String,
         exact_temperature: f64,
         endpoint_tag: String,
         metadata_mode: String,
@@ -270,6 +275,12 @@ async fn gateway_executes_gemini_chat_sync_via_local_decision_gate_with_local_sy
                 let raw_body = to_bytes(body, usize::MAX).await.expect("body should read");
                 let payload: serde_json::Value = serde_json::from_slice(&raw_body)
                     .expect("execution runtime payload should parse");
+                let upstream_url = payload
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let is_count_tokens = upstream_url.ends_with(":countTokens");
                 *seen_execution_runtime_inner
                     .lock()
                     .expect("mutex should lock") = Some(SeenExecutionRuntimeSyncRequest {
@@ -279,19 +290,45 @@ async fn gateway_executes_gemini_chat_sync_via_local_decision_gate_with_local_sy
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_string(),
-                    url: payload
-                        .get("url")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
+                    url: upstream_url,
                     has_model_field: payload
                         .get("body")
                         .and_then(|value| value.get("json_body"))
                         .and_then(|value| value.get("model"))
                         .is_some(),
+                    stream: payload
+                        .get("body")
+                        .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("stream"))
+                        .and_then(|value| value.as_bool()),
+                    nested_stream: payload
+                        .get("body")
+                        .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("generateContentRequest"))
+                        .and_then(|value| value.get("stream"))
+                        .and_then(|value| value.as_bool()),
+                    nested_model: payload
+                        .get("body")
+                        .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("generateContentRequest"))
+                        .and_then(|value| value.get("model"))
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned),
                     auth_header_value: payload
                         .get("headers")
                         .and_then(|value| value.get("x-goog-api-key"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    accept: payload
+                        .get("headers")
+                        .and_then(|value| value.get("accept"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    content_type: payload
+                        .get("headers")
+                        .and_then(|value| value.get("content-type"))
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
@@ -342,32 +379,42 @@ async fn gateway_executes_gemini_chat_sync_via_local_decision_gate_with_local_sy
                         .unwrap_or_default()
                         .to_string(),
                 });
-                Json(json!({
-                    "request_id": "trace-gemini-chat-local-123",
-                    "status_code": 200,
-                    "headers": {
-                        "content-type": "application/json"
-                    },
-                    "body": {
-                        "json_body": {
-                            "candidates": [{
-                                "content": {
-                                    "role": "model",
-                                    "parts": [{"text": "Hello from Gemini"}]
-                                },
-                                "finishReason": "STOP"
-                            }],
-                            "usageMetadata": {
-                                "promptTokenCount": 1,
-                                "candidatesTokenCount": 2,
-                                "totalTokenCount": 3
+                if is_count_tokens {
+                    Json(json!({
+                        "request_id": "trace-gemini-count-tokens-local-123",
+                        "status_code": 200,
+                        "headers": {"content-type": "application/json"},
+                        "body": {"json_body": {"totalTokens": 17}},
+                        "telemetry": {"elapsed_ms": 11}
+                    }))
+                } else {
+                    Json(json!({
+                        "request_id": "trace-gemini-chat-local-123",
+                        "status_code": 200,
+                        "headers": {
+                            "content-type": "application/json"
+                        },
+                        "body": {
+                            "json_body": {
+                                "candidates": [{
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{"text": "Hello from Gemini"}]
+                                    },
+                                    "finishReason": "STOP"
+                                }],
+                                "usageMetadata": {
+                                    "promptTokenCount": 1,
+                                    "candidatesTokenCount": 2,
+                                    "totalTokenCount": 3
+                                }
                             }
+                        },
+                        "telemetry": {
+                            "elapsed_ms": 27
                         }
-                    },
-                    "telemetry": {
-                        "elapsed_ms": 27
-                    }
-                }))
+                    }))
+                }
             }
         }),
     );
@@ -472,6 +519,60 @@ async fn gateway_executes_gemini_chat_sync_via_local_decision_gate_with_local_sy
     assert_eq!(*decision_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*plan_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
+
+    let count_tokens_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/v1beta/models/gemini-2.5-pro:countTokens?key=client-gemini-chat-local-key"
+        ))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::ACCEPT, "text/event-stream")
+        .header(TRACE_ID_HEADER, "trace-gemini-count-tokens-local-123")
+        .body(
+            r#"{"generateContentRequest":{"model":"models/gemini-2.5-pro","contents":[{"role":"user","parts":[{"text":"hello"}]}],"stream":true},"stream":true}"#,
+        )
+        .send()
+        .await
+        .expect("countTokens request should succeed");
+
+    assert_eq!(count_tokens_response.status(), StatusCode::OK);
+    assert_eq!(
+        count_tokens_response
+            .headers()
+            .get(EXECUTION_PATH_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(EXECUTION_PATH_EXECUTION_RUNTIME_SYNC)
+    );
+    let seen_count_tokens = seen_execution_runtime
+        .lock()
+        .expect("mutex should lock")
+        .clone()
+        .expect("countTokens execution request should be captured");
+    assert_eq!(
+        seen_count_tokens.url,
+        "https://generativelanguage.googleapis.com/custom/v1beta/models/gemini-2.5-pro-upstream:countTokens"
+    );
+    assert!(!seen_count_tokens.has_model_field);
+    assert_eq!(seen_count_tokens.stream, None);
+    assert_eq!(seen_count_tokens.nested_stream, None);
+    assert_eq!(
+        seen_count_tokens.nested_model.as_deref(),
+        Some("models/gemini-2.5-pro-upstream")
+    );
+    assert_eq!(seen_count_tokens.accept, "application/json");
+    assert_eq!(seen_count_tokens.content_type, "application/json");
+    assert_eq!(
+        seen_count_tokens.auth_header_value,
+        "sk-upstream-gemini-chat"
+    );
+
+    let count_tokens_json: serde_json::Value = count_tokens_response
+        .json()
+        .await
+        .expect("countTokens response should parse");
+    assert_eq!(
+        count_tokens_json["totalTokens"], 17,
+        "unexpected countTokens response: {count_tokens_json}"
+    );
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

@@ -133,7 +133,8 @@ fn gemini_response_output_has_visible_content(output: &CanonicalResponseOutput) 
         | CanonicalContentBlock::Image { .. }
         | CanonicalContentBlock::File { .. }
         | CanonicalContentBlock::Audio { .. } => true,
-        CanonicalContentBlock::Thinking { .. } | CanonicalContentBlock::Unknown { .. } => false,
+        CanonicalContentBlock::Thinking { text, .. } => !text.trim().is_empty(),
+        CanonicalContentBlock::Unknown { .. } => false,
     })
 }
 
@@ -473,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn gemini_response_with_only_thought_parts_is_not_success() {
+    fn gemini_response_with_only_thought_parts_is_valid() {
         let body = json!({
             "candidates": [{
                 "content": {
@@ -486,7 +487,11 @@ mod tests {
             "responseId": "resp-thought-only"
         });
 
-        assert!(from_raw(&body).is_none());
+        let canonical = from_raw(&body).expect("thought-only response should remain valid");
+        assert!(matches!(
+            canonical.content.first(),
+            Some(CanonicalContentBlock::Thinking { text, .. }) if text == "hidden plan"
+        ));
     }
 
     #[test]

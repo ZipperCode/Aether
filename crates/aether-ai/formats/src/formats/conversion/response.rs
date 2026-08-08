@@ -261,7 +261,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        convert_claude_chat_response_to_openai_chat,
+        convert_claude_chat_response_to_openai_chat, convert_gemini_chat_response_to_openai_chat,
+        convert_gemini_response_to_openai_responses,
         convert_openai_chat_response_to_openai_responses,
     };
 
@@ -325,5 +326,61 @@ mod tests {
 
         assert_eq!(converted["model"], "gpt-target");
         assert_eq!(converted["choices"][0]["message"]["content"], "hello");
+    }
+
+    #[test]
+    fn gemini_code_execution_parts_convert_consistently_to_openai() {
+        let body = json!({
+            "responseId": "resp-code",
+            "modelVersion": "gemini-2.5-pro",
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"executableCode": {"language": "python", "code": "print(1)"}},
+                        {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "1\n"}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+
+        let chat = convert_gemini_chat_response_to_openai_chat(&body, &json!({}))
+            .expect("openai chat response");
+        assert_eq!(
+            chat["choices"][0]["message"]["content"],
+            "```python\nprint(1)\n```\n```output\n1\n\n```"
+        );
+
+        let responses = convert_gemini_response_to_openai_responses(&body, &json!({}))
+            .expect("openai responses response");
+        assert_eq!(
+            responses["output_text"],
+            "```python\nprint(1)\n```\n```output\n1\n\n```"
+        );
+    }
+
+    #[test]
+    fn gemini_thought_only_response_reaches_openai_reasoning_fields() {
+        let body = json!({
+            "responseId": "resp-thought",
+            "modelVersion": "gemini-2.5-pro",
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hidden plan", "thought": true}]},
+                "finishReason": "STOP"
+            }]
+        });
+
+        let chat = convert_gemini_chat_response_to_openai_chat(&body, &json!({}))
+            .expect("openai chat response");
+        assert_eq!(
+            chat["choices"][0]["message"]["reasoning_content"],
+            "hidden plan"
+        );
+
+        let responses = convert_gemini_response_to_openai_responses(&body, &json!({}))
+            .expect("openai responses response");
+        assert_eq!(responses["output"][0]["type"], "reasoning");
+        assert_eq!(responses["output"][0]["summary"][0]["text"], "hidden plan");
     }
 }

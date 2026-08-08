@@ -201,6 +201,30 @@ mod tests {
     }
 
     #[test]
+    fn resolves_gemini_count_tokens_as_native_sync_operation() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1beta/models/gemini-2.5-pro:countTokens")
+            .body(())
+            .expect("request should build");
+        let (parts, _) = request.into_parts();
+        let mut decision = sample_decision("gemini", "count_tokens");
+        decision.api_operation = Some(ApiOperation::GeminiCountTokens);
+
+        assert_eq!(
+            resolve_execution_runtime_sync_plan_kind(&parts, &decision),
+            Some("gemini_count_tokens_sync")
+        );
+        assert!(supports_sync_execution_decision_kind(
+            "gemini_count_tokens_sync"
+        ));
+        assert_eq!(
+            resolve_execution_runtime_stream_plan_kind(&parts, &decision),
+            None
+        );
+    }
+
+    #[test]
     fn stream_matching_uses_surface_route_logic() {
         let request = Request::builder()
             .method(Method::POST)

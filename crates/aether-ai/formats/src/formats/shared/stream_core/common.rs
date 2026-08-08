@@ -181,11 +181,10 @@ pub fn canonical_usage_from_openai_usage(value: Option<&Value>) -> Option<Canoni
                 .and_then(Value::as_u64)
         })
         .unwrap_or(0);
-    let total_tokens = usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(
-        input_tokens
-            .saturating_add(output_tokens)
-            .saturating_add(reasoning_tokens),
-    );
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
     if input_tokens == 0 && total_tokens > output_tokens {
         input_tokens = total_tokens.saturating_sub(output_tokens);
     }
@@ -350,9 +349,7 @@ pub fn canonical_usage_from_claude_usage(value: Option<&Value>) -> Option<Canoni
         input_tokens,
         input_tokens_include_cache: false,
         output_tokens,
-        total_tokens: input_tokens
-            .saturating_add(output_tokens)
-            .saturating_add(reasoning_tokens),
+        total_tokens: input_tokens.saturating_add(output_tokens),
         cache_creation_tokens,
         cache_creation_ephemeral_5m_tokens,
         cache_creation_ephemeral_1h_tokens,
@@ -418,7 +415,14 @@ pub fn canonical_usage_from_gemini_usage(value: Option<&Value>) -> Option<Canoni
         .get("promptTokenCount")
         .or_else(|| usage.get("prompt_token_count"))
         .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .saturating_add(
+            usage
+                .get("toolUsePromptTokenCount")
+                .or_else(|| usage.get("tool_use_prompt_token_count"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
     let output_tokens = usage
         .get("candidatesTokenCount")
         .or_else(|| usage.get("candidates_token_count"))
@@ -805,9 +809,29 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        canonical_usage_from_claude_usage, canonical_usage_from_openai_usage,
         openai_stream_payload_is_terminal_error, openai_stream_terminal_error_body,
         openai_stream_terminal_error_message,
     };
+
+    #[test]
+    fn output_token_totals_do_not_double_count_reasoning() {
+        let openai = canonical_usage_from_openai_usage(Some(&json!({
+            "input_tokens": 3,
+            "output_tokens": 5,
+            "output_tokens_details": {"reasoning_tokens": 2}
+        })))
+        .expect("OpenAI usage should parse");
+        assert_eq!(openai.total_tokens, 8);
+
+        let claude = canonical_usage_from_claude_usage(Some(&json!({
+            "input_tokens": 3,
+            "output_tokens": 5,
+            "output_tokens_details": {"thinking_tokens": 2}
+        })))
+        .expect("Claude usage should parse");
+        assert_eq!(claude.total_tokens, 8);
+    }
 
     #[test]
     fn completed_openai_responses_payload_with_null_error_is_not_terminal_error() {

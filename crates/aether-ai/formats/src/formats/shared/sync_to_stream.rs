@@ -596,11 +596,7 @@ fn openai_chat_usage_counts(usage: &StandardizedUsage) -> Option<(u64, u64, u64,
         .dimensions
         .get("total_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| {
-            input_tokens
-                .saturating_add(output_tokens)
-                .saturating_add(reasoning_tokens)
-        });
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
     (total_tokens > 0).then_some((
         input_tokens,
         output_tokens,
@@ -1372,7 +1368,11 @@ fn standardized_usage_from_openai_usage(value: &Value) -> Option<StandardizedUsa
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{maybe_bridge_standard_sync_json_to_stream, standardized_usage_from_openai_usage};
+    use super::{
+        maybe_bridge_standard_sync_json_to_stream, openai_chat_usage_counts,
+        standardized_usage_from_openai_usage,
+    };
+    use aether_contracts::StandardizedUsage;
 
     fn utf8(bytes: Vec<u8>) -> String {
         String::from_utf8(bytes).expect("utf8 should decode")
@@ -1451,6 +1451,19 @@ mod tests {
         assert_eq!(usage.input_tokens, 20_435);
         assert_eq!(usage.output_tokens, 177);
         assert_eq!(usage.cache_read_tokens, 19_840);
+    }
+
+    #[test]
+    fn bridged_usage_total_does_not_double_count_reasoning() {
+        let mut usage = StandardizedUsage::new();
+        usage.input_tokens = 3;
+        usage.output_tokens = 5;
+        usage.reasoning_tokens = 2;
+
+        let (_, _, total_tokens, reasoning_tokens, _, _) =
+            openai_chat_usage_counts(&usage).expect("usage counts should exist");
+        assert_eq!(total_tokens, 8);
+        assert_eq!(reasoning_tokens, 2);
     }
 
     #[test]

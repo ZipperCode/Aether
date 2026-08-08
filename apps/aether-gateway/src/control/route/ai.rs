@@ -143,6 +143,18 @@ pub(super) fn classify_ai_public_route(
                 "gemini:embedding",
                 true,
             ))
+        } else if normalized_path.ends_with(":countTokens") {
+            Some(
+                classified_with_request_auth_channel(
+                    "ai_public",
+                    "gemini",
+                    "count_tokens",
+                    "api_key",
+                    "gemini:generate_content",
+                    true,
+                )
+                .with_api_operation(ApiOperation::GeminiCountTokens),
+            )
         } else if is_gemini_cli_request(headers) {
             Some(classified_with_request_auth_channel(
                 "ai_public",

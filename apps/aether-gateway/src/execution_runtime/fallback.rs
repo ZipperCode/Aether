@@ -134,6 +134,7 @@ pub(crate) fn should_fallback_to_control_sync(
             | "openai_responses_compact_sync"
             | "claude_chat_sync"
             | "gemini_chat_sync"
+            | "gemini_count_tokens_sync"
             | "claude_cli_sync"
             | "gemini_cli_sync"
     ) {
@@ -179,6 +180,7 @@ pub(crate) fn resolve_core_sync_error_finalize_report_kind(
         "openai_responses_compact_sync" => "openai_responses_compact_sync_finalize",
         "claude_chat_sync" => "claude_chat_sync_finalize",
         "gemini_chat_sync" => "gemini_chat_sync_finalize",
+        "gemini_count_tokens_sync" => "gemini_chat_sync_finalize",
         "gemini_interactions_sync" => "gemini_interactions_sync_finalize",
         "claude_cli_sync" => "claude_cli_sync_finalize",
         "gemini_cli_sync" => "gemini_cli_sync_finalize",

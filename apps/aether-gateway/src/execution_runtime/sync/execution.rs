@@ -111,6 +111,25 @@ const OPENAI_IMAGE_SYNC_JSON_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(
 const OPENAI_IMAGE_SYNC_JSON_HEARTBEAT_BYTES: &[u8] = b"\n";
 const OPENAI_IMAGE_SYNC_PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(5);
 const INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE: &str = "Provider returned HTTP 200 but the Gemini response did not contain visible model output; refusing to finalize it as a successful response.";
+const EMPTY_GEMINI_PROVIDER_SUCCESS_MESSAGE: &str =
+    "Provider returned HTTP 200 but the Gemini response contained no candidates.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InvalidGeminiProviderSuccess {
+    Blocked(String),
+    Empty,
+    MissingVisibleOutput,
+}
+
+impl InvalidGeminiProviderSuccess {
+    fn message(&self) -> String {
+        match self {
+            Self::Blocked(reason) => format!("Request blocked by Gemini API: {reason}"),
+            Self::Empty => EMPTY_GEMINI_PROVIDER_SUCCESS_MESSAGE.to_string(),
+            Self::MissingVisibleOutput => INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE.to_string(),
+        }
+    }
+}
 
 fn elapsed_ms_since(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
@@ -837,11 +856,14 @@ fn invalid_gemini_provider_success_message(
     report_context: Option<&Value>,
     status_code: u16,
     body_json: Option<&Value>,
-) -> Option<&'static str> {
+) -> Option<InvalidGeminiProviderSuccess> {
     if status_code >= 400 {
         return None;
     }
     if !provider_api_format_is_gemini_generate_content(plan, report_context) {
+        return None;
+    }
+    if report_context_api_operation(report_context) == Some("count_tokens") {
         return None;
     }
     let body_json = body_json?;
@@ -862,10 +884,7 @@ fn invalid_gemini_provider_success_message(
             crate::ai_serving::normalize_provider_private_response_value(body_json.clone(), context)
         });
     let body_json = normalized_body_json.as_ref().unwrap_or(body_json);
-    if crate::ai_serving::gemini_generate_content_response_has_visible_output(body_json) {
-        return None;
-    }
-    Some(INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE)
+    classify_invalid_gemini_provider_success(body_json)
 }
 
 fn invalid_gemini_provider_stream_success_message(
@@ -875,21 +894,54 @@ fn invalid_gemini_provider_stream_success_message(
     body_json: Option<&Value>,
     body_bytes: &[u8],
     has_body_bytes: bool,
-) -> Option<&'static str> {
+) -> Option<InvalidGeminiProviderSuccess> {
     if status_code >= 400 || body_json.is_some() || !has_body_bytes {
         return None;
     }
     if !provider_api_format_is_gemini_generate_content(plan, report_context) {
         return None;
     }
-    let Some(body_json) = crate::ai_serving::aggregate_gemini_stream_sync_response(body_bytes)
-    else {
-        return Some(INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE);
-    };
-    if crate::ai_serving::gemini_generate_content_response_has_visible_output(&body_json) {
+    if report_context_api_operation(report_context) == Some("count_tokens") {
         return None;
     }
-    Some(INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE)
+    let Some(body_json) = crate::ai_serving::aggregate_gemini_stream_sync_response(body_bytes)
+    else {
+        return Some(InvalidGeminiProviderSuccess::MissingVisibleOutput);
+    };
+    classify_invalid_gemini_provider_success(&body_json)
+}
+
+fn classify_invalid_gemini_provider_success(
+    body_json: &Value,
+) -> Option<InvalidGeminiProviderSuccess> {
+    if crate::ai_serving::gemini_generate_content_response_has_visible_output(body_json) {
+        return None;
+    }
+    if let Some(reason) = gemini_prompt_block_reason(body_json) {
+        return Some(InvalidGeminiProviderSuccess::Blocked(reason.to_string()));
+    }
+    let Some(candidates) = body_json.get("candidates").and_then(Value::as_array) else {
+        return Some(InvalidGeminiProviderSuccess::MissingVisibleOutput);
+    };
+    if !candidates.is_empty() {
+        return Some(InvalidGeminiProviderSuccess::MissingVisibleOutput);
+    }
+    Some(InvalidGeminiProviderSuccess::Empty)
+}
+
+fn gemini_prompt_block_reason(body_json: &Value) -> Option<&str> {
+    body_json
+        .get("promptFeedback")
+        .or_else(|| body_json.get("prompt_feedback"))
+        .and_then(Value::as_object)
+        .and_then(|feedback| {
+            feedback
+                .get("blockReason")
+                .or_else(|| feedback.get("block_reason"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
 }
 
 fn provider_api_format_is_gemini_generate_content(
@@ -903,21 +955,56 @@ fn provider_api_format_is_gemini_generate_content(
     crate::ai_serving::normalize_api_format_alias(provider_api_format) == "gemini:generate_content"
 }
 
-fn invalid_gemini_provider_success_execution_error(message: &str) -> ExecutionError {
-    ExecutionError {
-        kind: ExecutionErrorKind::Upstream5xx,
-        phase: ExecutionPhase::Finalize,
-        message: message.to_string(),
-        upstream_status: Some(StatusCode::OK.as_u16()),
-        retryable: true,
-        failover_recommended: true,
+fn report_context_api_operation(report_context: Option<&Value>) -> Option<&str> {
+    report_context
+        .and_then(|value| value.get("api_operation"))
+        .and_then(Value::as_str)
+}
+
+fn invalid_gemini_provider_success_execution_error(
+    invalid: &InvalidGeminiProviderSuccess,
+) -> ExecutionError {
+    match invalid {
+        InvalidGeminiProviderSuccess::Blocked(_) => ExecutionError {
+            kind: ExecutionErrorKind::Upstream4xx,
+            phase: ExecutionPhase::Finalize,
+            message: invalid.message(),
+            upstream_status: Some(StatusCode::OK.as_u16()),
+            retryable: false,
+            failover_recommended: false,
+        },
+        InvalidGeminiProviderSuccess::Empty
+        | InvalidGeminiProviderSuccess::MissingVisibleOutput => ExecutionError {
+            kind: ExecutionErrorKind::Upstream5xx,
+            phase: ExecutionPhase::Finalize,
+            message: invalid.message(),
+            upstream_status: Some(StatusCode::OK.as_u16()),
+            retryable: true,
+            failover_recommended: true,
+        },
+    }
+}
+
+fn invalid_gemini_provider_success_status(invalid: &InvalidGeminiProviderSuccess) -> StatusCode {
+    match invalid {
+        InvalidGeminiProviderSuccess::Blocked(_) => StatusCode::BAD_REQUEST,
+        InvalidGeminiProviderSuccess::Empty => StatusCode::INTERNAL_SERVER_ERROR,
+        InvalidGeminiProviderSuccess::MissingVisibleOutput => StatusCode::BAD_GATEWAY,
+    }
+}
+
+fn invalid_gemini_provider_success_code(invalid: &InvalidGeminiProviderSuccess) -> &'static str {
+    match invalid {
+        InvalidGeminiProviderSuccess::Blocked(_) => "prompt_blocked",
+        InvalidGeminiProviderSuccess::Empty => "empty_response",
+        InvalidGeminiProviderSuccess::MissingVisibleOutput => "invalid_provider_success_response",
     }
 }
 
 fn build_invalid_provider_success_body(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
-    message: &str,
+    invalid: &InvalidGeminiProviderSuccess,
 ) -> Option<Value> {
     let client_api_format = report_context
         .and_then(|value| value.get("client_api_format"))
@@ -925,9 +1012,15 @@ fn build_invalid_provider_success_body(
         .unwrap_or(plan.client_api_format.as_str());
     build_core_error_body_for_client_format(
         client_api_format,
-        message,
-        Some("invalid_provider_success_response"),
-        LocalCoreSyncErrorKind::ServerError,
+        invalid.message().as_str(),
+        Some(invalid_gemini_provider_success_code(invalid)),
+        match invalid {
+            InvalidGeminiProviderSuccess::Blocked(_) => LocalCoreSyncErrorKind::InvalidRequest,
+            InvalidGeminiProviderSuccess::Empty
+            | InvalidGeminiProviderSuccess::MissingVisibleOutput => {
+                LocalCoreSyncErrorKind::ServerError
+            }
+        },
     )
 }
 
@@ -2480,7 +2573,7 @@ async fn execute_execution_runtime_sync_impl(
         let mut headers = std::mem::take(&mut result.headers);
         let (body_bytes, mut body_json, body_base64) =
             decode_execution_result_body(result.body.take(), &mut headers)?;
-        if let Some(message) = invalid_gemini_provider_success_message(
+        if let Some(invalid) = invalid_gemini_provider_success_message(
             &plan,
             report_context.as_ref(),
             result.status_code,
@@ -2496,10 +2589,10 @@ async fn execute_execution_runtime_sync_impl(
                 body_base64.is_some(),
             )
         }) {
-            result.status_code = StatusCode::BAD_GATEWAY.as_u16();
-            result.error = Some(invalid_gemini_provider_success_execution_error(message));
+            result.status_code = invalid_gemini_provider_success_status(&invalid).as_u16();
+            result.error = Some(invalid_gemini_provider_success_execution_error(&invalid));
             if let Some(error_body) =
-                build_invalid_provider_success_body(&plan, report_context.as_ref(), message)
+                build_invalid_provider_success_body(&plan, report_context.as_ref(), &invalid)
             {
                 body_json = Some(error_body);
                 headers.insert("content-type".to_string(), "application/json".to_string());
@@ -3485,7 +3578,7 @@ mod tests {
             }
         });
 
-        let message = invalid_gemini_provider_success_message(
+        let invalid = invalid_gemini_provider_success_message(
             &plan,
             None,
             StatusCode::OK.as_u16(),
@@ -3493,18 +3586,81 @@ mod tests {
         )
         .expect("empty Gemini 200 response should be rejected from plan format");
 
-        assert!(message.contains("visible model output"));
+        assert_eq!(invalid, InvalidGeminiProviderSuccess::MissingVisibleOutput);
+    }
+
+    #[test]
+    fn gemini_count_tokens_success_skips_visible_output_guard() {
+        let plan = test_gemini_chat_plan();
+        let report_context = json!({
+            "provider_api_format": "gemini:generate_content",
+            "api_operation": "count_tokens"
+        });
+        let body = json!({"totalTokens": 17});
+
+        let message = invalid_gemini_provider_success_message(
+            &plan,
+            Some(&report_context),
+            StatusCode::OK.as_u16(),
+            Some(&body),
+        );
+
+        assert!(message.is_none());
     }
 
     #[test]
     fn invalid_gemini_provider_success_error_is_retryable_candidate_failure() {
         let error = invalid_gemini_provider_success_execution_error(
-            INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE,
+            &InvalidGeminiProviderSuccess::MissingVisibleOutput,
         );
 
         assert_eq!(error.kind, ExecutionErrorKind::Upstream5xx);
         assert_eq!(error.phase, ExecutionPhase::Finalize);
         assert_eq!(error.upstream_status, Some(StatusCode::OK.as_u16()));
+        assert!(error.retryable);
+        assert!(error.failover_recommended);
+    }
+
+    #[test]
+    fn invalid_gemini_provider_success_distinguishes_blocked_and_empty_candidates() {
+        let plan = test_gemini_chat_plan();
+        let blocked = json!({
+            "promptFeedback": {"blockReason": "SAFETY"}
+        });
+        let blocked = invalid_gemini_provider_success_message(
+            &plan,
+            None,
+            StatusCode::OK.as_u16(),
+            Some(&blocked),
+        )
+        .expect("blocked response should be rejected");
+        assert_eq!(
+            blocked,
+            InvalidGeminiProviderSuccess::Blocked("SAFETY".to_string())
+        );
+        assert_eq!(
+            invalid_gemini_provider_success_status(&blocked),
+            StatusCode::BAD_REQUEST
+        );
+        let error = invalid_gemini_provider_success_execution_error(&blocked);
+        assert_eq!(error.kind, ExecutionErrorKind::Upstream4xx);
+        assert!(!error.retryable);
+        assert!(!error.failover_recommended);
+
+        let empty = invalid_gemini_provider_success_message(
+            &plan,
+            None,
+            StatusCode::OK.as_u16(),
+            Some(&json!({"candidates": []})),
+        )
+        .expect("empty response should be rejected");
+        assert_eq!(empty, InvalidGeminiProviderSuccess::Empty);
+        assert_eq!(
+            invalid_gemini_provider_success_status(&empty),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let error = invalid_gemini_provider_success_execution_error(&empty);
+        assert_eq!(error.kind, ExecutionErrorKind::Upstream5xx);
         assert!(error.retryable);
         assert!(error.failover_recommended);
     }

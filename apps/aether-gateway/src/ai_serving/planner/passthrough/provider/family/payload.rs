@@ -262,7 +262,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
         provider_api_format,
         client_api_format: spec_metadata.api_format.to_string(),
         model_name: input.requested_model.clone(),
-        mapped_model,
+        mapped_model: mapped_model.clone(),
         prompt_cache_key,
         provider_request_headers,
         provider_request_body: Some(provider_request_body),
@@ -287,6 +287,8 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
         spec.operation,
         decision.provider_request_body.as_mut(),
         &mut decision.provider_request_headers,
+        &mapped_model,
+        &transport,
     );
     decision.provider_request_body_base64 = original_request_body_base64(
         parts,
@@ -315,8 +317,16 @@ fn enforce_provider_api_operation_invariants(
     operation: Option<crate::ai_serving::ApiOperation>,
     provider_request_body: Option<&mut serde_json::Value>,
     provider_request_headers: &mut std::collections::BTreeMap<String, String>,
+    mapped_model: &str,
+    transport: &crate::ai_serving::GatewayProviderTransportSnapshot,
 ) {
-    if operation != Some(crate::ai_serving::ApiOperation::ClaudeCountTokens) {
+    if !matches!(
+        operation,
+        Some(
+            crate::ai_serving::ApiOperation::ClaudeCountTokens
+                | crate::ai_serving::ApiOperation::GeminiCountTokens
+        )
+    ) {
         return;
     }
 
@@ -325,6 +335,13 @@ fn enforce_provider_api_operation_invariants(
             provider_request_body,
             operation,
         );
+        if operation == Some(crate::ai_serving::ApiOperation::GeminiCountTokens) {
+            crate::ai_serving::transport::rewrite_gemini_count_tokens_request_body(
+                provider_request_body,
+                mapped_model,
+                transport,
+            );
+        }
     }
     for header_name in ["accept", "content-type"] {
         provider_request_headers.retain(|name, _| !name.eq_ignore_ascii_case(header_name));
@@ -450,7 +467,68 @@ mod tests {
         enforce_provider_api_operation_invariants, original_request_body_base64, AdaptationMode,
         AiRequestGzipPolicy, OriginalRequestPayload,
     };
+    use crate::ai_serving::transport::snapshot::{
+        GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
+        GatewayProviderTransportProvider,
+    };
     use crate::ai_serving::ApiOperation;
+    use crate::ai_serving::GatewayProviderTransportSnapshot;
+
+    fn sample_transport() -> GatewayProviderTransportSnapshot {
+        GatewayProviderTransportSnapshot {
+            provider: GatewayProviderTransportProvider {
+                id: "provider-1".to_string(),
+                name: "Gemini".to_string(),
+                provider_type: "custom".to_string(),
+                website: None,
+                is_active: true,
+                keep_priority_on_conversion: false,
+                enable_format_conversion: true,
+                concurrent_limit: None,
+                max_retries: None,
+                proxy: None,
+                request_timeout_secs: None,
+                stream_first_byte_timeout_secs: None,
+                config: None,
+            },
+            endpoint: GatewayProviderTransportEndpoint {
+                id: "endpoint-1".to_string(),
+                provider_id: "provider-1".to_string(),
+                api_format: "gemini:generate_content".to_string(),
+                api_family: Some("gemini".to_string()),
+                endpoint_kind: Some("chat".to_string()),
+                is_active: true,
+                base_url: "https://generativelanguage.googleapis.com".to_string(),
+                header_rules: None,
+                body_rules: None,
+                max_retries: None,
+                custom_path: None,
+                config: None,
+                format_acceptance_config: None,
+                proxy: None,
+            },
+            key: GatewayProviderTransportKey {
+                id: "key-1".to_string(),
+                provider_id: "provider-1".to_string(),
+                name: "key".to_string(),
+                auth_type: "api_key".to_string(),
+                is_active: true,
+                api_formats: None,
+                auth_type_by_format: None,
+                allow_auth_channel_mismatch_formats: None,
+                allowed_models: None,
+                capabilities: None,
+                rate_multipliers: None,
+                global_priority_by_format: None,
+                expires_at_unix_secs: None,
+                proxy: None,
+                fingerprint: None,
+                upstream_metadata: None,
+                decrypted_api_key: "secret".to_string(),
+                decrypted_auth_config: None,
+            },
+        }
+    }
 
     fn request_parts_with_original_payload(
         body_json: serde_json::Value,
@@ -482,6 +560,8 @@ mod tests {
             Some(ApiOperation::ClaudeCountTokens),
             Some(&mut body),
             &mut headers,
+            "claude-sonnet-4",
+            &sample_transport(),
         );
 
         assert!(body.get("stream").is_none());
@@ -511,6 +591,34 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn gemini_count_tokens_invariants_restore_wrapped_model_after_routing_mutations() {
+        let mut body = serde_json::json!({
+            "generateContentRequest": {
+                "model": "models/client-model",
+                "contents": [],
+                "stream": true
+            },
+            "stream": true
+        });
+        let mut headers = BTreeMap::new();
+
+        enforce_provider_api_operation_invariants(
+            Some(ApiOperation::GeminiCountTokens),
+            Some(&mut body),
+            &mut headers,
+            "gemini-upstream",
+            &sample_transport(),
+        );
+
+        assert_eq!(
+            body["generateContentRequest"]["model"],
+            "models/gemini-upstream"
+        );
+        assert!(body.get("stream").is_none());
+        assert!(body["generateContentRequest"].get("stream").is_none());
     }
 
     #[test]

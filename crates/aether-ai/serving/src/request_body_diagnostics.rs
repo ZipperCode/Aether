@@ -237,6 +237,8 @@ fn format_error_path(error: &FormatError) -> String {
         | FormatError::RequestParseFailed { .. }
         | FormatError::RequestEmitFailed { .. }
         | FormatError::ResponseParseFailed { .. }
+        | FormatError::ResponseBlocked { .. }
+        | FormatError::EmptyResponse { .. }
         | FormatError::ResponseEmitFailed { .. } => "$".to_string(),
     }
 }
@@ -271,6 +273,12 @@ fn format_error_message(
         }
         FormatError::ResponseParseFailed { format } => {
             format!("无法按 {format} 解析响应体")
+        }
+        FormatError::ResponseBlocked { format, reason } => {
+            format!("{format} 响应被上游拦截：{reason}")
+        }
+        FormatError::EmptyResponse { format } => {
+            format!("{format} 响应未返回任何候选内容")
         }
         FormatError::ResponseEmitFailed { format } => {
             format!("无法生成 {format} 响应体")

@@ -27,6 +27,29 @@ fn classifies_claude_count_tokens_as_execution_runtime_operation() {
 }
 
 #[test]
+fn classifies_gemini_count_tokens_as_execution_runtime_operation() {
+    let headers = headers(&[("x-goog-api-key", "gemini-key"), ("x-app", "Gemini-CLI")]);
+    let uri: Uri = "/v1beta/models/gemini-2.5-pro:countTokens"
+        .parse()
+        .expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::POST, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.route_family.as_deref(), Some("gemini"));
+    assert_eq!(decision.route_kind.as_deref(), Some("count_tokens"));
+    assert_eq!(decision.request_auth_channel.as_deref(), Some("api_key"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("gemini:generate_content")
+    );
+    assert!(decision.is_execution_runtime_candidate());
+    assert_eq!(
+        decision.api_operation,
+        Some(ApiOperation::GeminiCountTokens)
+    );
+}
+
+#[test]
 fn classifies_openai_embeddings_as_embedding_not_chat() {
     let headers = headers(&[("authorization", "Bearer sk-test")]);
     let uri: Uri = "/v1/embeddings".parse().expect("uri should parse");

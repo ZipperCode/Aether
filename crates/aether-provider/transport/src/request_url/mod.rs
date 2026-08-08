@@ -17,9 +17,10 @@ use crate::gemini_cli::{
 use crate::snapshot::GatewayProviderTransportSnapshot;
 use crate::url::{
     build_claude_count_tokens_url as build_default_claude_count_tokens_url,
-    build_claude_messages_url, build_gemini_content_url, build_openai_chat_url,
-    build_openai_responses_url, build_openai_search_url, build_passthrough_path_url,
-    normalize_gemini_content_action_path, strip_gateway_credential_query_parameters,
+    build_claude_messages_url, build_gemini_content_url, build_gemini_count_tokens_url,
+    build_openai_chat_url, build_openai_responses_url, build_openai_search_url,
+    build_passthrough_path_url, normalize_gemini_content_action_path,
+    normalize_gemini_count_tokens_path, strip_gateway_credential_query_parameters,
     GATEWAY_CREDENTIAL_QUERY_KEYS,
 };
 use crate::vertex::{
@@ -87,6 +88,8 @@ fn build_transport_request_url_inner(
     };
     let is_claude_count_tokens = normalized_provider_api_format == "claude:messages"
         && params.api_operation == Some(ApiOperation::ClaudeCountTokens);
+    let is_gemini_count_tokens = normalized_provider_api_format == "gemini:generate_content"
+        && params.api_operation == Some(ApiOperation::GeminiCountTokens);
     if !transport_supports_api_operation(
         transport,
         normalized_provider_api_format.as_str(),
@@ -134,7 +137,11 @@ fn build_transport_request_url_inner(
             &[][..]
         };
         let normalized_path = if normalized_provider_api_format == "gemini:generate_content" {
-            normalize_gemini_content_action_path(path, params.upstream_is_stream)
+            if is_gemini_count_tokens {
+                normalize_gemini_count_tokens_path(path)
+            } else {
+                normalize_gemini_content_action_path(path, params.upstream_is_stream)
+            }
         } else if normalized_provider_api_format == "gemini:embedding" {
             normalize_gemini_embedding_action_path(path, gemini_embedding_batch)
         } else {
@@ -197,12 +204,22 @@ fn build_transport_request_url_inner(
         } else {
             build_claude_messages_url(&transport.endpoint.base_url, params.request_query)
         }),
-        "gemini:generate_content" => build_gemini_content_url(
-            &transport.endpoint.base_url,
-            params.mapped_model?,
-            params.upstream_is_stream,
-            params.request_query,
-        ),
+        "gemini:generate_content" => {
+            if is_gemini_count_tokens {
+                build_gemini_count_tokens_url(
+                    &transport.endpoint.base_url,
+                    params.mapped_model?,
+                    params.request_query,
+                )
+            } else {
+                build_gemini_content_url(
+                    &transport.endpoint.base_url,
+                    params.mapped_model?,
+                    params.upstream_is_stream,
+                    params.request_query,
+                )
+            }
+        }
         "gemini:embedding" => build_gemini_embedding_url(
             &transport.endpoint.base_url,
             params.mapped_model?,
@@ -365,6 +382,24 @@ fn build_transport_hook_url(
         aether_ai_formats::normalize_api_format_alias(params.provider_api_format);
     match normalized_provider_api_format.as_str() {
         "gemini:generate_content" => {
+            if params.api_operation == Some(ApiOperation::GeminiCountTokens) {
+                if let Some(auth) = resolve_local_vertex_api_key_query_auth(transport) {
+                    return crate::vertex::build_vertex_api_key_gemini_count_tokens_url(
+                        params.mapped_model?,
+                        &auth.value,
+                        params.request_query,
+                    );
+                }
+                if let Some(auth_config) =
+                    resolve_local_vertex_service_account_auth_config(transport)
+                {
+                    return crate::vertex::build_vertex_service_account_gemini_count_tokens_url(
+                        params.mapped_model?,
+                        &auth_config,
+                        params.request_query,
+                    );
+                }
+            }
             if is_gemini_cli_provider_transport(transport) {
                 let query = params.request_query.map(|raw| {
                     form_urlencoded::parse(raw.as_bytes())
@@ -485,6 +520,8 @@ fn build_path_params(
                 } else {
                     "embedContent"
                 }
+            } else if params.api_operation == Some(ApiOperation::GeminiCountTokens) {
+                "countTokens"
             } else if params.upstream_is_stream {
                 "streamGenerateContent"
             } else {
@@ -500,14 +537,19 @@ pub fn transport_supports_api_operation(
     provider_api_format: &str,
     operation: Option<ApiOperation>,
 ) -> bool {
-    if operation != Some(ApiOperation::ClaudeCountTokens) {
-        return true;
+    match operation {
+        Some(ApiOperation::ClaudeCountTokens) => {
+            aether_ai_formats::normalize_api_format_alias(provider_api_format) == "claude:messages"
+                && anthropic_count_tokens_supported(transport)
+        }
+        Some(ApiOperation::GeminiCountTokens) => {
+            aether_ai_formats::normalize_api_format_alias(provider_api_format)
+                == "gemini:generate_content"
+                && !is_gemini_cli_provider_transport(transport)
+                && !is_antigravity_provider_transport(transport)
+        }
+        _ => true,
     }
-    if aether_ai_formats::normalize_api_format_alias(provider_api_format) != "claude:messages" {
-        return false;
-    }
-
-    anthropic_count_tokens_supported(transport)
 }
 
 fn anthropic_count_tokens_supported(transport: &GatewayProviderTransportSnapshot) -> bool {
@@ -1077,6 +1119,101 @@ mod tests {
             url,
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?foo=bar"
         );
+    }
+
+    #[test]
+    fn routes_gemini_count_tokens_across_official_and_custom_urls() {
+        let official = sample_transport(
+            "gemini",
+            "gemini:generate_content",
+            "https://generativelanguage.googleapis.com/v1beta",
+            None,
+        );
+        assert_eq!(
+            build_transport_request_url(
+                &official,
+                TransportRequestUrlParams {
+                    provider_api_format: "gemini:generate_content",
+                    mapped_model: Some("gemini-2.5-pro"),
+                    upstream_is_stream: false,
+                    request_query: Some("key=client-key&trace=1"),
+                    kiro_api_region: None,
+                    api_operation: Some(ApiOperation::GeminiCountTokens),
+                },
+            )
+            .as_deref(),
+            Some(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:countTokens?trace=1"
+            )
+        );
+
+        let custom = sample_transport(
+            "custom",
+            "gemini:generate_content",
+            "https://proxy.example",
+            Some("/google/models/{model}:{action}?tenant=base"),
+        );
+        assert_eq!(
+            build_transport_request_url(
+                &custom,
+                TransportRequestUrlParams {
+                    provider_api_format: "gemini:generate_content",
+                    mapped_model: Some("gemini-upstream"),
+                    upstream_is_stream: false,
+                    request_query: Some("trace=1"),
+                    kiro_api_region: None,
+                    api_operation: Some(ApiOperation::GeminiCountTokens),
+                },
+            )
+            .as_deref(),
+            Some("https://proxy.example/google/models/gemini-upstream:countTokens?tenant=base&trace=1")
+        );
+
+        let hardcoded = sample_transport(
+            "custom",
+            "gemini:generate_content",
+            "https://proxy.example",
+            Some("/v1beta/models/{model}:generateContent"),
+        );
+        assert_eq!(
+            build_transport_request_url(
+                &hardcoded,
+                TransportRequestUrlParams {
+                    provider_api_format: "gemini:generate_content",
+                    mapped_model: Some("gemini-upstream"),
+                    upstream_is_stream: false,
+                    request_query: None,
+                    kiro_api_region: None,
+                    api_operation: Some(ApiOperation::GeminiCountTokens),
+                },
+            )
+            .as_deref(),
+            Some("https://proxy.example/v1beta/models/gemini-upstream:countTokens")
+        );
+    }
+
+    #[test]
+    fn rejects_gemini_count_tokens_on_private_adapters() {
+        for provider_type in ["gemini_cli", "antigravity"] {
+            let transport = sample_transport(
+                provider_type,
+                "gemini:generate_content",
+                "https://private.example",
+                None,
+            );
+            assert!(build_transport_request_url(
+                &transport,
+                TransportRequestUrlParams {
+                    provider_api_format: "gemini:generate_content",
+                    mapped_model: Some("gemini-2.5-pro"),
+                    upstream_is_stream: false,
+                    request_query: None,
+                    kiro_api_region: None,
+                    api_operation: Some(ApiOperation::GeminiCountTokens),
+                },
+            )
+            .is_none());
+        }
     }
 
     #[test]

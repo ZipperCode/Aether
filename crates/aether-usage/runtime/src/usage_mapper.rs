@@ -27,6 +27,8 @@ impl UsageMapper {
         }
 
         apply_openai_cache_write_tokens(raw_usage, api_format, &mut usage);
+        apply_gemini_tool_use_prompt_tokens(raw_usage, api_format, &mut usage);
+        apply_gemini_thought_tokens(raw_usage, api_format, &mut usage);
         derive_missing_input_tokens(raw_usage, api_format, &mut usage);
         copy_explicit_total_tokens(raw_usage, api_format, &mut usage);
         usage.normalize_cache_creation_breakdown()
@@ -44,6 +46,43 @@ impl UsageMapper {
         }
         usage
     }
+}
+
+fn apply_gemini_tool_use_prompt_tokens(
+    raw_usage: &serde_json::Value,
+    api_format: &str,
+    usage: &mut StandardizedUsage,
+) {
+    if api_family(api_format).as_str() != "gemini" {
+        return;
+    }
+    let tool_tokens = numeric_i64(gemini_usage_field(
+        raw_usage,
+        "toolUsePromptTokenCount",
+        "tool_use_prompt_token_count",
+    ))
+    .unwrap_or_default()
+    .max(0);
+    usage.input_tokens = usage.input_tokens.saturating_add(tool_tokens);
+}
+
+fn apply_gemini_thought_tokens(
+    raw_usage: &serde_json::Value,
+    api_format: &str,
+    usage: &mut StandardizedUsage,
+) {
+    if api_family(api_format).as_str() != "gemini" {
+        return;
+    }
+    let reasoning_tokens = numeric_i64(gemini_usage_field(
+        raw_usage,
+        "thoughtsTokenCount",
+        "thoughts_token_count",
+    ))
+    .unwrap_or_default()
+    .max(0);
+    usage.reasoning_tokens = reasoning_tokens;
+    usage.output_tokens = usage.output_tokens.saturating_add(reasoning_tokens);
 }
 
 fn apply_openai_cache_write_tokens(
@@ -191,8 +230,13 @@ fn base_mapping(api_format: &str) -> BTreeMap<String, String> {
         }
         "gemini" => {
             mapping.insert("promptTokenCount".to_string(), "input_tokens".to_string());
+            mapping.insert("prompt_token_count".to_string(), "input_tokens".to_string());
             mapping.insert(
                 "candidatesTokenCount".to_string(),
+                "output_tokens".to_string(),
+            );
+            mapping.insert(
+                "candidates_token_count".to_string(),
                 "output_tokens".to_string(),
             );
             mapping.insert(
@@ -200,7 +244,15 @@ fn base_mapping(api_format: &str) -> BTreeMap<String, String> {
                 "cache_read_tokens".to_string(),
             );
             mapping.insert(
+                "cached_content_token_count".to_string(),
+                "cache_read_tokens".to_string(),
+            );
+            mapping.insert(
                 "usageMetadata.promptTokenCount".to_string(),
+                "input_tokens".to_string(),
+            );
+            mapping.insert(
+                "usage_metadata.prompt_token_count".to_string(),
                 "input_tokens".to_string(),
             );
             mapping.insert(
@@ -208,7 +260,15 @@ fn base_mapping(api_format: &str) -> BTreeMap<String, String> {
                 "output_tokens".to_string(),
             );
             mapping.insert(
+                "usage_metadata.candidates_token_count".to_string(),
+                "output_tokens".to_string(),
+            );
+            mapping.insert(
                 "usageMetadata.cachedContentTokenCount".to_string(),
+                "cache_read_tokens".to_string(),
+            );
+            mapping.insert(
+                "usage_metadata.cached_content_token_count".to_string(),
                 "cache_read_tokens".to_string(),
             );
         }
@@ -276,7 +336,11 @@ fn copy_explicit_total_tokens(
     usage: &mut StandardizedUsage,
 ) {
     let total_tokens = match api_family(api_format).as_str() {
-        "gemini" => numeric_i64(raw_usage.get("totalTokenCount")),
+        "gemini" => numeric_i64(gemini_usage_field(
+            raw_usage,
+            "totalTokenCount",
+            "total_token_count",
+        )),
         _ => numeric_i64(raw_usage.get("total_tokens")),
     };
     if let Some(total_tokens) = total_tokens.filter(|value| *value > 0) {
@@ -284,6 +348,26 @@ fn copy_explicit_total_tokens(
             .dimensions
             .insert("total_tokens".to_string(), serde_json::json!(total_tokens));
     }
+}
+
+fn gemini_usage_field<'a>(
+    raw_usage: &'a serde_json::Value,
+    camel_case: &str,
+    snake_case: &str,
+) -> Option<&'a serde_json::Value> {
+    raw_usage
+        .get(camel_case)
+        .or_else(|| raw_usage.get(snake_case))
+        .or_else(|| {
+            raw_usage
+                .get("usageMetadata")
+                .or_else(|| raw_usage.get("usage_metadata"))
+                .and_then(|metadata| {
+                    metadata
+                        .get(camel_case)
+                        .or_else(|| metadata.get(snake_case))
+                })
+        })
 }
 
 fn numeric_i64(value: Option<&serde_json::Value>) -> Option<i64> {
@@ -308,13 +392,20 @@ fn resolve_usage_value<'a>(
 ) -> Option<&'a serde_json::Value> {
     match family {
         "gemini" => {
-            if let Some(usage) = response.get("usageMetadata") {
+            if let Some(usage) = response
+                .get("usageMetadata")
+                .or_else(|| response.get("usage_metadata"))
+            {
                 return Some(usage);
             }
             if let Some(usage) = response
                 .get("candidates")
                 .and_then(|value| value.get(0))
-                .and_then(|value| value.get("usageMetadata"))
+                .and_then(|value| {
+                    value
+                        .get("usageMetadata")
+                        .or_else(|| value.get("usage_metadata"))
+                })
             {
                 return Some(usage);
             }
@@ -686,16 +777,69 @@ mod tests {
             &serde_json::json!({
                 "usageMetadata": {
                     "promptTokenCount": 14,
+                    "toolUsePromptTokenCount": 3,
                     "candidatesTokenCount": 6,
+                    "thoughtsTokenCount": 4,
                     "cachedContentTokenCount": 2
                 }
             }),
             "gemini:generate_content",
         );
 
-        assert_eq!(usage.input_tokens, 14);
-        assert_eq!(usage.output_tokens, 6);
+        assert_eq!(usage.input_tokens, 17);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(usage.reasoning_tokens, 4);
         assert_eq!(usage.cache_read_tokens, 2);
+    }
+
+    #[test]
+    fn maps_snake_case_gemini_usage_from_response() {
+        let usage = map_usage_from_response(
+            &serde_json::json!({
+                "usage_metadata": {
+                    "prompt_token_count": 14,
+                    "tool_use_prompt_token_count": 3,
+                    "candidates_token_count": 6,
+                    "thoughts_token_count": 4,
+                    "cached_content_token_count": 2,
+                    "total_token_count": 27
+                }
+            }),
+            "gemini:generate_content",
+        );
+
+        assert_eq!(usage.input_tokens, 17);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(usage.reasoning_tokens, 4);
+        assert_eq!(usage.cache_read_tokens, 2);
+        assert_eq!(
+            usage.dimensions.get("total_tokens"),
+            Some(&serde_json::json!(27))
+        );
+    }
+
+    #[test]
+    fn maps_nested_gemini_usage_when_called_with_full_response() {
+        let usage = map_usage(
+            &serde_json::json!({
+                "usageMetadata": {
+                    "promptTokenCount": 14,
+                    "toolUsePromptTokenCount": 3,
+                    "candidatesTokenCount": 6,
+                    "thoughtsTokenCount": 4,
+                    "totalTokenCount": 27
+                }
+            }),
+            "gemini:generate_content",
+        );
+
+        assert_eq!(usage.input_tokens, 17);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(usage.reasoning_tokens, 4);
+        assert_eq!(
+            usage.dimensions.get("total_tokens"),
+            Some(&serde_json::json!(27))
+        );
     }
 
     #[test]

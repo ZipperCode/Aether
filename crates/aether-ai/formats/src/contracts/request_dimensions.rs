@@ -26,13 +26,14 @@ impl ClientSurface {
 /// Semantic operation carried over an API wire format.
 ///
 /// Operations must not be represented as additional API formats: both
-/// Anthropic message creation and token counting use the `claude:messages`
-/// request contract.
+/// Anthropic message creation/token counting and Gemini content
+/// generation/token counting each share one wire contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiOperation {
     ClaudeMessagesCreate,
     ClaudeCountTokens,
+    GeminiCountTokens,
     OpenAiResponsesCompact,
 }
 
@@ -41,6 +42,7 @@ impl ApiOperation {
         match self {
             Self::ClaudeMessagesCreate => "messages",
             Self::ClaudeCountTokens => "count_tokens",
+            Self::GeminiCountTokens => "count_tokens",
             Self::OpenAiResponsesCompact => "compact",
         }
     }
@@ -55,5 +57,6 @@ mod tests {
         assert_eq!(ClientSurface::ClaudeCode.as_str(), "claude_code");
         assert_eq!(ApiOperation::ClaudeMessagesCreate.as_str(), "messages");
         assert_eq!(ApiOperation::ClaudeCountTokens.as_str(), "count_tokens");
+        assert_eq!(ApiOperation::GeminiCountTokens.as_str(), "count_tokens");
     }
 }

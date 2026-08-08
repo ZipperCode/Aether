@@ -163,7 +163,10 @@ pub fn classify_same_format_provider_request_behavior_for_operation(
         );
     let operation_requires_sync = matches!(
         api_operation,
-        Some(aether_ai_formats::ApiOperation::ClaudeCountTokens)
+        Some(
+            aether_ai_formats::ApiOperation::ClaudeCountTokens
+                | aether_ai_formats::ApiOperation::GeminiCountTokens
+        )
     );
     let upstream_is_stream = !operation_requires_sync
         && aether_ai_formats::resolve_upstream_is_stream_for_provider(
@@ -228,12 +231,71 @@ pub fn enforce_same_format_provider_api_operation_body_policy(
 ) -> bool {
     if !matches!(
         api_operation,
-        Some(aether_ai_formats::ApiOperation::ClaudeCountTokens)
+        Some(
+            aether_ai_formats::ApiOperation::ClaudeCountTokens
+                | aether_ai_formats::ApiOperation::GeminiCountTokens
+        )
     ) {
         return false;
     }
-    body.as_object_mut()
-        .is_some_and(|object| object.remove("stream").is_some())
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    let mut changed = object.remove("stream").is_some();
+    if api_operation == Some(aether_ai_formats::ApiOperation::GeminiCountTokens) {
+        for key in ["generateContentRequest", "generate_content_request"] {
+            if let Some(request) = object.get_mut(key).and_then(Value::as_object_mut) {
+                changed |= request.remove("stream").is_some();
+            }
+        }
+    }
+    changed
+}
+
+pub fn rewrite_gemini_count_tokens_request_body(
+    body: &mut Value,
+    mapped_model: &str,
+    transport: &GatewayProviderTransportSnapshot,
+) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    let request_key = if object.contains_key("generateContentRequest") {
+        "generateContentRequest"
+    } else if object.contains_key("generate_content_request") {
+        "generate_content_request"
+    } else {
+        return false;
+    };
+    if is_vertex_transport_context(transport) {
+        let Some(Value::Object(mut request)) = object.remove(request_key) else {
+            return false;
+        };
+        request.remove("model");
+        request.remove("stream");
+        object.extend(request);
+        return true;
+    }
+    let Some(request) = object.get_mut(request_key).and_then(Value::as_object_mut) else {
+        return false;
+    };
+
+    let rewritten_model = gemini_developer_model_resource_name(mapped_model);
+    let rewritten_model = Value::String(rewritten_model);
+    if request.get("model") == Some(&rewritten_model) {
+        return false;
+    }
+    request.insert("model".to_string(), rewritten_model);
+    true
+}
+
+fn gemini_developer_model_resource_name(mapped_model: &str) -> String {
+    let model = mapped_model.trim();
+    if model.starts_with("models/") {
+        model.to_string()
+    } else {
+        format!("models/{model}")
+    }
 }
 
 fn build_same_format_provider_request_body_inner(
@@ -672,7 +734,10 @@ pub fn build_same_format_provider_headers(
     }
     if matches!(
         input.api_operation,
-        Some(aether_ai_formats::ApiOperation::ClaudeCountTokens)
+        Some(
+            aether_ai_formats::ApiOperation::ClaudeCountTokens
+                | aether_ai_formats::ApiOperation::GeminiCountTokens
+        )
     ) {
         provider_request_headers.insert("accept".to_string(), "application/json".to_string());
     } else if input.behavior.upstream_is_stream {
@@ -1234,6 +1299,125 @@ mod tests {
         .expect("headers should build");
         assert_eq!(
             headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+
+        let mut gemini = sample_transport("custom");
+        gemini.endpoint.api_format = "gemini:generate_content".to_string();
+        gemini.endpoint.config = Some(json!({
+            "upstream_stream_policy": "force_stream"
+        }));
+        let gemini_behavior = classify_same_format_provider_request_behavior_for_operation(
+            &gemini,
+            SameFormatProviderRequestBehaviorParams {
+                require_streaming: false,
+                provider_api_format: "gemini:generate_content",
+                report_kind: "gemini_count_tokens_sync_success",
+            },
+            Some(aether_ai_formats::ApiOperation::GeminiCountTokens),
+        );
+        assert!(!gemini_behavior.upstream_is_stream);
+        assert!(!gemini_behavior.force_body_stream_field);
+
+        let mut gemini_body = json!({
+            "contents": [],
+            "stream": true,
+            "generateContentRequest": {
+                "model": "models/client-model",
+                "contents": [],
+                "stream": true
+            }
+        });
+        assert!(enforce_same_format_provider_api_operation_body_policy(
+            &mut gemini_body,
+            Some(aether_ai_formats::ApiOperation::GeminiCountTokens),
+        ));
+        assert!(gemini_body.get("stream").is_none());
+        assert!(gemini_body["generateContentRequest"]
+            .get("stream")
+            .is_none());
+        assert_eq!(
+            gemini_body["generateContentRequest"]["model"],
+            "models/client-model"
+        );
+        assert!(rewrite_gemini_count_tokens_request_body(
+            &mut gemini_body,
+            "upstream-model",
+            &gemini,
+        ));
+        assert_eq!(
+            gemini_body["generateContentRequest"]["model"],
+            "models/upstream-model"
+        );
+
+        let mut vertex_api_key = sample_transport("vertex_ai");
+        vertex_api_key.endpoint.api_format = "gemini:generate_content".to_string();
+        vertex_api_key.endpoint.base_url = "https://aiplatform.googleapis.com".to_string();
+        vertex_api_key.key.auth_type = "api_key".to_string();
+        let mut vertex_api_key_body = json!({
+            "generateContentRequest": {
+                "model": "models/client-model",
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                "systemInstruction": {"parts": [{"text": "be concise"}]}
+            }
+        });
+        assert!(rewrite_gemini_count_tokens_request_body(
+            &mut vertex_api_key_body,
+            "gemini-2.5-pro",
+            &vertex_api_key,
+        ));
+        assert!(vertex_api_key_body.get("generateContentRequest").is_none());
+        assert_eq!(vertex_api_key_body["contents"][0]["role"], "user");
+        assert_eq!(
+            vertex_api_key_body["systemInstruction"]["parts"][0]["text"],
+            "be concise"
+        );
+
+        let mut vertex_service_account = vertex_api_key;
+        vertex_service_account.key.auth_type = "service_account".to_string();
+        vertex_service_account.key.decrypted_api_key.clear();
+        vertex_service_account.key.decrypted_auth_config = Some(
+            json!({
+                "client_email": "svc@example.iam.gserviceaccount.com",
+                "private_key": "not-used",
+                "project_id": "demo-project",
+                "region": "europe-west4"
+            })
+            .to_string(),
+        );
+        let mut vertex_service_account_body = json!({
+            "generateContentRequest": {"contents": []}
+        });
+        assert!(rewrite_gemini_count_tokens_request_body(
+            &mut vertex_service_account_body,
+            "gemini-2.5-pro",
+            &vertex_service_account,
+        ));
+        assert!(vertex_service_account_body
+            .get("generateContentRequest")
+            .is_none());
+        assert_eq!(vertex_service_account_body["contents"], json!([]));
+
+        let gemini_headers = build_same_format_provider_headers(SameFormatProviderHeadersInput {
+            headers: &http::HeaderMap::new(),
+            provider_request_body: &gemini_body,
+            original_request_body: &gemini_body,
+            header_rules: None,
+            behavior: gemini_behavior,
+            api_operation: Some(aether_ai_formats::ApiOperation::GeminiCountTokens),
+            auth_header: Some("x-goog-api-key"),
+            auth_value: Some("secret"),
+            extra_headers: &BTreeMap::new(),
+            kiro_auth_config: None,
+            kiro_machine_id: None,
+        })
+        .expect("Gemini headers should build");
+        assert_eq!(
+            gemini_headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            gemini_headers.get("content-type").map(String::as_str),
             Some("application/json")
         );
     }

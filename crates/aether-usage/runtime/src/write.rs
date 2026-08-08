@@ -2603,7 +2603,6 @@ fn standardized_usage_total_tokens(usage: &StandardizedUsage) -> u64 {
 
     positive_usage_component(usage.input_tokens)
         .saturating_add(positive_usage_component(usage.output_tokens))
-        .saturating_add(positive_usage_component(usage.reasoning_tokens))
 }
 
 fn standardized_usage_explicit_total_tokens(usage: &StandardizedUsage) -> Option<u64> {
@@ -3402,38 +3401,48 @@ fn extract_token_counts_from_json(value: &Value) -> Option<(u64, u64, u64)> {
             .or_else(|| usage.get("completion_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or_default();
-        let reasoning = usage
-            .get("reasoning_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                usage
-                    .get("output_tokens_details")
-                    .or_else(|| usage.get("completion_tokens_details"))
-                    .and_then(Value::as_object)
-                    .and_then(|details| details.get("reasoning_tokens"))
-                    .and_then(Value::as_u64)
-            })
-            .unwrap_or_default();
         let total = usage
             .get("total_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or_else(|| input.saturating_add(output).saturating_add(reasoning));
+            // OpenAI 的 output/completion token 已包含 reasoning token。
+            .unwrap_or_else(|| input.saturating_add(output));
         return Some((input, output, total));
     }
 
-    if let Some(usage) = value.get("usageMetadata").and_then(Value::as_object) {
+    if let Some(usage) = value
+        .get("usageMetadata")
+        .or_else(|| value.get("usage_metadata"))
+        .and_then(Value::as_object)
+    {
         let input = usage
             .get("promptTokenCount")
+            .or_else(|| usage.get("prompt_token_count"))
             .and_then(Value::as_u64)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .saturating_add(
+                usage
+                    .get("toolUsePromptTokenCount")
+                    .or_else(|| usage.get("tool_use_prompt_token_count"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            );
         let output = usage
             .get("candidatesTokenCount")
+            .or_else(|| usage.get("candidates_token_count"))
             .and_then(Value::as_u64)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .saturating_add(
+                usage
+                    .get("thoughtsTokenCount")
+                    .or_else(|| usage.get("thoughts_token_count"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            );
         let raw_total = usage
             .get("totalTokenCount")
+            .or_else(|| usage.get("total_token_count"))
             .and_then(Value::as_u64)
-            .unwrap_or(input + output);
+            .unwrap_or_else(|| input.saturating_add(output));
         return Some((input, output, raw_total));
     }
 
@@ -3514,6 +3523,30 @@ mod tests {
     }
 
     #[test]
+    fn extracts_openai_usage_without_total_does_not_double_count_reasoning() {
+        let tokens = extract_token_counts_from_json(&json!({
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 2}
+            }
+        }))
+        .expect("tokens should exist");
+
+        assert_eq!(tokens, (3, 5, 8));
+    }
+
+    #[test]
+    fn standardized_usage_total_does_not_double_count_reasoning() {
+        let mut usage = StandardizedUsage::new();
+        usage.input_tokens = 3;
+        usage.output_tokens = 5;
+        usage.reasoning_tokens = 2;
+
+        assert_eq!(super::standardized_usage_total_tokens(&usage), 8);
+    }
+
+    #[test]
     fn extracts_openai_usage_tokens_with_prompt_token_details() {
         let tokens = extract_token_counts_from_json(&json!({
             "usage": {
@@ -3551,14 +3584,33 @@ mod tests {
         let tokens = extract_token_counts_from_json(&json!({
             "usageMetadata": {
                 "promptTokenCount": 14,
+                "toolUsePromptTokenCount": 3,
                 "candidatesTokenCount": 6,
+                "thoughtsTokenCount": 4,
                 "cachedContentTokenCount": 2,
-                "totalTokenCount": 20
+                "totalTokenCount": 27
             }
         }))
         .expect("tokens should exist");
 
-        assert_eq!(tokens, (14, 6, 20));
+        assert_eq!(tokens, (17, 10, 27));
+    }
+
+    #[test]
+    fn extracts_snake_case_gemini_usage_tokens() {
+        let tokens = extract_token_counts_from_json(&json!({
+            "usage_metadata": {
+                "prompt_token_count": 14,
+                "tool_use_prompt_token_count": 3,
+                "candidates_token_count": 6,
+                "thoughts_token_count": 4,
+                "cached_content_token_count": 2,
+                "total_token_count": 27
+            }
+        }))
+        .expect("tokens should exist");
+
+        assert_eq!(tokens, (17, 10, 27));
     }
 
     #[test]

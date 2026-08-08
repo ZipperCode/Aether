@@ -1292,6 +1292,41 @@ pub(crate) fn gemini_part_to_canonical_block(
             extensions,
         });
     }
+    if let Some(executable_code) = part_object
+        .get("executableCode")
+        .or_else(|| part_object.get("executable_code"))
+        .and_then(Value::as_object)
+    {
+        let language = executable_code
+            .get("language")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let code = executable_code
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Some(CanonicalContentBlock::Text {
+            text: format!("```{language}\n{code}\n```\n"),
+            extensions: gemini_extensions(part_object, &["executableCode", "executable_code"]),
+        });
+    }
+    if let Some(code_execution_result) = part_object
+        .get("codeExecutionResult")
+        .or_else(|| part_object.get("code_execution_result"))
+        .and_then(Value::as_object)
+    {
+        let output = code_execution_result
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Some(CanonicalContentBlock::Text {
+            text: format!("```output\n{output}\n```"),
+            extensions: gemini_extensions(
+                part_object,
+                &["codeExecutionResult", "code_execution_result"],
+            ),
+        });
+    }
     Some(CanonicalContentBlock::Unknown {
         raw_type: gemini_raw_part_type(part_object),
         payload: part.clone(),
@@ -6186,7 +6221,14 @@ pub(crate) fn gemini_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
         .get("promptTokenCount")
         .or_else(|| usage.get("prompt_token_count"))
         .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .saturating_add(
+            usage
+                .get("toolUsePromptTokenCount")
+                .or_else(|| usage.get("tool_use_prompt_token_count"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
     let visible_output_tokens = usage
         .get("candidatesTokenCount")
         .or_else(|| usage.get("candidates_token_count"))
@@ -6202,7 +6244,7 @@ pub(crate) fn gemini_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
         .or_else(|| usage.get("cached_content_token_count"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let output_tokens = visible_output_tokens + reasoning_tokens;
+    let output_tokens = visible_output_tokens.saturating_add(reasoning_tokens);
     Some(CanonicalUsage {
         input_tokens,
         input_tokens_include_cache: cache_read_tokens > 0,
@@ -6211,7 +6253,7 @@ pub(crate) fn gemini_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
             .get("totalTokenCount")
             .or_else(|| usage.get("total_token_count"))
             .and_then(Value::as_u64)
-            .unwrap_or(input_tokens + output_tokens),
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens)),
         cache_read_tokens,
         reasoning_tokens,
         extensions: gemini_extensions(
@@ -6219,6 +6261,8 @@ pub(crate) fn gemini_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
             &[
                 "promptTokenCount",
                 "prompt_token_count",
+                "toolUsePromptTokenCount",
+                "tool_use_prompt_token_count",
                 "cachedContentTokenCount",
                 "cached_content_token_count",
                 "candidatesTokenCount",

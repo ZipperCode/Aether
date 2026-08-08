@@ -366,6 +366,9 @@ pub fn parse_response(
     ctx: &FormatContext,
 ) -> Result<CanonicalResponse, FormatError> {
     let source = parse_format(source_format)?;
+    if source == FormatId::GeminiGenerateContent {
+        validate_gemini_response_candidate_presence(body, source)?;
+    }
     match source {
         FormatId::OpenAiChat => openai_chat::response::from(body, ctx),
         FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact => {
@@ -386,6 +389,38 @@ pub fn parse_response(
     .ok_or_else(|| FormatError::ResponseParseFailed {
         format: source.as_str().to_string(),
     })
+}
+
+fn validate_gemini_response_candidate_presence(
+    body: &Value,
+    source: FormatId,
+) -> Result<(), FormatError> {
+    let format = source.as_str().to_string();
+    if let Some(reason) = body
+        .get("promptFeedback")
+        .or_else(|| body.get("prompt_feedback"))
+        .and_then(Value::as_object)
+        .and_then(|feedback| {
+            feedback
+                .get("blockReason")
+                .or_else(|| feedback.get("block_reason"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    {
+        return Err(FormatError::ResponseBlocked {
+            format,
+            reason: reason.to_string(),
+        });
+    }
+    let Some(candidates) = body.get("candidates").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if !candidates.is_empty() {
+        return Ok(());
+    }
+    Err(FormatError::EmptyResponse { format })
 }
 
 pub fn emit_response(
@@ -5445,6 +5480,29 @@ mod tests {
             error,
             super::FormatError::LossyConversionBlocked { ref field, .. }
                 if field == "candidates[].finishReason"
+        ));
+    }
+
+    #[test]
+    fn pure_gemini_empty_candidates_have_typed_errors() {
+        let blocked = json!({
+            "promptFeedback": {"blockReason": "SAFETY"}
+        });
+        assert!(matches!(
+            convert_response_pure("gemini:generate_content", "openai:chat", &blocked),
+            Err(super::FormatError::ResponseBlocked { ref reason, .. }) if reason == "SAFETY"
+        ));
+
+        let empty = json!({"candidates": []});
+        assert!(matches!(
+            convert_response_pure("gemini:generate_content", "openai:chat", &empty),
+            Err(super::FormatError::EmptyResponse { .. })
+        ));
+
+        let malformed = json!({"candidates": {}});
+        assert!(matches!(
+            convert_response_pure("gemini:generate_content", "openai:chat", &malformed),
+            Err(super::FormatError::ResponseParseFailed { .. })
         ));
     }
 

@@ -475,6 +475,20 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             detail: "removed stream field for non-streaming API operation".to_string(),
         });
     }
+    if spec.operation == Some(crate::ai_serving::ApiOperation::GeminiCountTokens)
+        && crate::ai_serving::transport::rewrite_gemini_count_tokens_request_body(
+            &mut provider_request_body,
+            &prepared.mapped_model,
+            &transport,
+        )
+    {
+        compatibility_edits.push(SameFormatProviderCompatibilityEdit {
+            field: "generateContentRequest".to_string(),
+            action: SameFormatProviderCompatibilityEditAction::RuntimeRewrite,
+            detail: "normalized wrapped Gemini countTokens request for upstream transport"
+                .to_string(),
+        });
+    }
 
     let is_grok = prepared
         .transport

@@ -3472,6 +3472,7 @@ fn try_aggregate_gemini_stream_sync_response(
     let mut candidate: Map<String, Value> = Map::new();
     let mut role: Option<Value> = None;
     let mut saw_candidate = false;
+    let mut saw_empty_candidates = false;
     let mut parts: Vec<Value> = Vec::new();
     let mut tool_states: BTreeMap<usize, GeminiSyncToolState> = BTreeMap::new();
     let mut finish_reason: Option<String> = None;
@@ -3515,6 +3516,7 @@ fn try_aggregate_gemini_stream_sync_response(
         else {
             continue;
         };
+        saw_empty_candidates |= event_candidates.is_empty();
         for event_candidate in event_candidates {
             let Some(candidate_object) = event_candidate.as_object() else {
                 continue;
@@ -3665,7 +3667,18 @@ fn try_aggregate_gemini_stream_sync_response(
     }
 
     if !saw_candidate {
-        return Ok(None);
+        if prompt_feedback.is_none() && !saw_empty_candidates {
+            return Ok(None);
+        }
+        let mut response = Map::new();
+        response.insert("candidates".to_string(), Value::Array(Vec::new()));
+        if let Some(prompt) = prompt_feedback {
+            response.insert("promptFeedback".to_string(), prompt);
+        }
+        if let Some(usage) = usage_metadata {
+            response.insert("usageMetadata".to_string(), usage);
+        }
+        return Ok(Some(Value::Object(response)));
     }
 
     candidate.insert(
@@ -4213,6 +4226,23 @@ mod tests {
         );
         assert_eq!(aggregated["candidates"][0]["finishReason"], "STOP");
         assert_eq!(aggregated["usageMetadata"]["totalTokenCount"], 5);
+    }
+
+    #[test]
+    fn aggregates_gemini_stream_blocked_and_empty_candidate_responses() {
+        let blocked = "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n";
+        let blocked = aggregate_gemini_stream_sync_response(blocked.as_bytes())
+            .expect("blocked body should aggregate");
+        assert_eq!(blocked["candidates"], json!([]));
+        assert_eq!(blocked["promptFeedback"]["blockReason"], "SAFETY");
+
+        let empty = "data: {\"candidates\":[]}\n\n";
+        let empty = aggregate_gemini_stream_sync_response(empty.as_bytes())
+            .expect("empty candidates should aggregate");
+        assert_eq!(empty["candidates"], json!([]));
+
+        let usage_only = "data: {\"usageMetadata\":{\"promptTokenCount\":1}}\n\n";
+        assert!(aggregate_gemini_stream_sync_response(usage_only.as_bytes()).is_none());
     }
 
     #[test]

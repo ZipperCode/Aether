@@ -21,6 +21,14 @@ pub fn build_vertex_api_key_gemini_content_url(
     build_vertex_api_key_google_model_url(model, action, stream, api_key, request_query)
 }
 
+pub fn build_vertex_api_key_gemini_count_tokens_url(
+    model: &str,
+    api_key: &str,
+    request_query: Option<&str>,
+) -> Option<String> {
+    build_vertex_api_key_google_model_url(model, "countTokens", false, api_key, request_query)
+}
+
 pub fn build_vertex_api_key_imagen_content_url(
     model: &str,
     stream: bool,
@@ -55,6 +63,20 @@ pub fn build_vertex_service_account_gemini_content_url(
         "generateContent"
     };
     build_vertex_service_account_google_model_url(model, action, stream, auth_config, request_query)
+}
+
+pub fn build_vertex_service_account_gemini_count_tokens_url(
+    model: &str,
+    auth_config: &VertexServiceAccountAuthConfig,
+    request_query: Option<&str>,
+) -> Option<String> {
+    build_vertex_service_account_google_model_url(
+        model,
+        "countTokens",
+        false,
+        auth_config,
+        request_query,
+    )
 }
 
 pub fn build_vertex_service_account_gemini_embedding_url(
@@ -235,8 +257,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        build_vertex_api_key_gemini_content_url, build_vertex_api_key_imagen_content_url,
-        build_vertex_service_account_gemini_content_url,
+        build_vertex_api_key_gemini_content_url, build_vertex_api_key_gemini_count_tokens_url,
+        build_vertex_api_key_imagen_content_url, build_vertex_service_account_gemini_content_url,
+        build_vertex_service_account_gemini_count_tokens_url,
     };
     use crate::vertex::VertexServiceAccountAuthConfig;
 
@@ -252,6 +275,41 @@ mod tests {
             .as_deref(),
             Some(
                 "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse&foo=bar&key=vertex-secret"
+            )
+        );
+    }
+
+    #[test]
+    fn builds_vertex_gemini_count_tokens_urls() {
+        assert_eq!(
+            build_vertex_api_key_gemini_count_tokens_url(
+                "gemini-2.5-pro",
+                "vertex-secret",
+                Some("foo=bar")
+            )
+            .as_deref(),
+            Some(
+                "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-pro:countTokens?foo=bar&key=vertex-secret"
+            )
+        );
+
+        let auth_config = VertexServiceAccountAuthConfig {
+            client_email: "svc@example.iam.gserviceaccount.com".to_string(),
+            private_key: "not-used".to_string(),
+            project_id: "demo-project".to_string(),
+            token_uri: "https://oauth2.googleapis.com/token".to_string(),
+            region: None,
+            model_regions: BTreeMap::new(),
+        };
+        assert_eq!(
+            build_vertex_service_account_gemini_count_tokens_url(
+                "gemini-3.1-pro-preview",
+                &auth_config,
+                Some("foo=bar&key=client-key")
+            )
+            .as_deref(),
+            Some(
+                "https://aiplatform.googleapis.com/v1/projects/demo-project/locations/global/publishers/google/models/gemini-3.1-pro-preview:countTokens?foo=bar"
             )
         );
     }

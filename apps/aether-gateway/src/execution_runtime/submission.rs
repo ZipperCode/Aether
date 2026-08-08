@@ -209,6 +209,15 @@ fn local_core_sync_finalize_has_invalid_provider_success(
     {
         return Ok(false);
     }
+    if payload
+        .report_context
+        .as_ref()
+        .and_then(|value| value.get("api_operation"))
+        .and_then(serde_json::Value::as_str)
+        == Some("count_tokens")
+    {
+        return Ok(false);
+    }
     let Some(body_json) = resolve_local_sync_source_body_json(payload)? else {
         return Ok(false);
     };
@@ -925,6 +934,43 @@ mod tests {
             message.contains("visible model output"),
             "unexpected message: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn local_core_sync_finalize_accepts_gemini_count_tokens_body() {
+        let mut payload = core_finalize_payload(
+            "openai_chat_sync_finalize",
+            "gemini:generate_content",
+            "gemini:generate_content",
+            200,
+            json!({"totalTokens": 17}),
+        );
+        payload.report_context = Some(json!({
+            "client_api_format": "gemini:generate_content",
+            "provider_api_format": "gemini:generate_content",
+            "api_operation": "count_tokens",
+            "needs_conversion": false,
+            "has_envelope": false
+        }));
+
+        let state = AppState::new().expect("state should build");
+        let response = submit_local_core_error_or_sync_finalize(
+            &state,
+            "trace-gemini-count-tokens-200",
+            &test_decision(),
+            payload,
+        )
+        .await
+        .expect("response should build");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should read"),
+        )
+        .expect("body should decode");
+        assert_eq!(body, json!({"totalTokens": 17}));
     }
 
     #[tokio::test]
