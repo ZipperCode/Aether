@@ -163,6 +163,7 @@ pub(crate) async fn sync_global_model_provider_associations(
                 &allowed_models,
                 &[],
                 false,
+                false,
                 &[],
             )
             .await
@@ -356,6 +357,7 @@ where
                 &provider_id,
                 &[],
                 &models,
+                false,
                 replace_automatic_bindings,
                 &authoritative_endpoint_ids,
             )
@@ -456,6 +458,7 @@ async fn fetch_and_persist_key_models(
                 &target.provider.id,
                 &filtered_models,
                 &models,
+                true,
                 false,
                 &[],
             )
@@ -574,6 +577,7 @@ async fn fetch_and_persist_key_models(
         &target.provider.id,
         &filtered_models,
         &cached_models,
+        false,
         false,
         &[],
     )
@@ -845,6 +849,13 @@ mod tests {
         async fn create_admin_provider_model_with_bindings(
             &self,
             _record: &aether_data_contracts::repository::global_models::CreateAdminProviderModelWithBindingsRecord,
+        ) -> Result<Option<StoredAdminProviderModel>, Self::Error> {
+            Ok(None)
+        }
+
+        async fn create_admin_provider_model(
+            &self,
+            _record: &UpsertAdminProviderModelRecord,
         ) -> Result<Option<StoredAdminProviderModel>, Self::Error> {
             Ok(None)
         }

@@ -37,6 +37,11 @@ pub trait ModelFetchAssociationStore {
         record: &CreateAdminProviderModelWithBindingsRecord,
     ) -> Result<Option<StoredAdminProviderModel>, Self::Error>;
 
+    async fn create_admin_provider_model(
+        &self,
+        record: &UpsertAdminProviderModelRecord,
+    ) -> Result<Option<StoredAdminProviderModel>, Self::Error>;
+
     async fn update_admin_provider_model(
         &self,
         record: &UpsertAdminProviderModelRecord,
@@ -62,6 +67,7 @@ pub async fn sync_provider_model_whitelist_associations<S>(
     provider_id: &str,
     current_allowed_models: &[String],
     discovered_models: &[Value],
+    allow_unbound_preset_models: bool,
     replace_automatic_bindings: bool,
     authoritative_endpoint_ids: &[String],
 ) -> Result<(), S::Error>
@@ -77,6 +83,7 @@ where
         provider_id,
         current_allowed_models,
         discovered_models,
+        allow_unbound_preset_models,
     )
     .await?;
     sync_provider_model_endpoint_bindings(
@@ -136,6 +143,7 @@ async fn auto_associate_provider_by_key_whitelist<S>(
     provider_id: &str,
     allowed_models: &[String],
     discovered_models: &[Value],
+    allow_unbound_preset_models: bool,
 ) -> Result<(), S::Error>
 where
     S: ModelFetchAssociationStore + Sync + ?Sized,
@@ -234,6 +242,9 @@ where
         let endpoint_ids =
             discovered_endpoint_ids_for_provider_model(&prospective_model, discovered_models);
         if endpoint_ids.is_empty() {
+            if allow_unbound_preset_models {
+                state.create_admin_provider_model(&record).await?;
+            }
             continue;
         }
         let mutation = CreateAdminProviderModelWithBindingsRecord::new(
@@ -474,6 +485,7 @@ mod tests {
     struct AssociationTestStore {
         global_models: Vec<StoredAdminGlobalModel>,
         created: Mutex<Vec<CreateAdminProviderModelWithBindingsRecord>>,
+        unbound_created: Mutex<Vec<UpsertAdminProviderModelRecord>>,
     }
 
     #[async_trait]
@@ -516,6 +528,17 @@ mod tests {
             self.created
                 .lock()
                 .expect("created mutex")
+                .push(record.clone());
+            Ok(None)
+        }
+
+        async fn create_admin_provider_model(
+            &self,
+            record: &UpsertAdminProviderModelRecord,
+        ) -> Result<Option<StoredAdminProviderModel>, Self::Error> {
+            self.unbound_created
+                .lock()
+                .expect("unbound created mutex")
                 .push(record.clone());
             Ok(None)
         }
@@ -578,6 +601,7 @@ mod tests {
             &["gpt-5".to_string()],
             &[],
             false,
+            false,
             &[],
         )
         .await
@@ -590,6 +614,7 @@ mod tests {
             &["gpt-5".to_string()],
             &[json!({"id": "gpt-5", "endpoint_ids": ["endpoint-1"]})],
             false,
+            false,
             &[],
         )
         .await
@@ -597,6 +622,31 @@ mod tests {
         let created = state.created.lock().expect("created mutex");
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].endpoint_ids, vec!["endpoint-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn preset_association_allows_unbound_model_without_provider_endpoints() {
+        let state = AssociationTestStore {
+            global_models: vec![global_model()],
+            ..AssociationTestStore::default()
+        };
+
+        sync_provider_model_whitelist_associations(
+            &state,
+            "provider-1",
+            &["gpt-5".to_string()],
+            &[json!({"id": "gpt-5", "api_formats": ["openai:chat"]})],
+            true,
+            false,
+            &[],
+        )
+        .await
+        .expect("preset association should succeed");
+
+        assert!(state.created.lock().expect("created mutex").is_empty());
+        let unbound_created = state.unbound_created.lock().expect("unbound created mutex");
+        assert_eq!(unbound_created.len(), 1);
+        assert_eq!(unbound_created[0].provider_model_name, "gpt-5");
     }
 
     fn provider_model(

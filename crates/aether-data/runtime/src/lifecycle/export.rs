@@ -104,6 +104,10 @@ struct AuxiliaryTable {
 
 const AUXILIARY_TABLES: &[AuxiliaryTable] = &[
     AuxiliaryTable {
+        name: "model_endpoint_bindings",
+        primary_key: &["model_id", "endpoint_id"],
+    },
+    AuxiliaryTable {
         name: "audit_logs",
         primary_key: &["id"],
     },

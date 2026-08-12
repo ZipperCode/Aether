@@ -436,6 +436,15 @@ impl ModelFetchAssociationStore for AppState {
             .map_err(|err| format!("{err:?}"))
     }
 
+    async fn create_admin_provider_model(
+        &self,
+        record: &UpsertAdminProviderModelRecord,
+    ) -> Result<Option<StoredAdminProviderModel>, Self::Error> {
+        AppState::create_admin_provider_model(self, record)
+            .await
+            .map_err(|err| format!("{err:?}"))
+    }
+
     async fn update_admin_provider_model(
         &self,
         record: &UpsertAdminProviderModelRecord,

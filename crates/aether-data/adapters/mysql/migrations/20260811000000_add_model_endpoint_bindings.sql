@@ -48,7 +48,7 @@ INNER JOIN JSON_TABLE(
     '$[*]' COLUMNS(endpoint_id VARCHAR(64) PATH '$')
 ) AS mapped_endpoint
 INNER JOIN provider_endpoints AS endpoint
-    ON endpoint.id = mapped_endpoint.endpoint_id
+    ON BINARY endpoint.id = BINARY mapped_endpoint.endpoint_id
    AND endpoint.provider_id = model.provider_id
 WHERE NULLIF(TRIM(mapped_endpoint.endpoint_id), '') IS NOT NULL;
 
@@ -91,8 +91,8 @@ INNER JOIN JSON_TABLE(
 ) AS mapped_format
 INNER JOIN provider_endpoints AS endpoint
     ON endpoint.provider_id = model.provider_id
-   AND LOWER(TRIM(COALESCE(endpoint.api_format, '')))
-       = LOWER(TRIM(mapped_format.api_format))
+   AND BINARY LOWER(TRIM(COALESCE(endpoint.api_format, '')))
+       = BINARY LOWER(TRIM(mapped_format.api_format))
 WHERE NULLIF(TRIM(mapped_format.api_format), '') IS NOT NULL
   AND NOT EXISTS (
       SELECT 1
