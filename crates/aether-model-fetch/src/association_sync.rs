@@ -67,7 +67,7 @@ pub async fn sync_provider_model_whitelist_associations<S>(
     provider_id: &str,
     current_allowed_models: &[String],
     discovered_models: &[Value],
-    allow_unbound_preset_models: bool,
+    allow_unbound_models: bool,
     replace_automatic_bindings: bool,
     authoritative_endpoint_ids: &[String],
 ) -> Result<(), S::Error>
@@ -83,7 +83,7 @@ where
         provider_id,
         current_allowed_models,
         discovered_models,
-        allow_unbound_preset_models,
+        allow_unbound_models,
     )
     .await?;
     sync_provider_model_endpoint_bindings(
@@ -143,7 +143,7 @@ async fn auto_associate_provider_by_key_whitelist<S>(
     provider_id: &str,
     allowed_models: &[String],
     discovered_models: &[Value],
-    allow_unbound_preset_models: bool,
+    allow_unbound_models: bool,
 ) -> Result<(), S::Error>
 where
     S: ModelFetchAssociationStore + Sync + ?Sized,
@@ -151,7 +151,7 @@ where
     if allowed_models.is_empty() {
         return Ok(());
     }
-    if discovered_models.is_empty() {
+    if discovered_models.is_empty() && !allow_unbound_models {
         return Ok(());
     }
 
@@ -242,7 +242,7 @@ where
         let endpoint_ids =
             discovered_endpoint_ids_for_provider_model(&prospective_model, discovered_models);
         if endpoint_ids.is_empty() {
-            if allow_unbound_preset_models {
+            if allow_unbound_models {
                 state.create_admin_provider_model(&record).await?;
             }
             continue;
@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preset_association_allows_unbound_model_without_provider_endpoints() {
+    async fn association_allows_unbound_model_without_provider_endpoints() {
         let state = AssociationTestStore {
             global_models: vec![global_model()],
             ..AssociationTestStore::default()
@@ -635,13 +635,13 @@ mod tests {
             &state,
             "provider-1",
             &["gpt-5".to_string()],
-            &[json!({"id": "gpt-5", "api_formats": ["openai:chat"]})],
+            &[],
             true,
             false,
             &[],
         )
         .await
-        .expect("preset association should succeed");
+        .expect("unbound association should succeed");
 
         assert!(state.created.lock().expect("created mutex").is_empty());
         let unbound_created = state.unbound_created.lock().expect("unbound created mutex");

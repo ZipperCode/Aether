@@ -23,6 +23,11 @@ struct AdminModelEndpointInference {
     source: &'static str,
 }
 
+pub(crate) enum AdminProviderModelCreateMutation {
+    Bound(CreateAdminProviderModelWithBindingsRecord),
+    Unbound(UpsertAdminProviderModelRecord),
+}
+
 pub(crate) fn stored_admin_provider_model_from_upsert(
     model: &UpsertAdminProviderModelRecord,
 ) -> StoredAdminProviderModel {
@@ -107,12 +112,35 @@ fn normalize_provider_model_mapping_string_array_field(
 }
 
 impl<'a> AdminAppState<'a> {
-    pub(crate) async fn build_admin_provider_model_create_with_bindings_record(
+    pub(crate) async fn build_admin_provider_model_create_mutation(
         &self,
         model: UpsertAdminProviderModelRecord,
         endpoint_ids: Option<Vec<String>>,
         source: Option<&str>,
-    ) -> Result<CreateAdminProviderModelWithBindingsRecord, GatewayError> {
+    ) -> Result<AdminProviderModelCreateMutation, GatewayError> {
+        let provider_endpoints = self
+            .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(
+                &model.provider_id,
+            ))
+            .await?;
+        if provider_endpoints.is_empty() {
+            // 未配置 Endpoint 的 Provider 保留旧版未绑定模型；一旦存在 Endpoint，创建必须精确绑定。
+            if let Some(endpoint_id) = endpoint_ids
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .map(str::trim)
+                .find(|endpoint_id| !endpoint_id.is_empty())
+            {
+                return Err(GatewayError::Client {
+                    status: http::StatusCode::BAD_REQUEST,
+                    message: format!("Endpoint {endpoint_id} 不属于当前 Provider"),
+                });
+            }
+            return Ok(AdminProviderModelCreateMutation::Unbound(model));
+        }
+
         let prospective_model = stored_admin_provider_model_from_upsert(&model);
         let (endpoint_ids, source) = match endpoint_ids {
             Some(endpoint_ids) => {
@@ -132,7 +160,22 @@ impl<'a> AdminAppState<'a> {
             }
         };
         CreateAdminProviderModelWithBindingsRecord::new(model, endpoint_ids, source)
+            .map(AdminProviderModelCreateMutation::Bound)
             .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
+    pub(crate) async fn create_admin_provider_model_from_mutation(
+        &self,
+        mutation: &AdminProviderModelCreateMutation,
+    ) -> Result<Option<StoredAdminProviderModel>, GatewayError> {
+        match mutation {
+            AdminProviderModelCreateMutation::Bound(record) => {
+                self.create_admin_provider_model_with_bindings(record).await
+            }
+            AdminProviderModelCreateMutation::Unbound(record) => {
+                self.create_admin_provider_model(record).await
+            }
+        }
     }
 
     async fn validate_admin_model_endpoint_ids(
@@ -819,7 +862,7 @@ impl<'a> AdminAppState<'a> {
                 )?;
 
             let mutation = self
-                .build_admin_provider_model_create_with_bindings_record(
+                .build_admin_provider_model_create_mutation(
                     record,
                     Some(resolved_endpoint_ids),
                     Some("discovered"),
@@ -850,7 +893,7 @@ impl<'a> AdminAppState<'a> {
                 }
             };
             match self
-                .create_admin_provider_model_with_bindings(&mutation)
+                .create_admin_provider_model_from_mutation(&mutation)
                 .await
             {
                 Ok(Some(created)) => {
@@ -952,7 +995,7 @@ impl<'a> AdminAppState<'a> {
                     global_model.name.clone(),
                 )?;
             let mutation = self
-                .build_admin_provider_model_create_with_bindings_record(record, None, None)
+                .build_admin_provider_model_create_mutation(record, None, None)
                 .await;
             let mutation = match mutation {
                 Ok(mutation) => mutation,
@@ -966,7 +1009,7 @@ impl<'a> AdminAppState<'a> {
                 Err(err) => return Err(format!("{err:?}")),
             };
             match self
-                .create_admin_provider_model_with_bindings(&mutation)
+                .create_admin_provider_model_from_mutation(&mutation)
                 .await
             {
                 Ok(Some(created)) => {

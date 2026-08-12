@@ -117,6 +117,12 @@ pub(crate) async fn sync_global_model_provider_associations(
         .map(|provider| provider.id.clone())
         .collect::<Vec<_>>();
     let active_provider_ids = provider_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let provider_ids_with_endpoints = state
+        .list_provider_catalog_endpoints_by_provider_ids(&provider_ids)
+        .await?
+        .into_iter()
+        .map(|endpoint| endpoint.provider_id)
+        .collect::<BTreeSet<_>>();
     let linked_provider_ids = state
         .list_admin_provider_models_by_global_model_id(global_model_id)
         .await?
@@ -151,18 +157,19 @@ pub(crate) async fn sync_global_model_provider_associations(
                     global_model.config.as_ref(),
                     &allowed_models,
                 );
-            should_sync.then_some((provider.id, allowed_models))
+            let allow_unbound_models = !provider_ids_with_endpoints.contains(&provider.id);
+            should_sync.then_some((provider.id, allowed_models, allow_unbound_models))
         })
         .collect::<Vec<_>>();
 
     let results = stream::iter(targets.into_iter().map(
-        |(provider_id, allowed_models)| async move {
+        |(provider_id, allowed_models, allow_unbound_models)| async move {
             sync_provider_model_whitelist_associations(
                 state,
                 &provider_id,
                 &allowed_models,
                 &[],
-                false,
+                allow_unbound_models,
                 false,
                 &[],
             )

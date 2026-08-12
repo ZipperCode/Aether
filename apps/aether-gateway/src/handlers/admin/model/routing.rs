@@ -800,7 +800,7 @@ pub(crate) async fn build_admin_assign_global_model_to_providers_payload(
         )
         .map_err(|err| err.to_string())?;
         let mutation = match state
-            .build_admin_provider_model_create_with_bindings_record(record, None, None)
+            .build_admin_provider_model_create_mutation(record, None, None)
             .await
         {
             Ok(mutation) => mutation,
@@ -814,7 +814,7 @@ pub(crate) async fn build_admin_assign_global_model_to_providers_payload(
             Err(err) => return Err(format!("{err:?}")),
         };
         let created = state
-            .create_admin_provider_model_with_bindings(&mutation)
+            .create_admin_provider_model_from_mutation(&mutation)
             .await
             .map_err(|err| format!("{err:?}"))?;
         if let Some(created) = created {

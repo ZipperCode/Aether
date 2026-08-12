@@ -111,11 +111,7 @@ pub(super) async fn maybe_handle(
                 }
             };
             let mutation = match state
-                .build_admin_provider_model_create_with_bindings_record(
-                    record,
-                    endpoint_ids,
-                    Some("manual"),
-                )
+                .build_admin_provider_model_create_mutation(record, endpoint_ids, Some("manual"))
                 .await
             {
                 Ok(mutation) => mutation,
@@ -131,7 +127,7 @@ pub(super) async fn maybe_handle(
                 Err(err) => return Err(err),
             };
             let Some(model) = state
-                .create_admin_provider_model_with_bindings(&mutation)
+                .create_admin_provider_model_from_mutation(&mutation)
                 .await?
             else {
                 return Ok(Some(
