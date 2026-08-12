@@ -1126,6 +1126,26 @@ async fn gateway_global_model_routing_counts_image_provider_keys_by_provider_mod
                     "global-gpt-image",
                     "gpt-image-2",
                 ),
+            ])
+            .with_model_endpoint_bindings(vec![
+                StoredModelEndpointBinding::new(
+                    "model-image-gpt-image".to_string(),
+                    "endpoint-image".to_string(),
+                    "migration".to_string(),
+                    true,
+                    Some(1),
+                    Some(1),
+                )
+                .expect("image model binding should build"),
+                StoredModelEndpointBinding::new(
+                    "model-grok-gpt-image".to_string(),
+                    "endpoint-grok-chat".to_string(),
+                    "migration".to_string(),
+                    true,
+                    Some(1),
+                    Some(1),
+                )
+                .expect("Grok image model binding should build"),
             ]),
     );
 
