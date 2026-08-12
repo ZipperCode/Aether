@@ -17,7 +17,9 @@ use aether_data::repository::users::{
     InMemoryUserReadRepository, StoredUserAuthRecord, UpsertUserGroupRecord, UserReadRepository,
 };
 use aether_data::repository::wallet::{InMemoryWalletRepository, StoredWalletSnapshot};
-use aether_data_contracts::repository::global_models::StoredPublicGlobalModel;
+use aether_data_contracts::repository::global_models::{
+    StoredModelEndpointBinding, StoredPublicGlobalModel,
+};
 use axum::body::Body;
 use axum::routing::{any, delete, get, post, put};
 use axum::{extract::Request, Router};
@@ -745,7 +747,16 @@ async fn gateway_handles_admin_system_config_export_locally_with_trusted_admin_p
                 &provider_id,
                 "global-gpt-5",
                 "gpt-5",
-            )]),
+            )])
+            .with_model_endpoint_bindings(vec![StoredModelEndpointBinding::new(
+                "model-gpt-5".to_string(),
+                "endpoint-chat".to_string(),
+                "manual".to_string(),
+                true,
+                Some(1),
+                Some(1),
+            )
+            .expect("model endpoint binding should build")]),
     );
     let auth_module_repository = Arc::new(InMemoryAuthModuleReadRepository::seed(
         Vec::<StoredOAuthProviderModuleConfig>::new(),
@@ -802,11 +813,19 @@ async fn gateway_handles_admin_system_config_export_locally_with_trusted_admin_p
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["version"], "2.3");
+    assert_eq!(payload["version"], "2.4");
     assert!(payload["exported_at"].as_str().is_some());
     assert_eq!(payload["global_models"][0]["name"], "gpt-5");
     assert_eq!(payload["global_models"][0]["usage_count"], json!(7));
     assert_eq!(payload["providers"][0]["name"], "openai");
+    assert_eq!(
+        payload["providers"][0]["endpoints"][0]["id"],
+        "endpoint-chat"
+    );
+    assert_eq!(
+        payload["providers"][0]["endpoints"][1]["id"],
+        "endpoint-cli"
+    );
     assert_eq!(
         payload["providers"][0]["config"]["provider_ops"]["connector"]["credentials"]
             ["refresh_token"],
@@ -827,6 +846,14 @@ async fn gateway_handles_admin_system_config_export_locally_with_trusted_admin_p
     assert_eq!(
         payload["providers"][0]["models"][0]["global_model_name"],
         "gpt-5"
+    );
+    assert_eq!(
+        payload["providers"][0]["models"][0]["endpoint_bindings"],
+        json!([{
+            "endpoint_id": "endpoint-chat",
+            "source": "manual",
+            "is_active": true
+        }])
     );
     assert_eq!(payload["ldap_config"]["bind_password"], "");
     assert_eq!(

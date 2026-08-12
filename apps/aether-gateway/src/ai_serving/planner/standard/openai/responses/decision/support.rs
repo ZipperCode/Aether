@@ -50,8 +50,9 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
     trace_id: &str,
     decision: &GatewayControlDecision,
     body_json: &serde_json::Value,
-    plan_kind: &str,
+    spec: LocalOpenAiResponsesSpec,
 ) -> Result<Option<LocalOpenAiResponsesDecisionInput>, GatewayError> {
+    let spec_metadata = local_openai_responses_spec_metadata(spec);
     let Some(auth_context) = resolve_local_decision_execution_runtime_auth_context(decision) else {
         warn!(
             trace_id = %trace_id,
@@ -64,7 +65,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
             state,
             trace_id,
             decision,
-            plan_kind,
+            spec_metadata.decision_kind,
             extract_standard_requested_model(body_json).as_deref(),
             "missing_auth_context",
         );
@@ -80,7 +81,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
             state,
             trace_id,
             decision,
-            plan_kind,
+            spec_metadata.decision_kind,
             None,
             "missing_requested_model",
         );
@@ -109,7 +110,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
                 state,
                 trace_id,
                 decision,
-                plan_kind,
+                spec_metadata.decision_kind,
                 Some(requested_model.as_str()),
                 "auth_snapshot_missing",
             );
@@ -125,7 +126,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
                 state,
                 trace_id,
                 decision,
-                plan_kind,
+                spec_metadata.decision_kind,
                 Some(requested_model.as_str()),
                 "auth_snapshot_read_failed",
             );
@@ -134,6 +135,12 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
     };
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
+    let request_operation = openai_responses_request_operation(spec_metadata.api_format, body_json);
+    input.set_endpoint_capability_context(
+        spec_metadata.api_format,
+        spec_metadata.require_streaming,
+        request_operation,
+    );
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));
     if let Err(err) = attach_routing_policy_to_local_requested_model_input(
@@ -141,7 +148,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
         parts,
         &mut input,
         body_json,
-        "openai:responses",
+        spec_metadata.api_format,
     )
     .await
     {
@@ -191,6 +198,8 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
         planner_state,
         trace_id,
         spec_metadata.api_format,
+        spec_metadata.require_streaming,
+        request_operation,
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -363,6 +372,7 @@ pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<
     spec: LocalOpenAiResponsesSpec,
 ) -> Result<(LocalOpenAiResponsesCandidateAttemptSource<'a>, usize), GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
+    let request_operation = openai_responses_request_operation(spec_metadata.api_format, body_json);
     let planner_state = PlannerAppState::new(state);
     let sticky_session_token = extract_pool_sticky_session_token(body_json);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
@@ -392,6 +402,8 @@ pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<
         planner_state,
         trace_id,
         spec_metadata.api_format,
+        spec_metadata.require_streaming,
+        request_operation,
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -464,6 +476,7 @@ pub(crate) async fn mark_skipped_local_openai_responses_candidate(
     candidate_id: &str,
     skip_reason: &'static str,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -493,6 +506,7 @@ pub(crate) async fn mark_skipped_local_openai_responses_candidate_with_extra_dat
     skip_reason: &'static str,
     extra_data: Option<serde_json::Value>,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -523,6 +537,7 @@ pub(crate) async fn mark_skipped_local_openai_responses_candidate_with_failure_d
     skip_reason: &'static str,
     diagnostic: CandidateFailureDiagnostic,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,

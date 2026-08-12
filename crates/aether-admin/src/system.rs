@@ -43,9 +43,14 @@ pub struct AdminEmailTemplateUpdate {
     pub html: Option<String>,
 }
 
-pub const ADMIN_SYSTEM_CONFIG_EXPORT_VERSION: &str = "2.3";
-pub const ADMIN_SYSTEM_CONFIG_SUPPORTED_VERSIONS: &[&str] =
-    &["2.0", "2.1", "2.2", ADMIN_SYSTEM_CONFIG_EXPORT_VERSION];
+pub const ADMIN_SYSTEM_CONFIG_EXPORT_VERSION: &str = "2.4";
+pub const ADMIN_SYSTEM_CONFIG_SUPPORTED_VERSIONS: &[&str] = &[
+    "2.0",
+    "2.1",
+    "2.2",
+    "2.3",
+    ADMIN_SYSTEM_CONFIG_EXPORT_VERSION,
+];
 pub const ADMIN_SYSTEM_USERS_EXPORT_VERSION: &str = "1.5";
 pub const ADMIN_SYSTEM_USERS_SUPPORTED_VERSIONS: &[&str] =
     &["1.3", "1.4", ADMIN_SYSTEM_USERS_EXPORT_VERSION];
@@ -385,6 +390,9 @@ pub struct AdminSystemConfigGlobalModel {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdminSystemConfigEndpoint {
+    /// 导入导出时用于重写模型 Endpoint 绑定；不作为持久化主键直接复用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub api_format: String,
     pub base_url: String,
     #[serde(default)]
@@ -458,12 +466,22 @@ pub struct AdminSystemConfigProviderKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdminSystemConfigModelEndpointBinding {
+    pub endpoint_id: String,
+    pub source: String,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdminSystemConfigProviderModel {
     #[serde(default)]
     pub global_model_name: Option<String>,
     pub provider_model_name: String,
     #[serde(default)]
     pub provider_model_mappings: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_bindings: Option<Vec<AdminSystemConfigModelEndpointBinding>>,
     #[serde(default, deserialize_with = "deserialize_optional_f64_from_number")]
     pub price_per_request: Option<f64>,
     #[serde(default)]
@@ -3283,7 +3301,7 @@ mod tests {
 
     #[test]
     fn parse_admin_system_config_import_request_rejects_unknown_versions() {
-        for version in ["1.9", "2.4"] {
+        for version in ["1.9", "2.5"] {
             let err = parse_admin_system_config_import_request(
                 json!({
                     "version": version,

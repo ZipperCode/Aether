@@ -116,6 +116,11 @@ pub(crate) async fn resolve_local_openai_chat_decision_input(
     );
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
+    input.set_endpoint_capability_context(
+        "openai:chat",
+        plan_kind == crate::ai_serving::planner::common::OPENAI_CHAT_STREAM_PLAN_KIND,
+        None,
+    );
     input.request_auth_channel = decision.request_auth_channel.clone();
     let affinity_started_at = std::time::Instant::now();
     input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));

@@ -367,6 +367,19 @@ CREATE TABLE IF NOT EXISTS models (
     KEY models_provider_id_idx (`provider_id`)
 );
 
+CREATE TABLE IF NOT EXISTS model_endpoint_bindings (
+    `model_id` VARCHAR(64) NOT NULL,
+    `endpoint_id` VARCHAR(64) NOT NULL,
+    `source` VARCHAR(32) NOT NULL DEFAULT 'migration',
+    `is_active` TINYINT(1) NOT NULL DEFAULT 1,
+    `created_at` BIGINT NOT NULL,
+    `updated_at` BIGINT NOT NULL,
+    PRIMARY KEY (`model_id`, `endpoint_id`),
+    KEY model_endpoint_bindings_endpoint_active_idx (`endpoint_id`, `is_active`, `model_id`),
+    CONSTRAINT model_endpoint_bindings_model_id_fkey FOREIGN KEY (`model_id`) REFERENCES models (`id`) ON DELETE CASCADE,
+    CONSTRAINT model_endpoint_bindings_endpoint_id_fkey FOREIGN KEY (`endpoint_id`) REFERENCES provider_endpoints (`id`) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS global_models (
     `id` VARCHAR(64) NOT NULL,
     `name` VARCHAR(255) NOT NULL,

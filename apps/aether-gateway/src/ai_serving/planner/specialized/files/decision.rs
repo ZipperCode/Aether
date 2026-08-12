@@ -74,6 +74,10 @@ pub(super) async fn maybe_build_local_gemini_files_decision_payload_for_candidat
     }
     extra_fields.insert("file_key_id".to_string(), json!(candidate.key_id));
     extra_fields.insert("file_name".to_string(), json!(resolved.file_name));
+    extra_fields.insert(
+        "api_operation".to_string(),
+        json!(spec_metadata.decision_kind),
+    );
     let effective_headers = input.effective_headers(&parts.headers);
     let report_context = build_local_execution_report_context(LocalExecutionReportContextParts {
         auth_context: &input.auth_context,

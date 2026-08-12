@@ -107,11 +107,14 @@ use aether_data_contracts::repository::candidates::{
 };
 use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
-    GlobalModelReadRepository, GlobalModelWriteRepository, PublicCatalogModelListQuery,
-    PublicCatalogModelSearchQuery, PublicGlobalModelQuery, StoredAdminGlobalModel,
-    StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredProviderActiveGlobalModel,
+    CreateAdminProviderModelWithBindingsRecord, GlobalModelReadRepository,
+    GlobalModelWriteRepository, PublicCatalogModelListQuery, PublicCatalogModelSearchQuery,
+    PublicGlobalModelQuery, StoredAdminGlobalModel, StoredAdminGlobalModelPage,
+    StoredAdminProviderModel, StoredModelEndpointBinding, StoredProviderActiveGlobalModel,
     StoredProviderModelStats, StoredPublicCatalogModel, StoredPublicGlobalModel,
-    StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord,
+    UpdateAdminProviderModelWithBindingsRecord, UpsertAdminProviderModelRecord,
+    UpsertModelEndpointBindingRecord,
 };
 use aether_data_contracts::repository::model_catalog::{
     ModelCatalogReadRepository, StoredModelCatalogEntry,

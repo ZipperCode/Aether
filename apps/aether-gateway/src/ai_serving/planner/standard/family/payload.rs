@@ -237,6 +237,7 @@ pub(super) async fn mark_skipped_local_standard_candidate(
     candidate_id: &str,
     skip_reason: &'static str,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -265,6 +266,7 @@ pub(super) async fn mark_skipped_local_standard_candidate_with_extra_data(
     skip_reason: &'static str,
     extra_data: Option<serde_json::Value>,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -294,6 +296,7 @@ pub(super) async fn mark_skipped_local_standard_candidate_with_failure_diagnosti
     skip_reason: &'static str,
     diagnostic: CandidateFailureDiagnostic,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -365,28 +368,25 @@ mod tests {
     }
 
     fn sample_input() -> LocalRequestedModelDecisionInput {
-        LocalRequestedModelDecisionInput {
-            auth_context: ExecutionRuntimeAuthContext {
-                user_id: "user-1".to_string(),
-                api_key_id: "api-key-1".to_string(),
-                username: Some("alice".to_string()),
-                api_key_name: Some("default".to_string()),
-                balance_remaining: Some(10.0),
-                access_allowed: true,
-                api_key_is_standalone: false,
-            },
-            requested_model: "claude-sonnet-4-5".to_string(),
-            auth_snapshot: sample_auth_snapshot(),
-            required_capabilities: None,
-            request_auth_channel: None,
-            client_surface: None,
-            gateway_credential_carrier: None,
-            client_session_affinity: None,
-            routing_policy: None,
-            routing_trace_seed: None,
-            routing_context: None,
-            model_directive_policy: Default::default(),
-        }
+        let resolved_input =
+            crate::ai_serving::planner::decision_input::ResolvedLocalDecisionAuthInput {
+                auth_context: ExecutionRuntimeAuthContext {
+                    user_id: "user-1".to_string(),
+                    api_key_id: "api-key-1".to_string(),
+                    username: Some("alice".to_string()),
+                    api_key_name: Some("default".to_string()),
+                    balance_remaining: Some(10.0),
+                    access_allowed: true,
+                    api_key_is_standalone: false,
+                },
+                auth_snapshot: sample_auth_snapshot(),
+                required_capabilities: None,
+                model_directive_policy: Default::default(),
+            };
+        crate::ai_serving::planner::decision_input::build_local_requested_model_decision_input(
+            resolved_input,
+            "claude-sonnet-4-5".to_string(),
+        )
     }
 
     fn sample_transport(api_format: &str, endpoint_id: &str) -> GatewayProviderTransportSnapshot {

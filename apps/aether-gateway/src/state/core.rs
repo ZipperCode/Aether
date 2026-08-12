@@ -37,7 +37,8 @@ use super::super::async_task::{
 };
 use super::super::cache::{
     AuthApiKeyLastUsedCache, AuthContextCache, AuthSnapshotCache, DashboardResponseCache,
-    DirectPlanBypassCache, JsonValueCache, SchedulerAffinityCache, SchedulerAffinitySnapshotEntry,
+    DirectPlanBypassCache, EndpointCapabilityQuarantineCache, EndpointCapabilityQuarantineKey,
+    JsonValueCache, SchedulerAffinityCache, SchedulerAffinitySnapshotEntry,
     SchedulerAffinityTarget, SystemConfigCache, SystemConfigInflightRegistration, ValueCache,
 };
 use super::super::data::{GatewayDataConfig, GatewayDataState};
@@ -360,6 +361,7 @@ impl AppState {
             auth_api_key_last_used_cache: Arc::new(AuthApiKeyLastUsedCache::default()),
             oauth_refresh: Arc::new(provider_transport::LocalOAuthRefreshCoordinator::new()),
             direct_plan_bypass_cache: Arc::new(DirectPlanBypassCache::default()),
+            endpoint_capability_quarantine: Arc::new(EndpointCapabilityQuarantineCache::default()),
             scheduler_affinity_cache: Arc::new(SchedulerAffinityCache::default()),
             scheduler_affinity_epoch: Arc::new(AtomicU64::new(0)),
             dashboard_response_cache: Arc::new(DashboardResponseCache::default()),
@@ -893,6 +895,7 @@ impl AppState {
         self.candidate_page_cache.clear();
         self.candidate_resolved_page_cache.clear();
         self.clear_provider_transport_snapshot_cache();
+        self.endpoint_capability_quarantine.clear();
         self.invalidate_scheduler_affinity_cache();
     }
 
@@ -906,6 +909,84 @@ impl AppState {
         // including `is_active`, but not runtime health, circuit-breaker, or
         // adaptive projections. Keeping them avoids a global three-query transport
         // reload after every runtime health feedback write.
+    }
+
+    pub(crate) fn invalidate_model_routing_caches(&self) {
+        self.data.clear_minimal_candidate_selection_cache();
+        self.routing_group_selection_cache.clear();
+        self.candidate_row_page_cache.clear();
+        self.candidate_page_cache.clear();
+        self.candidate_resolved_page_cache.clear();
+        self.endpoint_capability_quarantine.clear();
+        self.invalidate_scheduler_affinity_cache();
+    }
+
+    pub(crate) fn endpoint_capability_is_quarantined(
+        &self,
+        model_id: &str,
+        endpoint_id: &str,
+        key_id: &str,
+        client_api_format: &str,
+        stream: bool,
+        request_operation: Option<&str>,
+    ) -> bool {
+        EndpointCapabilityQuarantineKey::new(
+            model_id,
+            endpoint_id,
+            key_id,
+            client_api_format,
+            stream,
+            request_operation,
+        )
+        .is_some_and(|key| self.endpoint_capability_quarantine.contains(&key))
+    }
+
+    pub(crate) fn quarantine_endpoint_capability(
+        &self,
+        model_id: &str,
+        endpoint_id: &str,
+        key_id: &str,
+        client_api_format: &str,
+        stream: bool,
+        request_operation: Option<&str>,
+    ) -> bool {
+        let Some(key) = EndpointCapabilityQuarantineKey::new(
+            model_id,
+            endpoint_id,
+            key_id,
+            client_api_format,
+            stream,
+            request_operation,
+        ) else {
+            return false;
+        };
+        self.endpoint_capability_quarantine.mark(key);
+        true
+    }
+
+    pub(crate) fn clear_endpoint_capability_quarantine_for_success(
+        &self,
+        model_id: &str,
+        endpoint_id: &str,
+        key_id: &str,
+        client_api_format: &str,
+        stream: bool,
+        request_operation: Option<&str>,
+    ) {
+        self.endpoint_capability_quarantine.clear_for_success(
+            model_id,
+            endpoint_id,
+            key_id,
+            client_api_format,
+            stream,
+            request_operation,
+        );
+    }
+
+    pub(crate) fn endpoint_capability_quarantine_snapshot(
+        &self,
+    ) -> Vec<EndpointCapabilityQuarantineKey> {
+        self.endpoint_capability_quarantine.snapshot()
     }
 
     pub(crate) fn invalidate_provider_runtime_state_caches(&self) {

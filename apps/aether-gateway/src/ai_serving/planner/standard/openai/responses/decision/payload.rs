@@ -1,7 +1,6 @@
 use serde_json::json;
 use tracing::debug;
 
-use crate::ai_serving::build_request_trace_proxy_value;
 use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision;
 use crate::ai_serving::planner::report_context::{
     build_local_execution_report_context, insert_native_client_envelope_name,
@@ -15,6 +14,7 @@ use crate::ai_serving::planner::{
 use crate::ai_serving::transport::{
     resolve_transport_execution_timeouts, resolve_transport_profile,
 };
+use crate::ai_serving::{build_request_trace_proxy_value, openai_responses_request_operation};
 use crate::{
     append_execution_contract_fields_to_value, append_local_failover_policy_to_value,
     AiExecutionDecision, AppState, GatewayError,
@@ -23,6 +23,16 @@ use crate::{
 use super::request::resolve_local_openai_responses_candidate_payload_parts;
 use super::support::{LocalOpenAiResponsesCandidateAttempt, LocalOpenAiResponsesDecisionInput};
 use super::LocalOpenAiResponsesSpec;
+
+fn insert_request_operation(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    api_format: &str,
+    body_json: &serde_json::Value,
+) {
+    if let Some(operation) = openai_responses_request_operation(api_format, body_json) {
+        fields.insert("api_operation".to_string(), json!(operation));
+    }
+}
 
 pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_candidate(
     state: &AppState,
@@ -79,6 +89,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         .or_else(|| resolve_transport_profile(&resolved.transport));
     let timeouts = resolve_transport_execution_timeouts(&resolved.transport);
     let mut extra_fields = serde_json::Map::new();
+    insert_request_operation(&mut extra_fields, spec_metadata.api_format, body_json);
     if let Some(proxy_value) =
         build_request_trace_proxy_value(Some(&resolved.transport), proxy.as_ref())
     {
@@ -249,4 +260,26 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         Some(transport.as_ref()),
     )?;
     Ok(Some(decision))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Map, Value};
+
+    fn request_operation_fields(api_format: &str, body: &Value) -> Map<String, Value> {
+        let mut fields = Map::new();
+        super::insert_request_operation(&mut fields, api_format, body);
+        fields
+    }
+
+    #[test]
+    fn responses_compaction_operation_is_preserved_for_runtime_capability_scope() {
+        let fields = request_operation_fields(
+            "openai:responses",
+            &json!({"input": [{"type": "compaction_trigger"}]}),
+        );
+
+        assert_eq!(fields.get("api_operation"), Some(&json!("compact")));
+        assert!(request_operation_fields("openai:responses", &json!({"input": []})).is_empty());
+    }
 }

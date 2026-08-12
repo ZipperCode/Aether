@@ -9,7 +9,9 @@ use aether_data::{
     DataBackends, DataLayerConfig, DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig,
 };
 use aether_data_contracts::repository::global_models::{
-    CreateAdminGlobalModelRecord, UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    CreateAdminGlobalModelRecord, CreateAdminProviderModelWithBindingsRecord,
+    UpdateAdminGlobalModelRecord, UpdateAdminProviderModelWithBindingsRecord,
+    UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -450,9 +452,26 @@ async fn seed_models(
         .iter()
         .any(|model| model.id == config.model_id)
     {
-        writer.update_admin_provider_model(&provider_model).await?;
+        let mutation = UpdateAdminProviderModelWithBindingsRecord::new(
+            provider_model,
+            Some(vec![config.endpoint_id.clone()]),
+            Some("mapping".to_string()),
+            Vec::new(),
+        )?;
+        writer
+            .update_admin_provider_model_with_bindings(&mutation)
+            .await?
+            .ok_or("pressure model and endpoint binding could not be updated")?;
     } else {
-        writer.create_admin_provider_model(&provider_model).await?;
+        let mutation = CreateAdminProviderModelWithBindingsRecord::new(
+            provider_model,
+            vec![config.endpoint_id.clone()],
+            "mapping".to_string(),
+        )?;
+        writer
+            .create_admin_provider_model_with_bindings(&mutation)
+            .await?
+            .ok_or("pressure model and endpoint binding could not be created")?;
     }
 
     Ok(())

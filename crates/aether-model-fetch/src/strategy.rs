@@ -20,8 +20,8 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 
 use crate::logic::{
-    aggregate_models_for_cache, extract_error_message, parse_models_response_page,
-    parse_windsurf_model_configs_response, preset_models_for_provider,
+    aggregate_models_for_cache, extract_error_message, json_string_list,
+    parse_models_response_page, parse_windsurf_model_configs_response, preset_models_for_provider,
 };
 use crate::transport::{
     build_antigravity_fetch_available_models_plan, build_antigravity_load_code_assist_plan,
@@ -47,6 +47,10 @@ pub struct ModelsFetchOutcome {
     pub cached_models: Vec<Value>,
     pub errors: Vec<String>,
     pub has_success: bool,
+    /// 本次结果来自固定目录，而不是 Endpoint 的上游模型发现接口。
+    pub used_preset_catalog: bool,
+    /// 本轮确实完成模型发现的 Endpoint。替换式对账只能清理这些 Endpoint 的旧绑定。
+    pub successful_endpoint_ids: Vec<String>,
     pub upstream_metadata: Option<Value>,
 }
 
@@ -163,7 +167,19 @@ async fn execute_model_fetch_strategy(
         return Err("No transport snapshots available for models fetch".to_string());
     };
 
-    match strategy.kind() {
+    let strategy_kind = strategy.kind();
+    let used_preset_catalog = matches!(
+        strategy_kind,
+        ModelFetchStrategyKind::PresetCatalog | ModelFetchStrategyKind::GeminiCliPreset
+    );
+    let requires_fallback_endpoint_evidence = !matches!(
+        strategy_kind,
+        ModelFetchStrategyKind::PresetCatalog
+            | ModelFetchStrategyKind::GeminiCliPreset
+            | ModelFetchStrategyKind::StandardTransport
+            | ModelFetchStrategyKind::Vertex
+    );
+    let mut outcome = match strategy_kind {
         ModelFetchStrategyKind::PresetCatalog => Ok(build_success_outcome(
             strategy.preset_models.unwrap_or_default(),
             None,
@@ -186,6 +202,43 @@ async fn execute_model_fetch_strategy(
         }
         ModelFetchStrategyKind::Kiro => fetch_kiro_models(runtime, first_transport).await,
         ModelFetchStrategyKind::Windsurf => fetch_windsurf_models(runtime, first_transport).await,
+    }?;
+    outcome.used_preset_catalog = used_preset_catalog;
+    if requires_fallback_endpoint_evidence {
+        attach_fallback_endpoint_id(&mut outcome.cached_models, first_transport);
+        if outcome.has_success && outcome.successful_endpoint_ids.is_empty() {
+            outcome.successful_endpoint_ids = outcome
+                .cached_models
+                .iter()
+                .flat_map(|model| json_string_list(model.get("endpoint_ids")))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if outcome.successful_endpoint_ids.is_empty() {
+                outcome
+                    .successful_endpoint_ids
+                    .push(first_transport.endpoint.id.clone());
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+fn attach_fallback_endpoint_id(models: &mut [Value], transport: &GatewayProviderTransportSnapshot) {
+    for model in models {
+        let Some(object) = model.as_object_mut() else {
+            continue;
+        };
+        let has_endpoint_ids = object
+            .get("endpoint_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+        if !has_endpoint_ids {
+            object.insert(
+                "endpoint_ids".to_string(),
+                json!([transport.endpoint.id.clone()]),
+            );
+        }
     }
 }
 
@@ -197,12 +250,14 @@ async fn fetch_standard_models(
     let mut all_models = Vec::new();
     let mut errors = Vec::new();
     let mut has_success = false;
+    let mut successful_endpoint_ids = Vec::new();
 
     for transport in transports {
         match fetch_standard_models_for_transport(runtime, transport).await {
             Ok(outcome) => {
                 all_models.extend(outcome.cached_models);
                 has_success |= outcome.has_success;
+                successful_endpoint_ids.extend(outcome.successful_endpoint_ids);
             }
             Err(err) => errors.push(format!("{}: {err}", transport.endpoint.api_format.trim())),
         }
@@ -211,7 +266,11 @@ async fn fetch_standard_models(
     let merged_models = aggregate_models_for_cache(&all_models);
     let upstream_metadata =
         crate::logic::model_catalog_upstream_metadata(provider_type, &merged_models);
-    Ok(build_success_outcome(merged_models, upstream_metadata, has_success).with_errors(errors))
+    Ok(
+        build_success_outcome(merged_models, upstream_metadata, has_success)
+            .with_errors(errors)
+            .with_successful_endpoint_ids(successful_endpoint_ids),
+    )
 }
 
 async fn fetch_standard_models_for_transport(
@@ -246,6 +305,13 @@ async fn fetch_standard_models_for_transport(
             if !seen_ids.insert(model_id.to_string()) {
                 continue;
             }
+            let mut model = model;
+            if let Some(object) = model.as_object_mut() {
+                object.insert(
+                    "endpoint_ids".to_string(),
+                    json!([transport.endpoint.id.clone()]),
+                );
+            }
             all_models.push(model);
         }
 
@@ -260,7 +326,8 @@ async fn fetch_standard_models_for_transport(
         next_after_id = Some(next_cursor);
     }
 
-    Ok(build_success_outcome(all_models, None, has_success))
+    Ok(build_success_outcome(all_models, None, has_success)
+        .with_successful_endpoint_ids(has_success.then(|| transport.endpoint.id.clone())))
 }
 
 async fn fetch_antigravity_models(
@@ -318,6 +385,8 @@ async fn fetch_antigravity_models(
         cached_models: Vec::new(),
         errors,
         has_success: false,
+        used_preset_catalog: false,
+        successful_endpoint_ids: Vec::new(),
         upstream_metadata: None,
     })
 }
@@ -498,6 +567,8 @@ async fn fetch_vertex_api_key_models(
             cached_models: Vec::new(),
             errors: vec!["vertex_ai(api_key): missing api key".to_string()],
             has_success: false,
+            used_preset_catalog: false,
+            successful_endpoint_ids: Vec::new(),
             upstream_metadata: None,
         });
     }
@@ -506,12 +577,20 @@ async fn fetch_vertex_api_key_models(
     let mut hard_errors = Vec::new();
     let mut soft_errors = Vec::new();
     let mut has_success = false;
+    let mut successful_endpoint_ids = BTreeSet::new();
+    let mut failed_endpoint_ids = BTreeSet::new();
 
     for base_url in iter_vertex_base_urls(transports) {
+        let transport = select_vertex_transport_for_base_and_format(
+            transports,
+            &base_url,
+            "gemini:",
+            reference_transport,
+        );
         let url = build_vertex_google_list_url(&base_url, api_key, None);
         let outcome = match fetch_vertex_models_from_url(
             runtime,
-            reference_transport,
+            transport,
             &url,
             auth_config,
             "google",
@@ -522,12 +601,13 @@ async fn fetch_vertex_api_key_models(
         {
             Ok(outcome) => outcome,
             Err(err) => {
+                failed_endpoint_ids.insert(transport.endpoint.id.clone());
                 hard_errors.push(format!("{base_url}: {err}"));
                 continue;
             }
         };
-        has_success |= outcome.has_success;
         if let Some(error) = outcome.error {
+            failed_endpoint_ids.insert(transport.endpoint.id.clone());
             if is_soft_not_found(&error) {
                 soft_errors.push(format!("{base_url}: {error}"));
             } else {
@@ -535,12 +615,22 @@ async fn fetch_vertex_api_key_models(
             }
             continue;
         }
+        if outcome.has_success {
+            has_success = true;
+            successful_endpoint_ids.insert(transport.endpoint.id.clone());
+        }
         all_models.extend(outcome.models);
     }
 
+    let successful_endpoint_ids = successful_endpoint_ids
+        .difference(&failed_endpoint_ids)
+        .cloned()
+        .collect::<Vec<_>>();
     let deduped = dedupe_models_by_id_and_format(all_models);
     if !deduped.is_empty() {
-        return Ok(build_success_outcome(deduped, None, true).with_errors(hard_errors));
+        return Ok(build_success_outcome(deduped, None, true)
+            .with_errors(hard_errors)
+            .with_successful_endpoint_ids(successful_endpoint_ids));
     }
 
     let errors = if !hard_errors.is_empty() {
@@ -555,6 +645,8 @@ async fn fetch_vertex_api_key_models(
         cached_models: Vec::new(),
         errors,
         has_success,
+        used_preset_catalog: false,
+        successful_endpoint_ids,
         upstream_metadata: None,
     })
 }
@@ -570,6 +662,8 @@ async fn fetch_vertex_service_account_models(
             cached_models: Vec::new(),
             errors: vec!["vertex_ai(service_account): missing auth_config".to_string()],
             has_success: false,
+            used_preset_catalog: false,
+            successful_endpoint_ids: Vec::new(),
             upstream_metadata: None,
         });
     };
@@ -583,11 +677,25 @@ async fn fetch_vertex_service_account_models(
     let mut hard_errors = Vec::new();
     let mut soft_errors = Vec::new();
     let mut has_success = false;
+    let mut successful_endpoint_ids = BTreeSet::new();
+    let mut failed_endpoint_ids = BTreeSet::new();
 
     for base in iter_vertex_base_urls(transports) {
+        let google_transport = select_vertex_transport_for_base_and_format(
+            transports,
+            &base,
+            "gemini:",
+            gemini_transport,
+        );
+        let anthropic_transport = select_vertex_transport_for_base_and_format(
+            transports,
+            &base,
+            "claude:",
+            claude_transport,
+        );
         for (publisher, transport, api_format) in [
-            ("google", gemini_transport, "gemini:generate_content"),
-            ("anthropic", claude_transport, "claude:messages"),
+            ("google", google_transport, "gemini:generate_content"),
+            ("anthropic", anthropic_transport, "claude:messages"),
         ] {
             let url = build_vertex_service_account_list_url(&base, publisher, None);
             let outcome = match fetch_vertex_models_from_url(
@@ -603,12 +711,13 @@ async fn fetch_vertex_service_account_models(
             {
                 Ok(outcome) => outcome,
                 Err(err) => {
+                    failed_endpoint_ids.insert(transport.endpoint.id.clone());
                     hard_errors.push(format!("{url}: {err}"));
                     continue;
                 }
             };
-            has_success |= outcome.has_success;
             if let Some(error) = outcome.error {
+                failed_endpoint_ids.insert(transport.endpoint.id.clone());
                 let labeled = format!("{url}: {error}");
                 if is_soft_not_found(&error) {
                     soft_errors.push(labeled);
@@ -617,13 +726,23 @@ async fn fetch_vertex_service_account_models(
                 }
                 continue;
             }
+            if outcome.has_success {
+                has_success = true;
+                successful_endpoint_ids.insert(transport.endpoint.id.clone());
+            }
             all_models.extend(outcome.models);
         }
     }
 
+    let successful_endpoint_ids = successful_endpoint_ids
+        .difference(&failed_endpoint_ids)
+        .cloned()
+        .collect::<Vec<_>>();
     let deduped = dedupe_models_by_id_and_format(all_models);
     if !deduped.is_empty() {
-        return Ok(build_success_outcome(deduped, None, true).with_errors(hard_errors));
+        return Ok(build_success_outcome(deduped, None, true)
+            .with_errors(hard_errors)
+            .with_successful_endpoint_ids(successful_endpoint_ids));
     }
 
     let errors = if !hard_errors.is_empty() {
@@ -638,6 +757,8 @@ async fn fetch_vertex_service_account_models(
         cached_models: Vec::new(),
         errors,
         has_success,
+        used_preset_catalog: false,
+        successful_endpoint_ids,
         upstream_metadata: None,
     })
 }
@@ -686,11 +807,16 @@ async fn fetch_vertex_models_from_url(
 
         has_success = true;
         let body_json = execution_result_json_body_allow_empty(&result)?;
-        all_models.extend(parse_vertex_models_payload(
-            &body_json,
-            auth_config,
-            fallback_publisher,
-        ));
+        let mut models = parse_vertex_models_payload(&body_json, auth_config, fallback_publisher);
+        for model in &mut models {
+            if let Some(object) = model.as_object_mut() {
+                object.insert(
+                    "endpoint_ids".to_string(),
+                    json!([transport.endpoint.id.clone()]),
+                );
+            }
+        }
+        all_models.extend(models);
         next_page_token = body_json
             .get("nextPageToken")
             .and_then(Value::as_str)
@@ -1037,6 +1163,31 @@ fn iter_vertex_base_urls(transports: &[GatewayProviderTransportSnapshot]) -> Vec
     urls
 }
 
+fn select_vertex_transport_for_base_and_format<'a>(
+    transports: &'a [GatewayProviderTransportSnapshot],
+    base_url: &str,
+    api_format_prefix: &str,
+    fallback: &'a GatewayProviderTransportSnapshot,
+) -> &'a GatewayProviderTransportSnapshot {
+    transports
+        .iter()
+        .find(|transport| {
+            transport
+                .endpoint
+                .base_url
+                .trim()
+                .trim_end_matches('/')
+                .eq_ignore_ascii_case(base_url)
+                && transport
+                    .endpoint
+                    .api_format
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with(api_format_prefix)
+        })
+        .unwrap_or(fallback)
+}
+
 fn build_vertex_google_list_url(base_url: &str, api_key: &str, page_token: Option<&str>) -> String {
     let url = build_vertex_publisher_models_list_base_url(base_url, "google");
     let mut url = append_query_param(url, "key", api_key);
@@ -1201,14 +1352,15 @@ fn is_soft_not_found(error: &str) -> bool {
 }
 
 fn dedupe_models_by_id_and_format(models: Vec<Value>) -> Vec<Value> {
-    let mut seen = BTreeSet::new();
-    let mut deduped = Vec::new();
+    let mut indexes: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut deduped: Vec<Value> = Vec::new();
     for model in models {
         let Some(model_id) = model
             .get("id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
         else {
             continue;
         };
@@ -1217,11 +1369,25 @@ fn dedupe_models_by_id_and_format(models: Vec<Value>) -> Vec<Value> {
             .and_then(Value::as_array)
             .and_then(|items| items.first())
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        let dedupe_key = format!("{model_id}:{api_format}");
-        if !seen.insert(dedupe_key) {
+            .unwrap_or_default()
+            .to_string();
+        let dedupe_key = (model_id, api_format);
+        if let Some(index) = indexes.get(&dedupe_key).copied() {
+            let endpoint_ids = json_string_list(deduped[index].get("endpoint_ids"))
+                .into_iter()
+                .chain(json_string_list(model.get("endpoint_ids")))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(Value::String)
+                .collect::<Vec<_>>();
+            if !endpoint_ids.is_empty() {
+                if let Some(object) = deduped[index].as_object_mut() {
+                    object.insert("endpoint_ids".to_string(), Value::Array(endpoint_ids));
+                }
+            }
             continue;
         }
+        indexes.insert(dedupe_key, deduped.len());
         deduped.push(model);
     }
     deduped
@@ -1237,6 +1403,8 @@ fn build_success_outcome(
         cached_models,
         errors: Vec::new(),
         has_success,
+        used_preset_catalog: false,
+        successful_endpoint_ids: Vec::new(),
         upstream_metadata,
     }
 }
@@ -1397,11 +1565,28 @@ fn now_unix_secs() -> u64 {
 
 trait OutcomeExt {
     fn with_errors(self, errors: Vec<String>) -> Self;
+    fn with_successful_endpoint_ids<I>(self, endpoint_ids: I) -> Self
+    where
+        I: IntoIterator<Item = String>;
 }
 
 impl OutcomeExt for ModelsFetchOutcome {
     fn with_errors(mut self, errors: Vec<String>) -> Self {
         self.errors = errors;
+        self
+    }
+
+    fn with_successful_endpoint_ids<I>(mut self, endpoint_ids: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.successful_endpoint_ids = endpoint_ids
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         self
     }
 }
@@ -1872,6 +2057,13 @@ mod tests {
         assert_eq!(outcome.cached_models.len(), 2);
         assert_eq!(outcome.errors.len(), 1);
         assert!(outcome.errors[0].contains("connection reset"));
+        assert_eq!(
+            outcome.successful_endpoint_ids,
+            vec![
+                "endpoint-chat".to_string(),
+                "endpoint-responses".to_string()
+            ]
+        );
         let shared_model = outcome
             .cached_models
             .iter()
@@ -1880,6 +2072,19 @@ mod tests {
         assert_eq!(
             shared_model.get("api_formats"),
             Some(&json!(["openai:chat", "openai:responses"]))
+        );
+        assert_eq!(
+            shared_model.get("endpoint_ids"),
+            Some(&json!(["endpoint-chat", "endpoint-responses"]))
+        );
+        let responses_only = outcome
+            .cached_models
+            .iter()
+            .find(|model| model.get("id").and_then(Value::as_str) == Some("responses-only"))
+            .expect("responses-only model should be cached");
+        assert_eq!(
+            responses_only.get("endpoint_ids"),
+            Some(&json!(["endpoint-responses"]))
         );
     }
 
@@ -1924,6 +2129,188 @@ mod tests {
         assert_eq!(outcome.cached_models.len(), 1);
         assert_eq!(outcome.errors.len(), 1);
         assert!(outcome.errors[0].contains("connect timeout"));
+        assert_eq!(
+            outcome.successful_endpoint_ids,
+            vec!["endpoint-2".to_string()]
+        );
+        assert_eq!(
+            outcome.cached_models[0]["endpoint_ids"],
+            json!(["endpoint-2"])
+        );
+    }
+
+    #[tokio::test]
+    async fn vertex_empty_catalog_keeps_only_the_successful_endpoint_authority() {
+        let executed_urls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = RoutingTestRuntime {
+            executed_urls: Arc::clone(&executed_urls),
+            routes: vec![
+                (
+                    "https://us-central1-aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                        .to_string(),
+                    Err("connect timeout".to_string()),
+                ),
+                (
+                    "https://aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                        .to_string(),
+                    Ok((200, json!({ "models": [] }))),
+                ),
+            ],
+        };
+        let mut failing_transport = sample_custom_aiplatform_transport();
+        failing_transport.endpoint.id = "endpoint-regional".to_string();
+        failing_transport.endpoint.base_url =
+            "https://us-central1-aiplatform.googleapis.com".to_string();
+        let mut successful_transport = sample_custom_aiplatform_transport();
+        successful_transport.endpoint.id = "endpoint-global".to_string();
+
+        let outcome =
+            fetch_models_from_transports(&runtime, &[failing_transport, successful_transport])
+                .await
+                .expect("an empty catalog is still authoritative for the successful endpoint");
+
+        assert!(outcome.has_success);
+        assert!(outcome.cached_models.is_empty());
+        assert_eq!(outcome.errors.len(), 1);
+        assert_eq!(
+            outcome.successful_endpoint_ids,
+            vec!["endpoint-global".to_string()]
+        );
+        assert_eq!(executed_urls.lock().expect("executed_urls lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn vertex_pagination_failure_does_not_claim_endpoint_authority() {
+        let executed_urls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = RoutingTestRuntime {
+            executed_urls: Arc::clone(&executed_urls),
+            routes: vec![
+                (
+                    "pageToken=page-2".to_string(),
+                    Ok((503, json!({ "error": { "message": "page unavailable" } }))),
+                ),
+                (
+                    "https://aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                        .to_string(),
+                    Ok((
+                        200,
+                        json!({
+                            "models": [{
+                                "name": "publishers/google/models/gemini-3.1-pro-preview"
+                            }],
+                            "nextPageToken": "page-2"
+                        }),
+                    )),
+                ),
+            ],
+        };
+
+        let outcome =
+            fetch_models_from_transports(&runtime, &[sample_custom_aiplatform_transport()])
+                .await
+                .expect("pagination failure should be returned as a failed fetch outcome");
+
+        assert!(!outcome.has_success);
+        assert!(outcome.cached_models.is_empty());
+        assert!(outcome.successful_endpoint_ids.is_empty());
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.errors[0].contains("page unavailable"));
+        assert_eq!(executed_urls.lock().expect("executed_urls lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn vertex_partial_failure_on_one_endpoint_keeps_positive_evidence_without_authority() {
+        let executed_urls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = RoutingTestRuntime {
+            executed_urls: Arc::clone(&executed_urls),
+            routes: vec![
+                (
+                    "https://us-central1-aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                        .to_string(),
+                    Ok((
+                        200,
+                        json!({
+                            "models": [{
+                                "name": "publishers/google/models/gemini-3.1-pro-preview"
+                            }]
+                        }),
+                    )),
+                ),
+                (
+                    "https://aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                        .to_string(),
+                    Err("global endpoint unavailable".to_string()),
+                ),
+            ],
+        };
+        let mut transport = sample_custom_aiplatform_transport();
+        transport.endpoint.id = "endpoint-regional".to_string();
+        transport.endpoint.base_url = "https://us-central1-aiplatform.googleapis.com".to_string();
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("partial endpoint discovery should preserve positive model evidence");
+
+        assert!(outcome.has_success);
+        assert_eq!(outcome.cached_models.len(), 1);
+        assert_eq!(
+            outcome.cached_models[0]["endpoint_ids"],
+            json!(["endpoint-regional"])
+        );
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.successful_endpoint_ids.is_empty());
+        assert_eq!(executed_urls.lock().expect("executed_urls lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn vertex_models_fetch_merges_endpoint_ids_for_duplicate_models() {
+        let executed_urls = Arc::new(Mutex::new(Vec::new()));
+        let response = json!({
+            "models": [{
+                "name": "publishers/google/models/gemini-3.1-pro-preview"
+            }]
+        });
+        let runtime = RoutingTestRuntime {
+            executed_urls: Arc::clone(&executed_urls),
+            routes: vec![
+                (
+                    "https://us-central1-aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                        .to_string(),
+                    Ok((200, response.clone())),
+                ),
+                (
+                    "https://aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                        .to_string(),
+                    Ok((200, response)),
+                ),
+            ],
+        };
+        let mut regional_transport = sample_custom_aiplatform_transport();
+        regional_transport.endpoint.id = "endpoint-regional".to_string();
+        regional_transport.endpoint.base_url =
+            "https://us-central1-aiplatform.googleapis.com".to_string();
+        let mut global_transport = sample_custom_aiplatform_transport();
+        global_transport.endpoint.id = "endpoint-global".to_string();
+
+        let outcome =
+            fetch_models_from_transports(&runtime, &[regional_transport, global_transport])
+                .await
+                .expect("vertex models fetch should merge duplicate endpoint evidence");
+
+        assert!(outcome.has_success);
+        assert_eq!(outcome.cached_models.len(), 1);
+        assert_eq!(
+            outcome.cached_models[0]["endpoint_ids"],
+            json!(["endpoint-global", "endpoint-regional"])
+        );
+        assert_eq!(
+            outcome.successful_endpoint_ids,
+            vec![
+                "endpoint-global".to_string(),
+                "endpoint-regional".to_string()
+            ]
+        );
+        assert_eq!(executed_urls.lock().expect("executed_urls lock").len(), 2);
     }
 
     #[test]

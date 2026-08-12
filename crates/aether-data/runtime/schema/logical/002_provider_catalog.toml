@@ -1630,6 +1630,66 @@ type = "unix_seconds"
 name = "models_provider_id_idx"
 columns = ["provider_id"]
 
+[table.model_endpoint_bindings]
+domain = "provider_catalog"
+order = 95
+primary_key = ["model_id", "endpoint_id"]
+
+[[table.model_endpoint_bindings.columns]]
+name = "model_id"
+type = "text_id"
+length = 64
+
+[[table.model_endpoint_bindings.columns]]
+name = "endpoint_id"
+type = "text_id"
+length = 64
+
+[[table.model_endpoint_bindings.columns]]
+name = "source"
+type = "text"
+length = 32
+default = "migration"
+
+[[table.model_endpoint_bindings.columns]]
+name = "is_active"
+type = "bool"
+default = true
+
+[[table.model_endpoint_bindings.columns]]
+name = "created_at"
+type = "unix_seconds"
+
+[table.model_endpoint_bindings.columns.driver.postgres]
+type = "timestamp with time zone"
+default = { raw = "NOW()" }
+
+[[table.model_endpoint_bindings.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[table.model_endpoint_bindings.columns.driver.postgres]
+type = "timestamp with time zone"
+default = { raw = "NOW()" }
+
+[[table.model_endpoint_bindings.indexes]]
+name = "model_endpoint_bindings_endpoint_active_idx"
+columns = ["endpoint_id", "is_active", "model_id"]
+
+[[table.model_endpoint_bindings.foreign_keys]]
+name = "model_endpoint_bindings_model_id_fkey"
+columns = ["model_id"]
+references_table = "models"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.model_endpoint_bindings.foreign_keys]]
+name = "model_endpoint_bindings_endpoint_id_fkey"
+columns = ["endpoint_id"]
+references_table = "provider_endpoints"
+references_columns = ["id"]
+on_delete = "cascade"
+
 [table.global_models]
 domain = "provider_catalog"
 order = 100

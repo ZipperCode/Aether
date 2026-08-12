@@ -80,6 +80,11 @@ pub(crate) async fn resolve_local_same_format_provider_decision_input(
     };
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
+    input.set_endpoint_capability_context(
+        spec_metadata.api_format,
+        spec_metadata.require_streaming,
+        spec.operation.map(|operation| operation.as_str()),
+    );
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_surface = decision.client_surface;
     input.gateway_credential_carrier = decision.gateway_credential_carrier;
@@ -146,6 +151,8 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
         planner_state,
         trace_id,
         spec_metadata.api_format,
+        spec_metadata.require_streaming,
+        spec.operation.map(|operation| operation.as_str()),
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -253,6 +260,8 @@ pub(crate) async fn build_local_same_format_provider_candidate_attempt_source<'a
         planner_state,
         trace_id,
         spec_metadata.api_format,
+        spec_metadata.require_streaming,
+        spec.operation.map(|operation| operation.as_str()),
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),

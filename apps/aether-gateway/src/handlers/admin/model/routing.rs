@@ -38,6 +38,33 @@ pub(crate) async fn build_admin_global_model_routing_payload(
         .iter()
         .map(|model| model.provider_id.clone())
         .collect::<Vec<_>>();
+    let model_ids = provider_models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let model_bindings = state.list_model_endpoint_bindings(&model_ids).await.ok()?;
+    let mut runtime_quarantines_by_model_and_endpoint = BTreeMap::new();
+    for entry in state.app().endpoint_capability_quarantine_snapshot() {
+        runtime_quarantines_by_model_and_endpoint
+            .entry((
+                entry.model_id().to_string(),
+                entry.endpoint_id().to_string(),
+            ))
+            .or_insert_with(Vec::new)
+            .push(json!({
+                "key_id": entry.key_id(),
+                "client_api_format": entry.client_api_format(),
+                "request_mode": entry.request_mode(),
+                "request_operation": entry.request_operation(),
+            }));
+    }
+    let mut bindings_by_model_and_endpoint = BTreeMap::new();
+    for binding in model_bindings {
+        bindings_by_model_and_endpoint.insert(
+            (binding.model_id.clone(), binding.endpoint_id.clone()),
+            binding,
+        );
+    }
     let providers = state
         .read_provider_catalog_providers_by_ids(&provider_ids)
         .await
@@ -131,7 +158,20 @@ pub(crate) async fn build_admin_global_model_routing_payload(
             .cloned()
             .unwrap_or_default()
         {
-            if endpoint.is_active {
+            let model_binding =
+                bindings_by_model_and_endpoint.get(&(model.id.clone(), endpoint.id.clone()));
+            let runtime_capability_quarantines = runtime_quarantines_by_model_and_endpoint
+                .remove(&(model.id.clone(), endpoint.id.clone()))
+                .unwrap_or_default();
+            let binding_is_active = model_binding.is_some_and(|binding| binding.is_active);
+            let endpoint_is_active = routing_endpoint_is_active(
+                provider.is_active,
+                model.is_active,
+                model.is_available,
+                endpoint.is_active,
+                binding_is_active,
+            );
+            if endpoint_is_active {
                 active_endpoints += 1;
             }
             let mut endpoint_keys = keys_by_provider
@@ -223,9 +263,18 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                 "custom_path": endpoint.custom_path,
                 "format_acceptance_config": endpoint.format_acceptance_config,
                 "is_active": endpoint.is_active,
+                "model_binding": model_binding.map(|binding| json!({
+                    "source": binding.source,
+                    "is_active": binding.is_active,
+                })),
+                "runtime_capability_quarantines": runtime_capability_quarantines,
                 "keys": key_payloads,
                 "total_keys": key_payloads.len(),
-                "active_keys": key_payloads.iter().filter(|value| value["is_active"] == json!(true)).count(),
+                "active_keys": if endpoint_is_active {
+                    key_payloads.iter().filter(|value| value["is_active"] == json!(true)).count()
+                } else {
+                    0
+                },
             }));
         }
         let model_mappings = model
@@ -248,6 +297,7 @@ pub(crate) async fn build_admin_global_model_routing_payload(
             "provider_model_name": &model.provider_model_name,
             "model_mappings": model_mappings,
             "model_is_active": model.is_active,
+            "model_is_available": model.is_available,
             "endpoints": endpoint_payloads,
             "total_endpoints": endpoint_payloads.len(),
             "active_endpoints": active_endpoints,
@@ -320,7 +370,17 @@ pub(crate) async fn build_admin_global_model_routing_payload(
     let active_providers = providers_payload
         .iter()
         .filter(|provider| {
-            provider["is_active"] == json!(true) && provider["model_is_active"] == json!(true)
+            provider["is_active"] == json!(true)
+                && provider["model_is_active"] == json!(true)
+                && provider["model_is_available"] == json!(true)
+                && provider["active_endpoints"].as_u64().unwrap_or(0) > 0
+                && provider["endpoints"].as_array().is_some_and(|endpoints| {
+                    endpoints.iter().any(|endpoint| {
+                        endpoint["is_active"] == json!(true)
+                            && endpoint["model_binding"]["is_active"] == json!(true)
+                            && endpoint["active_keys"].as_u64().unwrap_or(0) > 0
+                    })
+                })
         })
         .count();
     let total_providers = providers_payload.len();
@@ -339,6 +399,35 @@ pub(crate) async fn build_admin_global_model_routing_payload(
         "keep_priority_on_conversion": keep_priority_on_conversion,
         "all_keys_whitelist": all_keys_whitelist,
     }))
+}
+
+fn routing_endpoint_is_active(
+    provider_is_active: bool,
+    model_is_active: bool,
+    model_is_available: bool,
+    endpoint_is_active: bool,
+    binding_is_active: bool,
+) -> bool {
+    provider_is_active
+        && model_is_active
+        && model_is_available
+        && endpoint_is_active
+        && binding_is_active
+}
+
+#[cfg(test)]
+mod routing_endpoint_activity_tests {
+    use super::routing_endpoint_is_active;
+
+    #[test]
+    fn endpoint_activity_requires_every_routing_layer_to_be_active() {
+        assert!(routing_endpoint_is_active(true, true, true, true, true));
+        assert!(!routing_endpoint_is_active(false, true, true, true, true));
+        assert!(!routing_endpoint_is_active(true, false, true, true, true));
+        assert!(!routing_endpoint_is_active(true, true, false, true, true));
+        assert!(!routing_endpoint_is_active(true, true, true, false, true));
+        assert!(!routing_endpoint_is_active(true, true, true, true, false));
+    }
 }
 
 fn key_allowed_models_match_global_model_for_routing(
@@ -710,8 +799,22 @@ pub(crate) async fn build_admin_assign_global_model_to_providers_payload(
             None,
         )
         .map_err(|err| err.to_string())?;
+        let mutation = match state
+            .build_admin_provider_model_create_with_bindings_record(record, None, None)
+            .await
+        {
+            Ok(mutation) => mutation,
+            Err(crate::GatewayError::Client { message, .. }) => {
+                errors.push(json!({
+                    "provider_id": provider_id,
+                    "error": message,
+                }));
+                continue;
+            }
+            Err(err) => return Err(format!("{err:?}")),
+        };
         let created = state
-            .create_admin_provider_model(&record)
+            .create_admin_provider_model_with_bindings(&mutation)
             .await
             .map_err(|err| format!("{err:?}"))?;
         if let Some(created) = created {

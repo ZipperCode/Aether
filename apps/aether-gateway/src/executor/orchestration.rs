@@ -39,7 +39,10 @@ use crate::ai_serving::LocalExecutionAttemptSource;
 use crate::api::response::{
     attach_control_metadata_headers, build_client_response_from_parts_with_mutator,
 };
-use crate::constants::{CONTROL_CANDIDATE_ID_HEADER, EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS};
+use crate::constants::{
+    CONTROL_CANDIDATE_ID_HEADER, EXECUTION_PATH_EXECUTION_RUNTIME_SYNC,
+    EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS,
+};
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::sync::{
     build_openai_image_sync_json_whitespace_heartbeat_stream,
@@ -51,8 +54,8 @@ use crate::executor::candidate_loop::{
     execute_sync_plan_and_reports_with_transfer_tracker, ProviderTransferTracker,
 };
 use crate::executor::{
-    record_failed_usage_for_exhausted_request, LocalExecutionExhaustion,
-    LocalExecutionRequestOutcome,
+    record_failed_usage_for_deferred_upstream_response, record_failed_usage_for_exhausted_request,
+    take_deferred_upstream_exhaustion, LocalExecutionExhaustion, LocalExecutionRequestOutcome,
 };
 use crate::handlers::shared::system_config_bool;
 use crate::request_diagnostics::{current_request_diagnostics, scope_request_diagnostics_with};
@@ -847,19 +850,6 @@ where
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(1);
     let request_diagnostics = current_request_diagnostics();
 
-    tokio::spawn(async move {
-        scope_request_diagnostics_with(request_diagnostics, async move {
-            let bytes = standard_text_sync_heartbeat_final_bytes(
-                client_api_format.as_str(),
-                redaction_slot.as_ref(),
-                execute(state, parts, trace_id, decision, plan_kind, started_at).await,
-            )
-            .await;
-            let _ = tx.send(Ok(Bytes::from(bytes))).await;
-        })
-        .await;
-    });
-
     let headers = BTreeMap::from([(
         CONTENT_TYPE.as_str().to_string(),
         "application/json".to_string(),
@@ -884,7 +874,39 @@ where
             Ok(())
         },
     )?;
-    attach_control_metadata_headers(response, request_id.as_deref(), None)
+    let response = attach_control_metadata_headers(response, request_id.as_deref(), None)?;
+    let client_status_code = response.status().as_u16();
+    let client_headers = response.headers().clone();
+    let state_for_deferred_usage = state.clone();
+
+    tokio::spawn(async move {
+        scope_request_diagnostics_with(request_diagnostics, async move {
+            let mut result = execute(state, parts, trace_id, decision, plan_kind, started_at).await;
+            if let Ok(LocalExecutionRequestOutcome::Responded(response)) = &mut result {
+                if let Some(exhaustion) = take_deferred_upstream_exhaustion(response) {
+                    record_failed_usage_for_deferred_upstream_response(
+                        &state_for_deferred_usage,
+                        exhaustion,
+                        &started_at,
+                        client_status_code,
+                        &client_headers,
+                        EXECUTION_PATH_EXECUTION_RUNTIME_SYNC,
+                    )
+                    .await;
+                }
+            }
+            let bytes = standard_text_sync_heartbeat_final_bytes(
+                client_api_format.as_str(),
+                redaction_slot.as_ref(),
+                result,
+            )
+            .await;
+            let _ = tx.send(Ok(Bytes::from(bytes))).await;
+        })
+        .await;
+    });
+
+    Ok(response)
 }
 
 async fn record_standard_text_sync_heartbeat_exhaustion(
@@ -1112,6 +1134,45 @@ fn build_openai_image_sync_heartbeat_shell_response(
     attempts: Vec<AiSyncAttempt>,
     transfer_tracker: ProviderTransferTracker,
 ) -> Result<Response<Body>, GatewayError> {
+    build_openai_image_sync_heartbeat_shell_response_with_executor(
+        state,
+        request_path,
+        trace_id,
+        decision,
+        plan_kind,
+        attempts,
+        transfer_tracker,
+        execute_openai_image_sync_heartbeat_attempts,
+    )
+}
+
+fn build_openai_image_sync_heartbeat_shell_response_with_executor<F, Fut>(
+    state: AppState,
+    request_path: String,
+    trace_id: String,
+    decision: GatewayControlDecision,
+    plan_kind: String,
+    attempts: Vec<AiSyncAttempt>,
+    transfer_tracker: ProviderTransferTracker,
+    execute: F,
+) -> Result<Response<Body>, GatewayError>
+where
+    F: FnOnce(
+            AppState,
+            String,
+            String,
+            GatewayControlDecision,
+            String,
+            Vec<AiSyncAttempt>,
+            ProviderTransferTracker,
+            Instant,
+        ) -> Fut
+        + Send
+        + 'static,
+    Fut: std::future::Future<Output = Result<LocalExecutionRequestOutcome, GatewayError>>
+        + Send
+        + 'static,
+{
     let request_id = attempts
         .first()
         .map(|attempt| attempt.plan.request_id.clone())
@@ -1121,27 +1182,6 @@ fn build_openai_image_sync_heartbeat_shell_response(
     let started_at = Instant::now();
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(1);
     let request_diagnostics = current_request_diagnostics();
-
-    tokio::spawn(async move {
-        scope_request_diagnostics_with(request_diagnostics, async move {
-            let bytes = openai_image_sync_heartbeat_final_bytes(
-                execute_openai_image_sync_heartbeat_attempts(
-                    state,
-                    request_path,
-                    trace_id,
-                    decision,
-                    plan_kind,
-                    attempts,
-                    transfer_tracker,
-                    started_at,
-                )
-                .await,
-            )
-            .await;
-            let _ = tx.send(Ok(Bytes::from(bytes))).await;
-        })
-        .await;
-    });
 
     let headers = BTreeMap::from([(
         CONTENT_TYPE.as_str().to_string(),
@@ -1167,7 +1207,44 @@ fn build_openai_image_sync_heartbeat_shell_response(
             Ok(())
         },
     )?;
-    attach_control_metadata_headers(response, request_id.as_deref(), None)
+    let response = attach_control_metadata_headers(response, request_id.as_deref(), None)?;
+    let client_status_code = response.status().as_u16();
+    let client_headers = response.headers().clone();
+    let state_for_deferred_usage = state.clone();
+
+    tokio::spawn(async move {
+        scope_request_diagnostics_with(request_diagnostics, async move {
+            let mut result = execute(
+                state,
+                request_path,
+                trace_id,
+                decision,
+                plan_kind,
+                attempts,
+                transfer_tracker,
+                started_at,
+            )
+            .await;
+            if let Ok(LocalExecutionRequestOutcome::Responded(response)) = &mut result {
+                if let Some(exhaustion) = take_deferred_upstream_exhaustion(response) {
+                    record_failed_usage_for_deferred_upstream_response(
+                        &state_for_deferred_usage,
+                        exhaustion,
+                        &started_at,
+                        client_status_code,
+                        &client_headers,
+                        EXECUTION_PATH_EXECUTION_RUNTIME_SYNC,
+                    )
+                    .await;
+                }
+            }
+            let bytes = openai_image_sync_heartbeat_final_bytes(result).await;
+            let _ = tx.send(Ok(Bytes::from(bytes))).await;
+        })
+        .await;
+    });
+
+    Ok(response)
 }
 
 async fn execute_openai_image_sync_heartbeat_attempts(
@@ -1568,7 +1645,10 @@ mod tests {
     use super::*;
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::repository::usage::InMemoryUsageReadRepository;
-    use aether_data_contracts::repository::usage::UsageReadRepository;
+    use aether_data_contracts::repository::candidates::{
+        RequestCandidateStatus, StoredRequestCandidate,
+    };
+    use aether_data_contracts::repository::usage::{UsageBodyCaptureState, UsageReadRepository};
     use aether_usage_runtime::UsageRuntimeConfig;
     use futures_util::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1932,6 +2012,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_image_sync_heartbeat_records_deferred_usage_for_shell_response_once() {
+        let request_id = "trace-image-heartbeat-retry";
+        let plan = test_openai_image_heartbeat_plan("endpoint-deferred", "candidate-deferred");
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    request_candidate_repository,
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let state_for_assert = state.clone();
+        let exhaustion = crate::executor::build_local_execution_exhaustion(
+            &state,
+            &plan,
+            Some(&json!({"candidate_index": 0, "retry_index": 0})),
+        )
+        .await;
+        let deferred_response = crate::executor::mark_deferred_upstream_response(
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"error":{"type":"rate_limit","message":"slow down"}}"#,
+                ))
+                .expect("deferred response should build"),
+            exhaustion,
+        );
+
+        let response = build_openai_image_sync_heartbeat_shell_response_with_executor(
+            state,
+            "/v1/images/generations".to_string(),
+            request_id.to_string(),
+            test_openai_image_heartbeat_decision(),
+            TEST_OPENAI_IMAGE_SYNC_PLAN_KIND.to_string(),
+            vec![test_openai_image_heartbeat_attempt(
+                0,
+                "endpoint-deferred",
+                "candidate-deferred",
+            )],
+            ProviderTransferTracker::default(),
+            move |_state,
+                  _request_path,
+                  _trace_id,
+                  _decision,
+                  _plan_kind,
+                  _attempts,
+                  _transfer_tracker,
+                  _started_at| async move {
+                Ok(LocalExecutionRequestOutcome::responded(deferred_response))
+            },
+        )
+        .expect("heartbeat shell should build");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(
+            response.into_body(),
+            crate::headers::max_internal_buffered_body_bytes(),
+        )
+        .await
+        .expect("heartbeat response body should complete");
+        let body: Value = serde_json::from_slice(&body).expect("body should decode");
+        assert_eq!(body["error"]["upstream_status"], json!(429));
+
+        let stored = usage_repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("usage should read")
+            .expect("deferred usage should be terminal");
+        assert_eq!(stored.status, "failed");
+        assert_eq!(stored.billing_status, "void");
+        assert_eq!(stored.status_code, Some(StatusCode::OK.as_u16()));
+        assert_eq!(
+            stored.response_body_state,
+            Some(UsageBodyCaptureState::Unavailable)
+        );
+        assert_eq!(
+            stored.client_response_body_state,
+            Some(UsageBodyCaptureState::Unavailable)
+        );
+        assert_eq!(
+            state_for_assert
+                .usage_runtime
+                .metrics_snapshot()
+                .terminal_submission_rejected_total,
+            0,
+            "deferred exhaustion must be consumed and recorded exactly once"
+        );
+    }
+
+    #[tokio::test]
     async fn openai_image_sync_heartbeat_attempts_retry_first_candidate_then_return_second() {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_for_override = Arc::clone(&call_count);
@@ -2252,6 +2429,150 @@ mod tests {
             "trace-standard-text-heartbeat-retry",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn standard_text_sync_heartbeat_records_deferred_usage_for_shell_response() {
+        let plan = test_standard_text_heartbeat_plan(
+            "endpoint-deferred",
+            "candidate-deferred",
+            "openai:responses:compact",
+        );
+        let request_id = plan.request_id.clone();
+        let failed_candidate = StoredRequestCandidate::new(
+            "candidate-deferred".to_string(),
+            request_id.clone(),
+            None,
+            None,
+            None,
+            None,
+            2,
+            0,
+            Some("provider-openai".to_string()),
+            Some("endpoint-deferred".to_string()),
+            Some("key-openai".to_string()),
+            RequestCandidateStatus::Failed,
+            None,
+            false,
+            Some(503),
+            Some("overloaded".to_string()),
+            Some("provider overloaded".to_string()),
+            Some(10),
+            None,
+            Some(json!({
+                "upstream_response": {
+                    "headers": {"retry-after": "7"},
+                    "body": {"error": {"message": "provider overloaded"}}
+                }
+            })),
+            None,
+            100,
+            Some(101),
+            Some(111),
+        )
+        .expect("failed candidate should build");
+        let candidate_repository =
+            Arc::new(InMemoryRequestCandidateRepository::seed([failed_candidate]));
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    candidate_repository,
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let exhaustion = crate::executor::build_local_execution_exhaustion(
+            &state,
+            &plan,
+            Some(&json!({"candidate_index": 2})),
+        )
+        .await;
+        let deferred_response = crate::executor::mark_deferred_upstream_response(
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":{"message":"provider overloaded"}}"#))
+                .expect("deferred response should build"),
+            exhaustion,
+        );
+        let (parts, _) = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/v1/responses")
+            .body(())
+            .expect("request should build")
+            .into_parts();
+
+        let response = build_standard_text_sync_heartbeat_shell_response(
+            state,
+            parts,
+            request_id.clone(),
+            test_standard_text_heartbeat_decision(),
+            TEST_STANDARD_TEXT_SYNC_PLAN_KIND.to_string(),
+            move |_state, _parts, _trace_id, _decision, _plan_kind, _started_at| async move {
+                Ok(LocalExecutionRequestOutcome::responded(deferred_response))
+            },
+        )
+        .expect("heartbeat shell should build");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-cache, no-transform"))
+        );
+        assert_eq!(
+            response.headers().get("x-accel-buffering"),
+            Some(&HeaderValue::from_static("no"))
+        );
+        let body = to_bytes(
+            response.into_body(),
+            crate::headers::max_internal_buffered_body_bytes(),
+        )
+        .await
+        .expect("heartbeat response body should complete");
+        assert!(!body.is_empty());
+
+        let stored = usage_repository
+            .find_by_request_id(request_id.as_str())
+            .await
+            .expect("usage should read")
+            .expect("deferred usage should be terminal");
+        assert_eq!(stored.status, "failed");
+        assert_eq!(stored.billing_status, "void");
+        assert_eq!(stored.status_code, Some(StatusCode::OK.as_u16()));
+        assert_eq!(
+            stored
+                .response_headers
+                .as_ref()
+                .and_then(|headers| headers.get("retry-after")),
+            Some(&json!("7"))
+        );
+        assert_eq!(
+            stored.response_body_state,
+            Some(UsageBodyCaptureState::Unavailable)
+        );
+        assert_eq!(
+            stored.client_response_body_state,
+            Some(UsageBodyCaptureState::Unavailable)
+        );
+        let client_headers = stored
+            .client_response_headers
+            .as_ref()
+            .expect("shell response headers should be recorded");
+        assert_eq!(client_headers["content-type"], json!("application/json"));
+        assert_eq!(
+            client_headers["cache-control"],
+            json!("no-cache, no-transform")
+        );
+        assert_eq!(client_headers["x-accel-buffering"], json!("no"));
     }
 
     #[test]

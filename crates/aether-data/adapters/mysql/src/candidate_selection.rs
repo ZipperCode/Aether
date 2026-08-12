@@ -50,6 +50,10 @@ FROM providers p
 INNER JOIN provider_endpoints pe ON pe.provider_id = p.id
 INNER JOIN provider_api_keys pak ON pak.provider_id = p.id
 INNER JOIN models m ON m.provider_id = p.id
+INNER JOIN model_endpoint_bindings meb
+  ON meb.model_id = m.id
+ AND meb.endpoint_id = pe.id
+ AND meb.is_active = 1
 INNER JOIN global_models gm ON gm.id = m.global_model_id
 WHERE p.is_active = 1
   AND pe.is_active = 1
@@ -1118,6 +1122,13 @@ mod tests {
         StoredPoolKeyCandidateOrder, StoredPoolKeyCandidateRowsByKeyIdsQuery,
         StoredPoolKeyCandidateRowsQuery,
     };
+
+    #[test]
+    fn mysql_candidate_query_requires_an_active_model_endpoint_binding() {
+        let source = include_str!("candidate_selection.rs");
+        assert!(source.contains("INNER JOIN model_endpoint_bindings meb"));
+        assert!(source.contains("AND meb.is_active = 1"));
+    }
 
     #[test]
     fn api_format_page_query_uses_portable_sql_pagination_and_stable_order() {

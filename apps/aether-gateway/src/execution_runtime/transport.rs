@@ -4018,13 +4018,21 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 
 pub(crate) fn collect_response_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
     header_map_to_string_map(headers)
+        .into_iter()
+        .filter(|(name, _)| should_collect_provider_response_header(name))
+        .collect()
 }
 
 fn collect_tunnel_response_headers(headers: &[(String, String)]) -> BTreeMap<String, String> {
     headers
         .iter()
+        .filter(|(name, _)| should_collect_provider_response_header(name))
         .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
         .collect()
+}
+
+fn should_collect_provider_response_header(name: &str) -> bool {
+    !name.eq_ignore_ascii_case(crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
 }
 
 fn execution_header_for_log<'a>(
@@ -4199,6 +4207,7 @@ mod tests {
     use super::{
         append_upstream_response_body_chunk_with_limit, build_browser_wreq_client, build_client,
         build_direct_tunnel_request_meta, build_execution_response_body, build_request_headers,
+        collect_response_headers, collect_tunnel_response_headers,
         decode_response_body_bytes_with_limit, execute_sync_plan, execution_response_body_mode,
         record_manual_proxy_request_failure, record_manual_proxy_request_outcome,
         record_manual_proxy_request_success, record_manual_proxy_stream_error,
@@ -4257,6 +4266,47 @@ mod tests {
         );
         assert!(!materialized.contains_key("x-aether-grok-runtime"));
         assert!(!materialized.contains_key("x-aether-future-control"));
+    }
+
+    #[test]
+    fn provider_response_cannot_forge_local_runtime_miss_reason() {
+        let mut headers = AxumHeaderMap::new();
+        headers.insert("content-type", "application/json".parse().expect("header"));
+        headers.insert(
+            crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER,
+            "no_local_sync_plans".parse().expect("header"),
+        );
+
+        let collected = collect_response_headers(&headers);
+
+        assert_eq!(
+            collected.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(
+            !collected.contains_key(crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
+        );
+    }
+
+    #[test]
+    fn tunneled_provider_response_cannot_forge_local_runtime_miss_reason() {
+        let headers = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            (
+                crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER.to_uppercase(),
+                "no_local_sync_plans".to_string(),
+            ),
+        ];
+
+        let collected = collect_tunnel_response_headers(&headers);
+
+        assert_eq!(
+            collected.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(
+            !collected.contains_key(crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
+        );
     }
 
     #[test]

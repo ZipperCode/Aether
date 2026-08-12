@@ -44,7 +44,8 @@ use crate::control::{
 use crate::executor::{
     beautify_local_execution_client_error_message, build_local_execution_runtime_miss_context,
     maybe_execute_stream_request, maybe_execute_sync_request,
-    record_failed_usage_for_exhausted_request, record_failed_usage_for_runtime_miss_request,
+    record_failed_usage_for_deferred_upstream_response, record_failed_usage_for_exhausted_request,
+    record_failed_usage_for_runtime_miss_request, take_deferred_upstream_exhaustion,
     LocalExecutionRequestOutcome,
 };
 use crate::frontdoor_loop_guard::{
@@ -1668,7 +1669,20 @@ async fn proxy_request_inner(
                 "gateway local stream execution returned to proxy"
             );
             match stream_outcome {
-                LocalExecutionRequestOutcome::Responded(execution_runtime_response) => {
+                LocalExecutionRequestOutcome::Responded(mut execution_runtime_response) => {
+                    if let Some(exhaustion) =
+                        take_deferred_upstream_exhaustion(&mut execution_runtime_response)
+                    {
+                        record_failed_usage_for_deferred_upstream_response(
+                            &state,
+                            exhaustion,
+                            &started_at,
+                            execution_runtime_response.status().as_u16(),
+                            execution_runtime_response.headers(),
+                            EXECUTION_PATH_EXECUTION_RUNTIME_STREAM,
+                        )
+                        .await;
+                    }
                     let execution_runtime_response = restore_redacted_stream_execution_response(
                         execution_runtime_response,
                         &redaction_slot,
@@ -1727,7 +1741,20 @@ async fn proxy_request_inner(
             execute_sync_started_at.elapsed().as_millis() as u64,
         );
         match sync_outcome {
-            LocalExecutionRequestOutcome::Responded(execution_runtime_response) => {
+            LocalExecutionRequestOutcome::Responded(mut execution_runtime_response) => {
+                if let Some(exhaustion) =
+                    take_deferred_upstream_exhaustion(&mut execution_runtime_response)
+                {
+                    record_failed_usage_for_deferred_upstream_response(
+                        &state,
+                        exhaustion,
+                        &started_at,
+                        execution_runtime_response.status().as_u16(),
+                        execution_runtime_response.headers(),
+                        EXECUTION_PATH_EXECUTION_RUNTIME_SYNC,
+                    )
+                    .await;
+                }
                 let execution_runtime_response = restore_redacted_sync_execution_response(
                     execution_runtime_response,
                     &redaction_slot,
@@ -1788,7 +1815,20 @@ async fn proxy_request_inner(
                 execute_stream_started_at.elapsed().as_millis() as u64,
             );
             match stream_outcome {
-                LocalExecutionRequestOutcome::Responded(execution_runtime_response) => {
+                LocalExecutionRequestOutcome::Responded(mut execution_runtime_response) => {
+                    if let Some(exhaustion) =
+                        take_deferred_upstream_exhaustion(&mut execution_runtime_response)
+                    {
+                        record_failed_usage_for_deferred_upstream_response(
+                            &state,
+                            exhaustion,
+                            &started_at,
+                            execution_runtime_response.status().as_u16(),
+                            execution_runtime_response.headers(),
+                            EXECUTION_PATH_EXECUTION_RUNTIME_STREAM,
+                        )
+                        .await;
+                    }
                     let execution_runtime_response = restore_redacted_stream_execution_response(
                         execution_runtime_response,
                         &redaction_slot,
@@ -1821,13 +1861,26 @@ async fn proxy_request_inner(
             )
             .await?
             {
-                LocalExecutionRequestOutcome::Responded(control_response) => {
+                LocalExecutionRequestOutcome::Responded(mut control_response) => {
                     let reason = GatewayFallbackReason::ControlExecuteEmergency;
                     let control_execution_path = if stream_request {
                         EXECUTION_PATH_CONTROL_EXECUTE_STREAM
                     } else {
                         EXECUTION_PATH_CONTROL_EXECUTE_SYNC
                     };
+                    if let Some(exhaustion) =
+                        take_deferred_upstream_exhaustion(&mut control_response)
+                    {
+                        record_failed_usage_for_deferred_upstream_response(
+                            &state,
+                            exhaustion,
+                            &started_at,
+                            control_response.status().as_u16(),
+                            control_response.headers(),
+                            control_execution_path,
+                        )
+                        .await;
+                    }
                     state.record_fallback_metric(
                         GatewayFallbackMetricKind::ControlExecuteFallback,
                         control_decision,

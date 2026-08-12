@@ -4,6 +4,7 @@ mod auth_runtime;
 mod candidate_page;
 mod dashboard_response;
 mod direct_plan_bypass;
+mod endpoint_capability;
 mod scheduler_affinity;
 mod system_config;
 
@@ -30,6 +31,9 @@ pub(crate) use candidate_page::{
 };
 pub(crate) use dashboard_response::DashboardResponseCache;
 pub(crate) use direct_plan_bypass::DirectPlanBypassCache;
+pub(crate) use endpoint_capability::{
+    EndpointCapabilityQuarantineCache, EndpointCapabilityQuarantineKey,
+};
 pub(crate) use scheduler_affinity::{
     SchedulerAffinityCache, SchedulerAffinitySnapshotEntry, SchedulerAffinityTarget,
 };

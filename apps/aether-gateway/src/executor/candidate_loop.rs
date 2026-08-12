@@ -30,10 +30,10 @@ use crate::executor::{
 use crate::handlers::shared::provider_pool::release_admin_provider_pool_key_lease;
 use crate::log_ids::short_request_id;
 use crate::orchestration::{
-    local_execution_candidate_metadata_from_report_context,
+    apply_local_execution_effect, local_execution_candidate_metadata_from_report_context,
     local_failover_policy_from_report_context, resolve_local_failover_policy,
-    resolve_local_transport_failover_analysis_for_attempt, LocalFailoverDecision,
-    LocalFailoverPolicy,
+    resolve_local_transport_failover_analysis_for_attempt, LocalExecutionEffect,
+    LocalExecutionEffectContext, LocalFailoverDecision, LocalFailoverPolicy,
 };
 use crate::privacy::RedactionExecutionCandidateId;
 use crate::request_candidate_runtime::{
@@ -133,9 +133,12 @@ where
             AiAttemptLoopOutcome::Responded(response) => {
                 Ok(LocalExecutionRequestOutcome::responded(response))
             }
-            AiAttemptLoopOutcome::Deferred(response) => Ok(
-                LocalExecutionRequestOutcome::responded(mark_deferred_upstream_response(response)),
-            ),
+            AiAttemptLoopOutcome::Deferred {
+                response,
+                exhaustion,
+            } => Ok(LocalExecutionRequestOutcome::responded(
+                mark_deferred_upstream_response(response, exhaustion),
+            )),
             AiAttemptLoopOutcome::Exhausted(exhaustion) => {
                 Ok(LocalExecutionRequestOutcome::Exhausted(exhaustion))
             }
@@ -281,25 +284,32 @@ where
             return Ok(AiAttemptExecutionOutcome::Responded(response));
         }
         prewarm_direct_reqwest_candidate_client(plan);
-        let _permit = acquire_upstream_execution_gate(self.state, self.trace_id).await?;
-        let upstream_execution_gate_held_started_at = std::time::Instant::now();
-        let mut execution = execute_execution_runtime_sync_with_retry_scope(
+        let admission_report_context_owned = if attempt.report_context_ref().is_none() {
+            report_context.clone()
+        } else {
+            None
+        };
+        let admission_report_context = attempt
+            .report_context_ref()
+            .or(admission_report_context_owned.as_ref());
+        let mut execution = execute_sync_candidate_with_admission(
             self.state,
-            self.parts.uri.path(),
-            plan.clone(),
             self.trace_id,
-            self.decision,
             self.plan_kind,
-            attempt.report_kind(),
-            report_context,
+            plan,
+            admission_report_context,
+            execute_execution_runtime_sync_with_retry_scope(
+                self.state,
+                self.parts.uri.path(),
+                plan.clone(),
+                self.trace_id,
+                self.decision,
+                self.plan_kind,
+                attempt.report_kind(),
+                report_context,
+            ),
         )
         .await?;
-        observe_gateway_stage_ms(
-            "upstream_execution_gate_held",
-            upstream_execution_gate_held_started_at
-                .elapsed()
-                .as_millis() as u64,
-        );
         match &mut execution {
             AiAttemptExecutionOutcome::Responded(response)
             | AiAttemptExecutionOutcome::Retry {
@@ -412,9 +422,12 @@ where
             AiAttemptLoopOutcome::Responded(response) => {
                 Ok(LocalExecutionRequestOutcome::responded(response))
             }
-            AiAttemptLoopOutcome::Deferred(response) => Ok(
-                LocalExecutionRequestOutcome::responded(mark_deferred_upstream_response(response)),
-            ),
+            AiAttemptLoopOutcome::Deferred {
+                response,
+                exhaustion,
+            } => Ok(LocalExecutionRequestOutcome::responded(
+                mark_deferred_upstream_response(response, exhaustion),
+            )),
             AiAttemptLoopOutcome::Exhausted(exhaustion) => {
                 Ok(LocalExecutionRequestOutcome::Exhausted(exhaustion))
             }
@@ -786,7 +799,7 @@ where
     Attempt: AiExecutionAttempt + Send + Sync + 'static,
 {
     let mut last_attempted = None;
-    let mut fallback_response = None;
+    let mut fallback = None;
 
     loop {
         let next_started_at = std::time::Instant::now();
@@ -835,8 +848,12 @@ where
                 scope,
                 fallback_response: attempt_fallback_response,
             } => {
-                if attempt_fallback_response.is_some() {
-                    fallback_response = attempt_fallback_response;
+                if let Some(response) = attempt_fallback_response {
+                    fallback = Some((
+                        response,
+                        attempt.execution_plan().clone(),
+                        attempt.report_context(),
+                    ));
                 }
                 apply_attempt_retry_scope(source, &attempt, scope).await?;
             }
@@ -854,15 +871,21 @@ where
         last_attempted = Some((attempt.execution_plan().clone(), attempt.report_context()));
     }
 
-    if let Some(response) = fallback_response {
-        return Ok(LocalExecutionRequestOutcome::responded(
-            mark_deferred_upstream_response(response),
-        ));
-    }
+    let remaining = source.drain_execution_attempts().await?;
+    port.mark_unused_attempts(remaining).await?;
 
     let Some((last_plan, last_report_context)) = last_attempted else {
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
+
+    if let Some((response, fallback_plan, fallback_report_context)) = fallback {
+        let exhaustion = port
+            .build_exhaustion(fallback_plan, fallback_report_context)
+            .await?;
+        return Ok(LocalExecutionRequestOutcome::responded(
+            mark_deferred_upstream_response(response, exhaustion),
+        ));
+    }
 
     Ok(LocalExecutionRequestOutcome::Exhausted(
         port.build_exhaustion(last_plan, last_report_context)
@@ -1267,7 +1290,7 @@ fn should_record_candidate_admission_timeout(error: &GatewayError) -> bool {
     )
 }
 
-async fn record_stream_candidate_admission_timeout(
+async fn record_candidate_admission_timeout(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     plan: &aether_contracts::ExecutionPlan,
     report_context: Option<&serde_json::Value>,
@@ -1292,12 +1315,13 @@ async fn record_stream_candidate_admission_timeout(
     .await;
 }
 
-fn log_stream_candidate_admission_timeout(
+fn log_candidate_admission_timeout(
     trace_id: &str,
     plan_kind: &str,
     plan: &aether_contracts::ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     error: &GatewayError,
+    execution_mode: &'static str,
 ) {
     let provider_name = plan.provider_name.as_deref().unwrap_or("-");
     let model_name = plan.model_name.as_deref().unwrap_or("-");
@@ -1313,9 +1337,14 @@ fn log_stream_candidate_admission_timeout(
         } => (*gate, *queue_budget_ms),
         _ => ("-", 0),
     };
+    let event_name = match execution_mode {
+        "sync" => "local_sync_candidate_admission_timeout",
+        _ => "local_stream_candidate_admission_timeout",
+    };
     warn!(
-        event_name = "local_stream_candidate_admission_timeout",
+        event_name,
         log_type = "event",
+        execution_mode,
         trace_id = %trace_id,
         plan_kind,
         request_id = %short_request_id(plan.request_id.as_str()),
@@ -1327,8 +1356,89 @@ fn log_stream_candidate_admission_timeout(
         candidate_index = candidate_index.as_str(),
         gate,
         queue_budget_ms,
-        "gateway local stream candidate admission timed out; retrying next candidate"
+        "gateway local candidate admission timed out; retrying next candidate"
     );
+}
+
+async fn execute_sync_candidate_with_admission<Fut>(
+    state: &(impl CandidateAdmissionRuntime + ?Sized),
+    trace_id: &str,
+    plan_kind: &str,
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    execute: Fut,
+) -> Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>
+where
+    Fut: std::future::Future<
+            Output = Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
+        > + Send,
+{
+    let candidate_started_unix_ms = current_unix_ms();
+    let permit = match acquire_upstream_execution_gate(state, trace_id).await {
+        Ok(permit) => permit,
+        Err(err) if is_candidate_level_admission_timeout(&err) => {
+            state
+                .release_admission_candidate_pool_lease(plan, report_context)
+                .await;
+            record_candidate_admission_timeout(
+                state,
+                plan,
+                report_context,
+                candidate_started_unix_ms,
+                &err,
+            )
+            .await;
+            log_candidate_admission_timeout(
+                trace_id,
+                plan_kind,
+                plan,
+                report_context,
+                &err,
+                "sync",
+            );
+            return Ok(AiAttemptExecutionOutcome::retry(
+                AiAttemptRetryScope::Candidate,
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+    let permit_held_started_at = std::time::Instant::now();
+    let outcome = execute.await;
+    drop(permit);
+    observe_gateway_stage_ms(
+        "upstream_execution_gate_held",
+        permit_held_started_at.elapsed().as_millis() as u64,
+    );
+    match outcome {
+        Ok(outcome) => Ok(outcome),
+        Err(err) if is_candidate_level_admission_timeout(&err) => {
+            state
+                .release_admission_candidate_pool_lease(plan, report_context)
+                .await;
+            if should_record_candidate_admission_timeout(&err) {
+                record_candidate_admission_timeout(
+                    state,
+                    plan,
+                    report_context,
+                    candidate_started_unix_ms,
+                    &err,
+                )
+                .await;
+            }
+            log_candidate_admission_timeout(
+                trace_id,
+                plan_kind,
+                plan,
+                report_context,
+                &err,
+                "sync",
+            );
+            Ok(AiAttemptExecutionOutcome::retry(
+                AiAttemptRetryScope::Candidate,
+            ))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 #[derive(Debug)]
@@ -1338,7 +1448,7 @@ enum StreamCandidateWatchdogOutcome {
 }
 
 async fn execute_stream_candidate_with_watchdog<Fut>(
-    state: &(impl RequestCandidateRuntimeWriter + UpstreamExecutionGateProvider + ?Sized),
+    state: &(impl CandidateAdmissionRuntime + ?Sized),
     trace_id: &str,
     plan_kind: &str,
     plan: &aether_contracts::ExecutionPlan,
@@ -1357,7 +1467,10 @@ where
     let permit = match acquire_upstream_execution_gate(state, trace_id).await {
         Ok(permit) => permit,
         Err(err) if is_candidate_level_admission_timeout(&err) => {
-            record_stream_candidate_admission_timeout(
+            state
+                .release_admission_candidate_pool_lease(plan, report_context)
+                .await;
+            record_candidate_admission_timeout(
                 state,
                 plan,
                 report_context,
@@ -1365,7 +1478,14 @@ where
                 &err,
             )
             .await;
-            log_stream_candidate_admission_timeout(trace_id, plan_kind, plan, report_context, &err);
+            log_candidate_admission_timeout(
+                trace_id,
+                plan_kind,
+                plan,
+                report_context,
+                &err,
+                "stream",
+            );
             return Ok(StreamCandidateWatchdogOutcome::Executed(
                 AiAttemptExecutionOutcome::retry(AiAttemptRetryScope::Candidate),
             ));
@@ -1386,6 +1506,9 @@ where
             if watchdog_progress.terminal_started() {
                 Some(execution.await)
             } else {
+                // Watchdog records the timeout below. Claim terminal ownership before dropping
+                // the execution future so its cancellation guard cannot overwrite the failure.
+                watchdog_progress.claim_timeout_terminal();
                 None
             }
         }
@@ -1393,6 +1516,9 @@ where
     let outcome = match execution_result {
         Some(result) => result.map(StreamCandidateWatchdogOutcome::Executed),
         None => {
+            state
+                .record_admission_candidate_stream_timeout(plan, report_context)
+                .await;
             let finished_at_unix_ms = current_unix_ms();
             let request_id = short_request_id(plan.request_id.as_str());
             let provider_name = plan.provider_name.as_deref().unwrap_or("-");
@@ -1473,8 +1599,11 @@ where
         }
         Err(err) if is_candidate_level_admission_timeout(&err) => {
             drop(permit_hold);
+            state
+                .release_admission_candidate_pool_lease(plan, report_context)
+                .await;
             if should_record_candidate_admission_timeout(&err) {
-                record_stream_candidate_admission_timeout(
+                record_candidate_admission_timeout(
                     state,
                     plan,
                     report_context,
@@ -1483,7 +1612,14 @@ where
                 )
                 .await;
             }
-            log_stream_candidate_admission_timeout(trace_id, plan_kind, plan, report_context, &err);
+            log_candidate_admission_timeout(
+                trace_id,
+                plan_kind,
+                plan,
+                report_context,
+                &err,
+                "stream",
+            );
             Ok(StreamCandidateWatchdogOutcome::Executed(
                 AiAttemptExecutionOutcome::retry(AiAttemptRetryScope::Candidate),
             ))
@@ -1617,6 +1753,60 @@ trait UpstreamExecutionGateProvider {
     fn upstream_execution_gate_queue_budget(&self) -> Duration;
 }
 
+#[async_trait]
+trait CandidateAdmissionRuntime:
+    RequestCandidateRuntimeWriter + UpstreamExecutionGateProvider + Sync
+{
+    async fn release_admission_candidate_pool_lease(
+        &self,
+        _plan: &aether_contracts::ExecutionPlan,
+        _report_context: Option<&serde_json::Value>,
+    ) {
+    }
+
+    async fn record_admission_candidate_stream_timeout(
+        &self,
+        _plan: &aether_contracts::ExecutionPlan,
+        _report_context: Option<&serde_json::Value>,
+    ) {
+    }
+}
+
+#[async_trait]
+impl CandidateAdmissionRuntime for AppState {
+    async fn release_admission_candidate_pool_lease(
+        &self,
+        plan: &aether_contracts::ExecutionPlan,
+        report_context: Option<&serde_json::Value>,
+    ) {
+        apply_local_execution_effect(
+            self,
+            LocalExecutionEffectContext {
+                plan,
+                report_context,
+            },
+            LocalExecutionEffect::PoolLeaseRelease,
+        )
+        .await;
+    }
+
+    async fn record_admission_candidate_stream_timeout(
+        &self,
+        plan: &aether_contracts::ExecutionPlan,
+        report_context: Option<&serde_json::Value>,
+    ) {
+        apply_local_execution_effect(
+            self,
+            LocalExecutionEffectContext {
+                plan,
+                report_context,
+            },
+            LocalExecutionEffect::PoolStreamTimeout,
+        )
+        .await;
+    }
+}
+
 impl UpstreamExecutionGateProvider for AppState {
     fn upstream_execution_gate(&self) -> Option<&aether_runtime::ConcurrencyGate> {
         self.upstream_execution_gate.as_deref()
@@ -1687,6 +1877,7 @@ pub(crate) async fn mark_unused_local_candidate_items<T, FPlan, FContext>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
     use aether_contracts::{ExecutionPlan, ExecutionTimeouts, RequestBody};
@@ -1703,6 +1894,8 @@ mod tests {
         records: Mutex<Vec<UpsertRequestCandidateRecord>>,
         upstream_gate: Option<aether_runtime::ConcurrencyGate>,
         upstream_queue_budget: Duration,
+        lease_release_count: AtomicUsize,
+        stream_timeout_count: AtomicUsize,
     }
 
     impl Default for TestRequestCandidateWriter {
@@ -1711,6 +1904,8 @@ mod tests {
                 records: Mutex::new(Vec::new()),
                 upstream_gate: None,
                 upstream_queue_budget: Duration::from_millis(250),
+                lease_release_count: AtomicUsize::new(0),
+                stream_timeout_count: AtomicUsize::new(0),
             }
         }
     }
@@ -1724,6 +1919,8 @@ mod tests {
                     limit,
                 )),
                 upstream_queue_budget: queue_budget,
+                lease_release_count: AtomicUsize::new(0),
+                stream_timeout_count: AtomicUsize::new(0),
             }
         }
     }
@@ -1753,6 +1950,26 @@ mod tests {
 
         fn upstream_execution_gate_queue_budget(&self) -> Duration {
             self.upstream_queue_budget
+        }
+    }
+
+    #[async_trait]
+    impl CandidateAdmissionRuntime for TestRequestCandidateWriter {
+        async fn release_admission_candidate_pool_lease(
+            &self,
+            _plan: &aether_contracts::ExecutionPlan,
+            _report_context: Option<&serde_json::Value>,
+        ) {
+            self.lease_release_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn record_admission_candidate_stream_timeout(
+            &self,
+            _plan: &aether_contracts::ExecutionPlan,
+            _report_context: Option<&serde_json::Value>,
+        ) {
+            self.stream_timeout_count.fetch_add(1, Ordering::SeqCst);
+            self.lease_release_count.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1959,6 +2176,37 @@ mod tests {
         }
     }
 
+    struct ExhaustedSourceWithRetiredAttempt {
+        retired: Option<TransferTestAttempt>,
+    }
+
+    #[async_trait]
+    impl LocalExecutionAttemptSource<TransferTestAttempt> for ExhaustedSourceWithRetiredAttempt {
+        async fn next_execution_attempt(
+            &mut self,
+        ) -> Result<Option<TransferTestAttempt>, GatewayError> {
+            Ok(None)
+        }
+
+        async fn drain_execution_attempts(
+            &mut self,
+        ) -> Result<Vec<TransferTestAttempt>, GatewayError> {
+            Ok(self.retired.take().into_iter().collect())
+        }
+
+        async fn skip_credential(&mut self, _key_id: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn skip_endpoint(&mut self, _endpoint_id: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn skip_provider(&mut self, _provider_id: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+    }
+
     fn transfer_test_attempts() -> Vec<TransferTestAttempt> {
         fn attempt(label: &'static str, provider_id: &str, key_id: &str) -> TransferTestAttempt {
             let mut plan = test_plan(None);
@@ -2100,6 +2348,32 @@ mod tests {
             ["a-key1-retry0", "b-key1-retry0"]
         );
         assert_eq!(source.skipped_providers, ["provider-a"]);
+    }
+
+    #[tokio::test]
+    async fn dynamic_loop_marks_retired_attempts_unused_when_source_exhausts_without_execution() {
+        let state = AppState::new().expect("state should build");
+        let port = TransferTestPort::new(&state);
+        let retired = transfer_test_attempts()
+            .into_iter()
+            .next()
+            .expect("test attempt should exist");
+        let mut source = ExhaustedSourceWithRetiredAttempt {
+            retired: Some(retired),
+        };
+
+        let outcome = run_dynamic_attempt_loop(
+            &port,
+            &mut source,
+            "trace-retired-test",
+            "retired_test",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("dynamic attempt loop should succeed");
+
+        assert!(matches!(outcome, LocalExecutionRequestOutcome::NoPath));
+        assert_eq!(port.unused.lock().unwrap().as_slice(), ["a-key1-retry0"]);
     }
 
     #[test]
@@ -2437,6 +2711,77 @@ mod tests {
             .as_deref()
             .is_some_and(|message| message == "Stream first byte timeout"));
         assert_eq!(record.candidate_index, 2);
+        assert_eq!(writer.lease_release_count.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.stream_timeout_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_candidate_watchdog_claims_timeout_before_dropping_execution() {
+        let writer = Arc::new(TestRequestCandidateWriter::default());
+        let plan = test_plan(Some(ExecutionTimeouts {
+            first_byte_ms: Some(5),
+            ..ExecutionTimeouts::default()
+        }));
+        let report_context = test_report_context();
+        let cancellation_saw_timeout_claim = Arc::new(AtomicBool::new(false));
+        let cancellation_saw_timeout_claim_for_future = Arc::clone(&cancellation_saw_timeout_claim);
+
+        struct CancellationProbe {
+            progress: Arc<StreamCandidateWatchdogProgress>,
+            saw_timeout_claim: Arc<AtomicBool>,
+        }
+
+        impl Drop for CancellationProbe {
+            fn drop(&mut self) {
+                self.saw_timeout_claim
+                    .store(self.progress.timeout_terminal_claimed(), Ordering::SeqCst);
+            }
+        }
+
+        let result = execute_stream_candidate_with_watchdog(
+            writer.as_ref(),
+            "trace_watchdog_timeout_claim",
+            "claude_cli_stream",
+            &plan,
+            Some(&report_context),
+            false,
+            move || async move {
+                let progress = StreamCandidateWatchdogProgress::current()
+                    .expect("watchdog progress should be scoped into execution");
+                let _probe = CancellationProbe {
+                    progress,
+                    saw_timeout_claim: cancellation_saw_timeout_claim_for_future,
+                };
+                std::future::pending::<
+                    Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
+                >()
+                .await
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(StreamCandidateWatchdogOutcome::Executed(
+                AiAttemptExecutionOutcome::Retry {
+                    scope: AiAttemptRetryScope::Candidate,
+                    fallback_response: None,
+                }
+            ))
+        ));
+        assert!(
+            cancellation_saw_timeout_claim.load(Ordering::SeqCst),
+            "the execution cancellation guard must see watchdog terminal ownership"
+        );
+        let records = writer.records.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(
+            records[0].error_type.as_deref(),
+            Some("local_stream_candidate_watchdog_timeout")
+        );
+        assert_eq!(writer.lease_release_count.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.stream_timeout_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2474,6 +2819,8 @@ mod tests {
             records[0].error_type.as_deref(),
             Some("local_stream_candidate_watchdog_timeout")
         );
+        assert_eq!(writer.lease_release_count.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.stream_timeout_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2595,6 +2942,89 @@ mod tests {
             .as_deref()
             .is_some_and(|message| message.contains(UPSTREAM_EXECUTION_GATE_NAME)));
         assert_eq!(record.candidate_index, 2);
+        assert_eq!(writer.lease_release_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_candidate_upstream_execution_admission_timeout_marks_failed_and_continues() {
+        let writer = Arc::new(TestRequestCandidateWriter::with_upstream_gate(
+            1,
+            Duration::from_millis(1),
+        ));
+        let _held_permit = writer
+            .upstream_gate
+            .as_ref()
+            .expect("test gate should exist")
+            .try_acquire()
+            .expect("test gate permit should acquire");
+        let plan = test_plan(None);
+        let report_context = test_report_context();
+
+        let result = execute_sync_candidate_with_admission(
+            writer.as_ref(),
+            "trace_sync_admission",
+            "openai_chat_sync",
+            &plan,
+            Some(&report_context),
+            async {
+                panic!("execute future should not run while upstream execution gate is saturated")
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(AiAttemptExecutionOutcome::Retry {
+                scope: AiAttemptRetryScope::Candidate,
+                fallback_response: None,
+            })
+        ));
+        let records = writer.records.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(
+            records[0].status_code,
+            Some(http::StatusCode::TOO_MANY_REQUESTS.as_u16())
+        );
+        assert_eq!(
+            records[0].error_type.as_deref(),
+            Some("gateway_admission_timeout")
+        );
+        assert_eq!(records[0].candidate_index, 2);
+        assert_eq!(writer.lease_release_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_candidate_target_admission_timeout_continues_without_duplicate_record() {
+        let writer = Arc::new(TestRequestCandidateWriter::default());
+        let plan = test_plan(None);
+        let report_context = test_report_context();
+
+        let result = execute_sync_candidate_with_admission(
+            writer.as_ref(),
+            "trace_sync_target_admission",
+            "openai_chat_sync",
+            &plan,
+            Some(&report_context),
+            async {
+                Err(GatewayError::AdmissionTimeout {
+                    trace_id: "trace_sync_target_admission".to_string(),
+                    gate: UPSTREAM_TARGET_GATE_NAME,
+                    queue_budget_ms: 5,
+                })
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(AiAttemptExecutionOutcome::Retry {
+                scope: AiAttemptRetryScope::Candidate,
+                fallback_response: None,
+            })
+        ));
+        assert!(writer.records.lock().await.is_empty());
+        assert_eq!(writer.lease_release_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2630,5 +3060,6 @@ mod tests {
             ))
         ));
         assert!(writer.records.lock().await.is_empty());
+        assert_eq!(writer.lease_release_count.load(Ordering::SeqCst), 1);
     }
 }

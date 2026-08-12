@@ -94,6 +94,7 @@ pub(super) async fn maybe_handle(
             {
                 continue;
             }
+            let endpoint_ids = payload.endpoint_ids.clone();
             let record = match state
                 .build_admin_provider_model_create_record(&provider_id, payload)
                 .await
@@ -109,7 +110,30 @@ pub(super) async fn maybe_handle(
                     ));
                 }
             };
-            let Some(model) = state.create_admin_provider_model(&record).await? else {
+            let mutation = match state
+                .build_admin_provider_model_create_with_bindings_record(
+                    record,
+                    endpoint_ids,
+                    Some("manual"),
+                )
+                .await
+            {
+                Ok(mutation) => mutation,
+                Err(GatewayError::Client { message, .. }) => {
+                    return Ok(Some(
+                        (
+                            http::StatusCode::BAD_REQUEST,
+                            Json(json!({ "detail": message })),
+                        )
+                            .into_response(),
+                    ));
+                }
+                Err(err) => return Err(err),
+            };
+            let Some(model) = state
+                .create_admin_provider_model_with_bindings(&mutation)
+                .await?
+            else {
                 return Ok(Some(
                     (
                         http::StatusCode::INTERNAL_SERVER_ERROR,

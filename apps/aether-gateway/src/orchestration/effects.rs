@@ -253,6 +253,7 @@ pub(crate) enum LocalExecutionEffect<'a> {
     },
     PoolError(LocalPoolErrorEffect<'a>),
     PoolStreamTimeout,
+    PoolLeaseRelease,
 }
 
 struct PoolFeedbackContext {
@@ -316,6 +317,9 @@ pub(crate) async fn apply_local_execution_effect(
         }
         LocalExecutionEffect::PoolStreamTimeout => {
             record_pool_stream_timeout_effect(state, context).await;
+            release_pool_key_lease_effect(state, context).await;
+        }
+        LocalExecutionEffect::PoolLeaseRelease => {
             release_pool_key_lease_effect(state, context).await;
         }
     }

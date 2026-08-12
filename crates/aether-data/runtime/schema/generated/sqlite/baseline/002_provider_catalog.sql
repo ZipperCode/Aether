@@ -355,6 +355,19 @@ CREATE TABLE IF NOT EXISTS models (
 );
 CREATE INDEX IF NOT EXISTS models_provider_id_idx ON models (provider_id);
 
+CREATE TABLE IF NOT EXISTS model_endpoint_bindings (
+    model_id TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'migration',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (model_id, endpoint_id),
+    CONSTRAINT model_endpoint_bindings_model_id_fkey FOREIGN KEY (model_id) REFERENCES models (id) ON DELETE CASCADE,
+    CONSTRAINT model_endpoint_bindings_endpoint_id_fkey FOREIGN KEY (endpoint_id) REFERENCES provider_endpoints (id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS model_endpoint_bindings_endpoint_active_idx ON model_endpoint_bindings (endpoint_id, is_active, model_id);
+
 CREATE TABLE IF NOT EXISTS global_models (
     id TEXT PRIMARY KEY NOT NULL,
     name TEXT NOT NULL,

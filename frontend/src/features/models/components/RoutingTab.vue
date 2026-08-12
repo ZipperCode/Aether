@@ -72,10 +72,13 @@
         <div
           v-for="formatGroup in apiFormatGroups"
           :key="formatGroup.api_format"
+          data-testid="routing-format-group"
+          :data-api-format="formatGroup.api_format"
           class="border border-border/60 rounded-lg overflow-hidden"
         >
           <!-- 格式标题栏 -->
           <div
+            data-testid="routing-format-header"
             class="px-4 py-3 bg-muted/30 flex items-center justify-between cursor-pointer hover:bg-muted/50 transition-colors"
             @click="toggleFormat(formatGroup.api_format)"
           >
@@ -105,6 +108,72 @@
             <div v-if="isFormatExpanded(formatGroup.api_format)">
               <!-- ========== 全局 Key 优先模式 ========== -->
               <template v-if="isGlobalKeyMode">
+                <div class="px-3 pt-2 space-y-1.5">
+                  <template
+                    v-for="providerEntry in formatGroup.providers"
+                    :key="`${providerEntry.provider.id}-${providerEntry.provider.model_id}-${providerEntry.endpoint?.id || 'endpoint'}`"
+                  >
+                    <div
+                      v-if="providerEntry.endpoint"
+                      data-testid="endpoint-routing-card"
+                      :data-endpoint-id="providerEntry.endpoint.id"
+                      class="flex items-start gap-3 rounded-lg border px-3 py-2"
+                      :class="isEndpointBindingActive(providerEntry.provider, providerEntry.endpoint)
+                        ? 'border-border/50 bg-muted/15'
+                        : 'border-border/40 bg-muted/30 opacity-70'"
+                    >
+                      <div class="min-w-0 flex-1 space-y-0.5">
+                        <div class="flex flex-wrap items-center gap-1.5">
+                          <span class="text-xs font-medium truncate">{{ providerEntry.provider.name }}</span>
+                          <Badge
+                            variant="outline"
+                            class="text-[9px] px-1.5 py-0 shrink-0"
+                          >
+                            {{ formatApiFormat(providerEntry.endpoint.api_format) }}
+                          </Badge>
+                          <span
+                            v-if="providerEntry.is_cross_format"
+                            class="text-[9px] text-amber-600 dark:text-amber-400"
+                          >
+                            格式转换链路
+                          </span>
+                          <span
+                            v-if="!isEndpointBindingActive(providerEntry.provider, providerEntry.endpoint)"
+                            class="text-[9px] text-muted-foreground"
+                          >
+                            当前模型已禁用
+                          </span>
+                        </div>
+                        <div class="text-[10px] text-muted-foreground break-all">
+                          {{ formatEndpointUrl(providerEntry.endpoint) }}
+                        </div>
+                        <div class="text-[9px] text-muted-foreground/70 break-all">
+                          Endpoint ID · {{ providerEntry.endpoint.id }} · 绑定来源 · {{ getBindingSourceLabel(providerEntry.provider, providerEntry.endpoint) }}
+                        </div>
+                        <div
+                          v-if="(providerEntry.endpoint.runtime_capability_quarantines || []).length > 0"
+                          class="text-[9px] text-amber-600 dark:text-amber-400"
+                        >
+                          运行时能力暂不可用 · {{ formatRuntimeCapabilityQuarantines(providerEntry.endpoint) }}
+                        </div>
+                      </div>
+                      <div
+                        data-testid="endpoint-binding-control"
+                        class="flex items-center gap-2 shrink-0"
+                        title="仅控制当前模型与此 Endpoint 的绑定"
+                        @click.stop
+                      >
+                        <span class="text-[10px] font-medium whitespace-nowrap">Endpoint 链路</span>
+                        <Switch
+                          :model-value="isEndpointBindingActive(providerEntry.provider, providerEntry.endpoint)"
+                          :disabled="isBindingSaving(providerEntry.provider, providerEntry.endpoint)"
+                          :aria-label="`允许当前模型使用 ${providerEntry.provider.name} 的 Endpoint ${providerEntry.endpoint.id}`"
+                          @update:model-value="handleEndpointBindingToggle(providerEntry.provider, providerEntry.endpoint, $event)"
+                        />
+                      </div>
+                    </div>
+                  </template>
+                </div>
                 <div class="py-2 pl-3">
                   <template
                     v-for="(keyGroup, groupIndex) in formatGroup.keyGroups"
@@ -272,7 +341,7 @@
                 <div class="py-2 pl-3">
                   <div
                     v-for="(providerEntry, providerIndex) in formatGroup.providers"
-                    :key="`${providerEntry.provider.id}-${providerEntry.endpoint?.id || providerIndex}`"
+                    :key="`${providerEntry.provider.id}-${providerEntry.provider.model_id}-${providerEntry.endpoint?.id || providerIndex}`"
                   >
                     <!-- 提供商行 -->
                     <div class="flex py-1">
@@ -298,21 +367,25 @@
                       <!-- 提供商卡片 -->
                       <div
                         class="flex-1 mr-3"
-                        :class="!providerEntry.provider.is_active || !providerEntry.provider.model_is_active ? 'opacity-50' : ''"
+                        :class="!isFormatProviderEntryActive(providerEntry) ? 'opacity-50' : ''"
                       >
                         <div
+                          data-testid="endpoint-routing-card"
+                          :data-endpoint-id="providerEntry.endpoint?.id"
                           class="group rounded-lg transition-all"
                           :class="getFormatProviderCardClass(providerEntry, providerIndex)"
                         >
                           <!-- 卡片头部 -->
                           <div
+                            data-testid="endpoint-routing-card-header"
                             class="p-2.5 cursor-pointer"
-                            @click="toggleProviderInFormat(formatGroup.api_format, providerEntry.provider.id, providerEntry.endpoint?.id)"
+                            @click="toggleProviderInFormat(formatGroup.api_format, providerEntry.provider.id, providerEntry.provider.model_id, providerEntry.endpoint?.id)"
                           >
                             <div class="flex items-center gap-2">
                               <!-- 第一列：优先级标签（固定宽度，用于对齐） -->
                               <div
-                                v-if="providerEntry.provider.is_active && providerEntry.provider.model_is_active"
+                                v-if="isFormatProviderEntryActive(providerEntry)"
+                                data-testid="endpoint-priority-badge"
                                 class="min-w-8 px-1.5 py-0.5 rounded-full text-[10px] font-medium shrink-0 text-center"
                                 :class="providerIndex === 0
                                   ? 'bg-primary text-primary-foreground'
@@ -324,8 +397,9 @@
 
                               <!-- 第二列：状态指示灯 -->
                               <span
+                                data-testid="endpoint-status-dot"
                                 class="w-1.5 h-1.5 rounded-full shrink-0"
-                                :class="getProviderStatusClass(providerEntry.provider)"
+                                :class="getFormatProviderStatusClass(providerEntry)"
                               />
 
                               <!-- 第三列：名称(第一行) + URL(第二行) -->
@@ -345,12 +419,47 @@
                                   v-if="providerEntry.endpoint"
                                   class="text-[10px] text-muted-foreground truncate"
                                 >
-                                  {{ providerEntry.endpoint.base_url }}{{ providerEntry.endpoint.custom_path || '' }}
+                                  {{ formatEndpointUrl(providerEntry.endpoint) }}
+                                </div>
+                                <div
+                                  v-if="providerEntry.endpoint"
+                                  class="flex flex-wrap items-center gap-1 text-[9px] text-muted-foreground/70"
+                                >
+                                  <span>{{ formatApiFormat(providerEntry.endpoint.api_format) }}</span>
+                                  <span>·</span>
+                                  <span>Endpoint ID · {{ providerEntry.endpoint.id }}</span>
+                                  <span>·</span>
+                                  <span>绑定来源 · {{ getBindingSourceLabel(providerEntry.provider, providerEntry.endpoint) }}</span>
+                                  <template v-if="!isEndpointBindingActive(providerEntry.provider, providerEntry.endpoint)">
+                                    <span>·</span>
+                                    <span>当前模型已禁用</span>
+                                  </template>
+                                </div>
+                                <div
+                                  v-if="providerEntry.endpoint && (providerEntry.endpoint.runtime_capability_quarantines || []).length > 0"
+                                  class="text-[9px] text-amber-600 dark:text-amber-400"
+                                >
+                                  运行时能力暂不可用 · {{ formatRuntimeCapabilityQuarantines(providerEntry.endpoint) }}
                                 </div>
                               </div>
 
                               <!-- 第四列：操作区域 -->
                               <div class="flex items-center gap-1 shrink-0">
+                                <div
+                                  v-if="providerEntry.endpoint"
+                                  data-testid="endpoint-binding-control"
+                                  class="flex items-center gap-1.5 rounded-md border border-border/50 bg-background/60 px-1.5 py-0.5 mr-1"
+                                  title="仅控制当前模型与此 Endpoint 的绑定"
+                                  @click.stop
+                                >
+                                  <span class="text-[9px] font-medium whitespace-nowrap">Endpoint 链路</span>
+                                  <Switch
+                                    :model-value="isEndpointBindingActive(providerEntry.provider, providerEntry.endpoint)"
+                                    :disabled="isBindingSaving(providerEntry.provider, providerEntry.endpoint)"
+                                    :aria-label="`允许当前模型使用 ${providerEntry.provider.name} 的 Endpoint ${providerEntry.endpoint.id}`"
+                                    @update:model-value="handleEndpointBindingToggle(providerEntry.provider, providerEntry.endpoint, $event)"
+                                  />
+                                </div>
                                 <!-- 计费标签 -->
                                 <span
                                   v-if="providerEntry.provider.billing_type"
@@ -375,7 +484,7 @@
                                 <!-- 展开图标 -->
                                 <ChevronDown
                                   class="w-3.5 h-3.5 text-muted-foreground transition-transform"
-                                  :class="isProviderInFormatExpanded(formatGroup.api_format, providerEntry.provider.id, providerEntry.endpoint?.id) ? 'rotate-180' : ''"
+                                  :class="isProviderInFormatExpanded(formatGroup.api_format, providerEntry.provider.id, providerEntry.provider.model_id, providerEntry.endpoint?.id) ? 'rotate-180' : ''"
                                 />
                               </div>
                             </div>
@@ -384,7 +493,8 @@
                           <!-- 展开的 Keys 详情 -->
                           <Transition name="collapse">
                             <div
-                              v-if="isProviderInFormatExpanded(formatGroup.api_format, providerEntry.provider.id, providerEntry.endpoint?.id)"
+                              v-if="isProviderInFormatExpanded(formatGroup.api_format, providerEntry.provider.id, providerEntry.provider.model_id, providerEntry.endpoint?.id)"
+                              data-testid="endpoint-routing-key-details"
                               class="border-t border-border/30 p-2.5"
                             >
                               <!-- 模型映射显示 -->
@@ -596,6 +706,7 @@ import {
 import Card from '@/components/ui/card.vue'
 import Badge from '@/components/ui/badge.vue'
 import Button from '@/components/ui/button.vue'
+import Switch from '@/components/ui/switch.vue'
 import {
   getGlobalModelRoutingPreview,
   type ModelRoutingPreviewResponse,
@@ -606,6 +717,7 @@ import {
 import { API_FORMAT_ORDER } from '@/api/endpoints/types'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { recoverKeyHealth } from '@/api/endpoints/health'
+import { updateModel } from '@/api/endpoints/models'
 import { parseApiError } from '@/utils/errorParser'
 import { useToast } from '@/composables/useToast'
 import { useCountdownTimer, getProbeCountdown } from '@/composables/useCountdownTimer'
@@ -678,6 +790,100 @@ interface ApiFormatGroup {
   active_providers: number
   total_keys: number
   active_keys: number
+}
+
+function formatEndpointUrl(endpoint: RoutingEndpointInfo): string {
+  const baseUrl = endpoint.base_url.replace(/\/$/, '')
+  const customPath = endpoint.custom_path?.trim()
+  if (!customPath) return baseUrl
+  return `${baseUrl}/${customPath.replace(/^\//, '')}`
+}
+
+const savingBindings = ref<Set<string>>(new Set())
+const endpointBindingOverrides = ref<Map<string, boolean>>(new Map())
+
+function bindingKey(provider: RoutingProviderInfo, endpoint: RoutingEndpointInfo): string {
+  return `${provider.model_id}:${endpoint.id}`
+}
+
+function isBindingSaving(provider: RoutingProviderInfo, endpoint: RoutingEndpointInfo): boolean {
+  return savingBindings.value.has(bindingKey(provider, endpoint))
+}
+
+function isEndpointBindingActive(
+  provider: RoutingProviderInfo,
+  endpoint: RoutingEndpointInfo
+): boolean {
+  const override = endpointBindingOverrides.value.get(bindingKey(provider, endpoint))
+  if (override !== undefined) return override
+  return endpoint.model_binding?.is_active === true
+}
+
+function effectiveEndpointActiveKeys(
+  provider: RoutingProviderInfo,
+  endpoint: RoutingEndpointInfo
+): number {
+  if (!provider.is_active || !provider.model_is_active || !provider.model_is_available || !endpoint.is_active || !isEndpointBindingActive(provider, endpoint)) return 0
+  return (endpoint.keys || []).filter(key => key.is_active).length
+}
+
+function getBindingSourceLabel(
+  provider: RoutingProviderInfo,
+  endpoint: RoutingEndpointInfo
+): string {
+  if (endpointBindingOverrides.value.has(bindingKey(provider, endpoint))) return '人工设置'
+  switch (endpoint.model_binding?.source) {
+    case 'manual':
+      return '人工设置'
+    case 'discovered':
+      return '上游发现'
+    case 'mapping':
+      return '模型映射'
+    case 'migration':
+      return '兼容迁移'
+    default:
+      return '未绑定'
+  }
+}
+
+function formatRuntimeCapabilityQuarantines(endpoint: RoutingEndpointInfo): string {
+  return (endpoint.runtime_capability_quarantines || [])
+    .map(entry => [
+      `Key ${entry.key_id}`,
+      formatApiFormat(entry.client_api_format),
+      entry.request_mode === 'stream' ? '流式' : '非流式',
+      entry.request_operation || null,
+    ].filter(Boolean).join(' / '))
+    .join('、')
+}
+
+async function handleEndpointBindingToggle(
+  provider: RoutingProviderInfo,
+  endpoint: RoutingEndpointInfo,
+  isActive: boolean
+) {
+  const key = bindingKey(provider, endpoint)
+  if (savingBindings.value.has(key)) return
+
+  const hadOverride = endpointBindingOverrides.value.has(key)
+  const previousOverride = endpointBindingOverrides.value.get(key)
+  endpointBindingOverrides.value.set(key, isActive)
+  savingBindings.value.add(key)
+  try {
+    await updateModel(provider.id, provider.model_id, {
+      endpoint_bindings: [{ endpoint_id: endpoint.id, is_active: isActive }]
+    })
+    showSuccess(isActive ? '已启用模型 Endpoint 链路' : '已禁用模型 Endpoint 链路')
+  } catch (err: unknown) {
+    if (hadOverride && previousOverride !== undefined) {
+      endpointBindingOverrides.value.set(key, previousOverride)
+    } else {
+      endpointBindingOverrides.value.delete(key)
+    }
+    showError(parseApiError(err, '链路设置失败'), '错误')
+  } finally {
+    savingBindings.value.delete(key)
+  }
 }
 
 const STANDARD_ROUTING_API_FORMATS = [
@@ -780,6 +986,7 @@ function targetFormatsForEndpoint(
   endpoint: RoutingEndpointInfo
 ): string[] {
   const endpointFormat = normalizeLegacyOpenAIFormatAlias(endpoint.api_format)
+  if (!isEndpointBindingActive(provider, endpoint)) return [endpointFormat]
   const candidateFormats = Array.from(new Set([...STANDARD_ROUTING_API_FORMATS, endpointFormat]))
   return candidateFormats.filter(format =>
     endpointSupportsClientFormat(provider, endpoint, format, endpoint.api_format)
@@ -829,19 +1036,21 @@ const apiFormatGroups = computed<ApiFormatGroup[]>(() => {
           provider,
           endpoint,
           keys: endpoint.keys || [],
-          active_keys: endpoint.active_keys || 0,
+          active_keys: effectiveEndpointActiveKeys(provider, endpoint),
           is_cross_format: endpoint.api_format !== format,
           priority_api_format: endpoint.api_format
         })
 
-        for (const key of endpoint.keys || []) {
-          data.allKeys.push({
-            key,
-            provider,
-            endpoint,
-            is_cross_format: endpoint.api_format !== format,
-            priority_api_format: endpoint.api_format
-          })
+        if (provider.is_active && provider.model_is_active && provider.model_is_available && endpoint.is_active && isEndpointBindingActive(provider, endpoint)) {
+          for (const key of endpoint.keys || []) {
+            data.allKeys.push({
+              key,
+              provider,
+              endpoint,
+              is_cross_format: endpoint.api_format !== format,
+              priority_api_format: endpoint.api_format
+            })
+          }
         }
       }
     }
@@ -852,8 +1061,8 @@ const apiFormatGroups = computed<ApiFormatGroup[]>(() => {
   for (const [format, data] of formatMap) {
     // Provider 排序（提供商优先模式）
     const sortedProviders = [...data.providers].sort((a, b) => {
-      const aActive = a.provider.is_active && a.provider.model_is_active
-      const bActive = b.provider.is_active && b.provider.model_is_active
+      const aActive = isFormatProviderEntryActive(a)
+      const bActive = isFormatProviderEntryActive(b)
       if (aActive !== bActive) return bActive ? 1 : -1
       const aDemoted = shouldDemoteCrossFormat(format, a.priority_api_format, a.provider)
       const bDemoted = shouldDemoteCrossFormat(format, b.priority_api_format, b.provider)
@@ -889,24 +1098,30 @@ const apiFormatGroups = computed<ApiFormatGroup[]>(() => {
         ...group,
         keys: group.keys.sort((a, b) => {
           // 同优先级内按活跃状态和健康度排序
-          const aActive = a.key.is_active && a.provider.is_active && a.provider.model_is_active
-          const bActive = b.key.is_active && b.provider.is_active && b.provider.model_is_active
+          const aActive = a.key.is_active && isGlobalKeyEntryActive(a)
+          const bActive = b.key.is_active && isGlobalKeyEntryActive(b)
           if (aActive !== bActive) return bActive ? 1 : -1
           return b.key.health_score - a.key.health_score
         })
       }))
 
-    const activeProviders = sortedProviders.filter(
-      e => e.provider.is_active && e.provider.model_is_active && e.endpoint?.is_active && e.active_keys > 0
-    ).length
+    const providerModelActivity = new Map<string, boolean>()
+    for (const entry of sortedProviders) {
+      const isActive = isFormatProviderEntryActive(entry) && entry.active_keys > 0
+      providerModelActivity.set(
+        entry.provider.model_id,
+        (providerModelActivity.get(entry.provider.model_id) ?? false) || isActive
+      )
+    }
+    const activeProviders = Array.from(providerModelActivity.values()).filter(Boolean).length
     const totalKeys = sortedProviders.reduce((sum, e) => sum + e.keys.length, 0)
-    const activeKeys = sortedProviders.reduce((sum, e) => sum + e.active_keys, 0)
+    const activeKeys = sortedProviders.reduce((sum, entry) => sum + entry.active_keys, 0)
 
     groups.push({
       api_format: format,
       providers: sortedProviders,
       keyGroups,
-      total_providers: sortedProviders.length,
+      total_providers: providerModelActivity.size,
       active_providers: activeProviders,
       total_keys: totalKeys,
       active_keys: activeKeys
@@ -945,13 +1160,34 @@ function toggleFormat(format: string) {
 // 提供商模式：格式内提供商级别的展开状态
 const expandedProvidersInFormat = ref<Set<string>>(new Set())
 
-function isProviderInFormatExpanded(format: string, providerId: string, endpointId?: string): boolean {
-  const key = endpointId ? `${format}:${providerId}:${endpointId}` : `${format}:${providerId}`
+function providerExpansionKey(
+  format: string,
+  providerId: string,
+  modelId: string,
+  endpointId?: string
+): string {
+  return endpointId
+    ? `${format}:${providerId}:${modelId}:${endpointId}`
+    : `${format}:${providerId}:${modelId}`
+}
+
+function isProviderInFormatExpanded(
+  format: string,
+  providerId: string,
+  modelId: string,
+  endpointId?: string
+): boolean {
+  const key = providerExpansionKey(format, providerId, modelId, endpointId)
   return expandedProvidersInFormat.value.has(key)
 }
 
-function toggleProviderInFormat(format: string, providerId: string, endpointId?: string) {
-  const key = endpointId ? `${format}:${providerId}:${endpointId}` : `${format}:${providerId}`
+function toggleProviderInFormat(
+  format: string,
+  providerId: string,
+  modelId: string,
+  endpointId?: string
+) {
+  const key = providerExpansionKey(format, providerId, modelId, endpointId)
   if (expandedProvidersInFormat.value.has(key)) {
     expandedProvidersInFormat.value.delete(key)
   } else {
@@ -1060,12 +1296,30 @@ function getKeyPriorityGroups(keys: RoutingKeyInfo[]): KeyPriorityGroup[] {
   })
 }
 
-// 获取提供商状态样式
-function getProviderStatusClass(provider: RoutingProviderInfo): string {
-  if (!provider.is_active) {
+function isFormatProviderEntryActive(entry: FormatProviderEntry): boolean {
+  return !!entry.endpoint
+    && entry.provider.is_active
+    && entry.provider.model_is_active
+    && entry.provider.model_is_available
+    && entry.endpoint.is_active
+    && isEndpointBindingActive(entry.provider, entry.endpoint)
+}
+
+function isGlobalKeyEntryActive(entry: GlobalKeyEntry): boolean {
+  return !!entry.endpoint
+    && entry.provider.is_active
+    && entry.provider.model_is_active
+    && entry.provider.model_is_available
+    && entry.endpoint.is_active
+    && isEndpointBindingActive(entry.provider, entry.endpoint)
+}
+
+// Endpoint 卡片状态同时反映 Provider、模型关联、Endpoint 与模型绑定。
+function getFormatProviderStatusClass(entry: FormatProviderEntry): string {
+  if (!entry.provider.is_active || !entry.endpoint?.is_active || !isEndpointBindingActive(entry.provider, entry.endpoint)) {
     return 'bg-gray-400'
   }
-  if (!provider.model_is_active) {
+  if (!entry.provider.model_is_active || !entry.provider.model_is_available) {
     return 'bg-yellow-500'
   }
   return 'bg-green-500'
@@ -1073,7 +1327,7 @@ function getProviderStatusClass(provider: RoutingProviderInfo): string {
 
 // 获取格式分组中提供商节点圆点样式（提供商优先模式）
 function getFormatProviderNodeClass(entry: FormatProviderEntry, index: number): string {
-  if (!entry.provider.is_active || !entry.provider.model_is_active) {
+  if (!isFormatProviderEntryActive(entry)) {
     return 'bg-muted border-muted-foreground/30'
   }
   if (index === 0) {
@@ -1084,7 +1338,7 @@ function getFormatProviderNodeClass(entry: FormatProviderEntry, index: number): 
 
 // 获取格式分组中提供商卡片样式（提供商优先模式）
 function getFormatProviderCardClass(entry: FormatProviderEntry, index: number): string {
-  if (!entry.provider.is_active || !entry.provider.model_is_active) {
+  if (!isFormatProviderEntryActive(entry)) {
     return 'bg-muted/30 border border-border/40'
   }
   if (index === 0) {
@@ -1095,7 +1349,7 @@ function getFormatProviderCardClass(entry: FormatProviderEntry, index: number): 
 
 // 获取全局 Key 节点圆点样式（全局 Key 优先模式）
 function getGlobalKeyNodeClass(entry: GlobalKeyEntry, groupIndex: number, keyIndex: number): string {
-  if (!entry.key.is_active || !entry.provider.is_active || !entry.provider.model_is_active) {
+  if (!entry.key.is_active || !isGlobalKeyEntryActive(entry)) {
     return 'bg-muted border-muted-foreground/30'
   }
   if (groupIndex === 0 && keyIndex === 0) {
@@ -1113,7 +1367,7 @@ function isLastKeyInFormat(formatGroup: ApiFormatGroup, groupIndex: number, keyI
 
 // 获取全局 Key 卡片样式（全局 Key 优先模式）
 function getGlobalKeyCardClass(entry: GlobalKeyEntry, groupIndex: number, keyIndex: number): string {
-  if (!entry.key.is_active || !entry.provider.is_active || !entry.provider.model_is_active) {
+  if (!entry.key.is_active || !isGlobalKeyEntryActive(entry)) {
     return 'bg-muted/30 border border-border/40'
   }
   if (groupIndex === 0 && keyIndex === 0) {
@@ -1203,11 +1457,16 @@ async function handleRecoverKey(keyId: string, apiFormat: string) {
 watch(() => props.globalModelId, () => {
   expandedFormats.value.clear()
   expandedProvidersInFormat.value.clear()
+  endpointBindingOverrides.value.clear()
   // 如果没有外部数据，才自己加载
   if (props.routingData === undefined) {
     loadRoutingData()
   }
 }, { immediate: false })
+
+watch(() => props.routingData, (current, previous) => {
+  if (current !== previous) endpointBindingOverrides.value.clear()
+})
 
 onMounted(() => {
   // 如果没有外部数据，才自己加载

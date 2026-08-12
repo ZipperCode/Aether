@@ -7,11 +7,12 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_model_fetch::{
-    apply_model_filters, fetch_models_from_transports, global_model_matches_allowed_models,
-    json_string_list, model_catalog_upstream_metadata, model_fetch_interval_minutes,
-    model_fetch_startup_delay_seconds, model_fetch_startup_enabled, preset_models_for_provider,
-    selected_models_fetch_endpoints, sync_provider_model_whitelist_associations,
-    upstream_metadata_namespace_updates, ModelFetchAssociationStore, ModelFetchRunSummary,
+    aggregate_models_for_cache, apply_model_filters, fetch_models_from_transports,
+    global_model_matches_allowed_models, json_string_list, model_catalog_upstream_metadata,
+    model_fetch_interval_minutes, model_fetch_startup_delay_seconds, model_fetch_startup_enabled,
+    preset_models_for_provider, selected_models_fetch_endpoints,
+    sync_provider_model_whitelist_associations, upstream_metadata_namespace_updates,
+    ModelFetchAssociationStore, ModelFetchRunSummary,
 };
 use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
@@ -156,7 +157,15 @@ pub(crate) async fn sync_global_model_provider_associations(
 
     let results = stream::iter(targets.into_iter().map(
         |(provider_id, allowed_models)| async move {
-            sync_provider_model_whitelist_associations(state, &provider_id, &allowed_models).await
+            sync_provider_model_whitelist_associations(
+                state,
+                &provider_id,
+                &allowed_models,
+                &[],
+                false,
+                &[],
+            )
+            .await
         },
     ))
     .buffer_unordered(8)
@@ -175,7 +184,7 @@ where
     S: ModelFetchRuntimeState + ?Sized,
 {
     let targets = collect_fetch_targets(state, None, None).await?;
-    execute_fetch_targets(state, targets).await
+    execute_fetch_targets(state, targets, true).await
 }
 
 async fn perform_model_fetch_for_keys_with_state<S>(
@@ -187,7 +196,7 @@ where
     S: ModelFetchRuntimeState + ?Sized,
 {
     let targets = collect_fetch_targets(state, Some(provider_id), Some(key_ids)).await?;
-    execute_fetch_targets(state, targets).await
+    execute_fetch_targets(state, targets, false).await
 }
 
 async fn collect_fetch_targets<S>(
@@ -267,6 +276,7 @@ where
 async fn execute_fetch_targets<S>(
     state: &S,
     targets: Vec<SelectedFetchTarget>,
+    reconcile_automatic_bindings: bool,
 ) -> Result<ModelFetchRunSummary, GatewayError>
 where
     S: ModelFetchRuntimeState + ?Sized,
@@ -277,11 +287,80 @@ where
         failed: 0,
         skipped: 0,
     };
+    let mut discovered_models_by_provider = BTreeMap::<String, Vec<Value>>::new();
+    let mut provider_fetch_authority = BTreeMap::<String, (bool, BTreeSet<String>)>::new();
+    let mut provider_failed_endpoint_ids = BTreeMap::<String, BTreeSet<String>>::new();
     for target in targets {
-        match fetch_and_persist_key_models(state, &target).await? {
+        let target_endpoint_ids = target
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id.clone())
+            .collect::<BTreeSet<_>>();
+        let outcome = fetch_and_persist_key_models(state, &target).await?;
+        match outcome.disposition {
             KeyFetchDisposition::Succeeded => summary.succeeded += 1,
             KeyFetchDisposition::Failed => summary.failed += 1,
             KeyFetchDisposition::Skipped => summary.skipped += 1,
+        }
+        if reconcile_automatic_bindings && outcome.disposition == KeyFetchDisposition::Succeeded {
+            discovered_models_by_provider
+                .entry(target.provider.id.clone())
+                .or_default()
+                .extend(outcome.discovered_models);
+            let authority = provider_fetch_authority
+                .entry(target.provider.id.clone())
+                .or_default();
+            if outcome.used_preset_catalog {
+                authority.0 = true;
+            } else {
+                let successful_endpoint_ids = outcome
+                    .successful_endpoint_ids
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                authority.1.extend(successful_endpoint_ids.iter().cloned());
+                provider_failed_endpoint_ids
+                    .entry(target.provider.id.clone())
+                    .or_default()
+                    .extend(
+                        target_endpoint_ids
+                            .difference(&successful_endpoint_ids)
+                            .cloned(),
+                    );
+            }
+        } else if reconcile_automatic_bindings {
+            provider_failed_endpoint_ids
+                .entry(target.provider.id.clone())
+                .or_default()
+                .extend(target_endpoint_ids);
+        }
+    }
+    if reconcile_automatic_bindings {
+        for (provider_id, models) in discovered_models_by_provider {
+            let models = aggregate_models_for_cache(&models);
+            let (has_preset_results, authoritative_endpoint_ids) = provider_fetch_authority
+                .get(&provider_id)
+                .cloned()
+                .unwrap_or_default();
+            let failed_endpoint_ids = provider_failed_endpoint_ids
+                .get(&provider_id)
+                .cloned()
+                .unwrap_or_default();
+            let authoritative_endpoint_ids = authoritative_endpoint_ids
+                .difference(&failed_endpoint_ids)
+                .cloned()
+                .collect::<Vec<_>>();
+            let replace_automatic_bindings =
+                !authoritative_endpoint_ids.is_empty() && !has_preset_results;
+            sync_provider_model_whitelist_associations(
+                state,
+                &provider_id,
+                &[],
+                &models,
+                replace_automatic_bindings,
+                &authoritative_endpoint_ids,
+            )
+            .await
+            .map_err(GatewayError::Internal)?;
         }
     }
     Ok(summary)
@@ -315,13 +394,38 @@ enum KeyFetchDisposition {
     Skipped,
 }
 
+#[derive(Debug)]
+struct KeyFetchOutcome {
+    disposition: KeyFetchDisposition,
+    discovered_models: Vec<Value>,
+    used_preset_catalog: bool,
+    successful_endpoint_ids: Vec<String>,
+}
+
+impl KeyFetchOutcome {
+    fn without_models(disposition: KeyFetchDisposition) -> Self {
+        Self {
+            disposition,
+            discovered_models: Vec::new(),
+            used_preset_catalog: false,
+            successful_endpoint_ids: Vec::new(),
+        }
+    }
+}
+
 async fn fetch_and_persist_key_models(
     state: &(impl ModelFetchRuntimeState + ?Sized),
     target: &SelectedFetchTarget,
-) -> Result<KeyFetchDisposition, GatewayError> {
+) -> Result<KeyFetchOutcome, GatewayError> {
     let now_unix_secs = now_unix_secs();
     if target.endpoints.is_empty() {
-        if let Some(models) = preset_models_for_provider(&target.provider.provider_type) {
+        if let Some(mut models) = preset_models_for_provider(&target.provider.provider_type) {
+            let provider_endpoints = state
+                .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(
+                    &target.provider.id,
+                ))
+                .await?;
+            attach_model_endpoint_ids(&mut models, &provider_endpoints);
             let fetched_model_ids = models
                 .iter()
                 .filter_map(|model| model.get("id"))
@@ -351,10 +455,18 @@ async fn fetch_and_persist_key_models(
                 state,
                 &target.provider.id,
                 &filtered_models,
+                &models,
+                false,
+                &[],
             )
             .await
             .map_err(GatewayError::Internal)?;
-            return Ok(KeyFetchDisposition::Succeeded);
+            return Ok(KeyFetchOutcome {
+                disposition: KeyFetchDisposition::Succeeded,
+                discovered_models: models,
+                used_preset_catalog: true,
+                successful_endpoint_ids: Vec::new(),
+            });
         }
         persist_key_fetch_failure(
             state,
@@ -363,7 +475,9 @@ async fn fetch_and_persist_key_models(
             "No supported endpoint for Rust models fetch".to_string(),
         )
         .await?;
-        return Ok(KeyFetchDisposition::Skipped);
+        return Ok(KeyFetchOutcome::without_models(
+            KeyFetchDisposition::Skipped,
+        ));
     }
 
     let mut transports = Vec::new();
@@ -392,7 +506,9 @@ async fn fetch_and_persist_key_models(
             "Provider transport snapshot unavailable".to_string(),
         )
         .await?;
-        return Ok(KeyFetchDisposition::Skipped);
+        return Ok(KeyFetchOutcome::without_models(
+            KeyFetchDisposition::Skipped,
+        ));
     }
 
     let result = match fetch_models_from_transports(state, &transports).await {
@@ -405,7 +521,7 @@ async fn fetch_and_persist_key_models(
                 message = %err,
                 "gateway model fetch failed"
             );
-            return Ok(KeyFetchDisposition::Failed);
+            return Ok(KeyFetchOutcome::without_models(KeyFetchDisposition::Failed));
         }
     };
 
@@ -422,9 +538,20 @@ async fn fetch_and_persist_key_models(
             message = %error,
             "gateway model fetch failed"
         );
-        return Ok(KeyFetchDisposition::Failed);
+        return Ok(KeyFetchOutcome::without_models(KeyFetchDisposition::Failed));
     }
 
+    let mut cached_models = result.cached_models;
+    let used_preset_catalog = result.used_preset_catalog;
+    let successful_endpoint_ids = result.successful_endpoint_ids;
+    if used_preset_catalog {
+        let provider_endpoints = state
+            .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(
+                &target.provider.id,
+            ))
+            .await?;
+        attach_model_endpoint_ids(&mut cached_models, &provider_endpoints);
+    }
     let filtered_models = apply_model_filters(
         &result.fetched_model_ids,
         json_string_list(target.key.locked_models.as_ref()),
@@ -440,12 +567,55 @@ async fn fetch_and_persist_key_models(
     )
     .await?;
     state
-        .write_upstream_models_cache(&target.provider.id, &target.key.id, &result.cached_models)
+        .write_upstream_models_cache(&target.provider.id, &target.key.id, &cached_models)
         .await;
-    sync_provider_model_whitelist_associations(state, &target.provider.id, &filtered_models)
-        .await
-        .map_err(GatewayError::Internal)?;
-    Ok(KeyFetchDisposition::Succeeded)
+    sync_provider_model_whitelist_associations(
+        state,
+        &target.provider.id,
+        &filtered_models,
+        &cached_models,
+        false,
+        &[],
+    )
+    .await
+    .map_err(GatewayError::Internal)?;
+    Ok(KeyFetchOutcome {
+        disposition: KeyFetchDisposition::Succeeded,
+        discovered_models: cached_models,
+        used_preset_catalog,
+        successful_endpoint_ids,
+    })
+}
+
+fn attach_model_endpoint_ids(models: &mut [Value], endpoints: &[StoredProviderCatalogEndpoint]) {
+    for model in models {
+        if !json_string_list(model.get("endpoint_ids")).is_empty() {
+            continue;
+        }
+        let formats = json_string_list(model.get("api_formats"))
+            .into_iter()
+            .map(|format| crate::ai_serving::normalize_api_format_alias(&format))
+            .collect::<BTreeSet<_>>();
+        if formats.is_empty() {
+            continue;
+        }
+        let mut endpoint_ids = json_string_list(model.get("endpoint_ids"))
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        endpoint_ids.extend(
+            endpoints
+                .iter()
+                .filter(|endpoint| {
+                    formats.contains(&crate::ai_serving::normalize_api_format_alias(
+                        &endpoint.api_format,
+                    ))
+                })
+                .map(|endpoint| endpoint.id.clone()),
+        );
+        if let Some(object) = model.as_object_mut() {
+            object.insert("endpoint_ids".to_string(), json!(endpoint_ids));
+        }
+    }
 }
 
 async fn persist_key_fetch_failure(
@@ -513,7 +683,7 @@ mod tests {
     use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot};
     use aether_data_contracts::repository::global_models::{
         AdminGlobalModelListQuery, AdminProviderModelListQuery, StoredAdminGlobalModelPage,
-        StoredAdminProviderModel, UpsertAdminProviderModelRecord,
+        StoredAdminProviderModel, StoredModelEndpointBinding, UpsertAdminProviderModelRecord,
     };
     use aether_data_contracts::repository::provider_catalog::{
         ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
@@ -543,6 +713,8 @@ mod tests {
         execution_results: Arc<Mutex<VecDeque<ExecutionResult>>>,
         executed_plans: Arc<Mutex<Vec<ExecutionPlan>>>,
         cached_models: Arc<Mutex<HashMap<(String, String), Vec<Value>>>>,
+        provider_models: Arc<Mutex<Vec<StoredAdminProviderModel>>>,
+        binding_syncs: Arc<Mutex<Vec<(String, Vec<String>, bool, Vec<String>)>>>,
         upstream_metadata_updates: Arc<Mutex<Vec<(String, String, Value, Option<u64>)>>>,
     }
 
@@ -562,8 +734,15 @@ mod tests {
                 execution_results: Arc::new(Mutex::new(VecDeque::from(execution_results))),
                 executed_plans: Arc::new(Mutex::new(Vec::new())),
                 cached_models: Arc::new(Mutex::new(HashMap::new())),
+                provider_models: Arc::new(Mutex::new(Vec::new())),
+                binding_syncs: Arc::new(Mutex::new(Vec::new())),
                 upstream_metadata_updates: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn with_provider_models(self, models: Vec<StoredAdminProviderModel>) -> Self {
+            *self.provider_models.lock().expect("provider models mutex") = models;
+            self
         }
 
         fn key(&self, key_id: &str) -> StoredProviderCatalogKey {
@@ -620,11 +799,19 @@ mod tests {
         type Error = String;
 
         fn has_global_model_reader(&self) -> bool {
-            false
+            !self
+                .provider_models
+                .lock()
+                .expect("provider models mutex")
+                .is_empty()
         }
 
         fn has_global_model_writer(&self) -> bool {
-            false
+            !self
+                .provider_models
+                .lock()
+                .expect("provider models mutex")
+                .is_empty()
         }
 
         fn model_fetch_internal_error(&self, message: String) -> Self::Error {
@@ -633,9 +820,16 @@ mod tests {
 
         async fn list_admin_provider_models(
             &self,
-            _query: &AdminProviderModelListQuery,
+            query: &AdminProviderModelListQuery,
         ) -> Result<Vec<StoredAdminProviderModel>, Self::Error> {
-            Ok(Vec::new())
+            Ok(self
+                .provider_models
+                .lock()
+                .expect("provider models mutex")
+                .iter()
+                .filter(|model| model.provider_id == query.provider_id)
+                .cloned()
+                .collect())
         }
 
         async fn list_admin_global_models(
@@ -648,9 +842,9 @@ mod tests {
             })
         }
 
-        async fn create_admin_provider_model(
+        async fn create_admin_provider_model_with_bindings(
             &self,
-            _record: &UpsertAdminProviderModelRecord,
+            _record: &aether_data_contracts::repository::global_models::CreateAdminProviderModelWithBindingsRecord,
         ) -> Result<Option<StoredAdminProviderModel>, Self::Error> {
             Ok(None)
         }
@@ -660,6 +854,26 @@ mod tests {
             _record: &UpsertAdminProviderModelRecord,
         ) -> Result<Option<StoredAdminProviderModel>, Self::Error> {
             Ok(None)
+        }
+
+        async fn sync_model_endpoint_bindings(
+            &self,
+            model_id: &str,
+            endpoint_ids: &[String],
+            _source: &str,
+            replace_automatic: bool,
+            replacement_scope_endpoint_ids: &[String],
+        ) -> Result<Vec<StoredModelEndpointBinding>, Self::Error> {
+            self.binding_syncs
+                .lock()
+                .expect("binding syncs mutex")
+                .push((
+                    model_id.to_string(),
+                    endpoint_ids.to_vec(),
+                    replace_automatic,
+                    replacement_scope_endpoint_ids.to_vec(),
+                ));
+            Ok(Vec::new())
         }
 
         async fn list_provider_catalog_keys_by_provider_ids(
@@ -958,6 +1172,56 @@ mod tests {
             telemetry: None,
             error: None,
         }
+    }
+
+    fn execution_error_result(status_code: u16, body: Value) -> ExecutionResult {
+        let mut result = execution_result(body);
+        result.status_code = status_code;
+        result
+    }
+
+    fn sample_provider_model(
+        id: &str,
+        provider_id: &str,
+        provider_model_name: &str,
+    ) -> StoredAdminProviderModel {
+        StoredAdminProviderModel::new(
+            id.to_string(),
+            provider_id.to_string(),
+            format!("global-{id}"),
+            provider_model_name.to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            Some(provider_model_name.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("provider model should build")
+    }
+
+    fn sample_provider_model_with_alias(
+        id: &str,
+        provider_id: &str,
+        provider_model_name: &str,
+        alias: &str,
+    ) -> StoredAdminProviderModel {
+        let mut model = sample_provider_model(id, provider_id, provider_model_name);
+        model.provider_model_mappings = Some(json!([{ "name": alias }]));
+        model
     }
 
     #[tokio::test]
@@ -1341,5 +1605,495 @@ mod tests {
         let updated = state.key("key-openai-chat");
         assert_eq!(updated.allowed_models, Some(json!([])));
         assert_eq!(updated.last_models_fetch_error, None);
+    }
+
+    #[tokio::test]
+    async fn full_model_fetch_empty_catalog_reconciles_successful_endpoint_only() {
+        let provider = sample_provider("provider-empty", "custom");
+        let successful_endpoint =
+            sample_endpoint("endpoint-empty", "provider-empty", "openai:chat");
+        let failed_endpoint =
+            sample_endpoint("endpoint-failed", "provider-empty", "claude:messages");
+        let key = sample_key(
+            "key-empty",
+            "provider-empty",
+            "api_key",
+            &["openai:chat", "claude:messages"],
+        );
+        let state = TestState::new(
+            vec![provider],
+            vec![successful_endpoint, failed_endpoint],
+            vec![key],
+            HashMap::from([
+                (
+                    (
+                        "provider-empty".to_string(),
+                        "endpoint-empty".to_string(),
+                        "key-empty".to_string(),
+                    ),
+                    sample_transport(
+                        "custom",
+                        "provider-empty",
+                        "endpoint-empty",
+                        "key-empty",
+                        "openai:chat",
+                        "api_key",
+                        None,
+                    ),
+                ),
+                (
+                    (
+                        "provider-empty".to_string(),
+                        "endpoint-failed".to_string(),
+                        "key-empty".to_string(),
+                    ),
+                    sample_transport(
+                        "custom",
+                        "provider-empty",
+                        "endpoint-failed",
+                        "key-empty",
+                        "claude:messages",
+                        "api_key",
+                        None,
+                    ),
+                ),
+            ]),
+            vec![
+                execution_result(json!({ "data": [] })),
+                execution_error_result(503, json!({"error": {"message": "catalog unavailable"}})),
+            ],
+        )
+        .with_provider_models(vec![sample_provider_model(
+            "model-stale",
+            "provider-empty",
+            "stale-model",
+        )]);
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("empty authoritative catalog should reconcile bindings");
+
+        assert_eq!(summary.succeeded, 1);
+        let syncs = state.binding_syncs.lock().expect("binding syncs mutex");
+        assert!(syncs
+            .iter()
+            .any(|(model_id, endpoint_ids, replace, scope)| {
+                model_id == "model-stale"
+                    && endpoint_ids.is_empty()
+                    && *replace
+                    && scope == &["endpoint-empty".to_string()]
+            }));
+        assert!(!syncs.iter().any(|(_, _, replace, scope)| {
+            *replace
+                && scope
+                    .iter()
+                    .any(|endpoint_id| endpoint_id == "endpoint-failed")
+        }));
+    }
+
+    #[tokio::test]
+    async fn full_model_fetch_reconciles_bindings_from_each_successful_endpoint_only() {
+        let provider = sample_provider("provider-mixed", "custom");
+        let openai_endpoint = sample_endpoint("endpoint-openai", "provider-mixed", "openai:chat");
+        let claude_endpoint =
+            sample_endpoint("endpoint-claude", "provider-mixed", "claude:messages");
+        let key = sample_key(
+            "key-mixed",
+            "provider-mixed",
+            "api_key",
+            &["openai:chat", "claude:messages"],
+        );
+        let openai_transport = sample_transport(
+            "custom",
+            "provider-mixed",
+            "endpoint-openai",
+            "key-mixed",
+            "openai:chat",
+            "api_key",
+            None,
+        );
+        let claude_transport = sample_transport(
+            "custom",
+            "provider-mixed",
+            "endpoint-claude",
+            "key-mixed",
+            "claude:messages",
+            "api_key",
+            None,
+        );
+        let state = TestState::new(
+            vec![provider],
+            vec![openai_endpoint, claude_endpoint],
+            vec![key],
+            HashMap::from([
+                (
+                    (
+                        "provider-mixed".to_string(),
+                        "endpoint-openai".to_string(),
+                        "key-mixed".to_string(),
+                    ),
+                    openai_transport,
+                ),
+                (
+                    (
+                        "provider-mixed".to_string(),
+                        "endpoint-claude".to_string(),
+                        "key-mixed".to_string(),
+                    ),
+                    claude_transport,
+                ),
+            ]),
+            vec![
+                execution_result(json!({"data": [{"id": "gpt-5"}]})),
+                execution_error_result(
+                    503,
+                    json!({"error": {"message": "claude catalog unavailable"}}),
+                ),
+            ],
+        )
+        .with_provider_models(vec![
+            sample_provider_model("model-gpt", "provider-mixed", "gpt-5"),
+            sample_provider_model("model-claude", "provider-mixed", "claude-opus"),
+        ]);
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("full fetch should succeed");
+
+        assert_eq!(summary.succeeded, 1);
+        let syncs = state.binding_syncs.lock().expect("binding syncs mutex");
+        assert!(syncs
+            .iter()
+            .any(|(model_id, endpoint_ids, replace, scope)| {
+                model_id == "model-gpt"
+                    && endpoint_ids == &["endpoint-openai".to_string()]
+                    && *replace
+                    && scope == &["endpoint-openai".to_string()]
+            }));
+        assert!(syncs
+            .iter()
+            .any(|(model_id, endpoint_ids, replace, scope)| {
+                model_id == "model-claude"
+                    && endpoint_ids.is_empty()
+                    && *replace
+                    && scope == &["endpoint-openai".to_string()]
+            }));
+    }
+
+    #[tokio::test]
+    async fn full_model_fetch_does_not_replace_an_endpoint_when_another_key_fails() {
+        let provider = sample_provider("provider-shared", "custom");
+        let endpoint = sample_endpoint("endpoint-shared", "provider-shared", "openai:chat");
+        let successful_key = sample_key(
+            "key-success",
+            "provider-shared",
+            "api_key",
+            &["openai:chat"],
+        );
+        let failed_key = sample_key("key-failed", "provider-shared", "api_key", &["openai:chat"]);
+        let state = TestState::new(
+            vec![provider],
+            vec![endpoint],
+            vec![successful_key, failed_key],
+            HashMap::from([
+                (
+                    (
+                        "provider-shared".to_string(),
+                        "endpoint-shared".to_string(),
+                        "key-success".to_string(),
+                    ),
+                    sample_transport(
+                        "custom",
+                        "provider-shared",
+                        "endpoint-shared",
+                        "key-success",
+                        "openai:chat",
+                        "api_key",
+                        None,
+                    ),
+                ),
+                (
+                    (
+                        "provider-shared".to_string(),
+                        "endpoint-shared".to_string(),
+                        "key-failed".to_string(),
+                    ),
+                    sample_transport(
+                        "custom",
+                        "provider-shared",
+                        "endpoint-shared",
+                        "key-failed",
+                        "openai:chat",
+                        "api_key",
+                        None,
+                    ),
+                ),
+            ]),
+            vec![
+                execution_result(json!({"data": [{"id": "gpt-5"}]})),
+                execution_error_result(503, json!({"error": {"message": "catalog unavailable"}})),
+            ],
+        )
+        .with_provider_models(vec![sample_provider_model(
+            "model-gpt",
+            "provider-shared",
+            "gpt-5",
+        )]);
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("full fetch should finish");
+
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(summary.failed, 1);
+        let syncs = state.binding_syncs.lock().expect("binding syncs mutex");
+        assert!(syncs
+            .iter()
+            .any(|(model_id, endpoint_ids, replace, scope)| {
+                model_id == "model-gpt"
+                    && endpoint_ids == &["endpoint-shared".to_string()]
+                    && !replace
+                    && scope.is_empty()
+            }));
+        assert!(!syncs.iter().any(|(_, _, replace, _)| *replace));
+    }
+
+    #[tokio::test]
+    async fn full_model_fetch_does_not_replace_partially_failed_endpoint_from_another_key() {
+        let provider = sample_provider("provider-partial", "custom");
+        let openai_endpoint = sample_endpoint("endpoint-openai", "provider-partial", "openai:chat");
+        let claude_endpoint =
+            sample_endpoint("endpoint-claude", "provider-partial", "claude:messages");
+        let mixed_key = sample_key(
+            "key-mixed",
+            "provider-partial",
+            "api_key",
+            &["openai:chat", "claude:messages"],
+        );
+        let claude_key = sample_key(
+            "key-claude",
+            "provider-partial",
+            "api_key",
+            &["claude:messages"],
+        );
+        let state = TestState::new(
+            vec![provider],
+            vec![openai_endpoint, claude_endpoint],
+            vec![mixed_key, claude_key],
+            HashMap::from([
+                (
+                    (
+                        "provider-partial".to_string(),
+                        "endpoint-openai".to_string(),
+                        "key-mixed".to_string(),
+                    ),
+                    sample_transport(
+                        "custom",
+                        "provider-partial",
+                        "endpoint-openai",
+                        "key-mixed",
+                        "openai:chat",
+                        "api_key",
+                        None,
+                    ),
+                ),
+                (
+                    (
+                        "provider-partial".to_string(),
+                        "endpoint-claude".to_string(),
+                        "key-mixed".to_string(),
+                    ),
+                    sample_transport(
+                        "custom",
+                        "provider-partial",
+                        "endpoint-claude",
+                        "key-mixed",
+                        "claude:messages",
+                        "api_key",
+                        None,
+                    ),
+                ),
+                (
+                    (
+                        "provider-partial".to_string(),
+                        "endpoint-claude".to_string(),
+                        "key-claude".to_string(),
+                    ),
+                    sample_transport(
+                        "custom",
+                        "provider-partial",
+                        "endpoint-claude",
+                        "key-claude",
+                        "claude:messages",
+                        "api_key",
+                        None,
+                    ),
+                ),
+            ]),
+            vec![
+                execution_result(json!({"data": [{"id": "gpt-5"}]})),
+                execution_error_result(
+                    503,
+                    json!({"error": {"message": "claude catalog unavailable"}}),
+                ),
+                execution_result(json!({"data": [{"id": "claude-opus"}]})),
+            ],
+        )
+        .with_provider_models(vec![
+            sample_provider_model("model-gpt", "provider-partial", "gpt-5"),
+            sample_provider_model("model-claude", "provider-partial", "claude-opus"),
+        ]);
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("full fetch should finish");
+
+        assert_eq!(summary.succeeded, 2);
+        let syncs = state.binding_syncs.lock().expect("binding syncs mutex");
+        assert!(syncs
+            .iter()
+            .any(|(model_id, endpoint_ids, replace, scope)| {
+                model_id == "model-gpt"
+                    && endpoint_ids == &["endpoint-openai".to_string()]
+                    && *replace
+                    && scope == &["endpoint-openai".to_string()]
+            }));
+        assert!(!syncs.iter().any(|(_, _, replace, scope)| {
+            *replace
+                && scope
+                    .iter()
+                    .any(|endpoint_id| endpoint_id == "endpoint-claude")
+        }));
+    }
+
+    #[tokio::test]
+    async fn full_model_fetch_merges_endpoint_bindings_across_model_aliases() {
+        let provider = sample_provider("provider-alias", "custom");
+        let first_endpoint = sample_endpoint("endpoint-primary", "provider-alias", "openai:chat");
+        let second_endpoint =
+            sample_endpoint("endpoint-alias", "provider-alias", "claude:messages");
+        let key = sample_key(
+            "key-alias",
+            "provider-alias",
+            "api_key",
+            &["openai:chat", "claude:messages"],
+        );
+        let state = TestState::new(
+            vec![provider],
+            vec![first_endpoint, second_endpoint],
+            vec![key],
+            HashMap::from([
+                (
+                    (
+                        "provider-alias".to_string(),
+                        "endpoint-primary".to_string(),
+                        "key-alias".to_string(),
+                    ),
+                    sample_transport(
+                        "custom",
+                        "provider-alias",
+                        "endpoint-primary",
+                        "key-alias",
+                        "openai:chat",
+                        "api_key",
+                        None,
+                    ),
+                ),
+                (
+                    (
+                        "provider-alias".to_string(),
+                        "endpoint-alias".to_string(),
+                        "key-alias".to_string(),
+                    ),
+                    sample_transport(
+                        "custom",
+                        "provider-alias",
+                        "endpoint-alias",
+                        "key-alias",
+                        "claude:messages",
+                        "api_key",
+                        None,
+                    ),
+                ),
+            ]),
+            vec![
+                execution_result(json!({"data": [{"id": "primary-name"}]})),
+                execution_result(json!({"data": [{"id": "alias-name"}]})),
+            ],
+        )
+        .with_provider_models(vec![sample_provider_model_with_alias(
+            "model-alias",
+            "provider-alias",
+            "primary-name",
+            "alias-name",
+        )]);
+
+        perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("alias fetch should succeed");
+
+        let syncs = state.binding_syncs.lock().expect("binding syncs mutex");
+        assert!(syncs.iter().any(|(model_id, endpoint_ids, replace, _)| {
+            model_id == "model-alias"
+                && endpoint_ids == &["endpoint-alias".to_string(), "endpoint-primary".to_string()]
+                && *replace
+        }));
+    }
+
+    #[tokio::test]
+    async fn preset_catalog_fetch_does_not_replace_existing_automatic_bindings() {
+        let provider = sample_provider("provider-claude-code", "claude_code");
+        let endpoint = sample_endpoint(
+            "endpoint-claude-messages",
+            "provider-claude-code",
+            "claude:messages",
+        );
+        let key = sample_key(
+            "key-claude-code",
+            "provider-claude-code",
+            "oauth",
+            &["claude:messages"],
+        );
+        let transport = sample_transport(
+            "claude_code",
+            "provider-claude-code",
+            "endpoint-claude-messages",
+            "key-claude-code",
+            "claude:messages",
+            "oauth",
+            None,
+        );
+        let state = TestState::new(
+            vec![provider],
+            vec![endpoint],
+            vec![key],
+            HashMap::from([(
+                (
+                    "provider-claude-code".to_string(),
+                    "endpoint-claude-messages".to_string(),
+                    "key-claude-code".to_string(),
+                ),
+                transport,
+            )]),
+            Vec::new(),
+        )
+        .with_provider_models(vec![sample_provider_model(
+            "model-claude-opus",
+            "provider-claude-code",
+            "claude-opus-4-6",
+        )]);
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("preset fetch should succeed");
+
+        assert_eq!(summary.succeeded, 1);
+        let syncs = state.binding_syncs.lock().expect("binding syncs mutex");
+        assert!(syncs.iter().any(|(model_id, endpoint_ids, replace, _)| {
+            model_id == "model-claude-opus"
+                && endpoint_ids == &["endpoint-claude-messages".to_string()]
+                && !*replace
+        }));
+        assert!(syncs.iter().all(|(_, _, replace, _)| !*replace));
     }
 }

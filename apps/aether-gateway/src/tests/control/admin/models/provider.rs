@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::super::super::{
     build_router_with_state, sample_admin_global_model, sample_admin_provider_model,
-    sample_provider, start_server, AppState,
+    sample_endpoint, sample_key, sample_provider, start_server, AppState,
 };
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
@@ -200,13 +200,22 @@ async fn gateway_creates_admin_provider_model_locally_with_trusted_admin_princip
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider("provider-openai", "openai", 10)],
-        Vec::new(),
+        vec![sample_endpoint(
+            "endpoint-openai-embedding",
+            "provider-openai",
+            "openai:embedding",
+            "https://api.openai.example",
+        )],
         Vec::new(),
     ));
     let global_model_repository = Arc::new(
-        InMemoryGlobalModelReadRepository::seed(Vec::new()).with_admin_global_models(vec![
-            sample_admin_global_model("global-gpt-5", "gpt-5", "GPT 5"),
-        ]),
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "global-gpt-5",
+                "gpt-5",
+                "GPT 5",
+            )])
+            .with_endpoint_provider_ids([("endpoint-openai-embedding", "provider-openai")]),
     );
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
@@ -276,6 +285,93 @@ async fn gateway_creates_admin_provider_model_locally_with_trusted_admin_princip
     gateway_handle.abort();
     upstream_handle.abort();
 }
+
+#[tokio::test]
+async fn gateway_uses_global_model_regex_to_infer_created_model_endpoint_binding() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-mixed", "custom", 10)],
+        vec![
+            sample_endpoint(
+                "endpoint-openai-chat",
+                "provider-mixed",
+                "openai:chat",
+                "https://openai.example",
+            ),
+            sample_endpoint(
+                "endpoint-claude-messages",
+                "provider-mixed",
+                "claude:messages",
+                "https://claude.example",
+            ),
+        ],
+        vec![sample_key(
+            "key-mixed",
+            "provider-mixed",
+            "claude:messages",
+            "sk-test",
+        )],
+    ));
+    let mut global_model =
+        sample_admin_global_model("global-claude-opus", "claude-opus", "Claude Opus");
+    global_model.config = Some(json!({ "model_mappings": ["claude-opus-.*"] }));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![global_model])
+            .with_endpoint_provider_ids([
+                ("endpoint-openai-chat", "provider-mixed"),
+                ("endpoint-claude-messages", "provider-mixed"),
+            ]),
+    );
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_reader_for_tests(provider_catalog_repository)
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
+        );
+    state
+        .runtime_kv_setex(
+            "upstream_models:provider-mixed:key-mixed",
+            &serde_json::to_string(&vec![json!({
+                "id": "claude-opus-4-6",
+                "endpoint_ids": ["endpoint-claude-messages"]
+            })])
+            .expect("model cache should serialize"),
+            60,
+        )
+        .await
+        .expect("model cache should seed");
+    let (gateway_url, gateway_handle) = start_server(build_router_with_state(state)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/providers/provider-mixed/models"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_model_name": "claude-opus",
+            "global_model_id": "global-claude-opus"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    let model_id = payload["id"].as_str().expect("model id should exist");
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&[model_id.to_string()])
+        .await
+        .expect("bindings should read");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, "endpoint-claude-messages");
+    assert_eq!(bindings[0].source, "discovered");
+
+    gateway_handle.abort();
+}
+
 #[tokio::test]
 async fn gateway_updates_and_deletes_admin_provider_model_locally_with_trusted_admin_principal() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
@@ -293,7 +389,12 @@ async fn gateway_updates_and_deletes_admin_provider_model_locally_with_trusted_a
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider("provider-openai", "openai", 10)],
-        Vec::new(),
+        vec![sample_endpoint(
+            "endpoint-openai-embedding",
+            "provider-openai",
+            "openai:embedding",
+            "https://api.openai.example",
+        )],
         Vec::new(),
     ));
     let global_model_repository = Arc::new(
@@ -307,7 +408,8 @@ async fn gateway_updates_and_deletes_admin_provider_model_locally_with_trusted_a
                 "provider-openai",
                 "global-gpt-5",
                 "gpt-5-upstream",
-            )]),
+            )])
+            .with_endpoint_provider_ids([("endpoint-openai-embedding", "provider-openai")]),
     );
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
@@ -388,6 +490,692 @@ async fn gateway_updates_and_deletes_admin_provider_model_locally_with_trusted_a
     gateway_handle.abort();
     upstream_handle.abort();
 }
+
+#[tokio::test]
+async fn gateway_updates_only_provider_model_endpoint_bindings() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-openai", "openai", 10)],
+        vec![sample_endpoint(
+            "endpoint-openai-chat",
+            "provider-openai",
+            "openai:chat",
+            "https://api.openai.example",
+        )],
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "global-gpt-5",
+                "gpt-5",
+                "GPT 5",
+            )])
+            .with_admin_provider_models(vec![sample_admin_provider_model(
+                "model-openai-gpt5",
+                "provider-openai",
+                "global-gpt-5",
+                "gpt-5-upstream",
+            )])
+            .with_endpoint_provider_ids([("endpoint-openai-chat", "provider-openai")]),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(
+                    provider_catalog_repository,
+                )
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .patch(format!(
+            "{gateway_url}/api/admin/providers/provider-openai/models/model-openai-gpt5"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "endpoint_bindings": [{
+                "endpoint_id": "endpoint-openai-chat",
+                "is_active": true
+            }]
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["provider_model_name"], "gpt-5-upstream");
+    assert_eq!(payload["global_model_id"], "global-gpt-5");
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&["model-openai-gpt5".to_string()])
+        .await
+        .expect("bindings should read");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, "endpoint-openai-chat");
+    assert_eq!(bindings[0].source, "manual");
+    assert!(bindings[0].is_active);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_duplicate_provider_model_endpoint_bindings_as_bad_request() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-openai", "openai", 10)],
+        vec![sample_endpoint(
+            "endpoint-openai-chat",
+            "provider-openai",
+            "openai:chat",
+            "https://api.openai.example",
+        )],
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "global-gpt-5",
+                "gpt-5",
+                "GPT 5",
+            )])
+            .with_admin_provider_models(vec![sample_admin_provider_model(
+                "model-openai-gpt5",
+                "provider-openai",
+                "global-gpt-5",
+                "gpt-5-upstream",
+            )])
+            .with_endpoint_provider_ids([("endpoint-openai-chat", "provider-openai")]),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(
+                    provider_catalog_repository,
+                )
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .patch(format!(
+            "{gateway_url}/api/admin/providers/provider-openai/models/model-openai-gpt5"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "endpoint_bindings": [
+                {"endpoint_id": "endpoint-openai-chat", "is_active": true},
+                {"endpoint_id": " endpoint-openai-chat ", "is_active": false}
+            ]
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(
+        payload["detail"],
+        "Endpoint endpoint-openai-chat 在绑定列表中重复"
+    );
+    assert!(global_model_repository
+        .list_model_endpoint_bindings(&["model-openai-gpt5".to_string()])
+        .await
+        .expect("bindings should read")
+        .is_empty());
+
+    let empty_response = reqwest::Client::new()
+        .patch(format!(
+            "{gateway_url}/api/admin/providers/provider-openai/models/model-openai-gpt5"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({ "endpoint_bindings": [] }))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(empty_response.status(), StatusCode::BAD_REQUEST);
+    let empty_payload: serde_json::Value =
+        empty_response.json().await.expect("json body should parse");
+    assert_eq!(empty_payload["detail"], "至少提供一个 Endpoint 绑定");
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_cross_provider_model_endpoint_binding_without_mutating_model() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![
+            sample_provider("provider-openai", "openai", 10),
+            sample_provider("provider-alt", "alt", 20),
+        ],
+        vec![
+            sample_endpoint(
+                "endpoint-openai-chat",
+                "provider-openai",
+                "openai:chat",
+                "https://api.openai.example",
+            ),
+            sample_endpoint(
+                "endpoint-alt-chat",
+                "provider-alt",
+                "openai:chat",
+                "https://api.alt.example",
+            ),
+        ],
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![
+                sample_admin_global_model("global-gpt-5", "gpt-5", "GPT 5"),
+                sample_admin_global_model("global-gpt-5-mini", "gpt-5-mini", "GPT 5 mini"),
+            ])
+            .with_admin_provider_models(vec![sample_admin_provider_model(
+                "model-openai-gpt5",
+                "provider-openai",
+                "global-gpt-5",
+                "gpt-5-upstream",
+            )]),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(
+                    provider_catalog_repository,
+                )
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .patch(format!(
+            "{gateway_url}/api/admin/providers/provider-openai/models/model-openai-gpt5"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_model_name": "must-not-persist",
+            "global_model_id": "global-gpt-5-mini",
+            "endpoint_bindings": [{
+                "endpoint_id": "endpoint-alt-chat",
+                "is_active": true
+            }]
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(
+        payload["detail"],
+        "Endpoint endpoint-alt-chat 不属于当前 Provider"
+    );
+    let stored = global_model_repository
+        .get_admin_provider_model("provider-openai", "model-openai-gpt5")
+        .await
+        .expect("model should read")
+        .expect("model should remain");
+    assert_eq!(stored.provider_model_name, "gpt-5-upstream");
+    assert_eq!(stored.global_model_id, "global-gpt-5");
+    assert!(global_model_repository
+        .list_model_endpoint_bindings(&["model-openai-gpt5".to_string()])
+        .await
+        .expect("bindings should read")
+        .is_empty());
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rebuilds_automatic_endpoint_bindings_when_model_mapping_changes() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-mixed", "custom", 10)],
+        vec![
+            sample_endpoint(
+                "endpoint-openai-chat",
+                "provider-mixed",
+                "openai:chat",
+                "https://openai.example",
+            ),
+            sample_endpoint(
+                "endpoint-claude-messages",
+                "provider-mixed",
+                "claude:messages",
+                "https://claude.example",
+            ),
+        ],
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "global-claude-opus",
+                "claude-opus",
+                "Claude Opus",
+            )])
+            .with_admin_provider_models(vec![sample_admin_provider_model(
+                "model-claude-opus",
+                "provider-mixed",
+                "global-claude-opus",
+                "claude-opus-upstream",
+            )])
+            .with_model_endpoint_bindings(vec![
+                aether_data_contracts::repository::global_models::StoredModelEndpointBinding::new(
+                    "model-claude-opus".to_string(),
+                    "endpoint-openai-chat".to_string(),
+                    "discovered".to_string(),
+                    true,
+                    Some(1),
+                    Some(1),
+                )
+                .expect("old automatic binding should build"),
+            ])
+            .with_endpoint_provider_ids([
+                ("endpoint-openai-chat", "provider-mixed"),
+                ("endpoint-claude-messages", "provider-mixed"),
+            ]),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(
+                    provider_catalog_repository,
+                )
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .patch(format!(
+            "{gateway_url}/api/admin/providers/provider-mixed/models/model-claude-opus"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_model_mappings": [{
+                "name": "claude-opus-upstream",
+                "priority": 1,
+                "endpoint_ids": ["endpoint-claude-messages"]
+            }]
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&["model-claude-opus".to_string()])
+        .await
+        .expect("bindings should read");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, "endpoint-claude-messages");
+    assert_eq!(bindings[0].source, "mapping");
+    assert!(bindings[0].is_active);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rebuilds_automatic_endpoint_bindings_when_provider_model_name_changes() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-mixed", "custom", 10)],
+        vec![
+            sample_endpoint(
+                "endpoint-old",
+                "provider-mixed",
+                "openai:chat",
+                "https://old.example",
+            ),
+            sample_endpoint(
+                "endpoint-new",
+                "provider-mixed",
+                "claude:messages",
+                "https://new.example",
+            ),
+        ],
+        vec![sample_key(
+            "key-mixed",
+            "provider-mixed",
+            "claude:messages",
+            "sk-test",
+        )],
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "global-claude-opus",
+                "claude-opus",
+                "Claude Opus",
+            )])
+            .with_admin_provider_models(vec![sample_admin_provider_model(
+                "model-claude-opus",
+                "provider-mixed",
+                "global-claude-opus",
+                "old-upstream-name",
+            )])
+            .with_model_endpoint_bindings(vec![
+                aether_data_contracts::repository::global_models::StoredModelEndpointBinding::new(
+                    "model-claude-opus".to_string(),
+                    "endpoint-old".to_string(),
+                    "discovered".to_string(),
+                    true,
+                    Some(1),
+                    Some(1),
+                )
+                .expect("old automatic binding should build"),
+            ])
+            .with_endpoint_provider_ids([
+                ("endpoint-old", "provider-mixed"),
+                ("endpoint-new", "provider-mixed"),
+            ]),
+    );
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_reader_for_tests(provider_catalog_repository)
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
+        );
+    state
+        .runtime_kv_setex(
+            "upstream_models:provider-mixed:key-mixed",
+            &serde_json::to_string(&vec![json!({
+                "id": "new-upstream-name",
+                "endpoint_ids": ["endpoint-new"]
+            })])
+            .expect("model cache should serialize"),
+            60,
+        )
+        .await
+        .expect("model cache should seed");
+    let (gateway_url, gateway_handle) = start_server(build_router_with_state(state)).await;
+
+    let response = reqwest::Client::new()
+        .patch(format!(
+            "{gateway_url}/api/admin/providers/provider-mixed/models/model-claude-opus"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({ "provider_model_name": "new-upstream-name" }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&["model-claude-opus".to_string()])
+        .await
+        .expect("bindings should read");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, "endpoint-new");
+    assert_eq!(bindings[0].source, "discovered");
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_uses_explicit_bindings_when_renaming_multi_endpoint_model() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-mixed", "custom", 10)],
+        vec![
+            sample_endpoint(
+                "endpoint-old",
+                "provider-mixed",
+                "openai:chat",
+                "https://old.example",
+            ),
+            sample_endpoint(
+                "endpoint-new",
+                "provider-mixed",
+                "claude:messages",
+                "https://new.example",
+            ),
+        ],
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "global-claude-opus",
+                "claude-opus",
+                "Claude Opus",
+            )])
+            .with_admin_provider_models(vec![sample_admin_provider_model(
+                "model-claude-opus",
+                "provider-mixed",
+                "global-claude-opus",
+                "old-upstream-name",
+            )])
+            .with_model_endpoint_bindings(vec![
+                aether_data_contracts::repository::global_models::StoredModelEndpointBinding::new(
+                    "model-claude-opus".to_string(),
+                    "endpoint-old".to_string(),
+                    "discovered".to_string(),
+                    true,
+                    Some(1),
+                    Some(1),
+                )
+                .expect("old automatic binding should build"),
+            ])
+            .with_endpoint_provider_ids([
+                ("endpoint-old", "provider-mixed"),
+                ("endpoint-new", "provider-mixed"),
+            ]),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(
+                    provider_catalog_repository,
+                )
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .patch(format!(
+            "{gateway_url}/api/admin/providers/provider-mixed/models/model-claude-opus"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_model_name": "renamed-with-manual-route",
+            "endpoint_bindings": [{
+                "endpoint_id": "endpoint-new",
+                "is_active": true
+            }]
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&["model-claude-opus".to_string()])
+        .await
+        .expect("bindings should read");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, "endpoint-new");
+    assert_eq!(bindings[0].source, "manual");
+    assert!(bindings[0].is_active);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_multi_endpoint_model_without_endpoint_evidence() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-mixed", "custom", 10)],
+        vec![
+            sample_endpoint(
+                "endpoint-openai-chat",
+                "provider-mixed",
+                "openai:chat",
+                "https://openai.example",
+            ),
+            sample_endpoint(
+                "endpoint-claude-messages",
+                "provider-mixed",
+                "claude:messages",
+                "https://claude.example",
+            ),
+        ],
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new()).with_admin_global_models(vec![
+            sample_admin_global_model("global-claude-opus", "claude-opus", "Claude Opus"),
+        ]),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(
+                    provider_catalog_repository,
+                )
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/providers/provider-mixed/models"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_model_name": "claude-opus-upstream",
+            "global_model_id": "global-claude-opus"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(
+        payload["detail"],
+        "模型 claude-opus-upstream 无法推断 Endpoint，请明确选择至少一个 Endpoint"
+    );
+    assert!(global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-mixed".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 20,
+        })
+        .await
+        .expect("models should read")
+        .is_empty());
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_creates_multi_endpoint_model_with_explicit_endpoint_binding() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-mixed", "custom", 10)],
+        vec![
+            sample_endpoint(
+                "endpoint-openai-chat",
+                "provider-mixed",
+                "openai:chat",
+                "https://openai.example",
+            ),
+            sample_endpoint(
+                "endpoint-claude-messages",
+                "provider-mixed",
+                "claude:messages",
+                "https://claude.example",
+            ),
+        ],
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "global-claude-opus",
+                "claude-opus",
+                "Claude Opus",
+            )])
+            .with_endpoint_provider_ids([
+                ("endpoint-openai-chat", "provider-mixed"),
+                ("endpoint-claude-messages", "provider-mixed"),
+            ]),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(
+                    provider_catalog_repository,
+                )
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/providers/provider-mixed/models"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_model_name": "claude-opus-upstream",
+            "global_model_id": "global-claude-opus",
+            "endpoint_ids": ["endpoint-claude-messages"]
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    let model_id = payload["id"].as_str().expect("model id should exist");
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&[model_id.to_string()])
+        .await
+        .expect("bindings should read");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, "endpoint-claude-messages");
+    assert_eq!(bindings[0].source, "manual");
+
+    gateway_handle.abort();
+}
+
 #[tokio::test]
 async fn gateway_batch_creates_admin_provider_models_locally_with_trusted_admin_principal() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
@@ -405,14 +1193,21 @@ async fn gateway_batch_creates_admin_provider_models_locally_with_trusted_admin_
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider("provider-openai", "openai", 10)],
-        Vec::new(),
+        vec![sample_endpoint(
+            "endpoint-openai-chat",
+            "provider-openai",
+            "openai:chat",
+            "https://api.openai.example",
+        )],
         Vec::new(),
     ));
     let global_model_repository = Arc::new(
-        InMemoryGlobalModelReadRepository::seed(Vec::new()).with_admin_global_models(vec![
-            sample_admin_global_model("global-gpt-5", "gpt-5", "GPT 5"),
-            sample_admin_global_model("global-gpt-4.1", "gpt-4.1", "GPT 4.1"),
-        ]),
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![
+                sample_admin_global_model("global-gpt-5", "gpt-5", "GPT 5"),
+                sample_admin_global_model("global-gpt-4.1", "gpt-4.1", "GPT 4.1"),
+            ])
+            .with_endpoint_provider_ids([("endpoint-openai-chat", "provider-openai")]),
     );
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
@@ -578,7 +1373,12 @@ async fn gateway_assigns_and_imports_admin_provider_models_locally_with_trusted_
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider("provider-openai", "openai", 10)],
-        Vec::new(),
+        vec![sample_endpoint(
+            "endpoint-openai-chat",
+            "provider-openai",
+            "openai:chat",
+            "https://api.openai.example",
+        )],
         Vec::new(),
     ));
     let global_model_repository = Arc::new(
@@ -640,6 +1440,57 @@ async fn gateway_assigns_and_imports_admin_provider_models_locally_with_trusted_
         1
     );
 
+    let legacy_import_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/providers/provider-openai/import-from-upstream"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "model_ids": ["gpt-5-upstream", "legacy-only-model"],
+            "price_per_request": 0.1
+        }))
+        .send()
+        .await
+        .expect("legacy import request should succeed");
+    assert_eq!(legacy_import_response.status(), StatusCode::OK);
+    let legacy_import_payload: serde_json::Value = legacy_import_response
+        .json()
+        .await
+        .expect("legacy import body should parse");
+    assert_eq!(
+        legacy_import_payload["success"]
+            .as_array()
+            .expect("legacy success array")
+            .len(),
+        2
+    );
+    let legacy_provider_model_id = legacy_import_payload["success"][1]["provider_model_id"]
+        .as_str()
+        .expect("legacy provider model id")
+        .to_string();
+    let legacy_bindings = global_model_repository
+        .list_model_endpoint_bindings(&[
+            "model-openai-gpt5".to_string(),
+            legacy_provider_model_id.clone(),
+        ])
+        .await
+        .expect("legacy import bindings should read");
+    assert!(legacy_bindings.iter().any(|binding| {
+        binding.model_id == "model-openai-gpt5"
+            && binding.endpoint_id == "endpoint-openai-chat"
+            && binding.source == "migration"
+            && binding.is_active
+    }));
+    assert!(legacy_bindings.iter().any(|binding| {
+        binding.model_id == legacy_provider_model_id
+            && binding.endpoint_id == "endpoint-openai-chat"
+            && binding.source == "discovered"
+            && binding.is_active
+    }));
+
     let import_response = reqwest::Client::new()
         .post(format!(
             "{gateway_url}/api/admin/providers/provider-openai/import-from-upstream"
@@ -650,6 +1501,18 @@ async fn gateway_assigns_and_imports_admin_provider_models_locally_with_trusted_
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
         .json(&json!({
             "model_ids": ["gpt-5-upstream", "brand-new-model"],
+            "models": [
+                {
+                    "id": "gpt-5-upstream",
+                    "api_formats": ["openai:chat"],
+                    "endpoint_ids": ["endpoint-openai-chat"]
+                },
+                {
+                    "id": "brand-new-model",
+                    "api_formats": ["openai:chat"],
+                    "endpoint_ids": ["endpoint-openai-chat"]
+                }
+            ],
             "price_per_request": 0.1
         }))
         .send()
@@ -668,8 +1531,94 @@ async fn gateway_assigns_and_imports_admin_provider_models_locally_with_trusted_
         2
     );
     assert_eq!(import_payload["success"][1]["created_global_model"], true);
+    let imported_provider_model_id = import_payload["success"][1]["provider_model_id"]
+        .as_str()
+        .expect("provider model id")
+        .to_string();
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&[
+            "model-openai-gpt5".to_string(),
+            imported_provider_model_id.clone(),
+        ])
+        .await
+        .expect("imported bindings should read");
+    assert!(bindings.iter().any(|binding| {
+        binding.model_id == "model-openai-gpt5"
+            && binding.endpoint_id == "endpoint-openai-chat"
+            && binding.is_active
+    }));
+    assert!(bindings.iter().any(|binding| {
+        binding.model_id == imported_provider_model_id
+            && binding.endpoint_id == "endpoint-openai-chat"
+            && binding.is_active
+    }));
     assert_eq!(*upstream_hits_clone.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_import_failure_removes_new_unreferenced_global_model() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-openai", "openai", 10)],
+        vec![sample_endpoint(
+            "endpoint-openai-chat",
+            "provider-openai",
+            "openai:chat",
+            "https://api.openai.example",
+        )],
+        Vec::new(),
+    ));
+    // Provider Catalog 能看到 Endpoint，但持久化测试替身显式拒绝它，模拟原子创建失败。
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_endpoint_provider_ids(std::iter::empty::<(&str, &str)>()),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(
+                    provider_catalog_repository,
+                )
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/providers/provider-openai/import-from-upstream"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "model_ids": ["orphan-prone-model"],
+            "models": [{
+                "id": "orphan-prone-model",
+                "api_formats": ["openai:chat"],
+                "endpoint_ids": ["endpoint-openai-chat"]
+            }]
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert!(payload["success"]
+        .as_array()
+        .expect("success array")
+        .is_empty());
+    assert_eq!(payload["errors"].as_array().expect("errors array").len(), 1);
+    assert!(global_model_repository
+        .get_admin_global_model_by_name("orphan-prone-model")
+        .await
+        .expect("global model should read")
+        .is_none());
+
+    gateway_handle.abort();
 }

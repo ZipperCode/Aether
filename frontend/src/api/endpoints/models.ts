@@ -6,6 +6,7 @@ import type {
   ModelCatalogResponse,
   ProviderAvailableSourceModelsResponse,
   ImportFromUpstreamResponse,
+  UpstreamModel,
 } from './types'
 
 /**
@@ -131,7 +132,7 @@ export async function batchAssignModelsToProvider(
  */
 export async function importModelsFromUpstream(
   providerId: string,
-  modelIds: string[],
+  models: UpstreamModel[],
   options?: {
     tiered_pricing?: object
     price_per_request?: number
@@ -140,7 +141,12 @@ export async function importModelsFromUpstream(
   const response = await client.post(
     `/api/admin/providers/${providerId}/import-from-upstream`,
     {
-      model_ids: modelIds,
+      model_ids: models.map(model => model.id),
+      models: models.map(model => ({
+        id: model.id,
+        api_formats: model.api_formats,
+        endpoint_ids: model.endpoint_ids ?? []
+      })),
       ...options
     }
   )

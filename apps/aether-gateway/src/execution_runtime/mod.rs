@@ -66,6 +66,79 @@ pub(crate) fn ai_attempt_retry_scope_from_failure_disposition(
     }
 }
 
+pub(crate) fn local_execution_runtime_miss_reason<'a>(
+    headers: &'a BTreeMap<String, String>,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(name, _)| {
+            name.eq_ignore_ascii_case(crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
+        })
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn is_endpoint_capability_runtime_miss(
+    headers: &BTreeMap<String, String>,
+    expected_reason: &str,
+) -> bool {
+    local_execution_runtime_miss_reason(headers)
+        .is_some_and(|reason| reason.eq_ignore_ascii_case(expected_reason))
+}
+
+fn report_context_string_field<'a>(
+    report_context: Option<&'a Value>,
+    field: &str,
+) -> Option<&'a str> {
+    report_context?
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn report_context_request_operation(report_context: Option<&Value>) -> Option<&str> {
+    report_context_string_field(report_context, "api_operation")
+}
+
+pub(crate) fn quarantine_endpoint_capability_from_report_context(
+    state: &crate::AppState,
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&Value>,
+    stream: bool,
+) -> bool {
+    let Some(model_id) = report_context_string_field(report_context, "model_id") else {
+        return false;
+    };
+    state.quarantine_endpoint_capability(
+        model_id,
+        &plan.endpoint_id,
+        &plan.key_id,
+        &plan.client_api_format,
+        stream,
+        report_context_request_operation(report_context),
+    )
+}
+
+pub(crate) fn clear_endpoint_capability_quarantine_from_report_context(
+    state: &crate::AppState,
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&Value>,
+    stream: bool,
+) {
+    let Some(model_id) = report_context_string_field(report_context, "model_id") else {
+        return;
+    };
+    state.clear_endpoint_capability_quarantine_for_success(
+        model_id,
+        &plan.endpoint_id,
+        &plan.key_id,
+        &plan.client_api_format,
+        stream,
+        report_context_request_operation(report_context),
+    );
+}
+
 #[cfg(test)]
 mod retry_scope_tests {
     use aether_ai_serving::AiAttemptRetryScope;

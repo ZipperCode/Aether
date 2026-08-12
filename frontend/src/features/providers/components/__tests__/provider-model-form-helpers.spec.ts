@@ -29,6 +29,7 @@ describe('provider model form embedding helpers', () => {
     const payload = buildProviderModelCreatePayload({
       globalModelId: 'gm-embedding',
       providerModelName: 'text-embedding-3-small',
+      endpointIds: ['endpoint-embedding'],
       finalTieredPricing: pricing,
       tieredPricingModified: false,
       pricePerRequest: 0.25,
@@ -46,6 +47,7 @@ describe('provider model form embedding helpers', () => {
     expect(payload).toMatchObject({
       global_model_id: 'gm-embedding',
       provider_model_name: 'text-embedding-3-small',
+      endpoint_ids: ['endpoint-embedding'],
       tiered_pricing: undefined,
       price_per_request: undefined,
       config: undefined,
@@ -58,6 +60,7 @@ describe('provider model form embedding helpers', () => {
     const payload = buildProviderModelCreatePayload({
       globalModelId: 'gm-local-manual',
       providerModelName: 'intranet-chat-model-v1',
+      endpointIds: ['endpoint-intranet'],
       finalTieredPricing: pricing,
       tieredPricingModified: false,
       pricePerRequest: undefined,
@@ -70,6 +73,7 @@ describe('provider model form embedding helpers', () => {
     expect(payload).toMatchObject({
       global_model_id: 'gm-local-manual',
       provider_model_name: 'intranet-chat-model-v1',
+      endpoint_ids: ['endpoint-intranet'],
       tiered_pricing: undefined,
       price_per_request: undefined,
       config: undefined,
@@ -178,6 +182,7 @@ describe('provider model pricing override helpers', () => {
     const createPayload = buildProviderModelCreatePayload({
       globalModelId: 'global-model-1',
       providerModelName: 'gpt-test',
+      endpointIds: ['endpoint-1'],
       finalTieredPricing: override,
       tieredPricingModified: true,
       pricePerRequestModified: false,

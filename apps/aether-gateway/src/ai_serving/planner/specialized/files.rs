@@ -109,6 +109,7 @@ pub(crate) async fn build_local_gemini_files_sync_attempt_source_for_kind<'a>(
         Some(body_json),
         trace_id,
         decision,
+        spec,
     )
     .await?
     else {
@@ -149,7 +150,8 @@ pub(crate) async fn build_local_gemini_files_stream_attempt_source_for_kind<'a>(
     };
 
     let Some(input) =
-        resolve_local_gemini_files_decision_input(state, parts, None, trace_id, decision).await?
+        resolve_local_gemini_files_decision_input(state, parts, None, trace_id, decision, spec)
+            .await?
     else {
         return Ok(None);
     };
@@ -343,6 +345,7 @@ pub(crate) async fn maybe_build_sync_local_gemini_files_decision_payload(
         Some(body_json),
         trace_id,
         decision,
+        spec,
     )
     .await?
     else {
@@ -386,7 +389,8 @@ pub(crate) async fn maybe_build_stream_local_gemini_files_decision_payload(
     };
 
     let Some(input) =
-        resolve_local_gemini_files_decision_input(state, parts, None, trace_id, decision).await?
+        resolve_local_gemini_files_decision_input(state, parts, None, trace_id, decision, spec)
+            .await?
     else {
         return Ok(None);
     };
@@ -433,6 +437,7 @@ async fn build_local_sync_plan_and_reports(
         Some(body_json),
         trace_id,
         decision,
+        spec,
     )
     .await?
     else {
@@ -487,7 +492,8 @@ async fn build_local_stream_plan_and_reports(
 ) -> Result<Vec<AiStreamAttempt>, GatewayError> {
     let spec_metadata = local_gemini_files_spec_metadata(spec);
     let Some(input) =
-        resolve_local_gemini_files_decision_input(state, parts, None, trace_id, decision).await?
+        resolve_local_gemini_files_decision_input(state, parts, None, trace_id, decision, spec)
+            .await?
     else {
         return Ok(Vec::new());
     };

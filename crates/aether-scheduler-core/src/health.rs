@@ -68,6 +68,13 @@ pub fn is_candidate_in_recent_failure_cooldown(
         if now_unix_secs.saturating_sub(observed_at_unix_secs) > FAILURE_COOLDOWN_WINDOW_SECS {
             continue;
         }
+        if candidate
+            .error_type
+            .as_deref()
+            .is_some_and(|error_type| error_type == "endpoint_capability_mismatch")
+        {
+            continue;
+        }
 
         match candidate.status {
             RequestCandidateStatus::Success => return false,
@@ -760,6 +767,29 @@ mod tests {
             stored_candidate("two", RequestCandidateStatus::Success, 99),
             stored_candidate("three", RequestCandidateStatus::Cancelled, 98),
         ];
+
+        assert!(!is_candidate_in_recent_failure_cooldown(
+            &recent_candidates,
+            "provider-a",
+            "endpoint-a",
+            "key-a",
+            100,
+        ));
+    }
+
+    #[test]
+    fn endpoint_capability_mismatches_do_not_trigger_key_cooldown() {
+        let recent_candidates = (0..8)
+            .map(|index| {
+                let mut candidate = stored_candidate(
+                    &format!("capability-mismatch-{index}"),
+                    RequestCandidateStatus::Failed,
+                    92 + index,
+                );
+                candidate.error_type = Some("endpoint_capability_mismatch".to_string());
+                candidate
+            })
+            .collect::<Vec<_>>();
 
         assert!(!is_candidate_in_recent_failure_cooldown(
             &recent_candidates,

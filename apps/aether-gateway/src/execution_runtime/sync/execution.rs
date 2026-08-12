@@ -65,8 +65,10 @@ use crate::execution_runtime::windsurf::maybe_execute_windsurf_sync;
 use crate::execution_runtime::{
     ai_attempt_retry_scope_from_failure_disposition, analyze_local_candidate_failover_sync,
     apply_endpoint_response_header_rules, attach_provider_response_headers_to_report_context,
-    local_failover_response_text, resolve_core_sync_error_finalize_report_kind,
-    should_fallback_to_control_sync, should_finalize_sync_response, LocalFailoverDecision,
+    clear_endpoint_capability_quarantine_from_report_context, is_endpoint_capability_runtime_miss,
+    local_failover_response_text, quarantine_endpoint_capability_from_report_context,
+    resolve_core_sync_error_finalize_report_kind, should_fallback_to_control_sync,
+    should_finalize_sync_response, LocalFailoverDecision,
 };
 use crate::log_ids::short_request_id;
 use crate::orchestration::{
@@ -113,6 +115,8 @@ const OPENAI_IMAGE_SYNC_PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(
 const INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE: &str = "Provider returned HTTP 200 but the Gemini response did not contain visible model output; refusing to finalize it as a successful response.";
 const EMPTY_GEMINI_PROVIDER_SUCCESS_MESSAGE: &str =
     "Provider returned HTTP 200 but the Gemini response contained no candidates.";
+const NO_LOCAL_SYNC_PLANS_REASON: &str = "no_local_sync_plans";
+const ENDPOINT_CAPABILITY_MISMATCH_ERROR_TYPE: &str = "endpoint_capability_mismatch";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InvalidGeminiProviderSuccess {
@@ -216,6 +220,22 @@ impl SyncAttemptTerminalGuard {
             return;
         }
         self.armed = false;
+        let (status_code, error_type, error_message) = match error {
+            GatewayError::AdmissionTimeout {
+                gate,
+                queue_budget_ms,
+                ..
+            } => (
+                StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                "gateway_admission_timeout",
+                format!("gateway admission gate {gate} timed out after {queue_budget_ms}ms"),
+            ),
+            other => (
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                "local_sync_attempt_aborted",
+                format!("Local sync attempt failed before terminal finalization: {other:?}"),
+            ),
+        };
         record_sync_attempt_forced_terminal_state(
             self.state.clone(),
             self.plan.clone(),
@@ -225,9 +245,9 @@ impl SyncAttemptTerminalGuard {
             self.candidate_started_at,
             UsageEventType::Failed,
             RequestCandidateStatus::Failed,
-            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            "local_sync_attempt_aborted",
-            format!("Local sync attempt failed before terminal finalization: {error:?}"),
+            status_code,
+            error_type,
+            error_message,
         )
         .await;
     }
@@ -319,7 +339,10 @@ async fn record_sync_attempt_forced_terminal_state(
     usage_data.error_category = Some(
         match usage_event_type {
             UsageEventType::Cancelled => "cancelled",
-            _ => "server_error",
+            UsageEventType::Failed if status_code >= 500 => "server_error",
+            UsageEventType::Failed if status_code >= 400 => "client_error",
+            UsageEventType::Failed => "non_success_status",
+            _ => "non_success_status",
         }
         .to_string(),
     );
@@ -336,13 +359,24 @@ async fn record_sync_attempt_forced_terminal_state(
     usage_data.client_response_headers = Some(json!({"content-type": "application/json"}));
     usage_data.client_response_body = Some(error_body);
 
-    state
-        .usage_runtime
-        .record_terminal_event_direct(
-            state.usage_lifecycle_data_state().as_ref(),
-            UsageEvent::new(usage_event_type, plan.request_id.clone(), usage_data),
-        )
-        .await;
+    let usage_runtime = Arc::clone(&state.usage_runtime);
+    let usage_data_state = Arc::clone(state.usage_lifecycle_data_state());
+    let event = UsageEvent::new(usage_event_type, plan.request_id.clone(), usage_data);
+    let terminal_write = tokio::spawn(async move {
+        usage_runtime
+            .record_terminal_event_direct(usage_data_state.as_ref(), event)
+            .await;
+    });
+    if let Err(err) = terminal_write.await {
+        warn!(
+            event_name = "local_sync_attempt_terminal_write_join_failed",
+            log_type = "ops",
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            error = %err,
+            "gateway failed to join the isolated sync terminal usage write"
+        );
+    }
 }
 
 impl SyncExecutionFailure {
@@ -1882,6 +1916,7 @@ async fn apply_sync_success_effects(
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
 ) {
+    clear_endpoint_capability_quarantine_from_report_context(state, plan, report_context, false);
     if let Some(report_context) = report_context {
         crate::ai_serving::persist_converted_response_history(
             state.runtime_state(),
@@ -2687,7 +2722,9 @@ async fn execute_execution_runtime_sync_impl(
             local_failover_analysis,
         );
     };
-    if result.status_code >= 400 {
+    let endpoint_capability_mismatch = result.status_code >= 400
+        && is_endpoint_capability_runtime_miss(&headers, NO_LOCAL_SYNC_PLANS_REASON);
+    if result.status_code >= 400 && !endpoint_capability_mismatch {
         apply_local_execution_effect(
             state,
             LocalExecutionEffectContext {
@@ -2751,6 +2788,67 @@ async fn execute_execution_runtime_sync_impl(
             }),
         )
         .await;
+    }
+    if endpoint_capability_mismatch {
+        quarantine_endpoint_capability_from_report_context(
+            state,
+            &plan,
+            report_context.as_ref(),
+            false,
+        );
+        if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
+            *retry_scope = AiAttemptRetryScope::Credential;
+        }
+        if let Some(retry_fallback) = retry_fallback_out.as_deref_mut() {
+            let mut fallback_headers = headers.clone();
+            apply_endpoint_response_header_rules(
+                state,
+                &plan,
+                &mut fallback_headers,
+                body_json.as_ref(),
+            )
+            .await?;
+            *retry_fallback = Some(attach_control_metadata_headers(
+                build_client_response_from_parts(
+                    result.status_code,
+                    &fallback_headers,
+                    Body::from(body_bytes.clone()),
+                    trace_id,
+                    Some(decision),
+                )?,
+                Some(plan.request_id.as_str()),
+                plan.candidate_id.as_deref(),
+            )?);
+        }
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: report_context.as_ref(),
+            },
+            LocalExecutionEffect::PoolLeaseRelease,
+        )
+        .await;
+        let terminal_unix_secs = current_request_candidate_unix_ms();
+        record_local_request_candidate_status(
+            state,
+            &plan,
+            report_context.as_ref(),
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Failed,
+                status_code: Some(result.status_code),
+                error_type: Some(ENDPOINT_CAPABILITY_MISMATCH_ERROR_TYPE.to_string()),
+                error_message: Some(format!(
+                    "Endpoint cannot build a local sync plan for {} -> {}",
+                    plan.client_api_format, plan.provider_api_format
+                )),
+                latency_ms: result_latency_ms.or_else(|| Some(elapsed_ms_since(candidate_started_at))),
+                started_at_unix_ms: Some(candidate_started_unix_secs),
+                finished_at_unix_ms: Some(terminal_unix_secs),
+            },
+        )
+        .await;
+        return Ok(None);
     }
     if matches!(
         local_failover_analysis.decision,
@@ -3523,6 +3621,112 @@ mod tests {
         assert_eq!(body["error"]["message"], "Upstream response too large");
     }
 
+    #[tokio::test]
+    async fn no_local_sync_plans_retries_at_credential_scope_without_key_penalty() {
+        let request_id = "req-sync-endpoint-capability-mismatch";
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            })
+            .with_execution_runtime_sync_override_for_tests(|plan| {
+                Ok(ExecutionResult {
+                    request_id: plan.request_id.clone(),
+                    candidate_id: plan.candidate_id.clone(),
+                    status_code: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    headers: BTreeMap::from([
+                        ("content-type".to_string(), "application/json".to_string()),
+                        (
+                            crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER.to_string(),
+                            "no_local_sync_plans".to_string(),
+                        ),
+                    ]),
+                    body: Some(aether_contracts::ResponseBody {
+                        json_body: Some(json!({
+                            "error": {"message": "unsupported endpoint format"}
+                        })),
+                        body_bytes_b64: None,
+                    }),
+                    telemetry: Some(ExecutionTelemetry {
+                        ttfb_ms: Some(1),
+                        elapsed_ms: Some(2),
+                        upstream_bytes: Some(64),
+                    }),
+                    error: None,
+                })
+            });
+        let mut plan = test_openai_image_plan(false);
+        plan.request_id = request_id.to_string();
+        plan.client_api_format = "openai:responses".to_string();
+        plan.provider_api_format = "openai:responses".to_string();
+        let plan_endpoint_id = plan.endpoint_id.clone();
+        let plan_key_id = plan.key_id.clone();
+        let outcome = execute_execution_runtime_sync_with_retry_scope(
+            &state,
+            "/v1/responses",
+            plan,
+            "trace-sync-endpoint-capability-mismatch",
+            &test_decision(),
+            "openai_responses_sync",
+            None,
+            Some(json!({
+                "candidate_index": 0,
+                "retry_index": 0,
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses",
+                "model_id": "model-sync-endpoint-capability-mismatch",
+            })),
+        )
+        .await
+        .expect("execution should classify the capability mismatch");
+
+        let AiAttemptExecutionOutcome::Retry {
+            scope,
+            fallback_response,
+        } = outcome
+        else {
+            panic!("capability mismatch should retry another credential");
+        };
+        assert_eq!(scope, AiAttemptRetryScope::Credential);
+        let fallback = fallback_response.expect("original upstream error should be retained");
+        assert_eq!(fallback.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            fallback
+                .headers()
+                .get(crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("no_local_sync_plans")
+        );
+
+        let candidates = request_candidate_repository
+            .list_by_request_id(request_id)
+            .await
+            .expect("request candidates should read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("endpoint_capability_mismatch")
+        );
+        assert!(state.endpoint_capability_is_quarantined(
+            "model-sync-endpoint-capability-mismatch",
+            &plan_endpoint_id,
+            &plan_key_id,
+            "openai:responses",
+            false,
+            None,
+        ));
+    }
+
     fn test_kiro_sync_plan() -> ExecutionPlan {
         ExecutionPlan {
             request_id: "req-kiro-sync-cache-1".to_string(),
@@ -3857,6 +4061,87 @@ mod tests {
         assert_eq!(
             stored_candidates[0].error_type.as_deref(),
             Some("local_sync_attempt_cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_attempt_guard_records_admission_timeout_once_as_429() {
+        let request_id = "req-sync-admission-timeout";
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let mut plan = test_openai_image_plan(false);
+        plan.request_id = request_id.to_string();
+        let mut guard = SyncAttemptTerminalGuard::new(
+            &state,
+            &plan,
+            Some(json!({"candidate_index": 0, "retry_index": 0})),
+            100,
+            Instant::now(),
+        );
+        let admission_timeout = GatewayError::AdmissionTimeout {
+            trace_id: request_id.to_string(),
+            gate: "gateway_upstream_target",
+            queue_budget_ms: 250,
+        };
+
+        guard.fail_and_disarm(&admission_timeout).await;
+        guard
+            .fail_and_disarm(&GatewayError::Internal("must be ignored".to_string()))
+            .await;
+
+        let candidates = request_candidate_repository
+            .list_by_request_id(request_id)
+            .await
+            .expect("candidate trace should read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(
+            candidates[0].status_code,
+            Some(StatusCode::TOO_MANY_REQUESTS.as_u16())
+        );
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("gateway_admission_timeout")
+        );
+
+        let usage = usage_repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("usage should read")
+            .expect("failed usage should exist");
+        assert_eq!(usage.status, "failed");
+        assert_eq!(usage.billing_status, "void");
+        assert_eq!(
+            usage.status_code,
+            Some(StatusCode::TOO_MANY_REQUESTS.as_u16())
+        );
+        assert_eq!(usage.error_category.as_deref(), Some("client_error"));
+        assert_eq!(
+            usage
+                .client_response_body
+                .as_ref()
+                .and_then(|body| body.pointer("/error/type")),
+            Some(&json!("gateway_admission_timeout"))
+        );
+        assert_eq!(
+            state
+                .usage_runtime
+                .metrics_snapshot()
+                .terminal_submission_rejected_total,
+            0,
+            "the guard must submit exactly one terminal usage event"
         );
     }
 

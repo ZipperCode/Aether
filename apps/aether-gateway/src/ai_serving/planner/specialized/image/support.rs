@@ -35,6 +35,7 @@ pub(super) use crate::ai_serving::planner::candidate_materialization::LocalExecu
 pub(super) use crate::ai_serving::planner::decision_input::LocalRequestedModelDecisionInput as LocalOpenAiImageDecisionInput;
 
 use super::request::resolve_requested_image_model_for_request;
+use super::LocalOpenAiImageSpec;
 
 pub(super) async fn resolve_local_openai_image_decision_input(
     state: &AppState,
@@ -43,6 +44,7 @@ pub(super) async fn resolve_local_openai_image_decision_input(
     body_base64: Option<&str>,
     trace_id: &str,
     decision: &GatewayControlDecision,
+    spec: LocalOpenAiImageSpec,
 ) -> Result<Option<LocalOpenAiImageDecisionInput>, GatewayError> {
     let Some(auth_context) = resolve_local_openai_image_auth_context(decision) else {
         return Ok(None);
@@ -77,6 +79,12 @@ pub(super) async fn resolve_local_openai_image_decision_input(
     };
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
+    let spec_metadata = local_openai_image_spec_metadata(spec);
+    input.set_endpoint_capability_context(
+        spec_metadata.api_format,
+        spec_metadata.require_streaming,
+        None,
+    );
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));
     if let Err(err) = attach_routing_policy_to_local_requested_model_input(
@@ -121,7 +129,7 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
             .list_selectable_candidates_with_skip_reasons(
                 candidate_api_format,
                 &input.requested_model,
-                false,
+                input.endpoint_capability_require_streaming,
                 input.required_capabilities.as_ref(),
                 matches_client_format.then_some(&input.auth_snapshot),
                 input.client_session_affinity.as_ref(),
@@ -195,7 +203,7 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
             .list_selectable_candidates_with_skip_reasons(
                 candidate_api_format,
                 &input.requested_model,
-                false,
+                input.endpoint_capability_require_streaming,
                 input.required_capabilities.as_ref(),
                 matches_client_format.then_some(&input.auth_snapshot),
                 input.client_session_affinity.as_ref(),
@@ -250,6 +258,8 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
         planner_state,
         trace_id,
         api_format,
+        input.endpoint_capability_require_streaming,
+        input.endpoint_capability_request_operation.as_deref(),
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -327,6 +337,8 @@ async fn materialize_local_openai_image_candidate_attempts(
         state,
         trace_id,
         api_format,
+        input.endpoint_capability_require_streaming,
+        input.endpoint_capability_request_operation.as_deref(),
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -393,6 +405,7 @@ pub(super) async fn mark_skipped_local_openai_image_candidate(
     candidate_id: &str,
     skip_reason: &'static str,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -420,6 +433,7 @@ pub(super) async fn mark_skipped_local_openai_image_candidate_with_failure_diagn
     skip_reason: &'static str,
     diagnostic: CandidateFailureDiagnostic,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),

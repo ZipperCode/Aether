@@ -379,6 +379,20 @@ CREATE TABLE IF NOT EXISTS public.models (
 ALTER TABLE ONLY public.models ADD CONSTRAINT models_pkey PRIMARY KEY (id);
 CREATE INDEX IF NOT EXISTS models_provider_id_idx ON public.models USING btree (provider_id);
 
+CREATE TABLE IF NOT EXISTS public.model_endpoint_bindings (
+    model_id character varying(64) NOT NULL,
+    endpoint_id character varying(64) NOT NULL,
+    source character varying(32) DEFAULT 'migration' NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT NOW() NOT NULL,
+    updated_at timestamp with time zone DEFAULT NOW() NOT NULL
+);
+
+ALTER TABLE ONLY public.model_endpoint_bindings ADD CONSTRAINT model_endpoint_bindings_pkey PRIMARY KEY (model_id, endpoint_id);
+CREATE INDEX IF NOT EXISTS model_endpoint_bindings_endpoint_active_idx ON public.model_endpoint_bindings USING btree (endpoint_id, is_active, model_id);
+ALTER TABLE ONLY public.model_endpoint_bindings ADD CONSTRAINT model_endpoint_bindings_model_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.model_endpoint_bindings ADD CONSTRAINT model_endpoint_bindings_endpoint_id_fkey FOREIGN KEY (endpoint_id) REFERENCES public.provider_endpoints(id) ON DELETE CASCADE;
+
 CREATE TABLE IF NOT EXISTS public.global_models (
     id character varying(64) NOT NULL,
     name character varying(255) NOT NULL,

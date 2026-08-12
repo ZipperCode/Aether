@@ -109,6 +109,7 @@ export interface Model {
 export interface ModelCreate {
   provider_model_name: string  // Provider 侧的主模型名称
   provider_model_mappings?: ProviderModelMapping[]  // 模型名称映射列表（带优先级）
+  endpoint_ids?: string[]  // 显式绑定的 Provider Endpoint；多 Endpoint Provider 必填
   global_model_id: string  // 关联的 GlobalModel ID（必填）
   // 计费配置（可选，为空时使用 GlobalModel 默认值）
   price_per_request?: number  // 按次计费价格
@@ -137,6 +138,10 @@ export interface ModelUpdate {
   is_active?: boolean
   is_available?: boolean
   config?: Record<string, unknown> | null
+  endpoint_bindings?: Array<{
+    endpoint_id: string
+    is_active: boolean
+  }>
 }
 
 export interface ModelCapabilities {
@@ -306,6 +311,7 @@ export interface UpstreamModel {
   visibility?: string
   supported_in_api?: boolean
   api_formats: string[]  // 该模型支持的所有 API 格式（后端保证返回数组）
+  endpoint_ids?: string[]  // 真实返回该模型的 Endpoint，用于自动绑定上游链路
   model_test_capabilities?: ModelTestCapabilities | null
 }
 
@@ -317,7 +323,7 @@ export interface ImportFromUpstreamSuccessItem {
   provider_model_id: string
   global_model_id: string
   global_model_name: string
-  created_global_model: boolean  // 始终为 false（不再自动创建 GlobalModel）
+  created_global_model: boolean  // 上游模型不存在对应 GlobalModel 时为 true
 }
 
 /**

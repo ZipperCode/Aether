@@ -22,6 +22,7 @@ const TRANSPORT_ERROR_CLIENT_MESSAGE: &str =
 #[derive(Debug, Default)]
 pub(crate) struct StreamCandidateWatchdogProgress {
     terminal_started: AtomicBool,
+    timeout_terminal_claimed: AtomicBool,
 }
 
 tokio::task_local! {
@@ -35,6 +36,18 @@ impl StreamCandidateWatchdogProgress {
 
     pub(crate) fn terminal_started(&self) -> bool {
         self.terminal_started.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn current() -> Option<Arc<Self>> {
+        STREAM_CANDIDATE_WATCHDOG_PROGRESS.try_with(Arc::clone).ok()
+    }
+
+    pub(crate) fn claim_timeout_terminal(&self) {
+        self.timeout_terminal_claimed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn timeout_terminal_claimed(&self) -> bool {
+        self.timeout_terminal_claimed.load(Ordering::Acquire)
     }
 
     pub(crate) async fn scope<F>(self: Arc<Self>, future: F) -> F::Output

@@ -913,6 +913,7 @@
     :provider-id="provider.id"
     :provider-name="provider.name"
     :editing-model="editingModel"
+    :endpoints="endpoints"
     @update:open="modelFormDialogOpen = $event"
     @saved="handleModelSaved"
   />

@@ -151,12 +151,12 @@ pub(crate) async fn build_local_image_sync_attempt_source_for_kind<'a>(
         body_base64,
         trace_id,
         decision,
+        spec,
     )
     .await?
     else {
         return Ok(None);
     };
-
     let effective_body_json = input.effective_body_json(body_json).clone();
     let Some((candidates, candidate_count)) = build_local_openai_image_candidate_attempt_source(
         state,
@@ -211,12 +211,12 @@ pub(crate) async fn build_local_image_stream_attempt_source_for_kind<'a>(
         body_base64,
         trace_id,
         decision,
+        spec,
     )
     .await?
     else {
         return Ok(None);
     };
-
     let effective_body_json = input.effective_body_json(body_json).clone();
     let Some((candidates, candidate_count)) = build_local_openai_image_candidate_attempt_source(
         state,
@@ -431,6 +431,7 @@ pub(crate) async fn maybe_build_sync_local_image_decision_payload(
         body_base64,
         trace_id,
         decision,
+        spec,
     )
     .await?
     else {
@@ -492,6 +493,7 @@ pub(crate) async fn maybe_build_stream_local_image_decision_payload(
         body_base64,
         trace_id,
         decision,
+        spec,
     )
     .await?
     else {
@@ -549,6 +551,7 @@ async fn build_local_sync_plan_and_reports(
         body_base64,
         trace_id,
         decision,
+        spec,
     )
     .await?
     else {
@@ -626,6 +629,7 @@ async fn build_local_stream_plan_and_reports(
         body_base64,
         trace_id,
         decision,
+        spec,
     )
     .await?
     else {

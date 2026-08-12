@@ -80,6 +80,11 @@ pub(super) async fn resolve_local_standard_decision_input(
     };
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
+    input.set_endpoint_capability_context(
+        spec_metadata.api_format,
+        spec_metadata.require_streaming,
+        None,
+    );
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));
     if let Err(err) = attach_routing_policy_to_local_requested_model_input(
@@ -149,6 +154,8 @@ pub(super) async fn materialize_local_standard_candidate_attempts(
         planner_state,
         trace_id,
         spec_metadata.api_format,
+        spec_metadata.require_streaming,
+        None,
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -239,8 +246,13 @@ pub(super) async fn build_local_standard_candidate_attempt_source<'a>(
         let (attempts, candidate_count) =
             materialize_local_standard_candidate_attempts(state, trace_id, input, body_json, spec)
                 .await?;
-        let source =
-            LocalExecutionCandidateAttemptSource::from_static_attempts_for_image_bridge(attempts);
+        let source = LocalExecutionCandidateAttemptSource::from_static_attempts_for_image_bridge(
+            state,
+            spec_metadata.api_format,
+            spec_metadata.require_streaming,
+            None,
+            attempts,
+        );
         return Ok((source, candidate_count));
     }
 

@@ -1,13 +1,15 @@
 use super::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
-    DataLayerError, GatewayDataState, PublicCatalogModelListQuery, PublicCatalogModelSearchQuery,
-    PublicGlobalModelQuery, StoredAdminGlobalModel, StoredAdminGlobalModelPage,
-    StoredAdminProviderModel, StoredApiFormatCandidateRowsQuery,
-    StoredMinimalCandidateSelectionRow, StoredModelCatalogEntry,
-    StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
-    StoredProviderActiveGlobalModel, StoredProviderModelStats, StoredPublicCatalogModel,
-    StoredPublicGlobalModel, StoredPublicGlobalModelPage, StoredRequestedModelCandidateRowsQuery,
-    UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    CreateAdminProviderModelWithBindingsRecord, DataLayerError, GatewayDataState,
+    PublicCatalogModelListQuery, PublicCatalogModelSearchQuery, PublicGlobalModelQuery,
+    StoredAdminGlobalModel, StoredAdminGlobalModelPage, StoredAdminProviderModel,
+    StoredApiFormatCandidateRowsQuery, StoredMinimalCandidateSelectionRow, StoredModelCatalogEntry,
+    StoredModelEndpointBinding, StoredPoolKeyCandidateRowsByKeyIdsQuery,
+    StoredPoolKeyCandidateRowsQuery, StoredProviderActiveGlobalModel, StoredProviderModelStats,
+    StoredPublicCatalogModel, StoredPublicGlobalModel, StoredPublicGlobalModelPage,
+    StoredRequestedModelCandidateRowsQuery, UpdateAdminGlobalModelRecord,
+    UpdateAdminProviderModelWithBindingsRecord, UpsertAdminProviderModelRecord,
+    UpsertModelEndpointBindingRecord,
 };
 
 impl GatewayDataState {
@@ -320,6 +322,25 @@ impl GatewayDataState {
         result
     }
 
+    pub(crate) async fn create_admin_provider_model_with_bindings(
+        &self,
+        record: &CreateAdminProviderModelWithBindingsRecord,
+    ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
+        let result = match &self.global_model_writer {
+            Some(repository) => {
+                repository
+                    .create_admin_provider_model_with_bindings(record)
+                    .await
+            }
+            None => Ok(None),
+        };
+        if result.as_ref().is_ok_and(Option::is_some) {
+            self.clear_billing_model_context_cache();
+            self.clear_minimal_candidate_selection_cache();
+        }
+        result
+    }
+
     pub(crate) async fn update_admin_provider_model(
         &self,
         record: &UpsertAdminProviderModelRecord,
@@ -395,6 +416,24 @@ impl GatewayDataState {
         result
     }
 
+    pub(crate) async fn delete_unreferenced_admin_global_model(
+        &self,
+        global_model_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        let result = match &self.global_model_writer {
+            Some(repository) => {
+                repository
+                    .delete_unreferenced_admin_global_model(global_model_id)
+                    .await
+            }
+            None => Ok(false),
+        };
+        if result.as_ref().is_ok_and(|changed| *changed) {
+            self.clear_billing_model_context_cache();
+        }
+        result
+    }
+
     pub(crate) async fn list_provider_model_stats(
         &self,
         provider_ids: &[String],
@@ -417,5 +456,76 @@ impl GatewayDataState {
             }
             None => Ok(Vec::new()),
         }
+    }
+
+    pub(crate) async fn list_model_endpoint_bindings(
+        &self,
+        model_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, DataLayerError> {
+        match &self.global_model_reader {
+            Some(repository) => repository.list_model_endpoint_bindings(model_ids).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) async fn sync_model_endpoint_bindings(
+        &self,
+        model_id: &str,
+        endpoint_ids: &[String],
+        source: &str,
+        replace_automatic: bool,
+        replacement_scope_endpoint_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, DataLayerError> {
+        let result = match &self.global_model_writer {
+            Some(repository) => {
+                repository
+                    .sync_model_endpoint_bindings(
+                        model_id,
+                        endpoint_ids,
+                        source,
+                        replace_automatic,
+                        replacement_scope_endpoint_ids,
+                    )
+                    .await
+            }
+            None => Ok(Vec::new()),
+        };
+        if result.is_ok() {
+            self.clear_minimal_candidate_selection_cache();
+        }
+        result
+    }
+
+    pub(crate) async fn update_admin_provider_model_with_bindings(
+        &self,
+        record: &UpdateAdminProviderModelWithBindingsRecord,
+    ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
+        let result = match &self.global_model_writer {
+            Some(repository) => {
+                repository
+                    .update_admin_provider_model_with_bindings(record)
+                    .await
+            }
+            None => Ok(None),
+        };
+        if result.as_ref().is_ok_and(Option::is_some) {
+            self.clear_billing_model_context_cache();
+            self.clear_minimal_candidate_selection_cache();
+        }
+        result
+    }
+
+    pub(crate) async fn upsert_model_endpoint_binding(
+        &self,
+        record: &UpsertModelEndpointBindingRecord,
+    ) -> Result<Option<StoredModelEndpointBinding>, DataLayerError> {
+        let result = match &self.global_model_writer {
+            Some(repository) => repository.upsert_model_endpoint_binding(record).await,
+            None => Ok(None),
+        };
+        if result.as_ref().is_ok_and(Option::is_some) {
+            self.clear_minimal_candidate_selection_cache();
+        }
+        result
     }
 }

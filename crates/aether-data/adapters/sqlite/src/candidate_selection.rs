@@ -59,6 +59,10 @@ FROM providers p
 INNER JOIN provider_endpoints pe ON pe.provider_id = p.id
 INNER JOIN provider_api_keys pak ON pak.provider_id = p.id
 INNER JOIN models m ON m.provider_id = p.id
+INNER JOIN model_endpoint_bindings meb
+  ON meb.model_id = m.id
+ AND meb.endpoint_id = pe.id
+ AND meb.is_active = 1
 INNER JOIN global_models gm ON gm.id = m.global_model_id
 WHERE p.is_active = 1
   AND pe.is_active = 1
@@ -1351,6 +1355,13 @@ mod tests {
     };
 
     #[test]
+    fn sqlite_candidate_query_requires_an_active_model_endpoint_binding() {
+        let source = include_str!("candidate_selection.rs");
+        assert!(source.contains("INNER JOIN model_endpoint_bindings meb"));
+        assert!(source.contains("AND meb.is_active = 1"));
+    }
+
+    #[test]
     fn vertex_auth_matrix_rejects_retired_claude_format() {
         for auth_type in ["api_key", "service_account", "vertex_ai"] {
             assert!(!vertex_key_auth_channel_matches(
@@ -1549,6 +1560,50 @@ mod tests {
         assert_eq!(search_rows.len(), 1);
         assert_eq!(search_rows[0].key_id, "key-codex-search");
         assert_eq!(search_rows[0].endpoint_api_format, "openai:search");
+    }
+
+    #[tokio::test]
+    async fn sqlite_candidate_selection_requires_an_active_model_endpoint_binding() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        seed_candidate_selection(&pool).await;
+        let repository = SqliteMinimalCandidateSelectionReadRepository::new(pool.clone());
+
+        let active_rows = repository
+            .list_for_exact_api_format_and_requested_model("openai:chat", "provider-model")
+            .await
+            .expect("active binding should load");
+        assert_eq!(active_rows.len(), 1);
+
+        sqlx::query(
+            "UPDATE model_endpoint_bindings SET is_active = 0 WHERE model_id = 'model-1' AND endpoint_id = 'endpoint-1'",
+        )
+        .execute(&pool)
+        .await
+        .expect("binding should disable");
+        let disabled_rows = repository
+            .list_for_exact_api_format_and_requested_model("openai:chat", "provider-model")
+            .await
+            .expect("disabled binding query should load");
+        assert!(disabled_rows.is_empty());
+
+        sqlx::query(
+            "DELETE FROM model_endpoint_bindings WHERE model_id = 'model-1' AND endpoint_id = 'endpoint-1'",
+        )
+        .execute(&pool)
+        .await
+        .expect("binding should delete");
+        let missing_rows = repository
+            .list_for_exact_api_format_and_requested_model("openai:chat", "provider-model")
+            .await
+            .expect("missing binding query should load");
+        assert!(missing_rows.is_empty());
     }
 
     #[tokio::test]
@@ -1755,6 +1810,15 @@ VALUES (
   '[{"name":"gpt-5.6-sol","api_formats":["openai:responses"],"priority":1}]',
   0, 1, 1, 1, 1
 );
+
+INSERT INTO model_endpoint_bindings (
+  model_id, endpoint_id, source, is_active, created_at, updated_at
+)
+VALUES
+  ('model-1', 'endpoint-1', 'discovered', 1, 1, 1),
+  ('model-chatgpt-web-image', 'endpoint-chatgpt-web', 'discovered', 1, 1, 1),
+  ('model-windsurf-opus', 'endpoint-windsurf', 'discovered', 1, 1, 1),
+  ('model-codex-search', 'endpoint-codex-search', 'discovered', 1, 1, 1);
 "#,
         )
         .execute(pool)
@@ -1845,6 +1909,13 @@ VALUES
     '[{"name":"sqlite-page-target","api_formats":["openai:chat"],"priority":1}]',
     1, 1, 1, 1
   );
+
+INSERT INTO model_endpoint_bindings (
+  model_id, endpoint_id, source, is_active, created_at, updated_at
+)
+SELECT id, 'endpoint-pagination', 'discovered', 1, 1, 1
+FROM models
+WHERE provider_id = 'provider-pagination';
 "#,
         )
         .execute(pool)

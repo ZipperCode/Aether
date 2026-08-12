@@ -465,6 +465,7 @@
       :provider-id="editingProvider?.id || ''"
       :provider-name="editingProvider?.name || ''"
       :editing-model="editingProviderModel"
+      :require-endpoint-selection="false"
       @update:open="handleEditProviderDialogUpdate"
       @saved="handleEditProviderSaved"
     />

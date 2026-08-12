@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data_contracts::repository::global_models::{
-    AdminProviderModelListQuery, GlobalModelReadRepository,
+    AdminProviderModelListQuery, GlobalModelReadRepository, StoredModelEndpointBinding,
 };
 use axum::body::Body;
 use axum::routing::any;
@@ -832,30 +832,59 @@ async fn gateway_handles_admin_global_model_routing_locally_with_trusted_admin_p
                     "global-gpt-5",
                     "gpt-5-upstream",
                 ),
-                sample_admin_provider_model(
-                    "model-alt-gpt5",
-                    "provider-alt",
-                    "global-gpt-5",
-                    "gpt-5-alt",
-                ),
+                {
+                    let mut model = sample_admin_provider_model(
+                        "model-alt-gpt5",
+                        "provider-alt",
+                        "global-gpt-5",
+                        "gpt-5-alt",
+                    );
+                    model.is_available = false;
+                    model
+                },
+            ])
+            .with_model_endpoint_bindings(vec![
+                StoredModelEndpointBinding::new(
+                    "model-openai-gpt5".to_string(),
+                    "endpoint-openai-chat".to_string(),
+                    "discovered".to_string(),
+                    true,
+                    Some(1),
+                    Some(1),
+                )
+                .expect("OpenAI model binding should build"),
+                StoredModelEndpointBinding::new(
+                    "model-alt-gpt5".to_string(),
+                    "endpoint-alt-chat".to_string(),
+                    "manual".to_string(),
+                    false,
+                    Some(1),
+                    Some(1),
+                )
+                .expect("disabled alternate model binding should build"),
             ]),
     );
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(
-                GatewayDataState::with_provider_catalog_reader_for_tests(
-                    provider_catalog_repository,
-                )
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_reader_for_tests(provider_catalog_repository)
                 .with_global_model_repository_for_tests(global_model_repository)
                 .with_system_config_values_for_tests(vec![
                     ("scheduling_mode".to_string(), json!("fixed_order")),
                     ("provider_priority_mode".to_string(), json!("global_key")),
                 ]),
-            ),
-    );
+        );
+    assert!(state.quarantine_endpoint_capability(
+        "model-openai-gpt5",
+        "endpoint-openai-chat",
+        "key-openai-routing",
+        "claude:messages",
+        true,
+        Some("messages"),
+    ));
+    let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -879,11 +908,13 @@ async fn gateway_handles_admin_global_model_routing_locally_with_trusted_admin_p
     assert_eq!(payload["scheduling_mode"], "fixed_order");
     assert_eq!(payload["priority_mode"], "global_key");
     assert_eq!(payload["total_providers"], 2);
-    assert_eq!(payload["active_providers"], 2);
+    assert_eq!(payload["active_providers"], 1);
 
     let providers = payload["providers"].as_array().expect("providers array");
     assert_eq!(providers.len(), 2);
     assert_eq!(providers[0]["id"], "provider-openai");
+    assert_eq!(providers[0]["model_is_available"], true);
+    assert_eq!(providers[0]["active_endpoints"], 1);
     assert_eq!(providers[0]["monthly_quota_usd"], 120.0);
     assert_eq!(
         providers[0]["model_mappings"][0]["name"],
@@ -895,6 +926,19 @@ async fn gateway_handles_admin_global_model_routing_locally_with_trusted_admin_p
         .expect("endpoints array");
     assert_eq!(openai_endpoints.len(), 1);
     assert_eq!(openai_endpoints[0]["api_format"], "openai:chat");
+    assert_eq!(
+        openai_endpoints[0]["model_binding"],
+        json!({"source": "discovered", "is_active": true})
+    );
+    assert_eq!(
+        openai_endpoints[0]["runtime_capability_quarantines"],
+        json!([{
+            "key_id": "key-openai-routing",
+            "client_api_format": "claude:messages",
+            "request_mode": "stream",
+            "request_operation": "messages"
+        }])
+    );
     let openai_keys = openai_endpoints[0]["keys"].as_array().expect("keys array");
     assert_eq!(openai_keys.len(), 1);
     assert_eq!(openai_keys[0]["name"], "primary");
@@ -913,10 +957,18 @@ async fn gateway_handles_admin_global_model_routing_locally_with_trusted_admin_p
         .as_array()
         .expect("endpoints array");
     assert_eq!(alt_endpoints.len(), 1);
+    assert_eq!(providers[1]["model_is_available"], false);
+    assert_eq!(providers[1]["active_endpoints"], 0);
+    assert_eq!(
+        alt_endpoints[0]["model_binding"],
+        json!({"source": "manual", "is_active": false})
+    );
     let alt_keys = alt_endpoints[0]["keys"].as_array().expect("keys array");
     assert_eq!(alt_keys.len(), 1);
     assert_eq!(alt_keys[0]["allowed_models"], json!(["gpt-5-upstream"]));
     assert_eq!(alt_keys[0]["matched_models"], json!(["gpt-5-upstream"]));
+    assert_eq!(alt_endpoints[0]["total_keys"], 1);
+    assert_eq!(alt_endpoints[0]["active_keys"], 0);
 
     let whitelist = payload["all_keys_whitelist"]
         .as_array()

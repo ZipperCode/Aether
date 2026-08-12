@@ -20,6 +20,7 @@ function isEmbeddingApiFormat(format: unknown): boolean {
 export interface ProviderModelCreatePayloadInput {
   globalModelId: string
   providerModelName: string
+  endpointIds: string[]
   finalTieredPricing: ProviderTieredPricingConfig | null
   tieredPricingModified: boolean
   pricePerRequest?: number
@@ -234,6 +235,7 @@ export function buildProviderModelCreatePayload(input: ProviderModelCreatePayloa
   return {
     global_model_id: input.globalModelId,
     provider_model_name: input.providerModelName,
+    endpoint_ids: input.endpointIds,
     tiered_pricing: input.tieredPricingModified && input.finalTieredPricing ? input.finalTieredPricing : undefined,
     price_per_request: input.pricePerRequestModified ? input.pricePerRequest : undefined,
     config: input.configTouched ? input.cleanConfig : undefined,

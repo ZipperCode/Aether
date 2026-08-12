@@ -28,6 +28,8 @@ use crate::client_session_affinity::client_session_affinity_from_parts;
 use crate::clock::current_unix_secs;
 use crate::{AppState, GatewayError};
 
+use super::LocalGeminiFilesSpec;
+
 pub(super) use crate::ai_serving::planner::candidate_materialization::LocalExecutionCandidateAttempt as LocalGeminiFilesCandidateAttempt;
 pub(super) use crate::ai_serving::planner::candidate_materialization::LocalExecutionCandidateAttemptSource as LocalGeminiFilesCandidateAttemptSource;
 pub(super) use crate::ai_serving::planner::decision_input::LocalRequestedModelDecisionInput as LocalGeminiFilesDecisionInput;
@@ -43,6 +45,7 @@ pub(super) async fn resolve_local_gemini_files_decision_input(
     body_json: Option<&serde_json::Value>,
     trace_id: &str,
     decision: &GatewayControlDecision,
+    spec: LocalGeminiFilesSpec,
 ) -> Result<Option<LocalGeminiFilesDecisionInput>, GatewayError> {
     let Some(auth_context) = resolve_local_decision_execution_runtime_auth_context(decision) else {
         return Ok(None);
@@ -76,6 +79,11 @@ pub(super) async fn resolve_local_gemini_files_decision_input(
         resolved_input,
         GEMINI_FILES_ROUTING_MODEL.to_string(),
     );
+    input.set_endpoint_capability_context(
+        GEMINI_FILES_CLIENT_API_FORMAT,
+        spec.require_streaming,
+        Some(spec.decision_kind),
+    );
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_session_affinity = client_session_affinity_from_parts(parts, body_json);
     attach_routing_policy_to_local_requested_model_input(
@@ -104,7 +112,7 @@ pub(super) async fn materialize_local_gemini_files_candidate_attempts(
         .list_selectable_candidates_for_required_capability_without_requested_model(
             GEMINI_FILES_CANDIDATE_API_FORMAT,
             GEMINI_FILES_REQUIRED_CAPABILITY,
-            false,
+            input.endpoint_capability_require_streaming,
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
             current_unix_secs(),
@@ -114,6 +122,8 @@ pub(super) async fn materialize_local_gemini_files_candidate_attempts(
         planner_state,
         trace_id,
         GEMINI_FILES_CLIENT_API_FORMAT,
+        input.endpoint_capability_require_streaming,
+        input.endpoint_capability_request_operation.as_deref(),
         None,
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -177,7 +187,7 @@ pub(super) async fn build_local_gemini_files_candidate_attempt_source<'a>(
         .list_selectable_candidates_for_required_capability_without_requested_model(
             GEMINI_FILES_CANDIDATE_API_FORMAT,
             GEMINI_FILES_REQUIRED_CAPABILITY,
-            false,
+            input.endpoint_capability_require_streaming,
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
             current_unix_secs(),
@@ -187,6 +197,8 @@ pub(super) async fn build_local_gemini_files_candidate_attempt_source<'a>(
         planner_state,
         trace_id,
         GEMINI_FILES_CLIENT_API_FORMAT,
+        input.endpoint_capability_require_streaming,
+        input.endpoint_capability_request_operation.as_deref(),
         None,
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -242,6 +254,7 @@ pub(super) async fn mark_skipped_local_gemini_files_candidate(
     candidate_id: &str,
     skip_reason: &'static str,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -269,6 +282,7 @@ pub(super) async fn mark_skipped_local_gemini_files_candidate_with_failure_diagn
     skip_reason: &'static str,
     diagnostic: CandidateFailureDiagnostic,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),

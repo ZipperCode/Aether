@@ -2,14 +2,18 @@ use async_trait::async_trait;
 use futures_util::{stream::TryStream, TryStreamExt};
 use serde_json::Value;
 use sqlx::{postgres::PgRow, PgPool, Postgres, QueryBuilder, Row};
+use std::collections::BTreeSet;
 
 use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
-    GlobalModelReadRepository, GlobalModelWriteRepository, PublicCatalogModelListQuery,
-    PublicCatalogModelSearchQuery, PublicGlobalModelQuery, StoredAdminGlobalModel,
-    StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredProviderActiveGlobalModel,
+    CreateAdminProviderModelWithBindingsRecord, GlobalModelReadRepository,
+    GlobalModelWriteRepository, PublicCatalogModelListQuery, PublicCatalogModelSearchQuery,
+    PublicGlobalModelQuery, StoredAdminGlobalModel, StoredAdminGlobalModelPage,
+    StoredAdminProviderModel, StoredModelEndpointBinding, StoredProviderActiveGlobalModel,
     StoredProviderModelStats, StoredPublicCatalogModel, StoredPublicGlobalModel,
-    StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord,
+    UpdateAdminProviderModelWithBindingsRecord, UpsertAdminProviderModelRecord,
+    UpsertModelEndpointBindingRecord,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -534,6 +538,7 @@ ORDER BY m.created_at DESC, m.id ASC
         &self,
         record: &UpsertAdminProviderModelRecord,
     ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
+        record.validate()?;
         let inserted = sqlx::query(
             r#"
 INSERT INTO models (
@@ -592,6 +597,7 @@ RETURNING id
         &self,
         record: &UpsertAdminProviderModelRecord,
     ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
+        record.validate()?;
         let updated = sqlx::query(
             r#"
 UPDATE models
@@ -782,6 +788,30 @@ RETURNING id
 
         Ok(deleted.is_some())
     }
+
+    pub async fn delete_unreferenced_admin_global_model(
+        &self,
+        global_model_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        let deleted = sqlx::query(
+            r#"
+DELETE FROM global_models
+WHERE id = $1
+  AND NOT EXISTS (
+    SELECT 1
+    FROM models
+    WHERE global_model_id = $1
+  )
+RETURNING id
+            "#,
+        )
+        .bind(global_model_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_postgres_err()?;
+
+        Ok(deleted.is_some())
+    }
 }
 
 #[async_trait]
@@ -916,6 +946,30 @@ LIMIT 1
     ) -> Result<Vec<StoredProviderActiveGlobalModel>, DataLayerError> {
         Self::list_active_global_model_ids_by_provider_ids(self, provider_ids).await
     }
+
+    async fn list_model_endpoint_bindings(
+        &self,
+        model_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, DataLayerError> {
+        if model_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+SELECT model_id, endpoint_id, source, is_active,
+       EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix_secs,
+       EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at_unix_secs
+FROM model_endpoint_bindings
+WHERE model_id = ANY($1::text[])
+ORDER BY model_id ASC, endpoint_id ASC
+            "#,
+        )
+        .bind(model_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_postgres_err()?;
+        rows.iter().map(map_model_endpoint_binding_row).collect()
+    }
 }
 
 #[async_trait]
@@ -927,11 +981,253 @@ impl GlobalModelWriteRepository for SqlxGlobalModelReadRepository {
         Self::create_admin_provider_model(self, record).await
     }
 
+    async fn create_admin_provider_model_with_bindings(
+        &self,
+        record: &CreateAdminProviderModelWithBindingsRecord,
+    ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
+        record.validate()?;
+        let mut tx = self.pool.begin().await.map_postgres_err()?;
+        let binding_endpoint_ids: BTreeSet<String> =
+            record.replacement_bindings.as_ref().map_or_else(
+                || record.endpoint_ids.iter().cloned().collect(),
+                |bindings| {
+                    bindings
+                        .iter()
+                        .map(|binding| binding.endpoint_id.clone())
+                        .collect()
+                },
+            );
+        if !binding_endpoint_ids.is_empty() {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM provider_endpoints WHERE provider_id = $1 AND id = ANY($2::text[])",
+            )
+            .bind(&record.model.provider_id)
+            .bind(binding_endpoint_ids.iter().cloned().collect::<Vec<_>>())
+            .fetch_one(&mut *tx)
+            .await
+            .map_postgres_err()?;
+            if count != binding_endpoint_ids.len() as i64 {
+                tx.rollback().await.map_postgres_err()?;
+                return Err(DataLayerError::UnexpectedValue(
+                    "model endpoint binding belongs to another provider".to_string(),
+                ));
+            }
+        }
+        sqlx::query(
+            r#"
+INSERT INTO models (
+  id, provider_id, global_model_id, provider_model_name, provider_model_mappings,
+  price_per_request, tiered_pricing, supports_vision, supports_function_calling,
+  supports_streaming, supports_extended_thinking, supports_image_generation,
+  is_active, is_available, config, created_at, updated_at
+) VALUES (
+  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW()
+)
+            "#,
+        )
+        .bind(&record.model.id)
+        .bind(&record.model.provider_id)
+        .bind(&record.model.global_model_id)
+        .bind(&record.model.provider_model_name)
+        .bind(record.model.provider_model_mappings.clone())
+        .bind(record.model.price_per_request)
+        .bind(record.model.tiered_pricing.clone())
+        .bind(record.model.supports_vision)
+        .bind(record.model.supports_function_calling)
+        .bind(record.model.supports_streaming)
+        .bind(record.model.supports_extended_thinking)
+        .bind(record.model.supports_image_generation)
+        .bind(record.model.is_active)
+        .bind(record.model.is_available)
+        .bind(record.model.config.clone())
+        .execute(&mut *tx)
+        .await
+        .map_postgres_err()?;
+        let bindings = record.replacement_bindings.clone().unwrap_or_else(|| {
+            record
+                .endpoint_ids
+                .iter()
+                .map(|endpoint_id| UpsertModelEndpointBindingRecord {
+                    model_id: record.model.id.clone(),
+                    endpoint_id: endpoint_id.clone(),
+                    source: record.source.clone(),
+                    is_active: true,
+                })
+                .collect()
+        });
+        for binding in &bindings {
+            sqlx::query(
+                r#"
+INSERT INTO model_endpoint_bindings
+  (model_id, endpoint_id, source, is_active, created_at, updated_at)
+VALUES ($1, $2, $3, $4, NOW(), NOW())
+ON CONFLICT (model_id, endpoint_id) DO UPDATE
+SET source = EXCLUDED.source, is_active = EXCLUDED.is_active, updated_at = NOW()
+                "#,
+            )
+            .bind(&binding.model_id)
+            .bind(&binding.endpoint_id)
+            .bind(&binding.source)
+            .bind(binding.is_active)
+            .execute(&mut *tx)
+            .await
+            .map_postgres_err()?;
+        }
+        tx.commit().await.map_postgres_err()?;
+        self.get_admin_provider_model(&record.model.provider_id, &record.model.id)
+            .await
+    }
+
     async fn update_admin_provider_model(
         &self,
         record: &UpsertAdminProviderModelRecord,
     ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
         Self::update_admin_provider_model(self, record).await
+    }
+
+    async fn update_admin_provider_model_with_bindings(
+        &self,
+        record: &UpdateAdminProviderModelWithBindingsRecord,
+    ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
+        record.validate()?;
+        let mut tx = self.pool.begin().await.map_postgres_err()?;
+        let endpoint_ids = record.replacement_bindings.as_ref().map_or_else(
+            || {
+                record
+                    .automatic_endpoint_ids
+                    .iter()
+                    .flatten()
+                    .chain(
+                        record
+                            .manual_bindings
+                            .iter()
+                            .map(|binding| &binding.endpoint_id),
+                    )
+                    .cloned()
+                    .collect::<Vec<_>>()
+            },
+            |bindings| {
+                bindings
+                    .iter()
+                    .map(|binding| binding.endpoint_id.clone())
+                    .collect()
+            },
+        );
+        validate_postgres_endpoint_ownership(&mut tx, &record.model.provider_id, &endpoint_ids)
+            .await?;
+        let updated = sqlx::query(
+            r#"
+UPDATE models
+SET global_model_id = $3, provider_model_name = $4, provider_model_mappings = $5,
+    price_per_request = $6, tiered_pricing = $7, supports_vision = $8,
+    supports_function_calling = $9, supports_streaming = $10,
+    supports_extended_thinking = $11, supports_image_generation = $12,
+    is_active = $13, is_available = $14, config = $15, updated_at = NOW()
+WHERE id = $1 AND provider_id = $2
+RETURNING id
+            "#,
+        )
+        .bind(&record.model.id)
+        .bind(&record.model.provider_id)
+        .bind(&record.model.global_model_id)
+        .bind(&record.model.provider_model_name)
+        .bind(record.model.provider_model_mappings.clone())
+        .bind(record.model.price_per_request)
+        .bind(record.model.tiered_pricing.clone())
+        .bind(record.model.supports_vision)
+        .bind(record.model.supports_function_calling)
+        .bind(record.model.supports_streaming)
+        .bind(record.model.supports_extended_thinking)
+        .bind(record.model.supports_image_generation)
+        .bind(record.model.is_active)
+        .bind(record.model.is_available)
+        .bind(record.model.config.clone())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_postgres_err()?;
+        if updated.is_none() {
+            tx.rollback().await.map_postgres_err()?;
+            return Ok(None);
+        }
+        if let Some(replacement_bindings) = &record.replacement_bindings {
+            sqlx::query("DELETE FROM model_endpoint_bindings WHERE model_id = $1")
+                .bind(&record.model.id)
+                .execute(&mut *tx)
+                .await
+                .map_postgres_err()?;
+            for binding in replacement_bindings {
+                sqlx::query(
+                    r#"
+INSERT INTO model_endpoint_bindings (model_id, endpoint_id, source, is_active, created_at, updated_at)
+VALUES ($1, $2, $3, $4, NOW(), NOW())
+                    "#,
+                )
+                .bind(&binding.model_id)
+                .bind(&binding.endpoint_id)
+                .bind(&binding.source)
+                .bind(binding.is_active)
+                .execute(&mut *tx)
+                .await
+                .map_postgres_err()?;
+            }
+        } else if let Some(endpoint_ids) = &record.automatic_endpoint_ids {
+            let automatic_source = record
+                .automatic_source
+                .as_deref()
+                .expect("validated automatic binding source");
+            let endpoint_ids = normalized_endpoint_ids(endpoint_ids);
+            sqlx::query(
+                "DELETE FROM model_endpoint_bindings WHERE model_id = $1 AND source <> 'manual' AND NOT (endpoint_id = ANY($2::text[]))",
+            )
+            .bind(&record.model.id)
+            .bind(&endpoint_ids)
+            .execute(&mut *tx)
+            .await
+            .map_postgres_err()?;
+            for endpoint_id in endpoint_ids {
+                sqlx::query(
+                    r#"
+INSERT INTO model_endpoint_bindings (model_id, endpoint_id, source, is_active, created_at, updated_at)
+VALUES ($1, $2, $3, TRUE, NOW(), NOW())
+ON CONFLICT (model_id, endpoint_id) DO UPDATE
+SET source = EXCLUDED.source, is_active = TRUE, updated_at = NOW()
+WHERE model_endpoint_bindings.source <> 'manual'
+                    "#,
+                )
+                .bind(&record.model.id)
+                .bind(endpoint_id)
+                .bind(automatic_source)
+                .execute(&mut *tx)
+                .await
+                .map_postgres_err()?;
+            }
+        }
+        for binding in record
+            .replacement_bindings
+            .is_none()
+            .then_some(record.manual_bindings.as_slice())
+            .into_iter()
+            .flatten()
+        {
+            sqlx::query(
+                r#"
+INSERT INTO model_endpoint_bindings (model_id, endpoint_id, source, is_active, created_at, updated_at)
+VALUES ($1, $2, $3, $4, NOW(), NOW())
+ON CONFLICT (model_id, endpoint_id) DO UPDATE
+SET source = EXCLUDED.source, is_active = EXCLUDED.is_active, updated_at = NOW()
+                "#,
+            )
+            .bind(&binding.model_id)
+            .bind(&binding.endpoint_id)
+            .bind(&binding.source)
+            .bind(binding.is_active)
+            .execute(&mut *tx)
+            .await
+            .map_postgres_err()?;
+        }
+        tx.commit().await.map_postgres_err()?;
+        self.get_admin_provider_model(&record.model.provider_id, &record.model.id)
+            .await
     }
 
     async fn delete_admin_provider_model(
@@ -962,6 +1258,201 @@ impl GlobalModelWriteRepository for SqlxGlobalModelReadRepository {
     ) -> Result<bool, DataLayerError> {
         Self::delete_admin_global_model(self, global_model_id).await
     }
+
+    async fn delete_unreferenced_admin_global_model(
+        &self,
+        global_model_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        Self::delete_unreferenced_admin_global_model(self, global_model_id).await
+    }
+
+    async fn sync_model_endpoint_bindings(
+        &self,
+        model_id: &str,
+        endpoint_ids: &[String],
+        source: &str,
+        replace_automatic: bool,
+        replacement_scope_endpoint_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, DataLayerError> {
+        validate_model_endpoint_binding_source(source)?;
+        let endpoint_ids = normalized_endpoint_ids(endpoint_ids);
+        let replacement_scope_endpoint_ids =
+            normalized_endpoint_ids(replacement_scope_endpoint_ids);
+        let mut tx = self.pool.begin().await.map_postgres_err()?;
+        let provider_id: Option<String> =
+            sqlx::query_scalar("SELECT provider_id FROM models WHERE id = $1")
+                .bind(model_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_postgres_err()?;
+        let Some(provider_id) = provider_id else {
+            tx.rollback().await.map_postgres_err()?;
+            return Err(DataLayerError::UnexpectedValue(
+                "provider model not found".to_string(),
+            ));
+        };
+        validate_postgres_endpoint_ownership(&mut tx, &provider_id, &endpoint_ids).await?;
+        if replace_automatic && !replacement_scope_endpoint_ids.is_empty() {
+            sqlx::query(
+                r#"
+DELETE FROM model_endpoint_bindings
+WHERE model_id = $1
+  AND source <> 'manual'
+  AND endpoint_id = ANY($3::text[])
+  AND NOT (endpoint_id = ANY($2::text[]))
+                "#,
+            )
+            .bind(model_id)
+            .bind(&endpoint_ids)
+            .bind(&replacement_scope_endpoint_ids)
+            .execute(&mut *tx)
+            .await
+            .map_postgres_err()?;
+        }
+        for endpoint_id in &endpoint_ids {
+            sqlx::query(
+                r#"
+INSERT INTO model_endpoint_bindings (
+  model_id, endpoint_id, source, is_active, created_at, updated_at
+)
+VALUES ($1, $2, $3, TRUE, NOW(), NOW())
+ON CONFLICT (model_id, endpoint_id) DO UPDATE
+SET source = EXCLUDED.source,
+    is_active = TRUE,
+    updated_at = NOW()
+WHERE model_endpoint_bindings.source <> 'manual'
+                "#,
+            )
+            .bind(model_id)
+            .bind(endpoint_id)
+            .bind(source)
+            .execute(&mut *tx)
+            .await
+            .map_postgres_err()?;
+        }
+        tx.commit().await.map_postgres_err()?;
+        self.list_model_endpoint_bindings(&[model_id.to_string()])
+            .await
+    }
+
+    async fn upsert_model_endpoint_binding(
+        &self,
+        record: &UpsertModelEndpointBindingRecord,
+    ) -> Result<Option<StoredModelEndpointBinding>, DataLayerError> {
+        record.validate()?;
+        let mut tx = self.pool.begin().await.map_postgres_err()?;
+        let provider_id: Option<String> =
+            sqlx::query_scalar("SELECT provider_id FROM models WHERE id = $1")
+                .bind(&record.model_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_postgres_err()?;
+        let Some(provider_id) = provider_id else {
+            tx.rollback().await.map_postgres_err()?;
+            return Ok(None);
+        };
+        validate_postgres_endpoint_ownership(
+            &mut tx,
+            &provider_id,
+            std::slice::from_ref(&record.endpoint_id),
+        )
+        .await?;
+        let row = sqlx::query(
+            r#"
+INSERT INTO model_endpoint_bindings (
+  model_id, endpoint_id, source, is_active, created_at, updated_at
+)
+VALUES ($1, $2, $3, $4, NOW(), NOW())
+ON CONFLICT (model_id, endpoint_id) DO UPDATE
+SET source = EXCLUDED.source,
+    is_active = EXCLUDED.is_active,
+    updated_at = NOW()
+RETURNING model_id, endpoint_id, source, is_active,
+          EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_unix_secs,
+          EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at_unix_secs
+            "#,
+        )
+        .bind(&record.model_id)
+        .bind(&record.endpoint_id)
+        .bind(&record.source)
+        .bind(record.is_active)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_postgres_err()?;
+        let result = row
+            .as_ref()
+            .map(map_model_endpoint_binding_row)
+            .transpose()?;
+        tx.commit().await.map_postgres_err()?;
+        Ok(result)
+    }
+}
+
+fn normalized_endpoint_ids(endpoint_ids: &[String]) -> Vec<String> {
+    let mut endpoint_ids = endpoint_ids
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    endpoint_ids.sort_unstable();
+    endpoint_ids.dedup();
+    endpoint_ids
+}
+
+fn validate_model_endpoint_binding_source(source: &str) -> Result<(), DataLayerError> {
+    UpsertModelEndpointBindingRecord::new(
+        "validation-model".to_string(),
+        "validation-endpoint".to_string(),
+        source.to_string(),
+        true,
+    )
+    .map(|_| ())
+}
+
+async fn validate_postgres_endpoint_ownership(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    provider_id: &str,
+    endpoint_ids: &[String],
+) -> Result<(), DataLayerError> {
+    let endpoint_ids = normalized_endpoint_ids(endpoint_ids);
+    if endpoint_ids.is_empty() {
+        return Ok(());
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM provider_endpoints WHERE provider_id = $1 AND id = ANY($2::text[])",
+    )
+    .bind(provider_id)
+    .bind(&endpoint_ids)
+    .fetch_one(&mut **tx)
+    .await
+    .map_postgres_err()?;
+    if count != endpoint_ids.len() as i64 {
+        return Err(DataLayerError::UnexpectedValue(
+            "model endpoint binding belongs to another provider".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn map_model_endpoint_binding_row(
+    row: &PgRow,
+) -> Result<StoredModelEndpointBinding, DataLayerError> {
+    let created_at = row
+        .try_get::<Option<i64>, _>("created_at_unix_secs")
+        .map_postgres_err()?
+        .and_then(|value| u64::try_from(value).ok());
+    let updated_at = row
+        .try_get::<Option<i64>, _>("updated_at_unix_secs")
+        .map_postgres_err()?
+        .and_then(|value| u64::try_from(value).ok());
+    StoredModelEndpointBinding::new(
+        row.try_get("model_id").map_postgres_err()?,
+        row.try_get("endpoint_id").map_postgres_err()?,
+        row.try_get("source").map_postgres_err()?,
+        row.try_get("is_active").map_postgres_err()?,
+        created_at,
+        updated_at,
+    )
 }
 
 fn apply_public_model_filters(

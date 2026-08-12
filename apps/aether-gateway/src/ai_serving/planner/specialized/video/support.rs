@@ -82,6 +82,7 @@ pub(super) async fn resolve_local_video_create_decision_input(
     };
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
+    input.set_endpoint_capability_context(spec_metadata.api_format, false, None);
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));
     if let Err(err) = attach_routing_policy_to_local_requested_model_input(
@@ -216,6 +217,8 @@ pub(super) async fn build_local_video_create_candidate_attempt_source<'a>(
         planner_state,
         trace_id,
         api_format,
+        false,
+        None,
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -282,6 +285,8 @@ async fn materialize_local_video_create_candidate_attempts(
         state,
         trace_id,
         api_format,
+        input.endpoint_capability_require_streaming,
+        input.endpoint_capability_request_operation.as_deref(),
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -329,6 +334,7 @@ pub(super) async fn mark_skipped_local_video_candidate(
     candidate_id: &str,
     skip_reason: &'static str,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -356,6 +362,7 @@ pub(super) async fn mark_skipped_local_video_candidate_with_failure_diagnostic(
     skip_reason: &'static str,
     diagnostic: CandidateFailureDiagnostic,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),

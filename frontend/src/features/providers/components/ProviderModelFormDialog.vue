@@ -105,6 +105,45 @@
           </p>
         </div>
         <div
+          v-if="requireEndpointSelection"
+          class="space-y-2"
+        >
+          <Label class="text-xs">Endpoint 绑定 *</Label>
+          <div
+            v-if="endpoints.length"
+            class="space-y-2 rounded-lg border border-border/60 bg-muted/20 p-3"
+          >
+            <label
+              v-for="endpoint in endpoints"
+              :key="endpoint.id"
+              class="flex cursor-pointer items-start gap-2"
+            >
+              <Checkbox
+                :checked="form.endpoint_ids.includes(endpoint.id)"
+                :aria-label="`绑定 Endpoint ${endpoint.id}`"
+                class="mt-0.5"
+                @update:checked="checked => toggleEndpoint(endpoint.id, checked === true)"
+              />
+              <span class="min-w-0">
+                <span class="block text-sm font-medium">{{ endpoint.api_format }}</span>
+                <span class="block truncate font-mono text-xs text-muted-foreground">{{ endpoint.id }} · {{ endpoint.base_url }}</span>
+              </span>
+            </label>
+          </div>
+          <p
+            v-else
+            class="text-xs text-destructive"
+          >
+            当前 Provider 没有 Endpoint，无法创建可路由模型。
+          </p>
+          <p
+            v-if="endpoints.length > 1"
+            class="text-xs text-muted-foreground"
+          >
+            此 Provider 有多个 Endpoint，请选择模型实际支持的链路。
+          </p>
+        </div>
+        <div
           v-if="selectedGlobalModelSupportsEmbedding"
           class="rounded-lg border border-border/60 bg-muted/20 px-3 py-2"
         >
@@ -380,6 +419,7 @@ import TieredPricingEditor from '@/features/models/components/TieredPricingEdito
 import { tieredPricingHasImageOutputPricing } from '@/features/models/utils/tiered-pricing'
 import type {
   Model,
+  ProviderEndpoint,
   ProviderTieredPricingConfig,
   TieredPricingConfig,
 } from '@/api/endpoints'
@@ -396,11 +436,15 @@ interface Props {
   providerId: string
   providerName?: string
   editingModel?: Model | null
+  endpoints?: ProviderEndpoint[]
+  requireEndpointSelection?: boolean
 }
 
 const props = withDefaults(defineProps<Props>(), {
   providerName: '',
-  editingModel: null
+  editingModel: null,
+  endpoints: () => [],
+  requireEndpointSelection: true,
 })
 
 const emit = defineEmits<{
@@ -495,6 +539,7 @@ const form = ref({
   provider_model_name: '',
   manual_global_model_name: '',
   manual_global_model_display_name: '',
+  endpoint_ids: [] as string[],
   price_per_request: undefined as number | undefined,
   config: {} as Record<string, unknown>,
   // 能力配置
@@ -511,6 +556,7 @@ const autoFillMissingCachePrices = computed(() => !isEditing.value && manualGlob
 const canSubmitCreate = computed(() => {
   if (isEditing.value) return true
   if (!form.value.provider_model_name.trim()) return false
+  if (props.requireEndpointSelection && form.value.endpoint_ids.length === 0) return false
   if (manualGlobalModelMode.value) return !!form.value.manual_global_model_name.trim()
   return !!form.value.global_model_id
 })
@@ -528,6 +574,7 @@ watch(() => props.open, async (newOpen) => {
         provider_model_name: props.editingModel.provider_model_name || '',
         manual_global_model_name: '',
         manual_global_model_display_name: '',
+        endpoint_ids: [],
         // 显示有效的按次计费价格（继承自全局模型）
         price_per_request: props.editingModel.effective_price_per_request ?? props.editingModel.price_per_request ?? undefined,
         config: effectiveConfig ? JSON.parse(JSON.stringify(effectiveConfig)) : {},
@@ -576,6 +623,7 @@ watch(() => props.open, async (newOpen) => {
       selectInitialBillingMode()
     } else {
       // 添加模式：加载可用全局模型
+      form.value.endpoint_ids = props.endpoints.length === 1 ? [props.endpoints[0].id] : []
       await loadAvailableGlobalModels()
     }
   }
@@ -630,6 +678,7 @@ function resetForm() {
     provider_model_name: '',
     manual_global_model_name: '',
     manual_global_model_display_name: '',
+    endpoint_ids: [],
     price_per_request: undefined,
     config: {},
     supports_vision: undefined,
@@ -656,6 +705,13 @@ function resetForm() {
 function updatePricePerRequest(value: string | number) {
   form.value.price_per_request = parseNumberInput(value, { allowFloat: true })
   pricePerRequestModified.value = form.value.price_per_request !== originalPricePerRequest.value
+}
+
+function toggleEndpoint(endpointId: string, checked: boolean) {
+  const selected = new Set(form.value.endpoint_ids)
+  if (checked) selected.add(endpointId)
+  else selected.delete(endpointId)
+  form.value.endpoint_ids = [...selected]
 }
 
 function handleBillingModeChange(mode: string) {
@@ -918,7 +974,11 @@ function handleClose(value: boolean) {
 async function handleSubmit() {
   if (submitting.value) return
   if (!isEditing.value && !canSubmitCreate.value) {
-    showError(manualGlobalModelMode.value ? '请填写模型ID和 Provider 模型名' : '请选择模型并填写 Provider 模型名', '错误')
+    if (props.requireEndpointSelection && form.value.endpoint_ids.length === 0) {
+      showError('请至少选择一个 Endpoint', '错误')
+    } else {
+      showError(manualGlobalModelMode.value ? '请填写模型ID和 Provider 模型名' : '请选择模型并填写 Provider 模型名', '错误')
+    }
     return
   }
 
@@ -977,6 +1037,7 @@ async function handleSubmit() {
       await createModel(props.providerId, buildProviderModelCreatePayload({
         globalModelId: selectedModel.id,
         providerModelName: form.value.provider_model_name.trim(),
+        endpointIds: form.value.endpoint_ids,
         finalTieredPricing: providerTieredPricingOverride,
         tieredPricingModified: manualGlobalModelMode.value ? false : tieredPricingModified.value,
         pricePerRequest: manualGlobalModelMode.value ? undefined : form.value.price_per_request,

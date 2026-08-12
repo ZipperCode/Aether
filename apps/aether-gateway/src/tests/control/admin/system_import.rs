@@ -20,7 +20,7 @@ use aether_data::repository::users::{StoredUserAuthRecord, UserReadRepository};
 use aether_data::repository::wallet::{StoredWalletSnapshot, WalletLookupKey};
 use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, GlobalModelReadRepository,
-    StoredPublicGlobalModel,
+    StoredModelEndpointBinding, StoredPublicGlobalModel,
 };
 use aether_data_contracts::repository::pool_scores::{
     GetPoolMemberScoresByIdsQuery, PoolMemberHardState, PoolMemberIdentity, PoolMemberProbeStatus,
@@ -36,7 +36,8 @@ use serde_json::{json, Value};
 
 use super::super::helpers::{hash_api_key, sample_endpoint, sample_key, sample_provider};
 use super::super::{
-    build_router_with_state, build_state_with_execution_runtime_override, start_server, AppState,
+    build_router_with_state, build_state_with_execution_runtime_override,
+    sample_admin_global_model, sample_admin_provider_model, start_server, AppState,
 };
 use crate::ai_serving::{
     build_provider_key_pool_score_upsert, provider_key_pool_score_id, provider_key_pool_score_scope,
@@ -303,6 +304,846 @@ fn gateway_imports_admin_system_config_locally_and_persists_data() {
         "gateway_imports_admin_system_config_locally_and_persists_data",
         gateway_imports_admin_system_config_locally_and_persists_data_impl,
     );
+}
+
+#[test]
+fn gateway_system_import_overwrite_replaces_old_automatic_model_binding() {
+    run_admin_system_import_test(
+        "gateway_system_import_overwrite_replaces_old_automatic_model_binding",
+        gateway_system_import_overwrite_replaces_old_automatic_model_binding_impl,
+    );
+}
+
+#[test]
+fn gateway_system_import_remaps_exported_endpoint_ids_in_fresh_repository() {
+    run_admin_system_import_test(
+        "gateway_system_import_remaps_exported_endpoint_ids_in_fresh_repository",
+        gateway_system_import_remaps_exported_endpoint_ids_in_fresh_repository_impl,
+    );
+}
+
+#[test]
+fn gateway_system_import_remaps_legacy_endpoint_ids_by_api_format() {
+    run_admin_system_import_test(
+        "gateway_system_import_remaps_legacy_endpoint_ids_by_api_format",
+        gateway_system_import_remaps_legacy_endpoint_ids_by_api_format_impl,
+    );
+}
+
+#[test]
+fn gateway_system_import_rejects_ambiguous_legacy_endpoint_ids_without_mutation() {
+    run_admin_system_import_test(
+        "gateway_system_import_rejects_ambiguous_legacy_endpoint_ids_without_mutation",
+        gateway_system_import_rejects_ambiguous_legacy_endpoint_ids_without_mutation_impl,
+    );
+}
+
+#[test]
+fn gateway_system_import_legacy_model_binds_all_provider_endpoints() {
+    run_admin_system_import_test(
+        "gateway_system_import_legacy_model_binds_all_provider_endpoints",
+        gateway_system_import_legacy_model_binds_all_provider_endpoints_impl,
+    );
+}
+
+#[test]
+fn gateway_system_import_rejects_empty_model_endpoint_bindings_without_mutation() {
+    run_admin_system_import_test(
+        "gateway_system_import_rejects_empty_model_endpoint_bindings_without_mutation",
+        gateway_system_import_rejects_empty_model_endpoint_bindings_without_mutation_impl,
+    );
+}
+
+#[test]
+fn gateway_system_import_rejects_colliding_endpoint_bindings_without_mutation() {
+    run_admin_system_import_test(
+        "gateway_system_import_rejects_colliding_endpoint_bindings_without_mutation",
+        gateway_system_import_rejects_colliding_endpoint_bindings_without_mutation_impl,
+    );
+}
+
+#[test]
+fn gateway_system_import_rejects_unsupported_fixed_endpoint_binding_without_mutation() {
+    run_admin_system_import_test(
+        "gateway_system_import_rejects_unsupported_fixed_endpoint_binding_without_mutation",
+        gateway_system_import_rejects_unsupported_fixed_endpoint_binding_without_mutation_impl,
+    );
+}
+
+async fn assert_system_import_rejected_without_repository_mutation(
+    payload: Value,
+    expected_detail: &str,
+) {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(Vec::<
+        StoredPublicGlobalModel,
+    >::new()));
+    let data_state = build_admin_system_data_state_with_repositories(
+        Arc::clone(&provider_catalog_repository),
+        Arc::clone(&global_model_repository),
+    )
+    .with_system_config_values_for_tests([(
+        "existing_setting".to_string(),
+        json!({ "enabled": true }),
+    )]);
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data_state);
+    let before_system_configs = state
+        .list_system_config_entries()
+        .await
+        .expect("system configs should read");
+    let gateway = build_router_with_state(state.clone());
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/config/import"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&payload)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body should parse");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(expected_detail)),
+        "unexpected detail: {}",
+        body["detail"]
+    );
+    assert!(global_model_repository
+        .list_admin_global_models(&AdminGlobalModelListQuery {
+            offset: 0,
+            limit: 10_000,
+            is_active: None,
+            search: None,
+        })
+        .await
+        .expect("global models should read")
+        .items
+        .is_empty());
+    let after_providers = provider_catalog_repository
+        .list_providers(false)
+        .await
+        .expect("providers should read");
+    let provider_ids = after_providers
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect::<Vec<_>>();
+    let after_endpoints = provider_catalog_repository
+        .list_endpoints_by_provider_ids(&provider_ids)
+        .await
+        .expect("endpoints should read");
+    let after_keys = provider_catalog_repository
+        .list_keys_by_provider_ids(&provider_ids)
+        .await
+        .expect("keys should read");
+    let mut after_provider_models = Vec::new();
+    for provider_id in &provider_ids {
+        after_provider_models.extend(
+            global_model_repository
+                .list_admin_provider_models(&AdminProviderModelListQuery {
+                    provider_id: provider_id.clone(),
+                    is_active: None,
+                    offset: 0,
+                    limit: 10_000,
+                })
+                .await
+                .expect("provider models should read"),
+        );
+    }
+    let model_ids = after_provider_models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let after_bindings = global_model_repository
+        .list_model_endpoint_bindings(&model_ids)
+        .await
+        .expect("bindings should read");
+    assert!(after_providers.is_empty());
+    assert!(after_endpoints.is_empty());
+    assert!(after_keys.is_empty());
+    assert!(after_provider_models.is_empty());
+    assert!(after_bindings.is_empty());
+    assert_eq!(
+        state
+            .list_system_config_entries()
+            .await
+            .expect("system configs should read"),
+        before_system_configs
+    );
+
+    gateway_handle.abort();
+}
+
+async fn gateway_system_import_rejects_colliding_endpoint_bindings_without_mutation_impl() {
+    let mut payload = sample_system_import_payload();
+    payload["providers"][0]["endpoints"] = json!([
+        {
+            "id": "endpoint-cli",
+            "api_format": "openai:cli",
+            "base_url": "https://api.example.com",
+            "is_active": true
+        },
+        {
+            "id": "endpoint-responses",
+            "api_format": "openai:responses",
+            "base_url": "https://api.example.com",
+            "is_active": true
+        }
+    ]);
+    payload["providers"][0]["models"][0]["endpoint_bindings"] = json!([
+        { "endpoint_id": "endpoint-cli", "source": "manual", "is_active": true },
+        { "endpoint_id": "endpoint-responses", "source": "manual", "is_active": true }
+    ]);
+
+    assert_system_import_rejected_without_repository_mutation(
+        payload,
+        "Endpoint endpoint-responses 存在重复模型绑定",
+    )
+    .await;
+}
+
+async fn gateway_system_import_rejects_unsupported_fixed_endpoint_binding_without_mutation_impl() {
+    let mut payload = sample_system_import_payload();
+    payload["providers"][0]["provider_type"] = json!("vertex_ai");
+    payload["providers"][0]["endpoints"] = json!([
+        {
+            "id": "endpoint-gemini",
+            "api_format": "gemini:generate_content",
+            "base_url": "https://aiplatform.googleapis.com",
+            "is_active": true
+        },
+        {
+            "id": "endpoint-claude",
+            "api_format": "claude:messages",
+            "base_url": "https://aiplatform.googleapis.com",
+            "is_active": true
+        }
+    ]);
+    payload["providers"][0]["models"][0]["endpoint_bindings"] = json!([{
+        "endpoint_id": "endpoint-claude",
+        "source": "manual",
+        "is_active": true
+    }]);
+
+    assert_system_import_rejected_without_repository_mutation(
+        payload,
+        "Endpoint endpoint-claude 不在当前 Provider 的导入配置中",
+    )
+    .await;
+}
+
+async fn gateway_system_import_rejects_empty_model_endpoint_bindings_without_mutation_impl() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-import", "import-openai", 10)],
+        vec![sample_endpoint(
+            "endpoint-existing",
+            "provider-import",
+            "openai:chat",
+            "https://api.example.com",
+        )],
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "global-import",
+                "gpt-5",
+                "GPT 5",
+            )])
+            .with_admin_provider_models(vec![sample_admin_provider_model(
+                "model-import",
+                "provider-import",
+                "global-import",
+                "gpt-5",
+            )])
+            .with_model_endpoint_bindings(vec![StoredModelEndpointBinding::new(
+                "model-import".to_string(),
+                "endpoint-existing".to_string(),
+                "manual".to_string(),
+                true,
+                Some(1),
+                Some(1),
+            )
+            .expect("existing binding should build")])
+            .with_endpoint_provider_ids([("endpoint-existing", "provider-import")]),
+    );
+    let data_state = build_admin_system_data_state_with_repositories(
+        Arc::clone(&provider_catalog_repository),
+        Arc::clone(&global_model_repository),
+    )
+    .with_system_config_values_for_tests([(
+        "existing_setting".to_string(),
+        json!({ "enabled": true }),
+    )]);
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data_state);
+    let provider_ids = vec!["provider-import".to_string()];
+    let before_global_models = global_model_repository
+        .list_admin_global_models(&AdminGlobalModelListQuery {
+            offset: 0,
+            limit: 10_000,
+            is_active: None,
+            search: None,
+        })
+        .await
+        .expect("global models should read")
+        .items;
+    let before_providers = provider_catalog_repository
+        .list_providers(false)
+        .await
+        .expect("providers should read");
+    let before_endpoints = provider_catalog_repository
+        .list_endpoints_by_provider_ids(&provider_ids)
+        .await
+        .expect("endpoints should read");
+    let before_keys = provider_catalog_repository
+        .list_keys_by_provider_ids(&provider_ids)
+        .await
+        .expect("keys should read");
+    let before_provider_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-import".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 10_000,
+        })
+        .await
+        .expect("provider models should read");
+    let before_bindings = global_model_repository
+        .list_model_endpoint_bindings(&["model-import".to_string()])
+        .await
+        .expect("bindings should read");
+    let before_system_configs = state
+        .list_system_config_entries()
+        .await
+        .expect("system configs should read");
+    let gateway = build_router_with_state(state.clone());
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let mut payload = sample_system_import_payload();
+    payload["global_models"][0]["name"] = json!("gpt-5");
+    payload["providers"][0]["endpoints"][0]["id"] = json!("endpoint-export");
+    payload["providers"][0]["models"][0]["endpoint_bindings"] = json!([]);
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/config/import"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&payload)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body should parse");
+    assert_eq!(
+        body["detail"],
+        "endpoint_bindings 至少需要一个 Endpoint 绑定"
+    );
+    let after_global_models = global_model_repository
+        .list_admin_global_models(&AdminGlobalModelListQuery {
+            offset: 0,
+            limit: 10_000,
+            is_active: None,
+            search: None,
+        })
+        .await
+        .expect("global models should read")
+        .items;
+    let after_providers = provider_catalog_repository
+        .list_providers(false)
+        .await
+        .expect("providers should read");
+    let after_endpoints = provider_catalog_repository
+        .list_endpoints_by_provider_ids(&provider_ids)
+        .await
+        .expect("endpoints should read");
+    let after_keys = provider_catalog_repository
+        .list_keys_by_provider_ids(&provider_ids)
+        .await
+        .expect("keys should read");
+    let after_provider_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-import".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 10_000,
+        })
+        .await
+        .expect("provider models should read");
+    let after_bindings = global_model_repository
+        .list_model_endpoint_bindings(&["model-import".to_string()])
+        .await
+        .expect("bindings should read");
+    let after_system_configs = state
+        .list_system_config_entries()
+        .await
+        .expect("system configs should read");
+
+    assert_eq!(after_global_models, before_global_models);
+    assert_eq!(after_providers, before_providers);
+    assert_eq!(after_endpoints, before_endpoints);
+    assert_eq!(after_keys, before_keys);
+    assert!(
+        after_keys.iter().all(|key| key.name != "primary"),
+        "invalid import must not create the primary key"
+    );
+    assert_eq!(after_provider_models, before_provider_models);
+    assert_eq!(after_bindings, before_bindings);
+    assert_eq!(after_system_configs, before_system_configs);
+
+    gateway_handle.abort();
+}
+
+async fn gateway_system_import_overwrite_replaces_old_automatic_model_binding_impl() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-import", "import-openai", 10)],
+        vec![
+            sample_endpoint(
+                "endpoint-old",
+                "provider-import",
+                "openai:chat",
+                "https://old.example.com",
+            ),
+            sample_endpoint(
+                "endpoint-new",
+                "provider-import",
+                "claude:messages",
+                "https://new.example.com",
+            ),
+        ],
+        Vec::new(),
+    ));
+    let mut provider_model =
+        sample_admin_provider_model("model-import", "provider-import", "global-import", "gpt-5");
+    provider_model.provider_model_mappings = Some(json!([{
+        "name": "gpt-5",
+        "endpoint_ids": ["endpoint-old"]
+    }]));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "global-import",
+                "gpt-5",
+                "GPT 5",
+            )])
+            .with_admin_provider_models(vec![provider_model])
+            .with_model_endpoint_bindings(vec![StoredModelEndpointBinding::new(
+                "model-import".to_string(),
+                "endpoint-old".to_string(),
+                "mapping".to_string(),
+                true,
+                Some(1),
+                Some(1),
+            )
+            .expect("old binding should build")])
+            .with_endpoint_provider_ids([
+                ("endpoint-old", "provider-import"),
+                ("endpoint-new", "provider-import"),
+            ]),
+    );
+    let data_state = build_admin_system_data_state_with_repositories(
+        Arc::clone(&provider_catalog_repository),
+        Arc::clone(&global_model_repository),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(data_state),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let mut payload = sample_system_import_payload();
+    payload["global_models"][0]["name"] = json!("gpt-5");
+    payload["providers"][0]["endpoints"] = json!([
+        {
+            "id": "endpoint-export-old",
+            "api_format": "openai:chat",
+            "base_url": "https://old.example.com",
+            "is_active": true
+        },
+        {
+            "id": "endpoint-export-new",
+            "api_format": "claude:messages",
+            "base_url": "https://new.example.com",
+            "is_active": true
+        }
+    ]);
+    payload["providers"][0]["api_keys"] = json!([]);
+    payload["providers"][0]["models"][0]["provider_model_mappings"] = json!([{
+        "name": "gpt-5",
+        "endpoint_ids": ["endpoint-export-new"]
+    }]);
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/config/import"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&payload)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let body: Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={body}");
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&["model-import".to_string()])
+        .await
+        .expect("bindings should read");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, "endpoint-new");
+    assert_eq!(bindings[0].source, "mapping");
+    let stored_model = global_model_repository
+        .get_admin_provider_model("provider-import", "model-import")
+        .await
+        .expect("provider model should read")
+        .expect("provider model should exist");
+    assert_eq!(
+        stored_model.provider_model_mappings,
+        Some(json!([{
+            "name": "gpt-5",
+            "endpoint_ids": ["endpoint-new"]
+        }]))
+    );
+
+    gateway_handle.abort();
+}
+
+async fn gateway_system_import_remaps_exported_endpoint_ids_in_fresh_repository_impl() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(Vec::<
+        StoredPublicGlobalModel,
+    >::new()));
+    let data_state = build_admin_system_data_state_with_repositories(
+        Arc::clone(&provider_catalog_repository),
+        Arc::clone(&global_model_repository),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(data_state),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let mut payload = sample_system_import_payload();
+    payload["providers"][0]["endpoints"] = json!([
+        {
+            "id": "endpoint-export-chat",
+            "api_format": "openai:chat",
+            "base_url": "https://chat.example.com",
+            "is_active": true
+        },
+        {
+            "id": "endpoint-export-messages",
+            "api_format": "claude:messages",
+            "base_url": "https://messages.example.com",
+            "is_active": true
+        }
+    ]);
+    payload["providers"][0]["api_keys"] = json!([]);
+    payload["providers"][0]["models"][0]["provider_model_mappings"] = json!([{
+        "name": "gpt-5",
+        "endpoint_ids": ["endpoint-export-messages"]
+    }]);
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/config/import"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&payload)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let body: Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={body}");
+
+    let providers = provider_catalog_repository
+        .list_providers(false)
+        .await
+        .expect("providers should read");
+    let provider = providers.first().expect("provider should exist");
+    let endpoints = provider_catalog_repository
+        .list_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
+        .await
+        .expect("endpoints should read");
+    let messages_endpoint = endpoints
+        .iter()
+        .find(|endpoint| endpoint.api_format == "claude:messages")
+        .expect("messages endpoint should exist");
+    assert_ne!(messages_endpoint.id, "endpoint-export-messages");
+
+    let models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: provider.id.clone(),
+            is_active: None,
+            offset: 0,
+            limit: 10,
+        })
+        .await
+        .expect("provider models should read");
+    let model = models.first().expect("provider model should exist");
+    assert_eq!(
+        model.provider_model_mappings,
+        Some(json!([{
+            "name": "gpt-5",
+            "endpoint_ids": [messages_endpoint.id.clone()]
+        }]))
+    );
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(std::slice::from_ref(&model.id))
+        .await
+        .expect("bindings should read");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, messages_endpoint.id);
+    assert_eq!(bindings[0].source, "mapping");
+
+    gateway_handle.abort();
+}
+
+async fn gateway_system_import_remaps_legacy_endpoint_ids_by_api_format_impl() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(Vec::<
+        StoredPublicGlobalModel,
+    >::new()));
+    let data_state = build_admin_system_data_state_with_repositories(
+        Arc::clone(&provider_catalog_repository),
+        Arc::clone(&global_model_repository),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(data_state),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let mut payload = sample_system_import_payload();
+    payload["version"] = json!("2.3");
+    payload["providers"][0]["endpoints"] = json!([
+        {
+            "api_format": "openai:chat",
+            "base_url": "https://chat.example.com",
+            "is_active": true
+        },
+        {
+            "api_format": "claude:messages",
+            "base_url": "https://messages.example.com",
+            "is_active": true
+        }
+    ]);
+    payload["providers"][0]["api_keys"] = json!([]);
+    payload["providers"][0]["models"][0]["provider_model_mappings"] = json!([{
+        "name": "gpt-5",
+        "api_formats": ["claude:messages"],
+        "endpoint_ids": ["endpoint-from-legacy-instance"]
+    }]);
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/config/import"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&payload)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let body: Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={body}");
+
+    let provider = provider_catalog_repository
+        .list_providers(false)
+        .await
+        .expect("providers should read")
+        .into_iter()
+        .next()
+        .expect("provider should exist");
+    let messages_endpoint = provider_catalog_repository
+        .list_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
+        .await
+        .expect("endpoints should read")
+        .into_iter()
+        .find(|endpoint| endpoint.api_format == "claude:messages")
+        .expect("messages endpoint should exist");
+    let model = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: provider.id,
+            is_active: None,
+            offset: 0,
+            limit: 10,
+        })
+        .await
+        .expect("provider models should read")
+        .into_iter()
+        .next()
+        .expect("provider model should exist");
+    assert_eq!(
+        model.provider_model_mappings,
+        Some(json!([{
+            "name": "gpt-5",
+            "api_formats": ["claude:messages"],
+            "endpoint_ids": [messages_endpoint.id.clone()]
+        }]))
+    );
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(std::slice::from_ref(&model.id))
+        .await
+        .expect("bindings should read");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, messages_endpoint.id);
+    assert_eq!(bindings[0].source, "mapping");
+
+    gateway_handle.abort();
+}
+
+async fn gateway_system_import_rejects_ambiguous_legacy_endpoint_ids_without_mutation_impl() {
+    let mut payload = sample_system_import_payload();
+    payload["version"] = json!("2.3");
+    payload["providers"][0]["endpoints"] = json!([
+        {
+            "api_format": "openai:chat",
+            "base_url": "https://chat.example.com",
+            "is_active": true
+        },
+        {
+            "api_format": "claude:messages",
+            "base_url": "https://messages.example.com",
+            "is_active": true
+        }
+    ]);
+    payload["providers"][0]["models"][0]["provider_model_mappings"] = json!([{
+        "name": "gpt-5",
+        "endpoint_ids": ["endpoint-from-legacy-instance"]
+    }]);
+
+    assert_system_import_rejected_without_repository_mutation(
+        payload,
+        "使用了无法重映射的 endpoint_ids，且当前 Provider 有多个 Endpoint",
+    )
+    .await;
+}
+
+async fn gateway_system_import_legacy_model_binds_all_provider_endpoints_impl() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(Vec::<
+        StoredPublicGlobalModel,
+    >::new()));
+    let data_state = build_admin_system_data_state_with_repositories(
+        Arc::clone(&provider_catalog_repository),
+        Arc::clone(&global_model_repository),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(data_state),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let mut payload = sample_system_import_payload();
+    payload["providers"][0]["endpoints"] = json!([
+        {
+            "api_format": "openai:chat",
+            "base_url": "https://chat.example.com",
+            "is_active": true
+        },
+        {
+            "api_format": "claude:messages",
+            "base_url": "https://messages.example.com",
+            "is_active": true
+        }
+    ]);
+    payload["providers"][0]["api_keys"] = json!([]);
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/config/import"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&payload)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let body: Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={body}");
+
+    let provider = provider_catalog_repository
+        .list_providers(false)
+        .await
+        .expect("providers should read")
+        .into_iter()
+        .next()
+        .expect("provider should exist");
+    let endpoint_ids = provider_catalog_repository
+        .list_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
+        .await
+        .expect("endpoints should read")
+        .into_iter()
+        .map(|endpoint| endpoint.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let model = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: provider.id,
+            is_active: None,
+            offset: 0,
+            limit: 10,
+        })
+        .await
+        .expect("provider models should read")
+        .into_iter()
+        .next()
+        .expect("provider model should exist");
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(std::slice::from_ref(&model.id))
+        .await
+        .expect("bindings should read");
+    assert_eq!(bindings.len(), endpoint_ids.len());
+    assert_eq!(
+        bindings
+            .iter()
+            .map(|binding| binding.endpoint_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        endpoint_ids
+    );
+    assert!(bindings.iter().all(|binding| binding.source == "migration"));
+
+    gateway_handle.abort();
 }
 
 async fn gateway_imports_admin_system_config_locally_and_persists_data_impl() {
@@ -923,7 +1764,7 @@ async fn gateway_rejects_unknown_admin_system_config_import_versions_impl() {
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
 
-    for version in ["1.9", "2.4"] {
+    for version in ["1.9", "2.5"] {
         let response = client
             .post(format!("{gateway_url}/api/admin/system/config/import"))
             .header(GATEWAY_HEADER, "rust-phase3b")
@@ -946,7 +1787,7 @@ async fn gateway_rejects_unknown_admin_system_config_import_versions_impl() {
             .as_str()
             .expect("detail should be a string");
         assert!(detail.contains(&format!("不支持的配置版本: {version}")));
-        assert!(detail.contains("支持的版本: 2.0, 2.1, 2.2, 2.3"));
+        assert!(detail.contains("支持的版本: 2.0, 2.1, 2.2, 2.3, 2.4"));
     }
 
     gateway_handle.abort();

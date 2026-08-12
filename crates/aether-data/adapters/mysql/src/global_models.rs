@@ -1,14 +1,17 @@
 use async_trait::async_trait;
 use sqlx::{mysql::MySqlRow, MySql, QueryBuilder, Row};
+use std::collections::BTreeSet;
 
 use aether_data_contracts::repository::global_models::{
     metadata_supports_embedding, AdminGlobalModelListQuery, AdminProviderModelListQuery,
-    CreateAdminGlobalModelRecord, GlobalModelReadRepository, GlobalModelWriteRepository,
-    PublicCatalogModelListQuery, PublicCatalogModelSearchQuery, PublicGlobalModelQuery,
-    StoredAdminGlobalModel, StoredAdminGlobalModelPage, StoredAdminProviderModel,
+    CreateAdminGlobalModelRecord, CreateAdminProviderModelWithBindingsRecord,
+    GlobalModelReadRepository, GlobalModelWriteRepository, PublicCatalogModelListQuery,
+    PublicCatalogModelSearchQuery, PublicGlobalModelQuery, StoredAdminGlobalModel,
+    StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredModelEndpointBinding,
     StoredProviderActiveGlobalModel, StoredProviderModelStats, StoredPublicCatalogModel,
     StoredPublicGlobalModel, StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord,
-    UpsertAdminProviderModelRecord,
+    UpdateAdminProviderModelWithBindingsRecord, UpsertAdminProviderModelRecord,
+    UpsertModelEndpointBindingRecord,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -179,6 +182,9 @@ impl MysqlGlobalModelReadRepository {
         &self,
         record: &UpsertAdminProviderModelRecord,
     ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
+        record.validate()?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        lock_mysql_global_model(&mut tx, &record.global_model_id).await?;
         let now = current_unix_secs();
         sqlx::query(
             r#"
@@ -227,9 +233,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         .bind(optional_json_to_string(&record.config, "models.config")?)
         .bind(now as i64)
         .bind(now as i64)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_sql_err()?;
+
+        tx.commit().await.map_sql_err()?;
 
         self.get_admin_provider_model(&record.provider_id, &record.id)
             .await
@@ -239,6 +247,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         &self,
         record: &UpsertAdminProviderModelRecord,
     ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
+        record.validate()?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        lock_mysql_global_model(&mut tx, &record.global_model_id).await?;
         let now = current_unix_secs();
         let updated = sqlx::query(
             r#"
@@ -284,13 +295,16 @@ WHERE id = ?
         .bind(now as i64)
         .bind(&record.id)
         .bind(&record.provider_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_sql_err()?;
 
         if updated.rows_affected() == 0 {
+            tx.rollback().await.map_sql_err()?;
             return Ok(None);
         }
+
+        tx.commit().await.map_sql_err()?;
 
         self.get_admin_provider_model(&record.provider_id, &record.id)
             .await
@@ -424,6 +438,10 @@ WHERE id = ?
         global_model_id: &str,
     ) -> Result<bool, DataLayerError> {
         let mut tx = self.pool.begin().await.map_sql_err()?;
+        if !lock_mysql_global_model_if_present(&mut tx, global_model_id).await? {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
 
         sqlx::query(
             r#"
@@ -442,6 +460,37 @@ DELETE FROM global_models
 WHERE id = ?
 "#,
         )
+        .bind(global_model_id)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+
+        tx.commit().await.map_sql_err()?;
+
+        Ok(deleted.rows_affected() > 0)
+    }
+
+    pub async fn delete_unreferenced_admin_global_model(
+        &self,
+        global_model_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        if !lock_mysql_global_model_if_present(&mut tx, global_model_id).await? {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        let deleted = sqlx::query(
+            r#"
+DELETE FROM global_models
+WHERE id = ?
+  AND NOT EXISTS (
+    SELECT 1
+    FROM models
+    WHERE global_model_id = ?
+  )
+"#,
+        )
+        .bind(global_model_id)
         .bind(global_model_id)
         .execute(&mut *tx)
         .await
@@ -738,6 +787,27 @@ ORDER BY m.created_at DESC, m.id ASC
         let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
         rows.iter().map(map_active_global_model_row).collect()
     }
+
+    async fn list_model_endpoint_bindings(
+        &self,
+        model_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, DataLayerError> {
+        if model_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut builder = QueryBuilder::<MySql>::new(
+            "SELECT model_id, endpoint_id, source, is_active, created_at, updated_at FROM model_endpoint_bindings WHERE model_id IN (",
+        );
+        {
+            let mut separated = builder.separated(", ");
+            for model_id in model_ids {
+                separated.push_bind(model_id);
+            }
+        }
+        builder.push(") ORDER BY model_id ASC, endpoint_id ASC");
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
+        rows.iter().map(map_model_endpoint_binding_row).collect()
+    }
 }
 
 #[async_trait]
@@ -749,11 +819,309 @@ impl GlobalModelWriteRepository for MysqlGlobalModelReadRepository {
         Self::create_admin_provider_model(self, record).await
     }
 
+    async fn create_admin_provider_model_with_bindings(
+        &self,
+        record: &CreateAdminProviderModelWithBindingsRecord,
+    ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
+        record.validate()?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        lock_mysql_global_model(&mut tx, &record.model.global_model_id).await?;
+        let binding_endpoint_ids: BTreeSet<String> =
+            record.replacement_bindings.as_ref().map_or_else(
+                || record.endpoint_ids.iter().cloned().collect(),
+                |bindings| {
+                    bindings
+                        .iter()
+                        .map(|binding| binding.endpoint_id.clone())
+                        .collect()
+                },
+            );
+        if !binding_endpoint_ids.is_empty() {
+            let mut builder = QueryBuilder::<MySql>::new(
+                "SELECT COUNT(*) AS count FROM provider_endpoints WHERE provider_id = ",
+            );
+            builder
+                .push_bind(&record.model.provider_id)
+                .push(" AND id IN (");
+            {
+                let mut separated = builder.separated(", ");
+                for endpoint_id in &binding_endpoint_ids {
+                    separated.push_bind(endpoint_id);
+                }
+            }
+            builder.push(")");
+            let count: i64 = builder
+                .build()
+                .fetch_one(&mut *tx)
+                .await
+                .map_sql_err()?
+                .try_get("count")
+                .map_sql_err()?;
+            if count != binding_endpoint_ids.len() as i64 {
+                tx.rollback().await.map_sql_err()?;
+                return Err(DataLayerError::UnexpectedValue(
+                    "model endpoint binding belongs to another provider".to_string(),
+                ));
+            }
+        }
+        let now = current_unix_secs() as i64;
+        sqlx::query::<MySql>(
+            r#"
+INSERT INTO models (
+  id, provider_id, global_model_id, provider_model_name, provider_model_mappings,
+  price_per_request, tiered_pricing, supports_vision, supports_function_calling,
+  supports_streaming, supports_extended_thinking, supports_image_generation,
+  is_active, is_available, config, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&record.model.id)
+        .bind(&record.model.provider_id)
+        .bind(&record.model.global_model_id)
+        .bind(&record.model.provider_model_name)
+        .bind(optional_json_to_string(
+            &record.model.provider_model_mappings,
+            "models.provider_model_mappings",
+        )?)
+        .bind(record.model.price_per_request)
+        .bind(optional_json_to_string(
+            &record.model.tiered_pricing,
+            "models.tiered_pricing",
+        )?)
+        .bind(record.model.supports_vision)
+        .bind(record.model.supports_function_calling)
+        .bind(record.model.supports_streaming)
+        .bind(record.model.supports_extended_thinking)
+        .bind(record.model.supports_image_generation)
+        .bind(record.model.is_active)
+        .bind(record.model.is_available)
+        .bind(optional_json_to_string(
+            &record.model.config,
+            "models.config",
+        )?)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        let bindings = record.replacement_bindings.clone().unwrap_or_else(|| {
+            record
+                .endpoint_ids
+                .iter()
+                .map(|endpoint_id| UpsertModelEndpointBindingRecord {
+                    model_id: record.model.id.clone(),
+                    endpoint_id: endpoint_id.clone(),
+                    source: record.source.clone(),
+                    is_active: true,
+                })
+                .collect()
+        });
+        for binding in &bindings {
+            sqlx::query(
+                r#"
+INSERT INTO model_endpoint_bindings
+  (model_id, endpoint_id, source, is_active, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE source = VALUES(source), is_active = VALUES(is_active), updated_at = VALUES(updated_at)
+                "#,
+            )
+            .bind(&binding.model_id)
+            .bind(&binding.endpoint_id)
+            .bind(&binding.source)
+            .bind(binding.is_active)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        }
+        tx.commit().await.map_sql_err()?;
+        self.get_admin_provider_model(&record.model.provider_id, &record.model.id)
+            .await
+    }
+
     async fn update_admin_provider_model(
         &self,
         record: &UpsertAdminProviderModelRecord,
     ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
         Self::update_admin_provider_model(self, record).await
+    }
+
+    async fn update_admin_provider_model_with_bindings(
+        &self,
+        record: &UpdateAdminProviderModelWithBindingsRecord,
+    ) -> Result<Option<StoredAdminProviderModel>, DataLayerError> {
+        record.validate()?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        lock_mysql_global_model(&mut tx, &record.model.global_model_id).await?;
+        let endpoint_ids = record.replacement_bindings.as_ref().map_or_else(
+            || {
+                record
+                    .automatic_endpoint_ids
+                    .iter()
+                    .flatten()
+                    .chain(
+                        record
+                            .manual_bindings
+                            .iter()
+                            .map(|binding| &binding.endpoint_id),
+                    )
+                    .cloned()
+                    .collect::<Vec<_>>()
+            },
+            |bindings| {
+                bindings
+                    .iter()
+                    .map(|binding| binding.endpoint_id.clone())
+                    .collect()
+            },
+        );
+        validate_mysql_endpoint_ownership(&mut tx, &record.model.provider_id, &endpoint_ids)
+            .await?;
+        let existing = sqlx::query::<MySql>(
+            "SELECT id FROM models WHERE id = ? AND provider_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(&record.model.id)
+        .bind(&record.model.provider_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_sql_err()?;
+        if existing.is_none() {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        }
+        sqlx::query::<MySql>(
+            r#"
+UPDATE models
+SET global_model_id = ?, provider_model_name = ?, provider_model_mappings = ?,
+    price_per_request = ?, tiered_pricing = ?, supports_vision = ?,
+    supports_function_calling = ?, supports_streaming = ?, supports_extended_thinking = ?,
+    supports_image_generation = ?, is_active = ?, is_available = ?, config = ?, updated_at = ?
+WHERE id = ? AND provider_id = ?
+            "#,
+        )
+        .bind(&record.model.global_model_id)
+        .bind(&record.model.provider_model_name)
+        .bind(optional_json_to_string(
+            &record.model.provider_model_mappings,
+            "models.provider_model_mappings",
+        )?)
+        .bind(record.model.price_per_request)
+        .bind(optional_json_to_string(
+            &record.model.tiered_pricing,
+            "models.tiered_pricing",
+        )?)
+        .bind(record.model.supports_vision)
+        .bind(record.model.supports_function_calling)
+        .bind(record.model.supports_streaming)
+        .bind(record.model.supports_extended_thinking)
+        .bind(record.model.supports_image_generation)
+        .bind(record.model.is_active)
+        .bind(record.model.is_available)
+        .bind(optional_json_to_string(
+            &record.model.config,
+            "models.config",
+        )?)
+        .bind(current_unix_secs() as i64)
+        .bind(&record.model.id)
+        .bind(&record.model.provider_id)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        if let Some(replacement_bindings) = &record.replacement_bindings {
+            sqlx::query("DELETE FROM model_endpoint_bindings WHERE model_id = ?")
+                .bind(&record.model.id)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+            let now = current_unix_secs() as i64;
+            for binding in replacement_bindings {
+                sqlx::query(
+                    r#"
+INSERT INTO model_endpoint_bindings (model_id, endpoint_id, source, is_active, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+                    "#,
+                )
+                .bind(&binding.model_id)
+                .bind(&binding.endpoint_id)
+                .bind(&binding.source)
+                .bind(binding.is_active)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+            }
+        } else if let Some(endpoint_ids) = &record.automatic_endpoint_ids {
+            let automatic_source = record
+                .automatic_source
+                .as_deref()
+                .expect("validated automatic binding source");
+            let endpoint_ids = normalized_endpoint_ids(endpoint_ids);
+            let mut builder =
+                QueryBuilder::<MySql>::new("DELETE FROM model_endpoint_bindings WHERE model_id = ");
+            builder
+                .push_bind(&record.model.id)
+                .push(" AND source <> 'manual'");
+            if !endpoint_ids.is_empty() {
+                builder.push(" AND endpoint_id NOT IN (");
+                let mut separated = builder.separated(", ");
+                for endpoint_id in &endpoint_ids {
+                    separated.push_bind(endpoint_id);
+                }
+                separated.push_unseparated(")");
+            }
+            builder.build().execute(&mut *tx).await.map_sql_err()?;
+            let now = current_unix_secs() as i64;
+            for endpoint_id in endpoint_ids {
+                sqlx::query(
+                    r#"
+INSERT INTO model_endpoint_bindings (model_id, endpoint_id, source, is_active, created_at, updated_at)
+VALUES (?, ?, ?, 1, ?, ?)
+ON DUPLICATE KEY UPDATE
+  source = IF(source = 'manual', source, VALUES(source)),
+  is_active = IF(source = 'manual', is_active, 1),
+  updated_at = IF(source = 'manual', updated_at, VALUES(updated_at))
+                    "#,
+                )
+                .bind(&record.model.id)
+                .bind(endpoint_id)
+                .bind(automatic_source)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+            }
+        }
+        let now = current_unix_secs() as i64;
+        for binding in record
+            .replacement_bindings
+            .is_none()
+            .then_some(record.manual_bindings.as_slice())
+            .into_iter()
+            .flatten()
+        {
+            sqlx::query(
+                r#"
+INSERT INTO model_endpoint_bindings (model_id, endpoint_id, source, is_active, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE source = VALUES(source), is_active = VALUES(is_active), updated_at = VALUES(updated_at)
+                "#,
+            )
+            .bind(&binding.model_id)
+            .bind(&binding.endpoint_id)
+            .bind(&binding.source)
+            .bind(binding.is_active)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        }
+        tx.commit().await.map_sql_err()?;
+        self.get_admin_provider_model(&record.model.provider_id, &record.model.id)
+            .await
     }
 
     async fn delete_admin_provider_model(
@@ -784,6 +1152,248 @@ impl GlobalModelWriteRepository for MysqlGlobalModelReadRepository {
     ) -> Result<bool, DataLayerError> {
         Self::delete_admin_global_model(self, global_model_id).await
     }
+
+    async fn delete_unreferenced_admin_global_model(
+        &self,
+        global_model_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        Self::delete_unreferenced_admin_global_model(self, global_model_id).await
+    }
+
+    async fn sync_model_endpoint_bindings(
+        &self,
+        model_id: &str,
+        endpoint_ids: &[String],
+        source: &str,
+        replace_automatic: bool,
+        replacement_scope_endpoint_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, DataLayerError> {
+        validate_model_endpoint_binding_source(source)?;
+        let endpoint_ids = normalized_endpoint_ids(endpoint_ids);
+        let replacement_scope_endpoint_ids =
+            normalized_endpoint_ids(replacement_scope_endpoint_ids);
+        let now = current_unix_secs() as i64;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let provider_id: Option<String> =
+            sqlx::query_scalar("SELECT provider_id FROM models WHERE id = ?")
+                .bind(model_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?;
+        let Some(provider_id) = provider_id else {
+            tx.rollback().await.map_sql_err()?;
+            return Err(DataLayerError::UnexpectedValue(
+                "provider model not found".to_string(),
+            ));
+        };
+        validate_mysql_endpoint_ownership(&mut tx, &provider_id, &endpoint_ids).await?;
+        if replace_automatic && !replacement_scope_endpoint_ids.is_empty() {
+            let mut builder =
+                QueryBuilder::<MySql>::new("DELETE FROM model_endpoint_bindings WHERE model_id = ");
+            builder.push_bind(model_id).push(" AND source <> 'manual'");
+            builder.push(" AND endpoint_id IN (");
+            {
+                let mut separated = builder.separated(", ");
+                for endpoint_id in &replacement_scope_endpoint_ids {
+                    separated.push_bind(endpoint_id);
+                }
+            }
+            builder.push(")");
+            if !endpoint_ids.is_empty() {
+                builder.push(" AND endpoint_id NOT IN (");
+                {
+                    let mut separated = builder.separated(", ");
+                    for endpoint_id in &endpoint_ids {
+                        separated.push_bind(endpoint_id);
+                    }
+                }
+                builder.push(")");
+            }
+            builder.build().execute(&mut *tx).await.map_sql_err()?;
+        }
+        for endpoint_id in &endpoint_ids {
+            sqlx::query(
+                r#"
+INSERT INTO model_endpoint_bindings (
+  model_id, endpoint_id, source, is_active, created_at, updated_at
+)
+VALUES (?, ?, ?, 1, ?, ?)
+ON DUPLICATE KEY UPDATE
+  source = IF(source = 'manual', source, VALUES(source)),
+  is_active = IF(source = 'manual', is_active, 1),
+  updated_at = IF(source = 'manual', updated_at, VALUES(updated_at))
+                "#,
+            )
+            .bind(model_id)
+            .bind(endpoint_id)
+            .bind(source)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        }
+        tx.commit().await.map_sql_err()?;
+        self.list_model_endpoint_bindings(&[model_id.to_string()])
+            .await
+    }
+
+    async fn upsert_model_endpoint_binding(
+        &self,
+        record: &UpsertModelEndpointBindingRecord,
+    ) -> Result<Option<StoredModelEndpointBinding>, DataLayerError> {
+        record.validate()?;
+        let now = current_unix_secs() as i64;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let provider_id: Option<String> =
+            sqlx::query_scalar("SELECT provider_id FROM models WHERE id = ?")
+                .bind(&record.model_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?;
+        let Some(provider_id) = provider_id else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        };
+        validate_mysql_endpoint_ownership(
+            &mut tx,
+            &provider_id,
+            std::slice::from_ref(&record.endpoint_id),
+        )
+        .await?;
+        sqlx::query(
+            r#"
+INSERT INTO model_endpoint_bindings (
+  model_id, endpoint_id, source, is_active, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  source = VALUES(source),
+  is_active = VALUES(is_active),
+  updated_at = VALUES(updated_at)
+            "#,
+        )
+        .bind(&record.model_id)
+        .bind(&record.endpoint_id)
+        .bind(&record.source)
+        .bind(record.is_active)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        tx.commit().await.map_sql_err()?;
+        Ok(self
+            .list_model_endpoint_bindings(std::slice::from_ref(&record.model_id))
+            .await?
+            .into_iter()
+            .find(|binding| binding.endpoint_id == record.endpoint_id))
+    }
+}
+
+fn normalized_endpoint_ids(endpoint_ids: &[String]) -> Vec<String> {
+    let mut endpoint_ids = endpoint_ids
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    endpoint_ids.sort_unstable();
+    endpoint_ids.dedup();
+    endpoint_ids
+}
+
+fn validate_model_endpoint_binding_source(source: &str) -> Result<(), DataLayerError> {
+    UpsertModelEndpointBindingRecord::new(
+        "validation-model".to_string(),
+        "validation-endpoint".to_string(),
+        source.to_string(),
+        true,
+    )
+    .map(|_| ())
+}
+
+async fn lock_mysql_global_model_if_present(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    global_model_id: &str,
+) -> Result<bool, DataLayerError> {
+    Ok(sqlx::query_scalar::<MySql, String>(
+        "SELECT id FROM global_models WHERE id = ? LIMIT 1 FOR UPDATE",
+    )
+    .bind(global_model_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_sql_err()?
+    .is_some())
+}
+
+async fn lock_mysql_global_model(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    global_model_id: &str,
+) -> Result<(), DataLayerError> {
+    if lock_mysql_global_model_if_present(tx, global_model_id).await? {
+        return Ok(());
+    }
+    Err(DataLayerError::UnexpectedValue(
+        "global model not found".to_string(),
+    ))
+}
+
+async fn validate_mysql_endpoint_ownership(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    provider_id: &str,
+    endpoint_ids: &[String],
+) -> Result<(), DataLayerError> {
+    let endpoint_ids = normalized_endpoint_ids(endpoint_ids);
+    if endpoint_ids.is_empty() {
+        return Ok(());
+    }
+    let mut builder = QueryBuilder::<MySql>::new(
+        "SELECT COUNT(*) AS count FROM provider_endpoints WHERE provider_id = ",
+    );
+    builder.push_bind(provider_id).push(" AND id IN (");
+    {
+        let mut separated = builder.separated(", ");
+        for endpoint_id in &endpoint_ids {
+            separated.push_bind(endpoint_id);
+        }
+    }
+    builder.push(")");
+    let count: i64 = builder
+        .build()
+        .fetch_one(&mut **tx)
+        .await
+        .map_sql_err()?
+        .try_get("count")
+        .map_sql_err()?;
+    if count != endpoint_ids.len() as i64 {
+        return Err(DataLayerError::UnexpectedValue(
+            "model endpoint binding belongs to another provider".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn map_model_endpoint_binding_row(
+    row: &MySqlRow,
+) -> Result<StoredModelEndpointBinding, DataLayerError> {
+    let created_at = row
+        .try_get::<i64, _>("created_at")
+        .map_sql_err()
+        .ok()
+        .and_then(|value| u64::try_from(value).ok());
+    let updated_at = row
+        .try_get::<i64, _>("updated_at")
+        .map_sql_err()
+        .ok()
+        .and_then(|value| u64::try_from(value).ok());
+    StoredModelEndpointBinding::new(
+        row.try_get("model_id").map_sql_err()?,
+        row.try_get("endpoint_id").map_sql_err()?,
+        row.try_get("source").map_sql_err()?,
+        row.try_get("is_active").map_sql_err()?,
+        created_at,
+        updated_at,
+    )
 }
 
 fn current_unix_secs() -> u64 {
@@ -1152,8 +1762,9 @@ mod tests {
 
     use aether_data_contracts::repository::global_models::{
         AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
-        GlobalModelReadRepository, PublicCatalogModelListQuery, PublicCatalogModelSearchQuery,
-        PublicGlobalModelQuery, UpsertAdminProviderModelRecord,
+        GlobalModelReadRepository, GlobalModelWriteRepository, PublicCatalogModelListQuery,
+        PublicCatalogModelSearchQuery, PublicGlobalModelQuery,
+        UpdateAdminProviderModelWithBindingsRecord, UpsertAdminProviderModelRecord,
     };
     use serde_json::json;
 
@@ -1299,6 +1910,19 @@ INSERT INTO providers (
             .await
             .expect("provider model should create")
             .expect("created provider model should return");
+
+        let same_second_update = UpdateAdminProviderModelWithBindingsRecord::new(
+            provider_model.clone(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("provider model atomic update should validate");
+        repository
+            .update_admin_provider_model_with_bindings(&same_second_update)
+            .await
+            .expect("unchanged provider model should update")
+            .expect("unchanged provider model should not be treated as missing");
 
         let public = repository
             .list_public_models(&PublicGlobalModelQuery {

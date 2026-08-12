@@ -933,6 +933,309 @@ pub struct UpsertAdminProviderModelRecord {
     pub config: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredModelEndpointBinding {
+    pub model_id: String,
+    pub endpoint_id: String,
+    pub source: String,
+    pub is_active: bool,
+    pub created_at_unix_secs: Option<u64>,
+    pub updated_at_unix_secs: Option<u64>,
+}
+
+impl StoredModelEndpointBinding {
+    pub fn new(
+        model_id: String,
+        endpoint_id: String,
+        source: String,
+        is_active: bool,
+        created_at_unix_secs: Option<u64>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<Self, crate::DataLayerError> {
+        let model_id = model_id.trim().to_string();
+        let endpoint_id = endpoint_id.trim().to_string();
+        let source = source.trim().to_string();
+        validate_model_endpoint_binding_fields(&model_id, &endpoint_id, &source)?;
+        Ok(Self {
+            model_id,
+            endpoint_id,
+            source,
+            is_active,
+            created_at_unix_secs,
+            updated_at_unix_secs,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UpsertModelEndpointBindingRecord {
+    pub model_id: String,
+    pub endpoint_id: String,
+    pub source: String,
+    pub is_active: bool,
+}
+
+fn validate_model_endpoint_binding_fields(
+    model_id: &str,
+    endpoint_id: &str,
+    source: &str,
+) -> Result<(), crate::DataLayerError> {
+    if model_id.trim().is_empty() || endpoint_id.trim().is_empty() {
+        return Err(crate::DataLayerError::UnexpectedValue(
+            "model endpoint binding identity is empty".to_string(),
+        ));
+    }
+    if model_id != model_id.trim() || endpoint_id != endpoint_id.trim() {
+        return Err(crate::DataLayerError::UnexpectedValue(
+            "model endpoint binding identity has surrounding whitespace".to_string(),
+        ));
+    }
+    if source.trim().is_empty() {
+        return Err(crate::DataLayerError::UnexpectedValue(
+            "model endpoint binding source is empty".to_string(),
+        ));
+    }
+    if source != source.trim() {
+        return Err(crate::DataLayerError::UnexpectedValue(
+            "model endpoint binding source has surrounding whitespace".to_string(),
+        ));
+    }
+    if source.chars().count() > 32 {
+        return Err(crate::DataLayerError::UnexpectedValue(
+            "model endpoint binding source exceeds 32 characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_model_endpoint_bindings(
+    model_id: &str,
+    bindings: &[UpsertModelEndpointBindingRecord],
+) -> Result<(), crate::DataLayerError> {
+    let mut endpoint_ids = std::collections::BTreeSet::new();
+    for binding in bindings {
+        binding.validate()?;
+        if binding.model_id != model_id {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "model endpoint binding belongs to another model".to_string(),
+            ));
+        }
+        if !endpoint_ids.insert(binding.endpoint_id.trim()) {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "duplicate model endpoint binding endpoint_id".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_model_endpoint_ids(endpoint_ids: &[String]) -> Result<(), crate::DataLayerError> {
+    let mut normalized_endpoint_ids = std::collections::BTreeSet::new();
+    for endpoint_id in endpoint_ids {
+        let endpoint_id = endpoint_id.trim();
+        if endpoint_id.is_empty() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "model endpoint binding endpoint_id is empty".to_string(),
+            ));
+        }
+        if !normalized_endpoint_ids.insert(endpoint_id) {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "duplicate model endpoint binding endpoint_id".to_string(),
+            ));
+        }
+    }
+    if endpoint_ids
+        .iter()
+        .any(|endpoint_id| endpoint_id != endpoint_id.trim())
+    {
+        return Err(crate::DataLayerError::UnexpectedValue(
+            "model endpoint binding endpoint_id has surrounding whitespace".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// 原子创建 Provider Model 及其初始 Endpoint 绑定。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CreateAdminProviderModelWithBindingsRecord {
+    pub model: UpsertAdminProviderModelRecord,
+    pub endpoint_ids: Vec<String>,
+    pub source: String,
+    pub replacement_bindings: Option<Vec<UpsertModelEndpointBindingRecord>>,
+}
+
+impl CreateAdminProviderModelWithBindingsRecord {
+    pub fn new(
+        model: UpsertAdminProviderModelRecord,
+        endpoint_ids: Vec<String>,
+        source: String,
+    ) -> Result<Self, crate::DataLayerError> {
+        let source = source.trim();
+        let endpoint_ids = endpoint_ids
+            .into_iter()
+            .map(|endpoint_id| endpoint_id.trim().to_string())
+            .filter(|endpoint_id| !endpoint_id.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let record = Self {
+            model,
+            endpoint_ids,
+            source: source.to_string(),
+            replacement_bindings: None,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn with_replacement_bindings(
+        mut self,
+        replacement_bindings: Vec<UpsertModelEndpointBindingRecord>,
+    ) -> Result<Self, crate::DataLayerError> {
+        self.replacement_bindings = Some(replacement_bindings);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), crate::DataLayerError> {
+        self.model.validate()?;
+        if self.source.trim().is_empty() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "model endpoint binding source is empty".to_string(),
+            ));
+        }
+        if self.source != self.source.trim() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "model endpoint binding source has surrounding whitespace".to_string(),
+            ));
+        }
+        if self.source.chars().count() > 32 {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "model endpoint binding source exceeds 32 characters".to_string(),
+            ));
+        }
+        if self.replacement_bindings.is_none() {
+            validate_model_endpoint_ids(&self.endpoint_ids)?;
+            if self.endpoint_ids.is_empty() {
+                return Err(crate::DataLayerError::UnexpectedValue(
+                    "provider model requires at least one endpoint binding".to_string(),
+                ));
+            }
+        }
+        if let Some(bindings) = &self.replacement_bindings {
+            validate_model_endpoint_bindings(&self.model.id, bindings)?;
+            if bindings.is_empty() {
+                return Err(crate::DataLayerError::UnexpectedValue(
+                    "provider model requires at least one endpoint binding".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 原子更新 Provider Model 以及由该 PATCH 产生的 Endpoint 绑定变化。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UpdateAdminProviderModelWithBindingsRecord {
+    pub model: UpsertAdminProviderModelRecord,
+    pub automatic_endpoint_ids: Option<Vec<String>>,
+    pub automatic_source: Option<String>,
+    pub manual_bindings: Vec<UpsertModelEndpointBindingRecord>,
+    pub replacement_bindings: Option<Vec<UpsertModelEndpointBindingRecord>>,
+}
+
+impl UpdateAdminProviderModelWithBindingsRecord {
+    pub fn new(
+        model: UpsertAdminProviderModelRecord,
+        automatic_endpoint_ids: Option<Vec<String>>,
+        automatic_source: Option<String>,
+        manual_bindings: Vec<UpsertModelEndpointBindingRecord>,
+    ) -> Result<Self, crate::DataLayerError> {
+        let record = Self {
+            model,
+            automatic_endpoint_ids,
+            automatic_source: automatic_source.map(|source| source.trim().to_string()),
+            manual_bindings,
+            replacement_bindings: None,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn with_replacement_bindings(
+        mut self,
+        replacement_bindings: Vec<UpsertModelEndpointBindingRecord>,
+    ) -> Result<Self, crate::DataLayerError> {
+        self.replacement_bindings = Some(replacement_bindings);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), crate::DataLayerError> {
+        self.model.validate()?;
+        if self.automatic_endpoint_ids.is_some() {
+            let Some(source) = self.automatic_source.as_deref() else {
+                return Err(crate::DataLayerError::UnexpectedValue(
+                    "automatic model endpoint binding source is empty".to_string(),
+                ));
+            };
+            if source.trim().is_empty() {
+                return Err(crate::DataLayerError::UnexpectedValue(
+                    "automatic model endpoint binding source is empty".to_string(),
+                ));
+            }
+            if source != source.trim() {
+                return Err(crate::DataLayerError::UnexpectedValue(
+                    "automatic model endpoint binding source has surrounding whitespace"
+                        .to_string(),
+                ));
+            }
+            if source.chars().count() > 32 {
+                return Err(crate::DataLayerError::UnexpectedValue(
+                    "automatic model endpoint binding source exceeds 32 characters".to_string(),
+                ));
+            }
+            validate_model_endpoint_ids(
+                self.automatic_endpoint_ids
+                    .as_deref()
+                    .expect("checked automatic endpoint ids"),
+            )?;
+        }
+        validate_model_endpoint_bindings(&self.model.id, &self.manual_bindings)?;
+        if let Some(bindings) = &self.replacement_bindings {
+            validate_model_endpoint_bindings(&self.model.id, bindings)?;
+            if bindings.is_empty() {
+                return Err(crate::DataLayerError::UnexpectedValue(
+                    "provider model replacement requires at least one endpoint binding".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl UpsertModelEndpointBindingRecord {
+    pub fn new(
+        model_id: String,
+        endpoint_id: String,
+        source: String,
+        is_active: bool,
+    ) -> Result<Self, crate::DataLayerError> {
+        let record = Self {
+            model_id: model_id.trim().to_string(),
+            endpoint_id: endpoint_id.trim().to_string(),
+            source: source.trim().to_string(),
+            is_active,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn validate(&self) -> Result<(), crate::DataLayerError> {
+        validate_model_endpoint_binding_fields(&self.model_id, &self.endpoint_id, &self.source)
+    }
+}
+
 impl UpsertAdminProviderModelRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -952,33 +1255,7 @@ impl UpsertAdminProviderModelRecord {
         is_available: bool,
         config: Option<Value>,
     ) -> Result<Self, crate::DataLayerError> {
-        if id.trim().is_empty() {
-            return Err(crate::DataLayerError::UnexpectedValue(
-                "models.id is empty".to_string(),
-            ));
-        }
-        if provider_id.trim().is_empty() {
-            return Err(crate::DataLayerError::UnexpectedValue(
-                "models.provider_id is empty".to_string(),
-            ));
-        }
-        if global_model_id.trim().is_empty() {
-            return Err(crate::DataLayerError::UnexpectedValue(
-                "models.global_model_id is empty".to_string(),
-            ));
-        }
-        if provider_model_name.trim().is_empty() {
-            return Err(crate::DataLayerError::UnexpectedValue(
-                "models.provider_model_name is empty".to_string(),
-            ));
-        }
-        validate_provider_model_pricing(price_per_request)?;
-        validate_processing_tier_price_multipliers(
-            "models.tiered_pricing",
-            tiered_pricing.as_ref(),
-        )?;
-
-        Ok(Self {
+        let record = Self {
             id,
             provider_id,
             global_model_id,
@@ -994,7 +1271,38 @@ impl UpsertAdminProviderModelRecord {
             is_active,
             is_available,
             config,
-        })
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn validate(&self) -> Result<(), crate::DataLayerError> {
+        if self.id.trim().is_empty() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "models.id is empty".to_string(),
+            ));
+        }
+        if self.provider_id.trim().is_empty() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "models.provider_id is empty".to_string(),
+            ));
+        }
+        if self.global_model_id.trim().is_empty() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "models.global_model_id is empty".to_string(),
+            ));
+        }
+        if self.provider_model_name.trim().is_empty() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "models.provider_model_name is empty".to_string(),
+            ));
+        }
+        validate_provider_model_pricing(self.price_per_request)?;
+        validate_processing_tier_price_multipliers(
+            "models.tiered_pricing",
+            self.tiered_pricing.as_ref(),
+        )?;
+        Ok(())
     }
 }
 
@@ -1255,6 +1563,11 @@ pub trait GlobalModelReadRepository: Send + Sync {
         &self,
         provider_ids: &[String],
     ) -> Result<Vec<StoredProviderActiveGlobalModel>, crate::DataLayerError>;
+
+    async fn list_model_endpoint_bindings(
+        &self,
+        model_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, crate::DataLayerError>;
 }
 
 #[async_trait]
@@ -1264,9 +1577,19 @@ pub trait GlobalModelWriteRepository: Send + Sync {
         record: &UpsertAdminProviderModelRecord,
     ) -> Result<Option<StoredAdminProviderModel>, crate::DataLayerError>;
 
+    async fn create_admin_provider_model_with_bindings(
+        &self,
+        record: &CreateAdminProviderModelWithBindingsRecord,
+    ) -> Result<Option<StoredAdminProviderModel>, crate::DataLayerError>;
+
     async fn update_admin_provider_model(
         &self,
         record: &UpsertAdminProviderModelRecord,
+    ) -> Result<Option<StoredAdminProviderModel>, crate::DataLayerError>;
+
+    async fn update_admin_provider_model_with_bindings(
+        &self,
+        record: &UpdateAdminProviderModelWithBindingsRecord,
     ) -> Result<Option<StoredAdminProviderModel>, crate::DataLayerError>;
 
     async fn delete_admin_provider_model(
@@ -1289,6 +1612,30 @@ pub trait GlobalModelWriteRepository: Send + Sync {
         &self,
         global_model_id: &str,
     ) -> Result<bool, crate::DataLayerError>;
+
+    /// 仅当 GlobalModel 尚未被任何 Provider Model 引用时删除。
+    /// 用于多步创建失败后的并发安全补偿，不得级联删除已被其他请求采用的模型。
+    async fn delete_unreferenced_admin_global_model(
+        &self,
+        global_model_id: &str,
+    ) -> Result<bool, crate::DataLayerError>;
+
+    /// 同步自动发现的绑定；人工记录不会被该操作覆盖。
+    /// `replace_automatic` 为 false 时仅新增或刷新自动记录；为 true 时只清理
+    /// `replacement_scope_endpoint_ids` 范围内未被本轮保留的自动记录。
+    async fn sync_model_endpoint_bindings(
+        &self,
+        model_id: &str,
+        endpoint_ids: &[String],
+        source: &str,
+        replace_automatic: bool,
+        replacement_scope_endpoint_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, crate::DataLayerError>;
+
+    async fn upsert_model_endpoint_binding(
+        &self,
+        record: &UpsertModelEndpointBindingRecord,
+    ) -> Result<Option<StoredModelEndpointBinding>, crate::DataLayerError>;
 }
 
 #[cfg(test)]
@@ -1296,9 +1643,219 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        explicit_pricing_catalog_state, CreateAdminGlobalModelRecord, ExplicitPricingCatalogState,
-        UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+        explicit_pricing_catalog_state, CreateAdminGlobalModelRecord,
+        CreateAdminProviderModelWithBindingsRecord, ExplicitPricingCatalogState,
+        UpdateAdminGlobalModelRecord, UpdateAdminProviderModelWithBindingsRecord,
+        UpsertAdminProviderModelRecord, UpsertModelEndpointBindingRecord,
     };
+
+    fn sample_provider_model_record() -> UpsertAdminProviderModelRecord {
+        UpsertAdminProviderModelRecord::new(
+            "model-1".to_string(),
+            "provider-1".to_string(),
+            "global-model-1".to_string(),
+            "provider-model-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .expect("provider model should build")
+    }
+
+    #[test]
+    fn replacement_bindings_reject_duplicate_endpoint_ids() {
+        let binding = UpsertModelEndpointBindingRecord::new(
+            "model-1".to_string(),
+            "endpoint-1".to_string(),
+            "mapping".to_string(),
+            true,
+        )
+        .expect("binding should build");
+
+        let err = CreateAdminProviderModelWithBindingsRecord::new(
+            sample_provider_model_record(),
+            vec!["endpoint-1".to_string()],
+            "mapping".to_string(),
+        )
+        .and_then(|record| record.with_replacement_bindings(vec![binding.clone(), binding]))
+        .expect_err("duplicate endpoint bindings should be rejected before persistence");
+
+        assert!(err
+            .to_string()
+            .contains("duplicate model endpoint binding endpoint_id"));
+    }
+
+    #[test]
+    fn atomic_provider_model_mutations_reject_empty_binding_sets() {
+        let create_err = CreateAdminProviderModelWithBindingsRecord::new(
+            sample_provider_model_record(),
+            Vec::new(),
+            "manual".to_string(),
+        )
+        .expect_err("provider model creation requires an endpoint binding");
+        assert!(create_err
+            .to_string()
+            .contains("requires at least one endpoint binding"));
+
+        let binding = UpsertModelEndpointBindingRecord::new(
+            "model-1".to_string(),
+            "endpoint-1".to_string(),
+            "manual".to_string(),
+            true,
+        )
+        .expect("binding should build");
+        let create_replacement_err = CreateAdminProviderModelWithBindingsRecord::new(
+            sample_provider_model_record(),
+            vec!["endpoint-1".to_string()],
+            "manual".to_string(),
+        )
+        .and_then(|record| record.with_replacement_bindings(Vec::new()))
+        .expect_err("empty replacement bindings must not bypass create validation");
+        assert!(create_replacement_err
+            .to_string()
+            .contains("requires at least one endpoint binding"));
+
+        let update_replacement_err = UpdateAdminProviderModelWithBindingsRecord::new(
+            sample_provider_model_record(),
+            None,
+            None,
+            vec![binding],
+        )
+        .and_then(|record| record.with_replacement_bindings(Vec::new()))
+        .expect_err("overwrite must not clear every endpoint binding");
+        assert!(update_replacement_err
+            .to_string()
+            .contains("replacement requires at least one endpoint binding"));
+    }
+
+    #[test]
+    fn update_bindings_reject_invalid_manual_records() {
+        let duplicate = UpsertModelEndpointBindingRecord::new(
+            "model-1".to_string(),
+            "endpoint-1".to_string(),
+            "manual".to_string(),
+            true,
+        )
+        .expect("binding should build");
+        let err = UpdateAdminProviderModelWithBindingsRecord::new(
+            sample_provider_model_record(),
+            None,
+            None,
+            vec![duplicate.clone(), duplicate],
+        )
+        .expect_err("duplicate manual endpoint bindings should be rejected");
+        assert!(err
+            .to_string()
+            .contains("duplicate model endpoint binding endpoint_id"));
+
+        let err = UpdateAdminProviderModelWithBindingsRecord::new(
+            sample_provider_model_record(),
+            None,
+            None,
+            vec![UpsertModelEndpointBindingRecord {
+                model_id: "model-1".to_string(),
+                endpoint_id: "endpoint-1".to_string(),
+                source: String::new(),
+                is_active: true,
+            }],
+        )
+        .expect_err("public binding fields must not bypass validation");
+        assert!(err
+            .to_string()
+            .contains("model endpoint binding source is empty"));
+    }
+
+    #[test]
+    fn binding_source_respects_schema_length() {
+        let err = UpsertModelEndpointBindingRecord::new(
+            "model-1".to_string(),
+            "endpoint-1".to_string(),
+            "x".repeat(33),
+            true,
+        )
+        .expect_err("binding source longer than the schema must be rejected");
+        assert!(err
+            .to_string()
+            .contains("model endpoint binding source exceeds 32 characters"));
+    }
+
+    #[test]
+    fn atomic_mutation_validation_rechecks_public_model_and_endpoint_fields() {
+        let mut invalid_model = sample_provider_model_record();
+        invalid_model.id.clear();
+        let create = CreateAdminProviderModelWithBindingsRecord {
+            model: invalid_model,
+            endpoint_ids: vec!["endpoint-1".to_string()],
+            source: "manual".to_string(),
+            replacement_bindings: None,
+        };
+        assert!(create
+            .validate()
+            .expect_err("public model fields must be revalidated")
+            .to_string()
+            .contains("models.id is empty"));
+
+        let update = UpdateAdminProviderModelWithBindingsRecord {
+            model: sample_provider_model_record(),
+            automatic_endpoint_ids: Some(vec![String::new()]),
+            automatic_source: Some("discovered".to_string()),
+            manual_bindings: Vec::new(),
+            replacement_bindings: None,
+        };
+        assert!(update
+            .validate()
+            .expect_err("empty automatic endpoint ids must be rejected")
+            .to_string()
+            .contains("model endpoint binding endpoint_id is empty"));
+
+        let create = CreateAdminProviderModelWithBindingsRecord {
+            model: sample_provider_model_record(),
+            endpoint_ids: vec!["endpoint-1".to_string(), "endpoint-1".to_string()],
+            source: "manual".to_string(),
+            replacement_bindings: None,
+        };
+        assert!(create
+            .validate()
+            .expect_err("duplicate create endpoint ids must be rejected")
+            .to_string()
+            .contains("duplicate model endpoint binding endpoint_id"));
+
+        let create = CreateAdminProviderModelWithBindingsRecord {
+            model: sample_provider_model_record(),
+            endpoint_ids: vec![" endpoint-1 ".to_string()],
+            source: "manual".to_string(),
+            replacement_bindings: None,
+        };
+        assert!(create
+            .validate()
+            .expect_err("non-canonical endpoint ids must be rejected")
+            .to_string()
+            .contains("endpoint_id has surrounding whitespace"));
+
+        let update = UpdateAdminProviderModelWithBindingsRecord {
+            model: sample_provider_model_record(),
+            automatic_endpoint_ids: Some(vec![
+                "endpoint-1".to_string(),
+                " endpoint-1 ".to_string(),
+            ]),
+            automatic_source: Some("discovered".to_string()),
+            manual_bindings: Vec::new(),
+            replacement_bindings: None,
+        };
+        assert!(update
+            .validate()
+            .expect_err("duplicate automatic endpoint ids must be rejected")
+            .to_string()
+            .contains("duplicate model endpoint binding endpoint_id"));
+    }
 
     #[test]
     fn embedding_missing_billing_config_rejected() {

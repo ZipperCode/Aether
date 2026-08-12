@@ -243,7 +243,8 @@ async fn gateway_model_fetch_updates_key_and_syncs_provider_model_whitelist_asso
                 "gpt-4.1",
                 "gpt-4.1",
                 &["gpt-4\\.1"],
-            )]),
+            )])
+            .with_endpoint_provider_ids([("endpoint-openai", "provider-openai")]),
     );
     let data_state = crate::data::GatewayDataState::disabled()
         .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))
@@ -460,7 +461,8 @@ async fn gateway_model_fetch_updates_key_and_syncs_provider_model_whitelist_asso
                 "gpt-4.1",
                 "gpt-4.1",
                 &["gpt-4\\.1"],
-            )]),
+            )])
+            .with_endpoint_provider_ids([("endpoint-openai", "provider-openai")]),
     );
     let data_state = crate::data::GatewayDataState::disabled()
         .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))
@@ -567,7 +569,8 @@ async fn gateway_background_model_fetch_updates_key_and_syncs_provider_model_whi
                 "gpt-4.1",
                 "gpt-4.1",
                 &["gpt-4\\.1"],
-            )]),
+            )])
+            .with_endpoint_provider_ids([("endpoint-openai", "provider-openai")]),
     );
     let data_state = crate::data::GatewayDataState::disabled()
         .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))

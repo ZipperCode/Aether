@@ -259,6 +259,8 @@ pub(crate) struct AdminProviderModelCreateRequest {
     pub(crate) provider_model_name: String,
     #[serde(default)]
     pub(crate) provider_model_mappings: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) endpoint_ids: Option<Vec<String>>,
     pub(crate) global_model_id: String,
     #[serde(
         default,
@@ -314,6 +316,14 @@ pub(crate) struct AdminProviderModelUpdateRequest {
     pub(crate) is_available: Option<bool>,
     #[serde(default)]
     pub(crate) config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) endpoint_bindings: Option<Vec<AdminModelEndpointBindingRequest>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct AdminModelEndpointBindingRequest {
+    pub(crate) endpoint_id: String,
+    pub(crate) is_active: bool,
 }
 
 pub(crate) type AdminProviderModelUpdatePatch =
@@ -326,7 +336,10 @@ pub(crate) struct AdminBatchAssignGlobalModelsRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AdminImportProviderModelsRequest {
+    #[serde(default)]
     pub(crate) model_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) models: Vec<AdminImportProviderModelSource>,
     #[serde(default)]
     pub(crate) tiered_pricing: Option<serde_json::Value>,
     #[serde(
@@ -334,4 +347,13 @@ pub(crate) struct AdminImportProviderModelsRequest {
         deserialize_with = "deserialize_optional_f64_from_number_or_string"
     )]
     pub(crate) price_per_request: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct AdminImportProviderModelSource {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) api_formats: Vec<String>,
+    #[serde(default)]
+    pub(crate) endpoint_ids: Vec<String>,
 }

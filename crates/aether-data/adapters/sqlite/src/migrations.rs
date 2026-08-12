@@ -110,6 +110,132 @@ mod tests {
             .is_empty());
     }
 
+    #[tokio::test]
+    async fn model_endpoint_binding_migration_is_evidence_driven() {
+        const MIGRATION_VERSION: i64 = 20260811000000;
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version < MIGRATION_VERSION)
+        {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|err| panic!("migration {} should run: {err}", migration.version));
+        }
+
+        sqlx::raw_sql(
+            r#"
+INSERT INTO providers (
+  id, name, provider_type, created_at, updated_at
+) VALUES
+  ('provider-multi', 'Provider Multi', 'custom', 1, 1),
+  ('provider-single', 'Provider Single', 'custom', 1, 1);
+
+INSERT INTO provider_endpoints (
+  id, provider_id, name, base_url, api_format, created_at, updated_at
+) VALUES
+  ('endpoint-chat', 'provider-multi', 'Chat', 'https://chat.example', 'openai:chat', 1, 1),
+  ('endpoint-messages', 'provider-multi', 'Messages', 'https://messages.example', 'claude:messages', 1, 1),
+  ('endpoint-single', 'provider-single', 'Single', 'https://single.example', 'openai:chat', 1, 1);
+
+INSERT INTO models (
+  id, provider_id, provider_model_name, api_format, provider_model_mappings,
+  created_at, updated_at
+) VALUES
+  ('model-explicit', 'provider-multi', 'explicit', NULL,
+   '[{"name":"explicit","endpoint_ids":["endpoint-messages"]}]', 1, 1),
+  ('model-mapping-format', 'provider-multi', 'mapping-format', NULL,
+   '[{"name":"mapping-format","api_formats":["claude:messages"]}]', 1, 1),
+  ('model-legacy-format', 'provider-multi', 'legacy-format', 'openai:chat', NULL, 1, 1),
+  ('model-unknown-multi', 'provider-multi', 'unknown-multi', NULL, NULL, 1, 1),
+  ('model-unknown-single', 'provider-single', 'unknown-single', NULL, NULL, 1, 1),
+  ('model-string-mapping', 'provider-single', 'string-mapping', NULL, '["alias"]', 1, 1),
+  ('model-invalid-json', 'provider-multi', 'invalid-json', NULL, 'not-json', 1, 1);
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy model fixtures should insert");
+
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == MIGRATION_VERSION)
+            .expect("model endpoint binding migration should be embedded");
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&pool)
+            .await
+            .expect("model endpoint binding migration should run");
+
+        let bindings = sqlx::query_as::<_, (String, String, String)>(
+            r#"
+SELECT model_id, endpoint_id, source
+FROM model_endpoint_bindings
+ORDER BY model_id, endpoint_id
+"#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("model endpoint bindings should load");
+
+        assert_eq!(
+            bindings,
+            vec![
+                (
+                    "model-explicit".to_string(),
+                    "endpoint-messages".to_string(),
+                    "mapping".to_string(),
+                ),
+                (
+                    "model-invalid-json".to_string(),
+                    "endpoint-chat".to_string(),
+                    "migration".to_string(),
+                ),
+                (
+                    "model-invalid-json".to_string(),
+                    "endpoint-messages".to_string(),
+                    "migration".to_string(),
+                ),
+                (
+                    "model-legacy-format".to_string(),
+                    "endpoint-chat".to_string(),
+                    "migration".to_string(),
+                ),
+                (
+                    "model-mapping-format".to_string(),
+                    "endpoint-messages".to_string(),
+                    "mapping".to_string(),
+                ),
+                (
+                    "model-string-mapping".to_string(),
+                    "endpoint-single".to_string(),
+                    "migration".to_string(),
+                ),
+                (
+                    "model-unknown-multi".to_string(),
+                    "endpoint-chat".to_string(),
+                    "migration".to_string(),
+                ),
+                (
+                    "model-unknown-multi".to_string(),
+                    "endpoint-messages".to_string(),
+                    "migration".to_string(),
+                ),
+                (
+                    "model-unknown-single".to_string(),
+                    "endpoint-single".to_string(),
+                    "migration".to_string(),
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn rejects_applied_migration_versions_unknown_to_this_binary() {
         let version = MIGRATOR

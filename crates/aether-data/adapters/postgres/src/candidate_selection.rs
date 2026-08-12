@@ -137,6 +137,10 @@ INNER JOIN LATERAL (
 ) pak ON TRUE
 INNER JOIN models m
   ON m.provider_id = p.id
+INNER JOIN model_endpoint_bindings meb
+  ON meb.model_id = m.id
+ AND meb.endpoint_id = pe.id
+ AND meb.is_active IS TRUE
 INNER JOIN global_models gm
   ON gm.id = m.global_model_id
 WHERE p.is_active = TRUE
@@ -400,6 +404,10 @@ INNER JOIN LATERAL (
 ) pak ON TRUE
 INNER JOIN models m
   ON m.provider_id = p.id
+INNER JOIN model_endpoint_bindings meb
+  ON meb.model_id = m.id
+ AND meb.endpoint_id = pe.id
+ AND meb.is_active IS TRUE
 INNER JOIN global_models gm
   ON gm.id = m.global_model_id
 WHERE p.is_active = TRUE
@@ -584,6 +592,10 @@ INNER JOIN provider_api_keys pak
   ON pak.provider_id = p.id
 INNER JOIN models m
   ON m.provider_id = p.id
+INNER JOIN model_endpoint_bindings meb
+  ON meb.model_id = m.id
+ AND meb.endpoint_id = pe.id
+ AND meb.is_active IS TRUE
 INNER JOIN global_models gm
   ON gm.id = m.global_model_id
 WHERE p.is_active = TRUE
@@ -1549,6 +1561,18 @@ mod tests {
         assert!(!LIST_POOL_KEYS_FOR_GROUP_SQL.contains("INNER JOIN LATERAL"));
         assert!(LIST_POOL_KEYS_FOR_GROUP_SQL.contains("AND pak.is_active IS TRUE"));
         assert!(!LIST_POOL_KEYS_FOR_GROUP_SQL.contains("AND pak.is_active = TRUE"));
+    }
+
+    #[test]
+    fn every_postgres_candidate_query_requires_an_active_model_endpoint_binding() {
+        for sql in [
+            LIST_FOR_EXACT_API_FORMAT_SQL,
+            LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL,
+            LIST_POOL_KEYS_FOR_GROUP_SQL,
+        ] {
+            assert!(sql.contains("INNER JOIN model_endpoint_bindings meb"));
+            assert!(sql.contains("AND meb.is_active IS TRUE"));
+        }
     }
 
     #[test]

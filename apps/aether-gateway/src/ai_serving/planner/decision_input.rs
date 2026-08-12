@@ -59,6 +59,9 @@ pub(crate) struct LocalRequestedModelDecisionInput {
     pub(crate) routing_trace_seed: Option<RoutingDecisionTrace>,
     pub(crate) routing_context: Option<LocalRoutingRequestContext>,
     pub(crate) model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot,
+    pub(crate) endpoint_capability_client_api_format: Option<String>,
+    pub(crate) endpoint_capability_require_streaming: bool,
+    pub(crate) endpoint_capability_request_operation: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +96,52 @@ impl LocalRequestedModelDecisionInput {
             .as_ref()
             .map(|context| &context.effective_headers)
             .unwrap_or(fallback)
+    }
+
+    pub(crate) fn set_endpoint_capability_context(
+        &mut self,
+        client_api_format: &str,
+        require_streaming: bool,
+        request_operation: Option<&str>,
+    ) {
+        self.endpoint_capability_client_api_format = Some(client_api_format.to_string());
+        self.endpoint_capability_require_streaming = require_streaming;
+        self.endpoint_capability_request_operation = request_operation.map(ToOwned::to_owned);
+    }
+
+    pub(crate) fn set_endpoint_capability_request_mode(&mut self, require_streaming: bool) {
+        self.endpoint_capability_require_streaming = require_streaming;
+    }
+
+    pub(crate) fn set_endpoint_capability_request_operation(
+        &mut self,
+        request_operation: Option<&str>,
+    ) {
+        self.endpoint_capability_request_operation = request_operation.map(ToOwned::to_owned);
+    }
+
+    pub(crate) fn quarantine_endpoint_capability(
+        &self,
+        state: &AppState,
+        candidate: &aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate,
+        skip_reason: &str,
+    ) -> bool {
+        if !crate::ai_serving::planner::candidate_materialization::is_static_endpoint_capability_skip_reason(
+            skip_reason,
+        ) {
+            return false;
+        }
+        let Some(client_api_format) = self.endpoint_capability_client_api_format.as_deref() else {
+            return false;
+        };
+        state.quarantine_endpoint_capability(
+            &candidate.model_id,
+            &candidate.endpoint_id,
+            &candidate.key_id,
+            client_api_format,
+            self.endpoint_capability_require_streaming,
+            self.endpoint_capability_request_operation.as_deref(),
+        )
     }
 }
 
@@ -387,6 +436,9 @@ pub(crate) fn build_local_requested_model_decision_input(
         routing_trace_seed: None,
         routing_context: None,
         model_directive_policy: resolved_input.model_directive_policy,
+        endpoint_capability_client_api_format: None,
+        endpoint_capability_require_streaming: false,
+        endpoint_capability_request_operation: None,
     }
 }
 
@@ -1145,55 +1197,51 @@ mod tests {
     }
 
     fn sample_decision_input() -> LocalRequestedModelDecisionInput {
-        LocalRequestedModelDecisionInput {
+        let resolved_input = ResolvedLocalDecisionAuthInput {
             auth_context: sample_auth_context(),
-            requested_model: "gpt-5".to_string(),
             auth_snapshot: sample_auth_snapshot(),
             required_capabilities: None,
-            request_auth_channel: None,
-            client_surface: None,
-            gateway_credential_carrier: None,
-            client_session_affinity: None,
-            routing_policy: None,
-            routing_trace_seed: None,
             model_directive_policy: Default::default(),
-            routing_context: Some(LocalRoutingRequestContext {
-                group_id: Some("group-1".to_string()),
-                group_version: Some(3),
-                selection_source: "explicit_header".to_string(),
-                client_api_format: "openai:chat".to_string(),
-                effective_body_json: json!({"model":"gpt-5"}),
-                effective_headers: HeaderMap::new(),
-                group_config_json: json!({
-                    "allowed_models": ["gpt-5"],
-                    "rules": [{
-                        "id": "provider-patch",
-                        "priority": 1,
-                        "enabled": true,
-                        "phase": "provider_request",
-                        "conditions": {},
-                        "actions": [
-                            {
-                                "type": "json_patch_body",
-                                "patch": [{
-                                    "op": "add",
-                                    "path": "/metadata/routing",
-                                    "value": "provider"
-                                }]
-                            },
-                            {
-                                "type": "patch_headers",
-                                "patch": [{
-                                    "op": "set",
-                                    "name": "x-provider-route",
-                                    "value": "provider"
-                                }]
-                            }
-                        ]
-                    }]
-                }),
+        };
+        let mut input =
+            build_local_requested_model_decision_input(resolved_input, "gpt-5".to_string());
+        input.routing_context = Some(LocalRoutingRequestContext {
+            group_id: Some("group-1".to_string()),
+            group_version: Some(3),
+            selection_source: "explicit_header".to_string(),
+            client_api_format: "openai:chat".to_string(),
+            effective_body_json: json!({"model":"gpt-5"}),
+            effective_headers: HeaderMap::new(),
+            group_config_json: json!({
+                "allowed_models": ["gpt-5"],
+                "rules": [{
+                    "id": "provider-patch",
+                    "priority": 1,
+                    "enabled": true,
+                    "phase": "provider_request",
+                    "conditions": {},
+                    "actions": [
+                        {
+                            "type": "json_patch_body",
+                            "patch": [{
+                                "op": "add",
+                                "path": "/metadata/routing",
+                                "value": "provider"
+                            }]
+                        },
+                        {
+                            "type": "patch_headers",
+                            "patch": [{
+                                "op": "set",
+                                "name": "x-provider-route",
+                                "value": "provider"
+                            }]
+                        }
+                    ]
+                }]
             }),
-        }
+        });
+        input
     }
 
     fn sample_decision() -> AiExecutionDecision {
@@ -1243,6 +1291,79 @@ mod tests {
             })),
             auth_context: Some(sample_auth_context()),
         }
+    }
+
+    #[test]
+    fn endpoint_capability_quarantine_only_accepts_static_endpoint_failures() {
+        let app = AppState::new().expect("state should build");
+        let mut input = sample_decision_input();
+        input.set_endpoint_capability_context("openai:responses:compact", false, Some("compact"));
+        let candidate = aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate {
+            provider_id: "provider-1".to_string(),
+            provider_name: "provider-1".to_string(),
+            provider_type: "openai".to_string(),
+            provider_priority: 0,
+            endpoint_id: "endpoint-1".to_string(),
+            endpoint_api_format: "openai:responses".to_string(),
+            key_id: "key-1".to_string(),
+            key_name: "key-1".to_string(),
+            key_auth_type: "api_key".to_string(),
+            key_internal_priority: 0,
+            key_global_priority_for_format: None,
+            key_capabilities: None,
+            model_id: "model-1".to_string(),
+            global_model_id: "global-model-1".to_string(),
+            global_model_name: "gpt-5".to_string(),
+            selected_provider_model_name: "gpt-5".to_string(),
+            supports_streaming: true,
+            mapping_matched_model: None,
+        };
+
+        assert!(!input.quarantine_endpoint_capability(
+            &app,
+            &candidate,
+            "transport_auth_unavailable"
+        ));
+        assert!(!input.quarantine_endpoint_capability(
+            &app,
+            &candidate,
+            "provider_request_body_build_failed"
+        ));
+        assert!(app.endpoint_capability_quarantine_snapshot().is_empty());
+
+        assert!(input.quarantine_endpoint_capability(&app, &candidate, "upstream_url_missing"));
+        assert!(app.endpoint_capability_is_quarantined(
+            "model-1",
+            "endpoint-1",
+            "key-1",
+            "openai:responses:compact",
+            false,
+            Some("compact"),
+        ));
+        assert!(!app.endpoint_capability_is_quarantined(
+            "model-1",
+            "endpoint-1",
+            "key-1",
+            "openai:responses",
+            false,
+            Some("compact"),
+        ));
+        assert!(!app.endpoint_capability_is_quarantined(
+            "model-1",
+            "endpoint-1",
+            "key-1",
+            "openai:responses:compact",
+            true,
+            Some("compact"),
+        ));
+        assert!(!app.endpoint_capability_is_quarantined(
+            "model-1",
+            "endpoint-1",
+            "key-1",
+            "openai:responses:compact",
+            false,
+            Some("create"),
+        ));
     }
 
     fn sample_codex_transport_with_card() -> GatewayProviderTransportSnapshot {
@@ -1342,28 +1463,23 @@ mod tests {
             .body(())
             .expect("request should build");
         let (parts, _) = request.into_parts();
-        let mut input = LocalRequestedModelDecisionInput {
+        let resolved_input = ResolvedLocalDecisionAuthInput {
             auth_context: sample_auth_context(),
-            requested_model: "mock-model".to_string(),
             auth_snapshot: sample_auth_snapshot(),
             required_capabilities: None,
-            request_auth_channel: None,
-            client_surface: None,
-            gateway_credential_carrier: None,
-            client_session_affinity: None,
-            routing_policy: None,
-            routing_trace_seed: None,
             model_directive_policy: Default::default(),
-            routing_context: Some(LocalRoutingRequestContext {
-                group_id: Some("stale".to_string()),
-                group_version: Some(1),
-                group_config_json: json!({}),
-                selection_source: "stale".to_string(),
-                client_api_format: "openai:chat".to_string(),
-                effective_body_json: json!({}),
-                effective_headers: HeaderMap::new(),
-            }),
         };
+        let mut input =
+            build_local_requested_model_decision_input(resolved_input, "mock-model".to_string());
+        input.routing_context = Some(LocalRoutingRequestContext {
+            group_id: Some("stale".to_string()),
+            group_version: Some(1),
+            group_config_json: json!({}),
+            selection_source: "stale".to_string(),
+            client_api_format: "openai:chat".to_string(),
+            effective_body_json: json!({}),
+            effective_headers: HeaderMap::new(),
+        });
         let group_config_json = json!({
             "default_policy": {
                 "priority_mode": "global_key",
@@ -1411,20 +1527,14 @@ mod tests {
             .body(())
             .expect("request should build");
         let (parts, _) = request.into_parts();
-        let mut input = LocalRequestedModelDecisionInput {
+        let resolved_input = ResolvedLocalDecisionAuthInput {
             auth_context: sample_auth_context(),
-            requested_model: "mock-model".to_string(),
             auth_snapshot: sample_auth_snapshot(),
             required_capabilities: None,
-            request_auth_channel: None,
-            client_surface: None,
-            gateway_credential_carrier: None,
-            client_session_affinity: None,
-            routing_policy: None,
-            routing_trace_seed: None,
-            routing_context: None,
             model_directive_policy: Default::default(),
         };
+        let mut input =
+            build_local_requested_model_decision_input(resolved_input, "mock-model".to_string());
         let group_config_json = json!({
             "rules": [{
                 "id": "rule-1",

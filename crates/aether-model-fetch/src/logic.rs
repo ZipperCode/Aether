@@ -618,6 +618,22 @@ pub fn aggregate_models_for_cache(models: &[Value]) -> Vec<Value> {
             .collect::<Vec<_>>();
         entry.insert("api_formats".to_string(), Value::Array(merged_formats));
 
+        let existing_endpoint_ids = json_string_list(entry.get("endpoint_ids"));
+        let endpoint_ids = json_string_list(object.get("endpoint_ids"));
+        let merged_endpoint_ids = existing_endpoint_ids
+            .into_iter()
+            .chain(endpoint_ids)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(Value::String)
+            .collect::<Vec<_>>();
+        if !merged_endpoint_ids.is_empty() {
+            entry.insert(
+                "endpoint_ids".to_string(),
+                Value::Array(merged_endpoint_ids),
+            );
+        }
+
         for (key, value) in object {
             if key == "api_format" || entry.contains_key(key) {
                 continue;
@@ -997,6 +1013,16 @@ mod tests {
         assert_eq!(aggregated.len(), 1);
         assert_eq!(aggregated[0]["api_formats"], json!(["openai:chat"]));
         assert!(aggregated[0].get("api_format").is_none());
+    }
+
+    #[test]
+    fn aggregate_models_for_cache_merges_endpoint_sources() {
+        let aggregated = aggregate_models_for_cache(&[
+            json!({"id":"claude-opus","api_formats":["claude:messages"],"endpoint_ids":["messages"]}),
+            json!({"id":"claude-opus","api_formats":["openai:chat"],"endpoint_ids":["openai"]}),
+            json!({"id":"claude-opus","endpoint_ids":["messages"]}),
+        ]);
+        assert_eq!(aggregated[0]["endpoint_ids"], json!(["messages", "openai"]));
     }
 
     #[test]

@@ -37,6 +37,16 @@ export interface RoutingEndpointInfo {
     reject_formats?: string[] | null
   } | null
   is_active: boolean
+  model_binding?: {
+    source: 'discovered' | 'mapping' | 'migration' | 'manual' | string
+    is_active: boolean
+  } | null
+  runtime_capability_quarantines?: Array<{
+    key_id: string
+    client_api_format: string
+    request_mode: 'sync' | 'stream' | string
+    request_operation?: string | null
+  }>
   keys: RoutingKeyInfo[]
   total_keys: number
   active_keys: number
@@ -68,6 +78,7 @@ export interface RoutingProviderInfo {
   provider_model_name: string
   model_mappings: RoutingModelMapping[]
   model_is_active: boolean
+  model_is_available: boolean
   endpoints: RoutingEndpointInfo[]
   total_endpoints: number
   active_endpoints: number

@@ -8,6 +8,7 @@ use crate::handlers::admin::provider::shared::payloads::{
     AdminProviderCreateRequest, AdminProviderKeyCreateRequest, AdminProviderKeyUpdatePatch,
     AdminProviderUpdatePatch,
 };
+use crate::handlers::admin::request::models::stored_admin_provider_model_from_upsert;
 use crate::handlers::admin::shared::{
     normalize_json_array, normalize_json_object, normalize_string_list,
 };
@@ -32,7 +33,7 @@ use aether_admin::system::{
     AdminSystemConfigProvider as ImportedProvider,
     AdminSystemConfigProviderKey as ImportedProviderKey,
     AdminSystemConfigProviderModel as ImportedProviderModel,
-    AdminSystemConfigProxyNode as ImportedProxyNode,
+    AdminSystemConfigProxyNode as ImportedProxyNode, ADMIN_SYSTEM_CONFIG_EXPORT_VERSION,
     ADMIN_SYSTEM_PROVIDER_OPS_SENSITIVE_CREDENTIAL_FIELDS, ADMIN_SYSTEM_USERS_SUPPORTED_VERSIONS,
 };
 use aether_data::repository::auth_modules::StoredLdapModuleConfig;
@@ -46,7 +47,8 @@ use aether_data::repository::system::{
 use aether_data::repository::wallet::WalletLookupKey;
 use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
-    UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    UpdateAdminGlobalModelRecord, UpdateAdminProviderModelWithBindingsRecord,
+    UpsertAdminProviderModelRecord, UpsertModelEndpointBindingRecord,
 };
 use aether_data_contracts::repository::pool_scores::PoolMemberScoreUpsertMode;
 use axum::{body::Bytes, http};
@@ -594,6 +596,231 @@ fn build_import_provider_model_record(
         config,
     )
     .map_err(|err| err.to_string())
+}
+
+fn resolve_legacy_import_model_endpoint_formats(
+    item: &ImportedProviderModel,
+    provider_endpoint_formats: &BTreeSet<String>,
+    exported_endpoint_ids: &BTreeSet<String>,
+) -> Result<Option<BTreeMap<String, BTreeSet<String>>>, String> {
+    let Some(mappings) = item
+        .provider_model_mappings
+        .as_ref()
+        .and_then(Value::as_array)
+    else {
+        return Ok(None);
+    };
+    let mut resolved_by_endpoint_id = BTreeMap::new();
+    for mapping in mappings {
+        let endpoint_ids = mapping
+            .get("endpoint_ids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|endpoint_id| !endpoint_id.is_empty())
+            .filter(|endpoint_id| !exported_endpoint_ids.contains(*endpoint_id))
+            .collect::<BTreeSet<_>>();
+        if endpoint_ids.is_empty() {
+            continue;
+        }
+        let mapped_api_formats = mapping
+            .get("api_formats")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(normalize_import_endpoint_format)
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let resolved = if mapped_api_formats.is_empty() {
+            if provider_endpoint_formats.len() != 1 {
+                return Err(format!(
+                    "旧版配置中的模型 '{}' 使用了无法重映射的 endpoint_ids，且当前 Provider 有多个 Endpoint；请使用 2.4 配置重新导出，或在 provider_model_mappings.api_formats 中明确 Endpoint",
+                    item.provider_model_name.trim()
+                ));
+            }
+            provider_endpoint_formats.clone()
+        } else {
+            let resolved = mapped_api_formats
+                .intersection(provider_endpoint_formats)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if resolved.is_empty() {
+                return Err(format!(
+                    "旧版配置中的模型 '{}' 无法根据 provider_model_mappings.api_formats 匹配当前 Provider 的 Endpoint",
+                    item.provider_model_name.trim()
+                ));
+            }
+            resolved
+        };
+        for endpoint_id in endpoint_ids {
+            resolved_by_endpoint_id.insert(endpoint_id.to_string(), resolved.clone());
+        }
+    }
+    Ok((!resolved_by_endpoint_id.is_empty()).then_some(resolved_by_endpoint_id))
+}
+
+fn remap_import_provider_model_endpoint_ids(
+    mut record: UpsertAdminProviderModelRecord,
+    endpoint_id_map: &BTreeMap<String, String>,
+    legacy_endpoint_ids: Option<&BTreeMap<String, Vec<String>>>,
+) -> UpsertAdminProviderModelRecord {
+    let Some(mappings) = record
+        .provider_model_mappings
+        .as_mut()
+        .and_then(Value::as_array_mut)
+    else {
+        return record;
+    };
+    for mapping in mappings {
+        let Some(mapping) = mapping.as_object_mut() else {
+            continue;
+        };
+        let Some(endpoint_ids) = mapping.get("endpoint_ids").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut normalized = BTreeSet::new();
+        for endpoint_id in endpoint_ids {
+            let Some(original) = endpoint_id.as_str() else {
+                continue;
+            };
+            if let Some(remapped) = endpoint_id_map.get(original.trim()) {
+                normalized.insert(remapped.clone());
+            } else if let Some(remapped) =
+                legacy_endpoint_ids.and_then(|ids| ids.get(original.trim()))
+            {
+                normalized.extend(remapped.iter().cloned());
+            } else {
+                normalized.insert(original.trim().to_string());
+            }
+        }
+        if normalized.is_empty() {
+            mapping.remove("endpoint_ids");
+        } else {
+            mapping.insert(
+                "endpoint_ids".to_string(),
+                Value::Array(normalized.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+    record
+}
+
+fn resolve_legacy_import_model_endpoint_ids(
+    item: &ImportedProviderModel,
+    provider_endpoint_formats: &BTreeSet<String>,
+    exported_endpoint_ids: &BTreeSet<String>,
+    provider_endpoint_ids_by_format: &BTreeMap<String, String>,
+) -> Result<Option<BTreeMap<String, Vec<String>>>, String> {
+    resolve_legacy_import_model_endpoint_formats(
+        item,
+        provider_endpoint_formats,
+        exported_endpoint_ids,
+    )
+    .map(|endpoint_formats| {
+        endpoint_formats.map(|endpoint_formats| {
+            endpoint_formats
+                .into_iter()
+                .map(|(legacy_endpoint_id, api_formats)| {
+                    let endpoint_ids = api_formats
+                        .into_iter()
+                        .filter_map(|api_format| {
+                            provider_endpoint_ids_by_format.get(&api_format).cloned()
+                        })
+                        .collect::<Vec<_>>();
+                    (legacy_endpoint_id, endpoint_ids)
+                })
+                .collect()
+        })
+    })
+}
+
+fn build_import_provider_model_endpoint_bindings(
+    model_id: &str,
+    item: &ImportedProviderModel,
+    endpoint_id_map: &BTreeMap<String, String>,
+) -> Result<Option<Vec<UpsertModelEndpointBindingRecord>>, String> {
+    let Some(bindings) = item.endpoint_bindings.as_ref() else {
+        return Ok(None);
+    };
+    if bindings.is_empty() {
+        return Err("endpoint_bindings 至少需要一个 Endpoint 绑定".to_string());
+    }
+    let mut records = Vec::with_capacity(bindings.len());
+    let mut seen = BTreeSet::new();
+    for binding in bindings {
+        let original_endpoint_id = trim_required(&binding.endpoint_id, "endpoint_id")?;
+        let endpoint_id = endpoint_id_map
+            .get(&original_endpoint_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!("Endpoint {original_endpoint_id} 不在当前 Provider 的导入配置中")
+            })?;
+        if !seen.insert(endpoint_id.clone()) {
+            return Err(format!("Endpoint {original_endpoint_id} 存在重复模型绑定"));
+        }
+        let source = trim_required(&binding.source, "source")?;
+        records.push(
+            UpsertModelEndpointBindingRecord::new(
+                model_id.to_string(),
+                endpoint_id,
+                source,
+                binding.is_active,
+            )
+            .map_err(|err| err.to_string())?,
+        );
+    }
+    Ok(Some(records))
+}
+
+fn validate_import_provider_model_endpoint_bindings(
+    provider: &ImportedProvider,
+    provider_type: &str,
+    legacy_config: bool,
+) -> Result<(), String> {
+    let mut endpoint_id_map = BTreeMap::new();
+    let mut provider_endpoint_formats = BTreeSet::new();
+    for endpoint in &provider.endpoints {
+        let normalized_api_format = normalize_import_endpoint_format(&endpoint.api_format)?;
+        if !fixed_provider_import_endpoint_supported(provider_type, &normalized_api_format) {
+            continue;
+        }
+        provider_endpoint_formats.insert(normalized_api_format.clone());
+        let Some(endpoint_id) = endpoint
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint_id| !endpoint_id.is_empty())
+        else {
+            continue;
+        };
+        if endpoint_id_map
+            .insert(endpoint_id.to_string(), normalized_api_format)
+            .is_some()
+        {
+            return Err(format!(
+                "Endpoint {endpoint_id} 在当前 Provider 的导入配置中重复"
+            ));
+        }
+    }
+
+    for model in &provider.models {
+        build_import_provider_model_endpoint_bindings(
+            "system-import-preflight",
+            model,
+            &endpoint_id_map,
+        )?;
+        if legacy_config && model.endpoint_bindings.is_none() {
+            let exported_endpoint_ids = endpoint_id_map.keys().cloned().collect();
+            resolve_legacy_import_model_endpoint_formats(
+                model,
+                &provider_endpoint_formats,
+                &exported_endpoint_ids,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -1170,6 +1397,27 @@ fn normalize_imported_wallet_target(
 }
 
 impl<'a> AdminAppState<'a> {
+    async fn infer_legacy_import_model_endpoint_ids(
+        &self,
+        provider_id: &str,
+        model: &aether_data_contracts::repository::global_models::StoredAdminProviderModel,
+    ) -> Result<(Vec<String>, &'static str), GatewayError> {
+        let (endpoint_ids, source) = self
+            .infer_admin_model_endpoint_ids(provider_id, model)
+            .await?;
+        if !endpoint_ids.is_empty() {
+            return Ok((endpoint_ids, source));
+        }
+
+        let endpoint_ids = self
+            .list_provider_catalog_endpoints_by_provider_ids(&[provider_id.to_string()])
+            .await?
+            .into_iter()
+            .map(|endpoint| endpoint.id)
+            .collect();
+        Ok((endpoint_ids, "migration"))
+    }
+
     pub(crate) async fn import_admin_system_data(
         &self,
         request_body: &Bytes,
@@ -1283,6 +1531,7 @@ impl<'a> AdminAppState<'a> {
             )));
         }
         let parsed = routed!(parse_admin_system_config_import_request(request_body));
+        let legacy_config = parsed.request.document.version != ADMIN_SYSTEM_CONFIG_EXPORT_VERSION;
         let root = parsed.root;
         let merge_mode = parsed.request.merge_mode;
 
@@ -1306,6 +1555,51 @@ impl<'a> AdminAppState<'a> {
         let imported_system_configs = routed!(parse_admin_system_config_array::<
             ImportedSystemConfig,
         >(&root, "system_configs",));
+
+        let mut providers_by_name = self
+            .list_provider_catalog_providers(false)
+            .await?
+            .into_iter()
+            .map(|provider| (provider.name.clone(), provider))
+            .collect::<BTreeMap<_, _>>();
+
+        // 显式模型绑定必须在任何配置写入前完成校验，避免 400 响应留下部分导入状态。
+        let mut preflight_provider_types = providers_by_name
+            .iter()
+            .map(|(name, provider)| (name.clone(), provider.provider_type.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for imported_provider in &imported_providers {
+            let provider_name = invalid!(trim_required(&imported_provider.value.name, "name"));
+            let existing_provider_type = preflight_provider_types.get(&provider_name);
+            if existing_provider_type.is_some() && merge_mode == AdminImportMergeMode::Error {
+                return Ok(Err(invalid_request(format!(
+                    "Provider '{provider_name}' 已存在"
+                ))));
+            }
+            let provider_type = match (existing_provider_type, merge_mode) {
+                (Some(existing), AdminImportMergeMode::Skip) => existing.clone(),
+                (Some(existing), AdminImportMergeMode::Overwrite)
+                    if !imported_provider.raw.contains_key("provider_type") =>
+                {
+                    existing.clone()
+                }
+                _ => invalid!(
+                    crate::handlers::admin::provider::write::normalize::normalize_provider_type_input(
+                        imported_provider
+                            .value
+                            .provider_type
+                            .as_deref()
+                            .unwrap_or("custom"),
+                    )
+                ),
+            };
+            invalid!(validate_import_provider_model_endpoint_bindings(
+                &imported_provider.value,
+                &provider_type,
+                legacy_config,
+            ));
+            preflight_provider_types.insert(provider_name, provider_type);
+        }
 
         let mut stats = AdminSystemConfigImportStats::default();
 
@@ -1492,13 +1786,6 @@ impl<'a> AdminAppState<'a> {
             stats.global_models.created += 1;
         }
 
-        let mut providers_by_name = self
-            .list_provider_catalog_providers(false)
-            .await?
-            .into_iter()
-            .map(|provider| (provider.name.clone(), provider))
-            .collect::<BTreeMap<_, _>>();
-
         for imported_provider_item in imported_providers {
             let (raw_provider, imported_provider) = imported_provider_item.into_parts();
             let provider_name = invalid!(trim_required(&imported_provider.name, "name"));
@@ -1596,6 +1883,7 @@ impl<'a> AdminAppState<'a> {
                 .into_iter()
                 .map(|endpoint| (endpoint.api_format.clone(), endpoint))
                 .collect::<BTreeMap<_, _>>();
+            let mut imported_endpoint_id_map = BTreeMap::<String, String>::new();
 
             for imported_endpoint_item in imported_endpoints {
                 let (raw_endpoint, imported_endpoint) = imported_endpoint_item.into_parts();
@@ -1643,6 +1931,15 @@ impl<'a> AdminAppState<'a> {
                     .cloned();
 
                 if let Some(existing_endpoint) = existing_endpoint {
+                    if let Some(imported_id) = imported_endpoint
+                        .id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                    {
+                        imported_endpoint_id_map
+                            .insert(imported_id.to_string(), existing_endpoint.id.clone());
+                    }
                     match merge_mode {
                         AdminImportMergeMode::Skip => {
                             stats.endpoints.skipped += 1;
@@ -1764,11 +2061,27 @@ impl<'a> AdminAppState<'a> {
                         "创建 Endpoint '{normalized_api_format}' 失败"
                     ))));
                 };
+                if let Some(imported_id) = imported_endpoint
+                    .id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                {
+                    imported_endpoint_id_map.insert(imported_id.to_string(), created.id.clone());
+                }
                 existing_endpoints_by_format.insert(normalized_api_format, created);
                 stats.endpoints.created += 1;
             }
 
             let provider_endpoint_formats = existing_endpoints_by_format
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let provider_endpoint_ids_by_format = existing_endpoints_by_format
+                .iter()
+                .map(|(api_format, endpoint)| (api_format.clone(), endpoint.id.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let exported_endpoint_ids = imported_endpoint_id_map
                 .keys()
                 .cloned()
                 .collect::<BTreeSet<_>>();
@@ -2060,13 +2373,64 @@ impl<'a> AdminAppState<'a> {
                             ))));
                         }
                         AdminImportMergeMode::Overwrite => {
-                            let record = invalid!(build_import_provider_model_record(
-                                &provider.id,
-                                Some(&existing_model.id),
-                                &global_model_id,
-                                &imported_model,
-                            ));
-                            let Some(updated) = self.update_admin_provider_model(&record).await?
+                            let legacy_endpoint_ids =
+                                if legacy_config && imported_model.endpoint_bindings.is_none() {
+                                    invalid!(resolve_legacy_import_model_endpoint_ids(
+                                        &imported_model,
+                                        &provider_endpoint_formats,
+                                        &exported_endpoint_ids,
+                                        &provider_endpoint_ids_by_format,
+                                    ))
+                                } else {
+                                    None
+                                };
+                            let record = remap_import_provider_model_endpoint_ids(
+                                invalid!(build_import_provider_model_record(
+                                    &provider.id,
+                                    Some(&existing_model.id),
+                                    &global_model_id,
+                                    &imported_model,
+                                )),
+                                &imported_endpoint_id_map,
+                                legacy_endpoint_ids.as_ref(),
+                            );
+                            let imported_bindings =
+                                invalid!(build_import_provider_model_endpoint_bindings(
+                                    &record.id,
+                                    &imported_model,
+                                    &imported_endpoint_id_map,
+                                ));
+                            let mutation = if let Some(imported_bindings) = imported_bindings {
+                                invalid!(UpdateAdminProviderModelWithBindingsRecord::new(
+                                    record,
+                                    None,
+                                    None,
+                                    Vec::new(),
+                                )
+                                .and_then(|mutation| {
+                                    mutation.with_replacement_bindings(imported_bindings)
+                                })
+                                .map_err(|err| err.to_string()))
+                            } else {
+                                let prospective_model =
+                                    stored_admin_provider_model_from_upsert(&record);
+                                let (endpoint_ids, source) = self
+                                    .infer_legacy_import_model_endpoint_ids(
+                                        &provider.id,
+                                        &prospective_model,
+                                    )
+                                    .await?;
+                                invalid!(UpdateAdminProviderModelWithBindingsRecord::new(
+                                    record,
+                                    Some(endpoint_ids),
+                                    Some(source.to_string()),
+                                    Vec::new(),
+                                )
+                                .map_err(|err| err.to_string()))
+                            };
+                            let Some(updated) = self
+                                .update_admin_provider_model_with_bindings(&mutation)
+                                .await?
                             else {
                                 return Ok(Err(invalid_request(format!(
                                     "更新 Provider '{provider_name}' 的模型 '{provider_model_name}' 失败"
@@ -2079,13 +2443,64 @@ impl<'a> AdminAppState<'a> {
                     continue;
                 }
 
-                let record = invalid!(build_import_provider_model_record(
-                    &provider.id,
-                    None,
-                    &global_model_id,
+                let legacy_endpoint_ids =
+                    if legacy_config && imported_model.endpoint_bindings.is_none() {
+                        invalid!(resolve_legacy_import_model_endpoint_ids(
+                            &imported_model,
+                            &provider_endpoint_formats,
+                            &exported_endpoint_ids,
+                            &provider_endpoint_ids_by_format,
+                        ))
+                    } else {
+                        None
+                    };
+                let record = remap_import_provider_model_endpoint_ids(
+                    invalid!(build_import_provider_model_record(
+                        &provider.id,
+                        None,
+                        &global_model_id,
+                        &imported_model,
+                    )),
+                    &imported_endpoint_id_map,
+                    legacy_endpoint_ids.as_ref(),
+                );
+                let imported_bindings = invalid!(build_import_provider_model_endpoint_bindings(
+                    &record.id,
                     &imported_model,
+                    &imported_endpoint_id_map,
                 ));
-                let Some(created) = self.create_admin_provider_model(&record).await? else {
+                let mutation = if let Some(imported_bindings) = imported_bindings {
+                    let endpoint_ids = imported_bindings
+                        .iter()
+                        .map(|binding| binding.endpoint_id.clone())
+                        .collect();
+                    invalid!(
+                        aether_data_contracts::repository::global_models::CreateAdminProviderModelWithBindingsRecord::new(
+                            record,
+                            endpoint_ids,
+                            "import".to_string(),
+                        )
+                        .and_then(|mutation| mutation.with_replacement_bindings(imported_bindings))
+                        .map_err(|err| err.to_string())
+                    )
+                } else {
+                    let prospective_model = stored_admin_provider_model_from_upsert(&record);
+                    let (endpoint_ids, source) = self
+                        .infer_legacy_import_model_endpoint_ids(&provider.id, &prospective_model)
+                        .await?;
+                    invalid!(
+                        aether_data_contracts::repository::global_models::CreateAdminProviderModelWithBindingsRecord::new(
+                            record,
+                            endpoint_ids,
+                            source.to_string(),
+                        )
+                        .map_err(|err| err.to_string())
+                    )
+                };
+                let Some(created) = self
+                    .create_admin_provider_model_with_bindings(&mutation)
+                    .await?
+                else {
                     return Ok(Err(invalid_request(format!(
                         "创建 Provider '{provider_name}' 的模型 '{provider_model_name}' 失败"
                     ))));

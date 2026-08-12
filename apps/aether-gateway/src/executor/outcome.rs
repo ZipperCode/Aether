@@ -9,7 +9,8 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::repository::usage::{
-    ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY, ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY,
+    UsageBodyCaptureState, ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY,
+    ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY,
 };
 use aether_usage_runtime::{
     build_usage_event_data_seed, UsageEvent, UsageEventData, UsageEventType,
@@ -36,8 +37,10 @@ pub(crate) enum LocalExecutionRequestOutcome {
     NoPath,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DeferredUpstreamResponse;
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredUpstreamResponse {
+    exhaustion: LocalExecutionExhaustion,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalExecutionExhaustion {
@@ -77,8 +80,13 @@ impl LocalExecutionRequestOutcome {
     }
 }
 
-pub(crate) fn mark_deferred_upstream_response(mut response: Response<Body>) -> Response<Body> {
-    response.extensions_mut().insert(DeferredUpstreamResponse);
+pub(crate) fn mark_deferred_upstream_response(
+    mut response: Response<Body>,
+    exhaustion: LocalExecutionExhaustion,
+) -> Response<Body> {
+    response
+        .extensions_mut()
+        .insert(DeferredUpstreamResponse { exhaustion });
     response
 }
 
@@ -87,6 +95,15 @@ pub(crate) fn is_deferred_upstream_response(response: &Response<Body>) -> bool {
         .extensions()
         .get::<DeferredUpstreamResponse>()
         .is_some()
+}
+
+pub(crate) fn take_deferred_upstream_exhaustion(
+    response: &mut Response<Body>,
+) -> Option<LocalExecutionExhaustion> {
+    response
+        .extensions_mut()
+        .remove::<DeferredUpstreamResponse>()
+        .map(|deferred| deferred.exhaustion)
 }
 
 impl LocalExecutionRuntimeMissContext {
@@ -171,11 +188,13 @@ pub(crate) async fn build_local_execution_exhaustion(
 ) -> LocalExecutionExhaustion {
     let mut exhaustion = build_fast_local_execution_exhaustion(plan, report_context);
     let mut data = build_usage_event_data_seed(plan, report_context);
-    let last_failed_candidate = match state
+    let failed_candidate = match state
         .read_request_candidates_by_request_id(plan.request_id.as_str())
         .await
     {
-        Ok(candidates) => select_last_failed_request_candidate(&candidates).cloned(),
+        Ok(candidates) => {
+            select_failed_request_candidate(&candidates, plan.candidate_id.as_deref()).cloned()
+        }
         Err(err) => {
             warn!(
                 request_id = %plan.request_id,
@@ -186,7 +205,7 @@ pub(crate) async fn build_local_execution_exhaustion(
         }
     };
 
-    if let Some(candidate) = last_failed_candidate.as_ref() {
+    if let Some(candidate) = failed_candidate.as_ref() {
         data.user_id = data.user_id.or_else(|| candidate.user_id.clone());
         data.api_key_id = data.api_key_id.or_else(|| candidate.api_key_id.clone());
         data.username = data.username.or_else(|| candidate.username.clone());
@@ -198,25 +217,37 @@ pub(crate) async fn build_local_execution_exhaustion(
         data.provider_api_key_id = data
             .provider_api_key_id
             .or_else(|| candidate.key_id.clone());
+        if let Some(upstream_response) = candidate
+            .extra_data
+            .as_ref()
+            .and_then(|extra_data| extra_data.get("upstream_response"))
+        {
+            data.response_headers = upstream_response.get("headers").cloned();
+            data.response_body = upstream_response.get("body").cloned();
+            data.response_body_ref = upstream_response
+                .get("body_ref")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
         attach_runtime_miss_candidate_usage_metadata(&mut data, candidate);
     }
 
     exhaustion.data = data;
-    exhaustion.candidate_id = last_failed_candidate
+    exhaustion.candidate_id = failed_candidate
         .as_ref()
         .map(|candidate| candidate.id.clone());
-    exhaustion.candidate_index = last_failed_candidate
+    exhaustion.candidate_index = failed_candidate
         .as_ref()
         .map(|candidate| candidate.candidate_index);
-    exhaustion.upstream_status_code = last_failed_candidate
+    exhaustion.upstream_status_code = failed_candidate
         .as_ref()
         .and_then(|candidate| candidate.status_code);
-    exhaustion.upstream_error_type = last_failed_candidate
+    exhaustion.upstream_error_type = failed_candidate
         .as_ref()
         .and_then(|candidate| candidate.error_type.clone())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    exhaustion.upstream_error_message = last_failed_candidate
+    exhaustion.upstream_error_message = failed_candidate
         .as_ref()
         .and_then(|candidate| candidate.error_message.clone())
         .map(|value| value.trim().to_string())
@@ -357,6 +388,76 @@ pub(crate) async fn record_failed_usage_for_exhausted_request(
         candidate_index,
         None,
         diagnostic,
+        None,
+        None,
+    );
+    data.request_metadata = Some(Value::Object(request_metadata));
+
+    state
+        .usage_runtime
+        .record_terminal_event_direct(
+            state.usage_lifecycle_data_state().as_ref(),
+            UsageEvent::new(UsageEventType::Failed, request_id, data),
+        )
+        .await;
+}
+
+pub(crate) async fn record_failed_usage_for_deferred_upstream_response(
+    state: &AppState,
+    exhaustion: LocalExecutionExhaustion,
+    started_at: &Instant,
+    client_status_code: u16,
+    client_headers: &HeaderMap,
+    execution_path: &str,
+) {
+    if !state.usage_runtime.is_enabled() {
+        return;
+    }
+
+    let LocalExecutionExhaustion {
+        request_id,
+        mut data,
+        candidate_id,
+        candidate_index,
+        upstream_status_code: _,
+        upstream_error_type: _,
+        upstream_error_message,
+    } = exhaustion;
+    let error_message = upstream_error_message
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("All local candidates failed before the upstream error was returned");
+    data.status_code = Some(client_status_code);
+    data.error_message = Some(error_message.to_string());
+    data.error_category = error_category_for_failed_status(client_status_code);
+    data.response_time_ms = Some(started_at.elapsed().as_millis() as u64);
+    let client_response_headers = runtime_miss_original_headers_json(client_headers);
+    data.response_body = None;
+    data.response_body_ref = None;
+    data.response_body_state = Some(UsageBodyCaptureState::Unavailable);
+    data.client_response_headers = Some(client_response_headers);
+    data.client_response_body = None;
+    data.client_response_body_ref = None;
+    data.client_response_body_state = Some(UsageBodyCaptureState::Unavailable);
+
+    let mut request_metadata = match data.request_metadata.take() {
+        Some(Value::Object(object)) => object,
+        Some(other) => Map::from_iter([("seed".to_string(), other)]),
+        None => Map::new(),
+    };
+    request_metadata.insert("trace_id".to_string(), Value::String(request_id.clone()));
+    request_metadata.insert(
+        "client_response_status_code".to_string(),
+        Value::from(client_status_code),
+    );
+    apply_runtime_miss_usage_routing(
+        &mut data,
+        &mut request_metadata,
+        execution_path,
+        candidate_id.as_deref(),
+        candidate_index,
+        None,
+        None,
         None,
         None,
     );
@@ -625,6 +726,23 @@ fn select_last_failed_request_candidate(
                     .unwrap_or(candidate.created_at_unix_ms),
             )
         })
+}
+
+fn select_failed_request_candidate<'a>(
+    candidates: &'a [StoredRequestCandidate],
+    candidate_id: Option<&str>,
+) -> Option<&'a StoredRequestCandidate> {
+    candidate_id
+        .and_then(|candidate_id| {
+            candidates.iter().find(|candidate| {
+                candidate.id == candidate_id
+                    && matches!(
+                        candidate.status,
+                        RequestCandidateStatus::Failed | RequestCandidateStatus::Cancelled
+                    )
+            })
+        })
+        .or_else(|| select_last_failed_request_candidate(candidates))
 }
 
 fn select_last_runtime_miss_executed_candidate(
@@ -1256,17 +1374,210 @@ mod tests {
     use super::{
         apply_runtime_miss_usage_routing, beautify_local_execution_client_error_message,
         insert_runtime_miss_candidate_usage_metadata,
+        record_failed_usage_for_deferred_upstream_response,
         request_candidate_represents_provider_execution, runtime_miss_client_error_body,
         select_last_runtime_miss_executed_candidate, select_last_runtime_miss_routing_candidate,
         LocalExecutionRuntimeMissContext, RuntimeMissCandidateContext,
     };
     use crate::constants::EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS;
     use crate::state::LocalExecutionRuntimeMissDiagnostic;
+    use crate::AppState;
+    use aether_contracts::{ExecutionPlan, RequestBody};
+    use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+    use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, StoredRequestCandidate,
     };
-    use aether_usage_runtime::UsageEventData;
+    use aether_data_contracts::repository::usage::{UsageBodyCaptureState, UsageReadRepository};
+    use aether_usage_runtime::{UsageEventData, UsageRuntimeConfig};
+    use http::HeaderMap;
     use serde_json::{json, Map, Value};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn deferred_upstream_response_records_failed_void_usage_immediately() {
+        let request_id = "req-deferred-upstream-terminal";
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_usage_repository_for_tests(Arc::clone(
+                    &usage_repository,
+                )),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = ExecutionPlan {
+            request_id: request_id.to_string(),
+            candidate_id: Some("candidate-deferred-upstream".to_string()),
+            provider_name: Some("provider-a".to_string()),
+            provider_id: "provider-a".to_string(),
+            endpoint_id: "endpoint-responses".to_string(),
+            key_id: "key-a".to_string(),
+            method: "POST".to_string(),
+            url: "https://provider.example/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "gpt-test"})),
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-test".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let mut exhaustion = super::build_fast_local_execution_exhaustion(
+            &plan,
+            Some(&json!({"candidate_index": 3})),
+        );
+        exhaustion.upstream_status_code = Some(503);
+        exhaustion.upstream_error_type = Some("endpoint_capability_mismatch".to_string());
+        exhaustion.upstream_error_message = Some("no_local_stream_plans".to_string());
+
+        record_failed_usage_for_deferred_upstream_response(
+            &state,
+            exhaustion,
+            &Instant::now(),
+            503,
+            &HeaderMap::new(),
+            "execution_runtime_stream",
+        )
+        .await;
+
+        let stored = usage_repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("usage should read")
+            .expect("terminal usage should exist before the response is returned");
+        assert_eq!(stored.status, "failed");
+        assert_eq!(stored.billing_status, "void");
+        assert_eq!(stored.status_code, Some(503));
+        assert_eq!(
+            stored.error_message.as_deref(),
+            Some("no_local_stream_plans")
+        );
+        assert_eq!(
+            stored.provider_endpoint_id.as_deref(),
+            Some("endpoint-responses")
+        );
+        assert_eq!(stored.candidate_index, Some(3));
+        assert!(stored.response_body.is_none());
+        assert_eq!(
+            stored.response_body_state,
+            Some(UsageBodyCaptureState::Unavailable)
+        );
+        assert!(stored.client_response_body.is_none());
+        assert_eq!(
+            stored.client_response_body_state,
+            Some(UsageBodyCaptureState::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_execution_exhaustion_prefers_the_planned_failed_candidate() {
+        let request_id = "req-preserved-fallback-candidate";
+        let planned_candidate = StoredRequestCandidate::new(
+            "candidate-fallback".to_string(),
+            request_id.to_string(),
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            Some("provider-fallback".to_string()),
+            Some("endpoint-fallback".to_string()),
+            Some("key-fallback".to_string()),
+            RequestCandidateStatus::Failed,
+            None,
+            false,
+            Some(429),
+            Some("rate_limit".to_string()),
+            Some("fallback error".to_string()),
+            Some(10),
+            None,
+            None,
+            None,
+            100,
+            Some(101),
+            Some(111),
+        )
+        .expect("planned candidate should build");
+        let later_candidate = StoredRequestCandidate::new(
+            "candidate-later".to_string(),
+            request_id.to_string(),
+            None,
+            None,
+            None,
+            None,
+            1,
+            0,
+            Some("provider-later".to_string()),
+            Some("endpoint-later".to_string()),
+            Some("key-later".to_string()),
+            RequestCandidateStatus::Failed,
+            None,
+            false,
+            Some(503),
+            Some("overloaded".to_string()),
+            Some("later error".to_string()),
+            Some(20),
+            None,
+            None,
+            None,
+            200,
+            Some(201),
+            Some(221),
+        )
+        .expect("later candidate should build");
+        let repository = Arc::new(InMemoryRequestCandidateRepository::seed([
+            planned_candidate,
+            later_candidate,
+        ]));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_request_candidate_data_reader_for_tests(repository);
+        let plan = ExecutionPlan {
+            request_id: request_id.to_string(),
+            candidate_id: Some("candidate-fallback".to_string()),
+            provider_name: Some("provider-fallback".to_string()),
+            provider_id: "provider-fallback".to_string(),
+            endpoint_id: "endpoint-fallback".to_string(),
+            key_id: "key-fallback".to_string(),
+            method: "POST".to_string(),
+            url: "https://provider.example/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "gpt-test"})),
+            stream: false,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-test".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+
+        let exhaustion = super::build_local_execution_exhaustion(&state, &plan, None).await;
+
+        assert_eq!(
+            exhaustion.candidate_id.as_deref(),
+            Some("candidate-fallback")
+        );
+        assert_eq!(exhaustion.candidate_index, Some(0));
+        assert_eq!(exhaustion.upstream_status_code, Some(429));
+        assert_eq!(
+            exhaustion.data.provider_endpoint_id.as_deref(),
+            Some("endpoint-fallback")
+        );
+    }
 
     #[test]
     fn local_execution_client_error_message_is_client_friendly() {

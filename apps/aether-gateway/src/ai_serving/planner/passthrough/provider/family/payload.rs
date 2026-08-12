@@ -382,6 +382,7 @@ pub(super) async fn mark_skipped_local_same_format_provider_candidate(
     candidate_id: &str,
     skip_reason: &'static str,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -410,6 +411,7 @@ pub(super) async fn mark_skipped_local_same_format_provider_candidate_with_extra
     skip_reason: &'static str,
     extra_data: Option<serde_json::Value>,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -439,6 +441,7 @@ pub(super) async fn mark_skipped_local_same_format_provider_candidate_with_failu
     skip_reason: &'static str,
     diagnostic: CandidateFailureDiagnostic,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),

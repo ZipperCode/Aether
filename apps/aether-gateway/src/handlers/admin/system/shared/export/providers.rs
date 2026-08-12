@@ -6,8 +6,8 @@ use super::support::{
 use crate::handlers::admin::request::AdminAppState;
 use crate::GatewayError;
 use aether_admin::system::{
-    AdminSystemConfigEndpoint, AdminSystemConfigProvider, AdminSystemConfigProviderKey,
-    AdminSystemConfigProviderModel,
+    AdminSystemConfigEndpoint, AdminSystemConfigModelEndpointBinding, AdminSystemConfigProvider,
+    AdminSystemConfigProviderKey, AdminSystemConfigProviderModel,
 };
 use aether_data_contracts::repository::global_models::AdminProviderModelListQuery;
 use std::collections::BTreeMap;
@@ -55,6 +55,18 @@ pub(crate) async fn build_admin_system_export_providers_payload(
             .await?;
         provider_models_by_provider.insert(provider.id.clone(), models);
     }
+    let model_ids = provider_models_by_provider
+        .values()
+        .flatten()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let mut endpoint_bindings_by_model = BTreeMap::<String, Vec<_>>::new();
+    for binding in state.list_model_endpoint_bindings(&model_ids).await? {
+        endpoint_bindings_by_model
+            .entry(binding.model_id.clone())
+            .or_default()
+            .push(binding);
+    }
 
     Ok(providers
         .iter()
@@ -67,6 +79,7 @@ pub(crate) async fn build_admin_system_export_providers_payload(
             let endpoints_data = endpoints
                 .iter()
                 .map(|endpoint| AdminSystemConfigEndpoint {
+                    id: Some(endpoint.id.clone()),
                     api_format: endpoint.api_format.clone(),
                     base_url: endpoint.base_url.clone(),
                     header_rules: endpoint.header_rules.clone(),
@@ -187,19 +200,35 @@ pub(crate) async fn build_admin_system_export_providers_payload(
                 .remove(&provider.id)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|model| AdminSystemConfigProviderModel {
-                    global_model_name: global_model_name_by_id.get(&model.global_model_id).cloned(),
-                    provider_model_name: model.provider_model_name,
-                    provider_model_mappings: model.provider_model_mappings,
-                    price_per_request: model.price_per_request,
-                    tiered_pricing: model.tiered_pricing,
-                    supports_vision: model.supports_vision,
-                    supports_function_calling: model.supports_function_calling,
-                    supports_streaming: model.supports_streaming,
-                    supports_extended_thinking: model.supports_extended_thinking,
-                    supports_image_generation: model.supports_image_generation,
-                    is_active: model.is_active,
-                    config: model.config,
+                .map(|model| {
+                    let endpoint_bindings = endpoint_bindings_by_model
+                        .remove(&model.id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|binding| AdminSystemConfigModelEndpointBinding {
+                            endpoint_id: binding.endpoint_id,
+                            source: binding.source,
+                            is_active: binding.is_active,
+                        })
+                        .collect::<Vec<_>>();
+                    AdminSystemConfigProviderModel {
+                        global_model_name: global_model_name_by_id
+                            .get(&model.global_model_id)
+                            .cloned(),
+                        provider_model_name: model.provider_model_name,
+                        provider_model_mappings: model.provider_model_mappings,
+                        endpoint_bindings: (!endpoint_bindings.is_empty())
+                            .then_some(endpoint_bindings),
+                        price_per_request: model.price_per_request,
+                        tiered_pricing: model.tiered_pricing,
+                        supports_vision: model.supports_vision,
+                        supports_function_calling: model.supports_function_calling,
+                        supports_streaming: model.supports_streaming,
+                        supports_extended_thinking: model.supports_extended_thinking,
+                        supports_image_generation: model.supports_image_generation,
+                        is_active: model.is_active,
+                        config: model.config,
+                    }
                 })
                 .collect::<Vec<_>>();
 

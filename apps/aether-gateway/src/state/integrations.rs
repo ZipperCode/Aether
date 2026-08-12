@@ -5,8 +5,9 @@ use aether_data_contracts::repository::candidates::{
     StoredRequestCandidate, UpsertRequestCandidateRecord,
 };
 use aether_data_contracts::repository::global_models::{
-    AdminGlobalModelListQuery, AdminProviderModelListQuery, StoredAdminGlobalModelPage,
-    StoredAdminProviderModel, UpsertAdminProviderModelRecord,
+    AdminGlobalModelListQuery, AdminProviderModelListQuery,
+    CreateAdminProviderModelWithBindingsRecord, StoredAdminGlobalModelPage,
+    StoredAdminProviderModel, StoredModelEndpointBinding, UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
@@ -426,11 +427,11 @@ impl ModelFetchAssociationStore for AppState {
             .map_err(|err| format!("{err:?}"))
     }
 
-    async fn create_admin_provider_model(
+    async fn create_admin_provider_model_with_bindings(
         &self,
-        record: &UpsertAdminProviderModelRecord,
+        record: &CreateAdminProviderModelWithBindingsRecord,
     ) -> Result<Option<StoredAdminProviderModel>, Self::Error> {
-        AppState::create_admin_provider_model(self, record)
+        AppState::create_admin_provider_model_with_bindings(self, record)
             .await
             .map_err(|err| format!("{err:?}"))
     }
@@ -442,6 +443,26 @@ impl ModelFetchAssociationStore for AppState {
         AppState::update_admin_provider_model(self, record)
             .await
             .map_err(|err| format!("{err:?}"))
+    }
+
+    async fn sync_model_endpoint_bindings(
+        &self,
+        model_id: &str,
+        endpoint_ids: &[String],
+        source: &str,
+        replace_automatic: bool,
+        replacement_scope_endpoint_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, Self::Error> {
+        AppState::sync_model_endpoint_bindings(
+            self,
+            model_id,
+            endpoint_ids,
+            source,
+            replace_automatic,
+            replacement_scope_endpoint_ids,
+        )
+        .await
+        .map_err(|err| format!("{err:?}"))
     }
 
     async fn list_provider_catalog_keys_by_provider_ids(

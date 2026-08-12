@@ -363,7 +363,11 @@ async function handleImport() {
 
   importing.value = true
   try {
-    const response = await importModelsFromUpstream(props.providerId, modelsToImport)
+    const selected = new Set(modelsToImport)
+    const response = await importModelsFromUpstream(
+      props.providerId,
+      upstreamModels.value.filter(model => selected.has(model.id))
+    )
 
     const successCount = response.success?.length || 0
     const errorCount = response.errors?.length || 0

@@ -18,7 +18,10 @@ pub trait AiExecutionAttempt {
 #[derive(Debug)]
 pub enum AiAttemptLoopOutcome<Response, Exhaustion> {
     Responded(Response),
-    Deferred(Response),
+    Deferred {
+        response: Response,
+        exhaustion: Exhaustion,
+    },
     Exhausted(Exhaustion),
     NoPath,
 }
@@ -103,7 +106,7 @@ where
     let mut remaining = attempts.into_iter();
     let mut last_attempted = None;
     let mut retry_filters: Vec<AiAttemptRetryFilter> = Vec::new();
-    let mut fallback_response = None;
+    let mut fallback = None;
 
     while let Some(attempt) = remaining.next() {
         if retry_filters.iter().any(|filter| filter.matches(&attempt))
@@ -130,8 +133,12 @@ where
                 fallback_response: attempt_fallback_response,
             } => {
                 port.record_attempt_failed(&attempt).await?;
-                if attempt_fallback_response.is_some() {
-                    fallback_response = attempt_fallback_response;
+                if let Some(response) = attempt_fallback_response {
+                    fallback = Some((
+                        response,
+                        attempt.execution_plan().clone(),
+                        attempt.report_context(),
+                    ));
                 }
                 if scope != AiAttemptRetryScope::Candidate {
                     retry_filters.push(AiAttemptRetryFilter::new(&attempt, scope));
@@ -144,13 +151,19 @@ where
         last_attempted = Some((attempt.execution_plan().clone(), attempt.report_context()));
     }
 
-    if let Some(response) = fallback_response {
-        return Ok(AiAttemptLoopOutcome::Deferred(response));
-    }
-
     let Some((last_plan, last_report_context)) = last_attempted else {
         return Ok(AiAttemptLoopOutcome::NoPath);
     };
+
+    if let Some((response, fallback_plan, fallback_report_context)) = fallback {
+        let exhaustion = port
+            .build_exhaustion(fallback_plan, fallback_report_context)
+            .await?;
+        return Ok(AiAttemptLoopOutcome::Deferred {
+            response,
+            exhaustion,
+        });
+    }
 
     Ok(AiAttemptLoopOutcome::Exhausted(
         port.build_exhaustion(last_plan, last_report_context)
@@ -266,6 +279,8 @@ mod tests {
         unused: Mutex<Vec<&'static str>>,
     }
 
+    struct FallbackContextPort;
+
     #[async_trait]
     impl AiAttemptLoopPort<TestAttempt> for ScopedRetryPort {
         type Response = &'static str;
@@ -351,6 +366,44 @@ mod tests {
             _last_report_context: Option<serde_json::Value>,
         ) -> Result<Self::Exhaustion, Self::Error> {
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl AiAttemptLoopPort<TestAttempt> for FallbackContextPort {
+        type Response = &'static str;
+        type Exhaustion = String;
+        type Error = &'static str;
+
+        async fn execute_attempt(
+            &self,
+            attempt: &TestAttempt,
+        ) -> Result<AiAttemptExecutionOutcome<Self::Response>, Self::Error> {
+            Ok(if attempt.id == "fallback-source" {
+                AiAttemptExecutionOutcome::Retry {
+                    scope: AiAttemptRetryScope::Candidate,
+                    fallback_response: Some("preserved-error"),
+                }
+            } else {
+                AiAttemptExecutionOutcome::retry(AiAttemptRetryScope::Candidate)
+            })
+        }
+
+        async fn mark_unused_attempts(
+            &self,
+            _attempts: Vec<TestAttempt>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn build_exhaustion(
+            &self,
+            last_plan: aether_contracts::ExecutionPlan,
+            _last_report_context: Option<serde_json::Value>,
+        ) -> Result<Self::Exhaustion, Self::Error> {
+            Ok(last_plan
+                .candidate_id
+                .expect("test attempt should have a candidate id"))
         }
     }
 
@@ -476,11 +529,32 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            super::AiAttemptLoopOutcome::Deferred("provider-error")
+            super::AiAttemptLoopOutcome::Deferred {
+                response: "provider-error",
+                exhaustion: (),
+            }
         ));
         assert_eq!(
             *port.unused.lock().expect("unused attempts should lock"),
             vec!["same-provider"]
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_exhaustion_uses_the_preserved_response_attempt() {
+        let outcome = run_ai_attempt_loop(
+            &FallbackContextPort,
+            vec![attempt("fallback-source"), attempt("later-failure")],
+        )
+        .await
+        .expect("fallback response loop should succeed");
+
+        assert!(matches!(
+            outcome,
+            super::AiAttemptLoopOutcome::Deferred {
+                response: "preserved-error",
+                exhaustion,
+            } if exhaustion == "fallback-source"
+        ));
     }
 }

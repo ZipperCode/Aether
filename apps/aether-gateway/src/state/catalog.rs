@@ -63,6 +63,54 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn list_model_endpoint_bindings(
+        &self,
+        model_ids: &[String],
+    ) -> Result<Vec<global_models::StoredModelEndpointBinding>, GatewayError> {
+        self.data
+            .list_model_endpoint_bindings(model_ids)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
+    pub(crate) async fn sync_model_endpoint_bindings(
+        &self,
+        model_id: &str,
+        endpoint_ids: &[String],
+        source: &str,
+        replace_automatic: bool,
+        replacement_scope_endpoint_ids: &[String],
+    ) -> Result<Vec<global_models::StoredModelEndpointBinding>, GatewayError> {
+        let bindings = self
+            .data
+            .sync_model_endpoint_bindings(
+                model_id,
+                endpoint_ids,
+                source,
+                replace_automatic,
+                replacement_scope_endpoint_ids,
+            )
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        self.invalidate_model_routing_caches();
+        Ok(bindings)
+    }
+
+    pub(crate) async fn upsert_model_endpoint_binding(
+        &self,
+        record: &global_models::UpsertModelEndpointBindingRecord,
+    ) -> Result<Option<global_models::StoredModelEndpointBinding>, GatewayError> {
+        let binding = self
+            .data
+            .upsert_model_endpoint_binding(record)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if binding.is_some() {
+            self.invalidate_model_routing_caches();
+        }
+        Ok(binding)
+    }
+
     pub(crate) async fn list_management_tokens(
         &self,
         query: &aether_data::repository::management_tokens::ManagementTokenListQuery,
@@ -295,6 +343,21 @@ impl AppState {
         Ok(created)
     }
 
+    pub(crate) async fn create_admin_provider_model_with_bindings(
+        &self,
+        record: &global_models::CreateAdminProviderModelWithBindingsRecord,
+    ) -> Result<Option<global_models::StoredAdminProviderModel>, GatewayError> {
+        let created = self
+            .data
+            .create_admin_provider_model_with_bindings(record)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if created.is_some() {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(created)
+    }
+
     pub(crate) async fn update_admin_provider_model(
         &self,
         record: &global_models::UpsertAdminProviderModelRecord,
@@ -302,6 +365,21 @@ impl AppState {
         let updated = self
             .data
             .update_admin_provider_model(record)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated.is_some() {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_admin_provider_model_with_bindings(
+        &self,
+        record: &global_models::UpdateAdminProviderModelWithBindingsRecord,
+    ) -> Result<Option<global_models::StoredAdminProviderModel>, GatewayError> {
+        let updated = self
+            .data
+            .update_admin_provider_model_with_bindings(record)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated.is_some() {
@@ -363,6 +441,21 @@ impl AppState {
         let deleted = self
             .data
             .delete_admin_global_model(global_model_id)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if deleted {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(deleted)
+    }
+
+    pub(crate) async fn delete_unreferenced_admin_global_model(
+        &self,
+        global_model_id: &str,
+    ) -> Result<bool, GatewayError> {
+        let deleted = self
+            .data
+            .delete_unreferenced_admin_global_model(global_model_id)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if deleted {
@@ -1142,8 +1235,9 @@ mod tests {
         StoredRequestedModelCandidateRowsQuery,
     };
     use aether_data_contracts::repository::global_models::{
-        CreateAdminGlobalModelRecord, StoredAdminGlobalModel, UpdateAdminGlobalModelRecord,
-        UpsertAdminProviderModelRecord,
+        CreateAdminGlobalModelRecord, StoredAdminGlobalModel, StoredAdminProviderModel,
+        UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+        UpsertModelEndpointBindingRecord,
     };
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -1271,6 +1365,35 @@ mod tests {
             None,
         )
         .expect("provider model record should build")
+    }
+
+    fn sample_admin_provider_model() -> StoredAdminProviderModel {
+        let record = sample_provider_model_record("model-1", "global-1", true);
+        StoredAdminProviderModel {
+            id: record.id,
+            provider_id: record.provider_id,
+            global_model_id: record.global_model_id,
+            provider_model_name: record.provider_model_name,
+            provider_model_mappings: record.provider_model_mappings,
+            price_per_request: record.price_per_request,
+            tiered_pricing: record.tiered_pricing,
+            supports_vision: record.supports_vision,
+            supports_function_calling: record.supports_function_calling,
+            supports_streaming: record.supports_streaming,
+            supports_extended_thinking: record.supports_extended_thinking,
+            supports_image_generation: record.supports_image_generation,
+            is_active: record.is_active,
+            is_available: record.is_available,
+            config: record.config,
+            created_at_unix_ms: None,
+            updated_at_unix_secs: None,
+            global_model_name: Some("gpt-5".to_string()),
+            global_model_display_name: Some("GPT 5".to_string()),
+            global_model_default_price_per_request: None,
+            global_model_default_tiered_pricing: None,
+            global_model_supported_capabilities: None,
+            global_model_config: None,
+        }
     }
 
     #[derive(Debug, Default)]
@@ -1416,6 +1539,81 @@ mod tests {
             .await
             .expect("global model delete should succeed"));
         assert_eq!(candidate_repository.clear_count(), 6);
+    }
+
+    #[tokio::test]
+    async fn model_endpoint_binding_write_invalidates_request_routing_caches() {
+        let global_model_repository = Arc::new(
+            InMemoryGlobalModelReadRepository::seed(Vec::new())
+                .with_admin_global_models(vec![sample_admin_global_model()])
+                .with_admin_provider_models(vec![sample_admin_provider_model()]),
+        );
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::default()
+                    .with_global_model_repository_for_tests(global_model_repository),
+            );
+
+        let ttl = Duration::from_secs(300);
+        let page_cache_key = CandidatePageCacheKey::new(
+            "gpt-5",
+            None,
+            "openai:chat",
+            true,
+            &sample_auth_snapshot(),
+            None,
+            None,
+            None,
+            state.scheduler_affinity_epoch(),
+            "fixed_order",
+            true,
+            None,
+            "",
+        );
+        state.candidate_page_cache.insert(
+            page_cache_key.clone(),
+            Some(Arc::new(crate::cache::CandidatePageSnapshot {
+                candidates: Vec::new(),
+                skipped_candidates: Vec::new(),
+            })),
+            ttl,
+        );
+        let affinity_cache_key = "binding-cache-affinity";
+        state.remember_scheduler_affinity_target(
+            affinity_cache_key,
+            SchedulerAffinityTarget {
+                provider_id: "provider-1".to_string(),
+                endpoint_id: "endpoint-1".to_string(),
+                key_id: "key-1".to_string(),
+            },
+            ttl,
+            128,
+        );
+        let initial_epoch = state.scheduler_affinity_epoch();
+
+        state
+            .upsert_model_endpoint_binding(
+                &UpsertModelEndpointBindingRecord::new(
+                    "model-1".to_string(),
+                    "endpoint-1".to_string(),
+                    "manual".to_string(),
+                    false,
+                )
+                .expect("binding record should build"),
+            )
+            .await
+            .expect("binding write should succeed")
+            .expect("binding should persist");
+
+        assert!(state
+            .candidate_page_cache
+            .get(&page_cache_key, ttl)
+            .is_none());
+        assert!(state.scheduler_affinity_epoch() > initial_epoch);
+        assert!(state
+            .read_scheduler_affinity_target(affinity_cache_key, ttl)
+            .is_none());
     }
 
     #[tokio::test]

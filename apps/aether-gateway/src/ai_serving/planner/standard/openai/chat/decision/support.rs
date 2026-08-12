@@ -38,6 +38,7 @@ pub(crate) async fn mark_skipped_local_openai_chat_candidate(
     candidate_id: &str,
     skip_reason: &'static str,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -67,6 +68,7 @@ pub(crate) async fn mark_skipped_local_openai_chat_candidate_with_extra_data(
     skip_reason: &'static str,
     extra_data: Option<serde_json::Value>,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -97,6 +99,7 @@ pub(crate) async fn mark_skipped_local_openai_chat_candidate_with_failure_diagno
     skip_reason: &'static str,
     diagnostic: CandidateFailureDiagnostic,
 ) {
+    input.quarantine_endpoint_capability(state, candidate, skip_reason);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -136,6 +139,11 @@ pub(crate) async fn materialize_local_openai_chat_candidate_attempts(
         planner_state,
         trace_id,
         "openai:chat",
+        body_json
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        None,
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -217,6 +225,11 @@ pub(crate) async fn build_local_openai_chat_candidate_attempt_source<'a>(
         planner_state,
         trace_id,
         "openai:chat",
+        body_json
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        None,
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
