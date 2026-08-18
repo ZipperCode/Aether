@@ -3656,6 +3656,11 @@ mod tests {
         assert_eq!(metrics.priority_pending_current.load(Ordering::Acquire), 3);
         assert_eq!(metrics.flush_failed_total.load(Ordering::Acquire), 1);
 
+        // 首次失败的退避上限是基础延迟；等待窗口结束后再验证阶段顺序。
+        tokio::time::sleep(Duration::from_millis(
+            FAILED_FLUSH_RETRY_BASE_DELAY_MS.saturating_add(1),
+        ))
+        .await;
         flush_batch(
             &repository,
             &config,
@@ -3707,7 +3712,8 @@ mod tests {
                 .expect("lifecycle status should enter its split lane");
         }
 
-        tokio::time::timeout(Duration::from_secs(1), repository.retry_started.notified())
+        // CI 并行执行完整网关测试时可能出现调度延迟，窗口需覆盖退避和任务饥饿。
+        tokio::time::timeout(Duration::from_secs(3), repository.retry_started.notified())
             .await
             .expect("pending retry should start after the injected failure");
         assert_eq!(
