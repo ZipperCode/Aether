@@ -8320,10 +8320,18 @@ async fn gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over
         )
         .expect("updated auth config ciphertext should build"),
     );
-    provider_catalog_repository
-        .update_key(&updated_key)
+    assert!(provider_catalog_repository
+        .update_key_oauth_credentials(
+            &updated_key.id,
+            updated_key
+                .encrypted_api_key
+                .as_deref()
+                .expect("OAuth key should keep encrypted api key"),
+            updated_key.encrypted_auth_config.as_deref(),
+            updated_key.expires_at_unix_secs,
+        )
         .await
-        .expect("key should update");
+        .expect("key should update"));
 
     let gateway = build_router_with_state(app_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
