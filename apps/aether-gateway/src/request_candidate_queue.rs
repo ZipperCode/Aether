@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::RandomState, HashMap, HashSet};
 use std::future::Future;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aether_data_contracts::repository::candidates::{
@@ -9,7 +10,7 @@ use aether_data_contracts::repository::candidates::{
 };
 use aether_runtime::{MetricKind, MetricSample};
 use tokio::sync::{mpsc, Semaphore};
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, Instant, MissedTickBehavior};
 use tracing::{debug, warn};
 
 const MODE_ENV: &str = "AETHER_GATEWAY_REQUEST_CANDIDATE_WRITE_MODE";
@@ -38,7 +39,8 @@ const DEFAULT_RUNTIME_THREADS: usize = 1;
 const MAX_RUNTIME_THREADS: usize = 8;
 const RUNTIME_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
 const RUNTIME_THREAD_NAME: &str = "aether-candidate-queue";
-const FAILED_FLUSH_RETRY_DELAY_MS: u64 = 25;
+const FAILED_FLUSH_RETRY_BASE_DELAY_MS: u64 = 100;
+const FAILED_FLUSH_RETRY_MAX_DELAY_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestCandidateWriteMode {
@@ -143,6 +145,13 @@ struct RequestCandidateQueueMetrics {
     db_write_wait_total: AtomicU64,
     compacted_total: AtomicU64,
     sync_fallback_total: AtomicU64,
+    retry_states: Mutex<HashMap<(usize, RequestCandidateQueueLane), RequestCandidateRetryState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestCandidateRetryState {
+    attempt: u32,
+    retry_not_before: Instant,
 }
 
 #[derive(Debug)]
@@ -1174,6 +1183,19 @@ async fn run_worker(
             }
         }
 
+        let retry_deadline = request_candidate_next_retry_deadline(&metrics, worker_index);
+        let scheduled_flush = async {
+            if let Some(deadline) = retry_deadline {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = tokio::time::sleep_until(deadline) => {}
+                }
+            } else {
+                ticker.tick().await;
+            }
+        };
+        tokio::pin!(scheduled_flush);
+
         tokio::select! {
             biased;
             received = active_receiver.recv(), if active_receiver_open => {
@@ -1239,7 +1261,7 @@ async fn run_worker(
                     }
                 }
             }
-            _ = ticker.tick() => {
+            _ = &mut scheduled_flush => {
                 if !active_batch.is_empty() {
                     flush_batch(
                         &repository,
@@ -1412,11 +1434,99 @@ async fn run_worker(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RequestCandidateQueueLane {
     Normal,
     Active,
     Terminal,
+}
+
+fn request_candidate_retry_delay(
+    metrics: &RequestCandidateQueueMetrics,
+    worker_index: usize,
+    lane: RequestCandidateQueueLane,
+) -> Duration {
+    let mut states = metrics
+        .retry_states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let attempt = states
+        .get(&(worker_index, lane))
+        .map(|state| state.attempt)
+        .unwrap_or_default()
+        .saturating_add(1);
+    let exponent = attempt.saturating_sub(1).min(16);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    let delay_ceiling = FAILED_FLUSH_RETRY_BASE_DELAY_MS
+        .saturating_mul(multiplier)
+        .min(FAILED_FLUSH_RETRY_MAX_DELAY_MS);
+    let minimum_delay = delay_ceiling / 2;
+    let jitter_window = delay_ceiling.saturating_sub(minimum_delay);
+    let jitter_seed = request_candidate_retry_jitter_salt()
+        ^ (worker_index as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ u64::from(attempt)
+        ^ (lane as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    let delay = Duration::from_millis(
+        minimum_delay.saturating_add(jitter_seed % jitter_window.saturating_add(1)),
+    );
+    states.insert(
+        (worker_index, lane),
+        RequestCandidateRetryState {
+            attempt,
+            retry_not_before: Instant::now() + delay,
+        },
+    );
+    delay
+}
+
+fn request_candidate_retry_is_ready(
+    metrics: &RequestCandidateQueueMetrics,
+    worker_index: usize,
+    lane: RequestCandidateQueueLane,
+) -> bool {
+    metrics
+        .retry_states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&(worker_index, lane))
+        .is_none_or(|state| Instant::now() >= state.retry_not_before)
+}
+
+fn request_candidate_next_retry_deadline(
+    metrics: &RequestCandidateQueueMetrics,
+    worker_index: usize,
+) -> Option<Instant> {
+    metrics
+        .retry_states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter_map(|((state_worker_index, _), state)| {
+            (*state_worker_index == worker_index).then_some(state.retry_not_before)
+        })
+        .min()
+}
+
+fn request_candidate_retry_jitter_salt() -> u64 {
+    static SALT: OnceLock<u64> = OnceLock::new();
+    *SALT.get_or_init(|| {
+        let random_state = RandomState::new();
+        let mut hasher = random_state.build_hasher();
+        hasher.write_u32(std::process::id());
+        hasher.finish()
+    })
+}
+
+fn reset_request_candidate_retry_delay(
+    metrics: &RequestCandidateQueueMetrics,
+    worker_index: usize,
+    lane: RequestCandidateQueueLane,
+) {
+    metrics
+        .retry_states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&(worker_index, lane));
 }
 
 async fn flush_batch(
@@ -1429,10 +1539,10 @@ async fn flush_batch(
     batch: &mut Vec<UpsertRequestCandidateRecord>,
     admission: Option<&Semaphore>,
 ) {
-    let records = std::mem::take(batch);
-    if records.is_empty() {
+    if batch.is_empty() || !request_candidate_retry_is_ready(metrics, worker_index, lane) {
         return;
     }
+    let records = std::mem::take(batch);
     let source_count = records.len();
     let flush_plan = compact_records_for_flush(records);
     let compacted = source_count.saturating_sub(flush_plan.record_count());
@@ -1520,11 +1630,22 @@ async fn flush_batch(
             .fetch_add(failed_or_dropped, Ordering::AcqRel);
     }
     if failed > 0 {
-        tokio::time::sleep(Duration::from_millis(FAILED_FLUSH_RETRY_DELAY_MS)).await;
         batch.extend(retry_normal);
         batch.extend(retry_pending);
         batch.extend(retry_streaming);
         batch.extend(retry_terminal);
+        let delay = request_candidate_retry_delay(metrics, worker_index, lane);
+        warn!(
+            event_name = "request_candidate_async_flush_retry_scheduled",
+            log_type = "event",
+            worker_index,
+            lane = ?lane,
+            failed,
+            retry_delay_ms = delay.as_millis() as u64,
+            "gateway scheduled request candidate persistence retry with backoff"
+        );
+    } else {
+        reset_request_candidate_retry_delay(metrics, worker_index, lane);
     }
     let released = source_count.saturating_sub(batch.len());
     if released > 0 {
@@ -1601,6 +1722,20 @@ async fn flush_compacted_records(
             .await
         {
             Ok(()) => record_compacted_flush_success(metrics, lane, chunk),
+            Err(err) if request_candidate_error_is_permanent_batch(&err) => {
+                for record in chunk {
+                    drop_invalid_request_candidate_record(
+                        metrics,
+                        lane,
+                        worker_index,
+                        record,
+                        &err,
+                    );
+                    result.dropped_source_count = result
+                        .dropped_source_count
+                        .saturating_add(record.source_count as u64);
+                }
+            }
             Err(err) if request_candidate_error_is_record_local(&err) && chunk.len() > 1 => {
                 warn!(
                     event_name = "request_candidate_async_flush_batch_isolating",
@@ -1692,14 +1827,57 @@ async fn upsert_compacted_request_candidate_records(
 
 fn request_candidate_error_is_record_local(error: &aether_data_contracts::DataLayerError) -> bool {
     match error {
-        aether_data_contracts::DataLayerError::InvalidInput(_) => true,
+        aether_data_contracts::DataLayerError::InvalidInput(_)
+        | aether_data_contracts::DataLayerError::UnexpectedValue(_) => true,
         aether_data_contracts::DataLayerError::Postgres(message)
         | aether_data_contracts::DataLayerError::Sql(message) => {
+            if let Some(code) = request_candidate_database_error_sqlstate(message) {
+                if code.starts_with("21")
+                    || code.starts_with("22")
+                    || code.starts_with("23")
+                    || code.starts_with("44")
+                {
+                    return true;
+                }
+            }
             let message = message.to_ascii_lowercase();
-            message.contains("foreign key constraint") || message.contains("violates foreign key")
+            message.contains("foreign key constraint")
+                || message.contains("violates foreign key")
+                || message.contains("unsupported unicode escape sequence")
+                || message.contains("\\u0000 cannot be converted to text")
+                || message.contains("invalid byte sequence for encoding \"utf8\": 0x00")
         }
         _ => false,
     }
+}
+
+fn request_candidate_error_is_permanent_batch(
+    error: &aether_data_contracts::DataLayerError,
+) -> bool {
+    match error {
+        aether_data_contracts::DataLayerError::InvalidConfiguration(_) => true,
+        aether_data_contracts::DataLayerError::Postgres(message)
+        | aether_data_contracts::DataLayerError::Sql(message) => {
+            request_candidate_database_error_sqlstate(message).is_some_and(|code| {
+                code.starts_with("0A")
+                    || code.starts_with("28")
+                    || code.starts_with("3D")
+                    || code.starts_with("3F")
+                    || code.starts_with("42")
+            })
+        }
+        _ => false,
+    }
+}
+
+fn request_candidate_database_error_sqlstate(message: &str) -> Option<&str> {
+    let suffix = message.strip_suffix(')')?;
+    let (_, code) = suffix.rsplit_once("(SQLSTATE ")?;
+    (code.len() == 5
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()))
+    .then_some(code)
 }
 
 fn compacted_source_count(records: &[CompactedRequestCandidateRecord]) -> usize {

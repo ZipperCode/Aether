@@ -535,6 +535,21 @@ impl UpsertRequestCandidateRecord {
                 "request candidate upsert request_id cannot be empty".to_string(),
             ));
         }
+        for (field, value) in [
+            ("id", Some(self.id.as_str())),
+            ("request_id", Some(self.request_id.as_str())),
+            ("user_id", self.user_id.as_deref()),
+            ("api_key_id", self.api_key_id.as_deref()),
+            ("provider_id", self.provider_id.as_deref()),
+            ("endpoint_id", self.endpoint_id.as_deref()),
+            ("key_id", self.key_id.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.contains('\0')) {
+                return Err(crate::DataLayerError::InvalidInput(format!(
+                    "request candidate upsert {field} cannot contain NUL"
+                )));
+            }
+        }
         Ok(())
     }
 }

@@ -683,7 +683,7 @@ watch(
         cooldownTimer.value = null
       }
       codeDigits.value = ['', '', '', '', '', '']
-      resetTurnstile()
+      // Turnstile 校验的是当前操作，不与输入中的邮箱值绑定，编辑邮箱时保留现有挑战状态。
     }
 
     // 清除之前的定时器

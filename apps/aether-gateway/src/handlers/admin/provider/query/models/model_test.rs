@@ -727,7 +727,6 @@ fn provider_query_build_test_request_body_for_api_format_with_search_session(
             "model": model,
             "input": message,
             "max_output_tokens": 30,
-            "temperature": 0.7,
             "stream": true,
         }),
         "openai:search" => json!({
@@ -746,7 +745,6 @@ fn provider_query_build_test_request_body_for_api_format_with_search_session(
                 "content": message
             }],
             "max_tokens": 30,
-            "temperature": 0.7,
             "stream": true,
         }),
         _ => json!({
@@ -756,7 +754,6 @@ fn provider_query_build_test_request_body_for_api_format_with_search_session(
                 "content": message
             }],
             "max_tokens": 30,
-            "temperature": 0.7,
             "stream": true,
         }),
     }
@@ -903,7 +900,6 @@ fn provider_query_build_test_request_body_with_model_policy(
             "content": provider_query_extract_message(payload)
                 .unwrap_or_else(|| DEFAULT_PROVIDER_QUERY_TEST_MESSAGE.to_string())
         }],
-        "temperature": 0.7,
         "stream": true,
     })
 }
