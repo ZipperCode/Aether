@@ -201,6 +201,15 @@ impl<'a> AdminAppState<'a> {
             .await
     }
 
+    pub(crate) async fn compare_and_update_provider_catalog_key_admin_state(
+        &self,
+        update: &aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyAdminCasUpdate,
+    ) -> Result<bool, GatewayError> {
+        self.app
+            .compare_and_update_provider_catalog_key_admin_state(update)
+            .await
+    }
+
     pub(crate) async fn compare_and_update_provider_catalog_key_adaptive_state(
         &self,
         update: &aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyAdaptiveStateUpdate,
