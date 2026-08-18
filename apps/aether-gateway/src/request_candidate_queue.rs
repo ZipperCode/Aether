@@ -2514,7 +2514,7 @@ mod tests {
                 self.first_attempt.notify_one();
             }
             if self.failing.load(Ordering::Acquire) {
-                return Err(DataLayerError::UnexpectedValue(
+                return Err(DataLayerError::TimedOut(
                     "injected sustained request candidate failure".to_string(),
                 ));
             }
