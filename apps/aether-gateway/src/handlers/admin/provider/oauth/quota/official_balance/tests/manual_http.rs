@@ -40,6 +40,7 @@ async fn manual_bound_router_exposes_multi_key_official_quota_payload() {
                     candidate_id: None,
                     status_code: 429,
                     headers: BTreeMap::from([("retry-after".into(), "60".into())]),
+                    response_observation: None,
                     body: Some(ResponseBody {
                         json_body: Some(json!({"error":{"message":"Bearer must-not-leak\r\nX-Api-Key: hidden"}})),
                         body_bytes_b64: None,
@@ -53,6 +54,7 @@ async fn manual_bound_router_exposes_multi_key_official_quota_payload() {
                     candidate_id: None,
                     status_code: 200,
                     headers: BTreeMap::new(),
+                    response_observation: None,
                     body: Some(ResponseBody {
                         json_body: Some(json!({
                             "is_available": true,

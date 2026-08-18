@@ -3733,6 +3733,7 @@ mod tests {
                             "no_local_sync_plans".to_string(),
                         ),
                     ]),
+                    response_observation: None,
                     body: Some(aether_contracts::ResponseBody {
                         json_body: Some(json!({
                             "error": {"message": "unsupported endpoint format"}

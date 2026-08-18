@@ -675,6 +675,7 @@ mod tests {
             candidate_id: None,
             status_code: 429,
             headers: std::collections::BTreeMap::from([("Retry-After".into(), v.into())]),
+            response_observation: None,
             body: None,
             telemetry: None,
             error: None,

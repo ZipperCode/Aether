@@ -144,6 +144,7 @@ fn http_failure_uses_execution_headers_for_bounded_delta_and_date_retry_after() 
         candidate_id: None,
         status_code: 429,
         headers: BTreeMap::from([("Retry-After".into(), "60".into())]),
+        response_observation: None,
         body: None,
         telemetry: None,
         error: None,
@@ -200,6 +201,7 @@ fn http_200_business_error_preserves_zhipu_reason_instead_of_parse_failed() {
         candidate_id: None,
         status_code: 200,
         headers: BTreeMap::new(),
+        response_observation: None,
         body: Some(ResponseBody {
             json_body: Some(json!({
                 "code": 1315,
@@ -256,6 +258,7 @@ fn http_200_zhipu_business_auth_error_maps_to_unauthorized() {
         candidate_id: None,
         status_code: 200,
         headers: BTreeMap::new(),
+        response_observation: None,
         body: Some(ResponseBody {
             json_body: Some(json!({
                 "code": 1001,
@@ -296,6 +299,7 @@ fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
                 candidate_id: None,
                 status_code: 200,
                 headers: BTreeMap::new(),
+                response_observation: None,
                 body: Some(ResponseBody {
                     json_body: Some(json!({"code": code, "success": false})),
                     body_bytes_b64: None,
@@ -318,6 +322,7 @@ fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
             candidate_id: None,
             status_code: 200,
             headers: BTreeMap::new(),
+            response_observation: None,
             body: Some(ResponseBody {
                 json_body: Some(json!({"code": 1305, "success": false})),
                 body_bytes_b64: None,
@@ -336,6 +341,7 @@ fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
             candidate_id: None,
             status_code: 200,
             headers: BTreeMap::new(),
+            response_observation: None,
             body: Some(ResponseBody {
                 json_body: Some(json!({"success": true, "data": {"limits": []}})),
                 body_bytes_b64: None,
@@ -355,6 +361,7 @@ fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
             candidate_id: None,
             status_code: 200,
             headers: BTreeMap::new(),
+            response_observation: None,
             body: Some(ResponseBody {
                 json_body: Some(json!({"success": false})),
                 body_bytes_b64: None,
@@ -399,6 +406,7 @@ fn zhipu_business_500_retries_team_quota_then_uses_informational_balance() {
             candidate_id: None,
             status_code: 200,
             headers: BTreeMap::new(),
+            response_observation: None,
             body: Some(ResponseBody {
                 json_body: Some(json!({"code": 500, "success": false})),
                 body_bytes_b64: None,
@@ -455,6 +463,7 @@ fn zhipu_balance_kind_uses_standard_account_parser() {
         candidate_id: None,
         status_code: 200,
         headers: BTreeMap::new(),
+        response_observation: None,
         body: Some(ResponseBody {
             json_body: Some(json!({
                 "success": true,
@@ -495,6 +504,7 @@ fn zhipu_balance_business_1113_becomes_a_structured_insufficient_balance() {
             candidate_id: None,
             status_code: 200,
             headers: BTreeMap::new(),
+            response_observation: None,
             body: Some(ResponseBody {
                 json_body: Some(json!({"code": 1113, "success": false})),
                 body_bytes_b64: None,
@@ -522,6 +532,7 @@ fn zhipu_balance_fallback_keeps_balance_but_marks_missing_plan_as_exhausted() {
             candidate_id: None,
             status_code: 200,
             headers: BTreeMap::new(),
+            response_observation: None,
             body: Some(ResponseBody {
                 json_body: Some(json!({"code": 1309, "success": false})),
                 body_bytes_b64: None,
@@ -538,6 +549,7 @@ fn zhipu_balance_fallback_keeps_balance_but_marks_missing_plan_as_exhausted() {
             candidate_id: None,
             status_code: 200,
             headers: BTreeMap::new(),
+            response_observation: None,
             body: Some(ResponseBody {
                 json_body: Some(json!({
                     "success": true,

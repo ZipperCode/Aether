@@ -10682,6 +10682,7 @@ mod tests {
                             "no_local_stream_plans".to_string(),
                         ),
                     ]),
+                    response_observation: None,
                 },
             }));
             yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
@@ -10722,6 +10723,7 @@ mod tests {
             None,
             Some(&mut retry_scope),
             Some(&mut fallback_response),
+            None,
         )
         .await
         .expect("execution should classify the capability mismatch");

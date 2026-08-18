@@ -238,6 +238,7 @@ fn malformed_success_is_typed_parse_failure_and_secrets_are_never_exposed() {
         candidate_id: None,
         status_code: 200,
         headers: BTreeMap::new(),
+        response_observation: None,
         body: Some(ResponseBody {
             json_body: Some(json!({"error":{"message":malicious}})),
             body_bytes_b64: None,
