@@ -2618,7 +2618,7 @@ mod tests {
             {
                 match self.pending_attempts.fetch_add(1, Ordering::AcqRel) {
                     0 => {
-                        return Err(DataLayerError::UnexpectedValue(
+                        return Err(DataLayerError::TimedOut(
                             "injected pending batch failure".to_string(),
                         ));
                     }
@@ -2683,7 +2683,7 @@ mod tests {
                 .expect("batch recorder lock")
                 .push(candidates.clone());
             if self.fail_next_batch.swap(false, Ordering::AcqRel) {
-                return Err(DataLayerError::UnexpectedValue(
+                return Err(DataLayerError::TimedOut(
                     "injected request candidate batch failure".to_string(),
                 ));
             }
