@@ -3658,7 +3658,7 @@ mod tests {
 
         // 首次失败的退避上限是基础延迟；等待窗口结束后再验证阶段顺序。
         tokio::time::sleep(Duration::from_millis(
-            FAILED_FLUSH_RETRY_BASE_DELAY_MS.saturating_add(1),
+            super::FAILED_FLUSH_RETRY_BASE_DELAY_MS.saturating_add(1),
         ))
         .await;
         flush_batch(
