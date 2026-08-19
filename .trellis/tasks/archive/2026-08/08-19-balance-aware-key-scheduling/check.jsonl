@@ -1,0 +1,7 @@
+{"file":".trellis/spec/aether-provider-pool/backend/index.md","reason":"检查余额快照解析与边界测试"}
+{"file":".trellis/spec/aether-pool-core/backend/index.md","reason":"检查 Pool eligibility、sticky 和扫描预算一致性"}
+{"file":".trellis/spec/aether-scheduler-core/backend/index.md","reason":"检查普通候选运行态过滤合同"}
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"检查刷新、缓存失效及跨层接线"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"检查是否出现重复余额或 sticky 过滤逻辑"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"检查所有构造方、消费者和边界测试是否完整"}
+{"file":".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md","reason":"复核实现是否满足最终余额调度跨层合同"}

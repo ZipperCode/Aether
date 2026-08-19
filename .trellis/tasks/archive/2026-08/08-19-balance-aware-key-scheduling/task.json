@@ -1,0 +1,28 @@
+{
+  "id": "balance-aware-key-scheduling",
+  "name": "balance-aware-key-scheduling",
+  "title": "额度感知 Key 调度与调度审查",
+  "description": "自动跳过并恢复低余额 Key，修复 sticky/刷新/缓存路径，并形成全局调度审查结论。",
+  "status": "completed",
+  "dev_type": null,
+  "scope": "aether-provider-pool,aether-pool-core,aether-scheduler-core,aether-gateway",
+  "package": "aether-gateway",
+  "priority": "P1",
+  "creator": "zipper",
+  "assignee": "zipper",
+  "createdAt": "2026-08-19",
+  "completedAt": "2026-08-19",
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "08-19-atomic-admission-accounting"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

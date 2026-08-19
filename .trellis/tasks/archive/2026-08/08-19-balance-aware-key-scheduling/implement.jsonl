@@ -1,0 +1,7 @@
+{"file":".trellis/spec/aether-provider-pool/backend/index.md","reason":"余额快照合同与统一解析逻辑所属包规范"}
+{"file":".trellis/spec/aether-pool-core/backend/index.md","reason":"Pool eligibility、skip reason 与扫描预算所属包规范"}
+{"file":".trellis/spec/aether-scheduler-core/backend/index.md","reason":"普通候选运行态过滤合同所属包规范"}
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"刷新、缓存、sticky 与组合根实现规范"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"余额判断与 sticky 过滤必须复用单一共享实现"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"余额事实跨 provider、pool、scheduler 和 gateway 的传递约束"}
+{"file":".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md","reason":"本任务形成的余额 eligibility、sticky、刷新与缓存权威合同"}
