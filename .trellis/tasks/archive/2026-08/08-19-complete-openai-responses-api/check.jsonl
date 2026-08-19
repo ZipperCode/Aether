@@ -1,0 +1,7 @@
+{"file":".trellis/tasks/08-19-complete-openai-responses-api/research/current-gap.md","reason":"复核 Codex HTTP create、compact、SSE、错误语义与 WebSocket 排除决定"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"检查 create 与 compact 是否复用既有受控机制且未复制 planner、URL 或响应逻辑"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"检查认证、准入、provider 选择、create/compact、错误、SSE 和 usage 边界是否全部闭环"}
+{"file":".trellis/spec/aether-ai-formats/backend/index.md","reason":"检查同格式保留与跨格式 fail-closed 契约未被 inventory allowlist 破坏"}
+{"file":".trellis/spec/aether-provider-transport/backend/index.md","reason":"检查 create/compact URL、body、header、上游错误与凭证隔离"}
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"检查 create/compact 两条路由的 control/auth/admission/finalize/usage 回归证据"}
+{"file": ".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md", "reason": "Review Codex HTTP passthrough, fail-closed, credential, error, and no-persistence boundaries"}

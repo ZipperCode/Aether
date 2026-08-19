@@ -1,0 +1,7 @@
+{"file":".trellis/tasks/08-19-complete-openai-responses-api/research/current-gap.md","reason":"Codex HTTP create/compact、当前调用链、差距矩阵与用户范围决策的实施基线"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"复用现有 passthrough plan、Responses create/compact transport 与响应路径，避免端点级重复实现"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"约束 create/compact route、control、auth、admission、provider、response、SSE 与 usage 的端到端数据流"}
+{"file":".trellis/spec/aether-ai-formats/backend/index.md","reason":"Responses 格式身份、canonical fail-closed 与同格式未知字段边界所属包规范"}
+{"file":".trellis/spec/aether-provider-transport/backend/index.md","reason":"受控上游 URL、method、query、body 和 provider 原生透传所属包规范"}
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"公共路由、控制分类、执行计划、响应终态与 usage 接线所属包规范"}
+{"file": ".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md", "reason": "Codex HTTP create/compact/SSE relay scope and executable compatibility contract"}
