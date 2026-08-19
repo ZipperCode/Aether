@@ -3,8 +3,8 @@ use super::routing::retry_after_eligibility;
 use crate::{handlers::admin::request::AdminAppState, GatewayError};
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_provider_pool::{
-    official_balance_backoff_with_jitter_secs, ProviderQuotaRefreshState,
-    ProviderQuotaSnapshotContract, ProviderQuotaSnapshotKind,
+    official_balance_backoff_with_jitter_secs, provider_pool_key_balance_below_minimum,
+    ProviderQuotaRefreshState, ProviderQuotaSnapshotContract, ProviderQuotaSnapshotKind,
     PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION, ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD,
 };
 use serde_json::{json, Value};
@@ -39,15 +39,22 @@ impl SubscriptionRoutingState {
     }
 }
 
+/// 持久化额度尝试，并仅在调度 eligibility 发生变化时失效候选缓存。
 pub(super) async fn persist_attempt(
     state: &AdminAppState<'_>,
     update: SnapshotUpdate<'_>,
 ) -> Result<PersistedSnapshot, GatewayError> {
     let key_id = update.key.id.clone();
     let now_unix_secs = update.now_unix_secs;
-    let invalidation_scope = quota_cache_invalidation_scope(&update);
-    let persisted = build_persisted_snapshot(update)
-        .map_err(|class| GatewayError::Internal(class.persisted_error()))?;
+    let persisted = build_persisted_snapshot(SnapshotUpdate {
+        key: update.key,
+        provider_type: update.provider_type,
+        attempt: update.attempt,
+        now_unix_secs: update.now_unix_secs,
+    })
+    .map_err(|class| GatewayError::Internal(class.persisted_error()))?;
+    let invalidation_scope =
+        quota_cache_invalidation_scope_for_snapshot(&update, &persisted.snapshot);
     let updated = state
         .mutate_provider_catalog_key_quota_snapshot(
             &key_id,
@@ -66,17 +73,43 @@ pub(super) async fn persist_attempt(
     Ok(persisted)
 }
 
+/// 计算额度写入的缓存失效范围；测试与非持久化调用复用实际快照装饰结果。
 pub(super) fn quota_cache_invalidation_scope(
     update: &SnapshotUpdate<'_>,
+) -> QuotaCacheInvalidationScope {
+    let Ok(persisted) = build_persisted_snapshot(SnapshotUpdate {
+        key: update.key,
+        provider_type: update.provider_type,
+        attempt: update.attempt,
+        now_unix_secs: update.now_unix_secs,
+    }) else {
+        return QuotaCacheInvalidationScope::CatalogOnly;
+    };
+    quota_cache_invalidation_scope_for_snapshot(update, &persisted.snapshot)
+}
+
+/// 比较写入前后的调度事实；余额 low/active/stale 只要跨越 eligibility 就失效路由缓存。
+fn quota_cache_invalidation_scope_for_snapshot(
+    update: &SnapshotUpdate<'_>,
+    next_snapshot: &Value,
 ) -> QuotaCacheInvalidationScope {
     let Some(quota_kind) = update.attempt.quota_kind() else {
         return QuotaCacheInvalidationScope::CatalogOnly;
     };
     match quota_kind {
         QuotaKind::Balance => {
+            let balance_eligibility_changed =
+                provider_pool_key_balance_below_minimum(update.key, update.provider_type)
+                    != balance_below_minimum_for_snapshot(
+                        update.key,
+                        update.provider_type,
+                        next_snapshot,
+                    );
             let previous = subscription_routing_state(typed_snapshot(update.key).as_ref());
             let next = subscription_routing_state_for_attempt(update.attempt, previous);
-            if next == SubscriptionRoutingState::Exhausted && previous != next {
+            if balance_eligibility_changed
+                || (next == SubscriptionRoutingState::Exhausted && previous != next)
+            {
                 QuotaCacheInvalidationScope::CandidateRouting
             } else {
                 QuotaCacheInvalidationScope::CatalogOnly
@@ -92,6 +125,17 @@ pub(super) fn quota_cache_invalidation_scope(
             }
         }
     }
+}
+
+/// 将待写入 quota 快照放入临时 Key，通过共享 helper 计算下一状态，避免复制余额解析规则。
+fn balance_below_minimum_for_snapshot(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    quota_snapshot: &Value,
+) -> bool {
+    let mut next_key = key.clone();
+    next_key.status_snapshot = Some(json!({"quota": quota_snapshot}));
+    provider_pool_key_balance_below_minimum(&next_key, provider_type)
 }
 
 fn subscription_routing_state(

@@ -5,6 +5,7 @@ use aether_admin::provider::{
 };
 use aether_data_contracts::repository::candidates::StoredRequestCandidate;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
+use aether_provider_pool::provider_pool_key_balance_below_minimum;
 use aether_scheduler_core::{
     auth_api_key_concurrency_limit_reached, build_provider_concurrent_limit_map,
     candidate_is_selectable_with_runtime_state, candidate_runtime_skip_reason_with_state,
@@ -26,10 +27,13 @@ pub(super) struct CandidateRuntimeSelectionSnapshot {
     pub(super) pool_provider_ids: BTreeSet<String>,
     provider_quota_blocks_requests: BTreeMap<String, bool>,
     key_account_quota_exhausted: BTreeMap<String, bool>,
+    /// 真实 Key 的标准余额是否明确低于内部调度下限。
+    key_balance_below_minimum: BTreeMap<String, bool>,
     key_oauth_invalid: BTreeMap<String, bool>,
     provider_key_rpm_reset_ats: BTreeMap<String, Option<u64>>,
 }
 
+/// 一次性读取候选准入所需运行态，确保排序和最终诊断消费同一余额事实。
 pub(super) async fn read_candidate_runtime_selection_snapshot(
     state: &(impl SchedulerRuntimeState + ?Sized),
     candidates: &[SchedulerMinimalCandidateSelectionCandidate],
@@ -62,6 +66,8 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         &provider_key_rpm_states,
         &provider_skip_exhausted_accounts,
     );
+    let key_balance_below_minimum =
+        read_key_balance_below_minimum_map(candidates, &provider_key_rpm_states);
     let key_oauth_invalid =
         read_key_oauth_invalid_map(candidates, &provider_key_rpm_states, now_unix_secs);
     let provider_quota_blocks_requests =
@@ -76,6 +82,7 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         pool_provider_ids,
         provider_quota_blocks_requests,
         key_account_quota_exhausted,
+        key_balance_below_minimum,
         key_oauth_invalid,
         provider_key_rpm_reset_ats,
     })
@@ -130,6 +137,7 @@ pub(super) fn auth_snapshot_concurrency_limit_reached(
         })
 }
 
+/// 判断普通候选当前是否可调度；PoolGroup 代表候选不继承其占位 Key 的余额事实。
 pub(super) fn is_candidate_selectable(
     candidate: &SchedulerMinimalCandidateSelectionCandidate,
     snapshot: &CandidateRuntimeSelectionSnapshot,
@@ -155,6 +163,12 @@ pub(super) fn is_candidate_selectable(
                 .get(candidate.key_id.as_str())
                 .copied()
                 .unwrap_or(false),
+        balance_below_minimum: !pool_group
+            && snapshot
+                .key_balance_below_minimum
+                .get(candidate.key_id.as_str())
+                .copied()
+                .unwrap_or(false),
         oauth_invalid: !pool_group
             && snapshot
                 .key_oauth_invalid
@@ -174,6 +188,7 @@ pub(super) fn is_candidate_selectable(
     })
 }
 
+/// 返回与准入判断一致的诊断原因，PoolGroup 的真实 Key 留在 Pool 展开阶段过滤。
 pub(super) fn current_candidate_runtime_skip_reason(
     candidate: &SchedulerMinimalCandidateSelectionCandidate,
     snapshot: &CandidateRuntimeSelectionSnapshot,
@@ -207,6 +222,12 @@ pub(super) fn current_candidate_runtime_skip_reason(
         account_quota_exhausted: !pool_group
             && snapshot
                 .key_account_quota_exhausted
+                .get(candidate.key_id.as_str())
+                .copied()
+                .unwrap_or(false),
+        balance_below_minimum: !pool_group
+            && snapshot
+                .key_balance_below_minimum
                 .get(candidate.key_id.as_str())
                 .copied()
                 .unwrap_or(false),
@@ -358,6 +379,24 @@ fn read_key_account_quota_exhaustion_map(
         .collect()
 }
 
+/// 从目录 Key 构建独立余额事实；PoolGroup 代表 Key 是否应用该事实由统一准入层决定。
+fn read_key_balance_below_minimum_map(
+    candidates: &[SchedulerMinimalCandidateSelectionCandidate],
+    provider_key_rpm_states: &BTreeMap<String, StoredProviderCatalogKey>,
+) -> BTreeMap<String, bool> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            let below_minimum = provider_key_rpm_states
+                .get(candidate.key_id.as_str())
+                .is_some_and(|key| {
+                    provider_pool_key_balance_below_minimum(key, candidate.provider_type.as_str())
+                });
+            (candidate.key_id.clone(), below_minimum)
+        })
+        .collect()
+}
+
 fn read_key_oauth_invalid_map(
     candidates: &[SchedulerMinimalCandidateSelectionCandidate],
     provider_key_rpm_states: &BTreeMap<String, StoredProviderCatalogKey>,
@@ -481,4 +520,92 @@ fn read_provider_key_rpm_reset_at_map(
             )
         })
         .collect::<BTreeMap<_, _>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 构造覆盖普通候选与 PoolGroup 代表候选的最小调度事实。
+    fn sample_candidate() -> SchedulerMinimalCandidateSelectionCandidate {
+        SchedulerMinimalCandidateSelectionCandidate {
+            provider_id: "provider-1".to_string(),
+            provider_name: "DeepSeek".to_string(),
+            provider_type: "deepseek".to_string(),
+            provider_priority: 0,
+            endpoint_id: "endpoint-1".to_string(),
+            endpoint_api_format: "openai:chat".to_string(),
+            key_id: "key-1".to_string(),
+            key_name: "key-1".to_string(),
+            key_auth_type: "api_key".to_string(),
+            key_internal_priority: 0,
+            key_global_priority_for_format: None,
+            key_capabilities: None,
+            model_id: "model-1".to_string(),
+            global_model_id: "global-model-1".to_string(),
+            global_model_name: "deepseek-chat".to_string(),
+            selected_provider_model_name: "deepseek-chat".to_string(),
+            supports_streaming: true,
+            mapping_matched_model: None,
+        }
+    }
+
+    /// 构造 fresh 且余额恰好等于内部下限的目录 Key。
+    fn low_balance_key() -> StoredProviderCatalogKey {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "key-1".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "schema_version": 1,
+                "provider_type": "deepseek",
+                "kind": "balance",
+                "freshness": "fresh",
+                "balances": [{"unit": "CNY", "available": "1"}]
+            }
+        }));
+        key
+    }
+
+    #[test]
+    fn runtime_balance_fact_blocks_real_key_but_not_pool_group_representative() {
+        // 验证普通 Key 消费余额事实，而 PoolGroup 留给展开后的真实 Key 过滤。
+        let candidate = sample_candidate();
+        let key = low_balance_key();
+        let provider_key_rpm_states = BTreeMap::from([(key.id.clone(), key)]);
+        let key_balance_below_minimum = read_key_balance_below_minimum_map(
+            std::slice::from_ref(&candidate),
+            &provider_key_rpm_states,
+        );
+        let mut snapshot = CandidateRuntimeSelectionSnapshot {
+            recent_candidates: Vec::new(),
+            provider_concurrent_limits: BTreeMap::new(),
+            provider_key_rpm_states,
+            pool_provider_ids: BTreeSet::new(),
+            provider_quota_blocks_requests: BTreeMap::new(),
+            key_account_quota_exhausted: BTreeMap::new(),
+            key_balance_below_minimum,
+            key_oauth_invalid: BTreeMap::new(),
+            provider_key_rpm_reset_ats: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+            Some("key_balance_below_minimum")
+        );
+        snapshot
+            .pool_provider_ids
+            .insert(candidate.provider_id.clone());
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+            None
+        );
+    }
 }

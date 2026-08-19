@@ -67,7 +67,7 @@ use aether_model_fetch::{
     preset_models_for_provider, selected_models_fetch_endpoints,
 };
 use aether_pool_core::PoolSchedulingPreset;
-use aether_provider_pool::ProviderPoolService;
+use aether_provider_pool::{provider_pool_key_balance_below_minimum, ProviderPoolService};
 use aether_scheduler_core::provider_key_circuit_payload_is_active_open_at;
 use axum::{
     body::{to_bytes, Body},
@@ -1392,6 +1392,8 @@ fn provider_query_pool_catalog_key_context(
             provider_type,
             quota_snapshot,
         ),
+        // 模型测试调度与正式请求共用同一余额事实，避免管理端测试命中低余额 Key。
+        balance_below_minimum: provider_pool_key_balance_below_minimum(key, provider_type),
         health_score,
         latency_avg_ms,
         catalog_lru_score: Some(key.last_used_at_unix_secs.unwrap_or(0) as f64),

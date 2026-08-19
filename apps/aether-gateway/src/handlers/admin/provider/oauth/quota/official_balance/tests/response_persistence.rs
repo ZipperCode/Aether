@@ -6,6 +6,25 @@ fn subscription(exhausted: bool) -> ProviderQuotaSnapshotContract {
     snapshot
 }
 
+/// 构造带 freshness 的标准余额快照，供缓存 eligibility 转换测试复用。
+fn balance(available: &str, freshness: &str) -> ProviderQuotaSnapshotContract {
+    let mut snapshot = ProviderQuotaSnapshotContract::balance(
+        "deepseek",
+        vec![aether_provider_pool::ProviderQuotaBalance {
+            unit: "CNY".to_string(),
+            available: Some(available.to_string()),
+            total: None,
+            granted: None,
+            topped_up: None,
+            used: None,
+        }],
+    );
+    snapshot
+        .extensions
+        .insert("freshness".to_string(), json!(freshness));
+    snapshot
+}
+
 #[test]
 fn balance_cache_scope_is_catalog_only() {
     // Given
@@ -26,6 +45,80 @@ fn balance_cache_scope_is_catalog_only() {
 
     // Then
     assert_eq!(scope, QuotaCacheInvalidationScope::CatalogOnly);
+}
+
+#[test]
+fn balance_cache_scope_invalidates_fresh_low_to_fresh_active() {
+    // 验证余额恢复后立即清除候选缓存，使 Key 自动重新加入调度。
+    let key = key(
+        "key-1",
+        "Low balance",
+        Some(serde_json::to_value(balance("1", "fresh")).expect("low snapshot")),
+    );
+    let attempt = AttemptResult::Success {
+        snapshot: balance("1.0001", "fresh"),
+        status_code: 200,
+        quota_kind: QuotaKind::Balance,
+    };
+
+    assert_eq!(
+        quota_cache_invalidation_scope(&SnapshotUpdate {
+            key: &key,
+            provider_type: "deepseek",
+            attempt: &attempt,
+            now_unix_secs: 100,
+        }),
+        QuotaCacheInvalidationScope::CandidateRouting
+    );
+}
+
+#[test]
+fn balance_cache_scope_invalidates_fresh_low_to_stale() {
+    // 验证刷新失败后的 stale 快照 fail-open，并立即清除旧低余额候选缓存。
+    let key = key(
+        "key-1",
+        "Low balance",
+        Some(serde_json::to_value(balance("1", "fresh")).expect("low snapshot")),
+    );
+    let attempt = AttemptResult::TransportFailure {
+        class: StableErrorClass::TransportFailed,
+        quota_kind: Some(QuotaKind::Balance),
+    };
+
+    assert_eq!(
+        quota_cache_invalidation_scope(&SnapshotUpdate {
+            key: &key,
+            provider_type: "deepseek",
+            attempt: &attempt,
+            now_unix_secs: 100,
+        }),
+        QuotaCacheInvalidationScope::CandidateRouting
+    );
+}
+
+#[test]
+fn balance_cache_scope_keeps_unchanged_low_state_catalog_only() {
+    // 验证 low→low 不重复失效候选缓存，仅刷新目录展示数据。
+    let key = key(
+        "key-1",
+        "Low balance",
+        Some(serde_json::to_value(balance("1", "fresh")).expect("low snapshot")),
+    );
+    let attempt = AttemptResult::Success {
+        snapshot: balance("0.5", "fresh"),
+        status_code: 200,
+        quota_kind: QuotaKind::Balance,
+    };
+
+    assert_eq!(
+        quota_cache_invalidation_scope(&SnapshotUpdate {
+            key: &key,
+            provider_type: "deepseek",
+            attempt: &attempt,
+            now_unix_secs: 100,
+        }),
+        QuotaCacheInvalidationScope::CatalogOnly
+    );
 }
 
 #[test]

@@ -4,6 +4,8 @@ use std::hash::{Hash, Hasher};
 
 pub const POOL_ACCOUNT_BLOCKED_SKIP_REASON: &str = "pool_account_blocked";
 pub const POOL_ACCOUNT_EXHAUSTED_SKIP_REASON: &str = "pool_account_exhausted";
+/// Pool 真实 Key 因标准余额明确不高于内部下限而被跳过。
+pub const POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON: &str = "pool_balance_below_minimum";
 pub const POOL_COOLDOWN_SKIP_REASON: &str = "pool_cooldown";
 pub const POOL_COST_LIMIT_REACHED_SKIP_REASON: &str = "pool_cost_limit_reached";
 
@@ -38,6 +40,8 @@ pub struct PoolMemberSignals {
     pub quota_reset_seconds: Option<f64>,
     pub account_blocked: bool,
     pub quota_exhausted: bool,
+    /// 标准余额快照明确为 fresh 且所有可用余额都不高于内部下限。
+    pub balance_below_minimum: bool,
     pub health_score: Option<f64>,
     pub latency_avg_ms: Option<f64>,
     pub catalog_lru_score: Option<f64>,
@@ -192,6 +196,7 @@ fn pool_candidate_group_id(group_key: &PoolGroupKey) -> String {
     )
 }
 
+/// 对单个 Pool 的真实 Key 应用硬过滤与排序，并保留每个被跳过 Key 的诊断原因。
 fn schedule_pool_group<Candidate>(
     group: Vec<PoolCandidateInput<Candidate>>,
     pool_config: &PoolSchedulingConfig,
@@ -228,6 +233,15 @@ fn schedule_pool_group<Candidate>(
             skipped.push(PoolSkippedCandidate {
                 candidate: item.candidate,
                 skip_reason: POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
+            });
+            continue;
+        }
+
+        // 余额不足是独立运行态事实，不继承订阅额度的显式开关。
+        if item.key_context.balance_below_minimum {
+            skipped.push(PoolSkippedCandidate {
+                candidate: item.candidate,
+                skip_reason: POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON,
             });
             continue;
         }
@@ -898,6 +912,46 @@ mod tests {
                 ("key-cooldown", "pool_cooldown"),
                 ("key-cost", "pool_cost_limit_reached"),
             ]
+        );
+    }
+
+    #[test]
+    fn pool_scheduler_always_skips_keys_with_low_balance() {
+        // 验证余额事实不依赖订阅额度开关，并保留可调度 Key。
+        let ready = sample_candidate("provider-pool", "endpoint-1", "key-ready", 10, true);
+        let mut low = sample_candidate("provider-pool", "endpoint-1", "key-low", 10, true);
+        low.key_context.balance_below_minimum = true;
+
+        let outcome = run_pool_scheduler(vec![low, ready], &BTreeMap::new(), "seed");
+
+        assert_eq!(outcome.candidates[0].candidate, "key-ready");
+        assert_eq!(outcome.skipped_candidates.len(), 1);
+        assert_eq!(
+            outcome.skipped_candidates[0].skip_reason,
+            POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON
+        );
+    }
+
+    #[test]
+    fn pool_scheduler_keeps_subscription_exhaustion_behind_existing_switch() {
+        // 验证新增余额事实不会改变订阅额度的显式开关合同。
+        let mut allowed = sample_candidate("provider-pool", "endpoint-1", "key-allowed", 10, true);
+        allowed.key_context.quota_exhausted = true;
+        let allowed_outcome = run_pool_scheduler(vec![allowed], &BTreeMap::new(), "seed");
+        assert_eq!(allowed_outcome.candidates.len(), 1);
+
+        let mut blocked = sample_candidate("provider-pool", "endpoint-1", "key-blocked", 10, true);
+        blocked.key_context.quota_exhausted = true;
+        blocked
+            .pool_config
+            .as_mut()
+            .expect("pool config")
+            .skip_exhausted_accounts = true;
+        let blocked_outcome = run_pool_scheduler(vec![blocked], &BTreeMap::new(), "seed");
+        assert_eq!(blocked_outcome.candidates.len(), 0);
+        assert_eq!(
+            blocked_outcome.skipped_candidates[0].skip_reason,
+            POOL_ACCOUNT_EXHAUSTED_SKIP_REASON
         );
     }
 

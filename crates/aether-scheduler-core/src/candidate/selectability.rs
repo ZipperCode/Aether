@@ -28,6 +28,8 @@ pub struct CandidateRuntimeSelectabilityInput<'a> {
     pub now_unix_secs: u64,
     pub provider_quota_blocks_requests: bool,
     pub account_quota_exhausted: bool,
+    /// 标准余额快照明确低于内部调度下限；该事实不受订阅额度开关控制。
+    pub balance_below_minimum: bool,
     pub oauth_invalid: bool,
     pub enforce_key_circuit_breaker: bool,
     pub rpm_reset_at: Option<u64>,
@@ -39,6 +41,7 @@ pub fn candidate_is_selectable_with_runtime_state(
     candidate_runtime_skip_reason_with_state(input).is_none()
 }
 
+/// 按统一优先级返回候选运行态阻断原因，余额不足与订阅耗尽保持独立诊断。
 pub fn candidate_runtime_skip_reason_with_state(
     input: CandidateRuntimeSelectabilityInput<'_>,
 ) -> Option<&'static str> {
@@ -50,6 +53,7 @@ pub fn candidate_runtime_skip_reason_with_state(
         now_unix_secs,
         provider_quota_blocks_requests,
         account_quota_exhausted,
+        balance_below_minimum,
         oauth_invalid,
         enforce_key_circuit_breaker,
         rpm_reset_at,
@@ -60,6 +64,10 @@ pub fn candidate_runtime_skip_reason_with_state(
     }
     if account_quota_exhausted {
         return Some("account_quota_exhausted");
+    }
+    // 余额事实独立于订阅 exhaustion，确保关闭旧开关时仍能保护低余额 Key。
+    if balance_below_minimum {
+        return Some("key_balance_below_minimum");
     }
     if oauth_invalid {
         return Some("oauth_invalid");

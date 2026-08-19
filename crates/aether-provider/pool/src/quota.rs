@@ -7,6 +7,9 @@ use crate::provider::ProviderPoolMemberInput;
 use crate::quota_snapshot::ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD;
 use crate::service::ProviderPoolService;
 
+/// 标准余额快照的固定内部调度下限；各币种独立比较，不做汇率换算。
+const PROVIDER_POOL_MINIMUM_SCHEDULABLE_BALANCE: f64 = 1.0;
+
 pub fn provider_pool_key_account_quota_exhausted(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
@@ -16,6 +19,55 @@ pub fn provider_pool_key_account_quota_exhausted(
         provider_type,
         key,
         auth_config: None,
+    })
+}
+
+/// 判断 Key 的标准余额快照是否明确低于可调度下限。
+///
+/// 只有 fresh、非无限额度、余额非空且每项单位和有限数值都有效时才会阻断；
+/// 任何未知或陈旧输入均放行，避免上游刷新失败后永久饿死 Key。
+pub fn provider_pool_key_balance_below_minimum(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+) -> bool {
+    let Some(quota_snapshot) = provider_pool_member_quota_snapshot(key, provider_type) else {
+        return false;
+    };
+    if !quota_snapshot
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("balance"))
+        || !quota_snapshot
+            .get("freshness")
+            .and_then(Value::as_str)
+            .is_some_and(|freshness| freshness.trim().eq_ignore_ascii_case("fresh"))
+    {
+        return false;
+    }
+    if quota_snapshot
+        .get("unlimited")
+        .is_some_and(|value| provider_pool_json_bool(Some(value)) != Some(false))
+    {
+        return false;
+    }
+
+    let Some(balances) = quota_snapshot
+        .get("balances")
+        .and_then(Value::as_array)
+        .filter(|balances| !balances.is_empty())
+    else {
+        return false;
+    };
+    balances.iter().all(|balance| {
+        let Some(balance) = balance.as_object() else {
+            return false;
+        };
+        balance
+            .get("unit")
+            .and_then(Value::as_str)
+            .is_some_and(|unit| !unit.trim().is_empty())
+            && provider_pool_json_f64(balance.get("available"))
+                .is_some_and(|available| available <= PROVIDER_POOL_MINIMUM_SCHEDULABLE_BALANCE)
     })
 }
 

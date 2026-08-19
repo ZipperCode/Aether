@@ -19,6 +19,9 @@ use crate::admin_api::{
     provider_quota_serving_policy, provider_type_supports_quota_refresh,
     refresh_provider_pool_quota_locally, AdminAppState, QuotaRefreshSource,
 };
+use crate::handlers::shared::provider_pool::{
+    admin_provider_pool_config_from_config_value, AdminProviderPoolConfig,
+};
 use crate::{AppState, GatewayError};
 
 const ACCOUNT_SELF_CHECK_REDIS_PREFIX: &str = "ap:account_self_check:last";
@@ -693,6 +696,24 @@ fn update_summary_from_outcome(
     }
 }
 
+/// 解析账户自检配置；ObservationOnly 余额提供商默认启用，其他策略仍遵循显式开关。
+fn account_self_check_config_for_provider(
+    provider: &StoredProviderCatalogProvider,
+    provider_type: &str,
+) -> Option<AdminProviderPoolConfig> {
+    let pool_config = admin_provider_pool_config(provider);
+    if matches!(
+        provider_quota_serving_policy(provider_type),
+        Some(ProviderQuotaServingPolicy::ObservationOnly)
+    ) {
+        return pool_config.or_else(|| {
+            admin_provider_pool_config_from_config_value(Some(&json!({"pool_advanced": {}})))
+        });
+    }
+    pool_config.filter(|config| config.account_self_check_enabled)
+}
+
+/// 执行一轮账户自检；低余额 Key 仍按原周期刷新，以便余额恢复后自动重新准入。
 pub(crate) async fn perform_account_self_check_once_with_config(
     state: &AppState,
     config: AccountSelfCheckWorkerConfig,
@@ -707,12 +728,9 @@ pub(crate) async fn perform_account_self_check_once_with_config(
         .into_iter()
         .filter_map(|provider| {
             let provider_type = provider.provider_type.trim().to_ascii_lowercase();
-            let pool_config = admin_provider_pool_config(&provider)?;
-            if pool_config.account_self_check_enabled {
-                Some((provider, provider_type, pool_config))
-            } else {
-                None
-            }
+            let pool_config =
+                account_self_check_config_for_provider(&provider, provider_type.as_str())?;
+            Some((provider, provider_type, pool_config))
         })
         .collect::<Vec<_>>();
 
@@ -897,9 +915,9 @@ pub(crate) fn spawn_account_self_check_worker(
 #[cfg(test)]
 mod tests {
     use super::{
-        quota_payload_result_for_key, record_score_probe_result_for_key,
-        select_account_self_check_key_ids, update_summary_from_outcome, AccountSelfCheckOutcome,
-        AccountSelfCheckRunSummary,
+        account_self_check_config_for_provider, quota_payload_result_for_key,
+        record_score_probe_result_for_key, select_account_self_check_key_ids,
+        update_summary_from_outcome, AccountSelfCheckOutcome, AccountSelfCheckRunSummary,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -911,9 +929,103 @@ mod tests {
         GetPoolMemberScoresByIdsQuery, PoolMemberHardState, PoolMemberProbeStatus,
         StoredPoolMemberScore,
     };
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
     use aether_provider_pool::ProviderQuotaServingPolicy;
 
     use crate::{data::GatewayDataState, AppState};
+
+    /// 构造账户自检策略测试所需的最小 Provider。
+    fn provider(
+        provider_type: &str,
+        config: Option<serde_json::Value>,
+    ) -> StoredProviderCatalogProvider {
+        let mut provider = StoredProviderCatalogProvider::new(
+            format!("provider-{provider_type}"),
+            provider_type.to_string(),
+            None,
+            provider_type.to_string(),
+        )
+        .expect("provider should build");
+        provider.config = config;
+        provider
+    }
+
+    #[test]
+    fn observation_only_provider_self_check_is_automatic_with_existing_defaults() {
+        // 验证余额观察型 Provider 无需手工开关，且保留自定义周期和并发。
+        let defaults =
+            account_self_check_config_for_provider(&provider("deepseek", None), "deepseek")
+                .expect("observation-only provider should enable self-check");
+        assert_eq!(defaults.account_self_check_interval_minutes, 60);
+        assert_eq!(defaults.account_self_check_concurrency, 4);
+
+        let configured = account_self_check_config_for_provider(
+            &provider(
+                "deepseek",
+                Some(json!({
+                    "pool_advanced": {
+                        "account_self_check_enabled": false,
+                        "account_self_check_interval_minutes": 90,
+                        "account_self_check_concurrency": 5
+                    }
+                })),
+            ),
+            "deepseek",
+        )
+        .expect("observation-only provider should keep configured cadence");
+        assert_eq!(configured.account_self_check_interval_minutes, 90);
+        assert_eq!(configured.account_self_check_concurrency, 5);
+
+        assert!(account_self_check_config_for_provider(
+            &provider("codex", Some(json!({"pool_advanced": {}}))),
+            "codex"
+        )
+        .is_none());
+        assert!(account_self_check_config_for_provider(
+            &provider(
+                "codex",
+                Some(json!({
+                    "pool_advanced": {"account_self_check_enabled": true}
+                })),
+            ),
+            "codex"
+        )
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn observation_only_failure_does_not_write_pool_hard_state() {
+        // 验证余额查询失败只保留 stale 快照语义，不写 Pool cooldown 或 hard-state。
+        let repository = Arc::new(InMemoryPoolMemberScoreRepository::seed([]));
+        let state = AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_pool_score_repository_for_tests(Arc::clone(&repository)),
+            );
+
+        record_score_probe_result_for_key(
+            &state,
+            "provider-deepseek",
+            "key-1",
+            100,
+            &AccountSelfCheckOutcome::Failed {
+                status_code: Some(503),
+                message: "upstream unavailable".to_string(),
+            },
+            ProviderQuotaServingPolicy::ObservationOnly,
+        )
+        .await;
+
+        let scores = state
+            .data
+            .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+                ids: vec!["score-key-1".to_string()],
+            })
+            .await
+            .expect("score lookup should succeed");
+        assert!(scores.is_empty());
+    }
 
     #[test]
     fn quota_backoff_is_skipped_and_never_failed() {

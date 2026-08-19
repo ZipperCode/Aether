@@ -9,8 +9,9 @@ use crate::capability::{
 };
 use crate::plan::{derive_plan_tier, normalize_provider_plan_tier};
 use crate::quota::{
-    provider_pool_account_blocked, provider_pool_quota_reset_seconds,
-    provider_pool_quota_snapshot_exhausted_decision, provider_pool_quota_usage_ratio,
+    provider_pool_account_blocked, provider_pool_key_balance_below_minimum,
+    provider_pool_quota_reset_seconds, provider_pool_quota_snapshot_exhausted_decision,
+    provider_pool_quota_usage_ratio,
 };
 
 #[derive(Debug, Clone)]
@@ -64,6 +65,7 @@ pub trait ProviderPoolAdapter: Send + Sync {
         normalize_provider_plan_tier(value, self.provider_type())
     }
 
+    /// 汇总 Pool 调度所需的目录事实，余额解析统一委托给 provider-pool。
     fn member_signals(&self, input: &ProviderPoolMemberInput<'_>) -> PoolMemberSignals {
         PoolMemberSignals {
             plan_tier: derive_plan_tier(input.provider_type, input.key, input.auth_config),
@@ -71,6 +73,10 @@ pub trait ProviderPoolAdapter: Send + Sync {
             quota_reset_seconds: provider_pool_quota_reset_seconds(input.key),
             account_blocked: provider_pool_account_blocked(input.key),
             quota_exhausted: self.quota_exhausted(input),
+            balance_below_minimum: provider_pool_key_balance_below_minimum(
+                input.key,
+                input.provider_type,
+            ),
             ..PoolMemberSignals::default()
         }
     }

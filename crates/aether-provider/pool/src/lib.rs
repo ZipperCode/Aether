@@ -53,9 +53,10 @@ pub use providers::{
     OfficialApiKeyQuotaProviderPoolAdapter, ZHIPU_ACCOUNT_REPORT_URL, ZHIPU_TEAM_QUOTA_URL,
 };
 pub use quota::{
-    provider_pool_key_account_quota_exhausted, provider_pool_key_scheduling_label,
-    provider_pool_member_quota_snapshot, provider_pool_quota_metadata_provider_type,
-    provider_pool_quota_metadata_updated_at, provider_pool_quota_snapshot_updated_at,
+    provider_pool_key_account_quota_exhausted, provider_pool_key_balance_below_minimum,
+    provider_pool_key_scheduling_label, provider_pool_member_quota_snapshot,
+    provider_pool_quota_metadata_provider_type, provider_pool_quota_metadata_updated_at,
+    provider_pool_quota_snapshot_updated_at,
 };
 pub use quota_refresh::{
     official_balance_backoff_secs, official_balance_backoff_with_jitter_secs,
@@ -144,6 +145,99 @@ mod tests {
             provider_pool_quota_snapshot_exhausted_decision(&key, "codex"),
             None
         );
+    }
+
+    #[test]
+    fn balance_scheduling_requires_fresh_complete_low_balances() {
+        // 验证固定边界和多币种“全部不高于阈值”语义。
+        let balance_key = |balances: Value| {
+            sample_key_with_quota(json!({
+                "schema_version": PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
+                "provider_type": "deepseek",
+                "kind": "balance",
+                "freshness": "fresh",
+                "balances": balances
+            }))
+        };
+
+        for available in ["0", "1"] {
+            assert!(provider_pool_key_balance_below_minimum(
+                &balance_key(json!([{"unit": "USD", "available": available}])),
+                "deepseek"
+            ));
+        }
+        assert!(!provider_pool_key_balance_below_minimum(
+            &balance_key(json!([{"unit": "USD", "available": "1.0001"}])),
+            "deepseek"
+        ));
+        assert!(provider_pool_key_balance_below_minimum(
+            &balance_key(json!([
+                {"unit": "USD", "available": "1"},
+                {"unit": "CNY", "available": "0.5"}
+            ])),
+            "deepseek"
+        ));
+        assert!(!provider_pool_key_balance_below_minimum(
+            &balance_key(json!([
+                {"unit": "USD", "available": "1"},
+                {"unit": "CNY", "available": "1.01"}
+            ])),
+            "deepseek"
+        ));
+    }
+
+    #[test]
+    fn balance_scheduling_fails_open_for_unknown_or_stale_inputs() {
+        // 验证无法确认余额事实时统一 fail-open，避免陈旧状态永久阻断。
+        let base = json!({
+            "schema_version": PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
+            "provider_type": "deepseek",
+            "kind": "balance",
+            "freshness": "fresh",
+            "balances": [{"unit": "USD", "available": "1"}]
+        });
+        let mut invalid_snapshots = Vec::new();
+
+        let mut stale = base.clone();
+        stale["freshness"] = json!("stale");
+        invalid_snapshots.push(stale);
+        let mut empty = base.clone();
+        empty["balances"] = json!([]);
+        invalid_snapshots.push(empty);
+        let mut missing_unit = base.clone();
+        missing_unit["balances"][0]
+            .as_object_mut()
+            .expect("balance")
+            .remove("unit");
+        invalid_snapshots.push(missing_unit);
+        let mut invalid_value = base.clone();
+        invalid_value["balances"][0]["available"] = json!("NaN");
+        invalid_snapshots.push(invalid_value);
+        let mut missing_value = base.clone();
+        missing_value["balances"][0]
+            .as_object_mut()
+            .expect("balance")
+            .remove("available");
+        invalid_snapshots.push(missing_value);
+        let mut empty_unit = base.clone();
+        empty_unit["balances"][0]["unit"] = json!("  ");
+        invalid_snapshots.push(empty_unit);
+        let mut unlimited = base.clone();
+        unlimited["unlimited"] = json!(true);
+        invalid_snapshots.push(unlimited);
+        let mut unknown_unlimited = base.clone();
+        unknown_unlimited["unlimited"] = json!("unknown");
+        invalid_snapshots.push(unknown_unlimited);
+        let mut subscription = base;
+        subscription["kind"] = json!("subscription");
+        invalid_snapshots.push(subscription);
+
+        for quota in invalid_snapshots {
+            assert!(!provider_pool_key_balance_below_minimum(
+                &sample_key_with_quota(quota),
+                "deepseek"
+            ));
+        }
     }
 
     #[test]
