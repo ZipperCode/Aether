@@ -51,3 +51,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: 发布 Aether v0.7.24
+
+**Date**: 2026-08-19
+**Task**: 发布 Aether v0.7.24
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+普通推送锁定 SHA，Rust CI 22/22 全绿后创建 annotated tag v0.7.24；Release Aether 7/7 成功并核验四个发布资产。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d215535ac` | (see git log) |
+
+### Status
+
+[OK] **Completed**
