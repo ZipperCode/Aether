@@ -19,6 +19,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
+| [Codex HTTP Responses Relay](./codex-http-responses-contract.md) | Executable create, compact, SSE, passthrough, and fail-closed contract | Current |
 
 ---
 

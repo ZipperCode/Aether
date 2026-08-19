@@ -20,6 +20,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Balance-Aware Key Scheduling](../../aether-provider-pool/backend/balance-scheduling-contract.md) | Runtime, sticky, refresh, and cache integration contract | Current |
+| [Codex HTTP Responses Relay](../../aether-ai-formats/backend/codex-http-responses-contract.md) | Cross-layer create, compact, SSE, auth, and state boundary | Current |
 
 ---
 
