@@ -1,0 +1,1 @@
+{"file":".trellis/tasks/08-19-release-v0-7-24/research/release-evidence.md","reason":"提供已核实的 Git、CI、tag 与 release 约束，执行时据此锁定 SHA 和停止条件"}
