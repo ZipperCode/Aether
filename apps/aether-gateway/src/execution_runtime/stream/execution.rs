@@ -8956,8 +8956,10 @@ mod tests {
         }
     }
 
+    /// 构造 Responses 失败流；`include_opaque_event` 控制终端错误前是否已有客户端可见事件。
     async fn execute_prefetched_codex_cyber_policy_failure(
         continue_failover: bool,
+        include_opaque_event: bool,
     ) -> Option<axum::http::Response<Body>> {
         let request_id = if continue_failover {
             "req-cyber-policy-retry"
@@ -8982,6 +8984,7 @@ mod tests {
             .expect("app state should build")
             .with_data_state_for_tests(data_state);
         let upstream_setup = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+        let upstream_opaque = "event: response.future.delta\ndata: {\"type\":\"response.future.delta\",\"sequence_number\":7,\"future_field\":{\"enabled\":true}}\n\n";
         let upstream_error = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"invalid_request\",\"message\":\"cyber policy rejected the request\",\"code\":\"cyber_policy_violation\",\"param\":\"input\"}}}\n\n";
         let frame_stream = stream! {
             yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
@@ -9002,6 +9005,15 @@ mod tests {
                     text: Some(upstream_setup.to_string()),
                 },
             }));
+            if include_opaque_event {
+                yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                    frame_type: StreamFrameType::Data,
+                    payload: StreamFramePayload::Data {
+                        chunk_b64: None,
+                        text: Some(upstream_opaque.to_string()),
+                    },
+                }));
+            }
             yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
                 frame_type: StreamFrameType::Data,
                 payload: StreamFramePayload::Data {
@@ -11117,19 +11129,35 @@ mod tests {
         assert_eq!(detected.pointer("/error/param"), Some(&json!("input")));
     }
 
+    /// 验证同格式 Responses 的不透明事件和 terminal error 在 observer 后仍逐字返回。
     #[tokio::test]
     async fn prefetched_codex_cyber_policy_violation_stops_failover_by_default() {
-        let response = execute_prefetched_codex_cyber_policy_failure(false)
+        let response = execute_prefetched_codex_cyber_policy_failure(false, true)
             .await
             .expect("default Codex cyber policy handling should return the provider error");
 
         assert_eq!(response.status().as_u16(), 200);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("Responses SSE error body should read");
+        assert_eq!(
+            body.as_ref(),
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\"}\n\n",
+                "event: response.future.delta\n",
+                "data: {\"type\":\"response.future.delta\",\"sequence_number\":7,\"future_field\":{\"enabled\":true}}\n\n",
+                "event: response.failed\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"invalid_request\",\"message\":\"cyber policy rejected the request\",\"code\":\"cyber_policy_violation\",\"param\":\"input\"}}}\n\n"
+            )
+            .as_bytes()
+        );
     }
 
     #[tokio::test]
     async fn prefetched_codex_cyber_policy_violation_retries_when_system_setting_is_enabled() {
         assert!(
-            execute_prefetched_codex_cyber_policy_failure(true)
+            execute_prefetched_codex_cyber_policy_failure(true, false)
                 .await
                 .is_none(),
             "enabling cyber failover should retry the next candidate"

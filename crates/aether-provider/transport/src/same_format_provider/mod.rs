@@ -1867,24 +1867,49 @@ mod tests {
         assert!(body.is_none());
     }
 
+    /// 验证当前 Codex HTTP create 负载及未来扩展字段在原生 Responses 路径中不经过字段白名单。
     #[test]
     fn same_format_responses_body_preserves_opaque_extension_fields() {
-        let opaque_option = json!({"mode": "custom"});
+        let body_json = json!({
+            "model": "gpt-5.4",
+            "instructions": "Use the configured tools.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up a value",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "store": false,
+            "stream": true,
+            "stream_options": {"include_obfuscation": false},
+            "include": ["reasoning.encrypted_content"],
+            "service_tier": "default",
+            "prompt_cache_key": "session-codex-http",
+            "text": {"verbosity": "medium"},
+            "client_metadata": {
+                "session_id": "session-codex-http",
+                "thread_id": "thread-codex-http"
+            },
+            "opaque_future_field": {"mode": "future", "enabled": true}
+        });
         let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
-            body_json: &json!({
-                "model": "gpt-5.6-sol",
-                "input": "hello",
-                "multi_agent": {"enabled": true},
-                "opaque_responses_option": opaque_option
-            }),
-            mapped_model: "gpt-5.6-sol",
+            body_json: &body_json,
+            mapped_model: "gpt-5.4",
             client_api_format: "openai:responses",
             provider_api_format: "openai:responses",
-            source_model: Some("gpt-5.6-sol"),
+            source_model: Some("gpt-5.4"),
             family: SameFormatProviderFamily::Standard,
             body_rules: None,
             request_headers: None,
-            upstream_is_stream: false,
+            upstream_is_stream: true,
             force_body_stream_field: false,
             kiro_auth_config: None,
             is_claude_code: false,
@@ -1892,8 +1917,7 @@ mod tests {
         });
 
         let body = body.expect("same-format Responses request should remain transparent");
-        assert_eq!(body["multi_agent"], json!({"enabled": true}));
-        assert_eq!(body["opaque_responses_option"], opaque_option);
+        assert_eq!(body, body_json);
     }
 
     #[test]
@@ -2461,6 +2485,7 @@ mod tests {
         );
     }
 
+    /// 验证同格式 header 转发不会泄露下游凭证和 Aether 内部身份，并只注入 provider 凭证。
     #[test]
     fn same_format_headers_cannot_restore_credentials_or_internal_headers() {
         let provider_request_body = json!({"model": "upstream-model"});

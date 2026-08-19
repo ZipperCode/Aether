@@ -5391,6 +5391,7 @@ mod tests {
         assert_eq!(body_json["id"], "resp_123");
     }
 
+    /// 验证 Compact 同格式成功响应保留 output 与 provider 的未来扩展字段。
     #[test]
     fn falls_back_to_body_json_for_openai_responses_same_family_sync_payload() {
         let report_context = json!({
@@ -5402,7 +5403,12 @@ mod tests {
             "id": "resp_123",
             "object": "response",
             "status": "completed",
-            "output": []
+            "output": [{
+                "type": "compaction",
+                "encrypted_content": "opaque-compacted-context",
+                "future_item_field": {"enabled": true}
+            }],
+            "future_response_field": {"mode": "opaque"}
         });
 
         let body_json = maybe_build_openai_responses_same_family_sync_body_from_normalized_payload(
@@ -5445,6 +5451,7 @@ mod tests {
         assert_eq!(body_json, provider_body_json);
     }
 
+    /// 验证 Responses 的 400/500 错误不会被成功响应 finalizer 消费，status/body 仍由通用 HTTP 边界处理。
     #[test]
     fn rejects_openai_responses_same_family_error_body_json() {
         let report_context = json!({
@@ -5460,16 +5467,22 @@ mod tests {
             }
         });
 
-        let body_json = maybe_build_openai_responses_same_family_sync_body_from_normalized_payload(
-            "openai_responses_sync_finalize",
-            200,
-            Some(&report_context),
-            Some(&provider_body_json),
-            None,
-        )
-        .expect("openai-responses same-family error guard should not error");
+        for status_code in [400, 500] {
+            let body_json =
+                maybe_build_openai_responses_same_family_sync_body_from_normalized_payload(
+                    "openai_responses_sync_finalize",
+                    status_code,
+                    Some(&report_context),
+                    Some(&provider_body_json),
+                    None,
+                )
+                .expect("openai-responses same-family error guard should not error");
 
-        assert!(body_json.is_none());
+            assert!(
+                body_json.is_none(),
+                "status {status_code} must pass through"
+            );
+        }
     }
 
     #[test]
