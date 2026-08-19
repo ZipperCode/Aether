@@ -28,3 +28,26 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: 完善 Codex HTTP Responses 中转契约
+
+**Date**: 2026-08-19
+**Task**: 完善 Codex HTTP Responses 中转契约
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+核对 OpenAI Codex HTTP 客户端后，将范围收敛为 Responses create、compact 与 HTTP SSE；补齐同格式字段、header、compact、opaque SSE、错误和 failover 回归，并记录无持久化的跨包契约。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `793ac8625` | (see git log) |
+| `0a26f87d9` | (see git log) |
+
+### Status
+
+[OK] **Completed**
