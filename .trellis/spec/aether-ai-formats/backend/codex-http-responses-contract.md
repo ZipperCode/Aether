@@ -58,6 +58,8 @@ Forward only headers allowed by the existing provider transport policy. Strip do
 
 Native same-format SSE preserves event names, event order, JSON fields, and unknown future events. Usage and error observers may inspect bytes but must not rewrite them. Preserve upstream HTTP error status/body and request identifiers through the existing HTTP response boundary.
 
+For native `openai:responses` SSE, classify the first complete body/event before committing downstream HTTP 2xx. If that first body is an embedded error and no output is client-visible, preserve the real error status or use the existing candidate-failover path. Do not expose a bare `{ "error": ... }` object as a successful Response: successful Responses require an `id`, while a post-commit `response.failed` event requires a complete Response object.
+
 Aether stores normal usage/audit records only. It does not store Response bodies or create `response_id` affinity for this Codex HTTP surface.
 
 ## 4. Validation & Error Matrix
@@ -70,6 +72,7 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 | Native Responses unknown SSE event/field | Preserve the emitted bytes and ordering. |
 | Cross-format material semantic cannot be represented | Return a structured conversion/terminal error; never silently drop it. |
 | Upstream HTTP 4xx/5xx | Preserve status and error body through the generic HTTP boundary. |
+| Upstream HTTP 2xx + first native Responses body is an embedded error | Detect before committing downstream 2xx; preserve the error or retry an eligible next candidate. |
 | Terminal SSE error after client-visible output | Return the same stream; do not splice a second provider stream. |
 | Retryable terminal policy error before additional client-visible output | Follow the existing configured failover policy. |
 | `store=false` | Forward unchanged; create no Aether Response persistence. |
@@ -80,6 +83,7 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 - Base: Codex sends a compact payload to a native provider; Aether returns the provider `output` array without local state.
 - Bad: a cross-format provider cannot represent a new input/tool item, and Aether silently removes it to keep the request running.
 - Bad: downstream credentials or `x-aether-*` identity headers reach provider egress.
+- Bad: a provider returns HTTP 200 plus a bare Responses error body, and Aether commits 200 before classifying it, causing clients to deserialize the error as a successful Response without `id`.
 - Bad: a general OpenAI resource endpoint is added solely because it exists in the official reference, without a downstream product requirement and provider-affinity design.
 
 ## 6. Tests Required
@@ -92,6 +96,7 @@ Keep focused regressions on the shared paths:
 - `rejects_openai_responses_same_family_error_body_json`: success finalization does not consume 4xx/5xx error bodies.
 - `prefetched_codex_cyber_policy_violation_stops_failover_by_default`: opaque SSE and terminal error bytes remain ordered and unchanged.
 - `prefetched_codex_cyber_policy_violation_retries_when_system_setting_is_enabled`: the no-extra-output retry boundary remains intact.
+- `same_format_responses_prefetch_retries_bare_error_before_committing_success`: a first bare Responses error is classified before HTTP commit and returns the existing candidate-retry signal.
 
 Run the API coverage generator in check mode and `cargo fmt --all --check`. Broaden crate tests only when a focused regression exposes a shared-contract risk.
 
@@ -115,4 +120,12 @@ Inspect the current Codex HTTP client
 -> preserve native unknown fields/events
 -> fail closed for unsupported cross-format semantics
 -> plan stateful resource APIs separately if a real consumer requires them
+```
+
+For native Responses streaming failures, the correct boundary is:
+
+```text
+inspect the first complete event before downstream 2xx
+-> embedded error with no visible output: preserve non-2xx or retry
+-> valid Responses event: commit and preserve the original stream bytes
 ```
