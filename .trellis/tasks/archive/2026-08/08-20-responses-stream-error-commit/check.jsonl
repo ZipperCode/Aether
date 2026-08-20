@@ -1,0 +1,3 @@
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"检查网关改动范围与质量入口"}
+{"file":".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md","reason":"检查原生 SSE 透传、错误状态与聚焦测试要求"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"检查边界行为与客户端可观察结果"}
