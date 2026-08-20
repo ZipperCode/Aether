@@ -73,3 +73,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: 修复 Responses 流式错误提交
+
+**Date**: 2026-08-20
+**Task**: 修复 Responses 流式错误提交
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+修复同格式 OpenAI Responses SSE 首段裸错误在 HTTP 200 提交后导致客户端缺少 id 的反序列化问题；复用首段分类与候选重试路径，并补充回归测试和协议规范。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f86e9941a` | (see git log) |
+
+### Status
+
+[OK] **Completed**
