@@ -83,6 +83,10 @@ fn is_codex_models_api_format(api_format: &str) -> bool {
     crate::ai_serving::normalize_api_format_alias(api_format) == "openai:responses"
 }
 
+fn is_standard_openai_models_api_format(api_format: &str) -> bool {
+    crate::ai_serving::normalize_api_format_alias(api_format) == "openai:chat"
+}
+
 fn is_codex_provider_row(row: &StoredModelCatalogEntry) -> bool {
     row.provider_type.trim().eq_ignore_ascii_case("codex")
 }
@@ -288,9 +292,9 @@ fn build_openai_catalog_models_list_response(model_names: &[String]) -> Response
     .into_response()
 }
 
-fn build_openai_catalog_model_detail_response(row: &StoredModelCatalogEntry) -> Response<Body> {
+fn build_openai_catalog_model_detail_response(model_name: &str) -> Response<Body> {
     Json(json!({
-        "id": row.global_model_name,
+        "id": model_name,
         "object": "model",
         "created": 0,
         "owned_by": PUBLIC_MODELS_OWNER,
@@ -413,10 +417,13 @@ async fn list_models_for_client_format(
     api_format: &str,
     auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
 ) -> Option<PublishedModelsList> {
+    // 标准 OpenAI 模型目录发布配置可见性，不把 `/v1/models` 误当作 Chat 调用能力校验。
+    let model_family_filter =
+        (!is_standard_openai_models_api_format(api_format)).then_some(api_format);
     if !state.has_global_model_data_reader() {
         let rows =
             await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
-        let rows = filter_catalog_for_models(rows, auth_snapshot, api_format);
+        let rows = filter_catalog_for_models(rows, auth_snapshot, model_family_filter);
         return Some(PublishedModelsList {
             model_names: rows
                 .iter()
@@ -433,7 +440,7 @@ async fn list_models_for_client_format(
     let catalog_rows = if needs_catalog {
         let rows =
             await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
-        filter_catalog_for_models(rows, auth_snapshot, api_format)
+        filter_catalog_for_models(rows, auth_snapshot, model_family_filter)
     } else {
         Vec::new()
     };
@@ -459,7 +466,7 @@ async fn list_models_for_client_format(
         } else {
             let rows =
                 await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
-            filter_catalog_for_models(rows, auth_snapshot, api_format)
+            filter_catalog_for_models(rows, auth_snapshot, model_family_filter)
         };
         return Some(PublishedModelsList {
             model_names: rows
@@ -472,7 +479,7 @@ async fn list_models_for_client_format(
     let models = filter_global_models_for_models(
         page.items,
         auth_snapshot,
-        api_format,
+        model_family_filter,
         allowed_global_model_ids.as_ref(),
     );
     let visible_names = models
@@ -510,7 +517,7 @@ async fn retain_routable_model_rows(
     auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
     now_unix_secs: u64,
 ) -> Option<Vec<StoredModelCatalogEntry>> {
-    let rows = filter_catalog_for_models(rows, auth_snapshot, api_format);
+    let rows = filter_catalog_for_models(rows, auth_snapshot, Some(api_format));
     let visibility = async {
         stream::iter(rows.into_iter().map(|row| async move {
             crate::ai_serving::PlannerAppState::new(state)
@@ -640,6 +647,22 @@ pub(super) async fn maybe_build_local_models_route_response(
         }
         Some("detail") => {
             let model_id = models_detail_id(&request_context.request_path)?;
+            if is_standard_openai_models_api_format(api_format) {
+                let published =
+                    match list_models_for_client_format(state, api_format, auth_snapshot).await {
+                        Some(published) => published,
+                        None => {
+                            return Some(build_models_read_fallback_response(
+                                request_context,
+                                api_format,
+                            ))
+                        }
+                    };
+                if !published.model_names.iter().any(|name| name == &model_id) {
+                    return Some(build_models_not_found_response(&model_id, api_format));
+                }
+                return Some(build_openai_catalog_model_detail_response(&model_id));
+            }
             let rows = match detail_model_rows_for_client_format(
                 state,
                 &model_id,
@@ -663,7 +686,7 @@ pub(super) async fn maybe_build_local_models_route_response(
             let response = match api_format {
                 "claude:messages" => build_claude_catalog_model_detail_response(row),
                 "gemini:generate_content" => build_gemini_catalog_model_detail_response(row),
-                _ => build_openai_catalog_model_detail_response(row),
+                _ => build_openai_catalog_model_detail_response(&row.global_model_name),
             };
             Some(response)
         }
