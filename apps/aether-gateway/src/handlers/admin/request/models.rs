@@ -256,6 +256,7 @@ impl<'a> AdminAppState<'a> {
         let mut model = model.clone();
         if let Some(global_model) = global_model {
             model.global_model_name = Some(global_model.name);
+            model.global_model_supported_capabilities = global_model.supported_capabilities;
             model.global_model_config = global_model.config;
         }
         let endpoints = self
@@ -368,6 +369,23 @@ impl<'a> AdminAppState<'a> {
         if !mapped_format_endpoint_ids.is_empty() {
             return Ok(AdminModelEndpointInference {
                 endpoint_ids: mapped_format_endpoint_ids,
+                source: "mapping",
+            });
+        }
+
+        // Global Model 元数据只作为第四优先级证据，不覆盖显式绑定、发现结果或 Provider Model 映射。
+        let declared_global_families = crate::model_metadata::global_model_declared_families(
+            model.global_model_config.as_ref(),
+            model.global_model_supported_capabilities.as_ref(),
+        );
+        let metadata_endpoint_ids = endpoints
+            .iter()
+            .filter(|endpoint| declared_global_families.supports_api_format(&endpoint.api_format))
+            .map(|endpoint| endpoint.id.clone())
+            .collect::<Vec<_>>();
+        if !metadata_endpoint_ids.is_empty() {
+            return Ok(AdminModelEndpointInference {
+                endpoint_ids: metadata_endpoint_ids,
                 source: "mapping",
             });
         }

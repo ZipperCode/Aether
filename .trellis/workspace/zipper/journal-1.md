@@ -95,3 +95,40 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: 修复特殊模型 Endpoint 推断与公开目录
+
+**Date**: 2026-08-21
+**Task**: 修复特殊模型 Endpoint 推断与公开目录
+**Package**: aether-gateway
+
+### Summary
+
+统一模型能力与 API 格式族语义，修复图像模型 Endpoint 自动推断，并让标准 OpenAI 模型列表和详情发布 Key 可见的全部 Global Models。
+
+### Main Changes
+
+- Global Model image_generation 能力自动匹配 openai:image Endpoint
+- 标准 OpenAI /v1/models 与详情跨模型族发布，同时保留 allowed_models 和 Provider 限制
+- Claude、Gemini、Codex 目录保持原有协议过滤
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9a05f2b027bd3465f61a9be7713234423952c367` | (see git log) |
+
+### Testing
+
+- [OK] 目标 Rust 文件 rustfmt --check 通过
+- [OK] git diff --check、CodeGraph 影响检查与两轮静态审查通过
+- [OK] 按项目约束未运行大模块编译或单元测试
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 在运行环境关联 gpt-image-2 并调用 /v1/models 做端到端确认
