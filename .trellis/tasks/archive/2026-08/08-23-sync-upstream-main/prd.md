@@ -27,7 +27,7 @@
 - [x] 实际冲突涉及的 Rust/TypeScript 逻辑至少通过工作区 Rust 编译检查与前端 TypeScript 检查；环境阻塞必须有明确证据。
 - [x] 主工作区原有 `.trellis/workflow.md` 修改内容与状态保持不变，除它之外没有任务遗留的未提交文件。
 - [x] `upstream` 远端指向 `https://github.com/fawney19/Aether.git`，但本任务没有执行 push。
-- [ ] 隔离 worktree 与临时同步分支在回并后清理完成。
+- [x] 隔离 worktree 与临时同步分支在回并后清理完成。
 
 ## Out of Scope
 
