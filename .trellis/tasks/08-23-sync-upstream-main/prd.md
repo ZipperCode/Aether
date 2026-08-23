@@ -22,11 +22,11 @@
 
 ## Acceptance Criteria
 
-- [ ] 原始本地基线、`origin/master` 与 `upstream/main` 均为最终本地 `master` 的祖先。
-- [ ] 最终仓库不存在未解决冲突，`git diff --check` 通过。
-- [ ] 实际冲突涉及的 Rust/TypeScript 逻辑至少通过工作区 Rust 编译检查与前端 TypeScript 检查；环境阻塞必须有明确证据。
-- [ ] 主工作区原有 `.trellis/workflow.md` 修改内容与状态保持不变，除它之外没有任务遗留的未提交文件。
-- [ ] `upstream` 远端指向 `https://github.com/fawney19/Aether.git`，但本任务没有执行 push。
+- [x] 原始本地基线、`origin/master` 与 `upstream/main` 均为最终本地 `master` 的祖先。
+- [x] 最终仓库不存在未解决冲突，`git diff --check` 通过。
+- [x] 实际冲突涉及的 Rust/TypeScript 逻辑至少通过工作区 Rust 编译检查与前端 TypeScript 检查；环境阻塞必须有明确证据。
+- [x] 主工作区原有 `.trellis/workflow.md` 修改内容与状态保持不变，除它之外没有任务遗留的未提交文件。
+- [x] `upstream` 远端指向 `https://github.com/fawney19/Aether.git`，但本任务没有执行 push。
 - [ ] 隔离 worktree 与临时同步分支在回并后清理完成。
 
 ## Out of Scope
@@ -34,3 +34,11 @@
 - 发布新版本、部署服务、迁移生产数据或推送远端。
 - 逐项重做上游功能设计或清理双方历史技术债。
 - 与合并冲突无关的格式化、重命名或兼容层新增。
+
+## Verification Evidence
+
+- 合并提交：`e4e223cb80369c825589a517155b13576919eea6`，父提交为本地同步结果 `821de21b3` 与 `upstream/main` 的 `3f2b67f19`。
+- 祖先检查：任务基线、`origin/master`、`upstream/main` 均通过 `git merge-base --is-ancestor`。
+- 通过：`cargo fmt --all --check`、`cargo check --workspace`、`cargo check -p aether-data-postgres`、`cargo check -p aether-gateway --lib`、`npm run type-check`、PostgreSQL sanitizer 定向测试。
+- queue 定向测试未进入测试代码：其 dev 依赖 `boring-sys2` 在 Visual Studio/CMake 探测阶段失败；对应 Gateway lib 编译和零调用静态审计已通过。
+- 独立审查清理了 PostgreSQL 重复 sanitizer 路径和 request queue 七个零调用旧 helper；最终冲突、冲突标记、工具输出污染与实际 NUL 字节均为 0。
