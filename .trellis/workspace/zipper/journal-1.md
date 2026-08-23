@@ -132,3 +132,27 @@
 ### Next Steps
 
 - 在运行环境关联 gpt-image-2 并调用 /v1/models 做端到端确认
+
+
+## Session 6: 同步上游 main 分支
+
+**Date**: 2026-08-23
+**Task**: 同步上游 main 分支
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+合并 origin/master 与 fawney19/Aether main，解决 52 个冲突并保留本地 Endpoint、Responses 错误与余额调度契约；Rust workspace 和前端类型检查通过，已回并 master 并清理隔离 worktree。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `821de21b3` | (see git log) |
+| `e4e223cb8` | (see git log) |
+| `41636cd19` | (see git log) |
+
+### Status
+
+[OK] **Completed**
