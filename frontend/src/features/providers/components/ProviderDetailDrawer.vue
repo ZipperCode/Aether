@@ -1070,6 +1070,7 @@ import {
 import { selectOpenProviderSnapshot } from '@/features/providers/utils/providerOpenState'
 import ProviderGenericQuotaCard from './ProviderGenericQuotaCard.vue'
 import {
+  clearPendingCodexResetCreditIdempotencyKey,
   clearPendingCodexResetCreditIdempotencyKeyForOutcome,
   createCodexResetCreditIdempotencyKey,
   formatCodexResetCreditCount as formatCodexResetCreditCountLabel,

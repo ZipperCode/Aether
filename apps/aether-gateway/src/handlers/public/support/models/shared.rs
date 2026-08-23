@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
 
+use aether_data_contracts::repository::candidate_selection::{
+    StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
+};
 use aether_data_contracts::repository::global_models::StoredPublicGlobalModel;
 use aether_data_contracts::repository::model_catalog::StoredModelCatalogEntry;
 
@@ -29,6 +32,44 @@ pub(crate) fn models_api_format(request_context: &GatewayPublicRequestContext) -
         "doubao:embedding" => Some("doubao:embedding"),
         "aliyun:multimodal_embedding" => Some("aliyun:multimodal_embedding"),
         _ => None,
+    }
+}
+
+const MODELS_CROSS_FORMAT_QUERY_API_FORMATS: &[&str] = &[
+    "openai:chat",
+    "openai:responses",
+    "openai:responses:compact",
+    "openai:image",
+    "claude:messages",
+    "gemini:generate_content",
+];
+const MODELS_EMBEDDING_QUERY_API_FORMATS: &[&str] = &[
+    "openai:embedding",
+    "jina:embedding",
+    "gemini:embedding",
+    "doubao:embedding",
+    "aliyun:multimodal_embedding",
+];
+const MODELS_RERANK_QUERY_API_FORMATS: &[&str] = &["openai:rerank", "jina:rerank"];
+
+/// 返回模型目录查询需要覆盖的兼容协议集合。
+///
+/// 生成类协议允许跨格式候选参与目录发布；图像、向量与重排保持各自的产品边界。
+pub(super) fn models_query_api_formats(api_format: &str) -> &'static [&'static str] {
+    match crate::ai_serving::normalize_api_format_alias(api_format).as_str() {
+        "openai:chat"
+        | "openai:responses"
+        | "openai:responses:compact"
+        | "claude:messages"
+        | "gemini:generate_content" => MODELS_CROSS_FORMAT_QUERY_API_FORMATS,
+        "openai:image" => &["openai:image"],
+        "openai:embedding"
+        | "jina:embedding"
+        | "gemini:embedding"
+        | "doubao:embedding"
+        | "aliyun:multimodal_embedding" => MODELS_EMBEDDING_QUERY_API_FORMATS,
+        "openai:rerank" | "jina:rerank" => MODELS_RERANK_QUERY_API_FORMATS,
+        _ => &[],
     }
 }
 
@@ -67,6 +108,152 @@ fn auth_allows_provider(
                 )
             })
         })
+}
+
+fn auth_snapshot_allows_provider_for_models(
+    auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
+    provider_id: &str,
+    provider_name: &str,
+    provider_type: &str,
+) -> bool {
+    let Some(allowed) = auth_snapshot
+        .and_then(crate::data::auth::GatewayAuthApiKeySnapshot::effective_allowed_providers)
+    else {
+        return true;
+    };
+
+    allowed.iter().any(|value| {
+        aether_scheduler_core::provider_matches_allowed_value(
+            value,
+            provider_id,
+            provider_name,
+            provider_type,
+        )
+    })
+}
+
+fn auth_snapshot_allows_model_for_models(
+    auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
+    global_model_name: &str,
+) -> bool {
+    let Some(allowed) = auth_snapshot
+        .and_then(crate::data::auth::GatewayAuthApiKeySnapshot::effective_allowed_models)
+    else {
+        return true;
+    };
+    allowed.iter().any(|value| value == global_model_name)
+}
+
+fn mapping_scope_matches_for_models(
+    mapping: &StoredProviderModelMapping,
+    row: &StoredMinimalCandidateSelectionRow,
+    api_format: &str,
+) -> bool {
+    let api_format_matches = mapping.api_formats.as_ref().is_none_or(|api_formats| {
+        api_formats
+            .iter()
+            .any(|value| value.trim().eq_ignore_ascii_case(api_format))
+    });
+    if !api_format_matches {
+        return false;
+    }
+
+    mapping.endpoint_ids.as_ref().is_none_or(|endpoint_ids| {
+        endpoint_ids
+            .iter()
+            .any(|endpoint_id| endpoint_id == &row.endpoint_id)
+    })
+}
+
+fn candidate_model_names_for_models(
+    row: &StoredMinimalCandidateSelectionRow,
+    api_format: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::from([row.model_provider_model_name.clone()]);
+    if let Some(mappings) = row.model_provider_model_mappings.as_ref() {
+        for mapping in mappings {
+            if mapping_scope_matches_for_models(mapping, row, api_format) {
+                names.insert(mapping.name.clone());
+            }
+        }
+    }
+    names
+}
+
+fn row_exposes_global_model_for_models(
+    row: &StoredMinimalCandidateSelectionRow,
+    api_format: &str,
+) -> bool {
+    let Some(key_allowed_models) = row.key_allowed_models.as_ref() else {
+        return true;
+    };
+    if key_allowed_models.is_empty() {
+        return false;
+    }
+    if key_allowed_models
+        .iter()
+        .any(|value| value == &row.global_model_name)
+    {
+        return true;
+    }
+
+    let candidate_models = candidate_model_names_for_models(row, api_format);
+    for allowed_model in key_allowed_models {
+        if candidate_models.contains(allowed_model) {
+            return true;
+        }
+    }
+
+    let Some(global_model_mappings) = row.global_model_mappings.as_ref() else {
+        return false;
+    };
+    for allowed_model in key_allowed_models {
+        for pattern in global_model_mappings {
+            if matches_model_mapping_for_models(pattern, allowed_model) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+pub(crate) fn filter_eligible_model_rows(
+    rows: Vec<StoredMinimalCandidateSelectionRow>,
+    auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
+    api_format: &str,
+) -> Vec<StoredMinimalCandidateSelectionRow> {
+    rows.into_iter()
+        .filter(|row| {
+            auth_snapshot_allows_provider_for_models(
+                auth_snapshot,
+                &row.provider_id,
+                &row.provider_name,
+                &row.provider_type,
+            )
+        })
+        .filter(|row| auth_snapshot_allows_model_for_models(auth_snapshot, &row.global_model_name))
+        .filter(|row| row_exposes_global_model_for_models(row, api_format))
+        .collect()
+}
+
+pub(super) fn filter_rows_for_models(
+    rows: Vec<StoredMinimalCandidateSelectionRow>,
+    auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
+    api_format: &str,
+) -> Vec<StoredMinimalCandidateSelectionRow> {
+    let mut filtered = filter_eligible_model_rows(rows, auth_snapshot, api_format);
+    filtered.sort_by(|left, right| left.global_model_name.cmp(&right.global_model_name));
+    let mut deduped = Vec::new();
+    let mut last_model_name: Option<String> = None;
+    for row in filtered {
+        if last_model_name.as_deref() == Some(row.global_model_name.as_str()) {
+            continue;
+        }
+        last_model_name = Some(row.global_model_name.clone());
+        deduped.push(row);
+    }
+    deduped
 }
 
 fn auth_allows_model_name(

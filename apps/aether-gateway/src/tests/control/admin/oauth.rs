@@ -8306,32 +8306,21 @@ async fn gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over
         "Bearer cached-codex-access-token"
     );
 
-    let mut updated_key = provider_catalog_repository
-        .list_keys_by_ids(&["key-codex-oauth-stale-cache".to_string()])
-        .await
-        .expect("keys should list")
-        .into_iter()
-        .next()
-        .expect("key should exist");
-    updated_key.encrypted_auth_config = Some(
-        encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{"provider_type":"codex","refresh_token":"fresh-codex-refresh-token","email":"alice@example.com","account_id":"acct-codex-123","plan_type":"plus","expires_at":1,"updated_at":4102444810}"#,
-        )
-        .expect("updated auth config ciphertext should build"),
-    );
+    let fresh_auth_config = encrypt_python_fernet_plaintext(
+        DEVELOPMENT_ENCRYPTION_KEY,
+        r#"{"provider_type":"codex","refresh_token":"fresh-codex-refresh-token","email":"alice@example.com","account_id":"acct-codex-123","plan_type":"plus","expires_at":1,"updated_at":4102444810}"#,
+    )
+    .expect("updated auth config ciphertext should build");
     assert!(provider_catalog_repository
-        .update_key_oauth_credentials(
-            &updated_key.id,
-            updated_key
-                .encrypted_api_key
-                .as_deref()
-                .expect("OAuth key should keep encrypted api key"),
-            updated_key.encrypted_auth_config.as_deref(),
-            updated_key.expires_at_unix_secs,
+        .update_key_oauth_runtime_state(
+            "key-codex-oauth-stale-cache",
+            None,
+            None,
+            Some(&fresh_auth_config),
+            Some(4_102_444_810),
         )
         .await
-        .expect("key should update"));
+        .expect("OAuth runtime state should update"));
 
     let gateway = build_router_with_state(app_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;

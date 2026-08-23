@@ -302,7 +302,7 @@ const CLAUDE_CODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProvider
 
 const CODEX_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "codex",
-    version: 1,
+    version: 2,
     base_url: "https://chatgpt.com/backend-api/codex",
     endpoints: &[
         FixedProviderEndpointTemplate {
@@ -326,6 +326,12 @@ const CODEX_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTempla
         FixedProviderEndpointTemplate {
             item_key: "openai:image",
             api_format: "openai:image",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "codex:live",
+            api_format: "codex:live",
             custom_path: None,
             config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
         },
@@ -700,7 +706,7 @@ mod tests {
     fn codex_fixed_provider_template_includes_codex_companion_endpoints() {
         let template = fixed_provider_template("codex").expect("codex template should exist");
         assert_eq!(template.base_url, "https://chatgpt.com/backend-api/codex");
-        assert_eq!(template.version, 1);
+        assert_eq!(template.version, 2);
         assert_eq!(
             template
                 .endpoints
@@ -711,7 +717,8 @@ mod tests {
                 "openai:responses",
                 "openai:responses:compact",
                 "openai:search",
-                "openai:image"
+                "openai:image",
+                "codex:live"
             ]
         );
 
@@ -724,6 +731,12 @@ mod tests {
             fixed_provider_endpoint_template_by_api_format("codex", "openai:search")
                 .expect("codex search endpoint should exist");
         assert!(search_template.config_defaults.is_empty());
+
+        let live_template = fixed_provider_endpoint_template_by_api_format("codex", "codex:live")
+            .expect("codex Live endpoint should exist");
+        assert_eq!(live_template.item_key, "codex:live");
+        assert_eq!(live_template.custom_path, None);
+        assert!(live_template.config_defaults.is_empty());
     }
 
     #[test]

@@ -1,8 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
 use aether_data_contracts::repository::global_models::PublicGlobalModelQuery;
 use aether_data_contracts::repository::model_catalog::StoredModelCatalogEntry;
 use axum::{
@@ -20,7 +21,8 @@ use super::models_responses::{
     build_models_auth_error_response, build_models_not_found_response,
 };
 use super::models_shared::{
-    filter_catalog_for_models, filter_global_models_for_models, models_api_format, models_detail_id,
+    filter_catalog_for_models, filter_eligible_model_rows, filter_global_models_for_models,
+    models_api_format, models_detail_id,
 };
 use super::{query_param_value, AppState, GatewayPublicRequestContext};
 
@@ -30,6 +32,18 @@ const MODELS_ROUTE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MODELS_ROUTE_READ_TIMEOUT: Duration = Duration::from_millis(50);
 const PUBLIC_MODELS_OWNER: &str = "aether";
 const PUBLIC_MODELS_FETCH_LIMIT: usize = 10_000;
+const CODEX_MODELS_QUERY_API_FORMATS: &[&str] = &["openai:responses"];
+const CODEX_MODELS_MAX_RESPONSE_MODELS: usize = 512;
+const CODEX_MODELS_MAX_RESPONSE_JSON_BYTES: usize = 8 * 1024 * 1024;
+
+/// 校验聚合后的 Codex 动态目录是否仍在响应数量与序列化体积边界内。
+fn codex_projected_catalog_fits_response_limits(cards: &[Value]) -> bool {
+    if cards.len() > CODEX_MODELS_MAX_RESPONSE_MODELS {
+        return false;
+    }
+    serde_json::to_vec(&serde_json::json!({ "models": cards }))
+        .is_ok_and(|body| body.len() <= CODEX_MODELS_MAX_RESPONSE_JSON_BYTES)
+}
 
 async fn await_models_route_read<T, E, Fut>(operation: &'static str, future: Fut) -> Option<T>
 where
@@ -79,6 +93,23 @@ fn build_models_read_fallback_response(
     }
 }
 
+/// 按稳定调度字段排序 Codex 候选，确保目录投影在节点间可复现。
+fn sort_model_rows(
+    mut rows: Vec<StoredMinimalCandidateSelectionRow>,
+) -> Vec<StoredMinimalCandidateSelectionRow> {
+    rows.sort_by(|left, right| {
+        left.global_model_name
+            .cmp(&right.global_model_name)
+            .then(left.provider_priority.cmp(&right.provider_priority))
+            .then(left.key_internal_priority.cmp(&right.key_internal_priority))
+            .then(left.provider_id.cmp(&right.provider_id))
+            .then(left.endpoint_id.cmp(&right.endpoint_id))
+            .then(left.key_id.cmp(&right.key_id))
+            .then(left.model_id.cmp(&right.model_id))
+    });
+    rows
+}
+
 fn is_codex_models_api_format(api_format: &str) -> bool {
     crate::ai_serving::normalize_api_format_alias(api_format) == "openai:responses"
 }
@@ -87,194 +118,125 @@ fn is_standard_openai_models_api_format(api_format: &str) -> bool {
     crate::ai_serving::normalize_api_format_alias(api_format) == "openai:chat"
 }
 
-fn is_codex_provider_row(row: &StoredModelCatalogEntry) -> bool {
+fn is_codex_provider_row(row: &StoredMinimalCandidateSelectionRow) -> bool {
     row.provider_type.trim().eq_ignore_ascii_case("codex")
 }
 
-fn codex_model_card_is_complete(card: &serde_json::Map<String, Value>) -> bool {
-    card.get("slug").and_then(Value::as_str).is_some()
-        && card.get("display_name").and_then(Value::as_str).is_some()
-        && card
-            .get("supported_reasoning_levels")
-            .and_then(Value::as_array)
-            .is_some()
-        && card.get("shell_type").and_then(Value::as_str).is_some()
-        && card.get("visibility").and_then(Value::as_str).is_some()
-        && card
-            .get("supported_in_api")
-            .and_then(Value::as_bool)
-            .is_some()
-        && card.get("priority").and_then(Value::as_i64).is_some()
-        && card
-            .get("base_instructions")
-            .and_then(Value::as_str)
-            .is_some()
-        && card
-            .get("supports_reasoning_summary_parameter")
-            .is_none_or(Value::is_boolean)
-        && card
-            .get("support_verbosity")
-            .and_then(Value::as_bool)
-            .is_some()
-        && card
-            .get("truncation_policy")
-            .and_then(Value::as_object)
-            .is_some()
-        && card
-            .get("supports_parallel_tool_calls")
-            .and_then(Value::as_bool)
-            .is_some()
-        && card
-            .get("experimental_supported_tools")
-            .and_then(Value::as_array)
-            .is_some()
-}
-
-fn project_codex_model_card(
-    cached_models: &[Value],
-    source_model: &str,
-    global_model: &str,
-) -> Option<Value> {
-    let mut card = cached_models
-        .iter()
-        .find(|model| {
-            model.get("id").and_then(Value::as_str) == Some(source_model)
-                || model.get("slug").and_then(Value::as_str) == Some(source_model)
-        })?
-        .as_object()?
-        .clone();
-    if !codex_model_card_is_complete(&card) {
-        return None;
+async fn load_codex_model_cards(
+    state: &AppState,
+    rows: &[StoredMinimalCandidateSelectionRow],
+    targets: &[crate::model_fetch::CodexCatalogTarget],
+    client_version: crate::model_fetch::NormalizedCodexClientVersion,
+) -> (Vec<Value>, Option<String>) {
+    let catalogs = crate::model_fetch::load_codex_catalogs(state, targets, &client_version).await;
+    for target in catalogs.stale_targets() {
+        let state = state.clone();
+        let target = target.clone();
+        let client_version = client_version.clone();
+        tokio::spawn(async move {
+            crate::model_fetch::refresh_codex_catalog_target(&state, &target, &client_version)
+                .await;
+        });
     }
-
-    card.remove("id");
-    card.remove("api_formats");
-    card.insert("slug".to_string(), Value::String(global_model.to_string()));
-    Some(Value::Object(card))
-}
-
-fn codex_catalog_cards(value: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
-    value?
-        .get("codex_models")
-        .and_then(|catalog| catalog.get("cards"))
-        .and_then(Value::as_object)
-}
-
-fn codex_catalog_card_candidates(row: &StoredModelCatalogEntry) -> Vec<Value> {
-    [
-        row.provider_model_config.as_ref(),
-        row.global_model_config.as_ref(),
-    ]
-    .into_iter()
-    .filter_map(codex_catalog_cards)
-    .flat_map(|cards| {
-        [
-            row.provider_model_name.as_str(),
-            row.global_model_name.as_str(),
-            row.provider_model_id.as_str(),
-        ]
-        .into_iter()
-        .filter_map(|name| cards.get(name).cloned())
-        .collect::<Vec<_>>()
-    })
-    .collect()
-}
-
-async fn load_codex_model_cards(state: &AppState, rows: &[StoredModelCatalogEntry]) -> Vec<Value> {
-    let visible_models = rows
+    if !catalogs.is_complete() {
+        warn!(
+            event_name = "codex_catalog_aggregate_incomplete",
+            client_version = %client_version.as_str(),
+            target_count = targets.len(),
+            "Codex catalog aggregation was incomplete; serving cards from available last-known-good snapshots"
+        );
+    }
+    let mut seen_global_models = BTreeSet::new();
+    let possible_inference_catalogs = rows
         .iter()
         .filter(|row| is_codex_provider_row(row))
-        .map(|row| (row.provider_id.clone(), row.global_model_name.clone()))
+        .map(|row| (row.provider_id.clone(), row.key_id.clone()))
         .collect::<BTreeSet<_>>();
-    let candidate_rows = await_models_route_read(
-        "codex_models_candidates",
-        state.list_minimal_candidate_selection_rows_for_api_format("openai:responses"),
-    )
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .filter(|row| {
-        row.provider_type.trim().eq_ignore_ascii_case("codex")
-            && visible_models.contains(&(row.provider_id.clone(), row.global_model_name.clone()))
-    })
-    .collect::<Vec<_>>();
-    let cache_keys = candidate_rows
+    let expected_global_models = rows
         .iter()
-        .map(|row| format!("upstream_models:{}:{}", row.provider_id, row.key_id))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let cached_values = await_models_route_read(
-        "codex_models_cache",
-        state.runtime_state.kv_get_many(&cache_keys),
-    )
-    .await
-    .unwrap_or_default();
-    let cached_models_by_key = cache_keys
-        .into_iter()
-        .zip(cached_values)
-        .filter_map(|(key, raw)| {
-            let models = serde_json::from_str::<Vec<Value>>(raw.as_deref()?).ok()?;
-            Some((key, models))
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    let mut seen_global_models = BTreeSet::new();
+        .filter(|row| is_codex_provider_row(row))
+        .map(|row| row.global_model_name.clone())
+        .collect::<BTreeSet<_>>();
     let mut cards = Vec::new();
     for row in rows.iter().filter(|row| is_codex_provider_row(row)) {
         if seen_global_models.contains(&row.global_model_name) {
             continue;
         }
-
-        // Codex 卡片来自具体 Key 的上游缓存；静态 catalog 配置只作为显式兜底来源。
-        for candidate in candidate_rows.iter().filter(|candidate| {
-            candidate.provider_id == row.provider_id
-                && candidate.global_model_name == row.global_model_name
-        }) {
-            let Some((source_model, _)) =
-                aether_scheduler_core::resolve_provider_model_name_with_model_directives_and_request_operation(
-                    candidate,
-                    row.global_model_name.as_str(),
-                    "openai:responses",
-                    false,
-                    None,
-                )
-            else {
-                continue;
-            };
-            let cache_key = format!(
-                "upstream_models:{}:{}",
-                candidate.provider_id, candidate.key_id
-            );
-            let Some(cached_models) = cached_models_by_key.get(&cache_key) else {
-                continue;
-            };
-            let Some(card) = project_codex_model_card(
-                cached_models,
-                source_model.as_str(),
-                row.global_model_name.as_str(),
-            ) else {
-                continue;
-            };
-            seen_global_models.insert(row.global_model_name.clone());
-            cards.push(card);
-            break;
-        }
-        if seen_global_models.contains(&row.global_model_name) {
+        let Some(snapshot) = catalogs.snapshot(&row.provider_id, &row.key_id) else {
             continue;
-        }
-
-        let catalog_models = codex_catalog_card_candidates(row);
-        if let Some(card) = project_codex_model_card(
-            &catalog_models,
-            row.provider_model_name.as_str(),
+        };
+        let source_model =
+            aether_scheduler_core::select_provider_model_name(row, "openai:responses");
+        let Some(card) = crate::ai_serving::project_codex_catalog_model_card(
+            &snapshot.models,
+            source_model.as_str(),
             row.global_model_name.as_str(),
-        ) {
-            seen_global_models.insert(row.global_model_name.clone());
-            cards.push(card);
+        ) else {
+            warn!(
+                event_name = "codex_catalog_authorized_model_missing",
+                provider_id = %row.provider_id,
+                key_id = %row.key_id,
+                client_version = %client_version.as_str(),
+                source_model = %source_model,
+                global_model = %row.global_model_name,
+                "authorized Codex model was not present in this upstream catalog mapping"
+            );
+            continue;
+        };
+        seen_global_models.insert(row.global_model_name.clone());
+        cards.push(card);
+        if cards.len() > CODEX_MODELS_MAX_RESPONSE_MODELS {
+            warn!(
+                event_name = "codex_catalog_aggregate_model_limit",
+                client_version = %client_version.as_str(),
+                model_count = cards.len(),
+                limit = CODEX_MODELS_MAX_RESPONSE_MODELS,
+                "Codex projected catalog exceeded the aggregate model limit; returning an empty remote catalog"
+            );
+            return (Vec::new(), None);
         }
     }
-    cards
+    let missing_model_count = expected_global_models
+        .difference(&seen_global_models)
+        .count();
+    if missing_model_count > 0 {
+        warn!(
+            event_name = "codex_catalog_authorized_models_incomplete",
+            client_version = %client_version.as_str(),
+            expected_model_count = expected_global_models.len(),
+            projected_model_count = cards.len(),
+            missing_model_count,
+            "Codex upstream catalogs omitted authorized mappings; serving the available cards without fabricating missing model metadata"
+        );
+    }
+    if !codex_projected_catalog_fits_response_limits(&cards) {
+        warn!(
+            event_name = "codex_catalog_aggregate_body_limit",
+            client_version = %client_version.as_str(),
+            model_count = cards.len(),
+            limit_bytes = CODEX_MODELS_MAX_RESPONSE_JSON_BYTES,
+            "Codex projected catalog exceeded the aggregate response body limit; returning an empty remote catalog"
+        );
+        return (Vec::new(), None);
+    }
+    if cards.is_empty() {
+        return (cards, None);
+    }
+    let etag = if possible_inference_catalogs.len() == 1 {
+        possible_inference_catalogs
+            .iter()
+            .next()
+            .and_then(|(provider_id, key_id)| catalogs.snapshot(provider_id, key_id))
+            .and_then(|snapshot| snapshot.etag.clone())
+    } else {
+        None
+    };
+    (cards, etag)
+}
+
+struct ModelRowsForClientFormat {
+    rows: Vec<StoredMinimalCandidateSelectionRow>,
+    codex_catalog_targets: Vec<crate::model_fetch::CodexCatalogTarget>,
 }
 
 fn build_openai_catalog_models_list_response(model_names: &[String]) -> Response<Body> {
@@ -290,6 +252,29 @@ fn build_openai_catalog_models_list_response(model_names: &[String]) -> Response
         }).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+/// 读取可用于 Codex 动态目录投影的真实候选行，并保留具体 Endpoint/Key 绑定。
+async fn list_codex_model_rows(
+    state: &AppState,
+    auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
+) -> Option<ModelRowsForClientFormat> {
+    let mut collected = Vec::new();
+    for query_format in CODEX_MODELS_QUERY_API_FORMATS {
+        let rows = await_models_route_read(
+            "candidate_selection_by_api_format",
+            state.list_minimal_candidate_selection_rows_for_api_format(query_format),
+        )
+        .await?;
+        let mut filtered = filter_eligible_model_rows(rows, auth_snapshot, query_format);
+        collected.append(&mut filtered);
+    }
+    collected.retain(is_codex_provider_row);
+    let codex_catalog_targets = crate::model_fetch::codex_catalog_targets(&collected);
+    Some(ModelRowsForClientFormat {
+        rows: sort_model_rows(collected),
+        codex_catalog_targets,
+    })
 }
 
 fn build_openai_catalog_model_detail_response(model_name: &str) -> Response<Body> {
@@ -558,6 +543,9 @@ pub(super) async fn maybe_build_local_models_route_response(
     }
 
     let auth_context = decision.auth_context.as_ref()?;
+    if !auth_context.access_allowed || auth_context.local_rejection.is_some() {
+        return Some(build_models_auth_error_response(api_format));
+    }
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -580,10 +568,60 @@ pub(super) async fn maybe_build_local_models_route_response(
             ))
         }
     };
-    let auth_snapshot = auth_snapshot.as_ref();
+    let Some(auth_snapshot) = auth_snapshot.as_ref() else {
+        warn!(
+            event_name = "models_route_auth_snapshot_missing",
+            user_id = %auth_context.user_id,
+            api_key_id = %auth_context.api_key_id,
+            "gateway models route rejected a request whose authenticated API key snapshot disappeared"
+        );
+        return Some(build_models_auth_error_response(api_format));
+    };
+    if !auth_snapshot.currently_usable {
+        return Some(build_models_auth_error_response(api_format));
+    }
+    let auth_snapshot = Some(auth_snapshot);
 
     match decision.route_kind.as_deref() {
         Some("list") => {
+            if is_codex_models_api_format(api_format) {
+                let listed = match list_codex_model_rows(state, auth_snapshot).await {
+                    Some(rows) => rows,
+                    None => {
+                        return Some(build_models_read_fallback_response(
+                            request_context,
+                            api_format,
+                        ))
+                    }
+                };
+                let rows = listed.rows;
+                if rows.is_empty() {
+                    return Some(build_empty_models_list_response(api_format));
+                }
+                let raw_client_version = query_param_value(
+                    request_context.request_query_string.as_deref(),
+                    "client_version",
+                );
+                let client_version = crate::model_fetch::normalize_codex_client_version(
+                    raw_client_version.as_deref(),
+                );
+                if client_version.used_fallback() {
+                    warn!(
+                        event_name = "codex_catalog_invalid_client_version",
+                        raw_length = raw_client_version.as_ref().map_or(0, String::len),
+                        fallback_version = %client_version.as_str(),
+                        "invalid Codex client_version used the bounded fallback version"
+                    );
+                }
+                let (models, etag) = load_codex_model_cards(
+                    state,
+                    &rows,
+                    &listed.codex_catalog_targets,
+                    client_version,
+                )
+                .await;
+                return Some(build_codex_models_list_response(models, etag.as_deref()));
+            }
             let published =
                 match list_models_for_client_format(state, api_format, auth_snapshot).await {
                     Some(published) => published,
@@ -596,10 +634,6 @@ pub(super) async fn maybe_build_local_models_route_response(
                 };
             if published.model_names.is_empty() {
                 return Some(build_empty_models_list_response(api_format));
-            }
-            if is_codex_models_api_format(api_format) {
-                let models = load_codex_model_cards(state, &published.catalog_rows).await;
-                return Some(build_codex_models_list_response(models));
             }
             let response = match api_format {
                 "claude:messages" => {
@@ -691,5 +725,34 @@ pub(super) async fn maybe_build_local_models_route_response(
             Some(response)
         }
         _ => Some(build_models_auth_error_response(api_format)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        codex_projected_catalog_fits_response_limits, CODEX_MODELS_MAX_RESPONSE_JSON_BYTES,
+        CODEX_MODELS_MAX_RESPONSE_MODELS,
+    };
+
+    #[test]
+    fn projected_codex_catalog_enforces_aggregate_count_and_body_limits() {
+        assert!(codex_projected_catalog_fits_response_limits(&[json!({
+            "slug": "gpt-future-dynamic",
+            "model_messages": {"instructions_template": "opaque"}
+        })]));
+
+        let too_many = (0..=CODEX_MODELS_MAX_RESPONSE_MODELS)
+            .map(|index| json!({"slug": format!("gpt-future-{index}")}))
+            .collect::<Vec<_>>();
+        assert!(!codex_projected_catalog_fits_response_limits(&too_many));
+
+        let oversized = vec![json!({
+            "slug": "gpt-future-oversized",
+            "future_capability": "x".repeat(CODEX_MODELS_MAX_RESPONSE_JSON_BYTES)
+        })];
+        assert!(!codex_projected_catalog_fits_response_limits(&oversized));
     }
 }

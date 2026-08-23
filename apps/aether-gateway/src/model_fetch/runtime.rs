@@ -7,12 +7,12 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_model_fetch::{
-    aggregate_models_for_cache, apply_model_filters, fetch_models_from_transports,
-    global_model_matches_allowed_models, json_string_list, model_catalog_upstream_metadata,
-    model_fetch_interval_minutes, model_fetch_startup_delay_seconds, model_fetch_startup_enabled,
-    preset_models_for_provider, selected_models_fetch_endpoints,
-    sync_provider_model_whitelist_associations, upstream_metadata_namespace_updates,
-    ModelFetchAssociationStore, ModelFetchRunSummary,
+    aggregate_models_for_cache, apply_model_filters,
+    fetch_models_from_transports_for_client_version, global_model_matches_allowed_models,
+    json_string_list, model_catalog_upstream_metadata, model_fetch_interval_minutes,
+    model_fetch_startup_delay_seconds, model_fetch_startup_enabled, preset_models_for_provider,
+    selected_models_fetch_endpoints, sync_provider_model_whitelist_associations,
+    upstream_metadata_namespace_updates, ModelFetchAssociationStore, ModelFetchRunSummary,
 };
 use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
@@ -521,7 +521,25 @@ async fn fetch_and_persist_key_models(
         ));
     }
 
-    let result = match fetch_models_from_transports(state, &transports).await {
+    let codex_client_version = if target
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+    {
+        state
+            .read_recent_codex_catalog_client_version(&target.provider.id, &target.key.id)
+            .await
+    } else {
+        None
+    };
+    let result = match fetch_models_from_transports_for_client_version(
+        state,
+        &transports,
+        codex_client_version.as_deref(),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(err) => {
             persist_key_fetch_failure(state, &target.key, now_unix_secs, err.clone()).await?;
@@ -551,7 +569,9 @@ async fn fetch_and_persist_key_models(
         return Ok(KeyFetchOutcome::without_models(KeyFetchDisposition::Failed));
     }
 
-    let mut cached_models = result.cached_models;
+    // 版本化 Codex 卡片保留在专用动态目录中；旧缓存与自动绑定消费带 Endpoint
+    // 投影的兼容模型，避免把内部绑定字段写回不透明上游卡片。
+    let mut association_models = result.legacy_models;
     let used_preset_catalog = result.used_preset_catalog;
     let successful_endpoint_ids = result.successful_endpoint_ids;
     if used_preset_catalog {
@@ -560,7 +580,7 @@ async fn fetch_and_persist_key_models(
                 &target.provider.id,
             ))
             .await?;
-        attach_model_endpoint_ids(&mut cached_models, &provider_endpoints);
+        attach_model_endpoint_ids(&mut association_models, &provider_endpoints);
     }
     let filtered_models = apply_model_filters(
         &result.fetched_model_ids,
@@ -577,13 +597,13 @@ async fn fetch_and_persist_key_models(
     )
     .await?;
     state
-        .write_upstream_models_cache(&target.provider.id, &target.key.id, &cached_models)
+        .write_upstream_models_cache(&target.provider.id, &target.key.id, &association_models)
         .await;
     sync_provider_model_whitelist_associations(
         state,
         &target.provider.id,
         &filtered_models,
-        &cached_models,
+        &association_models,
         false,
         false,
         &[],
@@ -592,7 +612,7 @@ async fn fetch_and_persist_key_models(
     .map_err(GatewayError::Internal)?;
     Ok(KeyFetchOutcome {
         disposition: KeyFetchDisposition::Succeeded,
-        discovered_models: cached_models,
+        discovered_models: association_models,
         used_preset_catalog,
         successful_endpoint_ids,
     })

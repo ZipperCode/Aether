@@ -1394,6 +1394,10 @@ fn provider_query_pool_catalog_key_context(
         ),
         // 模型测试调度与正式请求共用同一余额事实，避免管理端测试命中低余额 Key。
         balance_below_minimum: provider_pool_key_balance_below_minimum(key, provider_type),
+        quota_hard_blocked: admin_provider_pool_pure::admin_pool_key_quota_hard_blocked(
+            key,
+            provider_type,
+        ),
         health_score,
         latency_avg_ms,
         catalog_lru_score: Some(key.last_used_at_unix_secs.unwrap_or(0) as f64),
@@ -3252,7 +3256,7 @@ async fn provider_query_execute_standard_test_candidate(
         | "openai:rerank"
         | "jina:rerank" => {
             let Some(mut provider_request_body) =
-                crate::ai_serving::build_standard_request_body_with_model_directives_and_request_headers(
+                crate::ai_serving::build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy(
                     &request_body,
                     client_api_format,
                     request_model,
@@ -3264,6 +3268,10 @@ async fn provider_query_execute_standard_test_candidate(
                     Some(candidate.key.id.as_str()),
                     Some(&incoming_request_headers),
                     false,
+                    crate::ai_serving::openai_responses_reasoning_replay_policy(
+                        transport.provider.provider_type.as_str(),
+                        transport.endpoint.base_url.as_str(),
+                    ),
                 )
             else {
                 return Ok(provider_query_skipped_execution_outcome(
@@ -3308,7 +3316,7 @@ async fn provider_query_execute_standard_test_candidate(
     if matches!(
         normalized_provider_api_format.as_str(),
         "openai:chat" | "openai:responses" | "openai:responses:compact" | "openai:search"
-    ) && crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities(
+    ) && crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
         &mut provider_request_body,
         crate::ai_serving::OpenAiProviderRequestFinalization {
             source_api_format: client_api_format,
@@ -3321,6 +3329,10 @@ async fn provider_query_execute_standard_test_candidate(
             require_body_stream_field,
         },
         codex_model_capabilities.as_ref(),
+        crate::ai_serving::openai_responses_reasoning_replay_policy(
+            transport.provider.provider_type.as_str(),
+            transport.endpoint.base_url.as_str(),
+        ),
     )
     .is_err()
     {

@@ -42,6 +42,8 @@ pub struct PoolMemberSignals {
     pub quota_exhausted: bool,
     /// 标准余额快照明确为 fresh 且所有可用余额都不高于内部下限。
     pub balance_below_minimum: bool,
+    /// Provider 适配器明确声明的硬额度阻断，不受订阅耗尽开关控制。
+    pub quota_hard_blocked: bool,
     pub health_score: Option<f64>,
     pub latency_avg_ms: Option<f64>,
     pub catalog_lru_score: Option<f64>,
@@ -229,7 +231,9 @@ fn schedule_pool_group<Candidate>(
             continue;
         }
 
-        if pool_config.skip_exhausted_accounts && item.key_context.quota_exhausted {
+        if item.key_context.quota_hard_blocked
+            || (pool_config.skip_exhausted_accounts && item.key_context.quota_exhausted)
+        {
             skipped.push(PoolSkippedCandidate {
                 candidate: item.candidate,
                 skip_reason: POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
@@ -951,6 +955,30 @@ mod tests {
         assert_eq!(blocked_outcome.candidates.len(), 0);
         assert_eq!(
             blocked_outcome.skipped_candidates[0].skip_reason,
+            POOL_ACCOUNT_EXHAUSTED_SKIP_REASON
+        );
+    }
+
+    #[test]
+    fn pool_scheduler_always_skips_hard_quota_blocks() {
+        let ready = sample_candidate("provider-pool", "endpoint-1", "key-ready", 10, true);
+        let mut hard_blocked =
+            sample_candidate("provider-pool", "endpoint-1", "key-blocked", 10, true);
+        hard_blocked.key_context.quota_exhausted = true;
+        hard_blocked.key_context.quota_hard_blocked = true;
+
+        let outcome = run_pool_scheduler(vec![ready, hard_blocked], &BTreeMap::new(), "seed");
+
+        assert_eq!(
+            outcome
+                .candidates
+                .iter()
+                .map(|item| item.candidate.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-ready"]
+        );
+        assert_eq!(
+            outcome.skipped_candidates[0].skip_reason,
             POOL_ACCOUNT_EXHAUSTED_SKIP_REASON
         );
     }

@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use futures_util::{future::BoxFuture, stream::TryStream, TryStreamExt};
 use sqlx::{postgres::PgRow, PgPool, Postgres, QueryBuilder, Row};
-use tracing::warn;
 use uuid::Uuid;
 
 use aether_data_contracts::repository::candidates::{
@@ -189,13 +188,30 @@ DO UPDATE SET
   concurrent_requests = COALESCE(EXCLUDED.concurrent_requests, request_candidates.concurrent_requests),
   extra_data = CASE
     WHEN request_candidates.extra_data IS NULL THEN EXCLUDED.extra_data
-    WHEN EXCLUDED.extra_data IS NULL THEN request_candidates.extra_data
+    WHEN EXCLUDED.extra_data IS NULL THEN regexp_replace(
+      request_candidates.extra_data::text,
+      $aether_nul$(?<!\\)((?:\\\\)*)\\u0000$aether_nul$,
+      $aether_replacement$\1\\ufffd$aether_replacement$,
+      'g'
+    )::json
     WHEN json_typeof(request_candidates.extra_data) = 'object'
       AND json_typeof(EXCLUDED.extra_data) = 'object'
-      THEN (request_candidates.extra_data::jsonb || EXCLUDED.extra_data::jsonb)::json
+      THEN (
+        regexp_replace(
+          request_candidates.extra_data::text,
+          $aether_nul$(?<!\\)((?:\\\\)*)\\u0000$aether_nul$,
+          $aether_replacement$\1\\ufffd$aether_replacement$,
+          'g'
+        )::jsonb || EXCLUDED.extra_data::jsonb
+      )::json
     ELSE EXCLUDED.extra_data
   END,
-  required_capabilities = COALESCE(EXCLUDED.required_capabilities, request_candidates.required_capabilities),
+  required_capabilities = regexp_replace(
+    COALESCE(EXCLUDED.required_capabilities, request_candidates.required_capabilities)::text,
+    $aether_nul$(?<!\\)((?:\\\\)*)\\u0000$aether_nul$,
+    $aether_replacement$\1\\ufffd$aether_replacement$,
+    'g'
+  )::json,
   created_at = CASE
     WHEN request_candidates.created_at <= TO_TIMESTAMP(1)
       THEN EXCLUDED.created_at
@@ -304,13 +320,30 @@ DO UPDATE SET
   concurrent_requests = COALESCE(EXCLUDED.concurrent_requests, request_candidates.concurrent_requests),
   extra_data = CASE
     WHEN request_candidates.extra_data IS NULL THEN EXCLUDED.extra_data
-    WHEN EXCLUDED.extra_data IS NULL THEN request_candidates.extra_data
+    WHEN EXCLUDED.extra_data IS NULL THEN regexp_replace(
+      request_candidates.extra_data::text,
+      $aether_nul$(?<!\\)((?:\\\\)*)\\u0000$aether_nul$,
+      $aether_replacement$\1\\ufffd$aether_replacement$,
+      'g'
+    )::json
     WHEN json_typeof(request_candidates.extra_data) = 'object'
       AND json_typeof(EXCLUDED.extra_data) = 'object'
-      THEN (request_candidates.extra_data::jsonb || EXCLUDED.extra_data::jsonb)::json
+      THEN (
+        regexp_replace(
+          request_candidates.extra_data::text,
+          $aether_nul$(?<!\\)((?:\\\\)*)\\u0000$aether_nul$,
+          $aether_replacement$\1\\ufffd$aether_replacement$,
+          'g'
+        )::jsonb || EXCLUDED.extra_data::jsonb
+      )::json
     ELSE EXCLUDED.extra_data
   END,
-  required_capabilities = COALESCE(EXCLUDED.required_capabilities, request_candidates.required_capabilities),
+  required_capabilities = regexp_replace(
+    COALESCE(EXCLUDED.required_capabilities, request_candidates.required_capabilities)::text,
+    $aether_nul$(?<!\\)((?:\\\\)*)\\u0000$aether_nul$,
+    $aether_replacement$\1\\ufffd$aether_replacement$,
+    'g'
+  )::json,
   created_at = CASE
     WHEN request_candidates.created_at <= TO_TIMESTAMP(1)
       THEN EXCLUDED.created_at
@@ -394,13 +427,30 @@ DO UPDATE SET
   concurrent_requests = COALESCE(EXCLUDED.concurrent_requests, request_candidates.concurrent_requests),
   extra_data = CASE
     WHEN request_candidates.extra_data IS NULL THEN EXCLUDED.extra_data
-    WHEN EXCLUDED.extra_data IS NULL THEN request_candidates.extra_data
+    WHEN EXCLUDED.extra_data IS NULL THEN regexp_replace(
+      request_candidates.extra_data::text,
+      $aether_nul$(?<!\\)((?:\\\\)*)\\u0000$aether_nul$,
+      $aether_replacement$\1\\ufffd$aether_replacement$,
+      'g'
+    )::json
     WHEN json_typeof(request_candidates.extra_data) = 'object'
       AND json_typeof(EXCLUDED.extra_data) = 'object'
-      THEN (request_candidates.extra_data::jsonb || EXCLUDED.extra_data::jsonb)::json
+      THEN (
+        regexp_replace(
+          request_candidates.extra_data::text,
+          $aether_nul$(?<!\\)((?:\\\\)*)\\u0000$aether_nul$,
+          $aether_replacement$\1\\ufffd$aether_replacement$,
+          'g'
+        )::jsonb || EXCLUDED.extra_data::jsonb
+      )::json
     ELSE EXCLUDED.extra_data
   END,
-  required_capabilities = COALESCE(EXCLUDED.required_capabilities, request_candidates.required_capabilities),
+  required_capabilities = regexp_replace(
+    COALESCE(EXCLUDED.required_capabilities, request_candidates.required_capabilities)::text,
+    $aether_nul$(?<!\\)((?:\\\\)*)\\u0000$aether_nul$,
+    $aether_replacement$\1\\ufffd$aether_replacement$,
+    'g'
+  )::json,
   created_at = CASE
     WHEN request_candidates.created_at <= TO_TIMESTAMP(1)
       THEN EXCLUDED.created_at
@@ -729,8 +779,8 @@ impl SqlxRequestCandidateReadRepository {
         &self,
         mut candidate: UpsertRequestCandidateRecord,
     ) -> Result<StoredRequestCandidate, DataLayerError> {
+        sanitize_request_candidate_for_postgres(&mut candidate);
         candidate.validate()?;
-        sanitize_request_candidate_json_for_postgres(&mut candidate);
         self.tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
@@ -878,8 +928,8 @@ impl TryFrom<UpsertRequestCandidateRecord> for BatchUpsertRequestCandidateRow {
     type Error = DataLayerError;
 
     fn try_from(mut candidate: UpsertRequestCandidateRecord) -> Result<Self, Self::Error> {
+        sanitize_request_candidate_for_postgres(&mut candidate);
         candidate.validate()?;
-        sanitize_request_candidate_json_for_postgres(&mut candidate);
         Ok(Self {
             id: if candidate.id.trim().is_empty() {
                 Uuid::new_v4().to_string()
@@ -910,58 +960,6 @@ impl TryFrom<UpsertRequestCandidateRecord> for BatchUpsertRequestCandidateRow {
             started_at_unix_ms: candidate.started_at_unix_ms.map(|value| value as f64),
             finished_at_unix_ms: candidate.finished_at_unix_ms.map(|value| value as f64),
         })
-    }
-}
-
-fn sanitize_request_candidate_json_for_postgres(candidate: &mut UpsertRequestCandidateRecord) {
-    let extra_data_nul_count = candidate
-        .extra_data
-        .as_mut()
-        .map(sanitize_postgres_json_nul)
-        .unwrap_or_default();
-    let required_capabilities_nul_count = candidate
-        .required_capabilities
-        .as_mut()
-        .map(sanitize_postgres_json_nul)
-        .unwrap_or_default();
-    let nul_count = extra_data_nul_count.saturating_add(required_capabilities_nul_count);
-    if nul_count == 0 {
-        return;
-    }
-
-    warn!(
-        event_name = "request_candidate_postgres_json_nul_sanitized",
-        log_type = "event",
-        request_id = %candidate.request_id,
-        candidate_id = %candidate.id,
-        candidate_index = candidate.candidate_index,
-        retry_index = candidate.retry_index,
-        extra_data_nul_count,
-        required_capabilities_nul_count,
-        nul_count,
-        "sanitized PostgreSQL-incompatible NUL characters in request candidate JSON"
-    );
-}
-
-// PostgreSQL 的 json/jsonb 无法表示 NUL；在数据库边界替换，避免永久失败记录毒化整个异步批次。
-fn sanitize_postgres_json_nul(value: &mut serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::String(text) => replace_nul_characters(text),
-        serde_json::Value::Array(items) => items
-            .iter_mut()
-            .map(sanitize_postgres_json_nul)
-            .fold(0usize, usize::saturating_add),
-        serde_json::Value::Object(object) => {
-            let original = std::mem::take(object);
-            let mut nul_count = 0usize;
-            for (mut key, mut child) in original {
-                nul_count = nul_count.saturating_add(replace_nul_characters(&mut key));
-                nul_count = nul_count.saturating_add(sanitize_postgres_json_nul(&mut child));
-                object.insert(key, child);
-            }
-            nul_count
-        }
-        _ => 0,
     }
 }
 
@@ -1241,13 +1239,87 @@ fn to_i32_u64(value: u64) -> Result<i32, DataLayerError> {
     })
 }
 
+fn sanitize_request_candidate_for_postgres(candidate: &mut UpsertRequestCandidateRecord) -> usize {
+    let mut replacements = 0usize;
+    for value in [
+        &mut candidate.username,
+        &mut candidate.api_key_name,
+        &mut candidate.skip_reason,
+        &mut candidate.error_type,
+        &mut candidate.error_message,
+    ] {
+        if let Some(value) = value.as_mut() {
+            replacements = replacements.saturating_add(replace_nul_characters(value));
+        }
+    }
+    for value in [
+        &mut candidate.extra_data,
+        &mut candidate.required_capabilities,
+    ] {
+        if let Some(value) = value.as_mut() {
+            replacements = replacements.saturating_add(sanitize_json_nul_characters(value));
+        }
+    }
+    if replacements > 0 {
+        tracing::warn!(
+            event_name = "request_candidate_postgres_nul_sanitized",
+            log_type = "event",
+            candidate_index = candidate.candidate_index,
+            retry_index = candidate.retry_index,
+            status = ?candidate.status,
+            replacements,
+            "postgres request candidate persistence replaced unsupported NUL characters"
+        );
+    }
+    replacements
+}
+
+fn sanitize_json_nul_characters(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(value) => replace_nul_characters(value),
+        serde_json::Value::Array(values) => values.iter_mut().fold(0usize, |count, value| {
+            count.saturating_add(sanitize_json_nul_characters(value))
+        }),
+        serde_json::Value::Object(values) => {
+            let mut replacements = 0usize;
+            let original = std::mem::take(values);
+            for (mut key, mut value) in original {
+                replacements = replacements.saturating_add(replace_nul_characters(&mut key));
+                replacements =
+                    replacements.saturating_add(sanitize_json_nul_characters(&mut value));
+
+                if values.contains_key(&key) {
+                    let base = key.clone();
+                    let mut suffix = 1usize;
+                    loop {
+                        let candidate = format!("{base}#{suffix}");
+                        if !values.contains_key(&candidate) {
+                            key = candidate;
+                            break;
+                        }
+                        suffix = suffix.saturating_add(1);
+                    }
+                }
+                values.insert(key, value);
+            }
+            replacements
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        sanitize_postgres_json_nul, SqlxRequestCandidateReadRepository,
+        sanitize_request_candidate_for_postgres, SqlxRequestCandidateReadRepository,
         UPSERT_CONFLICT_INHERIT_IS_CACHED_SQL, UPSERT_CONFLICT_SQL, UPSERT_SQL,
     };
+    use crate::error::SqlxResultExt;
     use crate::{PostgresPoolConfig, PostgresPoolFactory};
+    use aether_data_contracts::repository::candidates::{
+        RequestCandidateStatus, UpsertRequestCandidateRecord,
+    };
+    use serde_json::{json, Map, Value};
 
     #[test]
     fn upsert_sql_does_not_default_missing_or_epoch_created_at_to_epoch() {
@@ -1286,19 +1358,68 @@ mod tests {
     }
 
     #[test]
-    fn postgres_candidate_json_replaces_nested_nul_in_keys_and_values() {
-        let mut value = serde_json::json!({
-            "plain": "kept",
-            "nested": ["before\0after", {"child\0key": "\0"}]
-        });
+    fn postgres_candidate_sanitizer_replaces_nul_in_text_and_nested_json() {
+        let mut extra_data = Map::new();
+        extra_data.insert(
+            "bad\0key".to_string(),
+            json!({"nested": ["bad\0value", {"literal": "\\u0000"}]}),
+        );
+        let mut required_capabilities = Map::new();
+        required_capabilities.insert("cap\0key".to_string(), Value::String("cap\0value".into()));
+        let mut candidate = UpsertRequestCandidateRecord {
+            id: "candidate-1".to_string(),
+            request_id: "request-1".to_string(),
+            user_id: None,
+            api_key_id: None,
+            username: Some("user\0name".to_string()),
+            api_key_name: Some("key\0name".to_string()),
+            candidate_index: 0,
+            retry_index: 0,
+            provider_id: None,
+            endpoint_id: None,
+            key_id: None,
+            status: RequestCandidateStatus::Failed,
+            skip_reason: Some("skip\0reason".to_string()),
+            is_cached: None,
+            status_code: Some(500),
+            error_type: Some("upstream\0error".to_string()),
+            error_message: Some("bad\0message".to_string()),
+            latency_ms: None,
+            concurrent_requests: None,
+            extra_data: Some(Value::Object(extra_data)),
+            required_capabilities: Some(Value::Object(required_capabilities)),
+            created_at_unix_ms: Some(1),
+            started_at_unix_ms: None,
+            finished_at_unix_ms: Some(2),
+        };
 
-        let replaced = sanitize_postgres_json_nul(&mut value);
+        assert_eq!(sanitize_request_candidate_for_postgres(&mut candidate), 9);
+        assert_eq!(candidate.username.as_deref(), Some("user�name"));
+        assert_eq!(candidate.api_key_name.as_deref(), Some("key�name"));
+        assert_eq!(candidate.skip_reason.as_deref(), Some("skip�reason"));
+        assert_eq!(candidate.error_type.as_deref(), Some("upstream�error"));
+        assert_eq!(candidate.error_message.as_deref(), Some("bad�message"));
+        assert_eq!(
+            candidate.extra_data,
+            Some(json!({"bad�key": {"nested": ["bad�value", {"literal": "\\u0000"}]}}))
+        );
+        assert_eq!(
+            candidate.required_capabilities,
+            Some(json!({"cap�key": "cap�value"}))
+        );
+    }
 
-        assert_eq!(replaced, 3);
-        assert_eq!(value["plain"], "kept");
-        assert_eq!(value["nested"][0], "before\u{FFFD}after");
-        assert_eq!(value["nested"][1]["child\u{FFFD}key"], "\u{FFFD}");
-        assert!(!value.to_string().contains("\\u0000"));
+    #[test]
+    fn every_postgres_candidate_conflict_path_repairs_legacy_json_nul_escapes() {
+        for sql in [
+            UPSERT_SQL,
+            UPSERT_CONFLICT_SQL,
+            UPSERT_CONFLICT_INHERIT_IS_CACHED_SQL,
+        ] {
+            assert!(sql.contains("regexp_replace("));
+            assert!(sql.contains(r"(?<!\\)((?:\\\\)*)\\u0000"));
+            assert!(sql.contains(r"\1\\ufffd"));
+        }
     }
 
     #[tokio::test]
@@ -1319,5 +1440,147 @@ mod tests {
         let repository = SqlxRequestCandidateReadRepository::new(pool);
         let _ = repository.pool();
         let _ = repository.transaction_runner();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL and PostgreSQL migrations"]
+    async fn live_postgres_candidate_nul_is_sanitized_and_legacy_json_is_repaired() {
+        let database_url = std::env::var("AETHER_TEST_DATABASE_URL")
+            .expect("AETHER_TEST_DATABASE_URL must point at the test database");
+        let factory = PostgresPoolFactory::new(PostgresPoolConfig {
+            database_url,
+            min_connections: 1,
+            max_connections: 2,
+            acquire_timeout_ms: 10_000,
+            idle_timeout_ms: 30_000,
+            max_lifetime_ms: 60_000,
+            statement_cache_capacity: 64,
+            require_ssl: false,
+        })
+        .expect("factory should build");
+        let repository = SqlxRequestCandidateReadRepository::new(
+            factory.connect_lazy().expect("lazy pool should build"),
+        );
+        crate::run_migrations(repository.pool())
+            .await
+            .expect("test database migrations should succeed");
+
+        let mapped_error = sqlx::query("SELECT $1::jsonb")
+            .bind(json!("bad\0value"))
+            .execute(repository.pool())
+            .await
+            .map_postgres_err()
+            .expect_err("PostgreSQL jsonb should reject a NUL string");
+        assert!(mapped_error.to_string().contains("SQLSTATE 22P05"));
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let single_request_id = format!("candidate-nul-single-{suffix}");
+        let batch_request_id = format!("candidate-nul-batch-{suffix}");
+        let healthy_request_id = format!("candidate-nul-healthy-{suffix}");
+        let legacy_extra =
+            r#"{"old\u0000key":"old\u0000value","literal":"\\u0000","adjacent":"\u0000\u0000"}"#;
+        let legacy_capabilities = r#"{"cap\u0000key":"cap\u0000value"}"#;
+        for request_id in [&single_request_id, &batch_request_id] {
+            sqlx::query(
+                r#"
+INSERT INTO request_candidates (
+  id, request_id, candidate_index, retry_index, status,
+  extra_data, required_capabilities, created_at
+)
+VALUES ($1, $2, 0, 0, 'pending', $3::json, $4::json, NOW())
+"#,
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(request_id)
+            .bind(legacy_extra)
+            .bind(legacy_capabilities)
+            .execute(repository.pool())
+            .await
+            .expect("legacy JSON poison seed should persist in the json column");
+        }
+
+        let candidate = |request_id: &str, id: String| UpsertRequestCandidateRecord {
+            id,
+            request_id: request_id.to_string(),
+            user_id: None,
+            api_key_id: None,
+            username: None,
+            api_key_name: None,
+            candidate_index: 0,
+            retry_index: 0,
+            provider_id: None,
+            endpoint_id: None,
+            key_id: None,
+            status: RequestCandidateStatus::Success,
+            skip_reason: None,
+            is_cached: Some(false),
+            status_code: Some(200),
+            error_type: None,
+            error_message: Some("bad\0message".to_string()),
+            latency_ms: Some(1),
+            concurrent_requests: None,
+            extra_data: Some(json!({"new": true, "nested": "new\0value"})),
+            required_capabilities: None,
+            created_at_unix_ms: Some(1_700_000_000_000),
+            started_at_unix_ms: Some(1_700_000_000_000),
+            finished_at_unix_ms: Some(1_700_000_000_001),
+        };
+
+        repository
+            .upsert(candidate(
+                &single_request_id,
+                uuid::Uuid::new_v4().to_string(),
+            ))
+            .await
+            .expect("single conflict should sanitize incoming and legacy JSON");
+        repository
+            .upsert_many(vec![
+                candidate(&batch_request_id, uuid::Uuid::new_v4().to_string()),
+                candidate(&healthy_request_id, uuid::Uuid::new_v4().to_string()),
+            ])
+            .await
+            .expect("batch conflict should sanitize poison without blocking a healthy peer");
+
+        for request_id in [&single_request_id, &batch_request_id] {
+            let rows = repository
+                .list_by_request_id(request_id)
+                .await
+                .expect("sanitized candidate should be readable");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status, RequestCandidateStatus::Success);
+            assert_eq!(rows[0].error_message.as_deref(), Some("bad�message"));
+            assert_eq!(
+                rows[0].extra_data,
+                Some(json!({
+                    "old�key": "old�value",
+                    "literal": "\\u0000",
+                    "adjacent": "��",
+                    "new": true,
+                    "nested": "new�value"
+                }))
+            );
+            assert_eq!(
+                rows[0].required_capabilities,
+                Some(json!({"cap�key": "cap�value"}))
+            );
+        }
+        assert_eq!(
+            repository
+                .list_by_request_id(&healthy_request_id)
+                .await
+                .expect("healthy batch peer should be readable")
+                .len(),
+            1
+        );
+
+        sqlx::query("DELETE FROM request_candidates WHERE request_id = ANY($1)")
+            .bind(vec![
+                single_request_id,
+                batch_request_id,
+                healthy_request_id,
+            ])
+            .execute(repository.pool())
+            .await
+            .expect("candidate NUL test rows should clean up");
     }
 }
