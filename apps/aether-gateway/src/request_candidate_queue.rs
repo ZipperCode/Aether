@@ -3702,6 +3702,7 @@ mod tests {
         assert_eq!(metrics.flush_sql_ops_total.load(Ordering::Acquire), 3);
     }
 
+    /// 验证外键毒记录会被二分拆批隔离，两条有效记录正常落库且仅毒记录被永久丢弃。
     #[tokio::test]
     async fn flush_isolates_and_drops_foreign_key_poison_without_retrying_valid_records() {
         let poisoned = Arc::new(PoisonedBatchRequestCandidateRepository::default());
@@ -3731,7 +3732,7 @@ mod tests {
         .await;
 
         assert!(batch.is_empty(), "irrecoverable poison must not be retried");
-        assert_eq!(poisoned.upsert_many_calls.load(Ordering::Acquire), 4);
+        assert_eq!(poisoned.upsert_many_calls.load(Ordering::Acquire), 5);
         assert_eq!(metrics.pending_current.load(Ordering::Acquire), 0);
         assert_eq!(metrics.flushed_total.load(Ordering::Acquire), 2);
         assert_eq!(metrics.dropped_total.load(Ordering::Acquire), 1);
