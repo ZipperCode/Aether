@@ -6858,6 +6858,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                     status_code,
                                     &body_json,
                                 );
+                                // `report_kind` 已是当前执行的报告类型借用；直接传递可保留错误终态语义，并避免无意义的双重引用。
                                 return handle_prefetch_provider_private_stream_error(
                                     state,
                                     trace_id,
@@ -6866,7 +6867,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                     report_context,
                                     request_id,
                                     candidate_id,
-                                    &report_kind,
+                                    report_kind,
                                     headers,
                                     prefetched_usage_telemetry.clone(),
                                     &provider_prefetched_body,
@@ -10671,6 +10672,7 @@ mod tests {
         }
     }
 
+    /// 验证上层流执行在等待响应头前持久化 pending，并在请求任务取消后把用量与候选状态收敛为 cancelled。
     #[tokio::test]
     async fn frame_stream_records_deferred_pending_before_waiting_for_headers() {
         let request_id = "req-frame-stream-deferred-pending";
@@ -10688,27 +10690,24 @@ mod tests {
                 enabled: true,
                 ..UsageRuntimeConfig::default()
             });
-        let plan = codex_cyber_policy_plan(request_id);
-        let release_headers = Arc::new(Notify::new());
-        let release_headers_for_stream = Arc::clone(&release_headers);
-        let frame_stream = stream! {
-            release_headers_for_stream.notified().await;
-            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
-                frame_type: StreamFrameType::Headers,
-                payload: StreamFramePayload::Headers {
-                    status_code: 200,
-                    headers: BTreeMap::from([(
-                        "content-type".to_string(),
-                        "text/event-stream".to_string(),
-                    )]),
-                    response_observation: None,
-                },
-            }));
-        }
-        .boxed();
+        let mut plan = codex_cyber_policy_plan(request_id);
+        plan.endpoint_id = "missing-endpoint".to_string();
+        plan.key_id = "missing-key".to_string();
+        let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            Vec::<StoredProviderCatalogProvider>::new(),
+            Vec::<StoredProviderCatalogEndpoint>::new(),
+            Vec::<StoredProviderCatalogKey>::new(),
+        ));
+        let state = state.with_data_state_for_tests(
+            crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                Arc::clone(&request_candidate_repository),
+                Arc::clone(&usage_repository),
+            )
+            .attach_provider_catalog_repository_for_tests(provider_catalog),
+        );
         let state_for_execution = state.clone();
         let execution = tokio::spawn(async move {
-            execute_stream_from_frame_stream(
+            execute_execution_runtime_stream(
                 &state_for_execution,
                 plan,
                 "trace-frame-stream-deferred-pending",
@@ -10719,12 +10718,6 @@ mod tests {
                     "provider_api_format": "openai:responses",
                     "client_api_format": "openai:responses",
                 })),
-                crate::clock::current_unix_ms(),
-                Instant::now(),
-                RequestStageTrace::from_env(),
-                false,
-                frame_stream,
-                None,
             )
             .await
         });
