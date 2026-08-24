@@ -335,6 +335,7 @@ async fn provider_aggregation_skips_unknown_provider_labels() {
     );
 }
 
+/// 验证无计量 WebSocket 会话仍计入请求生命周期，但不贡献 token 或费用汇总。
 #[tokio::test]
 async fn unmetered_session_audit_counts_lifecycle_without_token_or_cost_contribution() {
     let metered = sample_usage("req-metered", 100);
@@ -377,6 +378,8 @@ async fn unmetered_session_audit_counts_lifecycle_without_token_or_cost_contribu
             created_from_unix_secs: 0,
             created_until_unix_secs: 1_000,
             group_by: UsageAuditAggregationGroupBy::Model,
+            provider_id: None,
+            provider_name: None,
             limit: 10,
             exclude_reserved_provider_labels: false,
         })

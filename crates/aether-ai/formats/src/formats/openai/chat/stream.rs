@@ -1959,7 +1959,7 @@ impl OpenAIResponsesProviderState {
                 self.ensure_started(report_context, &mut out);
                 let (id, model) = self.identity(report_context);
                 self.emit_response_output_items(report_context, &mut out, response);
-                self.emit_agent_bridge_reasoning_fallbacks(report_context, &mut out, &value);
+                self.emit_agent_bridge_reasoning_fallbacks(report_context, &mut out, value);
 
                 out.push(CanonicalStreamFrame {
                     id,
@@ -2010,7 +2010,7 @@ impl OpenAIResponsesProviderState {
                 self.ensure_started(report_context, &mut out);
                 let (id, model) = self.identity(report_context);
                 self.emit_response_output_items(report_context, &mut out, response);
-                self.emit_agent_bridge_reasoning_fallbacks(report_context, &mut out, &value);
+                self.emit_agent_bridge_reasoning_fallbacks(report_context, &mut out, value);
 
                 let finish_reason = if self.tool_calls.is_empty() {
                     Some("stop".to_string())

@@ -21,7 +21,8 @@ use aether_data::{
     DataBackends, DataLayerConfig, DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig,
 };
 use aether_data_contracts::repository::global_models::{
-    CreateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    CreateAdminGlobalModelRecord, CreateAdminProviderModelWithBindingsRecord,
+    UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -1501,6 +1502,8 @@ fn catalog_key(
     ))
 }
 
+/// 先写入全局模型，再原子写入供应商模型及 endpoint 绑定；后两者不可拆分，否则候选查询
+/// 看不到该模型。
 async fn seed_models(backends: &DataBackends) -> Result<(), BoxError> {
     let writer = backends
         .write()
@@ -1518,29 +1521,35 @@ async fn seed_models(backends: &DataBackends) -> Result<(), BoxError> {
             Some(json!({"model_mappings": [UPSTREAM_MODEL]})),
         )?)
         .await?;
+    let provider_model = UpsertAdminProviderModelRecord::new(
+        PROVIDER_MODEL_ID.to_string(),
+        PROVIDER_ID.to_string(),
+        GLOBAL_MODEL_ID.to_string(),
+        UPSTREAM_MODEL.to_string(),
+        Some(json!([{
+            "name": UPSTREAM_MODEL,
+            "priority": 0,
+            "api_formats": ["openai:responses"],
+            "endpoint_ids": [ENDPOINT_ID]
+        }])),
+        Some(0.0),
+        None,
+        Some(false),
+        Some(false),
+        Some(true),
+        Some(false),
+        Some(false),
+        true,
+        true,
+        Some(json!({"responses_websocket_e2e": true})),
+    )?;
+    let mutation = CreateAdminProviderModelWithBindingsRecord::new(
+        provider_model,
+        vec![ENDPOINT_ID.to_string()],
+        "mapping".to_string(),
+    )?;
     writer
-        .create_admin_provider_model(&UpsertAdminProviderModelRecord::new(
-            PROVIDER_MODEL_ID.to_string(),
-            PROVIDER_ID.to_string(),
-            GLOBAL_MODEL_ID.to_string(),
-            UPSTREAM_MODEL.to_string(),
-            Some(json!([{
-                "name": UPSTREAM_MODEL,
-                "priority": 0,
-                "api_formats": ["openai:responses"],
-                "endpoint_ids": [ENDPOINT_ID]
-            }])),
-            Some(0.0),
-            None,
-            Some(false),
-            Some(false),
-            Some(true),
-            Some(false),
-            Some(false),
-            true,
-            true,
-            Some(json!({"responses_websocket_e2e": true})),
-        )?)
+        .create_admin_provider_model_with_bindings(&mutation)
         .await?;
     Ok(())
 }

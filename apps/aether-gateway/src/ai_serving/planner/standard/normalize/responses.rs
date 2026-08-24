@@ -100,6 +100,10 @@ pub(crate) fn build_local_openai_responses_request_body_with_codex_model_capabil
     )
 }
 
+/// 构建标准 Responses 候选的初始请求体。
+///
+/// 这里只做候选无关的规范化；reasoning replay 必须留给已知 endpoint 后的供应商感知
+/// 最终化，避免先按 OpenAI 默认策略删除 DeepSeek 的 opaque reasoning。
 #[allow(clippy::too_many_arguments)]
 fn build_local_openai_responses_request_body_with_codex_model_capabilities_and_websocket_mode(
     body_json: &Value,
@@ -153,10 +157,6 @@ fn build_local_openai_responses_request_body_with_codex_model_capabilities_and_w
         );
     }
     apply_openai_responses_compact_special_body_edits(
-        &mut provider_request_body,
-        provider_api_format,
-    );
-    crate::ai_serving::strip_incompatible_openai_responses_reasoning_items(
         &mut provider_request_body,
         provider_api_format,
     );
