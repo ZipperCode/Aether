@@ -3735,7 +3735,7 @@ mod tests {
         assert_eq!(poisoned.upsert_many_calls.load(Ordering::Acquire), 5);
         assert_eq!(metrics.pending_current.load(Ordering::Acquire), 0);
         assert_eq!(metrics.flushed_total.load(Ordering::Acquire), 2);
-        assert_eq!(metrics.dropped_total.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.permanent_dropped_total.load(Ordering::Acquire), 1);
         assert_eq!(metrics.flush_failed_total.load(Ordering::Acquire), 1);
         for request_id in ["valid-before", "valid-after"] {
             assert_eq!(
