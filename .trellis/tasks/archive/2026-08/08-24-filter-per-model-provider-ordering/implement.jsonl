@@ -1,0 +1,3 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "复用现有 Provider 摘要字段，禁止新增重复资格接口"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "约束父组件模型 ID 到排序编辑器的属性数据流"}
