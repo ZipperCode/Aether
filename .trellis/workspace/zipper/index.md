@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 7
+- **Total Sessions**: 8
 - **Last Active**: 2026-08-24
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~180 | Active |
+| `journal-1.md` | ~208 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 8 | 2026-08-24 | 发布 Aether v0.7.25 | `7a42452f2bb9d9a34cdd9a8263df2365c4cc5eaf`, `3ab6787a9e33746387e849174f9c93b632d4deac`, `beb1ef6b78f4c82f65301c3ead4dd61b3a248477`, `b31b8ebb41dfaaaf7f60872c4fa89ed9aaff3478`, `ec32c696d9b93e63de5c1333cddb34c6bcc7df9e`, `92def9b5012f0e5c2db148aa45310de675d51bf5`, `1ed38e84518366d8a547c2e2a27c3496b8de3cd8` | `master` |
 | 7 | 2026-08-24 | 按模型筛选可排序 Provider | `a0aa52967` | `master` |
 | 6 | 2026-08-23 | 同步上游 main 分支 | `821de21b3`, `e4e223cb8`, `41636cd19` | `master` |
 | 5 | 2026-08-21 | 修复特殊模型 Endpoint 推断与公开目录 | `9a05f2b027bd3465f61a9be7713234423952c367` | `master` |

@@ -178,3 +178,31 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 8: 发布 Aether v0.7.25
+
+**Date**: 2026-08-24
+**Task**: 发布 Aether v0.7.25
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+补齐前端 CI 门禁，逐轮修复 Gateway Clippy、流取消测试、响应体上限兼容与候选队列陈旧断言；从 23/23 Rust CI 全绿 SHA 发布 annotated v0.7.25，并验证 7/7 Release jobs 与四个资产。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7a42452f2bb9d9a34cdd9a8263df2365c4cc5eaf` | (see git log) |
+| `3ab6787a9e33746387e849174f9c93b632d4deac` | (see git log) |
+| `beb1ef6b78f4c82f65301c3ead4dd61b3a248477` | (see git log) |
+| `b31b8ebb41dfaaaf7f60872c4fa89ed9aaff3478` | (see git log) |
+| `ec32c696d9b93e63de5c1333cddb34c6bcc7df9e` | (see git log) |
+| `92def9b5012f0e5c2db148aa45310de675d51bf5` | (see git log) |
+| `1ed38e84518366d8a547c2e2a27c3496b8de3cd8` | (see git log) |
+
+### Status
+
+[OK] **Completed**
