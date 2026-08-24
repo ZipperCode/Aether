@@ -41,6 +41,35 @@ describe('provider detail demo contracts', () => {
     expect(secondPage.keys[0]?.id).not.toBe(firstPage.keys[0]?.id)
   })
 
+  it('returns active global model associations in provider summaries', async () => {
+    const [summaryResponse, modelsResponse] = await Promise.all([
+      handleMockRequest({
+        method: 'GET',
+        url: '/api/admin/providers/summary',
+      }),
+      handleMockRequest({
+        method: 'GET',
+        url: '/api/admin/providers/provider-005/models',
+      }),
+    ])
+    const summary = summaryResponse?.data as {
+      items: Array<{ id: string; global_model_ids: string[] }>
+    }
+    const models = modelsResponse?.data as Array<{
+      global_model_id: string
+      is_active: boolean
+    }>
+    const activeGlobalModelIds = Array.from(new Set(
+      models
+        .filter(model => model.is_active)
+        .map(model => model.global_model_id),
+    ))
+    const openAiProvider = summary.items.find(provider => provider.id === 'provider-005')
+
+    expect(openAiProvider?.global_model_ids).toEqual(activeGlobalModelIds)
+    expect(openAiProvider?.global_model_ids).toEqual(expect.arrayContaining(['gm-006', 'gm-007']))
+  })
+
   it('preserves the legacy array contract for skip/limit callers', async () => {
     const response = await handleMockRequest({
       method: 'GET',

@@ -1697,11 +1697,21 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
   'GET /api/admin/providers/summary': async () => {
     await delay()
     requireAdmin()
+    // Demo 摘要复用 Provider 模型生成器补齐生产接口的活跃模型关联，保证按模型排序可真实预览。
+    const providers = MOCK_PROVIDERS.map(provider => ({
+      ...provider,
+      global_model_ids: Array.from(new Set(
+        generateMockModelsForProvider(provider.id)
+          .filter(model => model.is_active === true)
+          .map(model => model.global_model_id)
+          .filter((modelId): modelId is string => typeof modelId === 'string' && modelId.length > 0)
+      )),
+    }))
     return createMockResponse({
-      total: MOCK_PROVIDERS.length,
+      total: providers.length,
       page: 1,
-      page_size: MOCK_PROVIDERS.length,
-      items: MOCK_PROVIDERS,
+      page_size: providers.length,
+      items: providers,
     })
   },
 

@@ -123,7 +123,9 @@
             v-if="providerRows.length === 0"
             class="rounded-lg border border-dashed border-border/70 px-4 py-8 text-center text-sm text-muted-foreground"
           >
-            暂无 Provider
+            {{ isPerModelProviderOrdering
+              ? (resolvedGlobalModelId ? '当前模型暂无可排序 Provider' : '未找到当前模型对应的全局模型')
+              : '暂无 Provider' }}
           </div>
           <div
             v-for="(row, index) in providerRows"
@@ -366,6 +368,8 @@ interface GlobalKeySource {
 const props = defineProps<{
   config: RoutingGroupConfig
   model?: string
+  /** 当前按模型排序对应的启用全局模型 ID；空值表示当前模型无法从目录解析。 */
+  globalModelId?: string
   priorityMode?: RoutingPriorityMode
   schedulingMode?: RoutingSchedulingMode
   showPriorityMode?: boolean
@@ -400,6 +404,10 @@ const selectedProviderIds = ref<Set<string>>(new Set())
 
 const config = computed(() => normalizeRoutingGroupConfig(props.config))
 const targetModel = computed(() => props.model?.trim() || DEFAULT_ROUTING_POLICY_MODEL)
+/** 非默认模型才启用 Provider 资格筛选，统一排序继续展示全量 Provider。 */
+const isPerModelProviderOrdering = computed(() => targetModel.value !== DEFAULT_ROUTING_POLICY_MODEL)
+/** 规范化父级解析结果，空字符串明确代表没有有效全局模型 ID。 */
+const resolvedGlobalModelId = computed(() => props.globalModelId?.trim() || '')
 const targetModelPolicy = computed(() => targetModel.value === DEFAULT_ROUTING_POLICY_MODEL
   ? getDefaultModelPolicy(config.value)
   : getModelPolicy(config.value, targetModel.value))
@@ -439,9 +447,16 @@ const poolProviderIds = computed(() => {
   return set
 })
 
+/** 按模型仅投影具备当前模型关联、已启用且至少有一个启用 Key 的 Provider。 */
 const providerRows = computed<ProviderPriorityRow[]>(() => {
   const overrides = targetModelPolicy.value.provider_priority_overrides
   return providers.value
+    .filter(provider => !isPerModelProviderOrdering.value || (
+      resolvedGlobalModelId.value !== ''
+      && provider.global_model_ids.includes(resolvedGlobalModelId.value)
+      && provider.is_active
+      && provider.active_keys > 0
+    ))
     .map(provider => ({
       id: provider.id,
       name: provider.name,
@@ -606,8 +621,12 @@ function moveProvider(providerId: string, direction: -1 | 1): void {
   updateProviderOverrides(Object.fromEntries(rows.map((row, index) => [row.id, index])))
 }
 
+/** 按模型重排只覆盖可见条目，保留暂时隐藏 Provider 的既有覆盖值。 */
 function updateProviderOverrides(overrides: Record<string, number>): void {
-  updateConfig(setModelProviderPriorityOverrides(config.value, targetModel.value, overrides))
+  const nextOverrides = isPerModelProviderOrdering.value
+    ? { ...targetModelPolicy.value.provider_priority_overrides, ...overrides }
+    : overrides
+  updateConfig(setModelProviderPriorityOverrides(config.value, targetModel.value, nextOverrides))
 }
 
 function isProviderSelected(providerId: string): boolean {

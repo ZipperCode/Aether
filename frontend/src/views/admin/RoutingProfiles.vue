@@ -667,6 +667,7 @@
                     <RoutingPriorityPolicyEditor
                       :config="activeConfigForReading"
                       :model="activePerModelPolicy.model"
+                      :global-model-id="activeGlobalModelId"
                       :priority-mode="modelPriorityMode(activePerModelPolicy.model)"
                       :scheduling-mode="modelSchedulingMode(activePerModelPolicy.model)"
                       :show-priority-mode="false"
@@ -861,6 +862,13 @@ const activePerModelPolicy = computed(() => {
   const existing = perModelPolicies.value.find(policy => policy.model === selectedPerModelName.value)
   if (existing) return existing
   return createEmptyModelPolicy(selectedPerModelName.value)
+})
+/** 当前按模型策略对应的启用全局模型 ID；缺失时由排序编辑器展示不可排序空态。 */
+const activeGlobalModelId = computed(() => {
+  const modelName = activePerModelPolicy.value?.model
+  return modelName
+    ? globalModels.value.find(model => model.name === modelName)?.id
+    : undefined
 })
 const firstStepPriorityMode = computed<RoutingPriorityMode>(() => {
   if (sortingScope.value === 'per_model' && activePerModelPolicy.value) {
