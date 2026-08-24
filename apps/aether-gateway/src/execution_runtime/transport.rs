@@ -631,11 +631,21 @@ pub(crate) fn with_upstream_response_body_limit(
     bounded_plan
 }
 
+/// 解析执行计划的响应体上限；公共调用方上限、内部场景上限与全局上限同时存在时始终采用最严格值。
 pub(crate) fn execution_plan_response_body_limit_bytes(plan: &ExecutionPlan) -> usize {
-    effective_response_body_limit_bytes(
+    let scoped_limit = effective_response_body_limit_bytes(
         execution_transport_header_value(&plan.headers, EXECUTION_RESPONSE_BODY_LIMIT_HEADER),
         crate::headers::max_internal_buffered_body_bytes(),
+    );
+    execution_transport_header_value(
+        &plan.headers,
+        EXECUTION_REQUEST_MAX_RESPONSE_BODY_BYTES_HEADER,
     )
+    .and_then(|value| value.trim().parse::<u64>().ok())
+    .and_then(|value| usize::try_from(value).ok())
+    .map_or(scoped_limit, |request_limit| {
+        request_limit.min(scoped_limit)
+    })
 }
 
 fn effective_response_body_limit_bytes(
