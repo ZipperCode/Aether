@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
-- **Last Active**: 2026-08-23
+- **Total Sessions**: 7
+- **Last Active**: 2026-08-24
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~158 | Active |
+| `journal-1.md` | ~180 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-08-24 | 按模型筛选可排序 Provider | `a0aa52967` | `master` |
 | 6 | 2026-08-23 | 同步上游 main 分支 | `821de21b3`, `e4e223cb8`, `41636cd19` | `master` |
 | 5 | 2026-08-21 | 修复特殊模型 Endpoint 推断与公开目录 | `9a05f2b027bd3465f61a9be7713234423952c367` | `master` |
 | 4 | 2026-08-20 | 修复 Responses 流式错误提交 | `f86e9941a` | `master` |

@@ -156,3 +156,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 7: 按模型筛选可排序 Provider
+
+**Date**: 2026-08-24
+**Task**: 按模型筛选可排序 Provider
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+按当前全局模型、Provider 启用状态和启用 Key 筛选模型级 Provider 排序，保留隐藏覆盖值并完成 Docker 预览与调度影响审查。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a0aa52967` | (see git log) |
+
+### Status
+
+[OK] **Completed**
