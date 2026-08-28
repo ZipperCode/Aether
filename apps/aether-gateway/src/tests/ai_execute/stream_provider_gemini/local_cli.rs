@@ -390,8 +390,8 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_s
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        strip_sse_keepalive_comments(&response.text().await.expect("body should read")),
-        "data: {\"candidates\":[]}\n\n"
+        response.text().await.expect("body should read"),
+        "[{\"candidates\":[]}]"
     );
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -918,8 +918,8 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        strip_sse_keepalive_comments(&response.text().await.expect("body should read")),
-        "data: {\"candidates\":[]}\n\n"
+        response.text().await.expect("body should read"),
+        "[{\"candidates\":[]}]"
     );
 
     let seen_refresh_request = seen_refresh
@@ -1406,8 +1406,8 @@ async fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_wi
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        strip_sse_keepalive_comments(&response.text().await.expect("body should read")),
-        "data: {\"candidates\":[]}\n\n"
+        response.text().await.expect("body should read"),
+        "[{\"candidates\":[]}]"
     );
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -1947,17 +1947,10 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
         .expect("request should succeed");
 
     assert_eq!(response.status(), StatusCode::OK);
-    let response_text =
-        strip_sse_keepalive_comments(&response.text().await.expect("body should read"));
-    let payload = response_text
-        .trim()
-        .strip_prefix("data: ")
-        .expect("response should start with sse data prefix");
-    let response_json: serde_json::Value =
-        serde_json::from_str(payload).expect("stream payload should parse");
+    let response_json: serde_json::Value = response.json().await.expect("body should parse");
     assert_eq!(
         response_json,
-        json!({
+        json!([{
             "_v1internal_response_id": "resp_antigravity_cli_local_stream_123",
             "candidates": [{
                 "content": {
@@ -1973,7 +1966,7 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
                 "candidatesTokenCount": 3,
                 "totalTokenCount": 5
             }
-        })
+        }])
     );
 
     let seen_refresh_request = seen_refresh

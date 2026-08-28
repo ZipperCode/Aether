@@ -1337,8 +1337,8 @@ async fn gateway_records_gemini_stream_usage_and_pricing_with_cache_read_tokens_
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        strip_sse_keepalive_comments(&response.text().await.expect("stream body should read")),
-        stream_body.concat()
+        response.text().await.expect("stream body should read"),
+        "[{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}]"
     );
 
     let stored_usage = wait_for_usage_status(
