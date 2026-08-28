@@ -206,3 +206,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 9: 优化同格式请求与流式热路径
+
+**Date**: 2026-08-28
+**Task**: 优化同格式请求与流式热路径
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+在同格式且请求体未变化、无编码压缩语义时复用前门规范化字节；移除传输 JSON 克隆与无转换流分片复制，并补齐契约和回归测试。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `37e42296c` | (see git log) |
+
+### Status
+
+[OK] **Completed**
