@@ -512,36 +512,71 @@ pub(super) async fn seed_provider_oauth_pool_score(
         return;
     }
 
-    let identity = PoolMemberIdentity::provider_api_key(provider.id.clone(), key.id.clone());
-    let scope = provider_key_pool_score_scope();
-    let score_id = provider_key_pool_score_id(&identity, &scope);
-    let existing = match state
+    let projection_lock = match state
         .app()
-        .data
-        .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
-            ids: vec![score_id],
-        })
+        .acquire_provider_key_quota_projection_lock(&provider.id, &key.id)
         .await
     {
-        Ok(mut scores) => scores.pop(),
+        Ok(lease) => lease,
         Err(err) => {
             tracing::debug!(
                 provider_id = %provider_id,
                 key_id = %key.id,
                 error = ?err,
-                "gateway provider oauth provisioning: failed to read existing pool score"
+                "gateway provider oauth provisioning: skipped score seed while quota fence is busy"
             );
             return;
         }
     };
-    let upsert = build_provider_key_pool_score_upsert(
-        key,
-        provider.provider_type.as_str(),
-        existing.as_ref(),
-        now_unix_secs,
-        pool_config.score_rules,
-    );
-    if let Err(err) = state.app().data.upsert_pool_member_score(upsert).await {
+    let upsert_result = async {
+        let current_key = state
+            .app()
+            .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(&key.id))
+            .await?
+            .into_iter()
+            .next()
+            .filter(|current| current.is_active && current.provider_id == provider.id);
+        let Some(current_key) = current_key else {
+            return Ok::<_, GatewayError>(None);
+        };
+
+        // Read the score snapshot only after acquiring the projection fence.
+        // Reusing a pre-lock snapshot could overwrite quota state or counters
+        // written while this OAuth provisioning task was waiting.
+        let identity =
+            PoolMemberIdentity::provider_api_key(provider.id.clone(), current_key.id.clone());
+        let scope = provider_key_pool_score_scope();
+        let score_id = provider_key_pool_score_id(&identity, &scope);
+        let existing = state
+            .app()
+            .data
+            .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+                ids: vec![score_id],
+            })
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .into_iter()
+            .next();
+        let upsert = build_provider_key_pool_score_upsert(
+            &current_key,
+            provider.provider_type.as_str(),
+            existing.as_ref(),
+            now_unix_secs,
+            pool_config.score_rules,
+        );
+        state
+            .app()
+            .data
+            .upsert_pool_member_score(upsert)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+    .await;
+    state
+        .app()
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
+    if let Err(err) = upsert_result {
         tracing::debug!(
             provider_id = %provider_id,
             key_id = %key.id,

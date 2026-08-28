@@ -31,6 +31,21 @@
     </div>
 
     <Button
+      v-if="quotaBlocked"
+      variant="ghost"
+      size="icon"
+      class="h-7 w-7 text-amber-600"
+      :disabled="restoringQuota"
+      :title="legacyT('清除额度耗尽阻断并恢复调度')"
+      @click="$emit('restoreQuota')"
+    >
+      <RefreshCw
+        class="w-3.5 h-3.5"
+        :class="{ 'animate-spin': restoringQuota }"
+      />
+    </Button>
+
+    <Button
       v-if="recoverable"
       variant="ghost"
       size="icon"
@@ -167,6 +182,8 @@ const props = withDefaults(defineProps<{
   apiKey: EndpointAPIKey
   providerType?: string | null
   recoverable?: boolean
+  quotaBlocked?: boolean
+  restoringQuota?: boolean
   recoverTitle?: string
   circuitBreakerTitle?: string
   circuitProbeCountdown?: string
@@ -179,6 +196,8 @@ const props = withDefaults(defineProps<{
 }>(), {
   providerType: null,
   recoverable: false,
+  quotaBlocked: false,
+  restoringQuota: false,
   recoverTitle: '',
   circuitBreakerTitle: '',
   circuitProbeCountdown: '',
@@ -192,6 +211,7 @@ const props = withDefaults(defineProps<{
 
 defineEmits<{
   (e: 'recover'): void
+  (e: 'restoreQuota'): void
   (e: 'permissions'): void
   (e: 'update:proxyPopoverOpen', value: boolean): void
   (e: 'clearProxy'): void

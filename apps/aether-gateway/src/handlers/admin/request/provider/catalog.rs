@@ -386,6 +386,15 @@ impl<'a> AdminAppState<'a> {
             .await
     }
 
+    pub(crate) async fn clear_provider_catalog_key_quota_scheduling_state(
+        &self,
+        key_id: &str,
+    ) -> Result<bool, GatewayError> {
+        self.app
+            .clear_provider_catalog_key_quota_scheduling_state(key_id)
+            .await
+    }
+
     pub(crate) async fn update_provider_catalog_keys(
         &self,
         keys: &[aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey],

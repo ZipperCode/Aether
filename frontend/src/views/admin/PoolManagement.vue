@@ -460,6 +460,20 @@
                       />
                     </Button>
                     <Button
+                      v-if="isQuotaSchedulingBlocked(key)"
+                      variant="ghost"
+                      size="icon"
+                      class="h-7 w-7 text-amber-600 hover:text-amber-700"
+                      :disabled="restoringQuotaKeyId === key.key_id"
+                      title="恢复额度耗尽 Key 调度"
+                      @click="restoreQuotaScheduling(key)"
+                    >
+                      <RefreshCw
+                        class="w-3.5 h-3.5"
+                        :class="{ 'animate-spin': restoringQuotaKeyId === key.key_id }"
+                      />
+                    </Button>
+                    <Button
                       variant="ghost"
                       size="icon"
                       class="h-7 w-7"
@@ -787,6 +801,20 @@
                     <RefreshCw class="w-3.5 h-3.5" />
                   </Button>
                   <Button
+                    v-else-if="actionId === 'restore_quota'"
+                    variant="ghost"
+                    size="icon"
+                    class="h-7 w-7 shrink-0 text-amber-600 hover:text-amber-700"
+                    :disabled="restoringQuotaKeyId === key.key_id"
+                    title="恢复额度耗尽 Key 调度"
+                    @click="restoreQuotaScheduling(key)"
+                  >
+                    <RefreshCw
+                      class="w-3.5 h-3.5"
+                      :class="{ 'animate-spin': restoringQuotaKeyId === key.key_id }"
+                    />
+                  </Button>
+                  <Button
                     v-else-if="actionId === 'permissions'"
                     variant="ghost"
                     size="icon"
@@ -1100,6 +1128,7 @@ import {
   updateProviderKey,
   refreshProviderQuota,
   resetProviderKeyCycleStats,
+  clearQuotaExhausted,
 } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import type {
@@ -1957,6 +1986,7 @@ const hasPoolKeyFilters = computed(() => searchQuery.value.trim().length > 0 || 
 const MANUAL_QUOTA_REFRESH_COOLDOWN_SECONDS = 5 * 60
 const refreshingOAuthKeyId = ref<string | null>(null)
 const resettingCycleKeyId = ref<string | null>(null)
+const restoringQuotaKeyId = ref<string | null>(null)
 const savingProxyKeyId = ref<string | null>(null)
 const proxyDesktopPopoverOpenKeyId = ref<string | null>(null)
 const proxyMobilePopoverOpenKeyId = ref<string | null>(null)
@@ -2186,6 +2216,7 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
         showRefreshToken: showOAuthRefreshControl,
         canResetCycleStats: canResetCycleStats(key),
         canClearCooldown: Boolean(key.cooldown_reason),
+        canRestoreQuota: isQuotaSchedulingBlocked(key),
         hasProxy: true,
       }).primary,
       ...getModelFetchDisplay(key),
@@ -2962,6 +2993,27 @@ async function clearCooldown(keyId: string) {
   }
 }
 
+async function restoreQuotaScheduling(key: PoolKeyDetail) {
+  if (restoringQuotaKeyId.value) return
+  const confirmed = await confirm({
+    title: '恢复 Key 调度',
+    message: `确认账号“${key.key_name || key.key_id.slice(0, 8)}”已完成充值或额度调整？恢复后仍会保留人工禁用、OAuth、冷却和健康状态。`,
+    confirmText: '恢复调度',
+  })
+  if (!confirmed) return
+
+  restoringQuotaKeyId.value = key.key_id
+  try {
+    const result = await clearQuotaExhausted(key.key_id)
+    success(result.message)
+    await Promise.all([loadKeys({ silent: true }), loadOverview({ silent: true })])
+  } catch (err) {
+    showError(parseApiError(err, '恢复 Key 调度失败'))
+  } finally {
+    restoringQuotaKeyId.value = null
+  }
+}
+
 async function handleResetCycleStats(key: PoolKeyDetail) {
   if (resettingCycleKeyId.value || !canResetCycleStats(key)) return
 
@@ -3280,11 +3332,18 @@ function isPoolKeyCostExhausted(key: PoolKeyDetail): boolean {
     && key.cost_window_usage >= key.cost_limit
 }
 
+function isQuotaSchedulingBlocked(key: PoolKeyDetail): boolean {
+  const scheduling = key.status_snapshot?.scheduling
+  return scheduling?.code === 'quota_exhausted' && scheduling.blocked === true
+}
+
 function getSchedulingBadgeLabel(key: PoolKeyDetail): string {
   const accountAlert = getAccountAlertLabel(key)
   if (accountAlert) return compactPoolStatusLabel(accountAlert) || accountAlert
   const oauthAlert = getBlockingOAuthStatusLabel(key)
   if (oauthAlert) return oauthAlert
+  if (getVisibleSchedulingReason(key) === 'key_quota_exhausted') return '额度耗尽·需人工恢复'
+  if (getVisibleSchedulingReason(key) === 'quota_suspected') return '疑似额度不足'
 
   const rawLabel = String(key.scheduling_label || '').trim()
   if (
@@ -3310,7 +3369,7 @@ function getSchedulingBadgeVariant(key: PoolKeyDetail): PoolStatusVariant {
 
   const reason = getVisibleSchedulingReason(key)
   if (reason === 'manual_disabled' || reason === 'inactive') return 'secondary'
-  if (reason === 'account_blocked' || reason === 'account_quota_exhausted' || reason === 'cost_exhausted') return 'destructive'
+  if (reason === 'account_blocked' || reason === 'account_quota_exhausted' || reason === 'key_quota_exhausted' || reason === 'cost_exhausted') return 'destructive'
   if (reason === 'cooldown') return 'warning'
   if (reason === 'cost_soft' || reason === 'cost') return 'warning'
   if (isPoolKeyCostExhausted(key)) return 'destructive'
@@ -3330,11 +3389,15 @@ function getSchedulingTitle(key: PoolKeyDetail): string {
 
   const reasons = getVisibleSchedulingReasons(key)
   if (reasons.length > 0) {
-    return reasons.map((item) => {
+    const title = reasons.map((item) => {
       const ttl = item.ttl_seconds && item.ttl_seconds > 0 ? ` (${formatTTL(item.ttl_seconds)})` : ''
       const detail = item.detail ? ` - ${item.detail}` : ''
       return `${item.label}${ttl}${detail}`
     }).join('\n')
+    const observedAt = key.status_snapshot?.scheduling?.last_observed_at
+    return typeof observedAt === 'number'
+      ? `${title}\n检测时间：${new Date(observedAt * 1000).toLocaleString()}`
+      : title
   }
 
   if (key.cooldown_reason) {

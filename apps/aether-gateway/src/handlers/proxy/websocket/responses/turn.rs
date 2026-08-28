@@ -47,9 +47,8 @@ use crate::execution_runtime::attempt_lifecycle::{
     ExecutionAttemptLifecycle,
 };
 use crate::orchestration::{
-    apply_local_stream_failure_effects, apply_local_stream_success_effects,
     release_local_pool_key_lease, release_pool_key_lease_from_report_context,
-    LocalExecutionEffectContext, LocalStreamFailureEffect,
+    LocalExecutionEffectContext,
 };
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, record_local_request_candidate_status,

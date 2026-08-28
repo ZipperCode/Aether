@@ -88,7 +88,9 @@ use crate::execution_runtime::kiro_cache::{
     KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD,
 };
 use crate::execution_runtime::kiro_web_search::maybe_execute_kiro_web_search_stream;
-use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
+use crate::execution_runtime::oauth_retry::{
+    refresh_oauth_plan_auth_for_retry, refresh_oauth_retry_credential_fingerprint,
+};
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_stream_plan_to_remote_execution_runtime;
 use crate::execution_runtime::submission::{
@@ -125,7 +127,8 @@ use crate::orchestration::{
     LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
     LocalExecutionEffect, LocalExecutionEffectContext, LocalFailoverAnalysis,
     LocalHealthFailureEffect, LocalHealthSuccessEffect, LocalOAuthInvalidationEffect,
-    LocalOAuthSuccessEffect, LocalPoolErrorEffect,
+    LocalOAuthSuccessEffect, LocalPoolErrorEffect, LocalSchedulingStateEffect,
+    PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD,
 };
 use crate::provider_pool_demand::{
     acquire_provider_pool_in_flight_guard, ProviderPoolInFlightGuard,
@@ -1228,9 +1231,13 @@ async fn execute_in_process_stream_with_oauth_retry(
         )
         .await
     {
+        let mut retry_report_context = report_context.cloned();
+        if let Some(retry_report_context) = retry_report_context.as_mut() {
+            refresh_oauth_retry_credential_fingerprint(state, plan, retry_report_context).await;
+        }
         drop(execution);
         execution = execute_in_process_stream(state, plan, trace_id).await?;
-        apply_stream_summary_report_context(&mut execution, report_context);
+        apply_stream_summary_report_context(&mut execution, retry_report_context.as_ref());
     }
     Ok(execution)
 }
@@ -1262,6 +1269,7 @@ async fn analyze_prefetched_stream_failure(
         report_context,
         failure.status_code,
         Some(failure.response_text.as_str()),
+        None,
     )
     .await;
     let disposition = classify_failure_disposition(
@@ -4413,6 +4421,7 @@ async fn execute_execution_runtime_stream_after_pending(
                 return Ok(None);
             }
         };
+        copy_stream_execution_credential_fingerprint(&execution, &mut report_context);
         observe_gateway_stage_trace_ms(
             &mut stage_trace,
             "stream_upstream_headers",
@@ -4541,6 +4550,7 @@ async fn execute_execution_runtime_stream_after_pending(
                     return Ok(None);
                 }
             };
+            copy_stream_execution_credential_fingerprint(&execution, &mut report_context);
             observe_gateway_stage_trace_ms(
                 &mut stage_trace,
                 "stream_upstream_headers",
@@ -6073,6 +6083,19 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         let error_response_text =
             local_failover_response_text(client_body_json.as_ref(), &client_error_body, None);
         if endpoint_capability_mismatch {
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::SchedulingState(LocalSchedulingStateEffect {
+                    status_code,
+                    response_text: error_response_text.as_deref(),
+                    quota_exhaustion: None,
+                }),
+            )
+            .await;
             quarantine_endpoint_capability_from_report_context(
                 state,
                 &plan,
@@ -6153,6 +6176,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             report_context.as_ref(),
             status_code,
             error_response_text.as_deref(),
+            Some(&headers),
         )
         .await;
         apply_local_execution_effect(
@@ -6173,51 +6197,76 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 plan: &plan,
                 report_context: report_context.as_ref(),
             },
-            LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
-                status_code,
-                classification: failover_analysis.classification,
-                headers: Some(&headers),
-            }),
-        )
-        .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
-                status_code,
-                classification: failover_analysis.classification,
-            }),
-        )
-        .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
+            LocalExecutionEffect::SchedulingState(LocalSchedulingStateEffect {
                 status_code,
                 response_text: error_response_text.as_deref(),
+                quota_exhaustion: failover_analysis.quota_exhaustion,
             }),
         )
         .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
-                status_code,
-                classification: failover_analysis.classification,
-                headers: &headers,
-                error_body: error_response_text.as_deref(),
-            }),
-        )
-        .await;
+        if failover_analysis.quota_exhaustion.is_none() {
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
+                    status_code,
+                    classification: failover_analysis.classification,
+                    headers: Some(&headers),
+                }),
+            )
+            .await;
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
+                    status_code,
+                    classification: failover_analysis.classification,
+                }),
+            )
+            .await;
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
+                    status_code,
+                    response_text: error_response_text.as_deref(),
+                }),
+            )
+            .await;
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                    status_code,
+                    classification: failover_analysis.classification,
+                    headers: &headers,
+                    error_body: error_response_text.as_deref(),
+                }),
+            )
+            .await;
+        } else {
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::PoolLeaseRelease,
+            )
+            .await;
+        }
         let failover_decision = failover_analysis.decision;
         debug!(
             event_name = "execution_runtime_stream_failover_decided",
@@ -8684,6 +8733,26 @@ fn apply_stream_summary_report_context(
     if let Some(report_context) = report_context.cloned() {
         execution.stream_summary_report_context = report_context;
     }
+}
+
+fn copy_stream_execution_credential_fingerprint(
+    execution: &DirectUpstreamStreamExecution,
+    report_context: &mut Option<Value>,
+) {
+    let Some(fingerprint) = execution
+        .stream_summary_report_context
+        .get(PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD)
+        .cloned()
+    else {
+        return;
+    };
+    let Some(report_context) = report_context.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    report_context.insert(
+        PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD.to_string(),
+        fingerprint,
+    );
 }
 
 #[cfg(test)]

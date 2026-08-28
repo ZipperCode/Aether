@@ -9,6 +9,8 @@ use crate::AppState;
 
 pub(crate) const CYBER_CONTINUE_FAILOVER_CONFIG_KEY: &str = "cyber_continue_failover";
 pub(crate) const RESPONSES_WEBSOCKET_CONFIG_KEY: &str = "responses_websocket";
+pub(crate) const PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD: &str =
+    "provider_key_credential_fingerprint";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalFailoverPolicy {
@@ -20,6 +22,7 @@ pub(crate) struct LocalFailoverPolicy {
     pub(crate) stop_on_transport_errors: bool,
     pub(crate) success_failover_patterns: Vec<LocalFailoverRegexRule>,
     pub(crate) error_stop_patterns: Vec<LocalFailoverRegexRule>,
+    pub(crate) quota_exhaustion_patterns: Vec<LocalFailoverRegexRule>,
     pub(crate) stop_cyber_policy_errors: bool,
     pub(crate) retry_client_errors_by_default: bool,
 }
@@ -35,6 +38,7 @@ impl Default for LocalFailoverPolicy {
             stop_on_transport_errors: false,
             success_failover_patterns: Vec::new(),
             error_stop_patterns: Vec::new(),
+            quota_exhaustion_patterns: Vec::new(),
             stop_cyber_policy_errors: true,
             retry_client_errors_by_default: true,
         }
@@ -77,6 +81,7 @@ pub(crate) async fn resolve_local_failover_policy(
         stop_on_transport_errors = policy.stop_on_transport_errors,
         success_failover_pattern_count = policy.success_failover_patterns.len(),
         error_stop_pattern_count = policy.error_stop_patterns.len(),
+        quota_exhaustion_pattern_count = policy.quota_exhaustion_patterns.len(),
         cyber_continue_failover,
         "gateway loaded local failover policy from transport snapshot"
     );
@@ -171,6 +176,9 @@ pub(crate) fn local_failover_policy_from_transport(
         error_stop_patterns: rules
             .map(|value| parse_regex_rules(value, "error_stop_patterns"))
             .unwrap_or_default(),
+        quota_exhaustion_patterns: rules
+            .map(|value| parse_regex_rules(value, "quota_exhaustion_patterns"))
+            .unwrap_or_default(),
     }
 }
 
@@ -206,6 +214,7 @@ pub(crate) fn local_failover_policy_from_report_context(
             .unwrap_or(false),
         success_failover_patterns: parse_regex_rules(object, "success_failover_patterns"),
         error_stop_patterns: parse_regex_rules(object, "error_stop_patterns"),
+        quota_exhaustion_patterns: parse_regex_rules(object, "quota_exhaustion_patterns"),
         stop_cyber_policy_errors: object
             .get("stop_cyber_policy_errors")
             .and_then(Value::as_bool)
@@ -227,6 +236,12 @@ pub(crate) fn append_local_failover_policy_to_value(
     object.insert(
         "local_failover_policy".to_string(),
         local_failover_policy_to_value(&local_failover_policy_from_transport(transport)),
+    );
+    object.insert(
+        PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD.to_string(),
+        Value::String(
+            aether_provider_transport::provider_transport_key_credential_fingerprint(transport),
+        ),
     );
     if transport
         .provider
@@ -274,6 +289,7 @@ fn local_failover_policy_to_value(policy: &LocalFailoverPolicy) -> Value {
         "stop_on_transport_errors": policy.stop_on_transport_errors,
         "success_failover_patterns": policy.success_failover_patterns.iter().map(local_failover_regex_rule_to_value).collect::<Vec<_>>(),
         "error_stop_patterns": policy.error_stop_patterns.iter().map(local_failover_regex_rule_to_value).collect::<Vec<_>>(),
+        "quota_exhaustion_patterns": policy.quota_exhaustion_patterns.iter().map(local_failover_regex_rule_to_value).collect::<Vec<_>>(),
         "stop_cyber_policy_errors": policy.stop_cyber_policy_errors,
         "retry_client_errors_by_default": policy.retry_client_errors_by_default,
     })
@@ -367,7 +383,7 @@ fn parse_regex_rules(
     rules: &serde_json::Map<String, serde_json::Value>,
     key: &str,
 ) -> Vec<LocalFailoverRegexRule> {
-    let allow_status_only = key == "error_stop_patterns";
+    let allow_status_only = matches!(key, "error_stop_patterns" | "quota_exhaustion_patterns");
     rules
         .get(key)
         .and_then(Value::as_array)
@@ -538,6 +554,7 @@ mod tests {
                     pattern: "validation".to_string(),
                     status_codes: [422].into_iter().collect(),
                 }],
+                quota_exhaustion_patterns: Vec::new(),
                 stop_cyber_policy_errors: true,
                 retry_client_errors_by_default: true,
             })

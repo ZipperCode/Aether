@@ -983,6 +983,7 @@ fn admin_pool_scheduling_payload(
     account_status_label: Option<&str>,
     account_status_reason: Option<&str>,
     account_status_source: Option<&str>,
+    scheduling_snapshot: Option<&serde_json::Map<String, serde_json::Value>>,
     account_quota_exhausted: bool,
     oauth_status_code: Option<&str>,
     oauth_status_label: Option<&str>,
@@ -1019,6 +1020,34 @@ fn admin_pool_scheduling_payload(
             })],
         );
     }
+    let runtime_quota_code = scheduling_snapshot
+        .and_then(|snapshot| snapshot.get("code"))
+        .and_then(serde_json::Value::as_str);
+    let runtime_quota_blocked = scheduling_snapshot
+        .and_then(|snapshot| snapshot.get("blocked"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let runtime_quota_reason = scheduling_snapshot
+        .and_then(|snapshot| snapshot.get("reason"))
+        .and_then(serde_json::Value::as_str);
+    let runtime_quota_source = scheduling_snapshot
+        .and_then(|snapshot| snapshot.get("source"))
+        .and_then(serde_json::Value::as_str);
+    if runtime_quota_code == Some("quota_exhausted") && runtime_quota_blocked {
+        return (
+            "blocked".to_string(),
+            "key_quota_exhausted".to_string(),
+            "额度耗尽·需人工恢复".to_string(),
+            vec![json!({
+                "code": "key_quota_exhausted",
+                "label": "额度耗尽·需人工恢复",
+                "blocking": true,
+                "source": runtime_quota_source.unwrap_or("runtime_error"),
+                "ttl_seconds": serde_json::Value::Null,
+                "detail": runtime_quota_reason,
+            })],
+        );
+    }
     if account_quota_exhausted {
         return (
             "blocked".to_string(),
@@ -1051,6 +1080,21 @@ fn admin_pool_scheduling_payload(
                 "source": oauth_status_source.unwrap_or("oauth"),
                 "ttl_seconds": serde_json::Value::Null,
                 "detail": oauth_status_reason,
+            })],
+        );
+    }
+    if runtime_quota_code == Some("quota_suspected") && !runtime_quota_blocked {
+        return (
+            "degraded".to_string(),
+            "quota_suspected".to_string(),
+            "疑似额度不足".to_string(),
+            vec![json!({
+                "code": "quota_suspected",
+                "label": "疑似额度不足",
+                "blocking": false,
+                "source": runtime_quota_source.unwrap_or("runtime_error"),
+                "ttl_seconds": serde_json::Value::Null,
+                "detail": runtime_quota_reason,
             })],
         );
     }
@@ -1123,6 +1167,9 @@ pub(super) fn build_admin_pool_key_payload(
     let oauth_snapshot = status_snapshot
         .get("oauth")
         .and_then(serde_json::Value::as_object);
+    let scheduling_snapshot = status_snapshot
+        .get("scheduling")
+        .and_then(serde_json::Value::as_object);
     let quota_updated_at =
         admin_pool_json_to_u64(quota_snapshot.and_then(|item| item.get("updated_at")));
     let account_quota = admin_pool_build_account_quota(provider_type, quota_snapshot);
@@ -1191,6 +1238,7 @@ pub(super) fn build_admin_pool_key_payload(
             account_status_label.as_deref(),
             account_status_reason.as_deref(),
             account_status_source.as_deref(),
+            scheduling_snapshot,
             account_quota_exhausted,
             oauth_status_code.as_deref(),
             oauth_status_label.as_deref(),

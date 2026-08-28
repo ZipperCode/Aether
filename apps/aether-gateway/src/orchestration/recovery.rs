@@ -1,7 +1,7 @@
 use super::classifier::{
-    classify_failure_disposition, classify_local_failover, classify_local_transport_error,
-    FailureRetryAction, LocalFailoverClassification, LocalFailoverInput,
-    LocalTransportFailoverClassification,
+    classify_failure_disposition, classify_local_failover, classify_local_quota_exhaustion,
+    classify_local_transport_error, FailureRetryAction, LocalFailoverClassification,
+    LocalFailoverInput, LocalQuotaExhaustionEvidence, LocalTransportFailoverClassification,
 };
 use super::LocalFailoverPolicy;
 
@@ -26,6 +26,7 @@ impl LocalFailoverDecision {
 pub(crate) struct LocalFailoverAnalysis {
     pub(crate) classification: LocalFailoverClassification,
     pub(crate) decision: LocalFailoverDecision,
+    pub(crate) quota_exhaustion: Option<LocalQuotaExhaustionEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,7 @@ impl LocalFailoverAnalysis {
         Self {
             classification: LocalFailoverClassification::UseDefault,
             decision: LocalFailoverDecision::UseDefault,
+            quota_exhaustion: None,
         }
     }
 }
@@ -51,6 +53,7 @@ pub(crate) fn analyze_local_failover(
     LocalFailoverAnalysis {
         classification,
         decision: decision_from_classification(classification),
+        quota_exhaustion: classify_local_quota_exhaustion(policy, input),
     }
 }
 
@@ -100,6 +103,7 @@ pub(crate) fn apply_provider_failure_disposition(
     LocalFailoverAnalysis {
         classification: analysis.classification,
         decision,
+        quota_exhaustion: analysis.quota_exhaustion,
     }
 }
 
@@ -121,7 +125,8 @@ const fn decision_from_classification(
         | LocalFailoverClassification::StopCyberPolicy => LocalFailoverDecision::StopLocalFailover,
         LocalFailoverClassification::RetrySuccessPattern
         | LocalFailoverClassification::RetryStatusCode
-        | LocalFailoverClassification::RetryUpstreamFailure => {
+        | LocalFailoverClassification::RetryUpstreamFailure
+        | LocalFailoverClassification::RetryQuotaExhausted => {
             LocalFailoverDecision::RetryNextCandidate
         }
     }

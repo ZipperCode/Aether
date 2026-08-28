@@ -52,9 +52,11 @@
 
       <Badge
         v-if="quotaStatusLabel"
-        variant="destructive"
+        :variant="quotaStatusLabel === '疑似额度不足' ? 'outline' : 'destructive'"
         class="h-4 shrink-0 px-1.5 py-0 text-[9px] font-semibold"
+        :class="quotaStatusLabel === '疑似额度不足' ? 'border-amber-500/40 text-amber-600 dark:text-amber-400' : ''"
         data-testid="provider-key-quota-status"
+        :title="quotaStatusTitle"
       >
         {{ quotaStatusLabel }}
       </Badge>
@@ -182,6 +184,7 @@ const props = withDefaults(defineProps<{
   kiroSubscriptionClass?: string
   quotaTypeLabel?: string | null
   quotaStatusLabel?: string | null
+  quotaStatusTitle?: string
   canExportCredential?: boolean
   showOAuthRefreshControl?: boolean
   accountLevelBlock?: boolean
@@ -200,6 +203,7 @@ const props = withDefaults(defineProps<{
   kiroSubscriptionClass: '',
   quotaTypeLabel: null,
   quotaStatusLabel: null,
+  quotaStatusTitle: '',
   canExportCredential: false,
   showOAuthRefreshControl: false,
   accountLevelBlock: false,

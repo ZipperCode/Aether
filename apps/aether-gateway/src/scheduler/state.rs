@@ -29,6 +29,14 @@ pub(crate) trait SchedulerRuntimeState {
         key_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogKey>, GatewayError>;
 
+    /// Reads credential-bearing Key records without the local catalog cache.
+    /// Scheduling must observe a quota block written by another gateway
+    /// instance before it admits a new candidate.
+    async fn read_provider_catalog_keys_by_ids_strong(
+        &self,
+        key_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKey>, GatewayError>;
+
     async fn read_recent_request_candidates(
         &self,
         limit: usize,

@@ -9,7 +9,10 @@ use aether_data_contracts::repository::pool_scores::{
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
-use aether_provider_pool::{provider_pool_quota_metadata_updated_at, ProviderQuotaServingPolicy};
+use aether_provider_pool::{
+    provider_pool_key_runtime_quota_blocked, provider_pool_quota_metadata_updated_at,
+    ProviderQuotaServingPolicy,
+};
 use aether_runtime_state::{RuntimeLockLease, RuntimeState};
 use futures_util::{stream, StreamExt};
 use serde_json::Value;
@@ -645,7 +648,7 @@ async fn remove_active_probe_member_ids(
 }
 
 async fn add_active_probe_member_ids(
-    runtime: &RuntimeState,
+    state: &AppState,
     provider_id: &str,
     key_ids: &BTreeSet<String>,
 ) {
@@ -654,14 +657,40 @@ async fn add_active_probe_member_ids(
     }
     let set_key = admin_provider_pool_quota_probe_active_members_key(provider_id);
     for key_id in key_ids {
-        if let Err(err) = runtime.set_add(&set_key, key_id).await {
-            debug!(
-                provider_id,
-                key_id,
-                error = ?err,
-                "gateway pool quota probe: failed to add active member"
-            );
+        let projection_lock = match state
+            .acquire_provider_key_quota_projection_lock(provider_id, key_id)
+            .await
+        {
+            Ok(lease) => lease,
+            Err(err) => {
+                debug!(
+                    provider_id,
+                    key_id,
+                    error = ?err,
+                    "gateway pool quota probe: skipped active member while quota fence is busy"
+                );
+                continue;
+            }
+        };
+        let quota_blocked = state
+            .provider_key_runtime_quota_blocked_strong(provider_id, key_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(true);
+        if !quota_blocked {
+            if let Err(err) = state.runtime_state.set_add(&set_key, key_id).await {
+                debug!(
+                    provider_id,
+                    key_id,
+                    error = ?err,
+                    "gateway pool quota probe: failed to add active member"
+                );
+            }
         }
+        state
+            .release_provider_key_quota_projection_lock(projection_lock)
+            .await;
     }
 }
 
@@ -913,6 +942,22 @@ async fn select_keys_for_provider(
         } else {
             BTreeSet::new()
         };
+        if !active_member_ids.is_empty() {
+            let active_ids = active_member_ids.iter().cloned().collect::<Vec<_>>();
+            let blocked_ids = state
+                .list_provider_catalog_keys_by_ids_strong(&active_ids)
+                .await?
+                .into_iter()
+                .filter(provider_pool_key_runtime_quota_blocked)
+                .map(|key| key.id)
+                .collect::<Vec<_>>();
+            if !blocked_ids.is_empty() {
+                remove_active_probe_member_ids(runtime, &provider.id, &blocked_ids).await;
+                for key_id in blocked_ids {
+                    active_member_ids.remove(&key_id);
+                }
+            }
+        }
         if mutate_active_members && matches!(mode, PoolQuotaProbeMode::Base) {
             let trimmed_ids = trim_pool_quota_probe_active_member_ids_to_target(
                 &active_member_ids,
@@ -954,7 +999,7 @@ async fn select_keys_for_provider(
             })
             .cloned()
             .collect::<Vec<_>>();
-        let mut selected_ids = select_pool_quota_probe_ids_for_active_target(
+        let selected_ids = select_pool_quota_probe_ids_for_active_target(
             &probe_eligible_key_ids,
             &active_member_ids,
             &scores_by_key,
@@ -980,17 +1025,21 @@ async fn select_keys_for_provider(
         .await;
 
         let mut keys_by_id = state
-            .list_provider_catalog_keys_by_ids(&selected_ids)
+            .list_provider_catalog_keys_by_ids_strong(&selected_ids)
             .await?
             .into_iter()
             .map(|key| (key.id.clone(), key))
             .collect::<BTreeMap<_, _>>();
-        Ok(PoolQuotaProbeSelectionOutcome::Selected(
-            selected_ids
-                .into_iter()
-                .filter_map(|key_id| keys_by_id.remove(&key_id))
-                .collect::<Vec<_>>(),
-        ))
+        let selected_keys = selected_ids
+            .into_iter()
+            .filter_map(|key_id| keys_by_id.remove(&key_id))
+            .filter(|key| !provider_pool_key_runtime_quota_blocked(key))
+            .collect::<Vec<_>>();
+        if selected_keys.is_empty() {
+            Ok(PoolQuotaProbeSelectionOutcome::Empty)
+        } else {
+            Ok(PoolQuotaProbeSelectionOutcome::Selected(selected_keys))
+        }
     }
     .await;
 
@@ -1098,18 +1147,15 @@ async fn record_score_probe_results_from_payload(
             if probe_result_is_neutral(item) {
                 continue;
             }
-            if probe_result_succeeded(item) {
-                succeeded.insert(key_id.to_string());
-            }
-            record_score_probe_result_for_key(
+            let result_succeeded = probe_result_succeeded(item);
+            let recorded_result = record_score_probe_result_for_key(
                 state,
                 provider_id,
                 key_id,
                 attempted_at,
-                probe_result_succeeded(item),
-                probe_result_hard_state(item).or_else(|| {
-                    (!probe_result_succeeded(item)).then_some(PoolMemberHardState::Cooldown)
-                }),
+                result_succeeded,
+                probe_result_hard_state(item)
+                    .or_else(|| (!result_succeeded).then_some(PoolMemberHardState::Cooldown)),
                 serde_json::json!({
                     "last_probe": {
                         "source": "pool_quota_probe",
@@ -1121,6 +1167,9 @@ async fn record_score_probe_results_from_payload(
                 }),
             )
             .await;
+            if recorded_result && result_succeeded {
+                succeeded.insert(key_id.to_string());
+            }
         }
     }
 
@@ -1155,7 +1204,34 @@ async fn record_score_probe_result_for_key(
     succeeded: bool,
     hard_state: Option<PoolMemberHardState>,
     score_reason_patch: Value,
-) {
+) -> bool {
+    let projection_lock = match state
+        .acquire_provider_key_quota_projection_lock(provider_id, key_id)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(err) => {
+            debug!(
+                provider_id,
+                key_id,
+                error = ?err,
+                "gateway pool quota probe: skipped score result while quota fence is busy"
+            );
+            return false;
+        }
+    };
+    let quota_blocked = state
+        .provider_key_runtime_quota_blocked_strong(provider_id, key_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true);
+    if quota_blocked {
+        state
+            .release_provider_key_quota_projection_lock(projection_lock)
+            .await;
+        return false;
+    }
     let result = PoolMemberProbeResult {
         identity: PoolMemberIdentity::provider_api_key(provider_id.to_string(), key_id.to_string()),
         scope: None,
@@ -1169,14 +1245,22 @@ async fn record_score_probe_result_for_key(
         },
         score_reason_patch: Some(score_reason_patch),
     };
-    if let Err(err) = state.data.record_pool_member_probe_result(result).await {
-        debug!(
-            provider_id,
-            key_id,
-            error = ?err,
-            "gateway pool quota probe: failed to record score probe result"
-        );
-    }
+    let recorded = match state.data.record_pool_member_probe_result(result).await {
+        Ok(_) => true,
+        Err(err) => {
+            debug!(
+                provider_id,
+                key_id,
+                error = ?err,
+                "gateway pool quota probe: failed to record score probe result"
+            );
+            false
+        }
+    };
+    state
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
+    recorded
 }
 
 async fn record_score_probe_in_progress_for_key(
@@ -1185,6 +1269,36 @@ async fn record_score_probe_in_progress_for_key(
     key_id: &str,
     attempted_at: u64,
 ) {
+    let projection_lock = match state
+        .acquire_provider_key_quota_projection_lock(provider_id, key_id)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(err) => {
+            debug!(
+                provider_id,
+                key_id,
+                error = ?err,
+                "gateway pool quota probe: skipped in-progress score update while quota fence is busy"
+            );
+            return;
+        }
+    };
+    let quota_blocked = state
+        .provider_key_runtime_quota_blocked_strong(provider_id, key_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true);
+    if quota_blocked {
+        state
+            .release_provider_key_quota_projection_lock(projection_lock)
+            .await;
+        return;
+    }
+
+    // Probe attempts update an existing score row through read-modify-write;
+    // keep the write inside the same fence as quota hard-state projection.
     let attempt = PoolMemberProbeAttempt {
         identity: PoolMemberIdentity::provider_api_key(provider_id.to_string(), key_id.to_string()),
         scope: None,
@@ -1204,6 +1318,9 @@ async fn record_score_probe_in_progress_for_key(
             "gateway pool quota probe: failed to mark score probe in progress"
         );
     }
+    state
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
 }
 
 fn probe_result_succeeded(item: &Value) -> bool {
@@ -1301,17 +1418,14 @@ async fn record_subscription_refresh_results(
         };
         let marker = match hard_state {
             PoolMemberHardState::QuotaExhausted => "quota_exhausted",
-            PoolMemberHardState::Available => {
-                available.insert(key_id.to_string());
-                "available"
-            }
+            PoolMemberHardState::Available => "available",
             PoolMemberHardState::Unknown
             | PoolMemberHardState::Cooldown
             | PoolMemberHardState::AuthInvalid
             | PoolMemberHardState::Banned
             | PoolMemberHardState::Inactive => continue,
         };
-        record_score_probe_result_for_key(
+        let recorded = record_score_probe_result_for_key(
             state,
             provider_id,
             key_id,
@@ -1321,6 +1435,9 @@ async fn record_subscription_refresh_results(
             serde_json::json!({"quota_refresh_health": {"state": marker}}),
         )
         .await;
+        if recorded && hard_state == PoolMemberHardState::Available {
+            available.insert(key_id.to_string());
+        }
     }
     available
 }
@@ -1549,12 +1666,7 @@ async fn perform_pool_quota_probe_for_provider(
                         }
                         ProviderQuotaServingPolicy::ObservationOnly => BTreeSet::new(),
                     };
-                    add_active_probe_member_ids(
-                        state.runtime_state.as_ref(),
-                        &provider.id,
-                        &successful_key_ids,
-                    )
-                    .await;
+                    add_active_probe_member_ids(state, &provider.id, &successful_key_ids).await;
                 }
             }
             Err(err) => {

@@ -4,6 +4,7 @@ use tracing::warn;
 use crate::orchestration::{
     local_failover_error_message, oauth_status_may_be_invalid as status_may_be_oauth_invalid,
     oauth_status_proves_access_token_invalid as status_proves_access_token_invalid,
+    PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD,
 };
 use crate::state::{AgentIdentityAuthConfigFence, CodexRuntimeOAuthObservation};
 use crate::{provider_transport::LocalOAuthRefreshError, AppState};
@@ -196,6 +197,68 @@ pub(crate) async fn refresh_oauth_plan_auth_for_retry(
             false
         }
     }
+}
+
+/// Refreshes the request-scoped credential fence after an OAuth retry changed
+/// the credential that will actually be sent upstream. A failed strong read
+/// leaves the old fence in place, which safely rejects later persistent effects.
+pub(crate) async fn refresh_oauth_retry_credential_fingerprint(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: &mut serde_json::Value,
+) {
+    let Some(object) = report_context.as_object_mut() else {
+        return;
+    };
+    let current_key = match state
+        .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(&plan.key_id))
+        .await
+    {
+        Ok(keys) => keys
+            .into_iter()
+            .next()
+            .filter(|key| key.provider_id == plan.provider_id),
+        Err(err) => {
+            warn!(
+                provider_id = %plan.provider_id,
+                key_id = %plan.key_id,
+                error = ?err,
+                "gateway could not refresh OAuth retry credential fence"
+            );
+            return;
+        }
+    };
+    let Some(current_key) = current_key else {
+        return;
+    };
+    let Some(current_endpoint) = state
+        .read_provider_catalog_endpoints_by_ids(std::slice::from_ref(&plan.endpoint_id))
+        .await
+        .ok()
+        .and_then(|mut endpoints| endpoints.drain(..).next())
+    else {
+        return;
+    };
+    let fingerprint = match aether_provider_transport::provider_catalog_key_credential_fingerprint(
+        &current_key,
+        &current_endpoint,
+        state.encryption_key().unwrap_or_default(),
+    ) {
+        Ok(fingerprint) => fingerprint,
+        Err(err) => {
+            warn!(
+                provider_id = %plan.provider_id,
+                key_id = %plan.key_id,
+                error = ?err,
+                "gateway could not rebuild OAuth retry credential fence"
+            );
+            return;
+        }
+    };
+    object.insert(
+        PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD.to_string(),
+        serde_json::Value::String(fingerprint),
+    );
 }
 
 fn report_context_string<'a>(

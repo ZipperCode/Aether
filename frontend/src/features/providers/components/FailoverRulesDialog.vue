@@ -244,6 +244,113 @@
           </div>
         </template>
       </div>
+
+      <!-- 额度耗尽规则 -->
+      <div class="space-y-3">
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0">
+            <h3 class="text-sm font-medium">
+              额度耗尽规则
+            </h3>
+            <p class="text-xs text-muted-foreground mt-0.5">
+              命中后立即阻断当前 Key 的后续调度，且只能由管理员人工恢复。状态码不填时会对所有上游终态匹配正则
+            </p>
+          </div>
+          <div class="flex items-center gap-1 shrink-0">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              class="h-7 text-xs px-2"
+              :title="quotaJsonMode ? '切回额度耗尽表单' : '切到额度耗尽 JSON'"
+              @click="toggleQuotaJsonMode"
+            >
+              <Code2 class="w-3 h-3 mr-1" />
+              {{ quotaJsonMode ? '表单' : 'JSON' }}
+            </Button>
+            <Button
+              v-if="quotaJsonMode"
+              type="button"
+              variant="ghost"
+              size="sm"
+              class="h-7 px-2 text-xs"
+              title="格式化额度耗尽 JSON"
+              @click="formatQuotaJsonDraft"
+            >
+              <AlignLeft class="w-3 h-3 mr-1" />
+              格式化
+            </Button>
+            <Button
+              v-if="!quotaJsonMode"
+              type="button"
+              variant="ghost"
+              size="sm"
+              class="h-7 text-xs px-2"
+              @click="addRule('quota')"
+            >
+              <Plus class="w-3 h-3 mr-1" />
+              添加
+            </Button>
+          </div>
+        </div>
+
+        <div
+          v-if="quotaJsonMode"
+          class="space-y-2"
+        >
+          <Textarea
+            :model-value="quotaJsonDraft"
+            class="min-h-[180px] font-mono text-xs leading-relaxed"
+            spellcheck="false"
+            placeholder="[{ &quot;status_codes&quot;: [403], &quot;pattern&quot;: &quot;INSUFFICIENT_BALANCE&quot; }]"
+            @update:model-value="updateQuotaJsonDraft"
+          />
+          <div
+            v-if="quotaJsonError"
+            class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          >
+            {{ quotaJsonError }}
+          </div>
+          <p class="text-xs text-muted-foreground">
+            JSON 应为数组；<code class="bg-muted px-1 rounded">status_codes</code> 与 <code class="bg-muted px-1 rounded">pattern</code> 至少填写一个。
+          </p>
+        </div>
+
+        <template v-else>
+          <div
+            v-if="quotaPatterns.length === 0"
+            class="text-xs text-muted-foreground px-3 py-4 border border-dashed rounded-lg text-center"
+          >
+            暂无自定义规则，系统仍会识别内置额度错误码
+          </div>
+          <div
+            v-for="(rule, index) in quotaPatterns"
+            :key="'q-' + index"
+            class="flex items-center gap-1"
+          >
+            <Input
+              v-model="quotaStatusCodeInputs[index]"
+              placeholder="状态码 (选填，可多个)"
+              size="sm"
+              class="font-mono text-xs w-40 shrink-0"
+            />
+            <Input
+              v-model="rule.pattern"
+              placeholder="正则内容 (选填)"
+              size="sm"
+              class="font-mono text-xs flex-1"
+            />
+            <Button
+              variant="ghost"
+              size="sm"
+              class="shrink-0 h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
+              @click="removeRule('quota', index)"
+            >
+              <Trash2 class="w-3.5 h-3.5" />
+            </Button>
+          </div>
+        </template>
+      </div>
     </div>
 
     <template #footer>
@@ -295,7 +402,9 @@ const continueOnTransportErrors = ref(true)
 
 const successPatterns = ref<FailoverRuleItem[]>([])
 const errorPatterns = ref<FailoverRuleItem[]>([])
+const quotaPatterns = ref<FailoverRuleItem[]>([])
 const statusCodeInputs = ref<string[]>([])
+const quotaStatusCodeInputs = ref<string[]>([])
 const successJsonMode = ref(false)
 const successJsonDraft = ref('')
 const successJsonError = ref<string | null>(null)
@@ -304,6 +413,10 @@ const errorJsonMode = ref(false)
 const errorJsonDraft = ref('')
 const errorJsonError = ref<string | null>(null)
 const errorJsonDirty = ref(false)
+const quotaJsonMode = ref(false)
+const quotaJsonDraft = ref('')
+const quotaJsonError = ref<string | null>(null)
+const quotaJsonDirty = ref(false)
 
 const TOP_LEVEL_STOP_STATUS_CODE_KEYS = [
   'stop_status_codes',
@@ -316,6 +429,7 @@ const MANAGED_FAILOVER_RULE_KEYS = [
   'stop_on_transport_errors',
   'success_failover_patterns',
   'error_stop_patterns',
+  'quota_exhaustion_patterns',
   ...TOP_LEVEL_STOP_STATUS_CODE_KEYS,
 ] as const
 
@@ -356,6 +470,7 @@ function buildPreservedFailoverRules(
 function buildNextFailoverRules(
   filteredSuccess: FailoverRuleItem[],
   filteredError: FailoverRuleItem[],
+  filteredQuota: FailoverRuleItem[],
 ): FailoverRulesConfig | null {
   const nextRules = buildPreservedFailoverRules(props.provider?.failover_rules)
   if (filteredSuccess.length > 0) {
@@ -363,6 +478,9 @@ function buildNextFailoverRules(
   }
   if (filteredError.length > 0) {
     nextRules.error_stop_patterns = filteredError
+  }
+  if (filteredQuota.length > 0) {
+    nextRules.quota_exhaustion_patterns = filteredQuota
   }
   if (!continueOnTransportErrors.value) {
     nextRules.stop_on_transport_errors = true
@@ -385,6 +503,10 @@ watch(() => [props.open, props.provider], () => {
       ...r,
       pattern: r.pattern || '',
     }))
+    quotaPatterns.value = (rules?.quota_exhaustion_patterns || []).map(r => ({
+      ...r,
+      pattern: r.pattern || '',
+    }))
     const topLevelStopStatusCodes = collectTopLevelStopStatusCodes(rules)
     if (topLevelStopStatusCodes.length > 0) {
       errorPatterns.value.push({
@@ -396,29 +518,40 @@ watch(() => [props.open, props.provider], () => {
     statusCodeInputs.value = errorPatterns.value.map(r =>
       r.status_codes?.length ? r.status_codes.join(',') : ''
     )
+    quotaStatusCodeInputs.value = quotaPatterns.value.map(r =>
+      r.status_codes?.length ? r.status_codes.join(',') : ''
+    )
     successJsonMode.value = false
     errorJsonMode.value = false
+    quotaJsonMode.value = false
     refreshSuccessJsonDraft()
     refreshErrorJsonDraft()
+    refreshQuotaJsonDraft()
   }
 }, { immediate: true })
 
-function addRule(type: 'success' | 'error') {
+function addRule(type: 'success' | 'error' | 'quota') {
   const rule: FailoverRuleItem = { pattern: '', description: '' }
   if (type === 'success') {
     successPatterns.value.push(rule)
-  } else {
+  } else if (type === 'error') {
     errorPatterns.value.push(rule)
     statusCodeInputs.value.push('')
+  } else {
+    quotaPatterns.value.push(rule)
+    quotaStatusCodeInputs.value.push('')
   }
 }
 
-function removeRule(type: 'success' | 'error', index: number) {
+function removeRule(type: 'success' | 'error' | 'quota', index: number) {
   if (type === 'success') {
     successPatterns.value.splice(index, 1)
-  } else {
+  } else if (type === 'error') {
     errorPatterns.value.splice(index, 1)
     statusCodeInputs.value.splice(index, 1)
+  } else {
+    quotaPatterns.value.splice(index, 1)
+    quotaStatusCodeInputs.value.splice(index, 1)
   }
 }
 
@@ -494,6 +627,22 @@ function buildErrorJsonRulesFromForm(): FailoverRuleItem[] {
     .filter(rule => rule.pattern || (rule.status_codes?.length || 0) > 0)
 }
 
+function buildQuotaJsonRulesFromForm(): FailoverRuleItem[] {
+  return quotaPatterns.value
+    .map((rule, index) => {
+      const parsed = parseStatusCodes(quotaStatusCodeInputs.value[index] || '')
+      const statusCodes = parsed.valid
+        ? parsed.codes
+        : uniqueStatusCodes(rule.status_codes || [])
+      return {
+        ...rule,
+        pattern: rule.pattern.trim(),
+        status_codes: statusCodes.length > 0 ? statusCodes : undefined,
+      }
+    })
+    .filter(rule => rule.pattern || (rule.status_codes?.length || 0) > 0)
+}
+
 function stringifyRuleArray(rules: FailoverRuleItem[]): string {
   return JSON.stringify(rules, null, 2)
 }
@@ -510,6 +659,12 @@ function refreshErrorJsonDraft() {
   errorJsonDirty.value = false
 }
 
+function refreshQuotaJsonDraft() {
+  quotaJsonDraft.value = stringifyRuleArray(buildQuotaJsonRulesFromForm())
+  quotaJsonError.value = null
+  quotaJsonDirty.value = false
+}
+
 function updateSuccessJsonDraft(value: string) {
   successJsonDraft.value = value
   successJsonDirty.value = true
@@ -522,9 +677,15 @@ function updateErrorJsonDraft(value: string) {
   errorJsonError.value = null
 }
 
+function updateQuotaJsonDraft(value: string) {
+  quotaJsonDraft.value = value
+  quotaJsonDirty.value = true
+  quotaJsonError.value = null
+}
+
 function readJsonRuleArray(
   parsed: unknown,
-  key: 'success_failover_patterns' | 'error_stop_patterns',
+  key: 'success_failover_patterns' | 'error_stop_patterns' | 'quota_exhaustion_patterns',
 ): { root: Record<string, unknown>; value: unknown[]; error: string | null } {
   if (Array.isArray(parsed)) return { root: {}, value: parsed, error: null }
   if (!isJsonObject(parsed)) return { root: {}, value: [], error: '规则 JSON 必须是数组或对象' }
@@ -586,8 +747,12 @@ function parseJsonSuccessRule(rule: unknown, index: number): { rule: FailoverRul
   }
 }
 
-function parseJsonErrorRule(rule: unknown, index: number): { rule: FailoverRuleItem | null; error: string | null } {
-  const label = `错误终止 JSON 第 ${index + 1} 条：`
+function parseJsonErrorRule(
+  rule: unknown,
+  index: number,
+  sectionLabel = '错误终止',
+): { rule: FailoverRuleItem | null; error: string | null } {
+  const label = `${sectionLabel} JSON 第 ${index + 1} 条：`
   if (!isJsonObject(rule)) return { rule: null, error: `${label}必须是对象` }
   const status = parseJsonStatusCodes(rule.status_codes, label, false)
   if (status.error) return { rule: null, error: status.error }
@@ -670,6 +835,28 @@ function parseErrorRulesJsonDraft(draft: string): { value: FailoverRuleItem[] | 
   return { value: normalized, error: null }
 }
 
+function parseQuotaRulesJsonDraft(draft: string): { value: FailoverRuleItem[] | null; error: string | null } {
+  const raw = draft.trim()
+  if (!raw) return { value: [], error: null }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error: unknown) {
+    return { value: null, error: error instanceof Error ? error.message : 'JSON 格式无效' }
+  }
+
+  const rules = readJsonRuleArray(parsed, 'quota_exhaustion_patterns')
+  if (rules.error) return { value: null, error: rules.error }
+  const normalized: FailoverRuleItem[] = []
+  for (let i = 0; i < rules.value.length; i++) {
+    const parsedRule = parseJsonErrorRule(rules.value[i], i, '额度耗尽')
+    if (parsedRule.error || !parsedRule.rule) return { value: null, error: parsedRule.error }
+    normalized.push(parsedRule.rule)
+  }
+  return { value: normalized, error: null }
+}
+
 function applySuccessJsonDraft(options: { notify?: boolean; notifyError?: boolean } = {}): boolean {
   const notifyError = options.notifyError !== false
   const parsed = parseSuccessRulesJsonDraft(successJsonDraft.value)
@@ -705,6 +892,23 @@ function applyErrorJsonDraft(options: { notify?: boolean; notifyError?: boolean 
   return true
 }
 
+function applyQuotaJsonDraft(options: { notify?: boolean; notifyError?: boolean } = {}): boolean {
+  const notifyError = options.notifyError !== false
+  const parsed = parseQuotaRulesJsonDraft(quotaJsonDraft.value)
+  if (!parsed.value) {
+    quotaJsonError.value = parsed.error
+    if (notifyError) showError(parsed.error || '额度耗尽规则 JSON 无效', '验证失败')
+    return false
+  }
+  quotaPatterns.value = parsed.value.map(rule => ({ ...rule }))
+  quotaStatusCodeInputs.value = quotaPatterns.value.map(rule => rule.status_codes?.join(',') || '')
+  quotaJsonDraft.value = stringifyRuleArray(parsed.value)
+  quotaJsonError.value = null
+  quotaJsonDirty.value = false
+  if (options.notify !== false) success('额度耗尽 JSON 已应用')
+  return true
+}
+
 function toggleSuccessJsonMode() {
   if (successJsonMode.value) {
     if (successJsonDirty.value && !applySuccessJsonDraft({ notify: false })) return
@@ -723,6 +927,16 @@ function toggleErrorJsonMode() {
   }
   refreshErrorJsonDraft()
   errorJsonMode.value = true
+}
+
+function toggleQuotaJsonMode() {
+  if (quotaJsonMode.value) {
+    if (quotaJsonDirty.value && !applyQuotaJsonDraft({ notify: false })) return
+    quotaJsonMode.value = false
+    return
+  }
+  refreshQuotaJsonDraft()
+  quotaJsonMode.value = true
 }
 
 function formatSuccessJsonDraft() {
@@ -755,11 +969,25 @@ function formatErrorJsonDraft() {
   }
 }
 
+function formatQuotaJsonDraft() {
+  const currentDraft = quotaJsonDraft.value
+  const parsed = parseQuotaRulesJsonDraft(currentDraft)
+  if (!parsed.value) {
+    quotaJsonError.value = parsed.error
+    return
+  }
+  const formattedDraft = stringifyRuleArray(parsed.value)
+  quotaJsonDraft.value = formattedDraft
+  quotaJsonError.value = null
+  if (formattedDraft !== currentDraft) quotaJsonDirty.value = true
+}
+
 async function handleSave() {
   if (!props.provider) return
 
   if (successJsonMode.value && !applySuccessJsonDraft({ notify: false })) return
   if (errorJsonMode.value && !applyErrorJsonDraft({ notify: false })) return
+  if (quotaJsonMode.value && !applyQuotaJsonDraft({ notify: false })) return
 
   // Validate patterns
   for (const rule of successPatterns.value) {
@@ -791,6 +1019,25 @@ async function handleSave() {
     errorPatterns.value[i].status_codes = result.codes.length > 0 ? result.codes : undefined
   }
 
+  for (let i = 0; i < quotaPatterns.value.length; i++) {
+    const result = parseStatusCodes(quotaStatusCodeInputs.value[i]?.trim() || '')
+    if (!result.valid) {
+      showError(`额度耗尽状态码格式错误: ${result.reason}`, '验证失败')
+      return
+    }
+    const patternErr = validateOptionalPattern(quotaPatterns.value[i].pattern)
+    if (patternErr) {
+      showError(patternErr, '验证失败')
+      return
+    }
+    const pattern = quotaPatterns.value[i].pattern.trim()
+    if (result.codes.length === 0 && !pattern) {
+      showError(`第 ${i + 1} 条额度耗尽规则：状态码和正则内容至少填写一个`, '验证失败')
+      return
+    }
+    quotaPatterns.value[i].status_codes = result.codes.length > 0 ? result.codes : undefined
+  }
+
   saving.value = true
   try {
     const filteredSuccess = successPatterns.value
@@ -806,8 +1053,15 @@ async function handleSave() {
         }
       })
       .filter(r => r.pattern || (r.status_codes?.length || 0) > 0)
+    const filteredQuota = quotaPatterns.value
+      .map(r => ({
+        ...r,
+        pattern: r.pattern.trim(),
+        status_codes: r.status_codes?.length ? r.status_codes : undefined,
+      }))
+      .filter(r => r.pattern || (r.status_codes?.length || 0) > 0)
 
-    const nextFailoverRules = buildNextFailoverRules(filteredSuccess, filteredError)
+    const nextFailoverRules = buildNextFailoverRules(filteredSuccess, filteredError, filteredQuota)
 
     await updateProvider(props.provider.id, {
       failover_rules: nextFailoverRules,

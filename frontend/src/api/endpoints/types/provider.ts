@@ -873,6 +873,7 @@ export interface FailoverRulesConfig {
   continue_status_codes?: number[]
   success_failover_patterns?: FailoverRuleItem[]
   error_stop_patterns?: FailoverRuleItem[]
+  quota_exhaustion_patterns?: FailoverRuleItem[]
 }
 
 export interface ProviderWithEndpointsSummary {

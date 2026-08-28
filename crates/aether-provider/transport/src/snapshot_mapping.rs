@@ -3,6 +3,9 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::DataLayerError;
+use sha2::{Digest, Sha256};
+
+use crate::auth_config::{absorb_local_auth_config_safe_subset, LocalAuthConfigAbsorption};
 
 use super::{
     GatewayProviderTransportEndpoint, GatewayProviderTransportKey, GatewayProviderTransportProvider,
@@ -112,6 +115,96 @@ pub(super) fn map_key(
         decrypted_api_key,
         decrypted_auth_config,
     })
+}
+
+pub(super) fn transport_key_credential_fingerprint(key: &GatewayProviderTransportKey) -> String {
+    credential_fingerprint(
+        &key.auth_type,
+        key.decrypted_api_key.as_str(),
+        // Snapshot construction already removes auth_config only when it was
+        // successfully absorbed into the real endpoint. Any value left here
+        // is credential material, including an otherwise safe subset whose
+        // merge failed because the endpoint contained conflicting state.
+        key.decrypted_auth_config.as_deref(),
+    )
+}
+
+pub(super) fn stored_key_credential_fingerprint(
+    key: &StoredProviderCatalogKey,
+    endpoint: &StoredProviderCatalogEndpoint,
+    encryption_key: &str,
+) -> Result<String, DataLayerError> {
+    let fallback_encryption_keys = fallback_encryption_keys(encryption_key);
+    let api_key = key
+        .encrypted_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|ciphertext| {
+            decrypt_secret(
+                encryption_key,
+                &fallback_encryption_keys,
+                ciphertext,
+                "provider_api_keys.api_key",
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let auth_config = key
+        .encrypted_auth_config
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|ciphertext| {
+            decrypt_secret(
+                encryption_key,
+                &fallback_encryption_keys,
+                ciphertext,
+                "provider_api_keys.auth_config",
+            )
+        })
+        .transpose()?;
+    Ok(credential_fingerprint(
+        &key.auth_type,
+        api_key.as_str(),
+        credential_fingerprint_auth_config(endpoint, auth_config.as_deref()),
+    ))
+}
+
+fn credential_fingerprint_auth_config<'a>(
+    endpoint: &StoredProviderCatalogEndpoint,
+    raw_auth_config: Option<&'a str>,
+) -> Option<&'a str> {
+    match absorb_local_auth_config_safe_subset(
+        &endpoint.base_url,
+        endpoint
+            .header_rules
+            .clone()
+            .filter(|value| !value.is_null()),
+        endpoint.custom_path.clone(),
+        raw_auth_config,
+    ) {
+        // Safe request-routing overrides are absorbed into the endpoint and
+        // are not credential material. Ignoring them here also keeps the
+        // fingerprint stable before and after transport normalization.
+        LocalAuthConfigAbsorption::Absorbed { .. } => None,
+        LocalAuthConfigAbsorption::Missing | LocalAuthConfigAbsorption::Unsupported => {
+            raw_auth_config
+        }
+    }
+}
+
+fn credential_fingerprint(auth_type: &str, api_key: &str, auth_config: Option<&str>) -> String {
+    let mut digest = Sha256::new();
+    for value in [auth_type.trim(), api_key, auth_config.unwrap_or_default()] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn normalize_optional_json(value: Option<serde_json::Value>) -> Option<serde_json::Value> {

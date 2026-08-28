@@ -2309,6 +2309,12 @@ pub(crate) fn provider_key_status_snapshot_payload(
         "account".to_string(),
         build_provider_key_account_status_snapshot(key, provider_type),
     );
+    if let Some(scheduling) = snapshot
+        .get_mut("scheduling")
+        .and_then(Value::as_object_mut)
+    {
+        scheduling.remove("credential_fingerprint");
+    }
     Value::Object(snapshot)
 }
 

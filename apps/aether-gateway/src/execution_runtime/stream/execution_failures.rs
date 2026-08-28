@@ -29,6 +29,7 @@ use crate::orchestration::{
     LocalAdaptiveRateLimitEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
     LocalExecutionEffectContext, LocalFailoverAnalysis, LocalFailoverDecision,
     LocalHealthFailureEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
+    LocalSchedulingStateEffect,
 };
 use crate::request_candidate_runtime::record_report_request_candidate_status;
 use crate::request_diagnostics::attach_current_request_diagnostics_and_candidate_timing_to_report_context;
@@ -363,9 +364,12 @@ async fn record_stream_sync_failure(
         report_context,
         payload.status_code,
         error_body.as_deref(),
+        Some(&payload.headers),
     )
     .await;
-    if matches!(error_type, "first_byte_timeout" | "read_timeout") {
+    if failure_analysis.quota_exhaustion.is_none()
+        && matches!(error_type, "first_byte_timeout" | "read_timeout")
+    {
         apply_local_execution_effect(
             state,
             LocalExecutionEffectContext {
@@ -388,57 +392,84 @@ async fn record_stream_sync_failure(
         }),
     )
     .await;
-    apply_local_execution_effect(
-        state,
-        LocalExecutionEffectContext {
-            plan,
-            report_context,
-        },
-        LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
-            status_code: payload.status_code,
-            classification: failure_analysis.classification,
-            headers: Some(&payload.headers),
-        }),
-    )
-    .await;
-    apply_local_execution_effect(
-        state,
-        LocalExecutionEffectContext {
-            plan,
-            report_context,
-        },
-        LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
-            status_code: payload.status_code,
-            classification: failure_analysis.classification,
-        }),
-    )
-    .await;
-    apply_local_execution_effect(
-        state,
-        LocalExecutionEffectContext {
-            plan,
-            report_context,
-        },
-        LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
-            status_code: payload.status_code,
-            response_text: error_body.as_deref(),
-        }),
-    )
-    .await;
-    apply_local_execution_effect(
-        state,
-        LocalExecutionEffectContext {
-            plan,
-            report_context,
-        },
-        LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
-            status_code: payload.status_code,
-            classification: failure_analysis.classification,
-            headers: &payload.headers,
-            error_body: error_body.as_deref(),
-        }),
-    )
-    .await;
+    if candidate_status_code.is_some() {
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan,
+                report_context,
+            },
+            LocalExecutionEffect::SchedulingState(LocalSchedulingStateEffect {
+                status_code: payload.status_code,
+                response_text: error_body.as_deref(),
+                quota_exhaustion: failure_analysis.quota_exhaustion,
+            }),
+        )
+        .await;
+    }
+    if failure_analysis.quota_exhaustion.is_none() {
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan,
+                report_context,
+            },
+            LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
+                status_code: payload.status_code,
+                classification: failure_analysis.classification,
+                headers: Some(&payload.headers),
+            }),
+        )
+        .await;
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan,
+                report_context,
+            },
+            LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
+                status_code: payload.status_code,
+                classification: failure_analysis.classification,
+            }),
+        )
+        .await;
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan,
+                report_context,
+            },
+            LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
+                status_code: payload.status_code,
+                response_text: error_body.as_deref(),
+            }),
+        )
+        .await;
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan,
+                report_context,
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: payload.status_code,
+                classification: failure_analysis.classification,
+                headers: &payload.headers,
+                error_body: error_body.as_deref(),
+            }),
+        )
+        .await;
+    } else {
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan,
+                report_context,
+            },
+            LocalExecutionEffect::PoolLeaseRelease,
+        )
+        .await;
+    }
     let retrying_next_candidate = matches!(
         failure_analysis.decision,
         LocalFailoverDecision::RetryNextCandidate

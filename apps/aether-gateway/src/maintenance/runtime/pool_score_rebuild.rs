@@ -112,6 +112,79 @@ fn provider_offset_cursor_key(provider_id: &str) -> String {
     format!("{POOL_SCORE_REBUILD_PROVIDER_OFFSET_PREFIX}:{provider_id}")
 }
 
+async fn upsert_current_provider_key_pool_score(
+    state: &AppState,
+    provider: &StoredProviderCatalogProvider,
+    pool_config: &AdminProviderPoolConfig,
+    key_id: &str,
+    only_if_missing: bool,
+    now_unix_secs: u64,
+) -> Result<bool, GatewayError> {
+    let projection_lock = match state
+        .acquire_provider_key_quota_projection_lock(&provider.id, key_id)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(err) => {
+            debug!(
+                provider_id = %provider.id,
+                key_id,
+                error = ?err,
+                "gateway pool score rebuild: skipped upsert while quota fence is busy"
+            );
+            return Ok(false);
+        }
+    };
+    let result = async {
+        let Some(key) = state
+            .list_provider_catalog_keys_by_ids_strong(&[key_id.to_string()])
+            .await?
+            .into_iter()
+            .next()
+            .filter(|key| key.is_active && key.provider_id == provider.id)
+        else {
+            return Ok(false);
+        };
+        let draft = build_provider_key_pool_score_upsert(
+            &key,
+            provider.provider_type.as_str(),
+            None,
+            now_unix_secs,
+            pool_config.score_rules,
+        );
+        let existing = state
+            .data
+            .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+                ids: vec![draft.id],
+            })
+            .await
+            .map_err(|err| GatewayError::Internal(format!("{err:?}")))?
+            .into_iter()
+            .next();
+        if only_if_missing && existing.is_some() {
+            return Ok(false);
+        }
+        let upsert = build_provider_key_pool_score_upsert(
+            &key,
+            provider.provider_type.as_str(),
+            existing.as_ref(),
+            now_unix_secs,
+            pool_config.score_rules,
+        );
+        Ok(state
+            .data
+            .upsert_pool_member_score(upsert)
+            .await
+            .map_err(|err| GatewayError::Internal(format!("{err:?}")))?
+            .is_some())
+    }
+    .await;
+    state
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
+    result
+}
+
 pub(crate) async fn ensure_provider_key_pool_scores_for_keys(
     state: &AppState,
     provider: &StoredProviderCatalogProvider,
@@ -181,19 +254,15 @@ pub(crate) async fn ensure_provider_key_pool_scores_for_keys(
         if existing_score_ids.contains(score_id) {
             continue;
         }
-        let upsert = build_provider_key_pool_score_upsert(
-            key,
-            provider.provider_type.as_str(),
-            None,
+        if upsert_current_provider_key_pool_score(
+            state,
+            provider,
+            pool_config,
+            &key.id,
+            true,
             now_unix_secs,
-            pool_config.score_rules,
-        );
-        if state
-            .data
-            .upsert_pool_member_score(upsert)
-            .await
-            .map_err(|err| GatewayError::Internal(format!("{err:?}")))?
-            .is_some()
+        )
+        .await?
         {
             upserted = upserted.saturating_add(1);
         }
@@ -315,47 +384,22 @@ pub(crate) async fn perform_pool_score_rebuild_once_with_config(
             .await;
             continue;
         }
-        let existing_scores = state
-            .data
-            .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
-                ids: build_items
-                    .iter()
-                    .map(|(_, score_id)| score_id.clone())
-                    .collect(),
-            })
-            .await
-            .unwrap_or_else(|err| {
-                debug!(
-                    provider_id = %provider.id,
-                    error = ?err,
-                    "gateway pool score rebuild: failed to read existing scores by id"
-                );
-                Vec::new()
-            })
-            .into_iter()
-            .map(|score| (score.id.clone(), score))
-            .collect::<BTreeMap<_, _>>();
         let mut provider_upserts = 0usize;
         summary.keys_seen = summary.keys_seen.saturating_add(total_keys);
-        for (key_index, score_id) in &build_items {
+        for (key_index, _) in &build_items {
             if summary.scores_upserted >= config.max_upserts_per_tick {
                 break;
             }
             let key = &selected_keys[*key_index];
-            let existing = existing_scores.get(score_id);
-            let upsert = build_provider_key_pool_score_upsert(
-                key,
-                provider.provider_type.as_str(),
-                existing,
+            if upsert_current_provider_key_pool_score(
+                state,
+                &provider,
+                &pool_config,
+                &key.id,
+                false,
                 now,
-                pool_config.score_rules,
-            );
-            if state
-                .data
-                .upsert_pool_member_score(upsert)
-                .await
-                .map_err(|err| GatewayError::Internal(format!("{err:?}")))?
-                .is_some()
+            )
+            .await?
             {
                 summary.scores_upserted = summary.scores_upserted.saturating_add(1);
                 provider_upserts = provider_upserts.saturating_add(1);

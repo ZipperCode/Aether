@@ -424,6 +424,11 @@ impl<'a> AdminAppState<'a> {
             .iter()
             .map(|key| key.id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
+        let runtime_quota_blocked_key_ids = keys
+            .iter()
+            .filter(|key| aether_provider_pool::provider_pool_key_runtime_quota_blocked(key))
+            .map(|key| key.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
         let mut exhausted_key_ids = keys
             .iter()
             .filter(|key| {
@@ -458,7 +463,20 @@ impl<'a> AdminAppState<'a> {
                 }
                 let page_len = scores.len();
                 for score in scores {
-                    if known_key_ids.contains(score.member_id.as_str()) {
+                    let runtime_quota_score = score
+                        .score_reason
+                        .get("hard_state_source")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("runtime_quota_exhaustion")
+                        || score
+                            .score_reason
+                            .pointer("/last_request_feedback/source")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("runtime_quota_exhaustion");
+                    if known_key_ids.contains(score.member_id.as_str())
+                        && !runtime_quota_blocked_key_ids.contains(score.member_id.as_str())
+                        && !runtime_quota_score
+                    {
                         exhausted_key_ids.insert(score.member_id);
                     }
                 }

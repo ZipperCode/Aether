@@ -268,6 +268,18 @@ export async function clearOAuthInvalid(keyId: string): Promise<{ message: strin
 }
 
 /**
+ * 清除运行时识别出的额度耗尽调度阻断，不改变 Key 的人工启用状态。
+ */
+export async function clearQuotaExhausted(keyId: string): Promise<{
+  key_id: string
+  cleared: boolean
+  message: string
+}> {
+  const response = await client.post(`/api/admin/endpoints/keys/${keyId}/clear-quota-exhausted`)
+  return response.data
+}
+
+/**
  * 重置 Key 的当前周期统计起点（Codex 号池）
  */
 export async function resetProviderKeyCycleStats(keyId: string): Promise<{

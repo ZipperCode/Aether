@@ -29,8 +29,9 @@ pub(crate) use self::attempt::{
 pub(crate) use self::classifier::{
     classify_anthropic_failure_disposition, classify_failure_disposition, classify_local_failover,
     classify_local_transport_error, failure_disposition_from_local_classification,
-    local_failover_error_message, FailureDisposition, FailureRetryAction, FailureScope,
-    FailureTokenAction, LocalFailoverClassification, LocalFailoverInput,
+    local_failover_error_message, local_quota_exhaustion_error_code, FailureDisposition,
+    FailureRetryAction, FailureScope, FailureTokenAction, LocalFailoverClassification,
+    LocalFailoverInput, LocalQuotaExhaustionConfidence, LocalQuotaExhaustionEvidence,
     LocalTransportFailoverClassification,
 };
 pub(crate) use self::codex_quota_breaker::{
@@ -46,7 +47,7 @@ pub(crate) use self::effects::{
     LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
     LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
     LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalOAuthSuccessEffect,
-    LocalPoolErrorEffect, LocalStreamFailureEffect,
+    LocalPoolErrorEffect, LocalSchedulingStateEffect, LocalStreamFailureEffect,
 };
 pub(crate) use self::health::{
     project_local_failure_health, project_local_key_circuit_closed,
@@ -60,7 +61,8 @@ pub(crate) use self::policy::{
     cyber_continue_failover_enabled, local_failover_policy_from_report_context,
     local_failover_policy_from_transport, resolve_local_failover_policy,
     responses_websocket_adapter, LocalFailoverPolicy, LocalFailoverRegexRule,
-    ResponsesWebSocketAdapter, CYBER_CONTINUE_FAILOVER_CONFIG_KEY, RESPONSES_WEBSOCKET_CONFIG_KEY,
+    ResponsesWebSocketAdapter, CYBER_CONTINUE_FAILOVER_CONFIG_KEY,
+    PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD, RESPONSES_WEBSOCKET_CONFIG_KEY,
 };
 pub(crate) use self::recovery::{
     analyze_local_failover, analyze_local_transport_error, apply_provider_failure_disposition,
@@ -80,15 +82,39 @@ pub(crate) async fn resolve_local_failover_analysis_for_attempt(
     report_context: Option<&serde_json::Value>,
     status_code: u16,
     response_text: Option<&str>,
+    response_headers: Option<&std::collections::BTreeMap<String, String>>,
 ) -> LocalFailoverAnalysis {
     if attempt_identity_from_report_context(report_context).is_none() {
         return LocalFailoverAnalysis::use_default();
     }
 
     let policy = resolve_local_failover_policy(state, plan, report_context).await;
-    let analysis =
-        analyze_local_failover(&policy, LocalFailoverInput::new(status_code, response_text));
+    let input = LocalFailoverInput::new(status_code, response_text).with_quota_reset_deadline(
+        response_headers.is_some_and(local_quota_reset_deadline_header_present),
+    );
+    let analysis = analyze_local_failover(&policy, input);
     apply_provider_failure_disposition(&plan.provider_api_format, status_code, analysis)
+}
+
+fn local_quota_reset_deadline_header_present(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    headers.iter().any(|(name, value)| {
+        let reset_header = matches!(
+            name.trim().to_ascii_lowercase().as_str(),
+            "retry-after"
+                | "ratelimit-reset"
+                | "x-ratelimit-reset"
+                | "x-ratelimit-reset-after"
+                | "x-ratelimit-reset-requests"
+                | "x-ratelimit-reset-tokens"
+                | "x-quota-reset"
+                | "x-quota-reset-at"
+                | "x-quota-reset-seconds"
+        );
+        let value = value.trim();
+        reset_header && !value.is_empty() && value != "0"
+    })
 }
 
 pub(crate) async fn resolve_local_failover_decision_for_attempt(
@@ -104,6 +130,7 @@ pub(crate) async fn resolve_local_failover_decision_for_attempt(
         report_context,
         status_code,
         response_text,
+        None,
     )
     .await
     .decision
@@ -137,6 +164,13 @@ pub(crate) fn build_local_error_flow_metadata(
         LocalFailoverDecision::UseDefault if status_code >= 400 => "passthrough",
         LocalFailoverDecision::UseDefault => "none",
     };
+    let quota_exhaustion = analysis.quota_exhaustion.map(|evidence| {
+        json!({
+            "source": evidence.source.as_str(),
+            "confidence": evidence.confidence.as_str(),
+            "failure_scope": "credential",
+        })
+    });
     json!({
         "stage": "candidate",
         "source": "upstream_response",
@@ -147,6 +181,7 @@ pub(crate) fn build_local_error_flow_metadata(
         "safe_to_expose": safe_to_expose,
         "propagation": propagation,
         "message": local_failover_error_message(response_text),
+        "quota_exhaustion": quota_exhaustion,
     })
 }
 

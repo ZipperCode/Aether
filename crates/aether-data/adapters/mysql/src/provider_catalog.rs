@@ -11,9 +11,10 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyAdaptiveStateUpdate, ProviderCatalogKeyAdminCasUpdate,
     ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
-    ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
-    ProviderCatalogReadRepository, ProviderCatalogUpstreamMetadataNamespaceUpdate,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeySchedulingStateCasUpdate,
+    ProviderCatalogKeyStatusSnapshotUpdate, ProviderCatalogReadRepository,
+    ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
@@ -1894,6 +1895,79 @@ WHERE id = ?
         Ok(rows_affected > 0)
     }
 
+    pub async fn compare_and_update_key_scheduling_state(
+        &self,
+        update: &ProviderCatalogKeySchedulingStateCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_scheduling_state_update(update)?;
+        let expected_scheduling = serde_json::to_string(
+            update
+                .expected_scheduling
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
+        )
+        .map_err(|err| {
+            DataLayerError::UnexpectedValue(format!(
+                "provider_api_keys expected scheduling state is not serializable: {err}"
+            ))
+        })?;
+        let scheduling = serde_json::to_string(
+            update
+                .scheduling
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
+        )
+        .map_err(|err| {
+            DataLayerError::UnexpectedValue(format!(
+                "provider_api_keys scheduling state is not serializable: {err}"
+            ))
+        })?;
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET status_snapshot = JSON_SET(
+      CASE
+        WHEN JSON_VALID(status_snapshot) AND JSON_TYPE(status_snapshot) = 'OBJECT'
+          THEN status_snapshot
+        ELSE JSON_OBJECT()
+      END,
+      '$.scheduling',
+      CAST(? AS JSON)
+    ),
+    updated_at = ?
+WHERE id = ?
+  AND BINARY api_key <=> BINARY ?
+  AND BINARY auth_config <=> BINARY ?
+  AND LOWER(auth_type) = LOWER(?)
+  AND COALESCE(JSON_EXTRACT(
+        CASE
+          WHEN JSON_VALID(status_snapshot) AND JSON_TYPE(status_snapshot) = 'OBJECT'
+            THEN status_snapshot
+          ELSE JSON_OBJECT()
+        END,
+        '$.scheduling'
+      ), CAST('null' AS JSON))
+      <=> CAST(? AS JSON)
+"#,
+        )
+        .bind(scheduling)
+        .bind(
+            update
+                .updated_at_unix_secs
+                .unwrap_or_else(current_unix_secs) as i64,
+        )
+        .bind(&update.key_id)
+        .bind(update.expected_encrypted_api_key.as_deref())
+        .bind(update.expected_encrypted_auth_config.as_deref())
+        .bind(&update.expected_auth_type)
+        .bind(expected_scheduling)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
     pub async fn compare_and_update_key_health_state(
         &self,
         update: &ProviderCatalogKeyHealthStateUpdate,
@@ -2316,6 +2390,13 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
         Self::update_key_status_snapshot(self, update).await
     }
 
+    async fn compare_and_update_key_scheduling_state(
+        &self,
+        update: &ProviderCatalogKeySchedulingStateCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_update_key_scheduling_state(self, update).await
+    }
+
     async fn compare_and_update_key_health_state(
         &self,
         update: &ProviderCatalogKeyHealthStateUpdate,
@@ -2377,6 +2458,30 @@ fn validate_runtime_metadata_update(
     if !update.status_snapshot_patch.is_object() {
         return Err(DataLayerError::InvalidInput(
             "provider catalog runtime status snapshot patch must be an object".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scheduling_state_update(
+    update: &ProviderCatalogKeySchedulingStateCasUpdate,
+) -> Result<(), DataLayerError> {
+    validate_non_empty(&update.key_id, "provider catalog scheduling state key_id")?;
+    validate_non_empty(
+        &update.expected_auth_type,
+        "provider catalog scheduling state auth_type",
+    )?;
+    if update
+        .scheduling
+        .as_ref()
+        .is_some_and(|value| !value.is_object())
+        || update
+            .expected_scheduling
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+    {
+        return Err(DataLayerError::InvalidInput(
+            "provider catalog scheduling state must be an object or null".to_string(),
         ));
     }
     Ok(())

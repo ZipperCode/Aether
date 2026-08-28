@@ -738,6 +738,8 @@ impl ExecutionAttemptLifecycle {
                         );
                         if facts.provider.stream_timeout() {
                             effect = effect.with_stream_timeout();
+                        } else if !facts.provider.is_terminal() {
+                            effect = effect.with_transport_error();
                         }
                         apply_local_stream_failure_effects(state, effect_context, effect).await;
                     }

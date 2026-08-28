@@ -694,10 +694,18 @@ pub(super) fn admin_pool_key_visible_status_filter(
     let account_snapshot = status_snapshot.get("account").and_then(Value::as_object);
     let quota_snapshot = status_snapshot.get("quota").and_then(Value::as_object);
     let oauth_snapshot = status_snapshot.get("oauth").and_then(Value::as_object);
+    let scheduling_code = status_snapshot
+        .get("scheduling")
+        .and_then(Value::as_object)
+        .and_then(|scheduling| scheduling.get("code"))
+        .and_then(Value::as_str);
     let auth_config = state.parse_catalog_auth_config_json(key);
 
     if let Some(status) = admin_pool_account_status_filter(account_snapshot) {
         return status;
+    }
+    if scheduling_code == Some("quota_exhausted") {
+        return "quota_exhausted";
     }
     if let Some(status) = admin_pool_quota_status_filter(quota_snapshot) {
         return status;

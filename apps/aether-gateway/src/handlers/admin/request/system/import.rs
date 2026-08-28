@@ -555,25 +555,47 @@ async fn seed_imported_oauth_pool_score(
         return Ok(());
     }
 
-    let upsert = build_provider_key_pool_score_upsert(
-        key,
-        provider.provider_type.as_str(),
-        None,
-        now_unix_secs,
-        pool_config.score_rules,
-    );
+    let projection_lock = state
+        .app()
+        .acquire_provider_key_quota_projection_lock(&provider.id, &key.id)
+        .await?;
+    let upsert_result = async {
+        let current = state
+            .app()
+            .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(&key.id))
+            .await?
+            .into_iter()
+            .next()
+            .filter(|key| key.is_active && key.provider_id == provider.id);
+        let Some(current) = current else {
+            return Ok::<(), GatewayError>(());
+        };
+        let upsert = build_provider_key_pool_score_upsert(
+            &current,
+            provider.provider_type.as_str(),
+            None,
+            now_unix_secs,
+            pool_config.score_rules,
+        );
+        state
+            .app()
+            .data
+            .upsert_pool_member_score_with_mode(upsert, PoolMemberScoreUpsertMode::OAuthRecovery)
+            .await
+            .map_err(|error| {
+                GatewayError::Internal(format!(
+                    "failed to recover OAuth pool score for key '{}': {error}",
+                    key.id
+                ))
+            })?;
+        Ok(())
+    }
+    .await;
     state
         .app()
-        .data
-        .upsert_pool_member_score_with_mode(upsert, PoolMemberScoreUpsertMode::OAuthRecovery)
-        .await
-        .map_err(|error| {
-            GatewayError::Internal(format!(
-                "failed to recover OAuth pool score for key '{}': {error}",
-                key.id
-            ))
-        })?;
-    Ok(())
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
+    upsert_result
 }
 
 fn build_import_provider_model_record(

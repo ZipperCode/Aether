@@ -20,6 +20,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Balance-Aware Key Scheduling](../../aether-provider-pool/backend/balance-scheduling-contract.md) | Ordinary candidate consumption of the shared balance eligibility contract | Current |
+| [Runtime Key Quota Block](../../aether-provider-pool/backend/runtime-quota-block-contract.md) | Ordinary candidate and credential-scope skip contract | Current |
 
 ---
 

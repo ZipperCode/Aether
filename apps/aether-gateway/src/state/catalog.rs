@@ -1,8 +1,13 @@
 use super::{AppState, GatewayError, LocalMutationOutcome, LocalProviderDeleteTaskState};
 use crate::handlers::shared::sync_provider_key_oauth_status_snapshot;
 use aether_data_contracts::repository::{candidates, global_models, pool_scores, provider_catalog};
-use std::time::{SystemTime, UNIX_EPOCH};
+use aether_runtime_state::RuntimeLockLease;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
+
+const PROVIDER_KEY_QUOTA_PROJECTION_LOCK_TTL: Duration = Duration::from_secs(30);
+const PROVIDER_KEY_QUOTA_PROJECTION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
+const PROVIDER_KEY_QUOTA_PROJECTION_LOCK_MAX_ATTEMPTS: usize = 50;
 
 impl AppState {
     pub fn has_provider_catalog_data_reader(&self) -> bool {
@@ -839,6 +844,148 @@ impl AppState {
             self.invalidate_provider_runtime_state_caches();
         }
         Ok(updated)
+    }
+
+    pub(crate) async fn compare_and_update_provider_catalog_key_scheduling_state(
+        &self,
+        update: &provider_catalog::ProviderCatalogKeySchedulingStateCasUpdate,
+    ) -> Result<bool, GatewayError> {
+        let updated = self
+            .data
+            .compare_and_update_provider_catalog_key_scheduling_state(update)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        // Scheduling changes affect both cached candidate materialization and
+        // affinity promotion. Invalidate on CAS success and conflict so a
+        // retry observes the winner's state.
+        self.invalidate_provider_quota_candidate_caches();
+        self.data.clear_provider_catalog_cache();
+        self.invalidate_scheduler_affinity_cache();
+        Ok(updated)
+    }
+
+    /// Serializes the persistent runtime quota fact with every derived Pool
+    /// score/active-probe projection. Redis-backed runtime state extends this
+    /// fence across gateway instances; the in-memory backend provides the same
+    /// ordering for a single-process deployment.
+    pub(crate) async fn acquire_provider_key_quota_projection_lock(
+        &self,
+        provider_id: &str,
+        key_id: &str,
+    ) -> Result<RuntimeLockLease, GatewayError> {
+        // Length-prefix both identifiers so custom IDs containing ':' cannot
+        // alias a different provider/Key tuple in the distributed lock space.
+        let lock_key = format!(
+            "provider_key_quota_projection:{}:{provider_id}:{}:{key_id}",
+            provider_id.len(),
+            key_id.len()
+        );
+        let owner = format!("aether-gateway-quota-projection-{}", std::process::id());
+        for attempt in 0..PROVIDER_KEY_QUOTA_PROJECTION_LOCK_MAX_ATTEMPTS {
+            match self
+                .runtime_state
+                .lock_try_acquire(&lock_key, &owner, PROVIDER_KEY_QUOTA_PROJECTION_LOCK_TTL)
+                .await
+                .map_err(|err| GatewayError::Internal(err.to_string()))?
+            {
+                Some(lease) => return Ok(lease),
+                None if attempt + 1 < PROVIDER_KEY_QUOTA_PROJECTION_LOCK_MAX_ATTEMPTS => {
+                    tokio::time::sleep(PROVIDER_KEY_QUOTA_PROJECTION_LOCK_RETRY_DELAY).await;
+                }
+                None => break,
+            }
+        }
+        Err(GatewayError::Internal(format!(
+            "provider key {key_id} quota projection is busy"
+        )))
+    }
+
+    pub(crate) async fn release_provider_key_quota_projection_lock(&self, lease: RuntimeLockLease) {
+        match self.runtime_state.lock_release(&lease).await {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                lock_key = %lease.key,
+                "provider key quota projection lock was no longer owned while releasing"
+            ),
+            Err(err) => warn!(
+                lock_key = %lease.key,
+                error = ?err,
+                "failed to release provider key quota projection lock"
+            ),
+        }
+    }
+
+    /// Reads the authoritative persisted scheduling fact without using the
+    /// provider catalog cache. `None` means the Key disappeared or no longer
+    /// belongs to the planned Provider while a derived writer was waiting for
+    /// the quota projection fence.
+    pub(crate) async fn provider_key_runtime_quota_blocked_strong(
+        &self,
+        provider_id: &str,
+        key_id: &str,
+    ) -> Result<Option<bool>, GatewayError> {
+        Ok(self
+            .list_provider_catalog_keys_by_ids_strong(&[key_id.to_string()])
+            .await?
+            .into_iter()
+            .next()
+            .filter(|key| key.provider_id == provider_id)
+            .map(|key| aether_provider_pool::provider_pool_key_runtime_quota_blocked(&key)))
+    }
+
+    pub(crate) async fn clear_provider_catalog_key_quota_scheduling_state(
+        &self,
+        key_id: &str,
+    ) -> Result<bool, GatewayError> {
+        const MAX_ATTEMPTS: usize = 4;
+        for _ in 0..MAX_ATTEMPTS {
+            let Some(key) = self
+                .list_provider_catalog_keys_by_ids_strong(&[key_id.to_string()])
+                .await?
+                .into_iter()
+                .next()
+            else {
+                return Ok(false);
+            };
+            let scheduling = key
+                .status_snapshot
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .and_then(|snapshot| snapshot.get("scheduling"))
+                .filter(|value| !value.is_null())
+                .cloned();
+            let quota_state = scheduling
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .and_then(|state| state.get("code"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|code| matches!(code, "quota_suspected" | "quota_exhausted"));
+            if !quota_state {
+                return Ok(false);
+            }
+            let update = provider_catalog::ProviderCatalogKeySchedulingStateCasUpdate {
+                key_id: key.id,
+                expected_encrypted_api_key: key.encrypted_api_key,
+                expected_encrypted_auth_config: key.encrypted_auth_config,
+                expected_auth_type: key.auth_type,
+                expected_scheduling: scheduling,
+                scheduling: None,
+                updated_at_unix_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs()),
+            };
+            if self
+                .compare_and_update_provider_catalog_key_scheduling_state(&update)
+                .await?
+            {
+                return Ok(true);
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(GatewayError::Internal(format!(
+            "provider key {key_id} scheduling state changed repeatedly while clearing quota block"
+        )))
     }
 
     pub(crate) async fn compare_and_update_provider_catalog_key_health_state(

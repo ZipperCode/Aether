@@ -14,6 +14,7 @@ struct ParsedLocalErrorResponse {
 pub(crate) struct LocalFailoverInput<'a> {
     pub(crate) status_code: u16,
     pub(crate) response_text: Option<&'a str>,
+    pub(crate) quota_reset_deadline: bool,
 }
 
 impl<'a> LocalFailoverInput<'a> {
@@ -23,7 +24,13 @@ impl<'a> LocalFailoverInput<'a> {
             response_text: response_text
                 .map(str::trim)
                 .filter(|value| !value.is_empty()),
+            quota_reset_deadline: false,
         }
+    }
+
+    pub(crate) const fn with_quota_reset_deadline(mut self, present: bool) -> Self {
+        self.quota_reset_deadline = present;
+        self
     }
 }
 
@@ -37,6 +44,7 @@ pub(crate) enum LocalFailoverClassification {
     RetrySuccessPattern,
     RetryStatusCode,
     RetryUpstreamFailure,
+    RetryQuotaExhausted,
 }
 
 impl LocalFailoverClassification {
@@ -50,8 +58,49 @@ impl LocalFailoverClassification {
             Self::RetrySuccessPattern => "retry_success_pattern",
             Self::RetryStatusCode => "retry_status_code",
             Self::RetryUpstreamFailure => "retry_upstream_failure",
+            Self::RetryQuotaExhausted => "retry_quota_exhausted",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalQuotaExhaustionConfidence {
+    Strong,
+    Weak,
+}
+
+impl LocalQuotaExhaustionConfidence {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Strong => "strong",
+            Self::Weak => "weak",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalQuotaExhaustionSource {
+    HttpPaymentRequired,
+    ErrorCode,
+    ConfiguredPattern,
+    MessageFallback,
+}
+
+impl LocalQuotaExhaustionSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::HttpPaymentRequired => "http_payment_required",
+            Self::ErrorCode => "error_code",
+            Self::ConfiguredPattern => "configured_pattern",
+            Self::MessageFallback => "message_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalQuotaExhaustionEvidence {
+    pub(crate) confidence: LocalQuotaExhaustionConfidence,
+    pub(crate) source: LocalQuotaExhaustionSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +221,12 @@ pub(crate) const fn failure_disposition_from_local_classification(
             FailureTokenAction::None,
             false,
         ),
+        LocalFailoverClassification::RetryQuotaExhausted => FailureDisposition::new(
+            FailureRetryAction::NextCredential,
+            FailureScope::Credential,
+            FailureTokenAction::None,
+            true,
+        ),
     }
 }
 
@@ -179,6 +234,12 @@ pub(crate) const fn classify_anthropic_failure_disposition(
     classification: LocalFailoverClassification,
     status_code: u16,
 ) -> FailureDisposition {
+    if matches!(
+        classification,
+        LocalFailoverClassification::RetryQuotaExhausted
+    ) {
+        return failure_disposition_from_local_classification(classification, status_code);
+    }
     if matches!(
         classification,
         LocalFailoverClassification::StopStatusCode
@@ -300,6 +361,87 @@ pub(crate) fn classify_local_failover(
     policy: &LocalFailoverPolicy,
     input: LocalFailoverInput<'_>,
 ) -> LocalFailoverClassification {
+    classify_local_failover_with_quota_evidence(
+        policy,
+        input,
+        classify_local_quota_exhaustion(policy, input),
+    )
+}
+
+pub(crate) fn classify_local_quota_exhaustion(
+    policy: &LocalFailoverPolicy,
+    input: LocalFailoverInput<'_>,
+) -> Option<LocalQuotaExhaustionEvidence> {
+    if policy
+        .quota_exhaustion_patterns
+        .iter()
+        .any(|rule| local_failover_regex_rule_matches(rule, input.response_text, input.status_code))
+    {
+        return Some(LocalQuotaExhaustionEvidence {
+            confidence: LocalQuotaExhaustionConfidence::Strong,
+            source: LocalQuotaExhaustionSource::ConfiguredPattern,
+        });
+    }
+
+    let response_text = input.response_text;
+    let parsed = response_text.and_then(|text| serde_json::from_str::<Value>(text).ok());
+    if input.status_code == 402 {
+        return Some(LocalQuotaExhaustionEvidence {
+            confidence: LocalQuotaExhaustionConfidence::Strong,
+            source: LocalQuotaExhaustionSource::HttpPaymentRequired,
+        });
+    }
+
+    let normalized_codes = parsed
+        .as_ref()
+        .map(local_error_code_values)
+        .unwrap_or_default();
+    let error_payload = input.status_code >= 400
+        || parsed
+            .as_ref()
+            .is_some_and(local_response_is_explicit_error_payload);
+    if error_payload
+        && normalized_codes
+            .iter()
+            .any(|code| local_quota_exhaustion_code_is_strong(code))
+    {
+        return Some(LocalQuotaExhaustionEvidence {
+            confidence: LocalQuotaExhaustionConfidence::Strong,
+            source: LocalQuotaExhaustionSource::ErrorCode,
+        });
+    }
+    if normalized_codes
+        .iter()
+        .any(|code| local_quota_error_code_is_transient(code))
+    {
+        return None;
+    }
+    if input.quota_reset_deadline
+        || parsed
+            .as_ref()
+            .is_some_and(local_quota_response_has_reset_deadline)
+    {
+        // A reset deadline only suppresses weak or otherwise ambiguous quota
+        // text. HTTP 402 and the exact non-resettable codes above remain strong
+        // evidence even when an intermediary also attaches Retry-After.
+        return None;
+    }
+
+    let response_text = response_text?;
+    if error_payload && local_quota_weak_message_matches(response_text) {
+        return Some(LocalQuotaExhaustionEvidence {
+            confidence: LocalQuotaExhaustionConfidence::Weak,
+            source: LocalQuotaExhaustionSource::MessageFallback,
+        });
+    }
+    None
+}
+
+fn classify_local_failover_with_quota_evidence(
+    policy: &LocalFailoverPolicy,
+    input: LocalFailoverInput<'_>,
+    quota_evidence: Option<LocalQuotaExhaustionEvidence>,
+) -> LocalFailoverClassification {
     if policy.stop_status_codes.contains(&input.status_code) {
         return LocalFailoverClassification::StopStatusCode;
     }
@@ -317,6 +459,10 @@ pub(crate) fn classify_local_failover(
         })
     {
         return LocalFailoverClassification::StopErrorPattern;
+    }
+
+    if quota_evidence.is_some() {
+        return LocalFailoverClassification::RetryQuotaExhausted;
     }
 
     if input.status_code == 200
@@ -342,6 +488,180 @@ pub(crate) fn classify_local_failover(
     }
 
     LocalFailoverClassification::UseDefault
+}
+
+pub(crate) fn local_quota_exhaustion_error_code(response_text: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<Value>(response_text?).ok()?;
+    let codes = local_error_code_values(&value);
+    codes
+        .iter()
+        .find(|code| local_quota_exhaustion_code_is_strong(code))
+        .cloned()
+        .or_else(|| codes.into_iter().next())
+        .map(|code| code.chars().take(120).collect())
+}
+
+fn local_error_code_values(value: &Value) -> Vec<String> {
+    let mut values = Vec::new();
+    collect_local_error_code_values(value, 0, &mut values);
+    values
+}
+
+fn collect_local_error_code_values(value: &Value, depth: usize, values: &mut Vec<String>) {
+    if depth > 8 || values.len() >= 16 {
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            for field in ["code", "type", "status"] {
+                if let Some(text) = object.get(field).and_then(Value::as_str) {
+                    let normalized = normalize_local_error_code(text);
+                    if !normalized.is_empty() && !values.contains(&normalized) {
+                        values.push(normalized);
+                    }
+                }
+            }
+            if let Some(error) = object.get("error") {
+                collect_local_error_code_values(error, depth + 1, values);
+            }
+            if let Some(message) = object.get("message").and_then(Value::as_str) {
+                let message = message.trim();
+                if (message.starts_with('{') || message.starts_with('['))
+                    && message.len() <= crate::MAX_ERROR_BODY_BYTES
+                {
+                    if let Ok(nested) = serde_json::from_str::<Value>(message) {
+                        collect_local_error_code_values(&nested, depth + 1, values);
+                    }
+                }
+            }
+            for (field, nested) in object {
+                if field == "error" || field == "message" {
+                    continue;
+                }
+                if nested.is_object() || nested.is_array() {
+                    collect_local_error_code_values(nested, depth + 1, values);
+                }
+                if values.len() >= 16 {
+                    break;
+                }
+            }
+        }
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && trimmed.len() <= crate::MAX_ERROR_BODY_BYTES
+            {
+                if let Ok(nested) = serde_json::from_str::<Value>(trimmed) {
+                    collect_local_error_code_values(&nested, depth + 1, values);
+                }
+            } else {
+                let normalized = normalize_local_error_code(trimmed);
+                if !normalized.is_empty() && !values.contains(&normalized) {
+                    values.push(normalized);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_local_error_code_values(item, depth + 1, values);
+                if values.len() >= 16 {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_local_error_code(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn local_quota_exhaustion_code_is_strong(code: &str) -> bool {
+    matches!(
+        code,
+        "insufficient_user_quota"
+            | "insufficient_quota"
+            | "insufficient_balance"
+            | "api_key_quota_exhausted"
+    )
+}
+
+fn local_quota_error_code_is_transient(code: &str) -> bool {
+    matches!(
+        code,
+        "rate_limit_error"
+            | "rate_limit_exceeded"
+            | "usage_limit_exceeded"
+            | "usage_limit_reached"
+            | "resource_exhausted"
+    )
+}
+
+fn local_quota_response_has_reset_deadline(value: &Value) -> bool {
+    fn walk(value: &Value, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match value {
+            Value::Object(object) => object.iter().any(|(key, value)| {
+                matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "retry_after"
+                        | "retry_after_ms"
+                        | "retry_at"
+                        | "retryafter"
+                        | "reset_at"
+                        | "reset_time"
+                        | "reset_timestamp"
+                        | "reset_seconds"
+                        | "reset_after"
+                        | "resetat"
+                        | "resetafter"
+                        | "quota_reset_at"
+                        | "quota_reset_time"
+                        | "quota_reset_timestamp"
+                        | "quota_reset_delay"
+                        | "quotaresettimestamp"
+                        | "quotaresetdelay"
+                ) && !value.is_null()
+                    || walk(value, depth + 1)
+            }),
+            Value::Array(items) => items.iter().any(|item| walk(item, depth + 1)),
+            _ => false,
+        }
+    }
+    walk(value, 0)
+}
+
+fn local_response_is_explicit_error_payload(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.contains_key("error")
+            || object
+                .get("success")
+                .and_then(Value::as_bool)
+                .is_some_and(|success| !success)
+    })
+}
+
+fn local_quota_weak_message_matches(response_text: &str) -> bool {
+    let normalized = response_text.to_ascii_lowercase();
+    [
+        "user quota is not enough",
+        "insufficient account balance",
+        "insufficient balance",
+        "balance is insufficient",
+        "insufficient quota",
+        "quota exhausted",
+        "quota has been exhausted",
+        "credit balance exhausted",
+        "api key 额度已用完",
+        "余额不足",
+        "额度不足",
+        "余额已用完",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
 }
 
 pub(crate) fn local_failover_error_message(response_text: Option<&str>) -> Option<String> {
@@ -744,10 +1064,6 @@ mod tests {
                 "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your authentication token has been invalidated. Please try signing in again.\"}}",
             ),
             (
-                402,
-                "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"payment required: credit balance exhausted\"}}",
-            ),
-            (
                 403,
                 "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"verify your account before continuing\"}}",
             ),
@@ -762,6 +1078,16 @@ mod tests {
                 LocalFailoverClassification::RetryUpstreamFailure
             );
         }
+        assert_eq!(
+            classify_local_failover(
+                &LocalFailoverPolicy::default(),
+                LocalFailoverInput::new(
+                    402,
+                    Some("{\"error\":{\"message\":\"payment required\"}}"),
+                ),
+            ),
+            LocalFailoverClassification::RetryQuotaExhausted
+        );
     }
 
     #[test]

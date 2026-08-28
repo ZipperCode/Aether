@@ -33,6 +33,13 @@ pub(crate) fn admin_clear_oauth_invalid_key_id(request_path: &str) -> Option<Str
         .map(ToOwned::to_owned)
 }
 
+pub(crate) fn admin_clear_quota_exhausted_key_id(request_path: &str) -> Option<String> {
+    request_path
+        .strip_prefix("/api/admin/endpoints/keys/")?
+        .strip_suffix("/clear-quota-exhausted")
+        .map(ToOwned::to_owned)
+}
+
 pub(crate) fn admin_reset_cycle_stats_key_id(request_path: &str) -> Option<String> {
     request_path
         .strip_prefix("/api/admin/endpoints/keys/")?

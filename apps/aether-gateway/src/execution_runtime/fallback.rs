@@ -1,9 +1,11 @@
-use aether_contracts::{ExecutionPlan, ExecutionResult};
+use aether_contracts::{
+    ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionPlan, ExecutionResult,
+};
 use serde_json::Value;
 
 use crate::orchestration::{
-    resolve_local_failover_analysis_for_attempt, LocalFailoverAnalysis,
-    LocalFailoverClassification, LocalFailoverDecision,
+    apply_provider_failure_disposition, resolve_local_failover_analysis_for_attempt,
+    LocalFailoverAnalysis, LocalFailoverClassification, LocalFailoverDecision,
 };
 use crate::AppState;
 
@@ -24,6 +26,35 @@ fn openai_image_success_disables_local_success_failover(
             .eq_ignore_ascii_case("openai:image")
 }
 
+/// Identifies execution errors that do not represent an authoritative
+/// upstream HTTP terminal. These errors must not advance or clear quota
+/// evidence even when a remote executor wrapped them in an ExecutionResult.
+pub(crate) fn execution_error_is_transport(error: &ExecutionError) -> bool {
+    if error.upstream_status.is_some() {
+        return false;
+    }
+    let explicit_transport_kind = matches!(
+        error.kind,
+        ExecutionErrorKind::ConnectTimeout
+            | ExecutionErrorKind::FirstByteTimeout
+            | ExecutionErrorKind::ReadTimeout
+            | ExecutionErrorKind::TlsError
+            | ExecutionErrorKind::ProxyError
+            | ExecutionErrorKind::ProtocolError
+    );
+    let retryable_internal_transport_phase = matches!(error.kind, ExecutionErrorKind::Internal)
+        && (error.retryable || error.failover_recommended)
+        && matches!(
+            error.phase,
+            ExecutionPhase::Connect
+                | ExecutionPhase::Handshake
+                | ExecutionPhase::Write
+                | ExecutionPhase::FirstByte
+                | ExecutionPhase::StreamRead
+        );
+    explicit_transport_kind || retryable_internal_transport_phase
+}
+
 pub(crate) async fn should_retry_next_local_candidate_sync(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -40,6 +71,7 @@ pub(crate) async fn should_retry_next_local_candidate_sync(
             report_context,
             result,
             response_text,
+            &result.headers,
         )
         .await
         .decision,
@@ -54,32 +86,77 @@ pub(crate) async fn analyze_local_candidate_failover_sync(
     report_context: Option<&serde_json::Value>,
     result: &ExecutionResult,
     response_text: Option<&str>,
+    response_headers: &std::collections::BTreeMap<String, String>,
 ) -> LocalFailoverAnalysis {
-    if sync_plan_kind_disables_local_candidate_failover(plan_kind) {
-        return LocalFailoverAnalysis::use_default();
-    }
-
-    if openai_image_success_disables_local_success_failover(plan, result.status_code) {
-        return LocalFailoverAnalysis::use_default();
-    }
-
-    if let Some(error) = result.error.as_ref() {
-        if !error.retryable && !error.failover_recommended {
-            return LocalFailoverAnalysis {
-                classification: LocalFailoverClassification::StopExecutionError,
-                decision: LocalFailoverDecision::StopLocalFailover,
-            };
-        }
-    }
-
-    resolve_local_failover_analysis_for_attempt(
+    let mut analysis = resolve_local_failover_analysis_for_attempt(
         state,
         plan,
         report_context,
         result.status_code,
         response_text,
+        Some(response_headers),
     )
-    .await
+    .await;
+    if result
+        .error
+        .as_ref()
+        .is_some_and(execution_error_is_transport)
+    {
+        analysis.quota_exhaustion = None;
+        if matches!(
+            analysis.classification,
+            LocalFailoverClassification::RetryQuotaExhausted
+        ) {
+            analysis = apply_provider_failure_disposition(
+                &plan.provider_api_format,
+                result.status_code,
+                LocalFailoverAnalysis {
+                    classification: LocalFailoverClassification::RetryUpstreamFailure,
+                    decision: LocalFailoverDecision::RetryNextCandidate,
+                    quota_exhaustion: None,
+                },
+            );
+        }
+    }
+
+    if let Some(error) = result.error.as_ref() {
+        if !error.retryable && !error.failover_recommended {
+            // An explicit execution error still owns the request-level stop
+            // decision, but a quota payload nested in the same response must
+            // remain available for the Key scheduling effect.
+            return LocalFailoverAnalysis {
+                classification: LocalFailoverClassification::StopExecutionError,
+                decision: LocalFailoverDecision::StopLocalFailover,
+                quota_exhaustion: analysis.quota_exhaustion,
+            };
+        }
+    }
+
+    if sync_plan_kind_disables_local_candidate_failover(plan_kind) {
+        // Mutating cancel/delete operations must never be replayed on another
+        // credential. Preserve quota evidence for scheduling, while the
+        // request-level terminal rule remains authoritative.
+        return if analysis.quota_exhaustion.is_some() {
+            LocalFailoverAnalysis {
+                decision: LocalFailoverDecision::StopLocalFailover,
+                ..analysis
+            }
+        } else {
+            LocalFailoverAnalysis::use_default()
+        };
+    }
+
+    if openai_image_success_disables_local_success_failover(plan, result.status_code) {
+        // The image special case suppresses ordinary success-pattern failover;
+        // an explicit quota error package still rotates the credential.
+        return if analysis.quota_exhaustion.is_some() {
+            analysis
+        } else {
+            LocalFailoverAnalysis::use_default()
+        };
+    }
+
+    analysis
 }
 
 pub(crate) async fn should_stop_local_candidate_failover_sync(
@@ -98,6 +175,7 @@ pub(crate) async fn should_stop_local_candidate_failover_sync(
             report_context,
             result,
             response_text,
+            &result.headers,
         )
         .await,
         LocalFailoverAnalysis {
@@ -205,6 +283,7 @@ pub(crate) async fn should_retry_next_local_candidate_stream(
             report_context,
             status_code,
             response_text,
+            None,
         )
         .await,
         LocalFailoverAnalysis {
@@ -229,6 +308,7 @@ pub(crate) async fn should_stop_local_candidate_failover_stream(
             report_context,
             status_code,
             response_text,
+            None,
         )
         .await,
         LocalFailoverAnalysis {
@@ -244,19 +324,24 @@ pub(crate) async fn resolve_local_candidate_failover_analysis_stream(
     report_context: Option<&serde_json::Value>,
     status_code: u16,
     response_text: Option<&str>,
+    response_headers: Option<&std::collections::BTreeMap<String, String>>,
 ) -> LocalFailoverAnalysis {
-    if openai_image_success_disables_local_success_failover(plan, status_code) {
-        return LocalFailoverAnalysis::use_default();
-    }
-
-    resolve_local_failover_analysis_for_attempt(
+    let analysis = resolve_local_failover_analysis_for_attempt(
         state,
         plan,
         report_context,
         status_code,
         response_text,
+        response_headers,
     )
-    .await
+    .await;
+    if openai_image_success_disables_local_success_failover(plan, status_code)
+        && analysis.quota_exhaustion.is_none()
+    {
+        LocalFailoverAnalysis::use_default()
+    } else {
+        analysis
+    }
 }
 
 pub(crate) async fn resolve_local_candidate_failover_decision_stream(
@@ -272,6 +357,7 @@ pub(crate) async fn resolve_local_candidate_failover_decision_stream(
         report_context,
         status_code,
         response_text,
+        None,
     )
     .await
     .decision
@@ -677,6 +763,7 @@ mod tests {
             Some(&local_report_context),
             &result,
             Some("provider returned HTTP 200 without visible model output"),
+            &result.headers,
         )
         .await;
 
@@ -952,6 +1039,7 @@ mod tests {
                 stop_on_transport_errors: false,
                 success_failover_patterns: Vec::new(),
                 error_stop_patterns: Vec::new(),
+                quota_exhaustion_patterns: Vec::new(),
                 stop_cyber_policy_errors: true,
                 retry_client_errors_by_default: true,
             }

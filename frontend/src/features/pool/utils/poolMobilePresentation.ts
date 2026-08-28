@@ -23,6 +23,7 @@ export type PoolMobileActionId =
   | 'refresh_token'
   | 'reset_cycle_stats'
   | 'clear_cooldown'
+  | 'restore_quota'
   | 'recover_health'
   | 'permissions'
   | 'proxy'
@@ -36,6 +37,7 @@ export interface PoolMobileActionInput {
   showRefreshToken?: boolean
   canResetCycleStats?: boolean
   canClearCooldown?: boolean
+  canRestoreQuota?: boolean
   canRecoverHealth?: boolean
   hasProxy?: boolean
 }
@@ -78,6 +80,9 @@ export function splitPoolMobileActions(input: PoolMobileActionInput): {
     if (input.canClearCooldown) {
       primary.push('clear_cooldown')
     }
+    if (input.canRestoreQuota) {
+      primary.push('restore_quota')
+    }
     if (input.canRecoverHealth) {
       primary.push('recover_health')
     }
@@ -102,6 +107,9 @@ export function splitPoolMobileActions(input: PoolMobileActionInput): {
   }
   if (input.canClearCooldown) {
     primary.push('clear_cooldown')
+  }
+  if (input.canRestoreQuota) {
+    primary.push('restore_quota')
   }
   if (input.canRecoverHealth) {
     primary.push('recover_health')

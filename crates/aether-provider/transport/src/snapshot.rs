@@ -9,7 +9,27 @@ use super::auth_config::{absorb_local_auth_config_safe_subset, LocalAuthConfigAb
 #[path = "snapshot_mapping.rs"]
 mod snapshot_mapping;
 
-use self::snapshot_mapping::{fallback_encryption_keys, map_endpoint, map_key, map_provider};
+use self::snapshot_mapping::{
+    fallback_encryption_keys, map_endpoint, map_key, map_provider,
+    stored_key_credential_fingerprint, transport_key_credential_fingerprint,
+};
+
+/// Builds a non-secret, request-scoped credential identity used to fence
+/// delayed runtime effects. The digest is never an authentication credential.
+pub fn provider_transport_key_credential_fingerprint(
+    transport: &GatewayProviderTransportSnapshot,
+) -> String {
+    transport_key_credential_fingerprint(&transport.key)
+}
+
+/// Rebuilds the same credential identity from a strongly read catalog row.
+pub fn provider_catalog_key_credential_fingerprint(
+    key: &StoredProviderCatalogKey,
+    endpoint: &StoredProviderCatalogEndpoint,
+    encryption_key: &str,
+) -> Result<String, DataLayerError> {
+    stored_key_credential_fingerprint(key, endpoint, encryption_key)
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct GatewayProviderTransportSnapshot {

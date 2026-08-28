@@ -67,6 +67,21 @@ pub struct ProviderCatalogKeyStatusSnapshotUpdate {
     pub updated_at_unix_secs: Option<u64>,
 }
 
+/// Runtime-owned scheduling state update fenced by the credential and the
+/// scheduling snapshot observed before projection. The caller owns only the
+/// top-level `status_snapshot.scheduling` field; `None` is persisted as JSON
+/// null so every backend can compare absent and cleared state consistently.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderCatalogKeySchedulingStateCasUpdate {
+    pub key_id: String,
+    pub expected_encrypted_api_key: Option<String>,
+    pub expected_encrypted_auth_config: Option<String>,
+    pub expected_auth_type: String,
+    pub expected_scheduling: Option<serde_json::Value>,
+    pub scheduling: Option<serde_json::Value>,
+    pub updated_at_unix_secs: Option<u64>,
+}
+
 /// Credential context observed before an OAuth refresh started. Repositories
 /// compare every field atomically with the runtime-state update so an
 /// administrator replacement cannot be overwritten by an older refresh.
@@ -1024,6 +1039,20 @@ pub trait ProviderCatalogWriteRepository: Send + Sync {
     ) -> Result<bool, crate::DataLayerError> {
         Err(crate::DataLayerError::InvalidConfiguration(
             "provider catalog status snapshot patches are not supported by this repository"
+                .to_string(),
+        ))
+    }
+
+    /// Atomically replaces only `status_snapshot.scheduling` when both the
+    /// current credential and the previously observed scheduling state still
+    /// match. This prevents delayed failures from an old credential from
+    /// blocking the administrator's replacement credential.
+    async fn compare_and_update_key_scheduling_state(
+        &self,
+        _update: &ProviderCatalogKeySchedulingStateCasUpdate,
+    ) -> Result<bool, crate::DataLayerError> {
+        Err(crate::DataLayerError::InvalidConfiguration(
+            "provider catalog scheduling state CAS updates are not supported by this repository"
                 .to_string(),
         ))
     }

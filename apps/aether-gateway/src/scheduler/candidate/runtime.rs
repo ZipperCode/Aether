@@ -5,7 +5,9 @@ use aether_admin::provider::{
 };
 use aether_data_contracts::repository::candidates::StoredRequestCandidate;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
-use aether_provider_pool::provider_pool_key_balance_below_minimum;
+use aether_provider_pool::{
+    provider_pool_key_balance_below_minimum, provider_pool_key_runtime_quota_blocked,
+};
 use aether_scheduler_core::{
     auth_api_key_concurrency_limit_reached, build_provider_concurrent_limit_map,
     candidate_is_selectable_with_runtime_state, candidate_runtime_skip_reason_with_state,
@@ -26,6 +28,7 @@ pub(super) struct CandidateRuntimeSelectionSnapshot {
     pub(super) provider_key_rpm_states: BTreeMap<String, StoredProviderCatalogKey>,
     pub(super) pool_provider_ids: BTreeSet<String>,
     provider_quota_blocks_requests: BTreeMap<String, bool>,
+    key_quota_hard_blocked: BTreeMap<String, bool>,
     key_account_quota_exhausted: BTreeMap<String, bool>,
     /// 真实 Key 的标准余额是否明确低于内部调度下限。
     key_balance_below_minimum: BTreeMap<String, bool>,
@@ -66,6 +69,8 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         &provider_key_rpm_states,
         &provider_skip_exhausted_accounts,
     );
+    let key_quota_hard_blocked =
+        read_key_quota_hard_blocked_map(candidates, &provider_key_rpm_states);
     let key_balance_below_minimum =
         read_key_balance_below_minimum_map(candidates, &provider_key_rpm_states);
     let key_oauth_invalid =
@@ -81,6 +86,7 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         provider_key_rpm_states,
         pool_provider_ids,
         provider_quota_blocks_requests,
+        key_quota_hard_blocked,
         key_account_quota_exhausted,
         key_balance_below_minimum,
         key_oauth_invalid,
@@ -157,6 +163,12 @@ pub(super) fn is_candidate_selectable(
             .get(candidate.provider_id.as_str())
             .copied()
             .unwrap_or(false),
+        quota_hard_blocked: !pool_group
+            && snapshot
+                .key_quota_hard_blocked
+                .get(candidate.key_id.as_str())
+                .copied()
+                .unwrap_or(false),
         account_quota_exhausted: !pool_group
             && snapshot
                 .key_account_quota_exhausted
@@ -219,6 +231,12 @@ pub(super) fn current_candidate_runtime_skip_reason(
         provider_key_rpm_states: &snapshot.provider_key_rpm_states,
         now_unix_secs,
         provider_quota_blocks_requests,
+        quota_hard_blocked: !pool_group
+            && snapshot
+                .key_quota_hard_blocked
+                .get(candidate.key_id.as_str())
+                .copied()
+                .unwrap_or(false),
         account_quota_exhausted: !pool_group
             && snapshot
                 .key_account_quota_exhausted
@@ -276,7 +294,12 @@ pub(super) async fn read_provider_key_rpm_states(
         return Ok(BTreeMap::new());
     }
 
-    let keys = state.read_provider_catalog_keys_by_ids(&key_ids).await?;
+    // A runtime quota block is persistent and may have been written by a
+    // different gateway instance; do not let the five-second catalog cache
+    // admit a stale candidate.
+    let keys = state
+        .read_provider_catalog_keys_by_ids_strong(&key_ids)
+        .await?;
     Ok(keys
         .into_iter()
         .map(|key| (key.id.clone(), key))
@@ -375,6 +398,21 @@ fn read_key_account_quota_exhaustion_map(
                         )
                     });
             (candidate.key_id.clone(), exhausted)
+        })
+        .collect()
+}
+
+fn read_key_quota_hard_blocked_map(
+    candidates: &[SchedulerMinimalCandidateSelectionCandidate],
+    provider_key_rpm_states: &BTreeMap<String, StoredProviderCatalogKey>,
+) -> BTreeMap<String, bool> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            let blocked = provider_key_rpm_states
+                .get(candidate.key_id.as_str())
+                .is_some_and(provider_pool_key_runtime_quota_blocked);
+            (candidate.key_id.clone(), blocked)
         })
         .collect()
 }
@@ -590,6 +628,7 @@ mod tests {
             provider_key_rpm_states,
             pool_provider_ids: BTreeSet::new(),
             provider_quota_blocks_requests: BTreeMap::new(),
+            key_quota_hard_blocked: BTreeMap::new(),
             key_account_quota_exhausted: BTreeMap::new(),
             key_balance_below_minimum,
             key_oauth_invalid: BTreeMap::new(),

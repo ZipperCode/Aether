@@ -48,7 +48,9 @@ use crate::execution_runtime::kiro_cache::{
     kiro_simulated_cache_enabled_from_report_context, KiroPromptCacheUsage,
     KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD,
 };
-use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
+use crate::execution_runtime::oauth_retry::{
+    refresh_oauth_plan_auth_for_retry, refresh_oauth_retry_credential_fingerprint,
+};
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_sync_plan_to_remote_execution_runtime;
 use crate::execution_runtime::submission::{
@@ -66,8 +68,9 @@ use crate::execution_runtime::windsurf::maybe_execute_windsurf_sync;
 use crate::execution_runtime::{
     ai_attempt_retry_scope_from_failure_disposition, analyze_local_candidate_failover_sync,
     apply_endpoint_response_header_rules, attach_provider_response_headers_to_report_context,
-    clear_endpoint_capability_quarantine_from_report_context, is_endpoint_capability_runtime_miss,
-    local_failover_response_text, quarantine_endpoint_capability_from_report_context,
+    clear_endpoint_capability_quarantine_from_report_context, execution_error_is_transport,
+    is_endpoint_capability_runtime_miss, local_failover_response_text,
+    quarantine_endpoint_capability_from_report_context,
     resolve_core_sync_error_finalize_report_kind, should_fallback_to_control_sync,
     should_finalize_sync_response, LocalFailoverDecision,
 };
@@ -79,6 +82,7 @@ use crate::orchestration::{
     LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
     LocalExecutionEffectContext, LocalHealthFailureEffect, LocalHealthSuccessEffect,
     LocalOAuthInvalidationEffect, LocalOAuthSuccessEffect, LocalPoolErrorEffect,
+    LocalSchedulingStateEffect,
 };
 use crate::provider_pool_demand::acquire_provider_pool_in_flight_guard;
 use crate::request_candidate_runtime::{
@@ -1961,7 +1965,14 @@ async fn apply_sync_success_effects(
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
+    quota_exhaustion_detected: bool,
 ) {
+    if quota_exhaustion_detected {
+        // HTTP 200 error envelopes must not be trained as provider success.
+        // The quota failure path already persisted scheduling state and
+        // released any Pool lease before final response construction.
+        return;
+    }
     clear_endpoint_capability_quarantine_from_report_context(state, plan, report_context, false);
     if let Some(report_context) = report_context {
         crate::ai_serving::persist_converted_response_history(
@@ -2657,18 +2668,6 @@ async fn execute_execution_runtime_sync_impl(
         local_failover_response_text,
         local_failover_analysis,
     ) = loop {
-        spawn_local_oauth_success_effect(
-            state.clone(),
-            &plan,
-            report_context.as_ref(),
-            LocalOAuthSuccessEffect {
-                status_code: result.status_code,
-                request_started_at_unix_ms: Some(
-                    provider_response_observation.request_started_at_unix_ms,
-                ),
-                request_order_id: Some(&provider_response_observation.request_order_id),
-            },
-        );
         let result_latency_ms = result
             .telemetry
             .as_ref()
@@ -2747,6 +2746,10 @@ async fn execute_execution_runtime_sync_impl(
             .await
             {
                 Ok(retry_result) => {
+                    if let Some(report_context) = report_context.as_mut() {
+                        refresh_oauth_retry_credential_fingerprint(state, &plan, report_context)
+                            .await;
+                    }
                     let retry_response_observed_at_unix_ms = current_request_candidate_unix_ms();
                     provider_response_observation = retry_result
                         .response_observation
@@ -2791,8 +2794,23 @@ async fn execute_execution_runtime_sync_impl(
             report_context.as_ref(),
             &result,
             local_failover_response_text.as_deref(),
+            &headers,
         )
         .await;
+        if local_failover_analysis.quota_exhaustion.is_none() {
+            spawn_local_oauth_success_effect(
+                state.clone(),
+                &plan,
+                report_context.as_ref(),
+                LocalOAuthSuccessEffect {
+                    status_code: result.status_code,
+                    request_started_at_unix_ms: Some(
+                        provider_response_observation.request_started_at_unix_ms,
+                    ),
+                    request_order_id: Some(&provider_response_observation.request_order_id),
+                },
+            );
+        }
         break (
             result_error_type,
             result_error_message,
@@ -2805,6 +2823,7 @@ async fn execute_execution_runtime_sync_impl(
             local_failover_analysis,
         );
     };
+    let quota_exhaustion_detected = local_failover_analysis.quota_exhaustion.is_some();
     let mut report_context = attach_provider_response_headers_to_report_context(
         report_context,
         &headers,
@@ -2814,7 +2833,69 @@ async fn execute_execution_runtime_sync_impl(
     );
     let endpoint_capability_mismatch = result.status_code >= 400
         && is_endpoint_capability_runtime_miss(&headers, NO_LOCAL_SYNC_PLANS_REASON);
-    if result.status_code >= 400 && !endpoint_capability_mismatch {
+    let result_transport_error = result
+        .error
+        .as_ref()
+        .is_some_and(execution_error_is_transport);
+    if endpoint_capability_mismatch {
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: report_context.as_ref(),
+            },
+            LocalExecutionEffect::SchedulingState(LocalSchedulingStateEffect {
+                status_code: result.status_code,
+                response_text: local_failover_response_text.as_deref(),
+                quota_exhaustion: None,
+            }),
+        )
+        .await;
+    }
+    let explicit_error_payload = body_json.as_ref().is_some_and(|body| {
+        body.get("error").is_some()
+            || body
+                .get("success")
+                .and_then(Value::as_bool)
+                .is_some_and(|success| !success)
+    });
+    if !endpoint_capability_mismatch
+        && !result_transport_error
+        && (result.status_code >= 400
+            || local_failover_analysis.quota_exhaustion.is_some()
+            || explicit_error_payload
+            || result.error.is_some()
+            || !matches!(
+                local_failover_analysis.classification,
+                crate::orchestration::LocalFailoverClassification::UseDefault
+            ))
+    {
+        // Run the lightweight scheduling state machine for every authoritative
+        // HTTP error package, including HTTP 200 envelopes. Transport errors
+        // have no authoritative terminal and intentionally leave suspicion
+        // state unchanged.
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: report_context.as_ref(),
+            },
+            LocalExecutionEffect::SchedulingState(LocalSchedulingStateEffect {
+                status_code: result.status_code,
+                response_text: local_failover_response_text.as_deref(),
+                quota_exhaustion: local_failover_analysis.quota_exhaustion,
+            }),
+        )
+        .await;
+    }
+    if (result.status_code >= 400
+        || local_failover_analysis.quota_exhaustion.is_some()
+        || !matches!(
+            local_failover_analysis.classification,
+            crate::orchestration::LocalFailoverClassification::UseDefault
+        ))
+        && !endpoint_capability_mismatch
+    {
         apply_local_execution_effect(
             state,
             LocalExecutionEffectContext {
@@ -2827,57 +2908,69 @@ async fn execute_execution_runtime_sync_impl(
             }),
         )
         .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
-                status_code: result.status_code,
-                classification: local_failover_analysis.classification,
-                headers: Some(&headers),
-            }),
-        )
-        .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
-                status_code: result.status_code,
-                classification: local_failover_analysis.classification,
-            }),
-        )
-        .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
-                status_code: result.status_code,
-                response_text: local_failover_response_text.as_deref(),
-            }),
-        )
-        .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
-                status_code: result.status_code,
-                classification: local_failover_analysis.classification,
-                headers: &headers,
-                error_body: local_failover_response_text.as_deref(),
-            }),
-        )
-        .await;
+        if local_failover_analysis.quota_exhaustion.is_none() {
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
+                    status_code: result.status_code,
+                    classification: local_failover_analysis.classification,
+                    headers: Some(&headers),
+                }),
+            )
+            .await;
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
+                    status_code: result.status_code,
+                    classification: local_failover_analysis.classification,
+                }),
+            )
+            .await;
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
+                    status_code: result.status_code,
+                    response_text: local_failover_response_text.as_deref(),
+                }),
+            )
+            .await;
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                    status_code: result.status_code,
+                    classification: local_failover_analysis.classification,
+                    headers: &headers,
+                    error_body: local_failover_response_text.as_deref(),
+                }),
+            )
+            .await;
+        } else {
+            apply_local_execution_effect(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::PoolLeaseRelease,
+            )
+            .await;
+        }
     }
     if endpoint_capability_mismatch {
         quarantine_endpoint_capability_from_report_context(
@@ -3021,7 +3114,7 @@ async fn execute_execution_runtime_sync_impl(
     let status_code = result.status_code;
     let has_body_bytes = body_base64.is_some();
     let mut body_json = body_json;
-    if (200..300).contains(&status_code) {
+    if (200..300).contains(&status_code) && !quota_exhaustion_detected {
         if let Some(response_body) = body_json.take() {
             body_json = Some(
                 crate::ai_serving::agent_bridge::finalize_agent_bridge_sync_response(
@@ -3033,7 +3126,7 @@ async fn execute_execution_runtime_sync_impl(
             );
         }
     }
-    if (200..300).contains(&status_code) {
+    if (200..300).contains(&status_code) && !quota_exhaustion_detected {
         seed_kiro_sync_simulated_cache_enabled(state, &plan, &mut report_context).await;
         if kiro_simulated_cache_enabled_from_report_context(report_context.as_ref()) {
             seed_kiro_sync_report_context_input_tokens(&plan, &mut report_context);
@@ -3046,7 +3139,10 @@ async fn execute_execution_runtime_sync_impl(
     let explicit_finalize = should_finalize_sync_response(report_kind.as_deref());
     let mapped_error_finalize_kind =
         resolve_core_sync_error_finalize_report_kind(plan_kind, &result, body_json.as_ref());
-    let implicit_finalize = if !explicit_finalize && mapped_error_finalize_kind.is_none() {
+    let implicit_finalize = if !quota_exhaustion_detected
+        && !explicit_finalize
+        && mapped_error_finalize_kind.is_none()
+    {
         maybe_build_implicit_sync_finalize_outcome(
             trace_id,
             decision,
@@ -3103,7 +3199,8 @@ async fn execute_execution_runtime_sync_impl(
     }
 
     let terminal_unix_secs = current_request_candidate_unix_ms();
-    let error_flow_report_context = (result.status_code >= 400)
+    let candidate_failed = result.status_code >= 400 || quota_exhaustion_detected;
+    let error_flow_report_context = candidate_failed
         .then(|| {
             with_sync_error_trace_context(
                 report_context.as_ref(),
@@ -3123,7 +3220,7 @@ async fn execute_execution_runtime_sync_impl(
             .as_ref()
             .or(report_context.as_ref()),
         SchedulerRequestCandidateStatusUpdate {
-            status: if result.status_code >= 400 {
+            status: if candidate_failed {
                 RequestCandidateStatus::Failed
             } else {
                 RequestCandidateStatus::Success
@@ -3162,6 +3259,7 @@ async fn execute_execution_runtime_sync_impl(
             &plan,
             implicit_finalize.payload.report_context.as_ref(),
             usage_payload,
+            quota_exhaustion_detected,
         )
         .await;
         record_sync_terminal_usage_and_disarm_guard(
@@ -3199,7 +3297,7 @@ async fn execute_execution_runtime_sync_impl(
     };
 
     if let Some(finalize_report_kind) = finalize_report_kind {
-        let mut payload = build_sync_report_payload(
+        let payload = build_sync_report_payload(
             trace_id,
             finalize_report_kind,
             report_context,
@@ -3209,7 +3307,12 @@ async fn execute_execution_runtime_sync_impl(
             body_base64,
             telemetry,
         );
-        if let Some(outcome) = maybe_build_sync_finalize_outcome(trace_id, decision, &payload)? {
+        let sync_finalize_outcome = if quota_exhaustion_detected {
+            None
+        } else {
+            maybe_build_sync_finalize_outcome(trace_id, decision, &payload)?
+        };
+        if let Some(outcome) = sync_finalize_outcome {
             let usage_payload = outcome.background_report.as_ref().unwrap_or(&payload);
             if status_code < 400 {
                 apply_sync_success_effects(
@@ -3217,6 +3320,7 @@ async fn execute_execution_runtime_sync_impl(
                     &plan,
                     payload.report_context.as_ref(),
                     usage_payload,
+                    quota_exhaustion_detected,
                 )
                 .await;
             }
@@ -3247,65 +3351,79 @@ async fn execute_execution_runtime_sync_impl(
                 candidate_id,
             )?));
         }
-        let mut payload = match maybe_build_local_video_success_outcome(
-            trace_id,
-            decision,
-            payload,
-            &state.video_tasks,
-            &plan,
-        )? {
-            LocalVideoSyncSuccessBuild::Handled(outcome) => {
-                let LocalVideoSyncSuccessOutcome {
-                    response,
-                    report_payload,
-                    original_report_context,
-                    report_mode,
-                    local_task_snapshot,
-                } = outcome;
-                apply_sync_success_effects(
-                    state,
-                    &plan,
-                    original_report_context.as_ref(),
-                    &report_payload,
-                )
-                .await;
-                record_sync_terminal_usage_and_disarm_guard(
-                    state,
-                    &plan,
-                    original_report_context.as_ref(),
-                    &report_payload,
-                    candidate_started_at,
-                    candidate_first_byte_elapsed_ms,
-                    &mut terminal_guard,
-                )
-                .await;
-                if let Some(snapshot) = local_task_snapshot {
-                    let _ = state.upsert_video_task_snapshot(&snapshot).await?;
-                    state.video_tasks.record_snapshot(snapshot);
-                }
-                match report_mode {
-                    VideoTaskSyncReportMode::InlineSync => {
-                        submit_sync_report(state, report_payload).await?;
+        let mut payload = if quota_exhaustion_detected {
+            payload
+        } else {
+            match maybe_build_local_video_success_outcome(
+                trace_id,
+                decision,
+                payload,
+                &state.video_tasks,
+                &plan,
+            )? {
+                LocalVideoSyncSuccessBuild::Handled(outcome) => {
+                    let LocalVideoSyncSuccessOutcome {
+                        response,
+                        report_payload,
+                        original_report_context,
+                        report_mode,
+                        local_task_snapshot,
+                    } = outcome;
+                    apply_sync_success_effects(
+                        state,
+                        &plan,
+                        original_report_context.as_ref(),
+                        &report_payload,
+                        quota_exhaustion_detected,
+                    )
+                    .await;
+                    record_sync_terminal_usage_and_disarm_guard(
+                        state,
+                        &plan,
+                        original_report_context.as_ref(),
+                        &report_payload,
+                        candidate_started_at,
+                        candidate_first_byte_elapsed_ms,
+                        &mut terminal_guard,
+                    )
+                    .await;
+                    if let Some(snapshot) = local_task_snapshot {
+                        let _ = state.upsert_video_task_snapshot(&snapshot).await?;
+                        state.video_tasks.record_snapshot(snapshot);
                     }
-                    VideoTaskSyncReportMode::Background => {
-                        spawn_sync_report(state.clone(), report_payload);
+                    match report_mode {
+                        VideoTaskSyncReportMode::InlineSync => {
+                            submit_sync_report(state, report_payload).await?;
+                        }
+                        VideoTaskSyncReportMode::Background => {
+                            spawn_sync_report(state.clone(), report_payload);
+                        }
                     }
+                    return Ok(Some(attach_control_metadata_headers(
+                        response,
+                        request_id,
+                        candidate_id,
+                    )?));
                 }
-                return Ok(Some(attach_control_metadata_headers(
-                    response,
-                    request_id,
-                    candidate_id,
-                )?));
+                LocalVideoSyncSuccessBuild::NotHandled(payload) => payload,
             }
-            LocalVideoSyncSuccessBuild::NotHandled(payload) => payload,
         };
-        if let Some(response) =
+        let local_sync_finalize_response = if quota_exhaustion_detected {
+            None
+        } else {
             maybe_build_local_sync_finalize_response(trace_id, decision, &payload)?
-        {
+        };
+        if let Some(response) = local_sync_finalize_response {
             let background_success_report_kind =
                 resolve_local_sync_success_background_report_kind(payload.report_kind.as_str());
-            apply_sync_success_effects(state, &plan, payload.report_context.as_ref(), &payload)
-                .await;
+            apply_sync_success_effects(
+                state,
+                &plan,
+                payload.report_context.as_ref(),
+                &payload,
+                quota_exhaustion_detected,
+            )
+            .await;
             record_sync_terminal_usage_and_disarm_guard(
                 state,
                 &plan,
@@ -3419,6 +3537,7 @@ async fn execute_execution_runtime_sync_impl(
             &plan,
             usage_payload.report_context.as_ref(),
             &usage_payload,
+            quota_exhaustion_detected,
         )
         .await;
     }

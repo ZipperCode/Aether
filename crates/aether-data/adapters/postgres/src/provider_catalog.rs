@@ -12,9 +12,10 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyAdaptiveStateUpdate, ProviderCatalogKeyAdminCasUpdate,
     ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
-    ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
-    ProviderCatalogReadRepository, ProviderCatalogUpstreamMetadataNamespaceUpdate,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeySchedulingStateCasUpdate,
+    ProviderCatalogKeyStatusSnapshotUpdate, ProviderCatalogReadRepository,
+    ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
@@ -2787,6 +2788,54 @@ WHERE id = $1
         Ok(rows_affected > 0)
     }
 
+    pub async fn compare_and_update_key_scheduling_state(
+        &self,
+        update: &ProviderCatalogKeySchedulingStateCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_scheduling_state_update(update)?;
+        let expected_scheduling = update
+            .expected_scheduling
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+        let scheduling = update.scheduling.clone().unwrap_or(serde_json::Value::Null);
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET status_snapshot = jsonb_set(
+      CASE
+        WHEN json_typeof(status_snapshot) = 'object' THEN status_snapshot::jsonb
+        ELSE '{}'::jsonb
+      END,
+      '{scheduling}',
+      $2::jsonb,
+      true
+    )::json,
+    updated_at = CASE
+      WHEN $3::double precision IS NULL THEN NOW()
+      ELSE TO_TIMESTAMP($3::double precision)
+    END
+WHERE id = $1
+  AND api_key IS NOT DISTINCT FROM $4
+  AND auth_config IS NOT DISTINCT FROM $5
+  AND LOWER(auth_type) = LOWER($6)
+  AND COALESCE(status_snapshot::jsonb -> 'scheduling', 'null'::jsonb)
+      IS NOT DISTINCT FROM $7::jsonb
+"#,
+        )
+        .bind(&update.key_id)
+        .bind(&scheduling)
+        .bind(update.updated_at_unix_secs.map(|value| value as f64))
+        .bind(update.expected_encrypted_api_key.as_deref())
+        .bind(update.expected_encrypted_auth_config.as_deref())
+        .bind(&update.expected_auth_type)
+        .bind(&expected_scheduling)
+        .execute(&self.pool)
+        .await
+        .map_postgres_err()?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
     pub async fn compare_and_update_key_health_state(
         &self,
         update: &ProviderCatalogKeyHealthStateUpdate,
@@ -3142,6 +3191,13 @@ impl ProviderCatalogWriteRepository for SqlxProviderCatalogReadRepository {
         Self::update_key_status_snapshot(self, update).await
     }
 
+    async fn compare_and_update_key_scheduling_state(
+        &self,
+        update: &ProviderCatalogKeySchedulingStateCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_update_key_scheduling_state(self, update).await
+    }
+
     async fn compare_and_update_key_health_state(
         &self,
         update: &ProviderCatalogKeyHealthStateUpdate,
@@ -3334,6 +3390,30 @@ fn is_missing_endpoint_health_score_column_sql(error: &DataLayerError) -> bool {
         }
         _ => false,
     }
+}
+
+fn validate_scheduling_state_update(
+    update: &ProviderCatalogKeySchedulingStateCasUpdate,
+) -> Result<(), DataLayerError> {
+    if update.key_id.trim().is_empty() || update.expected_auth_type.trim().is_empty() {
+        return Err(DataLayerError::InvalidInput(
+            "provider catalog scheduling state key_id and auth_type are required".to_string(),
+        ));
+    }
+    if update
+        .scheduling
+        .as_ref()
+        .is_some_and(|value| !value.is_object())
+        || update
+            .expected_scheduling
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+    {
+        return Err(DataLayerError::InvalidInput(
+            "provider catalog scheduling state must be an object or null".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn collect_query_rows<T, S>(

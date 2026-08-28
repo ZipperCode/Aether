@@ -669,6 +669,13 @@ impl SchedulerRuntimeState for AppState {
         AppState::read_provider_catalog_keys_by_ids(self, key_ids).await
     }
 
+    async fn read_provider_catalog_keys_by_ids_strong(
+        &self,
+        key_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKey>, GatewayError> {
+        AppState::list_provider_catalog_keys_by_ids_strong(self, key_ids).await
+    }
+
     async fn read_recent_request_candidates(
         &self,
         limit: usize,

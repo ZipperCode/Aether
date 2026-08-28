@@ -3269,6 +3269,16 @@ registerDynamicRoute('POST', '/api/admin/endpoints/keys/:keyId/clear-oauth-inval
   return createMockResponse({ message: 'OAuth invalid cleared (demo)', key_id: params.keyId })
 })
 
+registerDynamicRoute('POST', '/api/admin/endpoints/keys/:keyId/clear-quota-exhausted', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({
+    key_id: params.keyId,
+    cleared: true,
+    message: '已清除额度耗尽阻断（演示模式）',
+  })
+})
+
 registerDynamicRoute('POST', '/api/admin/endpoints/keys/:keyId/reset-cycle-stats', async (_config, params) => {
   await delay()
   requireAdmin()

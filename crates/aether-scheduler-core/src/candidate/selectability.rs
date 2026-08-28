@@ -27,6 +27,8 @@ pub struct CandidateRuntimeSelectabilityInput<'a> {
     pub provider_key_rpm_states: &'a BTreeMap<String, StoredProviderCatalogKey>,
     pub now_unix_secs: u64,
     pub provider_quota_blocks_requests: bool,
+    /// Persistent runtime quota block that requires explicit administrator recovery.
+    pub quota_hard_blocked: bool,
     pub account_quota_exhausted: bool,
     /// 标准余额快照明确低于内部调度下限；该事实不受订阅额度开关控制。
     pub balance_below_minimum: bool,
@@ -52,6 +54,7 @@ pub fn candidate_runtime_skip_reason_with_state(
         provider_key_rpm_states,
         now_unix_secs,
         provider_quota_blocks_requests,
+        quota_hard_blocked,
         account_quota_exhausted,
         balance_below_minimum,
         oauth_invalid,
@@ -61,6 +64,9 @@ pub fn candidate_runtime_skip_reason_with_state(
 
     if provider_quota_blocks_requests {
         return Some("provider_quota_blocked");
+    }
+    if quota_hard_blocked {
+        return Some("key_quota_exhausted");
     }
     if account_quota_exhausted {
         return Some("account_quota_exhausted");

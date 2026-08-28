@@ -78,12 +78,32 @@ pub fn provider_pool_key_quota_hard_blocked(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
 ) -> bool {
+    if provider_pool_key_runtime_quota_blocked(key) {
+        return true;
+    }
     let adapter = ProviderPoolService::with_builtin_adapters().adapter(provider_type);
     adapter.quota_hard_blocked(&ProviderPoolMemberInput {
         provider_type,
         key,
         auth_config: None,
     })
+}
+
+/// Returns whether runtime error classification installed a persistent,
+/// administrator-recoverable quota scheduling block for this exact Key.
+pub fn provider_pool_key_runtime_quota_blocked(key: &StoredProviderCatalogKey) -> bool {
+    key.status_snapshot
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|snapshot| snapshot.get("scheduling"))
+        .and_then(Value::as_object)
+        .is_some_and(|scheduling| {
+            scheduling.get("blocked").and_then(Value::as_bool) == Some(true)
+                && scheduling
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .is_some_and(|code| code.eq_ignore_ascii_case("quota_exhausted"))
+        })
 }
 
 pub fn provider_pool_member_quota_snapshot<'a>(

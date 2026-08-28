@@ -8,7 +8,7 @@ use aether_data_contracts::repository::pool_scores::{
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
-use aether_provider_pool::ProviderQuotaServingPolicy;
+use aether_provider_pool::{provider_pool_key_runtime_quota_blocked, ProviderQuotaServingPolicy};
 use aether_runtime_state::{RuntimeLockLease, RuntimeState};
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
@@ -356,7 +356,7 @@ async fn select_keys_for_provider(
         .await;
 
         let mut keys_by_id = state
-            .list_provider_catalog_keys_by_ids(&selected_ids)
+            .list_provider_catalog_keys_by_ids_strong(&selected_ids)
             .await?
             .into_iter()
             .map(|key| (key.id.clone(), key))
@@ -364,6 +364,7 @@ async fn select_keys_for_provider(
         Ok(selected_ids
             .into_iter()
             .filter_map(|key_id| keys_by_id.remove(&key_id))
+            .filter(|key| !provider_pool_key_runtime_quota_blocked(key))
             .collect::<Vec<_>>())
     }
     .await;
@@ -493,6 +494,36 @@ async fn record_score_probe_in_progress_for_key(
     if !state.data.has_pool_score_writer() {
         return;
     }
+    let projection_lock = match state
+        .acquire_provider_key_quota_projection_lock(provider_id, key_id)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(err) => {
+            debug!(
+                provider_id,
+                key_id,
+                error = ?err,
+                "gateway account self-check: skipped in-progress score update while quota fence is busy"
+            );
+            return;
+        }
+    };
+    let quota_blocked = state
+        .provider_key_runtime_quota_blocked_strong(provider_id, key_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true);
+    if quota_blocked {
+        state
+            .release_provider_key_quota_projection_lock(projection_lock)
+            .await;
+        return;
+    }
+
+    // Self-check attempts share the score row with runtime quota projection;
+    // serialize the read-modify-write so the manual block remains dominant.
     let attempt = PoolMemberProbeAttempt {
         identity: PoolMemberIdentity::provider_api_key(provider_id.to_string(), key_id.to_string()),
         scope: None,
@@ -517,6 +548,9 @@ async fn record_score_probe_in_progress_for_key(
             "gateway account self-check: failed to mark score probe in progress"
         );
     }
+    state
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
 }
 
 async fn record_score_probe_result_for_key(
@@ -533,6 +567,52 @@ async fn record_score_probe_result_for_key(
     if matches!(serving_policy, ProviderQuotaServingPolicy::ObservationOnly) {
         return;
     }
+
+    let projection_lock = match state
+        .acquire_provider_key_quota_projection_lock(provider_id, key_id)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(err) => {
+            debug!(
+                provider_id,
+                key_id,
+                error = ?err,
+                "gateway account self-check: skipped score result while quota fence is busy"
+            );
+            return;
+        }
+    };
+    let quota_blocked = state
+        .provider_key_runtime_quota_blocked_strong(provider_id, key_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true);
+    if !quota_blocked {
+        record_score_probe_result_for_key_locked(
+            state,
+            provider_id,
+            key_id,
+            attempted_at,
+            outcome,
+            serving_policy,
+        )
+        .await;
+    }
+    state
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
+}
+
+async fn record_score_probe_result_for_key_locked(
+    state: &AppState,
+    provider_id: &str,
+    key_id: &str,
+    attempted_at: u64,
+    outcome: &AccountSelfCheckOutcome,
+    serving_policy: ProviderQuotaServingPolicy,
+) {
     let subscription_hard_state = if matches!(
         serving_policy,
         ProviderQuotaServingPolicy::SubscriptionExhaustionOnly

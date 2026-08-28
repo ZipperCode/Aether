@@ -166,9 +166,24 @@ export interface ModelProbeStatusSnapshot {
   source?: 'admin_model_test' | string | null
 }
 
+export interface SchedulingStatusSnapshot {
+  code: 'quota_suspected' | 'quota_exhausted' | string
+  blocked: boolean
+  requires_manual_recovery?: boolean
+  source?: string | null
+  confidence?: 'strong' | 'weak' | string | null
+  confirmation_count?: number | null
+  status_code?: number | null
+  error_code?: string | null
+  reason?: string | null
+  first_observed_at?: number | null
+  last_observed_at?: number | null
+}
+
 export interface ProviderKeyStatusSnapshot {
   oauth: OAuthStatusSnapshot
   account: AccountStatusSnapshot
   quota: QuotaStatusSnapshot
+  scheduling?: SchedulingStatusSnapshot | null
   model_probe?: ModelProbeStatusSnapshot | null
 }

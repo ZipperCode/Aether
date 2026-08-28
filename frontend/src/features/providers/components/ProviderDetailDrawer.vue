@@ -135,6 +135,7 @@
                           :kiro-subscription-class="shouldShowKiroSubscriptionBadge(key) ? getOAuthPlanTypeClass(getKiroSubscriptionBadgeLabel(key)) : ''"
                           :quota-type-label="getGenericQuotaTypeLabel(key)"
                           :quota-status-label="getGenericQuotaStatusLabel(key)"
+                          :quota-status-title="getQuotaSchedulingTitle(key)"
                           :can-export-credential="canExportOAuthCredential(key)"
                           :show-o-auth-refresh-control="shouldShowOAuthRefreshControl(key, provider.provider_type)"
                           :account-level-block="isAccountLevelBlock(key)"
@@ -155,6 +156,8 @@
                       <ProviderKeyActionCluster
                         :api-key="key"
                         :provider-type="provider.provider_type"
+                        :quota-blocked="isQuotaSchedulingBlocked(key)"
+                        :restoring-quota="restoringQuotaKeyId === key.id"
                         :recoverable="isKeyRecoverable(key)"
                         :recover-title="getRecoverKeyTitle(key)"
                         :circuit-breaker-title="getKeyCircuitBreakerTitle(key)"
@@ -166,6 +169,7 @@
                         :saving-proxy="savingProxyKeyId === key.id"
                         :toggling="togglingKeyId === key.id"
                         @recover="handleRecoverKey(key)"
+                        @restore-quota="handleRestoreQuotaScheduling(key)"
                         @permissions="handleKeyPermissions(key)"
                         @update:proxy-popover-open="(v: boolean) => handleProxyPopoverToggle(key.id, v)"
                         @clear-proxy="clearKeyProxy(key)"
@@ -1020,6 +1024,7 @@ import {
   refreshProviderQuota,
   consumeCodexResetCredit,
   clearOAuthInvalid,
+  clearQuotaExhausted,
   type ProviderEndpoint,
   type EndpointAPIKey,
   type Model,
@@ -1189,6 +1194,7 @@ const refreshingOAuthKeyId = ref<string | null>(null)
 
 // OAuth 失效清除状态
 const clearingOAuthInvalidKeyId = ref<string | null>(null)
+const restoringQuotaKeyId = ref<string | null>(null)
 
 // Codex reset credit 消费状态
 const consumingCodexResetCreditKeyId = ref<string | null>(null)
@@ -1206,6 +1212,7 @@ const failoverRulesDialogOpen = ref(false)
 const FAILOVER_RULE_ARRAY_KEYS = [
   'success_failover_patterns',
   'error_stop_patterns',
+  'quota_exhaustion_patterns',
   'stop_status_codes',
   'stop_on_status_codes',
   'early_stop_status_codes',
@@ -1638,6 +1645,32 @@ async function handleRecoverKey(key: EndpointAPIKey) {
   }
 }
 
+async function handleRestoreQuotaScheduling(key: EndpointAPIKey) {
+  if (restoringQuotaKeyId.value) return
+  const keyName = key.name || key.id.slice(0, 8)
+  const confirmed = await confirm({
+    title: legacyT('恢复 Key 调度'),
+    message: locale.value === 'en-US'
+      ? `Confirm quota has been replenished for "${keyName}"? The key will be evaluated by its remaining scheduling states.`
+      : `确认 Key“${keyName}”已完成充值或额度调整？恢复后仍会保留人工禁用、OAuth、冷却和健康状态。`,
+    confirmText: legacyT('恢复调度'),
+    variant: 'default',
+  })
+  if (!confirmed) return
+
+  restoringQuotaKeyId.value = key.id
+  try {
+    const result = await clearQuotaExhausted(key.id)
+    showSuccess(legacyT(result.message))
+    await Promise.all([loadProvider(), loadEndpoints()])
+    emit('refresh')
+  } catch (err: unknown) {
+    showError(localizedApiError(err, '恢复 Key 调度失败'), legacyT('错误'))
+  } finally {
+    restoringQuotaKeyId.value = null
+  }
+}
+
 async function handleRefreshOAuth(key: EndpointAPIKey) {
   if (refreshingOAuthKeyId.value) return
   refreshingOAuthKeyId.value = key.id
@@ -1911,10 +1944,33 @@ function getGenericQuotaTypeLabel(key: EndpointAPIKey): string | null {
 }
 
 function getGenericQuotaStatusLabel(key: EndpointAPIKey): string | null {
+  if (isQuotaSchedulingBlocked(key)) return '额度耗尽·需人工恢复'
+  if (isQuotaSchedulingSuspected(key)) return '疑似额度不足'
   return isGenericQuotaUnavailable(
     key.status_snapshot?.quota,
     getGenericQuotaProviderType(key),
   ) ? 'Expired' : null
+}
+
+function isQuotaSchedulingBlocked(key: EndpointAPIKey): boolean {
+  const scheduling = key.status_snapshot?.scheduling
+  return scheduling?.code === 'quota_exhausted' && scheduling.blocked === true
+}
+
+function isQuotaSchedulingSuspected(key: EndpointAPIKey): boolean {
+  const scheduling = key.status_snapshot?.scheduling
+  return scheduling?.code === 'quota_suspected' && scheduling.blocked !== true
+}
+
+function getQuotaSchedulingTitle(key: EndpointAPIKey): string {
+  const scheduling = key.status_snapshot?.scheduling
+  if (!scheduling) return ''
+  const parts = [isQuotaSchedulingBlocked(key) ? '额度耗尽·需人工恢复' : '疑似额度不足']
+  if (scheduling.reason) parts.push(scheduling.reason)
+  if (typeof scheduling.last_observed_at === 'number') {
+    parts.push(new Date(scheduling.last_observed_at * 1000).toLocaleString(locale.value))
+  }
+  return parts.join(' · ')
 }
 
 function getQuotaSnapshotForProvider(

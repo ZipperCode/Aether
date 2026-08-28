@@ -6,6 +6,9 @@ use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKe
 use aether_pool_core::{
     score_pool_member_with_rules, PoolMemberScoreInput, PoolMemberScoreRules, POOL_SCORE_VERSION,
 };
+use aether_provider_pool::{
+    provider_pool_key_quota_hard_blocked, provider_pool_key_runtime_quota_blocked,
+};
 use serde_json::Value;
 
 use crate::handlers::shared::{provider_key_health_summary, provider_key_status_snapshot_payload};
@@ -28,6 +31,14 @@ pub(crate) fn build_provider_key_pool_score_upsert(
         now_unix_secs,
     );
     let mut output = score_pool_member_with_rules(&input, score_rules);
+    if provider_pool_key_runtime_quota_blocked(key) {
+        if let Some(reason) = output.score_reason.as_object_mut() {
+            reason.insert(
+                "hard_state_source".to_string(),
+                Value::String("runtime_quota_exhaustion".to_string()),
+            );
+        }
+    }
     if should_preserve_existing_auth_invalid(key, existing, output.hard_state) {
         output.hard_state = PoolMemberHardState::AuthInvalid;
         output.score = output
@@ -148,10 +159,11 @@ fn provider_key_score_input(
             .and_then(|quota| quota.get("usage_ratio"))
             .and_then(json_f64)
             .map(|value| value.clamp(0.0, 1.0)),
-        quota_exhausted: quota_snapshot
-            .and_then(|quota| quota.get("exhausted"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        quota_exhausted: provider_pool_key_quota_hard_blocked(key, provider_type)
+            || quota_snapshot
+                .and_then(|quota| quota.get("exhausted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         account_blocked: account_snapshot
             .and_then(|account| account.get("blocked"))
             .and_then(Value::as_bool)

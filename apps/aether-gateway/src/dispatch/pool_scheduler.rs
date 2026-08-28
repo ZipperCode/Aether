@@ -21,7 +21,8 @@ use aether_pool_core::{
     PoolMemberSignals, PoolRuntimeState, PoolSchedulingConfig, PoolSchedulingPreset,
     POOL_ACCOUNT_BLOCKED_SKIP_REASON, POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
     POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON, POOL_COOLDOWN_SKIP_REASON,
-    POOL_COST_LIMIT_REACHED_SKIP_REASON,
+    POOL_COST_LIMIT_REACHED_SKIP_REASON, POOL_KEY_QUOTA_EXHAUSTED_SKIP_REASON,
+    POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON,
 };
 use aether_provider_pool::ProviderPoolService;
 use aether_routing_core::{RankingOverlay, ResolvedRoutingPolicy};
@@ -319,7 +320,10 @@ fn active_probe_member_is_unschedulable_for_request(
         return true;
     }
     key_context.is_some_and(|context| {
-        context.account_blocked
+        context.catalog_state_unavailable
+            || context.account_blocked
+            || context.runtime_quota_hard_blocked
+            || context.quota_hard_blocked
             || (pool_config.skip_exhausted_accounts && context.quota_exhausted)
             || context.balance_below_minimum
     })
@@ -997,7 +1001,7 @@ impl<'a> PoolKeyCursor<'a> {
         let key = match self
             .state
             .app()
-            .read_provider_catalog_keys_by_ids(std::slice::from_ref(&sticky_key_id))
+            .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(&sticky_key_id))
             .await
         {
             Ok(mut keys) => keys.pop()?,
@@ -1257,13 +1261,50 @@ impl<'a> PoolKeyCursor<'a> {
             let _permit = permit;
             let mut failed = 0usize;
             for feedback in feedback {
-                let result = app
-                    .data
-                    .record_pool_member_schedule_feedback(feedback)
-                    .await;
-                if result.is_err() {
+                let feedback_provider_id = feedback.identity.pool_id.clone();
+                let feedback_key_id = feedback.identity.member_id.clone();
+                let projection_lock = match app
+                    .acquire_provider_key_quota_projection_lock(
+                        &feedback_provider_id,
+                        &feedback_key_id,
+                    )
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+
+                // Schedule-interest feedback is a read-modify-write operation.
+                // Serialize it with the runtime quota projection so a late
+                // background write cannot downgrade QuotaExhausted.
+                let should_record = match app
+                    .provider_key_runtime_quota_blocked_strong(
+                        &feedback_provider_id,
+                        &feedback_key_id,
+                    )
+                    .await
+                {
+                    Ok(Some(false)) => true,
+                    Ok(Some(true) | None) => false,
+                    Err(_) => {
+                        failed += 1;
+                        false
+                    }
+                };
+                if should_record
+                    && app
+                        .data
+                        .record_pool_member_schedule_feedback(feedback)
+                        .await
+                        .is_err()
+                {
                     failed += 1;
                 }
+                app.release_provider_key_quota_projection_lock(projection_lock)
+                    .await;
             }
             if failed > 0 {
                 warn!(
@@ -1372,6 +1413,8 @@ fn pool_skip_reason_releases_scan_budget(skip_reason: &str) -> bool {
         skip_reason,
         POOL_ACCOUNT_EXHAUSTED_SKIP_REASON
             | POOL_ACCOUNT_BLOCKED_SKIP_REASON
+            | POOL_KEY_QUOTA_EXHAUSTED_SKIP_REASON
+            | POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON
             | POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON
     )
 }
@@ -1451,7 +1494,7 @@ async fn read_pool_catalog_key_contexts_by_id(
 
     let keys = match state
         .app()
-        .read_provider_catalog_keys_by_ids(&key_ids)
+        .list_provider_catalog_keys_by_ids_strong(&key_ids)
         .await
     {
         Ok(keys) => keys,
@@ -1461,24 +1504,52 @@ async fn read_pool_catalog_key_contexts_by_id(
                 key_count = key_ids.len(),
                 "gateway pool scheduler: failed to read catalog key metadata"
             );
-            return BTreeMap::new();
+            // Do not fail open when the persistent scheduling fact cannot be
+            // read. Keep this distinct from a confirmed quota block so
+            // diagnostics do not instruct administrators to recover the Key.
+            return key_ids
+                .into_iter()
+                .map(|key_id| {
+                    (
+                        key_id,
+                        PoolCatalogKeyContext {
+                            catalog_state_unavailable: true,
+                            ..PoolCatalogKeyContext::default()
+                        },
+                    )
+                })
+                .collect();
         }
     };
 
     let provider_pool_service = ProviderPoolService::with_builtin_adapters();
-
-    keys.into_iter()
-        .map(|key| {
-            let provider_type = provider_type_by_key_id
-                .get(&key.id)
-                .map(String::as_str)
-                .unwrap_or_default();
+    let mut contexts = key_ids
+        .into_iter()
+        .map(|key_id| {
             (
-                key.id.clone(),
-                build_pool_catalog_key_context(state, &provider_pool_service, &key, provider_type),
+                key_id,
+                PoolCatalogKeyContext {
+                    catalog_state_unavailable: true,
+                    ..PoolCatalogKeyContext::default()
+                },
             )
         })
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    for key in keys {
+        let Some(provider_type) = provider_type_by_key_id.get(&key.id) else {
+            continue;
+        };
+        contexts.insert(
+            key.id.clone(),
+            build_pool_catalog_key_context(
+                state,
+                &provider_pool_service,
+                &key,
+                provider_type.as_str(),
+            ),
+        );
+    }
+    contexts
 }
 
 fn build_pool_catalog_key_context(
@@ -1506,6 +1577,10 @@ fn build_pool_catalog_key_context(
     let auth_config = parse_catalog_auth_config_json(state.app(), key);
     let mut signals =
         provider_pool_service.member_signals(provider_type, key, auth_config.as_ref());
+    // Provider adapters continue to own resettable quota semantics, while the
+    // persisted runtime block is an unconditional Key-wide scheduling fact.
+    signals.runtime_quota_hard_blocked =
+        aether_provider_pool::provider_pool_key_runtime_quota_blocked(key);
     signals.account_blocked |= admin_provider_pool_pure::admin_pool_key_is_known_banned(key);
     signals.account_blocked |=
         pool_key_requires_reauth_for_scheduling(key, current_unix_ms().saturating_div(1000));
@@ -1676,6 +1751,8 @@ fn active_probe_evicted_members_from_skipped(
             skipped_candidate.skip_reason,
             POOL_ACCOUNT_BLOCKED_SKIP_REASON
                 | POOL_ACCOUNT_EXHAUSTED_SKIP_REASON
+                | POOL_KEY_QUOTA_EXHAUSTED_SKIP_REASON
+                | POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON
                 | POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON
                 | POOL_COOLDOWN_SKIP_REASON
                 | POOL_COST_LIMIT_REACHED_SKIP_REASON

@@ -158,27 +158,50 @@ pub(super) async fn maybe_handle(
         .await?;
     if let Some(pool_config) = admin_provider_pool_config(&provider) {
         if provider_key_update_requires_pool_score_recovery(&existing_key, &updated) {
-            let upsert = build_provider_key_pool_score_upsert(
-                &updated,
-                provider.provider_type.as_str(),
-                None,
-                now_unix_secs,
-                pool_config.score_rules,
-            );
+            let projection_lock = state
+                .as_ref()
+                .acquire_provider_key_quota_projection_lock(&provider.id, &updated.id)
+                .await?;
+            let recovery_result = async {
+                let current = state
+                    .as_ref()
+                    .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(&updated.id))
+                    .await?
+                    .into_iter()
+                    .next()
+                    .filter(|key| key.is_active && key.provider_id == provider.id);
+                let Some(current) = current else {
+                    return Ok::<(), GatewayError>(());
+                };
+                let upsert = build_provider_key_pool_score_upsert(
+                    &current,
+                    provider.provider_type.as_str(),
+                    None,
+                    now_unix_secs,
+                    pool_config.score_rules,
+                );
+                state
+                    .as_ref()
+                    .data
+                    .upsert_pool_member_score_with_mode(
+                        upsert,
+                        PoolMemberScoreUpsertMode::OAuthRecovery,
+                    )
+                    .await
+                    .map_err(|err| {
+                        GatewayError::Internal(format!(
+                            "failed to recover pool score for updated provider key '{}': {err}",
+                            updated.id
+                        ))
+                    })?;
+                Ok(())
+            }
+            .await;
             state
                 .as_ref()
-                .data
-                .upsert_pool_member_score_with_mode(
-                    upsert,
-                    PoolMemberScoreUpsertMode::OAuthRecovery,
-                )
-                .await
-                .map_err(|err| {
-                    GatewayError::Internal(format!(
-                        "failed to recover pool score for updated provider key '{}': {err}",
-                        updated.id
-                    ))
-                })?;
+                .release_provider_key_quota_projection_lock(projection_lock)
+                .await;
+            recovery_result?;
         } else {
             let score_ensure_budget =
                 (pool_config.score_fallback_scan_limit as usize).clamp(1, 50_000);

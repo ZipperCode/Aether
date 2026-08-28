@@ -3,6 +3,7 @@ mod codex_reset_credit;
 mod create;
 mod delete;
 mod oauth_invalid;
+mod quota_exhausted;
 mod reset_cycle_stats;
 mod update;
 
@@ -29,6 +30,11 @@ pub(super) async fn maybe_handle(
     }
     if let Some(response) =
         oauth_invalid::maybe_handle(state, request_context, request_body).await?
+    {
+        return Ok(Some(response));
+    }
+    if let Some(response) =
+        quota_exhausted::maybe_handle(state, request_context, request_body).await?
     {
         return Ok(Some(response));
     }

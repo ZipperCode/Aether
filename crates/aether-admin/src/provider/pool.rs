@@ -241,6 +241,61 @@ fn admin_pool_scheduling_payload(
             })],
         );
     }
+    let runtime_quota = key
+        .status_snapshot
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|snapshot| snapshot.get("scheduling"))
+        .and_then(Value::as_object);
+    let runtime_quota_code = runtime_quota
+        .and_then(|snapshot| snapshot.get("code"))
+        .and_then(Value::as_str);
+    let runtime_quota_blocked = runtime_quota
+        .and_then(|snapshot| snapshot.get("blocked"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if runtime_quota_code == Some("quota_exhausted") && runtime_quota_blocked {
+        return (
+            "blocked".to_string(),
+            "key_quota_exhausted".to_string(),
+            "额度耗尽·需人工恢复".to_string(),
+            vec![json!({
+                "code": "key_quota_exhausted",
+                "label": "额度耗尽·需人工恢复",
+                "blocking": true,
+                "source": runtime_quota
+                    .and_then(|snapshot| snapshot.get("source"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("runtime_error"),
+                "ttl_seconds": Value::Null,
+                "detail": runtime_quota
+                    .and_then(|snapshot| snapshot.get("reason"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            })],
+        );
+    }
+    if runtime_quota_code == Some("quota_suspected") && !runtime_quota_blocked {
+        return (
+            "degraded".to_string(),
+            "quota_suspected".to_string(),
+            "疑似额度不足".to_string(),
+            vec![json!({
+                "code": "quota_suspected",
+                "label": "疑似额度不足",
+                "blocking": false,
+                "source": runtime_quota
+                    .and_then(|snapshot| snapshot.get("source"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("runtime_error"),
+                "ttl_seconds": Value::Null,
+                "detail": runtime_quota
+                    .and_then(|snapshot| snapshot.get("reason"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            })],
+        );
+    }
     if let Some(reason) = cooldown_reason {
         return (
             "degraded".to_string(),
@@ -1017,6 +1072,15 @@ pub fn build_admin_pool_key_payload(
 ) -> Value {
     let health_score = admin_pool_health_score(key);
     let circuit_breaker_open = false;
+    let mut status_snapshot = key.status_snapshot.clone().unwrap_or_else(|| json!({}));
+    if let Some(scheduling) = status_snapshot
+        .get_mut("scheduling")
+        .and_then(Value::as_object_mut)
+    {
+        // The credential fence is an internal digest, never an admin payload
+        // field. Scheduling code/reason remains visible for operations.
+        scheduling.remove("credential_fingerprint");
+    }
     let (scheduling_status, scheduling_reason, scheduling_label, scheduling_reasons) =
         admin_pool_scheduling_payload(
             key,
@@ -1029,7 +1093,7 @@ pub fn build_admin_pool_key_payload(
         "key_name": key.name,
         "is_active": key.is_active,
         "auth_type": key.auth_type,
-        "status_snapshot": key.status_snapshot.clone().unwrap_or_else(|| json!({})),
+        "status_snapshot": status_snapshot,
         "health_score": health_score,
         "circuit_breaker_open": circuit_breaker_open,
         "api_formats": admin_pool_api_formats(key),

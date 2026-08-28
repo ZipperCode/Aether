@@ -10,7 +10,8 @@ use super::{
     ProviderCatalogKeyAdminCasUpdate, ProviderCatalogKeyHealthStateUpdate,
     ProviderCatalogKeyListQuery, ProviderCatalogKeyOAuthCredentialCasDelete,
     ProviderCatalogKeyOAuthRuntimeStateCasUpdate, ProviderCatalogKeyRuntimeMetadataUpdate,
-    ProviderCatalogKeyStatusSnapshotUpdate, ProviderCatalogReadRepository, ProviderCatalogSnapshot,
+    ProviderCatalogKeySchedulingStateCasUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
+    ProviderCatalogReadRepository, ProviderCatalogSnapshot,
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
@@ -1292,6 +1293,75 @@ impl ProviderCatalogWriteRepository for InMemoryProviderCatalogReadRepository {
             "provider catalog status snapshot",
         )?;
         key.status_snapshot = Some(Value::Object(merge_json_objects(status_snapshot, patch)));
+        key.updated_at_unix_secs = Some(
+            update
+                .updated_at_unix_secs
+                .unwrap_or_else(current_unix_secs),
+        );
+        Ok(true)
+    }
+
+    async fn compare_and_update_key_scheduling_state(
+        &self,
+        update: &ProviderCatalogKeySchedulingStateCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        if update.key_id.trim().is_empty() || update.expected_auth_type.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog scheduling state key_id and auth_type are required".to_string(),
+            ));
+        }
+        if update
+            .scheduling
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+            || update
+                .expected_scheduling
+                .as_ref()
+                .is_some_and(|value| !value.is_object())
+        {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog scheduling state must be an object or null".to_string(),
+            ));
+        }
+
+        let mut index = self
+            .index
+            .write()
+            .expect("provider catalog repository lock");
+        let Some(key) = index.keys.get_mut(&update.key_id) else {
+            return Ok(false);
+        };
+        let current_scheduling = key
+            .status_snapshot
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|snapshot| snapshot.get("scheduling"))
+            .filter(|value| !value.is_null())
+            .cloned();
+        if key.encrypted_api_key != update.expected_encrypted_api_key
+            || key.encrypted_auth_config != update.expected_encrypted_auth_config
+            || !key
+                .auth_type
+                .eq_ignore_ascii_case(&update.expected_auth_type)
+            || current_scheduling != update.expected_scheduling
+        {
+            return Ok(false);
+        }
+
+        // Keep the in-memory CAS aligned with the SQL adapters: a malformed or
+        // legacy scalar root has no scheduling state and is normalized before
+        // the independently owned scheduling namespace is written.
+        let mut snapshot = key
+            .status_snapshot
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        snapshot.insert(
+            "scheduling".to_string(),
+            update.scheduling.clone().unwrap_or(Value::Null),
+        );
+        key.status_snapshot = Some(Value::Object(snapshot));
         key.updated_at_unix_secs = Some(
             update
                 .updated_at_unix_secs

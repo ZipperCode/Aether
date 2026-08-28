@@ -159,6 +159,7 @@ pub use same_format_provider::{
     SameFormatProviderRequestBodyOutput, SameFormatProviderUpstreamUrlParams,
 };
 pub use snapshot::{
+    provider_catalog_key_credential_fingerprint, provider_transport_key_credential_fingerprint,
     read_provider_transport_snapshot, GatewayProviderTransportSnapshot,
     ProviderTransportSnapshotSource,
 };

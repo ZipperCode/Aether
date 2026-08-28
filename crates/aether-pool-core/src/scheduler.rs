@@ -4,6 +4,8 @@ use std::hash::{Hash, Hasher};
 
 pub const POOL_ACCOUNT_BLOCKED_SKIP_REASON: &str = "pool_account_blocked";
 pub const POOL_ACCOUNT_EXHAUSTED_SKIP_REASON: &str = "pool_account_exhausted";
+pub const POOL_KEY_QUOTA_EXHAUSTED_SKIP_REASON: &str = "pool_key_quota_exhausted";
+pub const POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON: &str = "pool_key_state_unavailable";
 /// Pool 真实 Key 因标准余额明确不高于内部下限而被跳过。
 pub const POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON: &str = "pool_balance_below_minimum";
 pub const POOL_COOLDOWN_SKIP_REASON: &str = "pool_cooldown";
@@ -44,6 +46,10 @@ pub struct PoolMemberSignals {
     pub balance_below_minimum: bool,
     /// Provider 适配器明确声明的硬额度阻断，不受订阅耗尽开关控制。
     pub quota_hard_blocked: bool,
+    /// 运行时错误识别写入的永久额度阻断，只能由管理员恢复。
+    pub runtime_quota_hard_blocked: bool,
+    /// 目录强读失败或缺失，无法安全确认当前 Key 的持久调度状态。
+    pub catalog_state_unavailable: bool,
     pub health_score: Option<f64>,
     pub latency_avg_ms: Option<f64>,
     pub catalog_lru_score: Option<f64>,
@@ -223,10 +229,26 @@ fn schedule_pool_group<Candidate>(
             .copied()
             .or(item.key_context.latency_avg_ms);
 
+        if item.key_context.catalog_state_unavailable {
+            skipped.push(PoolSkippedCandidate {
+                candidate: item.candidate,
+                skip_reason: POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON,
+            });
+            continue;
+        }
+
         if item.key_context.account_blocked {
             skipped.push(PoolSkippedCandidate {
                 candidate: item.candidate,
                 skip_reason: POOL_ACCOUNT_BLOCKED_SKIP_REASON,
+            });
+            continue;
+        }
+
+        if item.key_context.runtime_quota_hard_blocked {
+            skipped.push(PoolSkippedCandidate {
+                candidate: item.candidate,
+                skip_reason: POOL_KEY_QUOTA_EXHAUSTED_SKIP_REASON,
             });
             continue;
         }

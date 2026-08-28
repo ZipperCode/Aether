@@ -11,7 +11,7 @@ use aether_data_contracts::repository::pool_scores::{
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyAdaptiveState, ProviderCatalogKeyAdaptiveStateUpdate,
-    ProviderCatalogKeyHealthStateUpdate,
+    ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeySchedulingStateCasUpdate,
 };
 use aether_routing_core::RoutingPoolPolicyOverride;
 use aether_scheduler_core::{
@@ -22,16 +22,19 @@ use aether_usage_runtime::{
     build_stream_terminal_usage_outcome, build_sync_terminal_usage_outcome,
     GatewayStreamReportRequest, GatewaySyncReportRequest, TerminalUsageOutcome,
 };
+use regex::Regex;
 use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
 use super::{
-    classify_failure_disposition, local_failover_error_message, project_local_adaptive_rate_limit,
-    project_local_adaptive_success, project_local_failure_health, project_local_key_circuit_closed,
+    classify_failure_disposition, local_failover_error_message, local_quota_exhaustion_error_code,
+    project_local_adaptive_rate_limit, project_local_adaptive_success,
+    project_local_failure_health, project_local_key_circuit_closed,
     project_local_key_circuit_failure, project_local_success_health,
     resolve_local_failover_analysis_for_attempt, FailureScope, LocalFailoverAnalysis,
-    LocalFailoverClassification,
+    LocalFailoverClassification, LocalQuotaExhaustionConfidence, LocalQuotaExhaustionEvidence,
+    PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD,
 };
 use crate::ai_serving::extract_pool_sticky_session_token;
 use crate::client_session_affinity::{
@@ -40,7 +43,8 @@ use crate::client_session_affinity::{
 use crate::clock::current_unix_secs;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::handlers::shared::provider_pool::{
-    admin_provider_pool_key_terminal_error_reason, record_admin_provider_pool_error,
+    admin_provider_pool_key_terminal_error_reason,
+    admin_provider_pool_quota_probe_active_members_key, record_admin_provider_pool_error,
     record_admin_provider_pool_stream_timeout, record_admin_provider_pool_success,
     release_admin_provider_pool_key_lease, AdminProviderPoolConfig,
     AdminProviderPoolSchedulingPreset,
@@ -230,6 +234,13 @@ pub(crate) struct LocalHealthFailureEffect {
 pub(crate) struct LocalHealthSuccessEffect;
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalSchedulingStateEffect<'a> {
+    pub(crate) status_code: u16,
+    pub(crate) response_text: Option<&'a str>,
+    pub(crate) quota_exhaustion: Option<LocalQuotaExhaustionEvidence>,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct LocalAdaptiveSuccessEffect;
 
 #[derive(Debug, Clone, Copy)]
@@ -251,6 +262,7 @@ pub(crate) enum LocalExecutionEffect<'a> {
     AdaptiveRateLimit(LocalAdaptiveRateLimitEffect<'a>),
     HealthFailure(LocalHealthFailureEffect),
     HealthSuccess(LocalHealthSuccessEffect),
+    SchedulingState(LocalSchedulingStateEffect<'a>),
     AdaptiveSuccess(LocalAdaptiveSuccessEffect),
     OauthInvalidation(LocalOAuthInvalidationEffect<'a>),
     OauthSuccess(LocalOAuthSuccessEffect<'a>),
@@ -340,6 +352,7 @@ pub(crate) struct LocalStreamFailureEffect<'a> {
     pub(crate) headers: &'a BTreeMap<String, String>,
     pub(crate) response_text: Option<&'a str>,
     pub(crate) stream_timeout: bool,
+    pub(crate) transport_error: bool,
 }
 
 impl<'a> LocalStreamFailureEffect<'a> {
@@ -353,11 +366,18 @@ impl<'a> LocalStreamFailureEffect<'a> {
             headers,
             response_text,
             stream_timeout: false,
+            transport_error: false,
         }
     }
 
     pub(crate) const fn with_stream_timeout(mut self) -> Self {
         self.stream_timeout = true;
+        self.transport_error = true;
+        self
+    }
+
+    pub(crate) const fn with_transport_error(mut self) -> Self {
+        self.transport_error = true;
         self
     }
 }
@@ -402,6 +422,9 @@ pub(crate) async fn apply_local_execution_effect(
         }
         LocalExecutionEffect::HealthSuccess(effect) => {
             record_health_success_effect(state, context, effect).await;
+        }
+        LocalExecutionEffect::SchedulingState(effect) => {
+            record_scheduling_state_effect(state, context, effect).await;
         }
         LocalExecutionEffect::AdaptiveSuccess(effect) => {
             record_adaptive_success_effect(state, context, effect).await;
@@ -478,10 +501,18 @@ pub(crate) async fn apply_local_stream_failure_effects(
         context.report_context,
         effect.status_code,
         effect.response_text,
+        Some(effect.headers),
     )
     .await;
 
-    if effect.stream_timeout {
+    // A transport failure has no authoritative upstream HTTP terminal. It
+    // must neither advance nor clear the credential's quota suspicion state.
+    let quota_exhaustion = if effect.transport_error {
+        None
+    } else {
+        analysis.quota_exhaustion
+    };
+    if effect.stream_timeout && quota_exhaustion.is_none() {
         apply_local_execution_effect(state, context, LocalExecutionEffect::PoolStreamTimeout).await;
     }
     apply_local_execution_effect(
@@ -493,45 +524,61 @@ pub(crate) async fn apply_local_stream_failure_effects(
         }),
     )
     .await;
-    apply_local_execution_effect(
-        state,
-        context,
-        LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
-            status_code: effect.status_code,
-            classification: analysis.classification,
-            headers: Some(effect.headers),
-        }),
-    )
-    .await;
-    apply_local_execution_effect(
-        state,
-        context,
-        LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
-            status_code: effect.status_code,
-            classification: analysis.classification,
-        }),
-    )
-    .await;
-    apply_local_execution_effect(
-        state,
-        context,
-        LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
-            status_code: effect.status_code,
-            response_text: effect.response_text,
-        }),
-    )
-    .await;
-    apply_local_execution_effect(
-        state,
-        context,
-        LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
-            status_code: effect.status_code,
-            classification: analysis.classification,
-            headers: effect.headers,
-            error_body: effect.response_text,
-        }),
-    )
-    .await;
+    if !effect.transport_error {
+        apply_local_execution_effect(
+            state,
+            context,
+            LocalExecutionEffect::SchedulingState(LocalSchedulingStateEffect {
+                status_code: effect.status_code,
+                response_text: effect.response_text,
+                quota_exhaustion,
+            }),
+        )
+        .await;
+    }
+    if quota_exhaustion.is_none() {
+        apply_local_execution_effect(
+            state,
+            context,
+            LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
+                status_code: effect.status_code,
+                classification: analysis.classification,
+                headers: Some(effect.headers),
+            }),
+        )
+        .await;
+        apply_local_execution_effect(
+            state,
+            context,
+            LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
+                status_code: effect.status_code,
+                classification: analysis.classification,
+            }),
+        )
+        .await;
+        apply_local_execution_effect(
+            state,
+            context,
+            LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
+                status_code: effect.status_code,
+                response_text: effect.response_text,
+            }),
+        )
+        .await;
+        apply_local_execution_effect(
+            state,
+            context,
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: effect.status_code,
+                classification: analysis.classification,
+                headers: effect.headers,
+                error_body: effect.response_text,
+            }),
+        )
+        .await;
+    } else {
+        apply_local_execution_effect(state, context, LocalExecutionEffect::PoolLeaseRelease).await;
+    }
 
     analysis
 }
@@ -591,6 +638,340 @@ fn report_context_u64_field(report_context: Option<&Value>, field: &str) -> Opti
                 .as_u64()
                 .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
         })
+}
+
+fn provider_key_scheduling_state(
+    key: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+) -> Option<Value> {
+    key.status_snapshot
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|snapshot| snapshot.get("scheduling"))
+        .filter(|value| !value.is_null())
+        .cloned()
+}
+
+fn scheduling_state_code(state: Option<&Value>) -> Option<&str> {
+    state
+        .and_then(Value::as_object)
+        .and_then(|state| state.get("code"))
+        .and_then(Value::as_str)
+}
+
+fn scheduling_state_confirmation_count(state: Option<&Value>) -> u64 {
+    state
+        .and_then(Value::as_object)
+        .and_then(|state| state.get("confirmation_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn scheduling_state_first_observed_at(state: Option<&Value>, fallback: u64) -> u64 {
+    state
+        .and_then(Value::as_object)
+        .and_then(|state| state.get("first_observed_at"))
+        .and_then(Value::as_u64)
+        .unwrap_or(fallback)
+}
+
+fn truncated_scheduling_reason(response_text: Option<&str>) -> Option<String> {
+    let raw = response_text.map(str::trim).unwrap_or_default();
+    if raw.is_empty() || serde_json::from_str::<Value>(raw).is_err() {
+        // Plain-text bodies can contain arbitrary upstream output. The source,
+        // confidence and error code already explain the match without storing
+        // the complete body.
+        return None;
+    }
+    let reason = local_failover_error_message(response_text).filter(|reason| reason != raw)?;
+    let truncated = reason.chars().take(500).collect::<String>();
+    let redacted = redact_scheduling_reason_secrets(&truncated);
+    (!redacted.is_empty()).then_some(redacted)
+}
+
+fn redact_scheduling_reason_secrets(value: &str) -> String {
+    static BEARER_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}")
+            .expect("quota scheduling bearer redaction regex should compile")
+    });
+    static SECRET_ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\b(api[_ -]?key|access[_ -]?token|refresh[_ -]?token|secret)\s*[:=]\s*[^\s,;]+",
+        )
+        .expect("quota scheduling secret assignment redaction regex should compile")
+    });
+    static KEY_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\bsk-[A-Za-z0-9_-]{8,}")
+            .expect("quota scheduling key prefix redaction regex should compile")
+    });
+
+    let value = BEARER_RE.replace_all(value, "Bearer [REDACTED]");
+    let value = SECRET_ASSIGNMENT_RE.replace_all(&value, "$1=[REDACTED]");
+    KEY_PREFIX_RE
+        .replace_all(&value, "[REDACTED]")
+        .trim()
+        .to_string()
+}
+
+async fn record_scheduling_state_effect(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    effect: LocalSchedulingStateEffect<'_>,
+) {
+    let Some(expected_fingerprint) = report_context_string_field(
+        context.report_context,
+        PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD,
+    ) else {
+        // Legacy or remote plans without a credential fence must not persist a
+        // key-wide block from a response that may belong to replaced credentials.
+        return;
+    };
+
+    if effect.quota_exhaustion.is_none() {
+        // Clearing a suspicion cannot downgrade a confirmed block and the CAS
+        // linearizes safely against a concurrent second weak signal. Avoid the
+        // distributed Pool projection lock on this common response path.
+        record_scheduling_state_effect_cas(state, context, effect, expected_fingerprint, false)
+            .await;
+        return;
+    }
+
+    let projection_lock = match state
+        .acquire_provider_key_quota_projection_lock(&context.plan.provider_id, &context.plan.key_id)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(err) => {
+            warn!(
+                provider_id = %context.plan.provider_id,
+                key_id = %context.plan.key_id,
+                error = ?err,
+                "gateway quota scheduling effect could not acquire projection fence; persisting source state without derived projection"
+            );
+            // The persistent scheduling fact is the authoritative admission
+            // guard. If the optional distributed projection fence is
+            // temporarily unavailable, still perform its credential-fenced CAS
+            // and let the next score rebuild reconcile Pool/active-probe state.
+            record_scheduling_state_effect_cas(state, context, effect, expected_fingerprint, false)
+                .await;
+            return;
+        }
+    };
+
+    record_scheduling_state_effect_cas(state, context, effect, expected_fingerprint, true).await;
+    state
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
+}
+
+async fn record_scheduling_state_effect_cas(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    effect: LocalSchedulingStateEffect<'_>,
+    expected_fingerprint: &str,
+    project_pool_state: bool,
+) {
+    let observed_at = current_unix_secs();
+
+    for _ in 0..PROVIDER_KEY_STATE_CAS_MAX_ATTEMPTS {
+        let Some(current_key) = state
+            .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(&context.plan.key_id))
+            .await
+            .ok()
+            .and_then(|mut keys| keys.drain(..).next())
+        else {
+            return;
+        };
+        let current_scheduling = provider_key_scheduling_state(&current_key);
+        let current_code = scheduling_state_code(current_scheduling.as_ref());
+        if effect.quota_exhaustion.is_none() && current_code != Some("quota_suspected") {
+            // The strong read is intentional: another gateway instance may
+            // have written a suspicion after this instance populated its
+            // catalog cache. A cache-negative shortcut could then let two weak
+            // signals become consecutive even though this terminal response
+            // occurred between them.
+            return;
+        }
+        let Some(current_endpoint) = state
+            .read_provider_catalog_endpoints_by_ids(std::slice::from_ref(&context.plan.endpoint_id))
+            .await
+            .ok()
+            .and_then(|mut endpoints| endpoints.drain(..).next())
+        else {
+            return;
+        };
+        let current_fingerprint =
+            match aether_provider_transport::provider_catalog_key_credential_fingerprint(
+                &current_key,
+                &current_endpoint,
+                state.encryption_key().unwrap_or_default(),
+            ) {
+                Ok(fingerprint) => fingerprint,
+                Err(err) => {
+                    warn!(
+                        provider_id = %context.plan.provider_id,
+                        key_id = %context.plan.key_id,
+                        error = ?err,
+                        "gateway quota scheduling effect could not verify credential fence"
+                    );
+                    return;
+                }
+            };
+        if current_fingerprint != expected_fingerprint {
+            return;
+        }
+
+        let next_scheduling = match effect.quota_exhaustion {
+            Some(evidence) if current_code == Some("quota_exhausted") => {
+                let mut confirmed = current_scheduling
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                confirmed.insert(
+                    "code".to_string(),
+                    Value::String("quota_exhausted".to_string()),
+                );
+                confirmed.insert("blocked".to_string(), Value::Bool(true));
+                confirmed.insert("requires_manual_recovery".to_string(), Value::Bool(true));
+                confirmed.insert(
+                    "source".to_string(),
+                    Value::String(evidence.source.as_str().to_string()),
+                );
+                confirmed.insert(
+                    "confidence".to_string(),
+                    Value::String(evidence.confidence.as_str().to_string()),
+                );
+                confirmed.insert(
+                    "confirmation_count".to_string(),
+                    serde_json::json!(scheduling_state_confirmation_count(
+                        current_scheduling.as_ref()
+                    )
+                    .saturating_add(1)),
+                );
+                confirmed.insert(
+                    "status_code".to_string(),
+                    serde_json::json!(effect.status_code),
+                );
+                confirmed.insert(
+                    "error_code".to_string(),
+                    serde_json::json!(local_quota_exhaustion_error_code(effect.response_text)),
+                );
+                confirmed.insert(
+                    "reason".to_string(),
+                    serde_json::json!(truncated_scheduling_reason(effect.response_text)),
+                );
+                confirmed.insert(
+                    "last_observed_at".to_string(),
+                    serde_json::json!(observed_at),
+                );
+                Some(Value::Object(confirmed))
+            }
+            Some(evidence) => {
+                let same_credential = current_scheduling
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|state| state.get("credential_fingerprint"))
+                    .and_then(Value::as_str)
+                    == Some(expected_fingerprint);
+                let previous_count = if current_code == Some("quota_suspected") && same_credential {
+                    scheduling_state_confirmation_count(current_scheduling.as_ref())
+                } else {
+                    0
+                };
+                let confirmation_count =
+                    if matches!(evidence.confidence, LocalQuotaExhaustionConfidence::Strong) {
+                        1
+                    } else {
+                        previous_count.saturating_add(1)
+                    };
+                let blocked = matches!(evidence.confidence, LocalQuotaExhaustionConfidence::Strong)
+                    || confirmation_count >= 2;
+                Some(serde_json::json!({
+                    "code": if blocked { "quota_exhausted" } else { "quota_suspected" },
+                    "blocked": blocked,
+                    "requires_manual_recovery": blocked,
+                    "source": evidence.source.as_str(),
+                    "confidence": evidence.confidence.as_str(),
+                    "confirmation_count": confirmation_count,
+                    "status_code": effect.status_code,
+                    "error_code": local_quota_exhaustion_error_code(effect.response_text),
+                    "reason": truncated_scheduling_reason(effect.response_text),
+                    "credential_fingerprint": expected_fingerprint,
+                    "first_observed_at": if same_credential {
+                        scheduling_state_first_observed_at(current_scheduling.as_ref(), observed_at)
+                    } else {
+                        observed_at
+                    },
+                    "last_observed_at": observed_at,
+                }))
+            }
+            None if current_code == Some("quota_suspected") => None,
+            None => return,
+        };
+
+        let update = ProviderCatalogKeySchedulingStateCasUpdate {
+            key_id: current_key.id.clone(),
+            expected_encrypted_api_key: current_key.encrypted_api_key.clone(),
+            expected_encrypted_auth_config: current_key.encrypted_auth_config.clone(),
+            expected_auth_type: current_key.auth_type.clone(),
+            expected_scheduling: current_scheduling,
+            scheduling: next_scheduling.clone(),
+            updated_at_unix_secs: Some(observed_at),
+        };
+        match state
+            .compare_and_update_provider_catalog_key_scheduling_state(&update)
+            .await
+        {
+            Ok(true) => {
+                let blocked =
+                    scheduling_state_code(next_scheduling.as_ref()) == Some("quota_exhausted");
+                if blocked {
+                    if project_pool_state {
+                        persist_pool_score_schedule_feedback(
+                            state,
+                            context,
+                            None,
+                            Some(PoolMemberHardState::QuotaExhausted),
+                            None,
+                            serde_json::json!({
+                                "hard_state_source": "runtime_quota_exhaustion",
+                                "last_request_feedback": {
+                                    "source": "runtime_quota_exhaustion",
+                                    "status_code": effect.status_code,
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    let _ = state
+                        .runtime_state
+                        .set_remove(
+                            &admin_provider_pool_quota_probe_active_members_key(
+                                &context.plan.provider_id,
+                            ),
+                            &context.plan.key_id,
+                        )
+                        .await;
+                }
+                return;
+            }
+            Ok(false) => tokio::task::yield_now().await,
+            Err(err) => {
+                warn!(
+                    provider_id = %context.plan.provider_id,
+                    key_id = %context.plan.key_id,
+                    error = ?err,
+                    "gateway quota scheduling effect failed to persist state"
+                );
+                return;
+            }
+        }
+    }
+    warn!(
+        provider_id = %context.plan.provider_id,
+        key_id = %context.plan.key_id,
+        "gateway quota scheduling effect exhausted CAS retries"
+    );
 }
 
 fn local_scheduler_affinity_cache_key(report_context: Option<&Value>) -> Option<String> {
@@ -1367,6 +1748,16 @@ async fn record_health_success_effect(
     context: LocalExecutionEffectContext<'_>,
     _effect: LocalHealthSuccessEffect,
 ) {
+    record_scheduling_state_effect(
+        state,
+        context,
+        LocalSchedulingStateEffect {
+            status_code: 200,
+            response_text: None,
+            quota_exhaustion: None,
+        },
+    )
+    .await;
     remember_successful_local_scheduler_affinity(state, context).await;
 
     let api_format = context.plan.provider_api_format.trim();
@@ -1861,7 +2252,8 @@ fn local_candidate_failure_should_invalidate_affinity(
     match classification {
         LocalFailoverClassification::RetrySuccessPattern
         | LocalFailoverClassification::RetryStatusCode
-        | LocalFailoverClassification::RetryUpstreamFailure => true,
+        | LocalFailoverClassification::RetryUpstreamFailure
+        | LocalFailoverClassification::RetryQuotaExhausted => true,
         LocalFailoverClassification::UseDefault | LocalFailoverClassification::StopStatusCode => {
             status_code >= 500
         }
@@ -1897,6 +2289,12 @@ fn local_candidate_failure_should_apply_key_effects(
     classification: LocalFailoverClassification,
     status_code: u16,
 ) -> bool {
+    if matches!(
+        classification,
+        LocalFailoverClassification::RetryQuotaExhausted
+    ) {
+        return false;
+    }
     if !provider_api_format
         .trim()
         .eq_ignore_ascii_case("claude:messages")
@@ -1972,6 +2370,88 @@ async fn record_pool_score_schedule_feedback(
     if !pool_score_feedback_gate_allows(context.plan, succeeded, hard_state, score_delta) {
         return;
     }
+
+    let projection_lock = match state
+        .acquire_provider_key_quota_projection_lock(&context.plan.provider_id, &context.plan.key_id)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(err) => {
+            warn!(
+                provider_id = %context.plan.provider_id,
+                key_id = %context.plan.key_id,
+                error = ?err,
+                "gateway pool score feedback skipped because quota projection fence is busy"
+            );
+            return;
+        }
+    };
+    let runtime_quota_blocked = match state
+        .provider_key_runtime_quota_blocked_strong(&context.plan.provider_id, &context.plan.key_id)
+        .await
+    {
+        Ok(Some(blocked)) => blocked,
+        Ok(None) => {
+            state
+                .release_provider_key_quota_projection_lock(projection_lock)
+                .await;
+            return;
+        }
+        Err(err) => {
+            warn!(
+                provider_id = %context.plan.provider_id,
+                key_id = %context.plan.key_id,
+                error = ?err,
+                "gateway pool score feedback could not verify quota scheduling state"
+            );
+            state
+                .release_provider_key_quota_projection_lock(projection_lock)
+                .await;
+            return;
+        }
+    };
+    if runtime_quota_blocked {
+        // A late success, timeout or health feedback must never downgrade the
+        // administrator-recoverable scheduling fact. Reassert only the hard
+        // projection without training success/failure counters.
+        persist_pool_score_schedule_feedback(
+            state,
+            context,
+            None,
+            Some(PoolMemberHardState::QuotaExhausted),
+            None,
+            serde_json::json!({
+                "hard_state_source": "runtime_quota_exhaustion",
+                "last_request_feedback": {
+                    "source": "runtime_quota_exhaustion_guard"
+                }
+            }),
+        )
+        .await;
+    } else {
+        persist_pool_score_schedule_feedback(
+            state,
+            context,
+            succeeded,
+            hard_state,
+            score_delta,
+            score_reason_patch,
+        )
+        .await;
+    }
+    state
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
+}
+
+async fn persist_pool_score_schedule_feedback(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    succeeded: Option<bool>,
+    hard_state: Option<PoolMemberHardState>,
+    score_delta: Option<i32>,
+    score_reason_patch: Value,
+) {
     let feedback = PoolMemberScheduleFeedback {
         identity: PoolMemberIdentity::provider_api_key(
             context.plan.provider_id.clone(),

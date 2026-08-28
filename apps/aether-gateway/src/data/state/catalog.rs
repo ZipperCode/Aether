@@ -4,11 +4,12 @@ use super::{
     ProviderCatalogKeyAdminCasUpdate, ProviderCatalogKeyHealthStateUpdate,
     ProviderCatalogKeyListQuery, ProviderCatalogKeyOAuthCredentialCasDelete,
     ProviderCatalogKeyOAuthRuntimeStateCasUpdate, ProviderCatalogKeyRuntimeMetadataUpdate,
-    ProviderCatalogKeyStatusSnapshotUpdate, PublicHealthStatusCount, PublicHealthTimelineBucket,
-    StoredGeminiFileMapping, StoredGeminiFileMappingListPage, StoredProviderCatalogEndpoint,
-    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
-    StoredRequestCandidate, UpsertGeminiFileMappingRecord, UpsertRequestCandidateRecord,
+    ProviderCatalogKeySchedulingStateCasUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
+    PublicHealthStatusCount, PublicHealthTimelineBucket, StoredGeminiFileMapping,
+    StoredGeminiFileMappingListPage, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
+    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider, StoredRequestCandidate,
+    UpsertGeminiFileMappingRecord, UpsertRequestCandidateRecord,
 };
 
 impl GatewayDataState {
@@ -846,6 +847,22 @@ impl GatewayDataState {
         if updated {
             self.clear_provider_catalog_cache();
         }
+        Ok(updated)
+    }
+
+    pub(crate) async fn compare_and_update_provider_catalog_key_scheduling_state(
+        &self,
+        update: &ProviderCatalogKeySchedulingStateCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let Some(repository) = &self.provider_catalog_writer else {
+            return Ok(false);
+        };
+        let updated = repository
+            .compare_and_update_key_scheduling_state(update)
+            .await?;
+        // A false result means another instance changed either the credential
+        // or scheduling state. Always clear the read cache before retrying.
+        self.clear_provider_catalog_cache();
         Ok(updated)
     }
 
