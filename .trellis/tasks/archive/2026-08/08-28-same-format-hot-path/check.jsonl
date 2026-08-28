@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "检查是否重复 exact-body 资格逻辑"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "检查 RequestBody 和流式跨层语义"}
+{"file": ".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md", "reason": "检查 Responses precommit、未知字段和重试边界"}
+{"file": ".trellis/spec/aether-gateway/backend/quality-guidelines.md", "reason": "检查 Gateway 共享执行边界和范围化验证"}
+{"file": ".trellis/tasks/08-28-same-format-hot-path/research/request-byte-fidelity.md", "reason": "核对请求实现与已确认缺口"}
+{"file": ".trellis/tasks/08-28-same-format-hot-path/research/stream-fast-path.md", "reason": "核对流式实现未越过 Responses 安全边界"}
+{"file": ".trellis/tasks/08-28-same-format-hot-path/research/validation-baseline.md", "reason": "核对最小测试和性能声明边界"}

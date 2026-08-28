@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "复用现有 OriginalRequestPayload 与 RequestBody resolver，禁止平行机制"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "校验 frontdoor 到 ExecutionPlan/Tunnel 的请求体边界"}
+{"file": ".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md", "reason": "保持 native Responses 字节、首事件分类和 failover 合同"}
+{"file": ".trellis/tasks/08-28-same-format-hot-path/research/request-byte-fidelity.md", "reason": "最新请求路径、缺口与最小改动证据"}
+{"file": ".trellis/tasks/08-28-same-format-hot-path/research/stream-fast-path.md", "reason": "流式直通边界与单点 copy elimination 证据"}
+{"file": ".trellis/tasks/08-28-same-format-hot-path/research/validation-baseline.md", "reason": "聚焦测试和可复现验证基线"}
