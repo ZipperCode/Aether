@@ -1,0 +1,5 @@
+{"file":".trellis/spec/aether-ai-formats/backend/index.md","reason":"Review canonical mappings, same-format preservation, and lossy conversion guards."}
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"Review gateway ownership for response headers and models routes."}
+{"file":".trellis/spec/aether-gateway/backend/quality-guidelines.md","reason":"Review response handling against existing gateway quality contracts."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Verify data survives every request/response/stream boundary."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Check for duplicated mode and catalog projection logic."}

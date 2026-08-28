@@ -22,7 +22,8 @@ use super::models_responses::{
 };
 use super::models_shared::{
     filter_catalog_for_models, filter_eligible_model_rows, filter_global_models_for_models,
-    models_api_format, models_detail_id,
+    models_api_format, models_detail_id, project_gemini_model_value,
+    provider_type_supports_gemini_count_tokens,
 };
 use super::{query_param_value, AppState, GatewayPublicRequestContext};
 
@@ -349,25 +350,9 @@ fn build_claude_catalog_model_detail_response(row: &StoredModelCatalogEntry) -> 
     .into_response()
 }
 
-fn build_gemini_catalog_model_value(model_name: &str) -> Value {
-    json!({
-        "name": format!("models/{model_name}"),
-        "baseModelId": model_name,
-        "version": "001",
-        "displayName": model_name,
-        "description": format!("Model {model_name}"),
-        "inputTokenLimit": 128000,
-        "outputTokenLimit": 8192,
-        "supportedGenerationMethods": ["generateContent", "countTokens"],
-        "temperature": 1.0,
-        "maxTemperature": 2.0,
-        "topP": 0.95,
-        "topK": 64,
-    })
-}
-
 fn build_gemini_catalog_models_list_response(
     model_names: &[String],
+    count_tokens_models: &BTreeSet<String>,
     page_size: usize,
     page_token: Option<&str>,
 ) -> Response<Body> {
@@ -379,7 +364,9 @@ fn build_gemini_catalog_models_list_response(
         .iter()
         .skip(start_idx)
         .take(page_size)
-        .map(|model_name| build_gemini_catalog_model_value(model_name))
+        .map(|model_name| {
+            project_gemini_model_value(model_name, count_tokens_models.contains(model_name))
+        })
         .collect::<Vec<_>>();
     let mut payload = json!({ "models": window });
     if end_idx < model_names.len() {
@@ -388,13 +375,48 @@ fn build_gemini_catalog_models_list_response(
     Json(payload).into_response()
 }
 
-fn build_gemini_catalog_model_detail_response(row: &StoredModelCatalogEntry) -> Response<Body> {
-    Json(build_gemini_catalog_model_value(&row.global_model_name)).into_response()
+fn build_gemini_catalog_model_detail_response(
+    row: &StoredModelCatalogEntry,
+    supports_count_tokens: bool,
+) -> Response<Body> {
+    Json(project_gemini_model_value(
+        &row.global_model_name,
+        supports_count_tokens,
+    ))
+    .into_response()
 }
 
 struct PublishedModelsList {
     model_names: Vec<String>,
     catalog_rows: Vec<StoredModelCatalogEntry>,
+    gemini_count_tokens_models: BTreeSet<String>,
+}
+
+async fn load_gemini_count_tokens_models(
+    state: &AppState,
+    auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
+) -> Option<BTreeSet<String>> {
+    let rows = await_models_route_read(
+        "gemini_count_tokens_candidates",
+        state.list_minimal_candidate_selection_rows_for_api_format("gemini:generate_content"),
+    )
+    .await?;
+    Some(
+        filter_eligible_model_rows(rows, auth_snapshot, "gemini:generate_content")
+            .into_iter()
+            .filter(|row| provider_type_supports_gemini_count_tokens(&row.provider_type))
+            .filter(|row| {
+                aether_scheduler_core::row_supports_requested_model_with_model_directives_and_request_operation(
+                    row,
+                    &row.global_model_name,
+                    "gemini:generate_content",
+                    false,
+                    Some("count_tokens"),
+                )
+            })
+            .map(|row| row.global_model_name)
+            .collect(),
+    )
 }
 
 async fn list_models_for_client_format(
@@ -402,6 +424,14 @@ async fn list_models_for_client_format(
     api_format: &str,
     auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
 ) -> Option<PublishedModelsList> {
+    let gemini_count_tokens_models =
+        if crate::ai_serving::normalize_api_format_alias(api_format) == "gemini:generate_content" {
+            load_gemini_count_tokens_models(state, auth_snapshot)
+                .await
+                .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
     // 标准 OpenAI 模型目录发布配置可见性，不把 `/v1/models` 误当作 Chat 调用能力校验。
     let model_family_filter =
         (!is_standard_openai_models_api_format(api_format)).then_some(api_format);
@@ -414,6 +444,7 @@ async fn list_models_for_client_format(
                 .iter()
                 .map(|row| row.global_model_name.clone())
                 .collect(),
+            gemini_count_tokens_models,
             catalog_rows: rows,
         });
     }
@@ -421,7 +452,9 @@ async fn list_models_for_client_format(
     let provider_restricted = auth_snapshot
         .and_then(crate::data::auth::GatewayAuthApiKeySnapshot::effective_allowed_providers)
         .is_some();
-    let needs_catalog = provider_restricted || is_codex_models_api_format(api_format);
+    let needs_catalog = provider_restricted
+        || is_codex_models_api_format(api_format)
+        || crate::ai_serving::normalize_api_format_alias(api_format) == "gemini:generate_content";
     let catalog_rows = if needs_catalog {
         let rows =
             await_models_route_read("model_catalog", state.data.list_model_catalog()).await?;
@@ -458,6 +491,7 @@ async fn list_models_for_client_format(
                 .iter()
                 .map(|row| row.global_model_name.clone())
                 .collect(),
+            gemini_count_tokens_models,
             catalog_rows: rows,
         });
     }
@@ -473,6 +507,7 @@ async fn list_models_for_client_format(
         .collect::<BTreeSet<_>>();
     Some(PublishedModelsList {
         model_names: visible_names.iter().cloned().collect(),
+        gemini_count_tokens_models,
         catalog_rows: catalog_rows
             .into_iter()
             .filter(|row| visible_names.contains(&row.global_model_name))
@@ -671,6 +706,7 @@ pub(super) async fn maybe_build_local_models_route_response(
                     );
                     build_gemini_catalog_models_list_response(
                         &published.model_names,
+                        &published.gemini_count_tokens_models,
                         page_size,
                         page_token.as_deref(),
                     )
@@ -719,7 +755,14 @@ pub(super) async fn maybe_build_local_models_route_response(
             };
             let response = match api_format {
                 "claude:messages" => build_claude_catalog_model_detail_response(row),
-                "gemini:generate_content" => build_gemini_catalog_model_detail_response(row),
+                "gemini:generate_content" => {
+                    let supports_count_tokens =
+                        load_gemini_count_tokens_models(state, auth_snapshot)
+                            .await
+                            .unwrap_or_default()
+                            .contains(&model_id);
+                    build_gemini_catalog_model_detail_response(row, supports_count_tokens)
+                }
                 _ => build_openai_catalog_model_detail_response(&row.global_model_name),
             };
             Some(response)

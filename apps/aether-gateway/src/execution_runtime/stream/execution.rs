@@ -63,12 +63,12 @@ use self::execution_failures::{
 use crate::ai_serving::api::{
     extract_provider_private_stream_error_body, maybe_bridge_standard_sync_json_to_stream,
     maybe_build_provider_private_stream_normalizer, maybe_build_stream_response_rewriter,
-    normalize_provider_private_report_context, StreamingStandardTerminalObserver,
-    CLAUDE_CHAT_STREAM_PLAN_KIND, CLAUDE_CLI_STREAM_PLAN_KIND, GEMINI_CHAT_STREAM_PLAN_KIND,
-    GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_INTERACTIONS_STREAM_PLAN_KIND,
-    OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_IMAGE_STREAM_PLAN_KIND,
-    OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND, OPENAI_RESPONSES_STREAM_PLAN_KIND,
-    UPSTREAM_IS_STREAM_KEY,
+    normalize_provider_private_report_context, resolve_gemini_stream_wire_mode,
+    GeminiStreamWireMode, StreamingStandardTerminalObserver, CLAUDE_CHAT_STREAM_PLAN_KIND,
+    CLAUDE_CLI_STREAM_PLAN_KIND, GEMINI_CHAT_STREAM_PLAN_KIND, GEMINI_CLI_STREAM_PLAN_KIND,
+    GEMINI_INTERACTIONS_STREAM_PLAN_KIND, OPENAI_CHAT_STREAM_PLAN_KIND,
+    OPENAI_IMAGE_STREAM_PLAN_KIND, OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND,
+    OPENAI_RESPONSES_STREAM_PLAN_KIND, UPSTREAM_IS_STREAM_KEY,
 };
 use crate::ai_serving::is_openai_responses_family_format;
 use crate::api::response::{
@@ -4876,12 +4876,19 @@ fn should_normalize_declared_stream_response_headers(
 }
 
 fn normalize_declared_stream_response_headers(headers: &mut BTreeMap<String, String>) {
+    normalize_declared_stream_response_headers_with_content_type(headers, "text/event-stream");
+}
+
+fn normalize_declared_stream_response_headers_with_content_type(
+    headers: &mut BTreeMap<String, String>,
+    content_type: &str,
+) {
     headers.retain(|name, _| {
         !name.eq_ignore_ascii_case("content-encoding")
             && !name.eq_ignore_ascii_case("content-length")
             && !name.eq_ignore_ascii_case("content-type")
     });
-    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    headers.insert("content-type".to_string(), content_type.to_string());
 }
 
 fn parse_prefetched_sync_json_body(body: &[u8]) -> Option<Value> {
@@ -4968,6 +4975,105 @@ fn encode_terminal_sse_error_event_for_plan(
     } else {
         encode_terminal_sse_error_event(failure)
     }
+}
+
+fn encode_gemini_json_array_terminal_error(
+    failure: &StreamFailureReport,
+    buffered_body: &[u8],
+) -> Result<Bytes, std::io::Error> {
+    let status = gemini_stream_error_status(failure);
+    let mut error_fields = serde_json::Map::from_iter([
+        ("code".to_string(), Value::from(failure.status_code)),
+        (
+            "message".to_string(),
+            Value::String(failure.error_message.clone()),
+        ),
+        ("status".to_string(), Value::String(status.to_string())),
+    ]);
+    if let Some(details) = failure
+        .provider_body_json
+        .as_ref()
+        .and_then(|body| body.get("error"))
+        .and_then(Value::as_object)
+        .and_then(|error| error.get("details"))
+        .filter(|details| details.is_array() || details.is_object())
+    {
+        error_fields.insert("details".to_string(), details.clone());
+    }
+    let error = Value::Object(serde_json::Map::from_iter([(
+        "error".to_string(),
+        Value::Object(error_fields),
+    )]));
+    let payload = serde_json::to_vec(&error).map_err(|err| IoError::other(err.to_string()))?;
+    let mut bytes = Vec::with_capacity(payload.len().saturating_add(3));
+    match buffered_body
+        .iter()
+        .rev()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .copied()
+    {
+        None => bytes.push(b'['),
+        Some(b'[') => {}
+        Some(b']') => return Ok(Bytes::new()),
+        Some(_) => bytes.push(b','),
+    }
+    bytes.extend(payload);
+    bytes.push(b']');
+    Ok(Bytes::from(bytes))
+}
+
+/// Map gateway/upstream failure labels to the status enum used by Gemini's
+/// JSON error contract. Upstream Gemini statuses are preserved; internal
+/// execution labels are translated from the HTTP status instead of leaking
+/// implementation-specific strings to the client.
+fn gemini_stream_error_status(failure: &StreamFailureReport) -> &'static str {
+    if let Some(status) = failure
+        .provider_body_json
+        .as_ref()
+        .and_then(|body| body.get("error"))
+        .and_then(Value::as_object)
+        .and_then(|error| error.get("status"))
+        .and_then(Value::as_str)
+        .and_then(gemini_known_error_status)
+    {
+        return status;
+    }
+    let normalized = failure.error_type.trim().to_ascii_uppercase();
+    gemini_known_error_status(&normalized).unwrap_or_else(|| match failure.status_code {
+        408 | 504 => "DEADLINE_EXCEEDED",
+        400 | 413 => "INVALID_ARGUMENT",
+        401 => "UNAUTHENTICATED",
+        403 => "PERMISSION_DENIED",
+        404 => "NOT_FOUND",
+        409 => "ABORTED",
+        429 => "RESOURCE_EXHAUSTED",
+        501 => "UNIMPLEMENTED",
+        503 => "UNAVAILABLE",
+        500..=599 => "INTERNAL",
+        _ => "UNKNOWN",
+    })
+}
+
+fn gemini_known_error_status(value: &str) -> Option<&'static str> {
+    Some(match value.trim().to_ascii_uppercase().as_str() {
+        "CANCELLED" => "CANCELLED",
+        "UNKNOWN" => "UNKNOWN",
+        "INVALID_ARGUMENT" => "INVALID_ARGUMENT",
+        "DEADLINE_EXCEEDED" => "DEADLINE_EXCEEDED",
+        "NOT_FOUND" => "NOT_FOUND",
+        "ALREADY_EXISTS" => "ALREADY_EXISTS",
+        "PERMISSION_DENIED" => "PERMISSION_DENIED",
+        "UNAUTHENTICATED" => "UNAUTHENTICATED",
+        "RESOURCE_EXHAUSTED" => "RESOURCE_EXHAUSTED",
+        "FAILED_PRECONDITION" => "FAILED_PRECONDITION",
+        "ABORTED" => "ABORTED",
+        "OUT_OF_RANGE" => "OUT_OF_RANGE",
+        "UNIMPLEMENTED" => "UNIMPLEMENTED",
+        "INTERNAL" => "INTERNAL",
+        "UNAVAILABLE" => "UNAVAILABLE",
+        "DATA_LOSS" => "DATA_LOSS",
+        _ => return None,
+    })
 }
 
 fn image_stream_failed_event_name(report_context: Option<&Value>) -> &'static str {
@@ -6512,10 +6618,24 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         maybe_build_provider_private_stream_normalizer(private_stream_normalizer_context.as_ref());
     let mut local_stream_rewriter =
         maybe_build_stream_response_rewriter(normalized_stream_report_context.as_ref());
+    let gemini_stream_content_type = report_context
+        .as_ref()
+        .and_then(resolve_gemini_stream_wire_mode)
+        .or_else(|| {
+            normalized_stream_report_context
+                .as_ref()
+                .and_then(resolve_gemini_stream_wire_mode)
+        })
+        .filter(|mode| *mode == GeminiStreamWireMode::JsonArray)
+        .map(|_| "application/json")
+        .unwrap_or("text/event-stream");
     if private_stream_normalizer.is_some() || local_stream_rewriter.is_some() {
         headers.remove("content-encoding");
         headers.remove("content-length");
-        headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        headers.insert(
+            "content-type".to_string(),
+            gemini_stream_content_type.to_string(),
+        );
     }
     let upstream_content_type = upstream_headers.get("content-type").map(String::as_str);
     let normalized_declared_stream_headers = private_stream_normalizer.is_none()
@@ -6527,7 +6647,10 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             report_context.as_ref(),
         );
     if normalized_declared_stream_headers {
-        normalize_declared_stream_response_headers(&mut headers);
+        normalize_declared_stream_response_headers_with_content_type(
+            &mut headers,
+            gemini_stream_content_type,
+        );
         debug!(
             event_name = "execution_runtime_stream_content_type_corrected",
             log_type = "debug",
@@ -6997,7 +7120,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                     headers.remove("content-length");
                                     headers.insert(
                                         "content-type".to_string(),
-                                        "text/event-stream".to_string(),
+                                        gemini_stream_content_type.to_string(),
                                     );
                                     stream_terminal_summary = outcome.terminal_summary;
                                     prefetched_body.extend_from_slice(&outcome.sse_body);
@@ -7277,6 +7400,17 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     }
 
     apply_endpoint_response_header_rules(state, &plan, &mut headers, None).await?;
+    if gemini_stream_content_type == "application/json" {
+        // The body is emitted by Aether's normalized stream path. Re-assert
+        // its framing after endpoint header rules so JSON-array Gemini
+        // responses are not mislabeled as SSE (or compressed upstream data).
+        headers.remove("content-encoding");
+        headers.remove("content-length");
+        headers.insert(
+            "content-type".to_string(),
+            gemini_stream_content_type.to_string(),
+        );
+    }
 
     let request_id = request_id.to_string();
     let candidate_id = candidate_id.map(ToOwned::to_owned);
@@ -8324,6 +8458,18 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     Some(encode_openai_image_failed_event(
                         report_context_owned.as_ref(),
                         failure,
+                    ))
+                } else if gemini_stream_content_type == "application/json"
+                    && !provider_error_forwarded_to_client
+                    && !buffered_body
+                        .iter()
+                        .rev()
+                        .find(|byte| !byte.is_ascii_whitespace())
+                        .is_some_and(|byte| *byte == b']')
+                {
+                    Some(encode_gemini_json_array_terminal_error(
+                        failure,
+                        &buffered_body,
                     ))
                 } else if emit_passthrough_sse_terminal_error && !provider_error_forwarded_to_client
                 {

@@ -25,7 +25,9 @@ use crate::formats::shared::stream_core::{
     StreamingStandardTerminalObserver,
 };
 use crate::formats::shared::stream_rewrite::maybe_build_ai_surface_stream_rewriter;
-use crate::formats::shared::AiSurfaceFinalizeError;
+use crate::formats::shared::{
+    resolve_gemini_stream_wire_mode, AiSurfaceFinalizeError, GeminiStreamWireMode,
+};
 
 pub struct SyncToStreamBridgeOutcome {
     pub sse_body: Vec<u8>,
@@ -1068,7 +1070,10 @@ fn emit_client_stream_from_canonical_frames(
             emit_with_claude_emitter(&mut emitter, canonical_frames)
         }
         "gemini:generate_content" => {
-            let mut emitter = GeminiClientEmitter::default();
+            let mut emitter = GeminiClientEmitter::with_wire_mode(
+                resolve_gemini_stream_wire_mode(report_context)
+                    .unwrap_or(GeminiStreamWireMode::Sse),
+            );
             emit_with_gemini_emitter(&mut emitter, canonical_frames)
         }
         _ => Ok(Vec::new()),

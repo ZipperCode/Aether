@@ -129,7 +129,7 @@ High-risk fields:
 
 ## Gemini GenerateContent <-> OpenAI Chat / Responses / Claude
 
-Gemini to OpenAI Chat, Gemini to OpenAI Responses, Gemini to Claude, and reverse generation paths are included in the field coverage matrix. Gemini-only request fields are preserved same-format and blocked cross-format unless the target mapping is explicitly audited.
+Gemini to OpenAI Chat, Gemini to OpenAI Responses, Gemini to Claude, and reverse generation paths are included in the field coverage matrix. Gemini-only request fields are preserved same-format and blocked cross-format unless the target mapping is explicitly audited; the four standard penalty/logprob controls are the audited exception.
 
 High-risk fields:
 
@@ -140,6 +140,7 @@ High-risk fields:
 | `toolConfig.functionCallingConfig.allowedFunctionNames` | OpenAI/Claude tool choice | single-name mapping implemented; multi-name input is lossy-blocked |
 | `toolConfig.functionCallingConfig.mode` | OpenAI/Claude tool choice enum | valid enum required; invalid values fail with `InvalidEnumValue` |
 | `generationConfig.thinkingConfig.thinkingLevel` | OpenAI/Claude reasoning effort | low/medium/high mapping implemented; invalid values fail closed |
+| `generationConfig.presencePenalty`, `frequencyPenalty`, `responseLogprobs`, `logprobs` | OpenAI Chat generation controls | mapped through canonical generation fields; targets without an equivalent remain lossy-blocked |
 | `safetySettings` | OpenAI/Claude no direct equivalent | lossy-blocked |
 | `cachedContent` | OpenAI/Claude no direct equivalent | lossy-blocked |
 | `codeExecution` | OpenAI/Claude tool/builtin mismatch | lossy-blocked |

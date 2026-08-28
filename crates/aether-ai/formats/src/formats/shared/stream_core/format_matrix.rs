@@ -21,6 +21,7 @@ use crate::formats::shared::stream_core::common::{
     unsupported_stream_event_message, CanonicalStreamEvent, CanonicalStreamFrame, CanonicalUsage,
 };
 use crate::formats::shared::AiSurfaceFinalizeError;
+use crate::formats::shared::{resolve_gemini_stream_wire_mode, GeminiStreamWireMode};
 
 #[derive(Default)]
 pub struct StreamingStandardFormatMatrix {
@@ -546,7 +547,10 @@ impl ClientStreamEmitter {
                     ),
                 ))
             }
-            FormatId::GeminiGenerateContent => Self::Gemini(GeminiClientEmitter::default()),
+            FormatId::GeminiGenerateContent => Self::Gemini(GeminiClientEmitter::with_wire_mode(
+                resolve_gemini_stream_wire_mode(report_context)
+                    .unwrap_or(GeminiStreamWireMode::Sse),
+            )),
             FormatId::OpenAiEmbedding
             | FormatId::OpenAiRealtime
             | FormatId::OpenAiSearch
@@ -594,9 +598,8 @@ impl ClientStreamEmitter {
                 let event = error_body.get("type").and_then(Value::as_str);
                 encode_json_sse(event, &error_body)
             }
-            ClientStreamEmitter::OpenAIChat(_) | ClientStreamEmitter::Gemini(_) => {
-                encode_json_sse(None, &error_body)
-            }
+            ClientStreamEmitter::OpenAIChat(_) => encode_json_sse(None, &error_body),
+            ClientStreamEmitter::Gemini(state) => state.emit_error(error_body),
         }
     }
 

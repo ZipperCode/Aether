@@ -76,6 +76,12 @@ impl ClaudeProviderState {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
+        if claude_stream_cross_format(report_context)
+            && audit_claude_cross_format_stream_event(event_object).is_some()
+        {
+            out.push(self.unknown_frame(report_context, value.clone()));
+            return Ok(out);
+        }
         match event_object
             .get("type")
             .and_then(Value::as_str)
@@ -993,6 +999,235 @@ fn merge_claude_usage(mut current: CanonicalUsage, next: CanonicalUsage) -> Cano
     };
     current.total_tokens = input_tokens.saturating_add(current.output_tokens);
     current
+}
+
+fn claude_stream_cross_format(report_context: &Value) -> bool {
+    let Some(client_format) = report_context
+        .get("client_api_format")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    crate::formats::id::normalize_api_format_alias(client_format) != "claude:messages"
+}
+
+/// Return the first provider-specific field path that the canonical stream
+/// state machine would otherwise ignore. Same-format Claude streams bypass
+/// this audit and retain their existing native passthrough behavior.
+fn audit_claude_cross_format_stream_event(event: &Map<String, Value>) -> Option<String> {
+    let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+        return Some("type".to_string());
+    };
+    let root_allowed: &[&str] = match event_type {
+        "message_start" => &["type", "message"],
+        "content_block_start" => &["type", "index", "content_block"],
+        "content_block_delta" => &["type", "index", "delta"],
+        "message_delta" => &["type", "delta", "usage"],
+        "content_block_stop" => &["type", "index", "canonical_index"],
+        "message_stop" | "ping" => &["type"],
+        "error" => &["type", "error"],
+        _ => return Some("type".to_string()),
+    };
+    if let Some(field) = first_unallowed_key(event, root_allowed) {
+        return Some(field.to_string());
+    }
+    match event_type {
+        "message_start" => audit_claude_stream_message(event.get("message")),
+        "content_block_start" => audit_claude_stream_content_block(event.get("content_block")),
+        "content_block_delta" => audit_claude_stream_delta(event.get("delta")),
+        "message_delta" => {
+            audit_claude_stream_delta_object(event.get("delta"), &["stop_reason", "stop_sequence"])
+                .or_else(|| {
+                    event
+                        .get("delta")
+                        .and_then(Value::as_object)
+                        .and_then(|delta| {
+                            delta
+                                .get("stop_sequence")
+                                .filter(|value| !value.is_null())
+                                .map(|_| "delta.stop_sequence".to_string())
+                        })
+                })
+                .or_else(|| audit_claude_stream_usage(event.get("usage")))
+        }
+        "error" => event
+            .get("error")
+            .map(|error| {
+                let Some(error) = error.as_object() else {
+                    return Some("error".to_string());
+                };
+                first_unallowed_key(error, &["type", "message"]).map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| Some("error".to_string())),
+        _ => None,
+    }
+}
+
+fn audit_claude_stream_message(message: Option<&Value>) -> Option<String> {
+    let Some(message_value) = message else {
+        return Some("message".to_string());
+    };
+    let Some(message) = message_value.as_object() else {
+        return Some("message".to_string());
+    };
+    if let Some(field) = first_unallowed_key(
+        message,
+        &[
+            "id",
+            "type",
+            "role",
+            "model",
+            "content",
+            "stop_reason",
+            "stop_sequence",
+            "usage",
+            "container",
+            "stop_details",
+        ],
+    ) {
+        return Some(format!("message.{field}"));
+    }
+    if message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| !content.is_empty())
+    {
+        return Some("message.content".to_string());
+    }
+    if message
+        .get("stop_sequence")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Some("message.stop_sequence".to_string());
+    }
+    for field in ["container", "stop_details"] {
+        if message.get(field).is_some_and(|value| !value.is_null()) {
+            return Some(format!("message.{field}"));
+        }
+    }
+    audit_claude_stream_usage(message.get("usage")).map(|field| format!("message.{field}"))
+}
+
+fn audit_claude_stream_content_block(block: Option<&Value>) -> Option<String> {
+    let Some(block_value) = block else {
+        return Some("content_block".to_string());
+    };
+    let Some(block) = block_value.as_object() else {
+        return Some("content_block".to_string());
+    };
+    let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+        return Some("content_block.type".to_string());
+    };
+    let allowed: &[&str] = match block_type {
+        "text" => &["type", "text"],
+        "thinking" => &["type", "thinking", "text", "signature"],
+        "redacted_thinking" => &["type", "data"],
+        "image" | "document" => &["type", "source"],
+        "tool_use" => &["type", "id", "name", "input"],
+        _ => return Some(format!("content_block.type ({block_type})")),
+    };
+    if let Some(field) = first_unallowed_key(block, allowed) {
+        return Some(format!("content_block.{field}"));
+    }
+    if matches!(block_type, "image" | "document") {
+        let Some(source_value) = block.get("source") else {
+            return Some("content_block.source".to_string());
+        };
+        let Some(source) = source_value.as_object() else {
+            return Some("content_block.source".to_string());
+        };
+        if let Some(field) = first_unallowed_key(source, &["type", "media_type", "data", "url"]) {
+            return Some(format!("content_block.source.{field}"));
+        }
+    }
+    None
+}
+
+fn audit_claude_stream_delta(delta: Option<&Value>) -> Option<String> {
+    let Some(delta_value) = delta else {
+        return Some("delta".to_string());
+    };
+    let Some(delta) = delta_value.as_object() else {
+        return Some("delta".to_string());
+    };
+    let Some(delta_type) = delta.get("type").and_then(Value::as_str) else {
+        return Some("delta.type".to_string());
+    };
+    let allowed: &[&str] = match delta_type {
+        "text_delta" => &["type", "text"],
+        "input_json_delta" => &["type", "partial_json"],
+        "thinking_delta" => &["type", "thinking", "text"],
+        "signature_delta" => &["type", "signature"],
+        _ => return Some(format!("delta.type ({delta_type})")),
+    };
+    first_unallowed_key(delta, allowed).map(|field| format!("delta.{field}"))
+}
+
+fn audit_claude_stream_delta_object(delta: Option<&Value>, allowed: &[&str]) -> Option<String> {
+    let Some(delta_value) = delta else {
+        return Some("delta".to_string());
+    };
+    let Some(delta) = delta_value.as_object() else {
+        return Some("delta".to_string());
+    };
+    first_unallowed_key(delta, allowed).map(|field| format!("delta.{field}"))
+}
+
+fn audit_claude_stream_usage(usage: Option<&Value>) -> Option<String> {
+    let Some(usage_value) = usage else {
+        return None;
+    };
+    let Some(usage) = usage_value.as_object() else {
+        return Some("usage".to_string());
+    };
+    let allowed = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_creation",
+        "output_tokens_details",
+        "reasoning_tokens",
+        "server_tool_use",
+        "service_tier",
+        "inference_geo",
+    ];
+    for field in usage.keys() {
+        if !allowed.contains(&field.as_str())
+            && usage.get(field).is_some_and(|value| !value.is_null())
+        {
+            return Some(field.to_string());
+        }
+    }
+    for (field, allowed) in [
+        (
+            "cache_creation",
+            &["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"][..],
+        ),
+        (
+            "output_tokens_details",
+            &["thinking_tokens", "reasoning_tokens"][..],
+        ),
+    ] {
+        let Some(details) = usage.get(field).and_then(Value::as_object) else {
+            continue;
+        };
+        for detail in details.keys() {
+            if !allowed.contains(&detail.as_str())
+                && details.get(detail).is_some_and(|value| !value.is_null())
+            {
+                return Some(format!("{field}.{detail}"));
+            }
+        }
+    }
+    None
+}
+
+fn first_unallowed_key<'a>(object: &'a Map<String, Value>, allowed: &[&str]) -> Option<&'a str> {
+    object
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+        .map(String::as_str)
 }
 
 fn canonical_content_part_from_claude_block(

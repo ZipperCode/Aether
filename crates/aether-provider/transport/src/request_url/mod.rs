@@ -765,22 +765,74 @@ fn maybe_add_gemini_stream_alt_sse(
         return upstream_url;
     }
 
-    let has_alt = upstream_url
-        .split_once('?')
-        .map(|(_, query)| {
-            form_urlencoded::parse(query.as_bytes())
-                .any(|(key, _)| key.as_ref().eq_ignore_ascii_case("alt"))
-        })
-        .unwrap_or(false);
-    if has_alt {
-        return upstream_url;
-    }
+    // Aether's internal Gemini stream parser consumes SSE regardless of the
+    // client's requested public framing.  Do not let an explicit `alt=json`
+    // (or a duplicate/conflicting `alt`) switch the upstream wire format away
+    // from SSE; the public JSON-array envelope is rebuilt at the client edge.
+    let Some((prefix, raw_query_and_fragment)) = upstream_url.split_once('?') else {
+        return upstream_url
+            .split_once('#')
+            .map(|(prefix, fragment)| format!("{prefix}?alt=sse#{fragment}"))
+            .unwrap_or_else(|| format!("{upstream_url}?alt=sse"));
+    };
+    let (raw_query, fragment) = raw_query_and_fragment
+        .split_once('#')
+        .map_or((raw_query_and_fragment, None), |(query, fragment)| {
+            (query, Some(fragment))
+        });
 
-    if upstream_url.contains('?') {
-        format!("{upstream_url}&alt=sse")
+    let mut saw_alt = false;
+    let mut changed = false;
+    let query = raw_query
+        .split('&')
+        .map(|component| {
+            let key = component
+                .split_once('=')
+                .map(|(key, _)| key)
+                .unwrap_or(component);
+            let decoded_key = form_urlencoded::parse(format!("{key}=").as_bytes())
+                .next()
+                .map(|(key, _)| key.into_owned());
+            if decoded_key
+                .as_deref()
+                .is_some_and(|key| key.eq_ignore_ascii_case("alt"))
+            {
+                saw_alt = true;
+                let raw_key = component
+                    .split_once('=')
+                    .map(|(key, _)| key)
+                    .unwrap_or(component);
+                if component
+                    .split_once('=')
+                    .map(|(_, value)| !value.eq_ignore_ascii_case("sse"))
+                    .unwrap_or(true)
+                {
+                    changed = true;
+                    return format!("{raw_key}=sse");
+                }
+            }
+            component.to_string()
+        })
+        .collect::<Vec<_>>();
+
+    let mut rebuilt = if saw_alt {
+        if changed {
+            format!("{prefix}?{}", query.join("&"))
+        } else {
+            upstream_url.clone()
+        }
+    } else if raw_query.is_empty() {
+        format!("{prefix}?alt=sse")
     } else {
-        format!("{upstream_url}?alt=sse")
+        format!("{prefix}?{}&alt=sse", query.join("&"))
+    };
+    if changed || !saw_alt {
+        if let Some(fragment) = fragment {
+            rebuilt.push('#');
+            rebuilt.push_str(fragment);
+        }
     }
+    rebuilt
 }
 
 fn custom_path_template_regex() -> &'static Regex {

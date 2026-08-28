@@ -1144,7 +1144,8 @@ pub(crate) fn gemini_contents_to_canonical_messages(
     };
     let contents = contents.as_array()?;
     let mut messages = Vec::new();
-    for content in contents {
+    let mut pending_calls_by_name = BTreeMap::<String, std::collections::VecDeque<String>>::new();
+    for (message_index, content) in contents.iter().enumerate() {
         let content_object = content.as_object()?;
         let role = match content_object
             .get("role")
@@ -1161,8 +1162,46 @@ pub(crate) fn gemini_contents_to_canonical_messages(
         };
         let parts = content_object.get("parts").and_then(Value::as_array)?;
         let mut blocks = Vec::new();
-        for (index, part) in parts.iter().enumerate() {
-            blocks.push(gemini_part_to_canonical_block(part, index)?);
+        for (part_index, part) in parts.iter().enumerate() {
+            let mut block = gemini_part_to_canonical_block(part, part_index)?;
+            match &mut block {
+                CanonicalContentBlock::ToolUse { id, name, .. } => {
+                    if gemini_function_call_explicit_id(part).is_none() {
+                        *id = format!("call_auto_{message_index}_{part_index}");
+                    }
+                    pending_calls_by_name
+                        .entry(name.clone())
+                        .or_default()
+                        .push_back(id.clone());
+                }
+                CanonicalContentBlock::ToolResult {
+                    tool_use_id, name, ..
+                } => {
+                    if let Some(explicit_id) = gemini_function_response_explicit_id(part) {
+                        consume_pending_gemini_call_id(
+                            &mut pending_calls_by_name,
+                            name.as_deref(),
+                            explicit_id,
+                        );
+                    } else {
+                        if let Some(function_name) = name.as_deref() {
+                            if let Some(pending_id) = pending_calls_by_name
+                                .get_mut(function_name)
+                                .and_then(std::collections::VecDeque::pop_front)
+                            {
+                                *tool_use_id = pending_id;
+                            } else {
+                                *tool_use_id =
+                                    format!("toolu_response_{message_index}_{part_index}");
+                            }
+                        } else {
+                            *tool_use_id = format!("toolu_response_{message_index}_{part_index}");
+                        }
+                    }
+                }
+                _ => {}
+            }
+            blocks.push(block);
         }
         if blocks.is_empty() {
             continue;
@@ -1174,6 +1213,152 @@ pub(crate) fn gemini_contents_to_canonical_messages(
         });
     }
     Some(messages)
+}
+
+/// Remove an explicitly identified Gemini function call from the pending
+/// per-name queues. A response may omit its function name, so fall back to a
+/// global ID lookup to avoid leaving a stale call that could be matched by a
+/// later ID-less response.
+fn consume_pending_gemini_call_id(
+    pending_calls_by_name: &mut BTreeMap<String, std::collections::VecDeque<String>>,
+    function_name: Option<&str>,
+    call_id: &str,
+) {
+    let queue_name = function_name
+        .filter(|name| {
+            pending_calls_by_name
+                .get(*name)
+                .is_some_and(|queue| queue.iter().any(|pending_id| pending_id == call_id))
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            pending_calls_by_name
+                .iter()
+                .find(|(_, queue)| queue.iter().any(|pending_id| pending_id == call_id))
+                .map(|(name, _)| name.clone())
+        });
+    let Some(queue_name) = queue_name else {
+        return;
+    };
+    let remove_queue = if let Some(queue) = pending_calls_by_name.get_mut(&queue_name) {
+        if let Some(position) = queue.iter().position(|pending_id| pending_id == call_id) {
+            queue.remove(position);
+        }
+        queue.is_empty()
+    } else {
+        false
+    };
+    if remove_queue {
+        pending_calls_by_name.remove(&queue_name);
+    }
+}
+
+fn gemini_function_call_explicit_id(part: &Value) -> Option<&str> {
+    part.as_object()?
+        .get("functionCall")
+        .or_else(|| part.get("function_call"))?
+        .as_object()?
+        .get("id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn gemini_function_response_explicit_id(part: &Value) -> Option<&str> {
+    part.as_object()?
+        .get("functionResponse")
+        .or_else(|| part.get("function_response"))?
+        .as_object()?
+        .get("id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Audit the Gemini response-part subset that the canonical conversion model
+/// can preserve. The returned field suffix is appended to the caller's source
+/// path so sync and stream conversion reject the same provider extensions.
+pub(crate) fn audit_gemini_cross_format_response_part(
+    part: &Map<String, Value>,
+) -> Result<(), String> {
+    let variants: [(&str, &str); 7] = [
+        ("inlineData", "inline_data"),
+        ("fileData", "file_data"),
+        ("functionCall", "function_call"),
+        ("functionResponse", "function_response"),
+        ("executableCode", "executable_code"),
+        ("codeExecutionResult", "code_execution_result"),
+        ("text", "text"),
+    ];
+    let present_variants = variants
+        .iter()
+        .filter(|(camel, snake)| part.contains_key(*camel) || part.contains_key(*snake))
+        .collect::<Vec<_>>();
+    if present_variants.len() != 1 {
+        return Err(String::new());
+    }
+    let (primary_camel, primary_snake) = *present_variants[0];
+    let root_field_is_safe = |field: &str| {
+        field == primary_camel
+            || field == primary_snake
+            || (primary_camel == "text"
+                && matches!(field, "thought" | "thoughtSignature" | "thought_signature"))
+    };
+    if let Some(field) = part
+        .keys()
+        .find(|field| !root_field_is_safe(field.as_str()))
+    {
+        return Err(field.clone());
+    }
+    if primary_camel == "text" {
+        if !part.get("text").is_some_and(Value::is_string) {
+            return Err("text".to_string());
+        }
+        if part.get("thought").is_some_and(|value| !value.is_boolean()) {
+            return Err("thought".to_string());
+        }
+        if part
+            .get("thoughtSignature")
+            .or_else(|| part.get("thought_signature"))
+            .is_some_and(|value| !value.is_string())
+        {
+            return Err("thoughtSignature".to_string());
+        }
+        if part.get("thought").and_then(Value::as_bool) != Some(true)
+            && part
+                .get("thoughtSignature")
+                .or_else(|| part.get("thought_signature"))
+                .and_then(Value::as_str)
+                .is_some_and(|signature| !signature.trim().is_empty())
+        {
+            return Err("thoughtSignature".to_string());
+        }
+        return Ok(());
+    }
+
+    let allowed: &[&str] = match primary_camel {
+        "inlineData" => &["mimeType", "mime_type", "data"],
+        "fileData" => &["mimeType", "mime_type", "fileUri", "file_uri"],
+        "functionCall" => &["id", "name", "args"],
+        "functionResponse" => &["id", "name", "response"],
+        "executableCode" => &["language", "code"],
+        "codeExecutionResult" => &["outcome", "output"],
+        _ => return Err(String::new()),
+    };
+    let Some(object) = part
+        .get(primary_camel)
+        .or_else(|| part.get(primary_snake))
+        .and_then(Value::as_object)
+    else {
+        return Err(primary_camel.to_string());
+    };
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(format!("{primary_camel}.{field}"));
+    }
+    Ok(())
 }
 
 pub(crate) fn gemini_part_to_canonical_block(
@@ -1597,7 +1782,19 @@ pub(crate) fn claude_block_to_canonical_block(block: &Value) -> Option<Canonical
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            extensions: claude_extensions(block_object, &["type", "text"]),
+            extensions: {
+                let mut extensions = claude_extensions(block_object, &["type", "text"]);
+                if let Some(annotations) = claude_text_citations_to_openai_annotations(block_object)
+                    .filter(|annotations| !annotations.is_empty())
+                {
+                    canonical_extension_object_mut(
+                        &mut extensions,
+                        OPENAI_RESPONSES_EXTENSION_NAMESPACE,
+                    )
+                    .insert("annotations".to_string(), Value::Array(annotations));
+                }
+                extensions
+            },
         }),
         "thinking" => Some(CanonicalContentBlock::Thinking {
             text: block_object
@@ -1680,6 +1877,338 @@ pub(crate) fn claude_block_to_canonical_block(block: &Value) -> Option<Canonical
             extensions: claude_raw_extensions(BTreeMap::new()),
         }),
     }
+}
+
+/// Project only citations that have an exact OpenAI URL-annotation
+/// representation. A web citation must identify a unique cited text segment
+/// and provide both URL and title; any other citation shape returns `None` so
+/// the cross-format validator can fail closed.
+pub(crate) fn claude_text_citations_to_openai_annotations(
+    block: &Map<String, Value>,
+) -> Option<Vec<Value>> {
+    let Some(citations_value) = block.get("citations") else {
+        return Some(Vec::new());
+    };
+    if citations_value.is_null() {
+        return Some(Vec::new());
+    }
+    let citations = citations_value.as_array()?;
+    let text = block.get("text").and_then(Value::as_str)?;
+    let mut annotations = Vec::with_capacity(citations.len());
+    for citation in citations {
+        let citation = citation.as_object()?;
+        if citation.get("type").and_then(Value::as_str) != Some("web_search_result_location")
+            || citation
+                .keys()
+                .any(|key| !matches!(key.as_str(), "type" | "url" | "title" | "cited_text"))
+        {
+            return None;
+        }
+        let url = citation
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let title = citation
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let cited_text = citation
+            .get("cited_text")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())?;
+        let mut matches = text.match_indices(cited_text);
+        let (byte_start, _) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        let start_index = text[..byte_start].chars().count();
+        let end_index = start_index.saturating_add(cited_text.chars().count());
+        annotations.push(json!({
+            "type": "url_citation",
+            "url": url,
+            "title": title,
+            "start_index": start_index,
+            "end_index": end_index,
+        }));
+    }
+    Some(annotations)
+}
+
+/// Project complete Gemini web grounding/citation metadata into OpenAI URL
+/// annotations keyed by the original Gemini part index. Partial source data,
+/// provider-only confidence/search metadata, or non-web chunks return `None`
+/// so callers can fail closed instead of inventing citation semantics.
+pub(crate) fn gemini_candidate_to_openai_url_annotations(
+    candidate: &Map<String, Value>,
+) -> Option<BTreeMap<usize, Vec<Value>>> {
+    let mut annotations_by_part = BTreeMap::<usize, Vec<Value>>::new();
+    if let Some(grounding) = candidate
+        .get("groundingMetadata")
+        .or_else(|| candidate.get("grounding_metadata"))
+    {
+        let grounding = grounding.as_object()?;
+        if grounding.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "groundingChunks" | "grounding_chunks" | "groundingSupports" | "grounding_supports"
+            )
+        }) {
+            return None;
+        }
+        let chunks = grounding
+            .get("groundingChunks")
+            .or_else(|| grounding.get("grounding_chunks"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let supports = grounding
+            .get("groundingSupports")
+            .or_else(|| grounding.get("grounding_supports"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if (!chunks.is_empty() && supports.is_empty())
+            || (chunks.is_empty() && !supports.is_empty())
+        {
+            return None;
+        }
+        for support in supports {
+            let support = support.as_object()?;
+            if support.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "segment" | "groundingChunkIndices" | "grounding_chunk_indices"
+                )
+            }) {
+                return None;
+            }
+            let segment = support.get("segment")?.as_object()?;
+            let (part_index, start_index, end_index) =
+                gemini_validated_segment(candidate, segment)?;
+            let chunk_indices = support
+                .get("groundingChunkIndices")
+                .or_else(|| support.get("grounding_chunk_indices"))?
+                .as_array()?;
+            if chunk_indices.is_empty() {
+                return None;
+            }
+            for chunk_index in chunk_indices {
+                let chunk_index = usize::try_from(chunk_index.as_u64()?).ok()?;
+                let chunk = chunks.get(chunk_index)?.as_object()?;
+                if chunk.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "web" | "retrievedContext" | "retrieved_context"
+                    )
+                }) {
+                    return None;
+                }
+                if ["web", "retrievedContext", "retrieved_context"]
+                    .iter()
+                    .filter(|key| chunk.contains_key(**key))
+                    .count()
+                    != 1
+                {
+                    return None;
+                }
+                let web = chunk
+                    .get("web")
+                    .or_else(|| chunk.get("retrievedContext"))
+                    .or_else(|| chunk.get("retrieved_context"))
+                    .and_then(Value::as_object)?;
+                if web
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "uri" | "title"))
+                {
+                    return None;
+                }
+                let uri = web
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                let title = web
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                annotations_by_part
+                    .entry(part_index)
+                    .or_default()
+                    .push(json!({
+                        "type": "url_citation",
+                        "url": uri,
+                        "title": title,
+                        "start_index": start_index,
+                        "end_index": end_index,
+                    }));
+            }
+        }
+    }
+
+    if let Some(citation_metadata) = candidate
+        .get("citationMetadata")
+        .or_else(|| candidate.get("citation_metadata"))
+    {
+        let citation_metadata = citation_metadata.as_object()?;
+        if citation_metadata
+            .keys()
+            .any(|key| !matches!(key.as_str(), "citationSources" | "citation_sources"))
+        {
+            return None;
+        }
+        let sources = citation_metadata
+            .get("citationSources")
+            .or_else(|| citation_metadata.get("citation_sources"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for source in sources {
+            let source = source.as_object()?;
+            if source.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "partIndex"
+                        | "part_index"
+                        | "startIndex"
+                        | "start_index"
+                        | "endIndex"
+                        | "end_index"
+                        | "text"
+                        | "uri"
+                        | "title"
+                        | "license"
+                )
+            }) {
+                return None;
+            }
+            let (part_index, start_index, end_index) =
+                gemini_validated_citation_source_segment(candidate, source)?;
+            let uri = source
+                .get("uri")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let title = source
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            if source.get("license").is_some_and(|value| {
+                !value.is_null() && value.as_str().is_none_or(|text| !text.trim().is_empty())
+            }) {
+                return None;
+            }
+            let mut annotation = json!({
+                "type": "url_citation",
+                "url": uri,
+                "start_index": start_index,
+                "end_index": end_index,
+            });
+            annotation["title"] = Value::String(title.to_string());
+            annotations_by_part
+                .entry(part_index)
+                .or_default()
+                .push(annotation);
+        }
+    }
+    Some(annotations_by_part)
+}
+
+fn gemini_validated_segment(
+    candidate: &Map<String, Value>,
+    segment: &Map<String, Value>,
+) -> Option<(usize, usize, usize)> {
+    if segment.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "partIndex"
+                | "part_index"
+                | "startIndex"
+                | "start_index"
+                | "endIndex"
+                | "end_index"
+                | "text"
+        )
+    }) {
+        return None;
+    }
+    let part_index = gemini_value_by_case(segment, "partIndex", "part_index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())?;
+    let start_index = gemini_value_by_case(segment, "startIndex", "start_index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())?;
+    let end_index = gemini_value_by_case(segment, "endIndex", "end_index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())?;
+    if start_index >= end_index {
+        return None;
+    }
+    let part = candidate
+        .get("content")?
+        .as_object()?
+        .get("parts")?
+        .as_array()?
+        .get(part_index)?
+        .as_object()?;
+    if part.get("thought").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let part_text = part.get("text")?.as_str()?;
+    let cited_text = part_text.get(start_index..end_index)?;
+    if let Some(expected_text) = segment.get("text").and_then(Value::as_str) {
+        if cited_text != expected_text {
+            return None;
+        }
+    }
+    Some((
+        part_index,
+        part_text[..start_index].chars().count(),
+        part_text[..end_index].chars().count(),
+    ))
+}
+
+fn gemini_validated_citation_source_segment(
+    candidate: &Map<String, Value>,
+    source: &Map<String, Value>,
+) -> Option<(usize, usize, usize)> {
+    if source.contains_key("partIndex") || source.contains_key("part_index") {
+        return gemini_validated_segment(candidate, source);
+    }
+    let parts = candidate
+        .get("content")?
+        .as_object()?
+        .get("parts")?
+        .as_array()?;
+    let text_parts = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            let object = part.as_object()?;
+            if object.get("thought").and_then(Value::as_bool) == Some(true) {
+                return None;
+            }
+            object.get("text").and_then(Value::as_str).map(|_| index)
+        })
+        .collect::<Vec<_>>();
+    let [part_index] = text_parts.as_slice() else {
+        return None;
+    };
+    let start_index = gemini_value_by_case(source, "startIndex", "start_index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())?;
+    let end_index = gemini_value_by_case(source, "endIndex", "end_index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())?;
+    let segment = Map::from_iter([
+        ("partIndex".to_string(), Value::from(*part_index as u64)),
+        ("startIndex".to_string(), Value::from(start_index as u64)),
+        ("endIndex".to_string(), Value::from(end_index as u64)),
+    ]);
+    gemini_validated_segment(candidate, &segment)
 }
 
 pub(crate) fn claude_media_block_to_canonical(
@@ -4360,7 +4889,15 @@ pub(crate) fn claude_thinking_to_canonical(
 ) -> Option<CanonicalThinkingConfig> {
     let thinking = request.get("thinking").and_then(Value::as_object);
     let output_config = request.get("output_config").and_then(Value::as_object);
-    if thinking.is_none() && output_config.is_none() {
+    let output_effort = output_config
+        .and_then(|value| value.get("effort"))
+        .and_then(Value::as_str)
+        .and_then(claude_output_effort_to_openai_reasoning_effort);
+    // `output_config.format` is a structured-output option, not an implicit
+    // request to enable extended thinking. Only materialize a canonical
+    // thinking object when the caller supplied `thinking` or an output effort
+    // that needs an equivalent target field.
+    if thinking.is_none() && output_effort.is_none() {
         return None;
     }
     let mut extensions = BTreeMap::new();
@@ -4378,36 +4915,64 @@ pub(crate) fn claude_thinking_to_canonical(
             );
         }
     }
-    if let Some(reasoning_effort) = output_config
-        .and_then(|value| value.get("effort"))
-        .and_then(Value::as_str)
-        .and_then(claude_output_effort_to_openai_reasoning_effort)
-        .or_else(|| {
-            thinking
-                .and_then(|value| value.get("budget_tokens"))
-                .and_then(Value::as_u64)
-                .map(map_thinking_budget_to_openai_reasoning_effort)
-        })
-    {
+    if let Some(reasoning_effort) = output_effort.or_else(|| {
+        thinking
+            .and_then(|value| value.get("budget_tokens"))
+            .and_then(Value::as_u64)
+            .map(map_thinking_budget_to_openai_reasoning_effort)
+    }) {
         extensions.insert(
             "openai".to_string(),
             json!({ "reasoning_effort": reasoning_effort }),
         );
     }
     Some(CanonicalThinkingConfig {
-        enabled: thinking
-            .and_then(|value| value.get("type"))
-            .and_then(Value::as_str)
-            .is_none_or(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "enabled" | "adaptive"
-                )
-            }),
+        enabled: thinking.is_some_and(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "enabled" | "adaptive"
+                    )
+                })
+        }),
         budget_tokens: thinking
             .and_then(|value| value.get("budget_tokens"))
             .and_then(Value::as_u64),
         extensions,
+    })
+}
+
+/// Parse Anthropic's official structured-output shape into the canonical
+/// response-format contract. Other `output_config` members remain in the
+/// Claude extension namespace and are audited by the cross-format validator.
+pub(crate) fn claude_response_format_to_canonical(
+    request: &Map<String, Value>,
+) -> Option<CanonicalResponseFormat> {
+    let output_config = request.get("output_config")?.as_object()?;
+    let format = output_config.get("format")?.as_object()?;
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return None;
+    }
+    let schema = format.get("schema")?.clone();
+    let name = format
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("response_schema");
+    Some(CanonicalResponseFormat {
+        format_type: "json_schema".to_string(),
+        json_schema: Some(json!({
+            "name": name,
+            "schema": schema,
+        })),
+        extensions: BTreeMap::from([(
+            "claude".to_string(),
+            json!({ "output_config_format": Value::Object(format.clone()) }),
+        )]),
     })
 }
 
@@ -4444,7 +5009,23 @@ pub(crate) fn gemini_generation_config(value: Option<&Value>) -> CanonicalGenera
             .and_then(openai_stop_to_vec),
         n: gemini_value_by_case(generation_config, "candidateCount", "candidate_count")
             .and_then(Value::as_u64),
+        presence_penalty: gemini_value_by_case(
+            generation_config,
+            "presencePenalty",
+            "presence_penalty",
+        )
+        .and_then(Value::as_f64),
+        frequency_penalty: gemini_value_by_case(
+            generation_config,
+            "frequencyPenalty",
+            "frequency_penalty",
+        )
+        .and_then(Value::as_f64),
         seed: generation_config.get("seed").and_then(Value::as_i64),
+        logprobs: gemini_value_by_case(generation_config, "responseLogprobs", "response_logprobs")
+            .and_then(Value::as_bool),
+        top_logprobs: gemini_value_by_case(generation_config, "logprobs", "top_logprobs")
+            .and_then(Value::as_u64),
         ..CanonicalGenerationConfig::default()
     }
 }
@@ -6180,6 +6761,23 @@ pub(crate) fn claude_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
         .or_else(|| usage.get("reasoning_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let mut extensions = claude_extensions(
+        usage,
+        &[
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_creation",
+            "output_tokens_details",
+            "reasoning_tokens",
+        ],
+    );
+    // Keep the complete native usage object for same-format response rebuilds;
+    // the canonical counters below still win when a cross-format emitter
+    // needs to normalize token accounting.
+    canonical_extension_object_mut(&mut extensions, "claude")
+        .insert("raw_usage".to_string(), Value::Object(usage.clone()));
     Some(CanonicalUsage {
         input_tokens,
         input_tokens_include_cache: false,
@@ -6199,18 +6797,7 @@ pub(crate) fn claude_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
             .and_then(|value| value.get("ephemeral_1h_input_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        extensions: claude_extensions(
-            usage,
-            &[
-                "input_tokens",
-                "output_tokens",
-                "cache_read_input_tokens",
-                "cache_creation_input_tokens",
-                "cache_creation",
-                "output_tokens_details",
-                "reasoning_tokens",
-            ],
-        ),
+        extensions,
         reasoning_tokens,
     })
 }
@@ -6245,6 +6832,28 @@ pub(crate) fn gemini_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let output_tokens = visible_output_tokens.saturating_add(reasoning_tokens);
+    let mut extensions = gemini_extensions(
+        usage,
+        &[
+            "promptTokenCount",
+            "prompt_token_count",
+            "toolUsePromptTokenCount",
+            "tool_use_prompt_token_count",
+            "cachedContentTokenCount",
+            "cached_content_token_count",
+            "candidatesTokenCount",
+            "candidates_token_count",
+            "thoughtsTokenCount",
+            "thoughts_token_count",
+            "totalTokenCount",
+            "total_token_count",
+        ],
+    );
+    // Preserve the full native usage object for same-format Gemini responses;
+    // normalized counters are written first and therefore remain authoritative
+    // when this value is emitted to another protocol.
+    canonical_extension_object_mut(&mut extensions, "gemini")
+        .insert("raw_usage".to_string(), Value::Object(usage.clone()));
     Some(CanonicalUsage {
         input_tokens,
         input_tokens_include_cache: cache_read_tokens > 0,
@@ -6256,23 +6865,7 @@ pub(crate) fn gemini_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
             .unwrap_or_else(|| input_tokens.saturating_add(output_tokens)),
         cache_read_tokens,
         reasoning_tokens,
-        extensions: gemini_extensions(
-            usage,
-            &[
-                "promptTokenCount",
-                "prompt_token_count",
-                "toolUsePromptTokenCount",
-                "tool_use_prompt_token_count",
-                "cachedContentTokenCount",
-                "cached_content_token_count",
-                "candidatesTokenCount",
-                "candidates_token_count",
-                "thoughtsTokenCount",
-                "thoughts_token_count",
-                "totalTokenCount",
-                "total_token_count",
-            ],
-        ),
+        extensions,
         ..CanonicalUsage::default()
     })
 }
@@ -6375,6 +6968,16 @@ pub(crate) fn canonical_usage_to_claude(value: &CanonicalUsage) -> Value {
         output["output_tokens_details"] = json!({
             "thinking_tokens": value.reasoning_tokens,
         });
+    }
+    if let Some(output_object) = output.as_object_mut() {
+        if let Some(claude) = value.extensions.get("claude").and_then(Value::as_object) {
+            if let Some(raw_usage) = claude.get("raw_usage").and_then(Value::as_object) {
+                merge_json_object_missing(output_object, raw_usage);
+            }
+            let mut fields = claude.clone();
+            fields.remove("raw_usage");
+            merge_json_object_missing(output_object, &fields);
+        }
     }
     output
 }
@@ -6671,7 +7274,15 @@ const GEMINI_MAPPED_GENERATION_CONFIG_KEYS: &[&str] = &[
     "top_k",
     "candidateCount",
     "candidate_count",
+    "presencePenalty",
+    "presence_penalty",
+    "frequencyPenalty",
+    "frequency_penalty",
     "seed",
+    "responseLogprobs",
+    "response_logprobs",
+    "logprobs",
+    "top_logprobs",
     "stopSequences",
     "stop_sequences",
     "thinkingConfig",

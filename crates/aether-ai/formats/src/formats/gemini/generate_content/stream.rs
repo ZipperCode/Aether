@@ -5,7 +5,8 @@ use serde_json::{json, Map, Value};
 use crate::formats::shared::response::{build_generated_tool_call_id, canonicalize_tool_arguments};
 use crate::formats::shared::sse::encode_json_sse;
 use crate::formats::shared::stream_core::common::*;
-use crate::formats::shared::AiSurfaceFinalizeError;
+use crate::formats::shared::{AiSurfaceFinalizeError, GeminiStreamWireMode};
+use crate::protocol::canonical::audit_gemini_cross_format_response_part;
 
 #[derive(Default)]
 struct GeminiProviderToolState {
@@ -86,7 +87,11 @@ impl GeminiProviderState {
             .and_then(Value::as_object)
             .filter(|response| response.contains_key("candidates"))
             .unwrap_or(raw_event_object);
-        if let Some(id) = event_object.get("responseId").and_then(Value::as_str) {
+        if let Some(id) = event_object
+            .get("responseId")
+            .or_else(|| event_object.get("_v1internal_response_id"))
+            .and_then(Value::as_str)
+        {
             self.response_id = Some(id.to_string());
         }
         if let Some(version) = event_object.get("modelVersion").and_then(Value::as_str) {
@@ -94,6 +99,54 @@ impl GeminiProviderState {
         }
 
         let mut out = Vec::new();
+        let cross_format = report_context
+            .get("client_api_format")
+            .and_then(Value::as_str)
+            .map(crate::formats::id::normalize_api_format_alias)
+            .is_some_and(|format| format != "gemini:generate_content");
+        if cross_format
+            && event_object.keys().any(|field| {
+                !matches!(
+                    field.as_str(),
+                    "responseId"
+                        | "_v1internal_response_id"
+                        | "modelVersion"
+                        | "candidates"
+                        | "usageMetadata"
+                )
+            })
+        {
+            out.push(self.unknown_frame(report_context, Value::Object(event_object.clone())));
+            return Ok(out);
+        }
+        if cross_format {
+            if let Some(usage) = event_object.get("usageMetadata") {
+                let Some(usage) = usage.as_object() else {
+                    out.push(self.unknown_frame(report_context, usage.clone()));
+                    return Ok(out);
+                };
+                if usage.keys().any(|field| {
+                    !matches!(
+                        field.as_str(),
+                        "promptTokenCount"
+                            | "prompt_token_count"
+                            | "toolUsePromptTokenCount"
+                            | "tool_use_prompt_token_count"
+                            | "cachedContentTokenCount"
+                            | "cached_content_token_count"
+                            | "candidatesTokenCount"
+                            | "candidates_token_count"
+                            | "thoughtsTokenCount"
+                            | "thoughts_token_count"
+                            | "totalTokenCount"
+                            | "total_token_count"
+                    )
+                }) {
+                    out.push(self.unknown_frame(report_context, Value::Object(usage.clone())));
+                    return Ok(out);
+                }
+            }
+        }
         let Some(candidates) = event_object.get("candidates").and_then(Value::as_array) else {
             out.push(self.unknown_frame(report_context, value.clone()));
             return Ok(out);
@@ -101,13 +154,51 @@ impl GeminiProviderState {
 
         for candidate in candidates {
             let Some(candidate_object) = candidate.as_object() else {
-                continue;
+                out.push(self.unknown_frame(report_context, candidate.clone()));
+                return Ok(out);
             };
-            let Some(content) = candidate_object.get("content").and_then(Value::as_object) else {
-                continue;
+            if cross_format
+                && candidate_object.keys().any(|field| {
+                    !matches!(
+                        field.as_str(),
+                        "index" | "content" | "finishReason" | "finish_reason"
+                    )
+                })
+            {
+                out.push(self.unknown_frame(report_context, candidate.clone()));
+                return Ok(out);
+            }
+            let empty_content = Map::new();
+            let content = match candidate_object.get("content") {
+                Some(content) => {
+                    let Some(content) = content.as_object() else {
+                        out.push(self.unknown_frame(report_context, candidate.clone()));
+                        return Ok(out);
+                    };
+                    content
+                }
+                None => &empty_content,
             };
-            let Some(parts) = content.get("parts").and_then(Value::as_array) else {
-                continue;
+            if cross_format
+                && content
+                    .keys()
+                    .any(|field| !matches!(field.as_str(), "role" | "parts"))
+            {
+                out.push(self.unknown_frame(report_context, Value::Object(content.clone())));
+                return Ok(out);
+            }
+            let empty_parts = Vec::new();
+            let parts = match content.get("parts") {
+                Some(parts) => {
+                    let Some(parts) = parts.as_array() else {
+                        out.push(
+                            self.unknown_frame(report_context, Value::Object(content.clone())),
+                        );
+                        return Ok(out);
+                    };
+                    parts
+                }
+                None => &empty_parts,
             };
             if !parts.is_empty() {
                 self.ensure_started(report_context, &mut out);
@@ -115,8 +206,13 @@ impl GeminiProviderState {
             let (id, model) = self.identity(report_context);
             for (index, part) in parts.iter().enumerate() {
                 let Some(part_object) = part.as_object() else {
-                    continue;
+                    out.push(self.unknown_frame(report_context, part.clone()));
+                    return Ok(out);
                 };
+                if cross_format && audit_gemini_cross_format_response_part(part_object).is_err() {
+                    out.push(self.unknown_frame(report_context, part.clone()));
+                    return Ok(out);
+                }
                 let reasoning_signature = part_object
                     .get("thoughtSignature")
                     .or_else(|| part_object.get("thought_signature"))
@@ -225,8 +321,10 @@ impl GeminiProviderState {
                     }
                     continue;
                 }
-                let Some(function_call) =
-                    part_object.get("functionCall").and_then(Value::as_object)
+                let Some(function_call) = part_object
+                    .get("functionCall")
+                    .or_else(|| part_object.get("function_call"))
+                    .and_then(Value::as_object)
                 else {
                     if let Some(content_part) = canonical_content_part_from_gemini_part(part_object)
                     {
@@ -301,8 +399,10 @@ impl GeminiProviderState {
                     });
                 }
             }
-            if let Some(finish_reason) =
-                candidate_object.get("finishReason").and_then(Value::as_str)
+            if let Some(finish_reason) = candidate_object
+                .get("finishReason")
+                .or_else(|| candidate_object.get("finish_reason"))
+                .and_then(Value::as_str)
             {
                 let has_tool_calls = !self.tool_calls.is_empty();
                 let mut finish_reason =
@@ -377,16 +477,33 @@ pub struct GeminiClientEmitter {
     model: Option<String>,
     finished: bool,
     tool_calls: BTreeMap<usize, GeminiClientToolState>,
+    wire_mode: GeminiStreamWireMode,
+    json_array_started: bool,
+    json_array_closed: bool,
 }
 
 impl GeminiClientEmitter {
+    /// Build a Gemini client emitter for the selected public wire framing.
+    /// Upstream frames are identical; only the outer SSE/JSON-array envelope
+    /// changes.
+    pub fn with_wire_mode(wire_mode: GeminiStreamWireMode) -> Self {
+        Self {
+            wire_mode,
+            ..Self::default()
+        }
+    }
+
+    pub fn wire_mode(&self) -> GeminiStreamWireMode {
+        self.wire_mode
+    }
+
     fn update_identity(&mut self, frame: &CanonicalStreamFrame) {
         self.response_id = Some(frame.id.clone());
         self.model = Some(frame.model.clone());
     }
 
     fn emit_candidate(
-        &self,
+        &mut self,
         parts: Vec<Value>,
         finish_reason: Option<&str>,
         usage: Option<CanonicalUsage>,
@@ -429,7 +546,50 @@ impl GeminiClientEmitter {
                 gemini_usage_metadata_from_usage(&usage),
             );
         }
-        encode_json_sse(None, &Value::Object(response))
+        self.encode_response_value(&Value::Object(response))
+    }
+
+    fn encode_response_value(&mut self, value: &Value) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        if self.wire_mode == GeminiStreamWireMode::Sse {
+            return encode_json_sse(None, value);
+        }
+
+        let payload = serde_json::to_vec(value)?;
+        let mut output = Vec::with_capacity(payload.len().saturating_add(1));
+        if self.json_array_started {
+            output.push(b',');
+        } else {
+            output.push(b'[');
+            self.json_array_started = true;
+        }
+        output.extend(payload);
+        Ok(output)
+    }
+
+    fn close_json_array(&mut self) -> Vec<u8> {
+        if self.wire_mode != GeminiStreamWireMode::JsonArray || self.json_array_closed {
+            return Vec::new();
+        }
+        self.json_array_closed = true;
+        if self.json_array_started {
+            b"]".to_vec()
+        } else {
+            self.json_array_started = true;
+            b"[]".to_vec()
+        }
+    }
+
+    /// Encode a structured client-facing error and terminate the selected
+    /// wire envelope. This keeps JSON-array responses valid even when a
+    /// conversion fails after one or more response objects were emitted.
+    pub fn emit_error(&mut self, error_body: Value) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        if self.finished && self.json_array_closed {
+            return Ok(Vec::new());
+        }
+        let mut output = self.encode_response_value(&error_body)?;
+        self.finished = true;
+        output.extend(self.close_json_array());
+        Ok(output)
     }
 
     fn flush_pending_tool_calls(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
@@ -574,11 +734,12 @@ impl GeminiClientEmitter {
     }
 
     pub fn finish(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
-        if self.finished {
-            return Ok(Vec::new());
+        let mut out = Vec::new();
+        if !self.finished {
+            out.extend(self.flush_pending_tool_calls()?);
+            self.finished = true;
         }
-        let out = self.flush_pending_tool_calls()?;
-        self.finished = true;
+        out.extend(self.close_json_array());
         Ok(out)
     }
 }

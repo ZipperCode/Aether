@@ -4,10 +4,12 @@ use crate::{
     formats::context::FormatContext,
     protocol::canonical::{
         canonical_extension_object_mut, canonical_usage_total_input_tokens,
-        canonical_usage_total_tokens_for_inclusive_input, gemini_extensions,
+        canonical_usage_total_tokens_for_inclusive_input,
+        gemini_candidate_to_openai_url_annotations, gemini_extensions,
         gemini_part_to_canonical_block, gemini_stop_reason_to_canonical, gemini_usage_to_canonical,
-        CanonicalContentBlock, CanonicalResponse, CanonicalResponseOutput, CanonicalRole,
-        CanonicalStopReason, CanonicalUsage,
+        namespace_extension_object, CanonicalContentBlock, CanonicalResponse,
+        CanonicalResponseOutput, CanonicalRole, CanonicalStopReason, CanonicalUsage,
+        OPENAI_RESPONSES_EXTENSION_NAMESPACE,
     },
 };
 
@@ -36,10 +38,30 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalResponse> {
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let content = parts
+        let mut indexed_content = parts
             .iter()
             .enumerate()
-            .filter_map(|(index, part)| gemini_part_to_canonical_block(part, index))
+            .filter_map(|(index, part)| {
+                gemini_part_to_canonical_block(part, index).map(|block| (index, block))
+            })
+            .collect::<Vec<_>>();
+        if let Some(annotations_by_part) =
+            gemini_candidate_to_openai_url_annotations(candidate_object)
+        {
+            for (part_index, annotations) in annotations_by_part {
+                let Some((_, CanonicalContentBlock::Text { extensions, .. })) = indexed_content
+                    .iter_mut()
+                    .find(|(source_part_index, _)| *source_part_index == part_index)
+                else {
+                    continue;
+                };
+                canonical_extension_object_mut(extensions, OPENAI_RESPONSES_EXTENSION_NAMESPACE)
+                    .insert("annotations".to_string(), Value::Array(annotations));
+            }
+        }
+        let content = indexed_content
+            .into_iter()
+            .map(|(_, block)| block)
             .collect::<Vec<_>>();
         let mut stop_reason = candidate_object
             .get("finishReason")
@@ -59,6 +81,19 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalResponse> {
             candidate_object,
             &["index", "content", "finishReason", "finish_reason"],
         );
+        if let Some(content_object) = candidate_object.get("content").and_then(Value::as_object) {
+            let content_extra = content_object
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "role" | "parts"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Map<_, _>>();
+            if !content_extra.is_empty() {
+                canonical_extension_object_mut(&mut extensions, "gemini").insert(
+                    "raw_content_fields".to_string(),
+                    Value::Object(content_extra),
+                );
+            }
+        }
         if let Some(raw_finish_reason) = candidate_object
             .get("finishReason")
             .or_else(|| candidate_object.get("finish_reason"))
@@ -190,8 +225,20 @@ fn canonical_to_gemini_response(
                 if let Some(raw_finish_reason) = gemini.get("raw_finish_reason").cloned() {
                     candidate_object.insert("finishReason".to_string(), raw_finish_reason);
                 }
+                if let Some(content_extra) =
+                    gemini.get("raw_content_fields").and_then(Value::as_object)
+                {
+                    if let Some(content_object) = candidate_object
+                        .get_mut("content")
+                        .and_then(Value::as_object_mut)
+                    {
+                        for (key, value) in content_extra {
+                            content_object.entry(key.clone()).or_insert(value.clone());
+                        }
+                    }
+                }
                 for (key, value) in gemini {
-                    if key == "raw_finish_reason" {
+                    if matches!(key.as_str(), "raw_finish_reason" | "raw_content_fields") {
                         continue;
                     }
                     candidate_object.entry(key.clone()).or_insert(value.clone());
@@ -250,9 +297,14 @@ fn canonical_blocks_to_gemini_parts(blocks: &[CanonicalContentBlock]) -> Option<
 
 fn canonical_block_to_gemini_part(block: &CanonicalContentBlock) -> Option<Option<Value>> {
     match block {
-        CanonicalContentBlock::Text { text, .. } => Some(Some(json!({ "text": text }))),
+        CanonicalContentBlock::Text { text, extensions } => Some(Some(
+            with_gemini_part_extensions(json!({ "text": text }), extensions),
+        )),
         CanonicalContentBlock::Thinking {
-            text, signature, ..
+            text,
+            signature,
+            extensions,
+            ..
         } => {
             if text.trim().is_empty() {
                 return Some(None);
@@ -266,17 +318,26 @@ fn canonical_block_to_gemini_part(block: &CanonicalContentBlock) -> Option<Optio
                     Value::String(signature.clone()),
                 );
             }
-            Some(Some(Value::Object(part)))
+            Some(Some(with_gemini_part_extensions(
+                Value::Object(part),
+                extensions,
+            )))
         }
         CanonicalContentBlock::ToolUse {
-            id, name, input, ..
-        } => Some(Some(json!({
-            "functionCall": {
-                "id": id,
-                "name": name,
-                "args": gemini_function_args(input),
-            }
-        }))),
+            id,
+            name,
+            input,
+            extensions,
+        } => Some(Some(with_gemini_part_extensions(
+            json!({
+                "functionCall": {
+                    "id": id,
+                    "name": name,
+                    "args": gemini_function_args(input),
+                }
+            }),
+            extensions,
+        ))),
         CanonicalContentBlock::ToolResult {
             tool_use_id,
             name,
@@ -295,31 +356,45 @@ fn canonical_block_to_gemini_part(block: &CanonicalContentBlock) -> Option<Optio
             data,
             url,
             media_type,
+            extensions,
             ..
-        } => Some(Some(canonical_media_to_gemini_part(
-            media_type.as_deref().unwrap_or("image/png"),
-            data.as_deref(),
-            url.as_deref(),
-        ))),
+        } => {
+            let part = canonical_media_to_gemini_part(
+                media_type.as_deref().unwrap_or("image/png"),
+                data.as_deref(),
+                url.as_deref(),
+            );
+            Some(Some(with_gemini_part_extensions(part, extensions)))
+        }
         CanonicalContentBlock::File {
             data,
             file_url,
             media_type,
+            extensions,
             ..
-        } => Some(Some(canonical_media_to_gemini_part(
-            media_type.as_deref().unwrap_or("application/octet-stream"),
-            data.as_deref(),
-            file_url.as_deref(),
-        ))),
+        } => {
+            let part = canonical_media_to_gemini_part(
+                media_type.as_deref().unwrap_or("application/octet-stream"),
+                data.as_deref(),
+                file_url.as_deref(),
+            );
+            Some(Some(with_gemini_part_extensions(part, extensions)))
+        }
         CanonicalContentBlock::Audio {
-            data, media_type, ..
+            data,
+            media_type,
+            extensions,
+            ..
         } => Some(data.as_ref().map(|data| {
-            json!({
-                "inlineData": {
-                    "mimeType": media_type.clone().unwrap_or_else(|| "audio/mpeg".to_string()),
-                    "data": data,
-                }
-            })
+            with_gemini_part_extensions(
+                json!({
+                    "inlineData": {
+                        "mimeType": media_type.clone().unwrap_or_else(|| "audio/mpeg".to_string()),
+                        "data": data,
+                    }
+                }),
+                extensions,
+            )
         })),
         CanonicalContentBlock::Unknown {
             payload,
@@ -331,6 +406,21 @@ fn canonical_block_to_gemini_part(block: &CanonicalContentBlock) -> Option<Optio
             .map(|_| Some(payload.clone()))
             .or(Some(None)),
     }
+}
+
+/// Re-attach audited Gemini part extensions on same-format response rebuilds.
+/// Cross-format validation runs before this emitter and blocks unrepresentable
+/// provider fields, while native Gemini fields remain available to a Gemini
+/// client instead of being silently discarded.
+fn with_gemini_part_extensions(
+    mut part: Value,
+    extensions: &std::collections::BTreeMap<String, Value>,
+) -> Value {
+    if let Some(object) = part.as_object_mut() {
+        let existing = object.clone();
+        object.extend(namespace_extension_object(extensions, "gemini", &existing));
+    }
+    part
 }
 
 fn canonical_media_to_gemini_part(
@@ -420,7 +510,14 @@ fn canonical_stop_reason_to_gemini(reason: Option<&CanonicalStopReason>) -> Valu
 
 fn canonical_usage_to_gemini_usage_metadata(usage: &CanonicalUsage) -> Value {
     let input_tokens = canonical_usage_total_input_tokens(usage);
-    let mut out = Map::new();
+    let mut out = usage
+        .extensions
+        .get("gemini")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("raw_usage"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     out.insert("promptTokenCount".to_string(), Value::from(input_tokens));
     out.insert(
         "candidatesTokenCount".to_string(),
@@ -444,6 +541,13 @@ fn canonical_usage_to_gemini_usage_metadata(usage: &CanonicalUsage) -> Value {
             "thoughtsTokenCount".to_string(),
             Value::from(usage.reasoning_tokens),
         );
+    }
+    if let Some(gemini) = usage.extensions.get("gemini").and_then(Value::as_object) {
+        for (key, value) in gemini {
+            if key != "raw_usage" {
+                out.entry(key.clone()).or_insert(value.clone());
+            }
+        }
     }
     Value::Object(out)
 }

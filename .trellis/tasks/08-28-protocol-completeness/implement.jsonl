@@ -1,0 +1,5 @@
+{"file":".trellis/spec/aether-ai-formats/backend/index.md","reason":"Owns canonical protocol conversion and fail-closed format boundaries."}
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"Owns HTTP stream headers and public model catalog projection boundaries."}
+{"file":".trellis/spec/aether-gateway/backend/quality-guidelines.md","reason":"Applies gateway response handling and bounded-runtime quality constraints."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"The task crosses wire format, canonical conversion, stream response, and catalog layers."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Requires one shared stream-mode resolver and one shared Gemini model projection."}

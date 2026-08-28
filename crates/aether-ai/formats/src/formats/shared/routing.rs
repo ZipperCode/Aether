@@ -1,4 +1,5 @@
 use http::Method;
+use serde_json::Value;
 use url::form_urlencoded;
 
 use crate::contracts::{
@@ -19,7 +20,77 @@ use crate::contracts::{
     OPENAI_VIDEO_CONTENT_PLAN_KIND, OPENAI_VIDEO_CREATE_SYNC_PLAN_KIND,
     OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND, OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
+use crate::formats::id::normalize_api_format_alias;
 use crate::formats::openai::image::request::is_openai_image_stream_request;
+
+/// Wire framing selected for a public Gemini `streamGenerateContent` call.
+///
+/// The upstream transport is normalized to SSE internally, while the public
+/// Gemini API uses `alt=sse` for SSE and a JSON array otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiStreamWireMode {
+    Sse,
+    JsonArray,
+}
+
+impl Default for GeminiStreamWireMode {
+    fn default() -> Self {
+        Self::Sse
+    }
+}
+
+/// Resolve the public Gemini stream framing from sanitized report context.
+///
+/// Returning `None` for non-Gemini or non-stream requests keeps this helper
+/// safe to call from the shared stream matrix. Private v1internal streams
+/// retain their historical SSE framing regardless of query parameters.
+pub fn resolve_gemini_stream_wire_mode(report_context: &Value) -> Option<GeminiStreamWireMode> {
+    let client_api_format = report_context
+        .get("client_api_format")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(normalize_api_format_alias)?;
+    if client_api_format != "gemini:generate_content" {
+        return None;
+    }
+
+    let request_path = report_context
+        .get("request_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let request_path_and_query = report_context
+        .get("request_path_and_query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let raw_path = request_path.or(request_path_and_query).unwrap_or_default();
+    let path = raw_path.split_once('?').map_or(raw_path, |(path, _)| path);
+    if !path.ends_with(":streamGenerateContent") {
+        return None;
+    }
+    if path.contains("/v1internal:") {
+        return Some(GeminiStreamWireMode::Sse);
+    }
+
+    let query = report_context
+        .get("request_query_string")
+        .and_then(Value::as_str)
+        .or_else(|| request_path.and_then(|path| path.split_once('?').map(|(_, query)| query)))
+        .or_else(|| {
+            request_path_and_query.and_then(|path| path.split_once('?').map(|(_, query)| query))
+        })
+        .or_else(|| raw_path.split_once('?').map(|(_, query)| query));
+    let requested_sse = query
+        .into_iter()
+        .flat_map(|query| form_urlencoded::parse(query.as_bytes()))
+        .any(|(key, value)| key.eq_ignore_ascii_case("alt") && value.eq_ignore_ascii_case("sse"));
+    Some(if requested_sse {
+        GeminiStreamWireMode::Sse
+    } else {
+        GeminiStreamWireMode::JsonArray
+    })
+}
 
 pub fn resolve_execution_runtime_stream_plan_kind(
     route_class: Option<&str>,

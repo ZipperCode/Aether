@@ -14,8 +14,8 @@ use crate::{
         canonical_messages_to_claude, canonical_openai_reasoning_effort,
         canonical_tool_choice_to_claude, canonical_tools_to_claude, claude_extensions,
         claude_generation_config, claude_messages_to_canonical, claude_parallel_tool_calls,
-        claude_system_to_canonical_instructions, claude_thinking_to_canonical,
-        claude_tool_choice_to_canonical, claude_tools_to_canonical,
+        claude_response_format_to_canonical, claude_system_to_canonical_instructions,
+        claude_thinking_to_canonical, claude_tool_choice_to_canonical, claude_tools_to_canonical,
         compact_canonical_claude_messages, insert_f64, mark_claude_messages_request_source,
         namespace_extension_object, CanonicalRequest,
     },
@@ -64,6 +64,7 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalRequest> {
     canonical.parallel_tool_calls = claude_parallel_tool_calls(request.get("tool_choice"));
     canonical.metadata = request.get("metadata").cloned();
     canonical.thinking = claude_thinking_to_canonical(request);
+    canonical.response_format = claude_response_format_to_canonical(request);
 
     canonical.extensions = claude_extensions(
         request,
@@ -202,5 +203,34 @@ pub fn to_raw(
         "claude",
         &output,
     ));
+    if let Some(response_format) = canonical.response_format.as_ref() {
+        let claude_format = response_format
+            .extensions
+            .get("claude")
+            .and_then(|value| value.get("output_config_format"))
+            .cloned()
+            .or_else(|| {
+                let json_schema = response_format.json_schema.as_ref()?.as_object()?;
+                let schema = json_schema.get("schema")?.clone();
+                let mut format = Map::new();
+                format.insert("type".to_string(), Value::String("json_schema".to_string()));
+                format.insert("schema".to_string(), schema);
+                if let Some(name) = json_schema.get("name").cloned() {
+                    format.insert("name".to_string(), name);
+                }
+                Some(Value::Object(format))
+            });
+        if let Some(claude_format) = claude_format {
+            output
+                .entry("output_config".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(output_config) = output
+                .get_mut("output_config")
+                .and_then(Value::as_object_mut)
+            {
+                output_config.insert("format".to_string(), claude_format);
+            }
+        }
+    }
     Some(Value::Object(output))
 }

@@ -3442,7 +3442,7 @@ async fn gateway_handles_public_gemini_models_without_hitting_fallback_probe() {
     assert_eq!(detail_payload["baseModelId"], "gemini-2.5-pro");
     assert_eq!(
         detail_payload["supportedGenerationMethods"],
-        json!(["generateContent", "countTokens"])
+        json!(["generateContent", "streamGenerateContent", "countTokens"])
     );
     assert_eq!(*fallback_probe_hits.lock().expect("mutex should lock"), 0);
 

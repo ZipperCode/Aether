@@ -432,8 +432,24 @@ fn canonical_generation_config_to_gemini(
     if let Some(value) = canonical.generation.top_k {
         generation_config.insert("topK".to_string(), Value::from(value));
     }
+    insert_f64(
+        &mut generation_config,
+        "presencePenalty",
+        canonical.generation.presence_penalty,
+    );
+    insert_f64(
+        &mut generation_config,
+        "frequencyPenalty",
+        canonical.generation.frequency_penalty,
+    );
     if let Some(value) = canonical.generation.n.filter(|value| *value > 1) {
         generation_config.insert("candidateCount".to_string(), Value::from(value));
+    }
+    if let Some(value) = canonical.generation.logprobs {
+        generation_config.insert("responseLogprobs".to_string(), Value::Bool(value));
+    }
+    if let Some(value) = canonical.generation.top_logprobs {
+        generation_config.insert("logprobs".to_string(), Value::from(value));
     }
     if let Some(value) = canonical.generation.seed {
         generation_config.insert("seed".to_string(), Value::from(value));

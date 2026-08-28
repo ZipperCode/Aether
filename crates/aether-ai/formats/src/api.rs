@@ -140,9 +140,10 @@ pub use crate::formats::shared::routing::{
     request_path_implies_stream_request, resolve_execution_runtime_stream_plan_kind,
     resolve_execution_runtime_stream_plan_kind_with_client_surface,
     resolve_execution_runtime_sync_plan_kind,
-    resolve_execution_runtime_sync_plan_kind_with_client_surface, sanitize_request_path,
-    sanitize_request_path_and_query, sanitize_request_query_string,
+    resolve_execution_runtime_sync_plan_kind_with_client_surface, resolve_gemini_stream_wire_mode,
+    sanitize_request_path, sanitize_request_path_and_query, sanitize_request_query_string,
     supports_stream_execution_decision_kind, supports_sync_execution_decision_kind,
+    GeminiStreamWireMode,
 };
 pub use crate::formats::shared::sse::{encode_done_sse, encode_json_sse, map_claude_stop_reason};
 pub use crate::formats::shared::standard_matrix::normalize_standard_request_to_openai_chat_request;

@@ -81,6 +81,20 @@ OPENAI_CHAT_BLOCKED = {
     "web_search_options",
 }
 
+OPENAI_CHAT_GEMINI_MAPPED = {
+    "presence_penalty",
+    "frequency_penalty",
+    "logprobs",
+    "top_logprobs",
+}
+
+GEMINI_GENERATION_CONFIG_MAPPED = {
+    "presencePenalty",
+    "frequencyPenalty",
+    "responseLogprobs",
+    "logprobs",
+}
+
 OPENAI_RESPONSES_MAPPED = {
     "model",
     "input",
@@ -467,6 +481,34 @@ def default_status(field: SourceField, profile: list[CoverageStatus]) -> Coverag
     raise ValueError(f"unsupported provider: {field.provider}")
 
 
+def audited_status_override(field: SourceField) -> CoverageStatus | None:
+    if (
+        field.provider == "OpenAI"
+        and field.schema == "CreateChatCompletionRequest"
+        and field.field in OPENAI_CHAT_GEMINI_MAPPED
+    ):
+        return CoverageStatus(
+            surface="openai:chat standard",
+            same_format_runtime="native",
+            canonical_roundtrip="mapped",
+            cross_format="mapped/lossy-blocked",
+            notes="Chat generation control maps to Gemini GenerationConfig; targets without an official equivalent fail closed",
+        )
+    if (
+        field.provider == "Gemini"
+        and field.schema == "GenerationConfig"
+        and field.field in GEMINI_GENERATION_CONFIG_MAPPED
+    ):
+        return CoverageStatus(
+            surface="gemini:generate_content standard",
+            same_format_runtime="native",
+            canonical_roundtrip="mapped",
+            cross_format="mapped/lossy-blocked",
+            notes="Gemini generation control maps through the canonical request; targets without an official equivalent fail closed",
+        )
+    return None
+
+
 def render_matrix(
     fields: list[SourceField],
     existing: dict[tuple[str, str, str], CoverageStatus],
@@ -490,7 +532,7 @@ def render_matrix(
     ]
 
     for field in fields:
-        status = existing.get(
+        status = audited_status_override(field) or existing.get(
             (field.provider, field.schema, field.field),
             default_status(field, profiles[(field.provider, field.schema)]),
         )

@@ -11,8 +11,9 @@ use crate::formats::{
     openai::{self, chat as openai_chat, responses as openai_responses},
 };
 use crate::protocol::canonical::{
-    CanonicalContentBlock, CanonicalEmbeddingInput, CanonicalRequest, CanonicalResponse,
-    CanonicalStopReason,
+    audit_gemini_cross_format_response_part, claude_text_citations_to_openai_annotations,
+    gemini_candidate_to_openai_url_annotations, CanonicalContentBlock, CanonicalEmbeddingInput,
+    CanonicalRequest, CanonicalResponse, CanonicalStopReason,
 };
 
 pub use crate::formats::context::{
@@ -260,6 +261,7 @@ fn validate_runtime_claude_latest_cross_format_fields(
     {
         validate_claude_output_effort_value(output_effort)?;
     }
+    validate_claude_output_config_cross_format(body, target)?;
     if body
         .get("thinking")
         .and_then(Value::as_object)
@@ -270,6 +272,7 @@ fn validate_runtime_claude_latest_cross_format_fields(
             .get("output_config")
             .and_then(Value::as_object)
             .and_then(|output_config| output_config.get("effort"))
+            .filter(|value| !value.is_null())
             .is_none()
     {
         return Err(FormatError::LossyConversionBlocked {
@@ -735,6 +738,7 @@ fn validate_response_conversion(
 
     validate_source_response_stop_enums(source, target, body)?;
     validate_gemini_cross_format_response(source, target, body)?;
+    validate_claude_cross_format_response(source, target, body)?;
     validate_response_content_has_no_unknown_blocks(source, target, response)?;
     validate_openai_responses_cross_format_response_extensions(source, target, response)?;
     validate_canonical_response_stop_reasons(source, target, response)
@@ -748,13 +752,119 @@ fn validate_gemini_cross_format_response(
     if source != FormatId::GeminiGenerateContent || target == FormatId::GeminiGenerateContent {
         return Ok(());
     }
-    for (candidate_index, candidate) in body
+    let Some(response) = body.as_object() else {
+        return Ok(());
+    };
+    for field in response.keys() {
+        if !matches!(
+            field.as_str(),
+            "responseId"
+                | "_v1internal_response_id"
+                | "modelVersion"
+                | "candidates"
+                | "usageMetadata"
+        ) {
+            return lossy_provider_response_field(
+                source,
+                target,
+                field,
+                "target format cannot preserve this Gemini response field",
+            );
+        }
+    }
+    if let Some(candidates) = response.get("candidates") {
+        if !candidates.is_array() {
+            return lossy_provider_response_field(
+                source,
+                target,
+                "candidates",
+                "Gemini candidates must be an array",
+            );
+        }
+    }
+    if let Some(usage) = response.get("usageMetadata") {
+        if !usage.is_object() {
+            return lossy_provider_response_field(
+                source,
+                target,
+                "usageMetadata",
+                "Gemini usageMetadata must be an object",
+            );
+        }
+    }
+
+    for (candidate_index, candidate) in response
         .get("candidates")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .enumerate()
     {
+        let Some(candidate) = candidate.as_object() else {
+            return lossy_provider_response_field(
+                source,
+                target,
+                &format!("candidates[{candidate_index}]"),
+                "Gemini candidate is not an object",
+            );
+        };
+        let citations_mapped = matches!(
+            target,
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+        ) && gemini_candidate_to_openai_url_annotations(candidate).is_some();
+        for field in candidate.keys() {
+            let safe = matches!(
+                field.as_str(),
+                "index" | "content" | "finishReason" | "finish_reason"
+            ) || (citations_mapped
+                && matches!(
+                    field.as_str(),
+                    "groundingMetadata"
+                        | "grounding_metadata"
+                        | "citationMetadata"
+                        | "citation_metadata"
+                ));
+            if !safe {
+                return lossy_provider_response_field(
+                    source,
+                    target,
+                    &format!("candidates[{candidate_index}].{field}"),
+                    "target format cannot preserve this Gemini candidate field",
+                );
+            }
+        }
+        let content = candidate.get("content").and_then(Value::as_object);
+        if candidate
+            .get("content")
+            .is_some_and(|value| !value.is_object())
+        {
+            return lossy_provider_response_field(
+                source,
+                target,
+                &format!("candidates[{candidate_index}].content"),
+                "Gemini candidate content must be an object",
+            );
+        }
+        if let Some(content) = content {
+            for field in content.keys() {
+                if !matches!(field.as_str(), "role" | "parts") {
+                    return lossy_provider_response_field(
+                        source,
+                        target,
+                        &format!("candidates[{candidate_index}].content.{field}"),
+                        "target format cannot preserve this Gemini content field",
+                    );
+                }
+            }
+            if content.get("parts").is_some_and(|value| !value.is_array()) {
+                return lossy_provider_response_field(
+                    source,
+                    target,
+                    &format!("candidates[{candidate_index}].content.parts"),
+                    "Gemini response content parts must be an array",
+                );
+            }
+        }
         for (part_index, part) in candidate
             .get("content")
             .and_then(Value::as_object)
@@ -764,30 +874,443 @@ fn validate_gemini_cross_format_response(
             .flatten()
             .enumerate()
         {
-            let Some(function_response) = part
-                .get("functionResponse")
-                .or_else(|| part.get("function_response"))
-                .and_then(Value::as_object)
-            else {
-                continue;
-            };
-            if let Some(field) = function_response
-                .keys()
-                .find(|field| !matches!(field.as_str(), "id" | "name" | "response"))
-            {
-                return Err(FormatError::LossyConversionBlocked {
-                    source_format: source.as_str().to_string(),
-                    target_format: target.as_str().to_string(),
-                    field: format!(
-                        "candidates[{candidate_index}].content.parts[{part_index}].functionResponse.{field}"
-                    ),
-                    reason: "target format cannot preserve this Gemini FunctionResponse field"
-                        .to_string(),
-                });
+            validate_gemini_response_part(source, target, candidate_index, part_index, part)?;
+        }
+    }
+    if let Some(usage) = response.get("usageMetadata").and_then(Value::as_object) {
+        for field in usage.keys() {
+            if !matches!(
+                field.as_str(),
+                "promptTokenCount"
+                    | "prompt_token_count"
+                    | "toolUsePromptTokenCount"
+                    | "tool_use_prompt_token_count"
+                    | "cachedContentTokenCount"
+                    | "cached_content_token_count"
+                    | "candidatesTokenCount"
+                    | "candidates_token_count"
+                    | "thoughtsTokenCount"
+                    | "thoughts_token_count"
+                    | "totalTokenCount"
+                    | "total_token_count"
+            ) {
+                return lossy_provider_response_field(
+                    source,
+                    target,
+                    &format!("usageMetadata.{field}"),
+                    "target format cannot preserve this Gemini usage field",
+                );
             }
         }
     }
     Ok(())
+}
+
+fn validate_gemini_response_part(
+    source: FormatId,
+    target: FormatId,
+    candidate_index: usize,
+    part_index: usize,
+    part: &Value,
+) -> Result<(), FormatError> {
+    let Some(part) = part.as_object() else {
+        return lossy_provider_response_field(
+            source,
+            target,
+            &format!("candidates[{candidate_index}].content.parts[{part_index}]"),
+            "Gemini response part is not an object",
+        );
+    };
+    let location = format!("candidates[{candidate_index}].content.parts[{part_index}]");
+    if let Err(field) = audit_gemini_cross_format_response_part(part) {
+        let field = if field.is_empty() {
+            location
+        } else {
+            format!("{location}.{field}")
+        };
+        return lossy_provider_response_field(
+            source,
+            target,
+            &field,
+            "target format cannot preserve this Gemini response part losslessly",
+        );
+    }
+    Ok(())
+}
+
+fn validate_claude_cross_format_response(
+    source: FormatId,
+    target: FormatId,
+    body: &Value,
+) -> Result<(), FormatError> {
+    if source != FormatId::ClaudeMessages || target == FormatId::ClaudeMessages {
+        return Ok(());
+    }
+    let Some(response) = body.as_object() else {
+        return Ok(());
+    };
+    for field in response.keys() {
+        if !matches!(
+            field.as_str(),
+            "id" | "type"
+                | "role"
+                | "model"
+                | "content"
+                | "stop_reason"
+                | "stop_sequence"
+                | "usage"
+                | "container"
+                | "stop_details"
+        ) {
+            return lossy_provider_response_field(
+                source,
+                target,
+                field,
+                "target format cannot preserve this Claude response field",
+            );
+        }
+    }
+    if let Some(content) = response.get("content") {
+        if !content.is_array() {
+            return lossy_provider_response_field(
+                source,
+                target,
+                "content",
+                "Claude response content must be an array",
+            );
+        }
+    }
+    if let Some(usage) = response.get("usage") {
+        if !usage.is_object() {
+            return lossy_provider_response_field(
+                source,
+                target,
+                "usage",
+                "Claude response usage must be an object",
+            );
+        }
+    }
+    if response
+        .get("stop_sequence")
+        .is_some_and(|value| !value.is_null())
+    {
+        return lossy_provider_response_field(
+            source,
+            target,
+            "stop_sequence",
+            "target format cannot preserve Claude stop_sequence metadata",
+        );
+    }
+    for field in ["container", "stop_details"] {
+        if response.get(field).is_some_and(|value| !value.is_null()) {
+            return lossy_provider_response_field(
+                source,
+                target,
+                field,
+                "target format cannot preserve Claude response metadata",
+            );
+        }
+    }
+
+    for (block_index, block) in response
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let Some(block) = block.as_object() else {
+            return lossy_provider_response_field(
+                source,
+                target,
+                &format!("content[{block_index}]"),
+                "Claude response content block is not an object",
+            );
+        };
+        let block_type = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let allowed: &[&str] = match block_type {
+            "text" => &["type", "text", "citations"],
+            "thinking" => &["type", "thinking", "text", "signature"],
+            "redacted_thinking" => &["type", "data"],
+            "image" | "document" => &["type", "source"],
+            "tool_use" => &["type", "id", "name", "input"],
+            "tool_result" => &["type", "tool_use_id", "content", "is_error"],
+            _ => {
+                return lossy_provider_response_field(
+                    source,
+                    target,
+                    &format!("content[{block_index}].type"),
+                    "target format cannot preserve this Claude content block type",
+                )
+            }
+        };
+        if block_type == "redacted_thinking" && target == FormatId::GeminiGenerateContent {
+            return lossy_provider_response_field(
+                source,
+                target,
+                &format!("content[{block_index}].type"),
+                "Gemini response parts cannot preserve Claude redacted thinking",
+            );
+        }
+        if block_type == "redacted_thinking"
+            && matches!(
+                target,
+                FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+            )
+        {
+            return lossy_provider_response_field(
+                source,
+                target,
+                &format!("content[{block_index}].type"),
+                "OpenAI Responses reasoning items cannot preserve Claude redacted thinking",
+            );
+        }
+        if matches!(block_type, "image" | "document") && target == FormatId::OpenAiChat {
+            return lossy_provider_response_field(
+                source,
+                target,
+                &format!("content[{block_index}].type"),
+                "OpenAI Chat responses cannot preserve Claude media output losslessly",
+            );
+        }
+        for field in block.keys() {
+            if !allowed.contains(&field.as_str()) {
+                return lossy_provider_response_field(
+                    source,
+                    target,
+                    &format!("content[{block_index}].{field}"),
+                    "target format cannot preserve this Claude content-block field",
+                );
+            }
+        }
+        if block_type == "tool_result"
+            && matches!(
+                target,
+                FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+            )
+        {
+            validate_claude_tool_result_response_content(
+                block.get("content"),
+                target,
+                &format!("content[{block_index}].content"),
+            )?;
+        }
+        if block.contains_key("citations")
+            && (!matches!(
+                target,
+                FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+            ) || claude_text_citations_to_openai_annotations(block).is_none())
+        {
+            return lossy_provider_response_field(
+                source,
+                target,
+                &format!("content[{block_index}].citations"),
+                "target format cannot preserve these Claude citations losslessly",
+            );
+        }
+        if matches!(block_type, "image" | "document") {
+            let Some(media_source) = block.get("source").and_then(Value::as_object) else {
+                return lossy_provider_response_field(
+                    source,
+                    target,
+                    &format!("content[{block_index}].source"),
+                    "Claude media source is not an object",
+                );
+            };
+            for field in media_source.keys() {
+                if !matches!(field.as_str(), "type" | "media_type" | "data" | "url") {
+                    return lossy_provider_response_field(
+                        source,
+                        target,
+                        &format!("content[{block_index}].source.{field}"),
+                        "target format cannot preserve this Claude media-source field",
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(usage) = response.get("usage").and_then(Value::as_object) {
+        for field in usage.keys() {
+            let is_known = matches!(
+                field.as_str(),
+                "input_tokens"
+                    | "output_tokens"
+                    | "cache_read_input_tokens"
+                    | "cache_creation_input_tokens"
+                    | "cache_creation"
+                    | "output_tokens_details"
+                    | "reasoning_tokens"
+                    | "server_tool_use"
+                    | "service_tier"
+                    | "inference_geo"
+            );
+            if !is_known
+                || usage.get(field).is_some_and(|value| {
+                    matches!(
+                        field.as_str(),
+                        "server_tool_use" | "service_tier" | "inference_geo"
+                    ) && !value.is_null()
+                })
+            {
+                return lossy_provider_response_field(
+                    source,
+                    target,
+                    &format!("usage.{field}"),
+                    "target format cannot preserve this Claude usage field",
+                );
+            }
+        }
+        for (field, allowed) in [
+            (
+                "cache_creation",
+                &["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"][..],
+            ),
+            (
+                "output_tokens_details",
+                &["thinking_tokens", "reasoning_tokens"][..],
+            ),
+        ] {
+            if let Some(details) = usage.get(field).and_then(Value::as_object) {
+                if let Some(detail) = details.keys().find(|detail| {
+                    !allowed.contains(&detail.as_str())
+                        && details.get(*detail).is_some_and(|value| !value.is_null())
+                }) {
+                    return lossy_provider_response_field(
+                        source,
+                        target,
+                        &format!("usage.{field}.{detail}"),
+                        "target format cannot preserve this Claude usage-detail field",
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate nested Claude `tool_result.content` blocks before they are
+/// flattened into an OpenAI tool output. The target emitters intentionally
+/// stringify an unsupported nested block as a fallback; doing that for a
+/// provider response would silently discard its block type and fields.
+fn validate_claude_tool_result_response_content(
+    content: Option<&Value>,
+    target: FormatId,
+    location: &str,
+) -> Result<(), FormatError> {
+    let Some(content) = content else {
+        return Ok(());
+    };
+    if content.is_string() {
+        return Ok(());
+    }
+    let Some(parts) = content.as_array() else {
+        return lossy_provider_response_field(
+            FormatId::ClaudeMessages,
+            target,
+            location,
+            "Claude tool_result content must be a string or an array of content blocks",
+        );
+    };
+
+    let representable = match target {
+        FormatId::OpenAiChat => {
+            openai_chat::request::claude_tool_result_parts_are_openai_chat_representable(parts)
+        }
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact => {
+            openai_responses::request::claude_tool_result_parts_are_openai_responses_representable(
+                parts,
+            )
+        }
+        _ => true,
+    };
+    if !representable {
+        return lossy_provider_response_field(
+            FormatId::ClaudeMessages,
+            target,
+            location,
+            "target OpenAI tool output cannot represent one or more Claude tool_result content blocks",
+        );
+    }
+
+    for (part_index, part) in parts.iter().enumerate() {
+        let Some(part_object) = part.as_object() else {
+            return lossy_provider_response_field(
+                FormatId::ClaudeMessages,
+                target,
+                &format!("{location}[{part_index}]"),
+                "Claude tool_result content block is not an object",
+            );
+        };
+        let block_type = part_object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let allowed = match block_type {
+            "text" => &["type", "text"][..],
+            "image" | "document" | "file" => &["type", "source"][..],
+            _ => {
+                // The representability check above should already reject this
+                // branch; keep the explicit path for malformed future helpers.
+                return lossy_provider_response_field(
+                    FormatId::ClaudeMessages,
+                    target,
+                    &format!("{location}[{part_index}].type"),
+                    "target OpenAI tool output cannot represent this Claude nested block type",
+                );
+            }
+        };
+        if let Some(field) = part_object
+            .keys()
+            .find(|field| !allowed.contains(&field.as_str()))
+        {
+            return lossy_provider_response_field(
+                FormatId::ClaudeMessages,
+                target,
+                &format!("{location}[{part_index}].{field}"),
+                "target OpenAI tool output cannot preserve this Claude nested block field",
+            );
+        }
+        if matches!(block_type, "image" | "document" | "file") {
+            let Some(source_object) = part_object.get("source").and_then(Value::as_object) else {
+                return lossy_provider_response_field(
+                    FormatId::ClaudeMessages,
+                    target,
+                    &format!("{location}[{part_index}].source"),
+                    "Claude nested media block source is not an object",
+                );
+            };
+            if let Some(field) = source_object
+                .keys()
+                .find(|field| !matches!(field.as_str(), "type" | "media_type" | "data" | "url"))
+            {
+                return lossy_provider_response_field(
+                    FormatId::ClaudeMessages,
+                    target,
+                    &format!("{location}[{part_index}].source.{field}"),
+                    "target OpenAI tool output cannot preserve this Claude nested media-source field",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lossy_provider_response_field(
+    source: FormatId,
+    target: FormatId,
+    field: &str,
+    reason: &str,
+) -> Result<(), FormatError> {
+    Err(FormatError::LossyConversionBlocked {
+        source_format: source.as_str().to_string(),
+        target_format: target.as_str().to_string(),
+        field: field.to_string(),
+        reason: reason.to_string(),
+    })
 }
 
 fn validate_openai_responses_cross_format_response_extensions(
@@ -1373,34 +1896,10 @@ fn validate_cross_format_generation_target(
                 }
             }
         }
-        FormatId::GeminiGenerateContent => {
-            for (field, present, reason) in [
-                (
-                    "presence_penalty",
-                    generation.presence_penalty.is_some(),
-                    "Gemini GenerateContent has no presence_penalty request field",
-                ),
-                (
-                    "frequency_penalty",
-                    generation.frequency_penalty.is_some(),
-                    "Gemini GenerateContent has no frequency_penalty request field",
-                ),
-                (
-                    "logprobs",
-                    generation.logprobs.is_some(),
-                    "Gemini GenerateContent has no logprobs request field",
-                ),
-                (
-                    "top_logprobs",
-                    generation.top_logprobs.is_some(),
-                    "Gemini GenerateContent has no top_logprobs request field",
-                ),
-            ] {
-                if present {
-                    return lossy_generation_field(source, target, field, reason);
-                }
-            }
-        }
+        // Gemini GenerateContent exposes the penalty and logprob controls in
+        // `GenerationConfig`; the request emitter maps them to the official
+        // camelCase names, so they are representable across formats.
+        FormatId::GeminiGenerateContent => {}
         _ => {}
     }
     Ok(())
@@ -1433,6 +1932,12 @@ fn source_generation_field_path(source: FormatId, canonical_field: &str) -> Stri
         (FormatId::GeminiGenerateContent, "top_k") => "generationConfig.topK",
         (FormatId::GeminiGenerateContent, "stop_sequences") => "generationConfig.stopSequences",
         (FormatId::GeminiGenerateContent, "n") => "generationConfig.candidateCount",
+        (FormatId::GeminiGenerateContent, "presence_penalty") => "generationConfig.presencePenalty",
+        (FormatId::GeminiGenerateContent, "frequency_penalty") => {
+            "generationConfig.frequencyPenalty"
+        }
+        (FormatId::GeminiGenerateContent, "logprobs") => "generationConfig.responseLogprobs",
+        (FormatId::GeminiGenerateContent, "top_logprobs") => "generationConfig.logprobs",
         (FormatId::GeminiGenerateContent, "seed") => "generationConfig.seed",
         (FormatId::GeminiGenerateContent, other) => return format!("generationConfig.{other}"),
         (_, other) => other,
@@ -1880,7 +2385,9 @@ fn thinking_extension_key_is_cross_format_safe(
 fn response_format_extension_key_is_cross_format_safe(namespace: &str, key: &str) -> bool {
     matches!(
         (namespace, key),
-        ("openai", _) | ("gemini", "raw_schema" | "schema_field")
+        ("openai", _)
+            | ("gemini", "raw_schema" | "schema_field")
+            | ("claude", "output_config_format")
     )
 }
 
@@ -2821,6 +3328,7 @@ fn validate_claude_cross_format_request(body: &Value, target: FormatId) -> Resul
     {
         validate_claude_output_effort_value(output_effort)?;
     }
+    validate_claude_output_config_cross_format(body, target)?;
     if body
         .get("thinking")
         .and_then(Value::as_object)
@@ -2831,6 +3339,7 @@ fn validate_claude_cross_format_request(body: &Value, target: FormatId) -> Resul
             .get("output_config")
             .and_then(Value::as_object)
             .and_then(|output_config| output_config.get("effort"))
+            .filter(|value| !value.is_null())
             .is_none()
     {
         return Err(FormatError::LossyConversionBlocked {
@@ -2888,6 +3397,9 @@ fn validate_claude_cross_format_request(body: &Value, target: FormatId) -> Resul
 }
 
 fn validate_claude_output_effort_value(value: &Value) -> Result<(), FormatError> {
+    if value.is_null() {
+        return Ok(());
+    }
     let Some(raw) = value.as_str() else {
         return Err(FormatError::InvalidTargetField {
             format: FormatId::ClaudeMessages.as_str().to_string(),
@@ -2904,6 +3416,64 @@ fn validate_claude_output_effort_value(value: &Value) -> Result<(), FormatError>
             value: raw.to_string(),
         })
     }
+}
+
+/// Validate the subset of Anthropic `output_config` that has an audited
+/// canonical representation. Keeping this check shared by pure and runtime
+/// conversion paths prevents the gateway path from silently dropping a new
+/// provider-only output option.
+fn validate_claude_output_config_cross_format(
+    body: &Value,
+    target: FormatId,
+) -> Result<(), FormatError> {
+    let Some(output_config_value) = body.get("output_config") else {
+        return Ok(());
+    };
+    let Some(output_config) = output_config_value.as_object() else {
+        return Err(FormatError::UnsupportedField {
+            format: FormatId::ClaudeMessages.as_str().to_string(),
+            field: "output_config".to_string(),
+            reason: "Claude output_config must be an object".to_string(),
+        });
+    };
+    if let Some(field) = output_config
+        .keys()
+        .find(|field| !matches!(field.as_str(), "effort" | "format"))
+    {
+        return Err(FormatError::LossyConversionBlocked {
+            source_format: FormatId::ClaudeMessages.as_str().to_string(),
+            target_format: target.as_str().to_string(),
+            field: format!("output_config.{field}"),
+            reason: "target format cannot preserve this Claude output_config field".to_string(),
+        });
+    }
+    if let Some(format) = output_config.get("format") {
+        if format.is_null() {
+            return Ok(());
+        }
+        let Some(format) = format.as_object() else {
+            return Err(FormatError::UnsupportedField {
+                format: FormatId::ClaudeMessages.as_str().to_string(),
+                field: "output_config.format".to_string(),
+                reason: "Claude output_config.format must be an object".to_string(),
+            });
+        };
+        if format.get("type").and_then(Value::as_str) != Some("json_schema")
+            || format.get("schema").is_none()
+            || format
+                .keys()
+                .any(|field| !matches!(field.as_str(), "type" | "name" | "schema"))
+        {
+            return Err(FormatError::LossyConversionBlocked {
+                source_format: FormatId::ClaudeMessages.as_str().to_string(),
+                target_format: target.as_str().to_string(),
+                field: "output_config.format".to_string(),
+                reason: "target format only supports the official Claude json_schema output format"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_gemini_cross_format_request(body: &Value, target: FormatId) -> Result<(), FormatError> {

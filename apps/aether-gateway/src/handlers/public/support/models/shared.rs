@@ -5,10 +5,42 @@ use aether_data_contracts::repository::candidate_selection::{
 };
 use aether_data_contracts::repository::global_models::StoredPublicGlobalModel;
 use aether_data_contracts::repository::model_catalog::StoredModelCatalogEntry;
+use serde_json::{json, Value};
 
 use crate::model_metadata::{declared_model_families, global_model_declared_families};
 
 use super::GatewayPublicRequestContext;
+
+/// 生成 Gemini 公共模型目录投影。
+///
+/// 目录只发布 Aether 能从当前路由数据确认的身份与操作能力；不再为
+/// token 限额或采样参数填充没有事实来源的固定数值。GenerateContent 的
+/// 同步与流式入口都由现有标准矩阵提供，因此流式方法始终随生成能力发布。
+pub(super) fn project_gemini_model_value(model_name: &str, supports_count_tokens: bool) -> Value {
+    let mut methods = vec![
+        Value::String("generateContent".to_string()),
+        Value::String("streamGenerateContent".to_string()),
+    ];
+    if supports_count_tokens {
+        methods.push(Value::String("countTokens".to_string()));
+    }
+    json!({
+        "name": format!("models/{model_name}"),
+        "baseModelId": model_name,
+        "displayName": model_name,
+        "description": format!("Model {model_name}"),
+        "supportedGenerationMethods": methods,
+    })
+}
+
+/// Gemini CLI 与 Antigravity 使用私有流适配器，明确不支持原生 countTokens。
+/// 其它 provider 类型沿用 transport 层的 native Gemini count-token 路径。
+pub(super) fn provider_type_supports_gemini_count_tokens(provider_type: &str) -> bool {
+    !matches!(
+        provider_type.trim().to_ascii_lowercase().as_str(),
+        "gemini_cli" | "antigravity"
+    )
+}
 
 pub(crate) fn models_api_format(request_context: &GatewayPublicRequestContext) -> Option<&str> {
     let signature = request_context

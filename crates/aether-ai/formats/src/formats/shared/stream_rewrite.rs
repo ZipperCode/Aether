@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
+use crate::formats::id::normalize_api_format_alias;
 use crate::formats::openai::image::stream::{OpenAiImageChatStreamState, OpenAiImageStreamState};
 use crate::formats::openai::responses::history::ResponseHistoryRecord;
 use crate::formats::openai::responses::response::ensure_modern_openai_responses_response_fields;
@@ -12,7 +13,9 @@ use crate::formats::shared::response::{
 use crate::formats::shared::sse::encode_json_sse;
 use crate::formats::shared::stream_core::StreamingStandardFormatMatrix;
 use crate::formats::shared::sync_products::anthropic_legacy_compatibility_enabled;
-use crate::formats::shared::AiSurfaceFinalizeError;
+use crate::formats::shared::{
+    resolve_gemini_stream_wire_mode, AiSurfaceFinalizeError, GeminiStreamWireMode,
+};
 use crate::provider_compat::kiro_stream::KiroToClaudeCliStreamState;
 use crate::provider_compat::private_envelope::transform_provider_private_stream_line;
 use crate::provider_compat::surfaces::{
@@ -27,6 +30,7 @@ pub enum FinalizeStreamRewriteMode {
     OpenAiImage,
     OpenAiImageToOpenAiChat,
     ClaudeReadToolSanitize,
+    GeminiJsonArray,
     Standard,
     KiroToClaudeCli,
     KiroToClaudeCliThenStandard,
@@ -65,6 +69,29 @@ pub fn resolve_finalize_stream_rewrite_mode(
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
+
+    // Public Gemini streams without `alt=sse` use a JSON-array envelope. The
+    // upstream execution transport is normalized to SSE. Keep an exact
+    // same-format stream as raw JSON data records so native provider fields
+    // are not lost while changing only the outer envelope; converted streams
+    // still use the canonical standard matrix below.
+    if resolve_gemini_stream_wire_mode(report_context) == Some(GeminiStreamWireMode::JsonArray) {
+        let same_gemini_format =
+            normalize_api_format_alias(provider_stream_event_api_format.as_str())
+                == "gemini:generate_content"
+                && normalize_api_format_alias(client_api_format.as_str())
+                    == "gemini:generate_content";
+        let can_wrap_raw = same_gemini_format
+            && !needs_conversion
+            && envelope_name.is_empty()
+            && model_directive_display_model_from_report_context(report_context).is_none();
+        return Some(if can_wrap_raw {
+            FinalizeStreamRewriteMode::GeminiJsonArray
+        } else {
+            FinalizeStreamRewriteMode::Standard
+        });
+    }
+
     let stream_needs_conversion = needs_conversion
         || !is_same_format_family(
             provider_stream_event_api_format.as_str(),
@@ -211,6 +238,7 @@ enum AiSurfaceStreamRewriteState {
     OpenAiImage(Box<OpenAiImageStreamState>),
     OpenAiImageToOpenAiChat(Box<OpenAiImageChatStreamState>),
     ClaudeReadToolSanitize(Box<ClaudeReadToolStreamSanitizer>),
+    GeminiJsonArray(GeminiJsonArrayStreamRewriter),
     Standard(Box<StreamingStandardFormatMatrix>),
     KiroToClaudeCli(Box<KiroToClaudeCliStreamState>),
     KiroToClaudeCliThenStandard {
@@ -250,6 +278,9 @@ pub fn maybe_build_ai_surface_stream_rewriter<'a>(
                 Box::<ClaudeReadToolStreamSanitizer>::default(),
             )
         }
+        FinalizeStreamRewriteMode::GeminiJsonArray => {
+            AiSurfaceStreamRewriteState::GeminiJsonArray(GeminiJsonArrayStreamRewriter::default())
+        }
         FinalizeStreamRewriteMode::Standard => {
             AiSurfaceStreamRewriteState::Standard(Box::<StreamingStandardFormatMatrix>::default())
         }
@@ -283,6 +314,7 @@ impl AiSurfaceStreamRewriter<'_> {
             AiSurfaceStreamRewriteState::ClaudeReadToolSanitize(state) => {
                 state.push_chunk(self.report_context, chunk)
             }
+            AiSurfaceStreamRewriteState::GeminiJsonArray(state) => state.push_chunk(chunk),
             AiSurfaceStreamRewriteState::KiroToClaudeCli(state) => {
                 state.push_chunk(self.report_context, chunk)
             }
@@ -314,6 +346,7 @@ impl AiSurfaceStreamRewriter<'_> {
             AiSurfaceStreamRewriteState::ClaudeReadToolSanitize(state) => {
                 state.finish(self.report_context)
             }
+            AiSurfaceStreamRewriteState::GeminiJsonArray(state) => state.finish(),
             AiSurfaceStreamRewriteState::KiroToClaudeCli(state) => {
                 state.finish(self.report_context)
             }
@@ -375,9 +408,73 @@ impl AiSurfaceStreamRewriter<'_> {
             AiSurfaceStreamRewriteState::OpenAiImage(_)
             | AiSurfaceStreamRewriteState::OpenAiImageToOpenAiChat(_)
             | AiSurfaceStreamRewriteState::ClaudeReadToolSanitize(_)
+            | AiSurfaceStreamRewriteState::GeminiJsonArray(_)
             | AiSurfaceStreamRewriteState::KiroToClaudeCli(_)
             | AiSurfaceStreamRewriteState::KiroToClaudeCliThenStandard { .. } => Ok(Vec::new()),
         }
+    }
+}
+
+/// Wrap raw Gemini SSE data records in the public non-SSE JSON-array framing.
+/// The payload bytes are kept intact after JSON validation, so same-format
+/// streams retain provider fields that the canonical model does not know.
+#[derive(Default)]
+struct GeminiJsonArrayStreamRewriter {
+    buffered: Vec<u8>,
+    started: bool,
+    closed: bool,
+}
+
+impl GeminiJsonArrayStreamRewriter {
+    fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        self.buffered.extend_from_slice(chunk);
+        let mut output = Vec::new();
+        while let Some(record) = drain_next_sse_record(&mut self.buffered) {
+            output.extend(self.transform_record(record)?);
+        }
+        Ok(output)
+    }
+
+    fn finish(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        let mut output = Vec::new();
+        if !self.buffered.is_empty() {
+            let record = std::mem::take(&mut self.buffered);
+            output.extend(self.transform_record(record)?);
+        }
+        if !self.closed {
+            self.closed = true;
+            if self.started {
+                output.push(b']');
+            } else {
+                self.started = true;
+                output.extend_from_slice(b"[]");
+            }
+        }
+        Ok(output)
+    }
+
+    fn transform_record(&mut self, record: Vec<u8>) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        let Some(data) = sse_record_json_data(&record) else {
+            return Ok(Vec::new());
+        };
+        let payload = data.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return Ok(Vec::new());
+        }
+        // Validate without rebuilding the value. This preserves the original
+        // JSON field order and number representation for native passthrough.
+        serde_json::from_str::<Value>(payload).map_err(|err| {
+            AiSurfaceFinalizeError::new(format!("invalid Gemini SSE JSON: {err}"))
+        })?;
+        let mut output = Vec::with_capacity(payload.len().saturating_add(2));
+        if self.started {
+            output.push(b',');
+        } else {
+            output.push(b'[');
+            self.started = true;
+        }
+        output.extend_from_slice(payload.as_bytes());
+        Ok(output)
     }
 }
 
@@ -604,22 +701,32 @@ fn drain_next_sse_record(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     None
 }
 
-fn parse_sse_record_json(record: &[u8]) -> Option<(Option<String>, Value)> {
+fn sse_record_json_data(record: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(record).ok()?;
-    let mut event = None;
     let mut data = String::new();
     for line in text.lines() {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some(value) = line.strip_prefix("event:") {
-            event = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("data:") {
+        if let Some(value) = line.strip_prefix("data:") {
             if !data.is_empty() {
                 data.push('\n');
             }
             data.push_str(value.trim_start());
         }
     }
-    if data.trim().is_empty() || data.trim() == "[DONE]" {
+    (!data.trim().is_empty()).then_some(data)
+}
+
+fn parse_sse_record_json(record: &[u8]) -> Option<(Option<String>, Value)> {
+    let text = std::str::from_utf8(record).ok()?;
+    let mut event = None;
+    for line in text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(value) = line.strip_prefix("event:") {
+            event = Some(value.trim().to_string());
+        }
+    }
+    let data = sse_record_json_data(record)?;
+    if data.trim() == "[DONE]" {
         return None;
     }
     let value = serde_json::from_str::<Value>(data.trim()).ok()?;

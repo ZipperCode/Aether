@@ -18,7 +18,8 @@ use tracing::warn;
 
 use crate::ai_serving::api::{
     maybe_bridge_standard_sync_json_to_stream, maybe_build_provider_private_stream_normalizer,
-    normalize_provider_private_report_context, StreamingStandardTerminalObserver,
+    normalize_provider_private_report_context, resolve_gemini_stream_wire_mode,
+    GeminiStreamWireMode, StreamingStandardTerminalObserver,
 };
 use crate::execution_runtime::ndjson::encode_stream_frame_ndjson;
 use crate::execution_runtime::transport::{
@@ -96,9 +97,18 @@ pub(crate) fn build_direct_execution_frame_stream(
                         &observer_context,
                     ) {
                         Ok(Some(outcome)) => {
+                            let client_content_type = if resolve_gemini_stream_wire_mode(
+                                &observer_context,
+                            ) == Some(GeminiStreamWireMode::JsonArray)
+                            {
+                                "application/json"
+                            } else {
+                                "text/event-stream"
+                            };
                             response_headers = rewrite_headers_for_bridged_sse_response(
                                 &response_headers,
                                 outcome.sse_body.len(),
+                                client_content_type,
                             );
                             response_body = Bytes::from(outcome.sse_body);
                             summary = outcome.terminal_summary;
@@ -1094,10 +1104,11 @@ fn maybe_bridge_non_sse_sync_json_to_stream(
 fn rewrite_headers_for_bridged_sse_response(
     headers: &BTreeMap<String, String>,
     body_len: usize,
+    content_type: &str,
 ) -> BTreeMap<String, String> {
     let mut rewritten = headers.clone();
     rewritten.remove("content-encoding");
-    rewritten.insert("content-type".to_string(), "text/event-stream".to_string());
+    rewritten.insert("content-type".to_string(), content_type.to_string());
     rewritten.insert("content-length".to_string(), body_len.to_string());
     rewritten
 }

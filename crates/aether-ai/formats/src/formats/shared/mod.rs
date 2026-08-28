@@ -18,6 +18,7 @@ pub mod sync_products;
 pub mod sync_to_stream;
 pub mod video;
 
+pub use self::routing::{resolve_gemini_stream_wire_mode, GeminiStreamWireMode};
 pub use self::sse::{encode_done_sse, encode_json_sse, map_claude_stop_reason};
 pub use self::stream_core::{CanonicalStreamEvent, CanonicalStreamFrame};
 pub use self::stream_rewrite::{
