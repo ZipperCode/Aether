@@ -1,6 +1,6 @@
 # Format Passthrough Contract
 
-Last audited: 2026-06-03
+Last audited: 2026-08-28
 
 This document defines the boundary between runtime passthrough, canonical roundtrip tests, and cross-format conversion.
 
@@ -18,7 +18,8 @@ Current implementation:
 Important limitation:
 
 - The current transport helper receives `body_json: &serde_json::Value`, not raw request bytes. It therefore guarantees no canonical conversion and JSON value preservation at this layer, but it cannot preserve original whitespace or object key order by itself.
-- True byte-level passthrough for requests with no transport edits requires a higher-level raw-body path that can forward the original bytes directly. Until that raw-body plumbing exists, tests should assert "conversion module not called" and JSON value equivalence for this helper, not byte-for-byte serialization equivalence.
+- Eligible native HTTP requests now have a higher-level exact-body path. The frontdoor retains the decoded entity bytes in `OriginalRequestPayload`; after every candidate-specific model, body-rule, redaction, compatibility, and encoding decision, the plan reuses those bytes only when the final JSON value is unchanged and no re-encoding is required. Other requests continue through JSON serialization.
+- Exact-body reuse is carried through the existing serialized `RequestBody.body_bytes_b64` contract. It preserves normalized JSON whitespace and key order without changing tunnel/remote execution DTOs, but it does not preserve the client's original gzip/zstd octets after frontdoor decoding.
 
 Provider schema drift does not change this rule. If OpenAI, Claude, or Gemini add a new field, same-format runtime routing must still forward it as part of the original provider body. The schema inventory and field coverage matrix are audit aids, not the runtime allowlist for same-format traffic.
 

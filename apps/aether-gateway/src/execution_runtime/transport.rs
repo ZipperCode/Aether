@@ -2554,11 +2554,12 @@ async fn send_relay_request(
     request.send().await.map_err(|err| err.to_string())
 }
 
+/// 将执行计划中的 JSON 或 base64 请求体物化为上游字节；仅 JSON 分支应用内容编码，并直接借用 Value 序列化。
 pub(crate) fn build_request_body(
     plan: &ExecutionPlan,
 ) -> Result<Vec<u8>, ExecutionRuntimeTransportError> {
-    let mut body_bytes = if let Some(json_body) = plan.body.json_body.clone() {
-        serde_json::to_vec(&json_body).map_err(ExecutionRuntimeTransportError::BodyEncode)?
+    let mut body_bytes = if let Some(json_body) = plan.body.json_body.as_ref() {
+        serde_json::to_vec(json_body).map_err(ExecutionRuntimeTransportError::BodyEncode)?
     } else if let Some(body_b64) = plan.body.body_bytes_b64.as_deref() {
         base64::engine::general_purpose::STANDARD
             .decode(body_b64)

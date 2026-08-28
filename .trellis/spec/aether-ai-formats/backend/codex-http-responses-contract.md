@@ -27,6 +27,12 @@ Content-Type: application/json
 
 Current Codex HTTP inference sends `store=false`, `stream=true`, a model, and the complete input for the turn. Current remote compaction sends a model and complete input and consumes the returned `output` array.
 
+Internal request-body fidelity signatures:
+
+- `OriginalRequestPayload::body_bytes_base64_if_unchanged(&Value) -> Option<String>`
+- `resolve_ai_passthrough_sync_request_body(Option<Value>, Option<String>) -> RequestBody`
+- `build_request_body(&ExecutionPlan) -> Result<Vec<u8>, ExecutionRuntimeTransportError>`
+
 ## 3. Contracts
 
 ### Create request
@@ -43,6 +49,10 @@ Preserve these current Codex fields and all unknown same-format JSON fields:
 - `client_metadata`
 
 For a native `openai:responses` provider, copy the JSON object and apply only documented provider transport edits. The API coverage matrix is an audit artifact, never a runtime allowlist.
+
+The HTTP planner may reuse the frontdoor-normalized exact JSON bytes only after the final candidate body is complete. Reuse requires alias-equivalent client/provider formats, equality between the final candidate JSON and `OriginalRequestPayload`, and no new content encoding or active/unknown request-gzip policy. A missing payload extension or any candidate mutation falls back to `json_body`; exact bytes are an egress representation, never a bypass around model mapping, body rules, redaction, compatibility validation, or per-candidate isolation.
+
+When exact bytes are selected, `RequestBody` carries only `body_bytes_b64`; `json_body` must be absent. Existing serialized/tunnel execution contracts therefore remain unchanged. The preserved bytes are the decoded entity bytes after frontdoor content-encoding normalization, not the client's original compressed octets.
 
 For a cross-format provider, map only semantics represented by the canonical model. Unsupported material input, tool, structured-output, or reasoning semantics must fail closed rather than disappear.
 
@@ -69,6 +79,8 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 | Missing/invalid Aether authentication | Reject locally before provider execution. |
 | Admission or quota failure | Return the existing local error; do not call upstream. |
 | Native Responses unknown request/response field | Preserve the JSON value. |
+| Final native candidate JSON equals the captured request and no encoding/gzip is active | Use the existing exact `body_bytes_b64` representation; do not also carry `json_body`. |
+| Final candidate JSON changed, formats differ, payload capture is absent, or encoding/gzip is active or unknown | Fall back to `json_body`; never reuse stale source bytes. |
 | Native Responses unknown SSE event/field | Preserve the emitted bytes and ordering. |
 | Cross-format material semantic cannot be represented | Return a structured conversion/terminal error; never silently drop it. |
 | Upstream HTTP 4xx/5xx | Preserve status and error body through the generic HTTP boundary. |
@@ -80,8 +92,11 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 ## 5. Good / Base / Bad Cases
 
 - Good: Codex sends the current full create payload plus a future field to a native Responses provider; the future field and opaque SSE event survive unchanged.
+- Good: a native request remains byte-equivalent after every candidate edit; the planner reuses its normalized exact bytes, including whitespace and object-key order.
 - Base: Codex sends a compact payload to a native provider; Aether returns the provider `output` array without local state.
+- Base: the selected provider model or stream policy changes the candidate JSON; the planner serializes the final JSON instead of reusing the source bytes.
 - Bad: a cross-format provider cannot represent a new input/tool item, and Aether silently removes it to keep the request running.
+- Bad: exact source bytes are selected before model/body/redaction rules finish, undoing the final candidate request.
 - Bad: downstream credentials or `x-aether-*` identity headers reach provider egress.
 - Bad: a provider returns HTTP 200 plus a bare Responses error body, and Aether commits 200 before classifying it, causing clients to deserialize the error as a successful Response without `id`.
 - Bad: a general OpenAI resource endpoint is added solely because it exists in the official reference, without a downstream product requirement and provider-affinity design.
@@ -91,6 +106,8 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 Keep focused regressions on the shared paths:
 
 - `same_format_responses_body_preserves_opaque_extension_fields`: current Codex create fields plus an unknown field remain equal after native request construction.
+- `openai_sync_and_stream_builders_prefer_prevalidated_exact_body`: Chat, Responses, and Responses Compact sync/stream builders prefer one prevalidated exact body and clear `json_body`.
+- `local_exact_body_requires_unchanged_same_format_unencoded_json`: local exact-byte recovery succeeds only for unchanged native JSON and falls back for changed JSON, cross-format, content encoding, active gzip, or missing payload capture.
 - `same_format_headers_cannot_restore_credentials_or_internal_headers`: downstream credentials/internal headers are absent and provider credentials are present.
 - `falls_back_to_body_json_for_openai_responses_same_family_sync_payload`: compact `output` and unknown response fields remain equal.
 - `rejects_openai_responses_same_family_error_body_json`: success finalization does not consume 4xx/5xx error bodies.
@@ -128,4 +145,13 @@ For native Responses streaming failures, the correct boundary is:
 inspect the first complete event before downstream 2xx
 -> embedded error with no visible output: preserve non-2xx or retry
 -> valid Responses event: commit and preserve the original stream bytes
+```
+
+For native request bytes, the correct boundary is:
+
+```text
+finish all per-candidate request edits
+-> compare final JSON with the captured parsed request
+-> unchanged native request with no re-encoding: reuse exact normalized bytes
+-> otherwise: serialize the final JSON
 ```

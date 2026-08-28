@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use aether_contracts::RequestBody;
 use tracing::debug;
 
 use super::super::{
@@ -9,6 +8,7 @@ use super::super::{
     take_ai_upstream_auth_pair, take_non_empty_string, AiExecutionPlanFromDecisionParts,
     AiStreamAttempt,
 };
+use super::resolve_openai_plan_request_body;
 use crate::ai_serving::planner::common::enforce_provider_body_stream_policy;
 use crate::ai_serving::planner::redaction::sanitize_upstream_url_for_log;
 use crate::ai_serving::provider_adaptation_requires_eventstream_accept;
@@ -31,6 +31,7 @@ fn effective_stream_accept_mode(
             .unwrap_or(false)
 }
 
+/// 从最终 OpenAI Chat 候选构建流式执行计划，并在保留 stream/Accept 语义后选择精确字节或 JSON。
 pub(crate) fn build_openai_chat_stream_plan_from_decision(
     parts: &http::request::Parts,
     body_json: &serde_json::Value,
@@ -121,6 +122,15 @@ pub(crate) fn build_openai_chat_stream_plan_from_decision(
         &provider_request_headers,
         &provider_request_body_value,
     )?;
+    let request_body = resolve_openai_plan_request_body(
+        parts,
+        provider_request_body_value,
+        payload.provider_request_body_base64.take(),
+        core.client_api_format.as_str(),
+        core.provider_api_format.as_str(),
+        payload.content_encoding.as_deref(),
+        payload.request_gzip.as_ref(),
+    );
     let plan = build_ai_execution_plan_from_decision(
         &mut payload,
         AiExecutionPlanFromDecisionParts {
@@ -129,7 +139,7 @@ pub(crate) fn build_openai_chat_stream_plan_from_decision(
             url,
             headers: std::mem::take(&mut provider_request_headers),
             content_type,
-            body: RequestBody::from_json(provider_request_body_value),
+            body: request_body,
             stream: effective_upstream_is_stream,
         },
     );
@@ -141,6 +151,7 @@ pub(crate) fn build_openai_chat_stream_plan_from_decision(
     }))
 }
 
+/// 从最终 OpenAI Responses/Compact 候选构建流式执行计划，并保持首段分类与后续流处理所需元数据不变。
 pub(crate) fn build_openai_responses_stream_plan_from_decision(
     parts: &http::request::Parts,
     _body_json: &serde_json::Value,
@@ -221,6 +232,15 @@ pub(crate) fn build_openai_responses_stream_plan_from_decision(
         &provider_request_headers,
         &provider_request_body_value,
     )?;
+    let request_body = resolve_openai_plan_request_body(
+        parts,
+        provider_request_body_value,
+        payload.provider_request_body_base64.take(),
+        core.client_api_format.as_str(),
+        core.provider_api_format.as_str(),
+        payload.content_encoding.as_deref(),
+        payload.request_gzip.as_ref(),
+    );
     let plan = build_ai_execution_plan_from_decision(
         &mut payload,
         AiExecutionPlanFromDecisionParts {
@@ -229,7 +249,7 @@ pub(crate) fn build_openai_responses_stream_plan_from_decision(
             url,
             headers: std::mem::take(&mut provider_request_headers),
             content_type,
-            body: RequestBody::from_json(provider_request_body_value),
+            body: request_body,
             stream: effective_upstream_is_stream,
         },
     );

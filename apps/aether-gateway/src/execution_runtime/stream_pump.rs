@@ -1136,6 +1136,7 @@ fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     message
 }
 
+/// 观察上游流块：私有协议先规范化并持有结果，普通协议直接借用当前块，避免只读观察前复制。
 fn observe_stream_chunk(
     observer: &mut StreamingStandardTerminalObserver,
     report_context: &Value,
@@ -1143,8 +1144,8 @@ fn observe_stream_chunk(
     observer_buffered: &mut Vec<u8>,
     chunk: &[u8],
 ) {
-    let normalized = if let Some(normalizer) = private_stream_normalizer {
-        match normalizer.push_chunk(chunk) {
+    if let Some(normalizer) = private_stream_normalizer {
+        let normalized = match normalizer.push_chunk(chunk) {
             Ok(normalized) => normalized,
             Err(err) => {
                 observer.disable_with_error(format!(
@@ -1152,12 +1153,11 @@ fn observe_stream_chunk(
                 ));
                 return;
             }
-        }
+        };
+        observe_normalized_bytes(observer, report_context, observer_buffered, &normalized);
     } else {
-        chunk.to_vec()
-    };
-
-    observe_normalized_bytes(observer, report_context, observer_buffered, &normalized);
+        observe_normalized_bytes(observer, report_context, observer_buffered, chunk);
+    }
 }
 
 fn finalize_stream_terminal_summary(
