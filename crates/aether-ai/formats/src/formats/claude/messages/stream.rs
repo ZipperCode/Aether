@@ -1174,9 +1174,7 @@ fn audit_claude_stream_delta_object(delta: Option<&Value>, allowed: &[&str]) -> 
 }
 
 fn audit_claude_stream_usage(usage: Option<&Value>) -> Option<String> {
-    let Some(usage_value) = usage else {
-        return None;
-    };
+    let usage_value = usage?;
     let Some(usage) = usage_value.as_object() else {
         return Some("usage".to_string());
     };

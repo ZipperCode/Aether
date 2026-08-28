@@ -70,6 +70,12 @@ enum StreamFailureHandling {
 }
 
 impl StreamFailureReport {
+    /// Return the original structured provider error body when one was
+    /// available, so client-specific terminal encoders can preserve details.
+    pub(super) fn provider_body_json(&self) -> Option<&Value> {
+        self.provider_body_json.as_ref()
+    }
+
     fn into_body_jsons(self) -> (Value, Option<Value>) {
         let Self {
             status_code,

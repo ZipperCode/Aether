@@ -4991,8 +4991,7 @@ fn encode_gemini_json_array_terminal_error(
         ("status".to_string(), Value::String(status.to_string())),
     ]);
     if let Some(details) = failure
-        .provider_body_json
-        .as_ref()
+        .provider_body_json()
         .and_then(|body| body.get("error"))
         .and_then(Value::as_object)
         .and_then(|error| error.get("details"))
@@ -5028,8 +5027,7 @@ fn encode_gemini_json_array_terminal_error(
 /// implementation-specific strings to the client.
 fn gemini_stream_error_status(failure: &StreamFailureReport) -> &'static str {
     if let Some(status) = failure
-        .provider_body_json
-        .as_ref()
+        .provider_body_json()
         .and_then(|body| body.get("error"))
         .and_then(Value::as_object)
         .and_then(|error| error.get("status"))

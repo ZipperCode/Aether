@@ -27,16 +27,11 @@ use crate::formats::openai::image::request::is_openai_image_stream_request;
 ///
 /// The upstream transport is normalized to SSE internally, while the public
 /// Gemini API uses `alt=sse` for SSE and a JSON array otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GeminiStreamWireMode {
+    #[default]
     Sse,
     JsonArray,
-}
-
-impl Default for GeminiStreamWireMode {
-    fn default() -> Self {
-        Self::Sse
-    }
 }
 
 /// Resolve the public Gemini stream framing from sanitized report context.

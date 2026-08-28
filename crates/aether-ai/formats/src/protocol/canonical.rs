@@ -5026,7 +5026,6 @@ pub(crate) fn gemini_generation_config(value: Option<&Value>) -> CanonicalGenera
             .and_then(Value::as_bool),
         top_logprobs: gemini_value_by_case(generation_config, "logprobs", "top_logprobs")
             .and_then(Value::as_u64),
-        ..CanonicalGenerationConfig::default()
     }
 }
 

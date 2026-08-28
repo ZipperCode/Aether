@@ -67,7 +67,10 @@ use aether_model_fetch::{
     preset_models_for_provider, selected_models_fetch_endpoints,
 };
 use aether_pool_core::PoolSchedulingPreset;
-use aether_provider_pool::{provider_pool_key_balance_below_minimum, ProviderPoolService};
+use aether_provider_pool::{
+    provider_pool_key_balance_below_minimum, provider_pool_key_runtime_quota_blocked,
+    ProviderPoolService,
+};
 use aether_scheduler_core::provider_key_circuit_payload_is_active_open_at;
 use axum::{
     body::{to_bytes, Body},
@@ -1398,6 +1401,9 @@ fn provider_query_pool_catalog_key_context(
             key,
             provider_type,
         ),
+        // 管理端模型测试从已成功读取的目录 Key 构建上下文，并与正式调度共享运行时额度阻断事实。
+        runtime_quota_hard_blocked: provider_pool_key_runtime_quota_blocked(key),
+        catalog_state_unavailable: false,
         health_score,
         latency_avg_ms,
         catalog_lru_score: Some(key.last_used_at_unix_secs.unwrap_or(0) as f64),
