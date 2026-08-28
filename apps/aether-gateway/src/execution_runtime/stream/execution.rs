@@ -5037,7 +5037,7 @@ fn gemini_stream_error_status(failure: &StreamFailureReport) -> &'static str {
         return status;
     }
     let normalized = failure.error_type.trim().to_ascii_uppercase();
-    gemini_known_error_status(&normalized).unwrap_or_else(|| match failure.status_code {
+    gemini_known_error_status(&normalized).unwrap_or(match failure.status_code {
         408 | 504 => "DEADLINE_EXCEEDED",
         400 | 413 => "INVALID_ARGUMENT",
         401 => "UNAUTHENTICATED",
