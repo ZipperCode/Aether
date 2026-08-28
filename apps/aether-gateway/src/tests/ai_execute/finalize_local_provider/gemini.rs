@@ -2033,7 +2033,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_upstream_stream_via_local_
     assert_eq!(
         response_json,
         json!({
-            "responseId": "resp-local-stream",
+            "responseId": "resp_antigravity_cli_sync_123",
             "_v1internal_response_id": "resp_antigravity_cli_sync_123",
             "candidates": [{
                 "content": {

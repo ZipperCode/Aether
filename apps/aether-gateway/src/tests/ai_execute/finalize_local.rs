@@ -1905,7 +1905,7 @@ async fn gateway_executes_openai_chat_antigravity_cross_format_sync_via_local_fi
     assert_eq!(
         response_json,
         json!({
-            "id": "resp-local-stream",
+            "id": "resp-antigravity-chat-sync-123",
             "object": "chat.completion",
             "model": "claude-sonnet-4-5",
             "choices": [{

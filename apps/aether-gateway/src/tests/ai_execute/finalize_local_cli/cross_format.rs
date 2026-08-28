@@ -1456,7 +1456,7 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
     assert_eq!(
         response_json,
         json!({
-            "id": "resp-local-stream",
+            "id": "resp_antigravity_cli_xfmt_123",
             "object": "response",
             "status": "completed",
             "model": "claude-sonnet-4-5",
@@ -1465,7 +1465,7 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
             "output_text": "Hello Antigravity",
             "output": [{
                 "type": "message",
-                "id": "resp-local-stream_msg",
+                "id": "resp_antigravity_cli_xfmt_123_msg",
                 "role": "assistant",
                 "status": "completed",
                 "content": [{
