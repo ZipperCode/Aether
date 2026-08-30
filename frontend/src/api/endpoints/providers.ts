@@ -272,6 +272,276 @@ export async function testModel(
   return response.data
 }
 
+/** 能力检测规模：40 题快筛或 100 题复核。 */
+export type ModelCapabilityMode = 'quick' | 'verify'
+
+/** 能力检测题面语言；双语在每个维度内中英文各半。 */
+export type ModelCapabilityLanguage = 'zh' | 'en' | 'bilingual'
+
+/** 服务端允许返回的固定能力偏离结论。 */
+export type ModelCapabilityVerdict =
+  | 'profile_only'
+  | 'no_large_deviation'
+  | 'needs_verification'
+  | 'no_significant_deviation'
+  | 'significant_deviation'
+  | 'inconclusive'
+
+/** 无法判断时的机器可读原因。 */
+export type ModelCapabilityInconclusiveReason =
+  | 'total_timeout'
+  | 'target_coverage'
+  | 'reference_coverage'
+  | 'paired_coverage'
+
+/** 五个等权随机客观题维度。 */
+export type ModelCapabilityDimension =
+  | 'quantitative'
+  | 'logical'
+  | 'algorithmic'
+  | 'language'
+  | 'instruction'
+
+/** 单题结果状态；只有 scored 会进入正确率分母。 */
+export type ModelCapabilityItemStatus =
+  | 'scored'
+  | 'network_failure'
+  | 'rate_limited'
+  | 'timeout'
+  | 'filtered'
+  | 'refused'
+  | 'truncated'
+  | 'unparseable'
+  | 'upstream_error'
+  | 'cancelled'
+
+/** 能力检测请求；浏览器不传题目、答案、模型名或 seed。 */
+export interface TestModelCapabilityRequest {
+  /** 目标提供商内部 ID。 */
+  provider_id: string
+  /** 目标 ProviderModel 内部 ID。 */
+  model_id: string
+  /** 本次固定使用的目标 endpoint ID。 */
+  endpoint_id: string
+  /** 本次固定使用的目标 Key ID。 */
+  api_key_id: string
+  /** 快筛或复核。 */
+  mode: ModelCapabilityMode
+  /** 中文、英文或双语题面。 */
+  language: ModelCapabilityLanguage
+  /** 是否读取目标模型已保存并重新校验的可信参考。 */
+  use_saved_reference: boolean
+  /** 客户端诊断 ID；不参与出题。 */
+  request_id?: string
+}
+
+/** 返回结果中的固定候选，不包含 URL、Key 名称或凭据。 */
+export interface ModelCapabilitySubject {
+  /** 提供商 ID。 */
+  provider_id: string
+  /** ProviderModel ID。 */
+  model_id: string
+  /** endpoint ID。 */
+  endpoint_id: string
+  /** Key ID。 */
+  api_key_id: string
+  /** 映射前模型名。 */
+  requested_model: string
+  /** 实际发往上游的模型名。 */
+  effective_model: string
+  /** 实际上游协议格式。 */
+  api_format: string
+}
+
+/** 上游可取得的 token 与费用；缺失字段不会由前端猜测。 */
+export interface ModelCapabilityUsage {
+  /** 输入 token。 */
+  input_tokens: number | null
+  /** 输出 token。 */
+  output_tokens: number | null
+  /** 总 token。 */
+  total_tokens: number | null
+  /** 上游明确给出的美元成本。 */
+  cost_usd: number | null
+}
+
+/** 单题对目标或参考的脱敏观察。 */
+export interface ModelCapabilityObservation {
+  /** 解析出的 A-D 选项。 */
+  parsed_option: 'A' | 'B' | 'C' | 'D' | null
+  /** 失败分类或已评分状态。 */
+  status: ModelCapabilityItemStatus
+  /** 已评分时的正确性。 */
+  correct: boolean | null
+  /** 上游耗时。 */
+  latency_ms: number | null
+  /** 单题可取得的 token 与费用。 */
+  usage: ModelCapabilityUsage | null
+}
+
+/** 逐题结果；刻意不含题面、原始响应或推理。 */
+export interface ModelCapabilityItemResult {
+  /** 服务端题目 ID。 */
+  question_id: string
+  /** 能力维度。 */
+  dimension: ModelCapabilityDimension
+  /** 实际题面语言。 */
+  language: 'zh' | 'en'
+  /** 唯一正确选项。 */
+  expected_option: 'A' | 'B' | 'C' | 'D'
+  /** 目标观察。 */
+  target: ModelCapabilityObservation
+  /** 参考观察；未启用参考时为 null。 */
+  reference: ModelCapabilityObservation | null
+}
+
+/** 不进入正确率分母的失败分类计数。 */
+export interface ModelCapabilityFailureCounts {
+  /** 网络失败。 */
+  network_failure: number
+  /** 限流。 */
+  rate_limited: number
+  /** 超时。 */
+  timeout: number
+  /** 内容过滤。 */
+  filtered: number
+  /** 明确拒答。 */
+  refused: number
+  /** 输出截断。 */
+  truncated: number
+  /** 无法解析。 */
+  unparseable: number
+  /** 其他上游错误。 */
+  upstream_error: number
+  /** 已取消。 */
+  cancelled: number
+}
+
+/** 单个能力维度的评分。 */
+export interface ModelCapabilityDimensionMetrics {
+  /** 能力维度。 */
+  dimension: ModelCapabilityDimension
+  /** 计划题数。 */
+  planned: number
+  /** 已评分题数。 */
+  scored: number
+  /** 正确题数。 */
+  correct: number
+  /** 已解析覆盖率。 */
+  coverage: number
+  /** 正确率；无样本时为 null。 */
+  score: number | null
+}
+
+/** 目标或参考的总体评分。 */
+export interface ModelCapabilityMetrics {
+  /** 计划题数。 */
+  planned: number
+  /** 已评分题数。 */
+  scored: number
+  /** 正确题数。 */
+  correct: number
+  /** 已解析覆盖率。 */
+  coverage: number
+  /** 五维等权总体分。 */
+  score: number | null
+  /** 95% Wilson 下界。 */
+  wilson_low: number | null
+  /** 95% Wilson 上界。 */
+  wilson_high: number | null
+  /** 五维评分。 */
+  dimensions: ModelCapabilityDimensionMetrics[]
+  /** 失败分类。 */
+  failures: ModelCapabilityFailureCounts
+  /** 单题上游耗时之和。 */
+  elapsed_ms: number
+  /** 可取得的 token 与费用汇总。 */
+  usage: ModelCapabilityUsage | null
+}
+
+/** 目标与参考的同题配对统计。 */
+export interface ModelCapabilityComparison {
+  /** 双方均解析的题数。 */
+  paired: number
+  /** 同题配对覆盖率。 */
+  paired_coverage: number
+  /** 仅参考正确的题数。 */
+  reference_only_correct: number
+  /** 仅目标正确的题数。 */
+  target_only_correct: number
+  /** 参考分减目标分。 */
+  score_gap: number | null
+  /** 单侧精确 McNemar p 值。 */
+  p_value: number
+}
+
+/** 能力检测实际采用的确定性请求轮廓。 */
+export interface ModelCapabilityRequestProfile {
+  /** 是否流式。 */
+  stream: boolean
+  /** 温度。 */
+  temperature: number
+  /** 最大输出 token。 */
+  max_output_tokens: number
+  /** 是否提供工具。 */
+  tools_enabled: boolean
+  /** 是否启用搜索。 */
+  search_enabled: boolean
+}
+
+/** 完整能力检测结果。 */
+export interface TestModelCapabilityResponse {
+  /** 单次运行 ID。 */
+  run_id: string
+  /** 题集合同版本。 */
+  suite_version: string
+  /** 服务端随机 seed。 */
+  seed: string
+  /** 实际模式。 */
+  mode: ModelCapabilityMode
+  /** 实际语言配置。 */
+  language: ModelCapabilityLanguage
+  /** 固定结论。 */
+  verdict: ModelCapabilityVerdict
+  /** 无法判断原因。 */
+  inconclusive_reason: ModelCapabilityInconclusiveReason | null
+  /** 目标固定候选。 */
+  target: ModelCapabilitySubject
+  /** 参考固定候选。 */
+  reference: ModelCapabilitySubject | null
+  /** 目标评分。 */
+  target_metrics: ModelCapabilityMetrics
+  /** 参考评分。 */
+  reference_metrics: ModelCapabilityMetrics | null
+  /** 配对统计。 */
+  comparison: ModelCapabilityComparison | null
+  /** 逐题脱敏结果。 */
+  items: ModelCapabilityItemResult[]
+  /** 同步请求墙钟耗时。 */
+  elapsed_ms: number
+  /** 实际请求轮廓。 */
+  request_profile: ModelCapabilityRequestProfile
+  /** 身份认证边界免责声明。 */
+  disclaimer: string
+}
+
+/** 调用独立能力检测 API；AbortSignal 取消时浏览器会丢弃后端剩余 future。 */
+export async function testModelCapability(
+  data: TestModelCapabilityRequest,
+  options: { signal?: AbortSignal } = {},
+): Promise<TestModelCapabilityResponse> {
+  const response = await client.post<TestModelCapabilityResponse>(
+    '/api/admin/provider-query/test-model-capability',
+    data,
+    {
+      // 给服务端 10/20 分钟硬时限预留 30 秒返回 inconclusive 结果，避免客户端先行截断。
+      timeout: data.mode === 'verify' ? 20 * 60 * 1000 + 30_000 : 10 * 60 * 1000 + 30_000,
+      signal: options.signal,
+    },
+  )
+  return response.data
+}
+
 /**
  * 带故障转移的模型测试
  */

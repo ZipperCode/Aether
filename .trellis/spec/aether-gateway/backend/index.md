@@ -22,6 +22,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Balance-Aware Key Scheduling](../../aether-provider-pool/backend/balance-scheduling-contract.md) | Runtime, sticky, refresh, and cache integration contract | Current |
 | [Runtime Key Quota Block](../../aether-provider-pool/backend/runtime-quota-block-contract.md) | Failure classification, effects, admin recovery, and cache integration | Current |
 | [Codex HTTP Responses Relay](../../aether-ai-formats/backend/codex-http-responses-contract.md) | Cross-layer create, compact, SSE, auth, and state boundary | Current |
+| [Model Capability Test](./model-capability-test-contract.md) | Pinned target/reference execution, random suite, scoring, API, and UI boundary | Current |
 
 ---
 

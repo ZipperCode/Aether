@@ -1,0 +1,4 @@
+{"file":".trellis/spec/guides/index.md","reason":"共享思考指南与跨层功能入口"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"锁定后端合同、前端类型和模型 config 的跨层一致性"}
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"gateway 后端边界与相关现有合同索引"}
+{"file":".trellis/tasks/08-29-model-capability-detection/research/summary.md","reason":"现有调用链、外部研究边界和已确认产品决策"}

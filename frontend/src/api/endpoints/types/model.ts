@@ -67,13 +67,31 @@ export interface ProviderTieredPricingConfig {
   [key: string]: unknown
 }
 
+/** 模型能力检测保存的可信参考四元组；只保存内部 ID，不包含密钥明文。 */
+export interface CapabilityTestReferenceConfig {
+  /** 可信参考提供商 ID。 */
+  provider_id: string
+  /** 可信参考 ProviderModel ID。 */
+  model_id: string
+  /** 每次复用前都由后端重新校验的 endpoint ID。 */
+  endpoint_id: string
+  /** 每次复用前都由后端重新校验的 Key ID。 */
+  api_key_id: string
+}
+
+/** ProviderModel 的开放配置，并为能力检测参考提供 typed 读取入口。 */
+export interface ProviderModelConfig extends Record<string, unknown> {
+  /** 首次选择后保存的可信官方参考；失效时不得自动替换。 */
+  capability_test_reference?: CapabilityTestReferenceConfig
+}
+
 export interface Model {
   id: string
   provider_id: string
   global_model_id: string  // 关联的 GlobalModel ID
   provider_model_name: string  // Provider 侧的主模型名称
   provider_model_mappings?: ProviderModelMapping[] | null  // 模型名称映射列表（带优先级）
-  config?: Record<string, unknown> | null  // 额外配置（如 billing/video 等）
+  config?: ProviderModelConfig | null  // 额外配置（如 billing/video、能力检测参考等）
   // 原始配置值（可能为空，为空时使用 GlobalModel 默认值）
   price_per_request?: number | null  // 按次计费价格
   tiered_pricing?: ProviderTieredPricingConfig | null  // Provider 原始覆盖，可仅包含 processing_tiers
@@ -102,7 +120,7 @@ export interface Model {
   global_model_name?: string
   global_model_display_name?: string
   // 有效配置（合并 Model 和 GlobalModel 的 config）
-  effective_config?: Record<string, unknown> | null
+  effective_config?: ProviderModelConfig | null
   model_test_capabilities?: ModelTestCapabilities | null
 }
 
@@ -121,7 +139,7 @@ export interface ModelCreate {
   supports_extended_thinking?: boolean
   supports_image_generation?: boolean
   is_active?: boolean
-  config?: Record<string, unknown>
+  config?: ProviderModelConfig
 }
 
 export interface ModelUpdate {
@@ -137,7 +155,7 @@ export interface ModelUpdate {
   supports_image_generation?: boolean
   is_active?: boolean
   is_available?: boolean
-  config?: Record<string, unknown> | null
+  config?: ProviderModelConfig | null
   endpoint_bindings?: Array<{
     endpoint_id: string
     is_active: boolean

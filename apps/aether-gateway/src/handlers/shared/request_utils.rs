@@ -201,6 +201,7 @@ pub(crate) fn json_string_list(value: Option<&serde_json::Value>) -> Vec<String>
         .collect()
 }
 
+/// 判断本地管理路由是否必须先缓冲请求体；所有读取 typed JSON 的新增 route kind 都必须登记在此。
 pub(crate) fn admin_proxy_local_requires_buffered_body(
     request_context: &GatewayPublicRequestContext,
 ) -> bool {
@@ -315,7 +316,12 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (
                     Some("provider_query_manage"),
                     http::Method::POST,
-                    Some("query_models" | "test_model" | "test_model_failover"),
+                    Some(
+                        "query_models"
+                        | "test_model"
+                        | "test_model_capability"
+                        | "test_model_failover",
+                    ),
                 )
                 | (Some("routing_profiles_manage"), http::Method::POST, Some("create_group"))
                 | (Some("routing_profiles_manage"), http::Method::PATCH, Some("update_group"))

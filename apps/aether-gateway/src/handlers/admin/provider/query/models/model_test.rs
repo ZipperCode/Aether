@@ -87,6 +87,7 @@ use uuid::Uuid;
 
 mod adapter;
 mod capabilities;
+mod capability_test;
 mod model_mapping;
 mod summary;
 
@@ -106,12 +107,15 @@ use self::capabilities::{
     provider_query_openai_image_normalize_options,
 };
 use self::model_mapping::{
+    provider_query_resolve_admin_model_effective_model,
     provider_query_resolve_explicit_mapped_effective_model,
     provider_query_resolve_global_effective_model,
 };
 use self::summary::{
     provider_query_candidate_summary_payload, provider_query_test_attempt_payload,
 };
+
+pub(crate) use self::capability_test::build_admin_provider_query_test_model_capability_response;
 
 pub(crate) const ADMIN_PROVIDER_QUERY_LOCAL_TEST_MODEL_MESSAGE: &str =
     "Rust local provider-query model test is not configured";
@@ -131,6 +135,8 @@ const ANTIGRAVITY_PROVIDER_CACHE_KEY_PREFIX: &str = "upstream_models_provider:";
 const DEFAULT_PROVIDER_QUERY_TEST_MESSAGE: &str = "Hello! This is a test message.";
 const PROVIDER_QUERY_MODEL_PROBE_MAX_ERROR_CHARS: usize = 512;
 static PROVIDER_QUERY_POOL_LOAD_BALANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// 管理端测试在解析完成后固定使用的端点、Key 与有效模型；能力检测复用它以禁止题间 failover。
+#[derive(Clone)]
 struct ProviderQueryTestCandidate {
     endpoint: StoredProviderCatalogEndpoint,
     key: StoredProviderCatalogKey,
@@ -1487,11 +1493,13 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
     skipped.chain(scheduled).collect()
 }
 
+/// 构建模型测试候选；传入 exact_model 时只允许该 ProviderModel 决定有效模型名。
 async fn provider_query_build_kiro_test_candidates(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
     payload: &Value,
     requested_model_override: Option<&str>,
+    exact_model: Option<&StoredAdminProviderModel>,
 ) -> Result<Vec<ProviderQueryTestCandidate>, Response<Body>> {
     provider_query_reconcile_fixed_provider_endpoints_for_test_model(state, provider).await?;
 
@@ -1582,7 +1590,13 @@ async fn provider_query_build_kiro_test_candidates(
         })?;
     let test_mode = provider_query_test_mode(payload);
     let explicit_mapped_model = provider_query_extract_mapped_model_name(payload);
-    let effective_model = if let Some(mapped_model_name) = explicit_mapped_model {
+    let effective_model = if let Some(model) = exact_model {
+        provider_query_resolve_admin_model_effective_model(model, &endpoint).map_err(|_| {
+            build_admin_provider_query_bad_request_response(
+                ADMIN_PROVIDER_QUERY_INVALID_MAPPED_MODEL_DETAIL,
+            )
+        })?
+    } else if let Some(mapped_model_name) = explicit_mapped_model {
         if let Some(effective_model) = provider_query_resolve_explicit_mapped_effective_model(
             state,
             &provider.id,
@@ -3896,6 +3910,7 @@ async fn build_admin_provider_query_kiro_failover_response(
             &provider,
             payload,
             Some(requested_failover_model.as_str()),
+            None,
         )
         .await
         {

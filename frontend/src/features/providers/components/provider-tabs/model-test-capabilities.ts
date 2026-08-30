@@ -15,6 +15,14 @@ export type ModelTestImageSource = {
   model_test_capabilities?: ModelTestCapabilities | null
 }
 
+/** 能力检测判断所需的最小模型元数据，兼容 Provider 与合并后的 Global config。 */
+export type ModelCapabilitySource = {
+  /** ProviderModel 原始开放配置。 */
+  config?: Record<string, unknown> | null
+  /** 合并 GlobalModel 默认值后的有效配置。 */
+  effective_config?: Record<string, unknown> | null
+}
+
 export type ModelTestKeySource = {
   api_formats?: string[] | null
   is_active?: boolean | null
@@ -45,6 +53,24 @@ const MODEL_TEST_BEARER_INHERITS_PROVIDER_FORMATS = new Set([
   'chatgpt_web',
 ])
 
+const MODEL_CAPABILITY_TEXT_API_FORMATS = new Set([
+  'openai:chat',
+  'openai:responses',
+  'claude:messages',
+  'gemini:generate_content',
+])
+
+const MODEL_CAPABILITY_TEXT_TYPES = new Set(['generation', 'chat', 'responses', 'text_generation'])
+const MODEL_CAPABILITY_NON_TEXT_TYPES = new Set([
+  'embedding',
+  'rerank',
+  'image',
+  'video',
+  'audio',
+  'realtime',
+  'files',
+])
+
 const MODEL_TEST_DIAGNOSTIC_LABELS: Record<string, string> = {
   key_model_not_allowed: 'Key 未允许当前模型，已跳过',
   pool_account_blocked: '账号已失效，需重新授权',
@@ -59,6 +85,38 @@ export function normalizeModelTestStringList(values: string[] | null | undefined
 export function isModelTestableApiFormat(apiFormat: string | null | undefined): boolean {
   const normalized = normalizeApiFormatAlias(apiFormat ?? '')
   return Boolean(normalized) && !MODEL_TEST_UNSUPPORTED_API_FORMATS.has(normalized)
+}
+
+/** 判断协议是否属于首版可稳定聚合文本的能力检测格式。 */
+export function isModelCapabilityApiFormat(apiFormat: string | null | undefined): boolean {
+  return MODEL_CAPABILITY_TEXT_API_FORMATS.has(normalizeApiFormatAlias(apiFormat ?? ''))
+}
+
+/** 根据显式格式、能力和模型类型判断是否为文本生成模型；无声明历史模型保持兼容。 */
+export function modelSupportsCapabilityDetection(
+  model: ModelCapabilitySource | null | undefined,
+): boolean {
+  if (!model) return false
+  const config = model.effective_config ?? model.config ?? {}
+  const apiFormats = Array.isArray(config.api_formats)
+    ? config.api_formats.filter((value): value is string => typeof value === 'string')
+    : []
+  if (apiFormats.length > 0) return apiFormats.some(isModelCapabilityApiFormat)
+
+  const capabilities = [config.capabilities, config.supported_capabilities]
+    .filter(Array.isArray)
+    .flat()
+    .filter((value): value is string => typeof value === 'string')
+    .map(value => value.trim().toLowerCase())
+  if (capabilities.some(value => MODEL_CAPABILITY_TEXT_TYPES.has(value))) return true
+  if (capabilities.some(value => MODEL_CAPABILITY_NON_TEXT_TYPES.has(value))) return false
+
+  const modelType = typeof config.model_type === 'string'
+    ? config.model_type.trim().toLowerCase()
+    : ''
+  if (MODEL_CAPABILITY_TEXT_TYPES.has(modelType)) return true
+  if (MODEL_CAPABILITY_NON_TEXT_TYPES.has(modelType)) return false
+  return true
 }
 
 export function modelTestKeySupportsEndpoint(

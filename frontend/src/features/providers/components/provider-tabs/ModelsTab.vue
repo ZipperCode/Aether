@@ -143,6 +143,17 @@
                     class="w-3.5 h-3.5"
                   />
                 </Button>
+                <!-- 能力检测只面向可固定到文本 Endpoint 与 Key 的模型。 -->
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  class="h-8 w-8"
+                  :title="capabilityActionTitle(model)"
+                  :disabled="capabilityActionDisabled(model)"
+                  @click="openCapabilityDialog(model)"
+                >
+                  <BrainCircuit class="w-3.5 h-3.5" />
+                </Button>
                 <Button
                   variant="ghost"
                   size="icon"
@@ -246,13 +257,21 @@
     @update:request-headers-draft="testRequestHeadersDraft = $event"
     @update:request-body-draft="testRequestBodyDraft = $event"
   />
+  <ModelCapabilityDialog
+    :open="capabilityDialogOpen"
+    :provider="provider"
+    :model="capabilityModel"
+    :endpoints="endpoints"
+    @close="closeCapabilityDialog"
+    @saved="handleCapabilityReferenceSaved"
+  />
 </template>
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { useSmartPagination } from '@/composables/useSmartPagination'
 import { useModelTest } from '@/composables/useModelTest'
-import { Box, Edit, Layers, Power, Copy, Loader2, Play } from 'lucide-vue-next'
+import { Box, BrainCircuit, Edit, Layers, Power, Copy, Loader2, Play } from 'lucide-vue-next'
 import Card from '@/components/ui/card.vue'
 import Button from '@/components/ui/button.vue'
 import { useToast } from '@/composables/useToast'
@@ -268,13 +287,16 @@ import { parseApiError } from '@/utils/errorParser'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
 import ModelTestDialog from './ModelTestDialog.vue'
+import ModelCapabilityDialog from './ModelCapabilityDialog.vue'
 import {
   buildDefaultModelTestRequestHeaders,
   buildDefaultModelTestRequestBody,
+  isModelCapabilityApiFormat,
   isModelTestableApiFormat,
   isModelTestableEndpoint,
   listModelTestMappedModelOptions,
   modelTestKeySupportsEndpoint,
+  modelSupportsCapabilityDetection,
   normalizeModelTestMappedModelSelection,
   parseModelTestRequestHeadersDraft,
   parseModelTestRequestBodyDraft,
@@ -317,6 +339,9 @@ const selectedTestKeyIds = ref<string[]>([])
 const modelTestProviderKeys = ref<EndpointAPIKey[]>([])
 const modelTestKeysLoadedProviderId = ref<string | null>(null)
 const loadingModelTestKeys = ref(false)
+// 能力检测对话框独立于联通测试状态，避免两套评分语义互相污染。
+const capabilityDialogOpen = ref(false)
+const capabilityModel = ref<Model | null>(null)
 const isPoolManagedProvider = computed(() => Boolean(props.provider.pool_advanced))
 const activeEndpoints = computed(() => (props.endpoints ?? [])
   .filter(endpoint => {
@@ -351,6 +376,14 @@ const providerKeysForModelTest = computed(() => (
     ? modelTestProviderKeys.value
     : props.providerKeys ?? []
 ))
+// 当前 Provider 中至少有一个固定 Key 的文本 endpoints。
+const capabilityEndpoints = computed(() => (props.endpoints ?? []).filter(endpoint => {
+  if (endpoint.is_active === false) return false
+  if (!isModelCapabilityApiFormat(endpoint.api_format)) return false
+  return endpoint.active_keys > 0 || providerKeysForModelTest.value.some(key => (
+    modelTestKeySupportsEndpoint(key, endpoint, props.provider.provider_type)
+  ))
+}))
 const testKeyOptions = computed(() => {
   const endpoint = selectedTestEndpoint.value
   if (!endpoint) return []
@@ -647,6 +680,39 @@ async function testModelConnection(model: Model) {
   modelTest.testResult.value = null
   modelTest.dialogOpen.value = true
   void ensureModelTestKeysLoaded()
+}
+
+/** 非文本模型或无固定 endpoint/Key 时禁用行内能力检测入口。 */
+function capabilityActionDisabled(model: Model): boolean {
+  return !model.is_active
+    || !modelSupportsCapabilityDetection(model)
+    || capabilityEndpoints.value.length === 0
+}
+
+/** 为禁用入口解释具体边界，避免把非文本能力误当成测试失败。 */
+function capabilityActionTitle(model: Model): string {
+  if (!model.is_active) return '模型已停用，无法进行能力检测'
+  if (!modelSupportsCapabilityDetection(model)) return '该模型不是受支持的文本生成格式'
+  if (capabilityEndpoints.value.length === 0) return '没有可固定使用的文本 Endpoint 与 Key'
+  return '模型能力检测'
+}
+
+/** 打开独立能力检测对话框；其请求和结果不写入 useModelTest。 */
+function openCapabilityDialog(model: Model) {
+  if (capabilityActionDisabled(model)) return
+  capabilityModel.value = model
+  capabilityDialogOpen.value = true
+}
+
+/** 关闭能力检测并清理当前模型引用。 */
+function closeCapabilityDialog() {
+  capabilityDialogOpen.value = false
+  capabilityModel.value = null
+}
+
+/** 可信参考保存后刷新父级列表，确保其他编辑入口拿到合并后的 config。 */
+function handleCapabilityReferenceSaved() {
+  emit('refresh')
 }
 
 function normalizeSelectedTestKeyIds(ids: string[]): string[] {

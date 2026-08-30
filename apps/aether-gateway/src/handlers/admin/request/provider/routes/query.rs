@@ -1,6 +1,7 @@
 use crate::handlers::admin::provider::query::{
     models::{
         build_admin_provider_query_models_response,
+        build_admin_provider_query_test_model_capability_response,
         build_admin_provider_query_test_model_failover_local_response,
         build_admin_provider_query_test_model_local_response,
     },
@@ -28,6 +29,7 @@ use axum::{
 use tracing::warn;
 
 impl<'a> AdminAppState<'a> {
+    /// 根据控制层已认证的 provider-query 路由分派本地处理器，并在执行前完成最小请求校验。
     pub(crate) async fn maybe_build_admin_provider_query_route_response(
         &self,
         request_context: &AdminRequestContext<'_>,
@@ -82,6 +84,9 @@ impl<'a> AdminAppState<'a> {
                     build_admin_provider_query_test_model_local_response(self, &payload).await?,
                 ))
             }
+            "test_model_capability" => Ok(Some(
+                build_admin_provider_query_test_model_capability_response(self, &payload).await?,
+            )),
             "test_model_failover" => {
                 let Some(_provider_id) = provider_query_extract_provider_id(&payload) else {
                     log_admin_provider_query_validation_failure(

@@ -2,6 +2,7 @@ use axum::http;
 
 use super::{classified, ClassifiedRoute};
 
+/// 对管理端观测与 provider-query 路由做精确分类，确保能力检测沿用写权限且不会落入通用代理。
 pub(super) fn classify_admin_observability_family_route(
     method: &http::Method,
     normalized_path: &str,
@@ -30,6 +31,20 @@ pub(super) fn classify_admin_observability_family_route(
             "admin_proxy",
             "provider_query_manage",
             "test_model",
+            "admin:provider_query",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && matches!(
+            normalized_path,
+            "/api/admin/provider-query/test-model-capability"
+                | "/api/admin/provider-query/test-model-capability/"
+        )
+    {
+        Some(classified(
+            "admin_proxy",
+            "provider_query_manage",
+            "test_model_capability",
             "admin:provider_query",
             false,
         ))

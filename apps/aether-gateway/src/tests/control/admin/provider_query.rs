@@ -1341,6 +1341,357 @@ async fn gateway_handles_admin_provider_query_test_model_locally_with_trusted_ad
     execution_runtime_handle.abort();
 }
 
+/// 能力检测必须固定显式 model/endpoint/Key、复用保存参考，并且响应不泄露原始上游正文。
+#[test]
+fn gateway_capability_test_pins_single_candidate_without_failover() {
+    run_provider_query_test(
+        "gateway_capability_test_pins_single_candidate_without_failover",
+        gateway_capability_test_pins_single_candidate_without_failover_impl,
+    );
+}
+
+/// 使用 mock runtime 验证 profile、同题参考、失效引用、非文本模型与停用 endpoint 边界。
+async fn gateway_capability_test_pins_single_candidate_without_failover_impl() {
+    let plans = Arc::new(Mutex::new(Vec::new()));
+    let plans_for_runtime = Arc::clone(&plans);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let plans = Arc::clone(&plans_for_runtime);
+            async move {
+                let body = plan.body.json_body.as_ref().expect("json body should exist");
+                assert_eq!(plan.provider_id, "provider-capability");
+                assert_eq!(plan.endpoint_id, "endpoint-capability-chat");
+                assert!(matches!(
+                    plan.key_id.as_str(),
+                    "key-capability-primary" | "key-capability-reference"
+                ));
+                assert_eq!(plan.provider_api_format, "openai:chat");
+                assert!(!plan.stream);
+                assert_eq!(body["temperature"], json!(0));
+                assert_eq!(body["max_tokens"], json!(1024));
+                assert_eq!(body["stream"], json!(false));
+                let prompt = body["messages"][0]["content"]
+                    .as_str()
+                    .expect("capability prompt should exist")
+                    .to_string();
+                plans.lock().expect("plans should lock").push((
+                    plan.endpoint_id.clone(),
+                    plan.key_id.clone(),
+                    plan.model_name.clone(),
+                    prompt,
+                ));
+                Json(json!({
+                    "request_id": plan.request_id,
+                    "candidate_id": plan.candidate_id,
+                    "status_code": 200,
+                    "headers": {"content-type": "application/json"},
+                    "body": {
+                        "json_body": {
+                            "id": "chatcmpl-capability",
+                            "choices": [{"message": {"role": "assistant", "content": "A"}}],
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}
+                        }
+                    },
+                    "telemetry": {"elapsed_ms": 2}
+                }))
+            }
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-capability", "Capability", 10);
+    provider.provider_type = "openai".to_string();
+    let mut inactive_endpoint = sample_endpoint(
+        "endpoint-capability-inactive",
+        "provider-capability",
+        "openai:chat",
+        "https://inactive.capability.example/v1",
+    );
+    inactive_endpoint.is_active = false;
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![
+            sample_endpoint(
+                "endpoint-capability-chat",
+                "provider-capability",
+                "openai:chat",
+                "https://api.capability.example/v1",
+            ),
+            inactive_endpoint,
+        ],
+        vec![
+            sample_key(
+                "key-capability-primary",
+                "provider-capability",
+                "openai:chat",
+                "sk-capability-secret",
+            ),
+            sample_key(
+                "key-capability-reference",
+                "provider-capability",
+                "openai:chat",
+                "sk-reference-secret",
+            ),
+        ],
+    ));
+    let mut decoy_model = sample_admin_provider_model(
+        "model-capability-decoy",
+        "provider-capability",
+        "global-capability-decoy",
+        "capability-decoy",
+    );
+    decoy_model.global_model_name = Some("capability-model".to_string());
+    decoy_model.provider_model_mappings = Some(json!([{
+        "name": "wrong-decoy-effective",
+        "priority": 1,
+        "api_formats": ["openai:chat"]
+    }]));
+    let mut provider_model = sample_admin_provider_model(
+        "model-capability",
+        "provider-capability",
+        "global-capability",
+        "capability-model",
+    );
+    provider_model.global_model_name = Some("capability-model".to_string());
+    provider_model.provider_model_mappings = Some(json!([{
+        "name": "capability-effective",
+        "priority": 1,
+        "api_formats": ["openai:chat"]
+    }]));
+    provider_model.config = Some(json!({
+        "billing": {"mode": "local"},
+        "capability_test_reference": {
+            "provider_id": "provider-capability",
+            "model_id": "model-capability-reference",
+            "endpoint_id": "endpoint-capability-chat",
+            "api_key_id": "key-capability-reference"
+        }
+    }));
+    let mut reference_model = sample_admin_provider_model(
+        "model-capability-reference",
+        "provider-capability",
+        "global-capability-reference",
+        "capability-reference",
+    );
+    reference_model.global_model_name = Some("capability-reference".to_string());
+    reference_model.provider_model_mappings = Some(json!([{
+        "name": "reference-effective",
+        "priority": 1,
+        "api_formats": ["openai:chat"]
+    }]));
+    let mut embedding_model = sample_admin_provider_model(
+        "model-capability-embedding",
+        "provider-capability",
+        "global-capability-embedding",
+        "embedding-model",
+    );
+    embedding_model.global_model_name = Some("embedding-model".to_string());
+    embedding_model.provider_model_mappings = None;
+    embedding_model.config = Some(json!({
+        "model_type": "embedding",
+        "api_formats": ["openai:embedding"]
+    }));
+    let mut invalid_reference_model = sample_admin_provider_model(
+        "model-capability-invalid-reference",
+        "provider-capability",
+        "global-capability-invalid-reference",
+        "invalid-reference-model",
+    );
+    invalid_reference_model.global_model_name = Some("invalid-reference-model".to_string());
+    invalid_reference_model.provider_model_mappings = Some(json!([{
+        "name": "invalid-reference-effective",
+        "priority": 1,
+        "api_formats": ["openai:chat"]
+    }]));
+    invalid_reference_model.config = Some(json!({
+        "capability_test_reference": {
+            "provider_id": "provider-capability",
+            "model_id": "model-capability-reference",
+            "endpoint_id": "endpoint-capability-inactive",
+            "api_key_id": "key-capability-reference"
+        }
+    }));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new()).with_admin_provider_models(vec![
+            decoy_model,
+            provider_model,
+            reference_model,
+            embedding_model,
+            invalid_reference_model,
+        ]),
+    );
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_transport_reader_for_tests(
+                    provider_catalog_repository,
+                    DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+                )
+                .with_global_model_repository_for_tests(global_model_repository),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-query/test-model-capability"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-capability",
+            "model_id": "model-capability",
+            "endpoint_id": "endpoint-capability-chat",
+            "api_key_id": "key-capability-primary",
+            "mode": "quick",
+            "language": "en",
+            "use_saved_reference": false,
+            "request_id": "provider-capability-test"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "unexpected response: {payload}");
+    assert_eq!(payload["suite_version"], json!("capability-v1"));
+    assert_eq!(payload["verdict"], json!("profile_only"));
+    assert_eq!(
+        payload["target"]["endpoint_id"],
+        json!("endpoint-capability-chat")
+    );
+    assert_eq!(
+        payload["target"]["api_key_id"],
+        json!("key-capability-primary")
+    );
+    assert_eq!(payload["target_metrics"]["planned"], json!(40));
+    assert_eq!(payload["target_metrics"]["scored"], json!(40));
+    assert_eq!(payload["items"].as_array().map(Vec::len), Some(40));
+    assert!(payload["reference"].is_null());
+    let serialized = payload.to_string();
+    assert!(!serialized.contains("sk-capability-secret"));
+    assert!(!serialized.contains("chatcmpl-capability"));
+    assert!(!serialized.contains("choices"));
+    {
+        let mut plans = plans.lock().expect("plans should lock");
+        assert_eq!(plans.len(), 40);
+        assert!(plans.iter().all(|(endpoint, key, model, _)| {
+            endpoint == "endpoint-capability-chat"
+                && key == "key-capability-primary"
+                && model.as_deref() == Some("capability-effective")
+        }));
+        plans.clear();
+    }
+
+    let reference_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-query/test-model-capability"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-capability",
+            "model_id": "model-capability",
+            "endpoint_id": "endpoint-capability-chat",
+            "api_key_id": "key-capability-primary",
+            "mode": "quick",
+            "language": "bilingual",
+            "use_saved_reference": true
+        }))
+        .send()
+        .await
+        .expect("reference request should succeed");
+    let reference_status = reference_response.status();
+    let reference_payload: serde_json::Value = reference_response
+        .json()
+        .await
+        .expect("reference json should parse");
+    assert_eq!(
+        reference_status,
+        StatusCode::OK,
+        "unexpected response: {reference_payload}"
+    );
+    assert_eq!(reference_payload["verdict"], json!("no_large_deviation"));
+    assert_eq!(
+        reference_payload["reference"]["api_key_id"],
+        json!("key-capability-reference")
+    );
+    assert!(reference_payload["items"]
+        .as_array()
+        .is_some_and(|items| items.iter().all(|item| !item["reference"].is_null())));
+    {
+        let plans = plans.lock().expect("plans should lock");
+        assert_eq!(plans.len(), 80);
+        assert_eq!(
+            plans
+                .iter()
+                .filter(|(_, key, model, _)| key == "key-capability-primary"
+                    && model.as_deref() == Some("capability-effective"))
+                .count(),
+            40
+        );
+        assert_eq!(
+            plans
+                .iter()
+                .filter(|(_, key, model, _)| key == "key-capability-reference"
+                    && model.as_deref() == Some("reference-effective"))
+                .count(),
+            40
+        );
+        let mut prompt_counts = std::collections::BTreeMap::new();
+        for (_, _, _, prompt) in plans.iter() {
+            *prompt_counts.entry(prompt).or_insert(0_usize) += 1;
+        }
+        assert_eq!(prompt_counts.len(), 40);
+        assert!(prompt_counts.values().all(|count| *count == 2));
+    }
+
+    for (model_id, endpoint_id, use_saved_reference) in [
+        ("model-capability", "endpoint-capability-inactive", false),
+        (
+            "model-capability-embedding",
+            "endpoint-capability-chat",
+            false,
+        ),
+        (
+            "model-capability-invalid-reference",
+            "endpoint-capability-chat",
+            true,
+        ),
+    ] {
+        let rejected = reqwest::Client::new()
+            .post(format!(
+                "{gateway_url}/api/admin/provider-query/test-model-capability"
+            ))
+            .header(GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .json(&json!({
+                "provider_id": "provider-capability",
+                "model_id": model_id,
+                "endpoint_id": endpoint_id,
+                "api_key_id": "key-capability-primary",
+                "mode": "quick",
+                "language": "en",
+                "use_saved_reference": use_saved_reference
+            }))
+            .send()
+            .await
+            .expect("invalid request should return safely");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
 #[test]
 fn gateway_handles_admin_provider_query_embedding_model_test() {
     run_provider_query_test(

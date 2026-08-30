@@ -7,15 +7,40 @@ import {
   extractModelTestResponsePreview,
   formatModelTestDiagnostic,
   getOpenAiImageModelTestMaxGenerationCount,
+  isModelCapabilityApiFormat,
   isModelTestableEndpoint,
   isModelTestableApiFormat,
   listModelTestMappedModelOptions,
   modelTestMappingScopeMatchesEndpoint,
+  modelSupportsCapabilityDetection,
   normalizeModelTestMappedModelSelection,
   selectPreferredModelTestEndpoint,
   setModelTestRequestBodyModel,
   syncModelTestRequestBodyDraft,
 } from '../model-test-request'
+
+describe('model capability eligibility', () => {
+  it('keeps the supported text protocol allowlist exact', () => {
+    expect([
+      'openai:chat',
+      'openai:responses',
+      'claude:messages',
+      'gemini:generate_content',
+    ].every(isModelCapabilityApiFormat)).toBe(true)
+    expect(isModelCapabilityApiFormat('openai:responses:compact')).toBe(false)
+    expect(isModelCapabilityApiFormat('openai:embedding')).toBe(false)
+  })
+
+  it('rejects declared non-text models while preserving legacy and hybrid text models', () => {
+    expect(modelSupportsCapabilityDetection({
+      effective_config: { model_type: 'embedding', api_formats: ['openai:embedding'] },
+    })).toBe(false)
+    expect(modelSupportsCapabilityDetection({
+      effective_config: { api_formats: ['openai:chat', 'openai:image'] },
+    })).toBe(true)
+    expect(modelSupportsCapabilityDetection({ effective_config: { streaming: true } })).toBe(true)
+  })
+})
 
 describe('buildDefaultModelTestRequestBody', () => {
   it.each([

@@ -14,8 +14,10 @@ export {
   formatModelTestDiagnostic,
   getOpenAiImageModelTestCapability,
   getOpenAiImageModelTestMaxGenerationCount,
+  isModelCapabilityApiFormat,
   isModelTestableApiFormat,
   isModelTestableEndpoint,
+  modelSupportsCapabilityDetection,
   modelTestKeySupportsEndpoint,
   selectPreferredModelTestEndpoint,
 } from './model-test-capabilities'
@@ -23,6 +25,7 @@ export type {
   ModelTestEndpointSource,
   ModelTestImageSource,
   ModelTestKeySource,
+  ModelCapabilitySource,
 } from './model-test-capabilities'
 export {
   extractModelTestImagePreviews,

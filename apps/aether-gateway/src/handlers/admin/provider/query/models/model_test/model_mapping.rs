@@ -9,6 +9,20 @@ use aether_data_contracts::repository::global_models::{
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogEndpoint;
 use serde_json::Value;
 
+/// 只根据请求中已确认的 ProviderModel 解析有效模型名，避免同名模型抢占显式 model_id。
+pub(super) fn provider_query_resolve_admin_model_effective_model(
+    model: &StoredAdminProviderModel,
+    endpoint: &StoredProviderCatalogEndpoint,
+) -> Result<String, GatewayError> {
+    let mappings =
+        provider_query_parse_provider_model_mappings(model.provider_model_mappings.as_ref())?;
+    let row = provider_query_admin_model_selection_row(model, endpoint, mappings);
+    Ok(aether_scheduler_core::select_provider_model_name(
+        &row,
+        &endpoint.api_format,
+    ))
+}
+
 pub(super) async fn provider_query_resolve_global_effective_model(
     state: &AdminAppState<'_>,
     provider_id: &str,
