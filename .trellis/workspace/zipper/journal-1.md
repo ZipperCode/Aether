@@ -228,3 +228,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 10: 模型能力检测与 v0.7.26 发布准备
+
+**Date**: 2026-08-30
+**Task**: 模型能力检测与 v0.7.26 发布准备
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+完成模型能力检测跨层实现、失效参考 fail-closed 修复与全范围验证，准备推送并发布 v0.7.26。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6d537bae3` | (see git log) |
+
+### Status
+
+[OK] **Completed**
