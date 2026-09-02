@@ -66,5 +66,5 @@
 - [x] AC4：R4 列出的 Gemini / Responses / Antigravity 协议兼容行为均已同步。
 - [x] AC5：VSCodex、套餐撤销、通用 Usage API 和 Nightly 发布功能未进入最终产品差异；必要依赖例外可逐项追溯到 R1-R4。
 - [x] AC6：Rust 格式检查、受影响 crate 的编译检查和针对性逻辑测试通过；前端受影响逻辑通过类型检查和必要的针对性测试。
-- [ ] AC7：最终 `master` 包含已验证的本地提交，`origin/master` 未被推送，临时 worktree 和临时分支已清理。
+- [x] AC7：最终 `master` 包含已验证的本地提交，`origin/master` 未被推送，临时 worktree 和临时分支已清理。
 - [x] AC8：本次新增或修改的手写函数、类型和业务/配置字段均具有符合项目要求的中文说明，且没有为第三方或生成文件制造无关改动。

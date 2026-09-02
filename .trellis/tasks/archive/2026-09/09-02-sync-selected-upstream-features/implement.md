@@ -68,7 +68,7 @@
 ## 6. 收口
 
 - [x] 更新 PRD 验收项和任务证据；仅在出现可复用的新合同且需要时更新 `.trellis/spec/`。
-- [ ] 提交产品与任务工件，按 Trellis 流程归档并记录 journal。
-- [ ] 确认主工作区仍处于原始干净 `master`，fast-forward 合并任务提交。
-- [ ] 验证本地 `master` 包含任务提交、`origin/master` 未变化且工作区干净。
-- [ ] 删除临时 worktree，删除临时分支并 prune。
+- [x] 提交产品与任务工件，按 Trellis 流程归档并记录 journal。
+- [x] 确认主工作区仍处于原始干净 `master`，fast-forward 合并任务提交。
+- [x] 验证本地 `master` 包含任务提交、`origin/master` 未变化且工作区干净。
+- [x] 删除临时 worktree，删除临时分支并 prune。
