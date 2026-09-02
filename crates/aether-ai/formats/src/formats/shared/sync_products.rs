@@ -3265,10 +3265,13 @@ fn materialize_openai_responses_tool_item(
 }
 
 #[derive(Default)]
+/// 聚合 Gemini 流式工具调用时保存身份、参数、签名及目标 part 位置。
 struct GeminiSyncToolState {
     call_id: String,
     name: String,
     arguments: String,
+    /// 对应函数调用的 thoughtSignature；完成聚合时写回 part 根节点。
+    thought_signature: String,
     part_index: Option<usize>,
 }
 
@@ -3459,6 +3462,7 @@ pub fn aggregate_gemini_stream_sync_response(body: &[u8]) -> Option<Value> {
         .flatten()
 }
 
+/// 严格聚合 Gemini 流为同步响应；未知事件或不可表达扩展会返回转换错误。
 fn try_aggregate_gemini_stream_sync_response(
     body: &[u8],
 ) -> Result<Option<Value>, AiSurfaceFinalizeError> {
@@ -3595,6 +3599,13 @@ fn try_aggregate_gemini_stream_sync_response(
                         parts.push(sync_gemini_function_call_part(state));
                         state.part_index = Some(part_index);
                     } else if let Some(part_index) = state.part_index {
+                        parts[part_index] = sync_gemini_function_call_part(state);
+                    }
+                }
+                CanonicalStreamEvent::ToolCallSignature { index, signature } => {
+                    let state = tool_states.entry(index).or_default();
+                    state.thought_signature = signature;
+                    if let Some(part_index) = state.part_index {
                         parts[part_index] = sync_gemini_function_call_part(state);
                     }
                 }
@@ -3802,8 +3813,9 @@ fn is_mergeable_gemini_text_part(part: &Map<String, Value>, thought: bool) -> bo
     })
 }
 
+/// 从聚合状态构造 Gemini functionCall，并在非空时恢复 thoughtSignature。
 fn sync_gemini_function_call_part(state: &GeminiSyncToolState) -> Value {
-    json!({
+    let mut part = json!({
         "functionCall": {
             "id": if state.call_id.trim().is_empty() {
                 "call_auto_0".to_string()
@@ -3817,7 +3829,11 @@ fn sync_gemini_function_call_part(state: &GeminiSyncToolState) -> Value {
             },
             "args": sync_gemini_function_args_value(&state.arguments),
         }
-    })
+    });
+    if !state.thought_signature.is_empty() {
+        part["thoughtSignature"] = Value::String(state.thought_signature.clone());
+    }
+    part
 }
 
 fn sync_gemini_function_response_part(

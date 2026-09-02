@@ -1,8 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::formats::openai::responses::{
+    decode_gemini_tool_signature_carrier, GeminiToolSignatureCarrierDirection,
+};
 use crate::formats::openai::shared::map_thinking_budget_to_openai_reasoning_effort;
 use crate::formats::shared::model_directives::ReasoningEffort;
 use crate::formats::shared::response::remove_empty_pages_from_tool_input_value;
@@ -1136,6 +1139,8 @@ pub(crate) fn gemini_system_to_canonical_instructions(
     }
 }
 
+/// 将 Gemini contents 转为规范消息，并为无 ID 工具调用生成避碰 ID。
+/// 工具结果按显式 ID、函数名、全局先进先出的顺序配对，确保并行历史不串联。
 pub(crate) fn gemini_contents_to_canonical_messages(
     contents: Option<&Value>,
 ) -> Option<Vec<CanonicalMessage>> {
@@ -1144,8 +1149,26 @@ pub(crate) fn gemini_contents_to_canonical_messages(
     };
     let contents = contents.as_array()?;
     let mut messages = Vec::new();
-    let mut pending_calls_by_name = BTreeMap::<String, std::collections::VecDeque<String>>::new();
-    for (message_index, content) in contents.iter().enumerate() {
+    let mut reserved_tool_call_ids = contents
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|content| content.get("parts"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter_map(|part| {
+            part.get("functionCall")
+                .or_else(|| part.get("function_call"))
+                .or_else(|| part.get("functionResponse"))
+                .or_else(|| part.get("function_response"))
+                .and_then(Value::as_object)
+                .and_then(gemini_explicit_function_id)
+                .map(ToOwned::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut pending_tool_calls = VecDeque::<(String, String)>::new();
+    let mut next_generated_tool_call_index = 0usize;
+    for content in contents {
         let content_object = content.as_object()?;
         let role = match content_object
             .get("role")
@@ -1162,40 +1185,72 @@ pub(crate) fn gemini_contents_to_canonical_messages(
         };
         let parts = content_object.get("parts").and_then(Value::as_array)?;
         let mut blocks = Vec::new();
-        for (part_index, part) in parts.iter().enumerate() {
-            let mut block = gemini_part_to_canonical_block(part, part_index)?;
+        for (index, part) in parts.iter().enumerate() {
+            let mut block = gemini_part_to_canonical_block(part, index)?;
             match &mut block {
                 CanonicalContentBlock::ToolUse { id, name, .. } => {
-                    if gemini_function_call_explicit_id(part).is_none() {
-                        *id = format!("call_auto_{message_index}_{part_index}");
+                    let has_explicit_id = part
+                        .as_object()
+                        .and_then(|part| {
+                            part.get("functionCall")
+                                .or_else(|| part.get("function_call"))
+                        })
+                        .and_then(Value::as_object)
+                        .and_then(gemini_explicit_function_id)
+                        .is_some();
+                    if !has_explicit_id {
+                        loop {
+                            let generated = format!("call_auto_{next_generated_tool_call_index}");
+                            next_generated_tool_call_index += 1;
+                            if reserved_tool_call_ids.insert(generated.clone()) {
+                                *id = generated;
+                                break;
+                            }
+                        }
                     }
-                    pending_calls_by_name
-                        .entry(name.clone())
-                        .or_default()
-                        .push_back(id.clone());
+                    pending_tool_calls.push_back((id.clone(), name.clone()));
                 }
                 CanonicalContentBlock::ToolResult {
                     tool_use_id, name, ..
                 } => {
-                    if let Some(explicit_id) = gemini_function_response_explicit_id(part) {
-                        consume_pending_gemini_call_id(
-                            &mut pending_calls_by_name,
-                            name.as_deref(),
-                            explicit_id,
-                        );
-                    } else {
-                        if let Some(function_name) = name.as_deref() {
-                            if let Some(pending_id) = pending_calls_by_name
-                                .get_mut(function_name)
-                                .and_then(std::collections::VecDeque::pop_front)
-                            {
-                                *tool_use_id = pending_id;
+                    let explicit_response_id = part
+                        .as_object()
+                        .and_then(|part| {
+                            part.get("functionResponse")
+                                .or_else(|| part.get("function_response"))
+                        })
+                        .and_then(Value::as_object)
+                        .and_then(gemini_explicit_function_id);
+                    let matched_position = explicit_response_id
+                        .and_then(|response_id| {
+                            pending_tool_calls
+                                .iter()
+                                .position(|(call_id, _)| call_id == response_id)
+                        })
+                        .or_else(|| {
+                            if explicit_response_id.is_none() {
+                                name.as_deref().and_then(|response_name| {
+                                    pending_tool_calls
+                                        .iter()
+                                        .position(|(_, call_name)| call_name == response_name)
+                                })
                             } else {
-                                *tool_use_id =
-                                    format!("toolu_response_{message_index}_{part_index}");
+                                None
                             }
-                        } else {
-                            *tool_use_id = format!("toolu_response_{message_index}_{part_index}");
+                        });
+                    let matched_call = matched_position
+                        .and_then(|position| pending_tool_calls.remove(position))
+                        .or_else(|| {
+                            if explicit_response_id.is_none() && name.is_none() {
+                                pending_tool_calls.pop_front()
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some((call_id, call_name)) = matched_call {
+                        *tool_use_id = call_id;
+                        if name.is_none() {
+                            *name = Some(call_name);
                         }
                     }
                 }
@@ -1215,69 +1270,8 @@ pub(crate) fn gemini_contents_to_canonical_messages(
     Some(messages)
 }
 
-/// Remove an explicitly identified Gemini function call from the pending
-/// per-name queues. A response may omit its function name, so fall back to a
-/// global ID lookup to avoid leaving a stale call that could be matched by a
-/// later ID-less response.
-fn consume_pending_gemini_call_id(
-    pending_calls_by_name: &mut BTreeMap<String, std::collections::VecDeque<String>>,
-    function_name: Option<&str>,
-    call_id: &str,
-) {
-    let queue_name = function_name
-        .filter(|name| {
-            pending_calls_by_name
-                .get(*name)
-                .is_some_and(|queue| queue.iter().any(|pending_id| pending_id == call_id))
-        })
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            pending_calls_by_name
-                .iter()
-                .find(|(_, queue)| queue.iter().any(|pending_id| pending_id == call_id))
-                .map(|(name, _)| name.clone())
-        });
-    let Some(queue_name) = queue_name else {
-        return;
-    };
-    let remove_queue = if let Some(queue) = pending_calls_by_name.get_mut(&queue_name) {
-        if let Some(position) = queue.iter().position(|pending_id| pending_id == call_id) {
-            queue.remove(position);
-        }
-        queue.is_empty()
-    } else {
-        false
-    };
-    if remove_queue {
-        pending_calls_by_name.remove(&queue_name);
-    }
-}
-
-fn gemini_function_call_explicit_id(part: &Value) -> Option<&str> {
-    part.as_object()?
-        .get("functionCall")
-        .or_else(|| part.get("function_call"))?
-        .as_object()?
-        .get("id")?
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn gemini_function_response_explicit_id(part: &Value) -> Option<&str> {
-    part.as_object()?
-        .get("functionResponse")
-        .or_else(|| part.get("function_response"))?
-        .as_object()?
-        .get("id")?
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-/// Audit the Gemini response-part subset that the canonical conversion model
-/// can preserve. The returned field suffix is appended to the caller's source
-/// path so sync and stream conversion reject the same provider extensions.
+/// 审计规范模型可无损承载的 Gemini 响应 part 字段。
+/// 返回的字段后缀由调用方拼入原始路径，使同步与流式转换执行同一 fail-closed 边界。
 pub(crate) fn audit_gemini_cross_format_response_part(
     part: &Map<String, Value>,
 ) -> Result<(), String> {
@@ -1298,11 +1292,14 @@ pub(crate) fn audit_gemini_cross_format_response_part(
         return Err(String::new());
     }
     let (primary_camel, primary_snake) = *present_variants[0];
+    // 仅允许规范模型有明确载体的 part 根字段；函数调用签名由 ToolUse 扩展承载。
     let root_field_is_safe = |field: &str| {
         field == primary_camel
             || field == primary_snake
             || (primary_camel == "text"
                 && matches!(field, "thought" | "thoughtSignature" | "thought_signature"))
+            || (primary_camel == "functionCall"
+                && matches!(field, "thoughtSignature" | "thought_signature"))
     };
     if let Some(field) = part
         .keys()
@@ -1336,6 +1333,15 @@ pub(crate) fn audit_gemini_cross_format_response_part(
         return Ok(());
     }
 
+    if primary_camel == "functionCall"
+        && part
+            .get("thoughtSignature")
+            .or_else(|| part.get("thought_signature"))
+            .is_some_and(|value| !value.is_string())
+    {
+        return Err("thoughtSignature".to_string());
+    }
+
     let allowed: &[&str] = match primary_camel {
         "inlineData" => &["mimeType", "mime_type", "data"],
         "fileData" => &["mimeType", "mime_type", "fileUri", "file_uri"],
@@ -1361,6 +1367,7 @@ pub(crate) fn audit_gemini_cross_format_response_part(
     Ok(())
 }
 
+/// 将 Gemini part 转为规范内容块，并保留函数调用根节点上的扩展与多种显式 ID 拼写。
 pub(crate) fn gemini_part_to_canonical_block(
     part: &Value,
     index: usize,
@@ -1416,11 +1423,7 @@ pub(crate) fn gemini_part_to_canonical_block(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())?;
-        let id = function_call
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let id = gemini_explicit_function_id(function_call)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("call_auto_{index}"));
         return Some(CanonicalContentBlock::ToolUse {
@@ -1444,11 +1447,7 @@ pub(crate) fn gemini_part_to_canonical_block(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let tool_use_id = function_response
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let tool_use_id = gemini_explicit_function_id(function_response)
             .map(ToOwned::to_owned)
             .or_else(|| name.clone())
             .unwrap_or_else(|| format!("toolu_response_{index}"));
@@ -1516,6 +1515,17 @@ pub(crate) fn gemini_part_to_canonical_block(
         raw_type: gemini_raw_part_type(part_object),
         payload: part.clone(),
         extensions: BTreeMap::from([("gemini".to_string(), part.clone())]),
+    })
+}
+
+/// 读取 Gemini 函数调用/结果支持的 `id`、`call_id` 或 `callId` 非空标识。
+fn gemini_explicit_function_id(function: &Map<String, Value>) -> Option<&str> {
+    ["id", "call_id", "callId"].iter().find_map(|field| {
+        function
+            .get(*field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     })
 }
 
@@ -2298,6 +2308,7 @@ pub(crate) fn claude_media_block_to_canonical(
     }
 }
 
+/// 将 Chat 消息转为规范内容块；工具输出保持原始 JSON 值或字符串，不解析 JSON 外观字符串。
 pub(crate) fn openai_message_content_blocks(
     message: &Map<String, Value>,
 ) -> Option<Vec<CanonicalContentBlock>> {
@@ -2417,13 +2428,7 @@ pub(crate) fn openai_message_content_blocks(
                 .unwrap_or_default()
                 .to_string(),
             name: None,
-            output: match message.get("content") {
-                Some(Value::String(raw)) => serde_json::from_str::<Value>(raw)
-                    .ok()
-                    .or_else(|| Some(Value::String(raw.clone()))),
-                Some(value) => Some(value.clone()),
-                None => None,
-            },
+            output: message.get("content").cloned(),
             content_text: Some(if text.is_empty() {
                 message
                     .get("content")
@@ -2524,6 +2529,7 @@ pub(crate) fn openai_reasoning_blocks(message: &Map<String, Value>) -> Vec<Canon
     blocks
 }
 
+/// 将 Responses input 转为规范消息；识别定向 Gemini 签名 carrier 并保留工具输出原始类型。
 pub(crate) fn openai_responses_input_to_canonical_messages(
     input: Option<&Value>,
 ) -> Option<Vec<CanonicalMessage>> {
@@ -2581,7 +2587,31 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                     .to_ascii_lowercase();
                 match item_type.as_str() {
                     "reasoning" => {
-                        pending_reasoning = openai_responses_reasoning_block_from_item(item_object);
+                        let reasoning = openai_responses_reasoning_block_from_item(item_object);
+                        let previous_signature = reasoning.as_ref().and_then(|block| match block {
+                            CanonicalContentBlock::Thinking {
+                                text,
+                                encrypted_content: Some(carrier),
+                                ..
+                            } if text.trim().is_empty() => decode_gemini_tool_signature_carrier(
+                                carrier,
+                            )
+                            .and_then(|(signature, direction)| {
+                                (direction == GeminiToolSignatureCarrierDirection::Previous)
+                                    .then_some(signature)
+                            }),
+                            _ => None,
+                        });
+                        if let Some(signature) = previous_signature {
+                            if attach_gemini_signature_to_previous_tool_use(
+                                &mut messages,
+                                signature,
+                            ) {
+                                pending_reasoning = None;
+                                continue;
+                            }
+                        }
+                        pending_reasoning = reasoning;
                     }
                     "message" => {
                         let role = openai_role_to_canonical(
@@ -2764,7 +2794,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                                 generated
                             });
                         let raw_output = item_object.get("output");
-                        let output = Some(parse_jsonish_value(raw_output));
+                        let output = Some(raw_output.cloned().unwrap_or_else(|| json!({})));
                         let mut extensions = openai_responses_extensions(
                             item_object,
                             &[
@@ -2841,12 +2871,31 @@ fn openai_responses_opaque_input_item_message(item: &Value, raw_type: String) ->
     }
 }
 
+/// 追加 Responses 工具调用，并把 next 方向 carrier 绑定到该调用而不保留合成 reasoning 块。
 fn append_openai_responses_tool_use(
     messages: &mut Vec<CanonicalMessage>,
-    tool_use: CanonicalContentBlock,
+    mut tool_use: CanonicalContentBlock,
     pending_reasoning: &mut Option<CanonicalContentBlock>,
 ) {
-    let reasoning = pending_reasoning.take();
+    let mut reasoning = pending_reasoning.take();
+    if let Some(CanonicalContentBlock::Thinking {
+        text,
+        encrypted_content: Some(carrier),
+        ..
+    }) = reasoning.as_ref()
+    {
+        if text.trim().is_empty() {
+            if let Some((signature, GeminiToolSignatureCarrierDirection::Next)) =
+                decode_gemini_tool_signature_carrier(carrier)
+            {
+                if let CanonicalContentBlock::ToolUse { extensions, .. } = &mut tool_use {
+                    canonical_extension_object_mut(extensions, "gemini")
+                        .insert("thoughtSignature".to_string(), Value::String(signature));
+                    reasoning = None;
+                }
+            }
+        }
+    }
     if let Some(last_message) = messages.last_mut() {
         if last_message.role == CanonicalRole::Assistant
             && (!is_openai_responses_input_message(&last_message.extensions)
@@ -2870,6 +2919,25 @@ fn append_openai_responses_tool_use(
         content,
         extensions: BTreeMap::new(),
     });
+}
+
+/// 将 previous 方向签名仅附到最后一条 assistant 消息的最后一个工具调用；不匹配时返回 false。
+fn attach_gemini_signature_to_previous_tool_use(
+    messages: &mut [CanonicalMessage],
+    signature: String,
+) -> bool {
+    let Some(message) = messages.last_mut() else {
+        return false;
+    };
+    if message.role != CanonicalRole::Assistant {
+        return false;
+    }
+    let Some(CanonicalContentBlock::ToolUse { extensions, .. }) = message.content.last_mut() else {
+        return false;
+    };
+    canonical_extension_object_mut(extensions, "gemini")
+        .insert("thoughtSignature".to_string(), Value::String(signature));
+    true
 }
 
 fn canonical_assistant_message_has_visible_content(message: &CanonicalMessage) -> bool {
@@ -2991,6 +3059,7 @@ pub(crate) fn openai_responses_content_to_blocks(
     }
 }
 
+/// 将 Responses output 转为规范响应块；函数输出保持 wire 原始 JSON 类型。
 pub(crate) fn openai_responses_output_to_canonical(
     output: Option<&Value>,
 ) -> Option<(Vec<CanonicalContentBlock>, BTreeMap<String, Value>)> {
@@ -3208,7 +3277,7 @@ pub(crate) fn openai_responses_output_to_canonical(
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| format!("call_auto_{index}"));
                 let raw_output = item_object.get("output");
-                let output = Some(parse_jsonish_value(raw_output));
+                let output = Some(raw_output.cloned().unwrap_or_else(|| json!({})));
                 let mut extensions = openai_responses_extensions(
                     item_object,
                     &[
@@ -4169,6 +4238,13 @@ pub(crate) fn is_claude_tool_result(extensions: &BTreeMap<String, Value>) -> boo
         .and_then(|value| value.get("source"))
         .and_then(Value::as_str)
         == Some(CLAUDE_TOOL_RESULT_SOURCE_MARKER)
+}
+
+/// 判断工具结果是否来自 Claude、Chat 或 Responses 的跨格式适配器，可参与 Gemini 顺序对齐。
+pub(crate) fn is_cross_format_tool_result(extensions: &BTreeMap<String, Value>) -> bool {
+    is_claude_tool_result(extensions)
+        || is_openai_chat_tool_result(extensions)
+        || is_openai_responses_tool_result(extensions)
 }
 
 fn is_openai_responses_tool_result(extensions: &BTreeMap<String, Value>) -> bool {
@@ -9354,6 +9430,143 @@ mod tests {
             rebuilt["contents"][0]["parts"],
             request["contents"][0]["parts"]
         );
+    }
+
+    /// 验证同名无 ID 并行调用按全局顺序生成不同 ID 并与结果一一对应。
+    #[test]
+    fn gemini_request_pairs_parallel_idless_function_responses_by_order() {
+        let contents = json!([
+            {
+                "role": "model",
+                "parts": [
+                    {"functionCall": {"name": "lookup", "args": {"q": "first"}}},
+                    {"functionCall": {"name": "lookup", "args": {"q": "second"}}}
+                ]
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {"functionResponse": {"name": "lookup", "response": {"result": "one"}}},
+                    {"functionResponse": {"name": "lookup", "response": {"result": "two"}}}
+                ]
+            }
+        ]);
+
+        let messages = super::gemini_contents_to_canonical_messages(Some(&contents))
+            .expect("Gemini contents should parse");
+        let call_ids = messages[0]
+            .content
+            .iter()
+            .map(|block| match block {
+                CanonicalContentBlock::ToolUse { id, .. } => id.as_str(),
+                _ => panic!("expected tool use"),
+            })
+            .collect::<Vec<_>>();
+        let result_ids = messages[1]
+            .content
+            .iter()
+            .map(|block| match block {
+                CanonicalContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+                _ => panic!("expected tool result"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_ne!(call_ids[0], call_ids[1]);
+        assert_eq!(result_ids, call_ids);
+    }
+
+    /// 验证不同名称的无 ID 结果优先按函数名匹配对应调用。
+    #[test]
+    fn gemini_request_pairs_idless_function_responses_by_name() {
+        let contents = json!([{
+            "role": "model",
+            "parts": [
+                {"functionCall": {"name": "first", "args": {}}},
+                {"functionCall": {"name": "second", "args": {}}}
+            ]
+        }, {
+            "role": "user",
+            "parts": [
+                {"functionResponse": {"name": "second", "response": {"result": 2}}},
+                {"functionResponse": {"name": "first", "response": {"result": 1}}}
+            ]
+        }]);
+
+        let messages = super::gemini_contents_to_canonical_messages(Some(&contents))
+            .expect("Gemini contents should parse");
+        let call_ids = messages[0]
+            .content
+            .iter()
+            .map(|block| match block {
+                CanonicalContentBlock::ToolUse { id, .. } => id.as_str(),
+                _ => panic!("expected tool use"),
+            })
+            .collect::<Vec<_>>();
+        let result_ids = messages[1]
+            .content
+            .iter()
+            .map(|block| match block {
+                CanonicalContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+                _ => panic!("expected tool result"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(result_ids, vec![call_ids[1], call_ids[0]]);
+    }
+
+    /// 验证生成的调用 ID 会预先避开请求内已有的显式调用 ID。
+    #[test]
+    fn gemini_request_generated_function_call_ids_avoid_explicit_ids() {
+        let contents = json!([{
+            "role": "model",
+            "parts": [
+                {"functionCall": {"name": "first", "args": {}}},
+                {"functionCall": {"id": "call_auto_0", "name": "second", "args": {}}}
+            ]
+        }]);
+
+        let messages = super::gemini_contents_to_canonical_messages(Some(&contents))
+            .expect("Gemini contents should parse");
+        let call_ids = messages[0]
+            .content
+            .iter()
+            .map(|block| match block {
+                CanonicalContentBlock::ToolUse { id, .. } => id.as_str(),
+                _ => panic!("expected tool use"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(call_ids, vec!["call_auto_1", "call_auto_0"]);
+    }
+
+    /// 验证生成的调用 ID 也会避开稍后函数结果声明的显式 ID。
+    #[test]
+    fn gemini_request_generated_function_call_ids_avoid_explicit_response_ids() {
+        let contents = json!([{
+            "role": "model",
+            "parts": [{"functionCall": {"name": "generated", "args": {}}}]
+        }, {
+            "role": "user",
+            "parts": [{
+                "functionResponse": {
+                    "id": "call_auto_0",
+                    "name": "external",
+                    "response": {"result": "done"}
+                }
+            }]
+        }]);
+
+        let messages = super::gemini_contents_to_canonical_messages(Some(&contents))
+            .expect("Gemini contents should parse");
+        let CanonicalContentBlock::ToolUse { id: call_id, .. } = &messages[0].content[0] else {
+            panic!("expected tool use");
+        };
+        let CanonicalContentBlock::ToolResult { tool_use_id, .. } = &messages[1].content[0] else {
+            panic!("expected tool result");
+        };
+
+        assert_eq!(call_id, "call_auto_1");
+        assert_eq!(tool_use_id, "call_auto_0");
     }
 
     #[test]

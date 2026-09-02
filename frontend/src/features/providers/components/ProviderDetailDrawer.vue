@@ -3078,8 +3078,23 @@ async function openAntigravityQuotaDialog(key: EndpointAPIKey) {
   }
 }
 
-async function handleKeyChanged() {
+/** 立即应用保存接口返回的 Key 快照，并同步当前选择引用。 */
+function applyUpdatedKeySnapshot(updatedKey: EndpointAPIKey) {
+  const index = providerKeys.value.findIndex(key => key.id === updatedKey.id)
+  if (index >= 0) {
+    providerKeys.value.splice(index, 1, updatedKey)
+  }
+  if (editingKey.value?.id === updatedKey.id) {
+    editingKey.value = updatedKey
+  }
+  syncCurrentSelections(endpoints.value, providerKeys.value)
+}
+
+/** 处理 Key 保存事件；刷新前后都重放返回快照，防止异步列表覆盖新值。 */
+async function handleKeyChanged(updatedKey?: EndpointAPIKey) {
+  if (updatedKey) applyUpdatedKeySnapshot(updatedKey)
   await Promise.all([loadProvider(), loadEndpoints(), loadMappingPreview()])
+  if (updatedKey) applyUpdatedKeySnapshot(updatedKey)
   emit('refresh')
   // 添加/修改 key 后自动获取已支持 provider 的配额（新 key 的 upstream_metadata 为空）
   void autoRefreshQuotaInBackground().then((changed) => {

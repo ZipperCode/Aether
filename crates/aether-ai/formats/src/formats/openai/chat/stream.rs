@@ -4,10 +4,12 @@ use serde_json::{json, Map, Value};
 
 use crate::formats::openai::namespace::NamespaceToolAliases;
 use crate::formats::openai::responses::{
+    encode_gemini_tool_signature_carrier_with_direction,
     openai_responses_synthetic_reasoning_item_id,
     response::{
         ensure_modern_openai_responses_response_fields, openai_responses_current_timestamp,
     },
+    GeminiToolSignatureCarrierDirection,
 };
 use crate::formats::shared::response::build_generated_tool_call_id;
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
@@ -2146,11 +2148,16 @@ pub struct OpenAIChatClientEmitter {
 }
 
 #[derive(Clone, Default)]
+/// 记录一个 Responses 客户端工具调用及其签名 carrier 的输出位置。
 struct OpenAIResponsesClientToolState {
     call_id: String,
     name: String,
     namespace: Option<String>,
     arguments: String,
+    /// 编码后的 Gemini 工具签名 carrier；只用于跨格式 Responses 输出。
+    thought_signature_carrier: Option<String>,
+    /// carrier 对应的 Responses output_index，用于完成快照保持事件顺序。
+    thought_signature_output_index: Option<usize>,
     output_index: Option<usize>,
     web_search: bool,
 }
@@ -2267,6 +2274,7 @@ impl OpenAIChatClientEmitter {
         index
     }
 
+    /// 将规范帧写为 Chat SSE；Gemini 工具签名无 Chat 等价字段，故不输出。
     pub fn emit(&mut self, frame: CanonicalStreamFrame) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
         self.update_identity(&frame);
         match frame.event {
@@ -2393,6 +2401,7 @@ impl OpenAIChatClientEmitter {
                 );
                 Ok(out)
             }
+            CanonicalStreamEvent::ToolCallSignature { .. } => Ok(Vec::new()),
             CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments } => {
                 let mut out = self.ensure_started()?;
                 let chat_index = self.chat_tool_call_index(index);
@@ -3082,6 +3091,7 @@ impl OpenAIResponsesClientEmitter {
         Ok(out)
     }
 
+    /// 构造 Responses 终态快照，并按分配顺序合并签名 carrier、消息与工具调用。
     fn terminal_response(
         &self,
         usage: CanonicalUsage,
@@ -3137,6 +3147,24 @@ impl OpenAIResponsesClientEmitter {
             ));
         }
         for (index, state) in &self.tool_calls {
+            if let (Some(output_index), Some(carrier)) = (
+                state.thought_signature_output_index,
+                state.thought_signature_carrier.as_ref(),
+            ) {
+                ordered_output.push((
+                    output_index,
+                    json!({
+                        "type": "reasoning",
+                        "id": openai_responses_synthetic_reasoning_item_id(
+                            self.response_id(),
+                            output_index,
+                        ),
+                        "status": "completed",
+                        "encrypted_content": carrier,
+                        "summary": [],
+                    }),
+                ));
+            }
             if let Some(output_index) = state.output_index {
                 let call_id = if state.call_id.is_empty() {
                     build_generated_tool_call_id(*index)
@@ -3309,6 +3337,7 @@ impl OpenAIResponsesClientEmitter {
         Ok(out)
     }
 
+    /// 将规范帧写为 Responses SSE；Gemini 工具签名编码为定向合成 reasoning item。
     pub fn emit(&mut self, frame: CanonicalStreamFrame) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
         self.update_identity(&frame);
         match frame.event {
@@ -3505,6 +3534,69 @@ impl OpenAIResponsesClientEmitter {
                         "response_id": response_id,
                         "output_index": output_index,
                         "item": item
+                    }),
+                )?);
+                Ok(out)
+            }
+            CanonicalStreamEvent::ToolCallSignature { index, signature } => {
+                let direction = if self
+                    .tool_calls
+                    .get(&index)
+                    .and_then(|state| state.output_index)
+                    .is_some()
+                {
+                    GeminiToolSignatureCarrierDirection::Previous
+                } else {
+                    GeminiToolSignatureCarrierDirection::Next
+                };
+                let Some(carrier) =
+                    encode_gemini_tool_signature_carrier_with_direction(&signature, direction)
+                else {
+                    return Ok(Vec::new());
+                };
+                if self
+                    .tool_calls
+                    .get(&index)
+                    .and_then(|state| state.thought_signature_carrier.as_deref())
+                    == Some(carrier.as_str())
+                {
+                    return Ok(Vec::new());
+                }
+
+                let mut out = self.ensure_started()?;
+                let output_index = self.allocate_output_index();
+                let item = json!({
+                    "type": "reasoning",
+                    "id": openai_responses_synthetic_reasoning_item_id(
+                        self.response_id(),
+                        output_index,
+                    ),
+                    "status": "completed",
+                    "encrypted_content": carrier,
+                    "summary": [],
+                });
+                let state = self.tool_calls.entry(index).or_default();
+                state.thought_signature_carrier = item
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                state.thought_signature_output_index = Some(output_index);
+                out.extend(self.encode_response_event(
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "response_id": self.response_id(),
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                )?);
+                out.extend(self.encode_response_event(
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "response_id": self.response_id(),
+                        "output_index": output_index,
+                        "item": item,
                     }),
                 )?);
                 Ok(out)
@@ -3881,6 +3973,7 @@ fn openai_responses_incomplete_finish_reason(payload: &Value) -> String {
 mod tests {
     use super::*;
     use crate::formats::claude::messages::stream::ClaudeClientEmitter;
+    use crate::formats::openai::responses::encode_gemini_tool_signature_carrier;
 
     fn data_line(value: Value) -> Vec<u8> {
         format!("data: {}\n", value).into_bytes()
@@ -5612,6 +5705,191 @@ mod tests {
         );
         assert!(
             sse.find("event: response.output_item.done") < sse.find("event: response.completed")
+        );
+    }
+
+    /// 验证调用前到达的 Gemini 签名在 Responses 流中先于函数调用 carrier 输出。
+    #[test]
+    fn openai_responses_client_emitter_carries_gemini_tool_signature() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_signed_tool_123".to_string(),
+                model: "gemini-3-flash-preview".to_string(),
+                event: CanonicalStreamEvent::ToolCallSignature {
+                    index: 0,
+                    signature: "opaque-tool-signature".to_string(),
+                },
+            })
+            .expect("tool signature should encode");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_signed_tool_123".to_string(),
+                    model: "gemini-3-flash-preview".to_string(),
+                    event: CanonicalStreamEvent::ToolCallStart {
+                        index: 0,
+                        call_id: "call_123".to_string(),
+                        name: "lookup".to_string(),
+                    },
+                })
+                .expect("tool call should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_signed_tool_123".to_string(),
+                    model: "gemini-3-flash-preview".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: "{\"query\":\"rust\"}".to_string(),
+                    },
+                })
+                .expect("tool arguments should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_signed_tool_123".to_string(),
+                    model: "gemini-3-flash-preview".to_string(),
+                    event: CanonicalStreamEvent::Finish {
+                        finish_reason: Some("tool_calls".to_string()),
+                        usage: None,
+                    },
+                })
+                .expect("tool finish should encode"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let carrier = encode_gemini_tool_signature_carrier("opaque-tool-signature")
+            .expect("signature carrier");
+        let carrier_index = sse.find(&carrier).expect("carrier in Responses stream");
+        let call_index = sse
+            .find("\"call_id\":\"call_123\"")
+            .expect("function call in Responses stream");
+        assert!(carrier_index < call_index);
+        assert!(sse.contains("\"encrypted_content\""));
+        assert!(sse.contains("event: response.completed\n"));
+    }
+
+    /// 验证调用后到达的 Gemini 签名使用 previous 方向并保持晚于函数调用。
+    #[test]
+    fn openai_responses_client_emitter_carries_late_gemini_tool_signature() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_late_signed_tool_123".to_string(),
+                model: "gemini-3-flash-preview".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_123".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("tool call should encode");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_late_signed_tool_123".to_string(),
+                    model: "gemini-3-flash-preview".to_string(),
+                    event: CanonicalStreamEvent::ToolCallSignature {
+                        index: 0,
+                        signature: "opaque-late-tool-signature".to_string(),
+                    },
+                })
+                .expect("late tool signature should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_late_signed_tool_123".to_string(),
+                    model: "gemini-3-flash-preview".to_string(),
+                    event: CanonicalStreamEvent::Finish {
+                        finish_reason: Some("tool_calls".to_string()),
+                        usage: None,
+                    },
+                })
+                .expect("tool finish should encode"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let carrier = encode_gemini_tool_signature_carrier_with_direction(
+            "opaque-late-tool-signature",
+            GeminiToolSignatureCarrierDirection::Previous,
+        )
+        .expect("late signature carrier");
+        let call_index = sse
+            .find("\"call_id\":\"call_123\"")
+            .expect("function call in Responses stream");
+        let carrier_index = sse
+            .find(&carrier)
+            .expect("late carrier in Responses stream");
+        assert!(call_index < carrier_index);
+        assert!(sse.contains("event: response.completed\n"));
+    }
+
+    /// 验证真实 Gemini 流经 Responses SSE 与历史输入后，函数调用签名仍能回到 Gemini 请求。
+    #[test]
+    fn gemini_stream_tool_signature_roundtrips_through_responses_history() {
+        let report_context = json!({});
+        let mut provider =
+            crate::formats::gemini::generate_content::stream::GeminiProviderState::default();
+        let frames = provider
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "responseId": "resp_stream_signature_roundtrip",
+                    "modelVersion": "gemini-3-flash-preview",
+                    "candidates": [{
+                        "index": 0,
+                        "content": {
+                            "parts": [{
+                                "functionCall": {
+                                    "id": "call_weather",
+                                    "name": "get_weather",
+                                    "args": {"city": "Shanghai"}
+                                },
+                                "thoughtSignature": "opaque-stream-tool-signature"
+                            }]
+                        },
+                        "finishReason": "STOP"
+                    }]
+                })),
+            )
+            .expect("Gemini stream should parse");
+
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend(emitter.emit(frame).expect("Responses frame should encode"));
+        }
+        let completed = String::from_utf8(bytes)
+            .expect("Responses SSE should be UTF-8")
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .find(|event| event["type"] == "response.completed")
+            .expect("Responses stream should contain a completed event");
+        let mut input = completed["response"]["output"]
+            .as_array()
+            .expect("completed response output")
+            .clone();
+        input.push(json!({
+            "type": "function_call_output",
+            "call_id": "call_weather",
+            "output": "sunny"
+        }));
+
+        let converted = crate::formats::registry::convert_request_pure(
+            "openai:responses",
+            "gemini:generate_content",
+            &json!({"model": "gemini-3-flash-preview", "input": input}),
+        )
+        .expect("Responses history should convert back to Gemini")
+        .value;
+        assert_eq!(
+            converted["contents"][0]["parts"][0]["thoughtSignature"],
+            "opaque-stream-tool-signature"
         );
     }
 

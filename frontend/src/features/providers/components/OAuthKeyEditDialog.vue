@@ -217,7 +217,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
-  saved: []
+  /** 保存成功时携带服务端返回的 OAuth Key 快照，避免父组件继续展示旧值。 */
+  saved: [key: EndpointAPIKey]
 }>()
 
 const { success, error: showError } = useToast()
@@ -367,6 +368,7 @@ function parsePatternText(text: string): string[] {
   return [...new Set(patterns)]
 }
 
+/** 保存 OAuth Key，并向父组件回传服务端最终快照。 */
 async function handleSave() {
   if (!props.editingKey) {
     showError('无法保存：缺少账号信息', '错误')
@@ -390,9 +392,9 @@ async function handleSave() {
       model_exclude_patterns: parsePatternText(form.value.model_exclude_patterns_text)
     }
 
-    await updateProviderKey(props.editingKey.id, updateData)
+    const updatedKey = await updateProviderKey(props.editingKey.id, updateData)
     success('账号已更新', '成功')
-    emit('saved')
+    emit('saved', updatedKey)
     emit('close')
   } catch (err: unknown) {
     const errorMessage = parseApiError(err, '保存失败')

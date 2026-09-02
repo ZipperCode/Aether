@@ -315,6 +315,7 @@ fn gemini_developer_model_resource_name(mapped_model: &str) -> String {
     }
 }
 
+/// 构建同格式 provider 请求；先应用操作员 body 规则，再记录 Gemini 专属兼容改写以禁用 exact-body 复用。
 fn build_same_format_provider_request_body_inner(
     input: SameFormatProviderRequestBodyInput<'_>,
     mut compatibility_edits: Option<&mut Vec<SameFormatProviderCompatibilityEdit>>,
@@ -474,6 +475,27 @@ fn build_same_format_provider_request_body_inner(
             SameFormatProviderCompatibilityEditAction::OperatorRule,
             "applied configured provider body rules",
         );
+    }
+    if matches!(input.family, SameFormatProviderFamily::Gemini)
+        && aether_ai_formats::api_format_alias_matches(
+            input.provider_api_format,
+            "gemini:generate_content",
+        )
+    {
+        let before_mixed_tool_compatibility = compatibility_edits
+            .is_some()
+            .then(|| provider_request_body.clone());
+        aether_ai_formats::ensure_server_side_tool_invocations_for_mixed_tools(
+            &mut provider_request_body,
+        )?;
+        if before_mixed_tool_compatibility.is_some_and(|before| before != provider_request_body) {
+            record_compatibility_edit(
+                &mut compatibility_edits,
+                "toolConfig.includeServerSideToolInvocations",
+                SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite,
+                "enabled Gemini server-side tool invocations for mixed built-in and function tools",
+            );
+        }
     }
     if matches!(input.family, SameFormatProviderFamily::Gemini)
         && aether_ai_formats::api_format_alias_matches(
@@ -2263,6 +2285,61 @@ mod tests {
         let function_response = &body["contents"][0]["parts"][1]["function_response"];
         assert!(function_response.get("id").is_none());
         assert_eq!(function_response["name"], "lookup_snake");
+    }
+
+    /// 验证同格式 Gemini 混合工具启用服务端调用，并在兼容报告中留下改写证据。
+    #[test]
+    fn same_format_gemini_body_enables_mixed_tool_invocations() {
+        let output = build_same_format_provider_request_body_with_compatibility_report(
+            SameFormatProviderRequestBodyInput {
+                body_json: &json!({
+                    "contents": [{
+                        "role": "user",
+                        "parts": [{"text": "Search, then save the result."}]
+                    }],
+                    "tools": [
+                        {"googleSearch": {}},
+                        {
+                            "functionDeclarations": [{
+                                "name": "save_result",
+                                "parameters": {"type": "object"}
+                            }]
+                        }
+                    ],
+                    "toolConfig": {
+                        "functionCallingConfig": {"mode": "AUTO"}
+                    }
+                }),
+                mapped_model: "gemini-3.7-flash",
+                client_api_format: "gemini:generate_content",
+                provider_api_format: "gemini:generate_content",
+                source_model: Some("gemini-3.7-flash"),
+                family: SameFormatProviderFamily::Gemini,
+                body_rules: None,
+                request_headers: None,
+                upstream_is_stream: true,
+                force_body_stream_field: false,
+                kiro_auth_config: None,
+                is_claude_code: false,
+                enable_model_directives: false,
+            },
+        )
+        .expect("same-format Gemini body should build");
+
+        assert_eq!(output.body["tools"][0]["googleSearch"], json!({}));
+        assert_eq!(
+            output.body["tools"][1]["functionDeclarations"][0]["name"],
+            "save_result"
+        );
+        assert_eq!(
+            output.body["toolConfig"]["includeServerSideToolInvocations"],
+            true
+        );
+        assert!(output.compatibility_edits.iter().any(|edit| {
+            edit.field == "toolConfig.includeServerSideToolInvocations"
+                && edit.action
+                    == SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite
+        }));
     }
 
     #[test]

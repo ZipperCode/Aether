@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use serde_json::Value;
 
 pub mod codex;
@@ -9,6 +10,79 @@ pub mod stream;
 
 const TOOL_ERROR_PREFIX: &str = "[tool error]";
 const AETHER_REASONING_ITEM_ID_PREFIX: &str = "rs_aether_";
+/// Aether 合成的 Gemini 工具签名 carrier 前缀，用于与 provider reasoning 区分。
+const GEMINI_TOOL_SIGNATURE_CARRIER_PREFIX: &str = "cpa-gemini-responses-carrier-v1:";
+/// 单个原始签名上限；解码前后都校验，避免 carrier 放大无界内存。
+const MAX_GEMINI_THOUGHT_SIGNATURE_LEN: usize = 32 * 1024 * 1024;
+/// Base64 无填充编码的最大长度上界。
+const MAX_GEMINI_THOUGHT_SIGNATURE_ENCODED_LEN: usize =
+    MAX_GEMINI_THOUGHT_SIGNATURE_LEN.div_ceil(3) * 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 指明合成 reasoning carrier 应绑定前一个还是后一个工具调用。
+pub(crate) enum GeminiToolSignatureCarrierDirection {
+    /// carrier 位于调用前，绑定后续工具调用。
+    Next,
+    /// carrier 位于调用后，绑定上一工具调用。
+    Previous,
+}
+
+impl GeminiToolSignatureCarrierDirection {
+    /// 返回 carrier wire 中稳定的小写方向标识。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Next => "next",
+            Self::Previous => "previous",
+        }
+    }
+}
+
+/// 以默认 next 方向编码 Gemini 工具签名；空值或超限值拒绝生成。
+pub(crate) fn encode_gemini_tool_signature_carrier(signature: &str) -> Option<String> {
+    encode_gemini_tool_signature_carrier_with_direction(
+        signature,
+        GeminiToolSignatureCarrierDirection::Next,
+    )
+}
+
+/// 按指定方向编码签名，保留签名原始空白与字节值。
+pub(crate) fn encode_gemini_tool_signature_carrier_with_direction(
+    signature: &str,
+    direction: GeminiToolSignatureCarrierDirection,
+) -> Option<String> {
+    (!signature.trim().is_empty() && signature.len() <= MAX_GEMINI_THOUGHT_SIGNATURE_LEN).then(
+        || {
+            format!(
+                "{GEMINI_TOOL_SIGNATURE_CARRIER_PREFIX}{}:function:{}",
+                direction.as_str(),
+                STANDARD_NO_PAD.encode(signature)
+            )
+        },
+    )
+}
+
+/// 解码并校验 Aether Gemini carrier；拒绝未知方向、嵌套 carrier、非法 Base64 与超限值。
+pub(crate) fn decode_gemini_tool_signature_carrier(
+    carrier: &str,
+) -> Option<(String, GeminiToolSignatureCarrierDirection)> {
+    let payload = carrier.strip_prefix(GEMINI_TOOL_SIGNATURE_CARRIER_PREFIX)?;
+    let (direction, encoded) = payload.split_once(":function:")?;
+    let direction = match direction {
+        "next" => GeminiToolSignatureCarrierDirection::Next,
+        "previous" => GeminiToolSignatureCarrierDirection::Previous,
+        _ => return None,
+    };
+    if encoded.len() > MAX_GEMINI_THOUGHT_SIGNATURE_ENCODED_LEN {
+        return None;
+    }
+    let decoded = STANDARD_NO_PAD.decode(encoded).ok()?;
+    if decoded.len() > MAX_GEMINI_THOUGHT_SIGNATURE_LEN {
+        return None;
+    }
+    let signature = String::from_utf8(decoded).ok()?;
+    (!signature.trim().is_empty() && !signature.starts_with(GEMINI_TOOL_SIGNATURE_CARRIER_PREFIX))
+        .then_some((signature, direction))
+}
 
 /// Controls which provider-owned reasoning items may be replayed on a Responses request.
 ///
@@ -243,12 +317,60 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        decode_gemini_tool_signature_carrier, encode_gemini_tool_signature_carrier_with_direction,
         openai_responses_request_operation, openai_responses_synthetic_reasoning_item_id,
         strip_incompatible_openai_responses_input_item_ids,
         strip_incompatible_openai_responses_reasoning_items,
         strip_incompatible_openai_responses_reasoning_items_with_policy,
-        OpenAiResponsesReasoningReplayPolicy, OPENAI_RESPONSES_OPERATION_COMPACT,
+        GeminiToolSignatureCarrierDirection, OpenAiResponsesReasoningReplayPolicy,
+        MAX_GEMINI_THOUGHT_SIGNATURE_ENCODED_LEN, MAX_GEMINI_THOUGHT_SIGNATURE_LEN,
+        OPENAI_RESPONSES_OPERATION_COMPACT,
     };
+
+    /// 验证两个方向均能无损往返包含空白与填充字符的签名。
+    #[test]
+    fn gemini_tool_signature_carrier_roundtrips_direction_and_exact_value() {
+        let signature = "  opaque-signature-with-padding==  ";
+        for direction in [
+            GeminiToolSignatureCarrierDirection::Next,
+            GeminiToolSignatureCarrierDirection::Previous,
+        ] {
+            let carrier = encode_gemini_tool_signature_carrier_with_direction(signature, direction)
+                .expect("signature carrier");
+            assert_eq!(
+                decode_gemini_tool_signature_carrier(&carrier),
+                Some((signature.to_string(), direction))
+            );
+        }
+    }
+
+    /// 验证嵌套 carrier 与编码前后超限值都被拒绝。
+    #[test]
+    fn gemini_tool_signature_carrier_rejects_nested_and_oversized_values() {
+        let nested = encode_gemini_tool_signature_carrier_with_direction(
+            "opaque-signature",
+            GeminiToolSignatureCarrierDirection::Next,
+        )
+        .expect("inner carrier");
+        let nested = encode_gemini_tool_signature_carrier_with_direction(
+            &nested,
+            GeminiToolSignatureCarrierDirection::Previous,
+        )
+        .expect("outer carrier");
+        assert_eq!(decode_gemini_tool_signature_carrier(&nested), None);
+        assert_eq!(
+            encode_gemini_tool_signature_carrier_with_direction(
+                &"x".repeat(MAX_GEMINI_THOUGHT_SIGNATURE_LEN + 1),
+                GeminiToolSignatureCarrierDirection::Next,
+            ),
+            None
+        );
+        let oversized = format!(
+            "cpa-gemini-responses-carrier-v1:next:function:{}",
+            "A".repeat(MAX_GEMINI_THOUGHT_SIGNATURE_ENCODED_LEN + 1)
+        );
+        assert_eq!(decode_gemini_tool_signature_carrier(&oversized), None);
+    }
 
     #[test]
     fn resolves_compaction_trigger_as_compact_operation_on_responses_transport() {

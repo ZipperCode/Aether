@@ -9,10 +9,13 @@ use crate::formats::shared::{AiSurfaceFinalizeError, GeminiStreamWireMode};
 use crate::protocol::canonical::audit_gemini_cross_format_response_part;
 
 #[derive(Default)]
+/// 累积单个 Gemini provider 工具调用的流式身份、参数与签名状态。
 struct GeminiProviderToolState {
     call_id: String,
     name: String,
     arguments: String,
+    /// 最近一次已发出的函数调用 thoughtSignature；用于去重并保证先于调用开始事件。
+    thought_signature: String,
     started_emitted: bool,
 }
 
@@ -68,6 +71,7 @@ impl GeminiProviderState {
         }
     }
 
+    /// 解析一行 Gemini provider 数据；函数调用签名会以独立规范事件先于调用事件输出。
     pub fn push_line(
         &mut self,
         report_context: &Value,
@@ -359,6 +363,16 @@ impl GeminiProviderState {
                     .and_then(Value::as_str)
                     .unwrap_or(tool_state.name.as_str())
                     .to_string();
+                if let Some(signature) = reasoning_signature {
+                    if tool_state.thought_signature != signature {
+                        tool_state.thought_signature = signature.clone();
+                        out.push(CanonicalStreamFrame {
+                            id: id.clone(),
+                            model: model.clone(),
+                            event: CanonicalStreamEvent::ToolCallSignature { index, signature },
+                        });
+                    }
+                }
                 if !tool_state.started_emitted {
                     out.push(CanonicalStreamFrame {
                         id: id.clone(),
@@ -464,10 +478,13 @@ fn map_gemini_stream_finish_reason(value: &str) -> Option<&str> {
 }
 
 #[derive(Default)]
+/// 累积向 Gemini 客户端回写的工具调用，直到参数足够完整再输出 part。
 struct GeminiClientToolState {
     call_id: String,
     name: String,
     arguments: String,
+    /// 随工具调用回放的 Gemini thoughtSignature；为空时不写入 wire part。
+    thought_signature: String,
     emitted: bool,
 }
 
@@ -592,6 +609,7 @@ impl GeminiClientEmitter {
         Ok(output)
     }
 
+    /// 刷新尚未输出的工具调用，并把已缓存签名附在对应 Gemini part 根节点。
     fn flush_pending_tool_calls(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
         let mut out = Vec::new();
         let mut pending = Vec::new();
@@ -602,7 +620,7 @@ impl GeminiClientEmitter {
             let args_value = parse_json_arguments_value(&tool_call.arguments)
                 .unwrap_or_else(|| Value::Object(Map::new()));
             tool_call.emitted = true;
-            pending.push(json!({
+            let mut part = json!({
                 "functionCall": {
                     "id": if tool_call.call_id.is_empty() {
                         build_generated_tool_call_id(*index)
@@ -616,7 +634,11 @@ impl GeminiClientEmitter {
                     },
                     "args": args_value,
                 }
-            }));
+            });
+            if !tool_call.thought_signature.is_empty() {
+                part["thoughtSignature"] = Value::String(tool_call.thought_signature.clone());
+            }
+            pending.push(part);
         }
         for part in pending {
             out.extend(self.emit_candidate(vec![part], None, None)?);
@@ -624,6 +646,7 @@ impl GeminiClientEmitter {
         Ok(out)
     }
 
+    /// 将规范流帧写为 Gemini 客户端事件；工具签名仅更新同索引调用状态。
     pub fn emit(&mut self, frame: CanonicalStreamFrame) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
         self.update_identity(&frame);
         match frame.event {
@@ -673,6 +696,10 @@ impl GeminiClientEmitter {
                 state.name = name;
                 Ok(Vec::new())
             }
+            CanonicalStreamEvent::ToolCallSignature { index, signature } => {
+                self.tool_calls.entry(index).or_default().thought_signature = signature;
+                Ok(Vec::new())
+            }
             CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments } => {
                 let emitted_part = {
                     let state = self.tool_calls.entry(index).or_default();
@@ -683,7 +710,7 @@ impl GeminiClientEmitter {
                         let args_value = parse_json_arguments_value(&state.arguments);
                         args_value.map(|args_value| {
                             state.emitted = true;
-                            json!({
+                            let mut part = json!({
                                 "functionCall": {
                                     "id": if state.call_id.is_empty() {
                                         build_generated_tool_call_id(index)
@@ -697,7 +724,12 @@ impl GeminiClientEmitter {
                                     },
                                     "args": args_value,
                                 }
-                            })
+                            });
+                            if !state.thought_signature.is_empty() {
+                                part["thoughtSignature"] =
+                                    Value::String(state.thought_signature.clone());
+                            }
+                            part
                         })
                     }
                 };
@@ -1141,6 +1173,7 @@ mod tests {
         )));
     }
 
+    /// 验证跨格式流不会把带扩展字段的 Gemini 工具结果误当成可安全转换结果。
     #[test]
     fn gemini_provider_state_rejects_extended_function_response_in_cross_format_streams() {
         let mut state = GeminiProviderState::default();
@@ -1177,6 +1210,58 @@ mod tests {
         assert!(!frames
             .iter()
             .any(|frame| matches!(frame.event, CanonicalStreamEvent::ToolResultDelta { .. })));
+    }
+
+    /// 验证 Gemini 函数调用的 thoughtSignature 先于工具调用事件进入规范流。
+    #[test]
+    fn gemini_provider_state_preserves_function_call_thought_signature() {
+        let mut state = GeminiProviderState::default();
+        let report_context = json!({});
+        let frames = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "responseId": "resp_signed_tool_123",
+                    "modelVersion": "gemini-3-flash-preview",
+                    "candidates": [{
+                        "index": 0,
+                        "content": {
+                            "parts": [{
+                                "functionCall": {
+                                    "id": "call_123",
+                                    "name": "lookup",
+                                    "args": {"query": "rust"}
+                                },
+                                "thoughtSignature": "opaque-tool-signature"
+                            }]
+                        }
+                    }]
+                })),
+            )
+            .expect("signed function call should parse");
+
+        let signature_index = frames
+            .iter()
+            .position(|frame| {
+                matches!(
+                    frame.event,
+                    CanonicalStreamEvent::ToolCallSignature {
+                        index: 0,
+                        ref signature,
+                    } if signature == "opaque-tool-signature"
+                )
+            })
+            .expect("tool signature event");
+        let call_index = frames
+            .iter()
+            .position(|frame| {
+                matches!(
+                    frame.event,
+                    CanonicalStreamEvent::ToolCallStart { index: 0, .. }
+                )
+            })
+            .expect("tool call start event");
+        assert!(signature_index < call_index);
     }
 
     #[test]

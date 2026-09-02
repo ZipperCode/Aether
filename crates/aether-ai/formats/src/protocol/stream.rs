@@ -39,6 +39,7 @@ pub enum CanonicalContentPart {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// 跨协议流式事件模型；专属事件由目标不支持时显式忽略或转为受控 carrier。
 pub enum CanonicalStreamEvent {
     Start,
     TextDelta(String),
@@ -59,6 +60,13 @@ pub enum CanonicalStreamEvent {
         index: usize,
         call_id: String,
         name: String,
+    },
+    /// Gemini 函数调用的 opaque thoughtSignature，必须与同索引工具调用保持时序关系。
+    ToolCallSignature {
+        /// 对应规范工具调用索引。
+        index: usize,
+        /// Gemini 返回且需原样回放的不可解释签名字串。
+        signature: String,
     },
     ToolCallArgumentsDelta {
         index: usize,

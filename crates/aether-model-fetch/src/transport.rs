@@ -260,6 +260,7 @@ pub async fn build_antigravity_fetch_available_models_plan(
     .await
 }
 
+/// 构建 Antigravity 项目发现请求；loadCodeAssist 固定走生产 cloudcode-pa 主机。
 pub async fn build_antigravity_load_code_assist_plan(
     runtime: &(impl ModelFetchTransportRuntime + ?Sized),
     transport: &GatewayProviderTransportSnapshot,
@@ -285,7 +286,7 @@ pub async fn build_antigravity_load_code_assist_plan(
         transport,
         ModelFetchExecutionPlanRequest {
             method: "POST".to_string(),
-            url: "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist".to_string(),
+            url: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist".to_string(),
             headers,
             content_type: Some("application/json".to_string()),
             body: RequestBody::from_json(json!({
@@ -1193,6 +1194,7 @@ mod tests {
         );
     }
 
+    /// 验证 Antigravity loadCodeAssist 计划使用生产主机并保留 CLI/OAuth 请求头。
     #[tokio::test]
     async fn builds_antigravity_load_code_assist_plan_with_cli_headers() {
         let runtime = TestRuntime {
@@ -1212,7 +1214,7 @@ mod tests {
         assert_eq!(plan.method, "POST");
         assert_eq!(
             plan.url,
-            "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+            "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
         );
         assert_eq!(
             plan.headers.get("authorization").map(String::as_str),

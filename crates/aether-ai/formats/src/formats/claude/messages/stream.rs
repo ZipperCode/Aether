@@ -668,6 +668,7 @@ impl ClaudeClientEmitter {
         Ok(out)
     }
 
+    /// 将规范帧投影为 Claude SSE；Gemini 专属工具签名没有 Claude 对等字段，故安全忽略。
     pub fn emit(&mut self, frame: CanonicalStreamFrame) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
         self.update_identity(&frame);
         match frame.event {
@@ -756,6 +757,7 @@ impl ClaudeClientEmitter {
                 out.extend(self.ensure_tool_block(index, &call_id, &name)?);
                 Ok(out)
             }
+            CanonicalStreamEvent::ToolCallSignature { .. } => Ok(Vec::new()),
             CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments } => {
                 let (call_id, name) = {
                     let state = self.tool_states.entry(index).or_default();

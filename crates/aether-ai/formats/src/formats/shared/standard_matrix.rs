@@ -1299,6 +1299,7 @@ mod tests {
         }
     }
 
+    /// 验证 Claude 请求经规范模型投影到各目标时保持既有载荷，并校验 Gemini 工具结果字符串语义。
     #[test]
     fn claude_request_uses_typed_canonical_without_changing_non_claude_target_payloads() {
         let request = json!({
@@ -1413,6 +1414,14 @@ mod tests {
                     let input_json = converted["input"].to_string();
                     assert!(!input_json.contains("<thinking>plan</thinking>"));
                     assert!(!input_json.contains("sig_123"));
+                    continue;
+                }
+                if provider_api_format == "gemini:generate_content" {
+                    assert_eq!(
+                        converted["contents"][2]["parts"][0]["functionResponse"]["response"]
+                            ["result"],
+                        json!({"ok": true})
+                    );
                     continue;
                 }
                 let legacy =
@@ -1764,6 +1773,7 @@ mod tests {
         );
     }
 
+    /// 验证 Claude CLI 请求使用 Gemini 3 目标时保持基础消息内容。
     #[test]
     fn builds_gemini_cli_request_from_claude_cli_source() {
         let request = json!({
@@ -1780,7 +1790,7 @@ mod tests {
         let converted = build_standard_request_body(
             &request,
             "claude:messages",
-            "gemini-2.5-pro",
+            "gemini-3-flash-preview",
             "google",
             "gemini:generate_content",
             "/v1/messages",
@@ -2025,5 +2035,54 @@ mod tests {
             claude["tools"][0]["input_schema"].get("required").is_some(),
             "surface conversion should preserve the Claude tool schema before transport envelopes"
         );
+    }
+
+    /// 验证 Responses 内置工具与函数声明组合会生成 Gemini 3 服务端调用开关。
+    #[test]
+    fn openai_responses_builtin_and_function_tools_enable_gemini_server_invocations() {
+        let request = json!({
+            "model": "gpt-5",
+            "input": "Search first, then save the result.",
+            "tools": [
+                {"type": "web_search_preview"},
+                {
+                    "type": "function",
+                    "name": "save_result",
+                    "description": "Save a search result",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "result": {"type": "string"}
+                        },
+                        "required": ["result"]
+                    }
+                }
+            ],
+            "tool_choice": "required"
+        });
+
+        let gemini = build_standard_request_body(
+            &request,
+            "openai:responses",
+            "gemini-3-flash-preview",
+            "google",
+            "gemini:generate_content",
+            "/v1/responses",
+            true,
+            None,
+            None,
+        )
+        .expect("openai responses should convert to gemini generate content");
+
+        assert_eq!(gemini["tools"][0]["googleSearch"], json!({}));
+        assert_eq!(
+            gemini["tools"][1]["functionDeclarations"][0]["name"],
+            "save_result"
+        );
+        assert_eq!(
+            gemini["toolConfig"]["includeServerSideToolInvocations"],
+            true
+        );
+        assert_eq!(gemini["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
     }
 }

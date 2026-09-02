@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
@@ -9,7 +9,9 @@ use crate::{
             map_openai_reasoning_effort_to_gemini_budget,
             map_thinking_budget_to_openai_reasoning_effort,
         },
-        shared::model_directives::{gemini_model_uses_thinking_level, ReasoningEffort},
+        shared::model_directives::{
+            gemini_model_supports_mixed_tools, gemini_model_uses_thinking_level, ReasoningEffort,
+        },
     },
     protocol::canonical::{
         apply_gemini_request_extensions, canonical_extension_object_mut,
@@ -18,9 +20,9 @@ use crate::{
         gemini_generation_config_extra, gemini_google_search_grounding,
         gemini_response_format_to_canonical, gemini_system_to_canonical_instructions,
         gemini_thinking_to_canonical, gemini_tool_choice_to_canonical, gemini_tools_to_canonical,
-        gemini_value_by_case, CanonicalContentBlock, CanonicalMessage, CanonicalRequest,
-        CanonicalResponseFormat, CanonicalRole, CanonicalToolChoice, CanonicalToolDefinition,
-        OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
+        gemini_value_by_case, is_cross_format_tool_result, CanonicalContentBlock, CanonicalMessage,
+        CanonicalRequest, CanonicalResponseFormat, CanonicalRole, CanonicalToolChoice,
+        CanonicalToolDefinition, OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
     },
 };
 
@@ -180,6 +182,7 @@ pub fn from_raw(body_json: &Value, request_path: &str) -> Option<CanonicalReques
     Some(canonical)
 }
 
+/// 将规范请求投影为 Gemini 请求；跨格式混合工具仅在 Gemini 3 上启用服务端调用标记。
 pub fn to_raw(
     canonical: &CanonicalRequest,
     mapped_model: &str,
@@ -187,7 +190,91 @@ pub fn to_raw(
 ) -> Option<Value> {
     let mut output = canonical_to_gemini_request_body(canonical, mapped_model, upstream_is_stream)?;
     apply_gemini_request_extensions(&mut output, &canonical.extensions)?;
+    if !canonical_has_raw_gemini_tools(canonical) {
+        enable_server_side_tool_invocations_for_mixed_tools(&mut output, mapped_model)?;
+    }
     Some(output)
+}
+
+/// 判断请求是否携带同格式 Gemini 原始工具；原始工具由扩展负责还原，不重复规范化。
+fn canonical_has_raw_gemini_tools(canonical: &CanonicalRequest) -> bool {
+    canonical
+        .extensions
+        .get("gemini")
+        .and_then(Value::as_object)
+        .is_some_and(|gemini| gemini.contains_key("raw_tools"))
+}
+
+/// 为跨格式混合工具执行模型门禁；不支持该能力的目标返回 None 使转换失败。
+fn enable_server_side_tool_invocations_for_mixed_tools(
+    output: &mut Value,
+    mapped_model: &str,
+) -> Option<()> {
+    let output_object = output.as_object_mut()?;
+    let tools = output_object.get("tools").and_then(Value::as_array);
+    let Some(tools) = tools else {
+        return Some(());
+    };
+    if !gemini_tools_are_mixed(tools) {
+        return Some(());
+    }
+    if !gemini_model_supports_mixed_tools(mapped_model) {
+        return None;
+    }
+    ensure_server_side_tool_invocations_for_mixed_tools(output)
+}
+
+/// 在已确定兼容的 Gemini 请求上写入 camelCase 混合工具开关，并移除蛇形别名。
+pub fn ensure_server_side_tool_invocations_for_mixed_tools(output: &mut Value) -> Option<()> {
+    let output_object = output.as_object_mut()?;
+    let tools = output_object.get("tools").and_then(Value::as_array);
+    let Some(tools) = tools else {
+        return Some(());
+    };
+    if !gemini_tools_are_mixed(tools) {
+        return Some(());
+    }
+
+    let tool_config = output_object
+        .entry("toolConfig".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()?;
+    tool_config.remove("include_server_side_tool_invocations");
+    tool_config.insert(
+        "includeServerSideToolInvocations".to_string(),
+        Value::Bool(true),
+    );
+    Some(())
+}
+
+/// 通过唯一 Gemini 工具投影判断规范请求是否同时含内置工具与函数声明。
+pub(crate) fn canonical_has_mixed_gemini_tools(canonical: &CanonicalRequest) -> bool {
+    canonical_tools_to_gemini(canonical)
+        .and_then(|tools| tools.as_array().cloned())
+        .is_some_and(|tools| gemini_tools_are_mixed(&tools))
+}
+
+/// 判断 Gemini wire 工具数组是否同时包含非空函数声明和至少一个内置工具。
+fn gemini_tools_are_mixed(tools: &[Value]) -> bool {
+    let has_function_declarations = tools.iter().any(|tool| {
+        tool.as_object().is_some_and(|tool| {
+            tool.get("functionDeclarations")
+                .or_else(|| tool.get("function_declarations"))
+                .and_then(Value::as_array)
+                .is_some_and(|declarations| !declarations.is_empty())
+        })
+    });
+    let has_builtin_tools = tools.iter().any(|tool| {
+        tool.as_object().is_some_and(|tool| {
+            tool.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "functionDeclarations" | "function_declarations"
+                )
+            })
+        })
+    });
+    has_function_declarations && has_builtin_tools
 }
 
 fn canonical_to_gemini_request_body(
@@ -241,16 +328,55 @@ fn canonical_system_instruction(canonical: &CanonicalRequest) -> Option<Value> {
     (!text.trim().is_empty()).then(|| json!({ "parts": [{ "text": text }] }))
 }
 
+/// 合并相邻同角色消息并生成 Gemini contents；用户侧工具结果会按前一批调用顺序对齐。
 fn canonical_messages_to_gemini_contents(messages: &[CanonicalMessage]) -> Option<Vec<Value>> {
     let mut contents = Vec::new();
     let mut tool_name_by_id = BTreeMap::new();
-    for message in messages {
-        let role = match message.role {
+    let mut pending_tool_use_ids = Vec::new();
+    let mut message_index = 0;
+    while message_index < messages.len() {
+        let role = match messages[message_index].role {
             CanonicalRole::Assistant => "model",
-            CanonicalRole::System | CanonicalRole::Developer => continue,
+            CanonicalRole::System | CanonicalRole::Developer => {
+                message_index += 1;
+                continue;
+            }
             CanonicalRole::Tool | CanonicalRole::User | CanonicalRole::Unknown => "user",
         };
-        let parts = canonical_blocks_to_gemini_parts(&message.content, &mut tool_name_by_id)?;
+        let mut blocks = Vec::new();
+        while message_index < messages.len() {
+            let next_role = match messages[message_index].role {
+                CanonicalRole::Assistant => Some("model"),
+                CanonicalRole::Tool | CanonicalRole::User | CanonicalRole::Unknown => Some("user"),
+                CanonicalRole::System | CanonicalRole::Developer => None,
+            };
+            match next_role {
+                Some(next_role) if next_role == role => {
+                    blocks.extend(messages[message_index].content.iter());
+                    message_index += 1;
+                }
+                None => message_index += 1,
+                Some(_) => break,
+            }
+        }
+
+        let blocks = if role == "user" {
+            let aligned = align_gemini_tool_results(blocks, &pending_tool_use_ids);
+            pending_tool_use_ids.clear();
+            aligned
+        } else {
+            pending_tool_use_ids = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    CanonicalContentBlock::ToolUse { id, .. } if !id.trim().is_empty() => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            blocks
+        };
+        let parts = canonical_blocks_to_gemini_parts(&blocks, &mut tool_name_by_id)?;
         if parts.is_empty() {
             continue;
         }
@@ -262,22 +388,98 @@ fn canonical_messages_to_gemini_contents(messages: &[CanonicalMessage]) -> Optio
     Some(contents)
 }
 
+/// 仅对明确来自跨格式适配器且能完整一一配对的工具结果排序；不确定时保持原顺序。
+fn align_gemini_tool_results<'a>(
+    blocks: Vec<&'a CanonicalContentBlock>,
+    pending_tool_use_ids: &[String],
+) -> Vec<&'a CanonicalContentBlock> {
+    if pending_tool_use_ids.is_empty() {
+        return blocks;
+    }
+
+    let result_indexes = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| match block {
+            CanonicalContentBlock::ToolResult { extensions, .. }
+                if is_cross_format_tool_result(extensions) =>
+            {
+                Some(index)
+            }
+            CanonicalContentBlock::ToolResult { .. } => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if result_indexes.len() != pending_tool_use_ids.len()
+        || blocks
+            .iter()
+            .filter(|block| matches!(block, CanonicalContentBlock::ToolResult { .. }))
+            .count()
+            != result_indexes.len()
+    {
+        return blocks;
+    }
+
+    let mut ordered = Vec::with_capacity(blocks.len());
+    let mut used = vec![false; result_indexes.len()];
+    for pending_id in pending_tool_use_ids {
+        if pending_id.trim().is_empty() {
+            return blocks;
+        }
+        let Some((result_position, block_index)) =
+            result_indexes
+                .iter()
+                .enumerate()
+                .find(|(result_position, block_index)| {
+                    if used[*result_position] {
+                        return false;
+                    }
+                    matches!(
+                        blocks[**block_index],
+                        CanonicalContentBlock::ToolResult { ref tool_use_id, .. }
+                            if tool_use_id == pending_id
+                    )
+                })
+        else {
+            return blocks;
+        };
+        used[result_position] = true;
+        ordered.push(blocks[*block_index]);
+    }
+    ordered.extend(
+        blocks
+            .iter()
+            .copied()
+            .filter(|block| !matches!(block, CanonicalContentBlock::ToolResult { .. })),
+    );
+    ordered
+}
+
+/// 将一组规范内容块转为 Gemini parts，并只给首个无真实签名的合成工具调用添加哨兵。
 fn canonical_blocks_to_gemini_parts(
-    blocks: &[CanonicalContentBlock],
+    blocks: &[&CanonicalContentBlock],
     tool_name_by_id: &mut BTreeMap<String, String>,
 ) -> Option<Vec<Value>> {
     let mut parts = Vec::new();
+    let mut saw_tool_use = false;
     for block in blocks {
-        if let Some(part) = canonical_block_to_gemini_part(block, tool_name_by_id)? {
+        let is_first_tool_use =
+            matches!(block, CanonicalContentBlock::ToolUse { .. }) && !saw_tool_use;
+        if let Some(part) =
+            canonical_block_to_gemini_part(block, tool_name_by_id, is_first_tool_use)?
+        {
             parts.push(part);
         }
+        saw_tool_use |= matches!(block, CanonicalContentBlock::ToolUse { .. });
     }
     Some(parts)
 }
 
+/// 转换单个规范内容块；`is_first_tool_use` 仅控制 Gemini 合成历史的签名校验哨兵。
 fn canonical_block_to_gemini_part(
     block: &CanonicalContentBlock,
     tool_name_by_id: &mut BTreeMap<String, String>,
+    is_first_tool_use: bool,
 ) -> Option<Option<Value>> {
     match block {
         CanonicalContentBlock::Text { text, .. } => Some(Some(json!({ "text": text }))),
@@ -329,16 +531,37 @@ fn canonical_block_to_gemini_part(
             })
         })),
         CanonicalContentBlock::ToolUse {
-            id, name, input, ..
+            id,
+            name,
+            input,
+            extensions,
         } => {
             tool_name_by_id.insert(id.clone(), name.clone());
-            Some(Some(json!({
+            let mut part = json!({
                 "functionCall": {
                     "id": id,
                     "name": name,
                     "args": gemini_function_args(input),
                 }
-            })))
+            });
+            let signature = extensions
+                .get("gemini")
+                .and_then(Value::as_object)
+                .and_then(|gemini| {
+                    gemini
+                        .get("thoughtSignature")
+                        .or_else(|| gemini.get("thought_signature"))
+                })
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| is_first_tool_use.then_some("skip_thought_signature_validator"));
+            if let Some(signature) = signature {
+                part.as_object_mut()?.insert(
+                    "thoughtSignature".to_string(),
+                    Value::String(signature.to_string()),
+                );
+            }
+            Some(Some(part))
         }
         CanonicalContentBlock::ToolResult {
             tool_use_id,
@@ -862,25 +1085,200 @@ fn insert_f64(output: &mut Map<String, Value>, key: &str, value: Option<f64>) {
     }
 }
 
+/// 就地把通用 JSON Schema 收窄为 Gemini 接受的子集，未知关键字会被丢弃。
 fn clean_gemini_schema(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            for inner in object.values_mut() {
-                clean_gemini_schema(inner);
-            }
-            if object.get("type").and_then(Value::as_str) == Some("object")
-                && !object.contains_key("properties")
-            {
-                object.insert("properties".to_string(), Value::Object(Map::new()));
+    let root = value.clone();
+    *value = json_schema_to_gemini_schema(&root, &root, &mut BTreeSet::new());
+}
+
+/// 递归转换单个 Schema，并只解析根内本地 `$ref`；循环引用按空对象安全收敛。
+fn json_schema_to_gemini_schema(
+    value: &Value,
+    root: &Value,
+    resolving_refs: &mut BTreeSet<String>,
+) -> Value {
+    let Some(object) = value.as_object() else {
+        return json!({});
+    };
+
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        if let Some(pointer) = reference.strip_prefix('#') {
+            if resolving_refs.insert(reference.to_string()) {
+                if let Some(resolved) = root.pointer(pointer).and_then(Value::as_object) {
+                    let mut merged = resolved.clone();
+                    for (key, value) in object {
+                        if key != "$ref" {
+                            merged.insert(key.clone(), value.clone());
+                        }
+                    }
+                    let schema = clean_gemini_schema_object(&merged, root, resolving_refs);
+                    resolving_refs.remove(reference);
+                    return Value::Object(schema);
+                }
+                resolving_refs.remove(reference);
             }
         }
-        Value::Array(items) => {
-            for item in items {
-                clean_gemini_schema(item);
+    }
+
+    Value::Object(clean_gemini_schema_object(object, root, resolving_refs))
+}
+
+/// 复制 Gemini 支持的 Schema 字段，归一联合类型、nullable、枚举和嵌套对象。
+fn clean_gemini_schema_object(
+    object: &Map<String, Value>,
+    root: &Value,
+    resolving_refs: &mut BTreeSet<String>,
+) -> Map<String, Value> {
+    let mut schema = Map::new();
+
+    for key in ["title", "description", "format", "pattern"] {
+        if let Some(value) = object.get(key).filter(|value| value.is_string()) {
+            schema.insert(key.to_string(), value.clone());
+        }
+    }
+    for key in ["default", "example"] {
+        if let Some(value) = object.get(key) {
+            schema.insert(key.to_string(), value.clone());
+        }
+    }
+    for key in ["minimum", "maximum"] {
+        if let Some(value) = object.get(key).filter(|value| value.is_number()) {
+            schema.insert(key.to_string(), value.clone());
+        }
+    }
+    for key in [
+        "minItems",
+        "maxItems",
+        "minLength",
+        "maxLength",
+        "minProperties",
+        "maxProperties",
+    ] {
+        if let Some(value) = object.get(key).and_then(gemini_int64_string) {
+            schema.insert(key.to_string(), Value::String(value));
+        }
+    }
+    if let Some(value) = object.get("nullable").filter(|value| value.is_boolean()) {
+        schema.insert("nullable".to_string(), value.clone());
+    }
+    for key in ["required", "propertyOrdering"] {
+        if let Some(values) = object.get(key).and_then(gemini_string_array) {
+            schema.insert(key.to_string(), values);
+        }
+    }
+    if let Some(values) = object.get("enum").and_then(Value::as_array) {
+        let values = values
+            .iter()
+            .filter(|value| value.is_string())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !values.is_empty() {
+            schema.insert("enum".to_string(), Value::Array(values));
+        }
+    }
+    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+        schema.insert(
+            "properties".to_string(),
+            Value::Object(
+                properties
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            json_schema_to_gemini_schema(value, root, resolving_refs),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(items) = object.get("items") {
+        schema.insert(
+            "items".to_string(),
+            json_schema_to_gemini_schema(items, root, resolving_refs),
+        );
+    }
+
+    let explicit_any_of = object
+        .get("anyOf")
+        .or_else(|| object.get("oneOf"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            Value::Array(
+                items
+                    .iter()
+                    .map(|item| json_schema_to_gemini_schema(item, root, resolving_refs))
+                    .collect(),
+            )
+        });
+    if let Some(any_of) = explicit_any_of {
+        schema.insert("anyOf".to_string(), any_of);
+    }
+
+    match object.get("type") {
+        Some(Value::String(schema_type)) => {
+            schema.insert("type".to_string(), Value::String(schema_type.clone()));
+        }
+        Some(Value::Array(types)) => {
+            let mut non_null_types = types
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|schema_type| *schema_type != "null")
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            let mut seen_types = BTreeSet::new();
+            non_null_types.retain(|schema_type| seen_types.insert(schema_type.clone()));
+            let nullable = types.iter().any(|value| value.as_str() == Some("null"));
+
+            match non_null_types.as_slice() {
+                [schema_type] => {
+                    schema.insert("type".to_string(), Value::String(schema_type.clone()));
+                }
+                [] if nullable => {
+                    schema.insert("type".to_string(), Value::String("null".to_string()));
+                }
+                [] => {}
+                _ if !schema.contains_key("anyOf") => {
+                    schema.insert(
+                        "anyOf".to_string(),
+                        Value::Array(
+                            non_null_types
+                                .iter()
+                                .map(|schema_type| json!({ "type": schema_type }))
+                                .collect(),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+            if nullable && !non_null_types.is_empty() {
+                schema.insert("nullable".to_string(), Value::Bool(true));
             }
         }
         _ => {}
     }
+
+    if schema.get("type").and_then(Value::as_str) == Some("object")
+        && !schema.contains_key("properties")
+    {
+        schema.insert("properties".to_string(), Value::Object(Map::new()));
+    }
+    schema
+}
+
+/// 将 Gemini 以字符串承载的 int64 约束从数字或字符串规范化为字符串。
+fn gemini_int64_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+/// 仅接受全字符串数组，避免把非法 required/propertyOrdering 静默发给 Gemini。
+fn gemini_string_array(value: &Value) -> Option<Value> {
+    let values = value.as_array()?;
+    values.iter().all(Value::is_string).then(|| value.clone())
 }
 
 #[cfg(test)]
@@ -888,6 +1286,81 @@ mod tests {
     use super::*;
     use crate::CanonicalContentBlock;
 
+    /// 验证复杂 JSON Schema 被解析并裁剪为 Gemini 支持的稳定结构。
+    #[test]
+    fn canonical_tool_declaration_sanitizes_json_schema_for_gemini() {
+        let declaration = canonical_tool_to_gemini_declaration(&CanonicalToolDefinition {
+            name: "inspect".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "$defs": {
+                    "Target": {
+                        "type": "object",
+                        "properties": {
+                            "secret": {
+                                "type": "string",
+                                "encrypted": true
+                            }
+                        },
+                        "required": ["secret"],
+                        "additionalProperties": false
+                    }
+                },
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "oneOf": [
+                            {"$ref": "#/$defs/Target"},
+                            {"type": "null"}
+                        ]
+                    },
+                    "mode": {
+                        "type": ["string", "null"],
+                        "enum": [1, "fast"]
+                    },
+                    "value": {
+                        "type": ["string", "integer"]
+                    }
+                }
+            })),
+            strict: None,
+            extensions: BTreeMap::new(),
+        });
+
+        assert_eq!(
+            declaration["parameters"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "secret": {"type": "string"}
+                                },
+                                "required": ["secret"]
+                            },
+                            {"type": "null"}
+                        ]
+                    },
+                    "mode": {
+                        "type": "string",
+                        "nullable": true,
+                        "enum": ["fast"]
+                    },
+                    "value": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "integer"}
+                        ]
+                    }
+                }
+            })
+        );
+    }
+
+    /// 验证工具结果转换仍保留与函数调用配对所需的 response ID。
     #[test]
     fn canonical_tool_result_to_gemini_request_preserves_function_response_id() {
         let mut tool_name_by_id = BTreeMap::new();
@@ -903,6 +1376,7 @@ mod tests {
                 extensions: BTreeMap::new(),
             },
             &mut tool_name_by_id,
+            false,
         )
         .expect("part should be representable")
         .expect("part should not be omitted");
@@ -918,5 +1392,28 @@ mod tests {
             function_response["response"],
             serde_json::json!({"result": {"ok": true}})
         );
+    }
+
+    /// 验证混合工具仅允许 Gemini 3，Gemini 2.5 在传输前失败。
+    #[test]
+    fn mixed_builtin_and_function_tools_require_gemini_three() {
+        let canonical = CanonicalRequest {
+            model: "gemini-2.5-pro".to_string(),
+            tools: vec![CanonicalToolDefinition {
+                name: "save_result".to_string(),
+                description: None,
+                parameters: Some(json!({"type": "object"})),
+                strict: None,
+                extensions: BTreeMap::new(),
+            }],
+            extensions: BTreeMap::from([(
+                "gemini".to_string(),
+                json!({"builtin_tools": [{"googleSearch": {}}]}),
+            )]),
+            ..CanonicalRequest::default()
+        };
+
+        assert!(to_raw(&canonical, "gemini-2.5-pro", false).is_none());
+        assert!(to_raw(&canonical, "gemini-3-flash-preview", false).is_some());
     }
 }

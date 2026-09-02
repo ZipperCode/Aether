@@ -643,7 +643,13 @@ pub fn claude_model_uses_adaptive_effort(model: &str) -> bool {
         || model.contains("sonnet-4-6")
 }
 
+/// 判断 Gemini 模型是否采用 thinkingLevel 指令；当前与 Gemini 3 能力族一致。
 pub fn gemini_model_uses_thinking_level(model: &str) -> bool {
+    gemini_model_supports_mixed_tools(model)
+}
+
+/// 判断最终映射模型是否属于支持内置工具与函数声明混用的 Gemini 3 系列。
+pub(crate) fn gemini_model_supports_mixed_tools(model: &str) -> bool {
     model
         .trim()
         .to_ascii_lowercase()

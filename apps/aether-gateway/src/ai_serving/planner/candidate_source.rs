@@ -86,6 +86,50 @@ impl GatewayLocalCandidatePreselectionPort<'_> {
     }
 }
 
+/// 为请求语义生成候选格式列表。
+/// Responses compaction 含 OpenAI 专属控制项，必须在候选预选阶段限制到 Responses 端点。
+fn request_candidate_api_formats_for_operation(
+    client_api_format: &str,
+    require_streaming: bool,
+    request_operation: Option<&str>,
+) -> Vec<String> {
+    let candidate_api_formats =
+        crate::ai_serving::request_candidate_api_formats(client_api_format, require_streaming)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+    restrict_candidate_api_formats_for_operation(
+        client_api_format,
+        request_operation,
+        candidate_api_formats,
+    )
+}
+
+/// 收窄调用方提供的候选格式；普通 Responses 与旧 compact 专用格式保持原有候选语义。
+fn restrict_candidate_api_formats_for_operation(
+    client_api_format: &str,
+    request_operation: Option<&str>,
+    candidate_api_formats: Vec<String>,
+) -> Vec<String> {
+    let is_responses_compaction = request_operation.is_some_and(|operation| {
+        operation.eq_ignore_ascii_case(crate::ai_serving::OPENAI_RESPONSES_OPERATION_COMPACT)
+    });
+    let is_standard_responses_client =
+        crate::ai_serving::normalize_api_format_alias(client_api_format) == "openai:responses";
+    if !(is_responses_compaction && is_standard_responses_client) {
+        return candidate_api_formats;
+    }
+
+    candidate_api_formats
+        .into_iter()
+        .filter(|candidate_api_format| {
+            crate::ai_serving::normalize_api_format_alias(candidate_api_format)
+                == "openai:responses"
+        })
+        .collect()
+}
+
 #[async_trait]
 impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
     type Candidate = SchedulerMinimalCandidateSelectionCandidate;
@@ -199,6 +243,7 @@ fn resolve_model_directive_routing_models(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 按客户端格式建立本地候选预选，并在进入调度前应用请求操作约束。
 pub(crate) async fn preselect_local_execution_candidates_with_serving(
     state: PlannerAppState<'_>,
     model_directive_policy: &crate::system_features::ModelDirectivePolicySnapshot,
@@ -219,11 +264,11 @@ pub(crate) async fn preselect_local_execution_candidates_with_serving(
     >,
     GatewayError,
 > {
-    let candidate_api_formats =
-        crate::ai_serving::request_candidate_api_formats(client_api_format, require_streaming)
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+    let candidate_api_formats = request_candidate_api_formats_for_operation(
+        client_api_format,
+        require_streaming,
+        request_operation,
+    );
     preselect_local_execution_candidates_for_api_formats_with_serving(
         state,
         model_directive_policy,
@@ -243,6 +288,7 @@ pub(crate) async fn preselect_local_execution_candidates_with_serving(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 使用调用方指定的格式集合执行预选；仍会二次收窄 compaction，防止旁路调用绕过约束。
 pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_serving(
     state: PlannerAppState<'_>,
     model_directive_policy: &crate::system_features::ModelDirectivePolicySnapshot,
@@ -264,6 +310,11 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
     >,
     GatewayError,
 > {
+    let candidate_api_formats = restrict_candidate_api_formats_for_operation(
+        client_api_format,
+        request_operation,
+        candidate_api_formats,
+    );
     let model_directive_routing_models = resolve_model_directive_routing_models(
         model_directive_policy,
         &candidate_api_formats,
@@ -345,6 +396,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// 创建分页候选游标，并冻结本次请求的操作感知格式集合与模型指令映射。
     pub(crate) async fn new(
         state: PlannerAppState<'a>,
         model_directive_policy: &crate::system_features::ModelDirectivePolicySnapshot,
@@ -362,11 +414,11 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         allow_priority_page_cache: bool,
         trace_id: Option<&str>,
     ) -> Self {
-        let candidate_api_formats =
-            crate::ai_serving::request_candidate_api_formats(client_api_format, require_streaming)
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>();
+        let candidate_api_formats = request_candidate_api_formats_for_operation(
+            client_api_format,
+            require_streaming,
+            request_operation,
+        );
         let model_directive_routing_models = resolve_model_directive_routing_models(
             model_directive_policy,
             &candidate_api_formats,
@@ -1461,6 +1513,32 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// 验证标准 Responses compaction 仅保留 Responses 候选，普通请求与旧格式不受影响。
+    #[test]
+    fn compaction_operation_excludes_non_responses_provider_formats() {
+        assert_eq!(
+            request_candidate_api_formats_for_operation("openai:responses", true, Some("compact"),),
+            vec!["openai:responses"]
+        );
+        assert_eq!(
+            request_candidate_api_formats_for_operation("openai:responses", true, None),
+            vec![
+                "openai:responses",
+                "openai:chat",
+                "claude:messages",
+                "gemini:generate_content"
+            ]
+        );
+        assert_eq!(
+            request_candidate_api_formats_for_operation(
+                "openai:responses:compact",
+                false,
+                Some("compact"),
+            ),
+            vec!["openai:responses:compact"]
+        );
+    }
 
     #[derive(Default)]
     struct EmptyFallbackCountingRepository {

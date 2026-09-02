@@ -192,7 +192,7 @@ pub(crate) use aether_ai_formats::{
     validate_agent_bridge_function_call_arguments, AgentBridgeCompatibilityReport,
     AgentBridgePrimaryState, AgentBridgeRequestSanitizeReport, ApiOperation, ClientSurface,
     AGENT_BRIDGE_HANDLE_PREFIX, AGENT_BRIDGE_REASONING_PREFIX, AGENT_BRIDGE_REPORT_CONTEXT_FIELD,
-    CODEX_CLIENT_VERSION,
+    CODEX_CLIENT_VERSION, OPENAI_RESPONSES_OPERATION_COMPACT,
 };
 
 pub(crate) fn plan_kind_matches_api_operation(
