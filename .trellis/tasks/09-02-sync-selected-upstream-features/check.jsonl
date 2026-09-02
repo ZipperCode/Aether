@@ -1,0 +1,14 @@
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/prd.md","reason":"逐项核对 AC1-AC7"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/design.md","reason":"核对冲突保护、排除路径与最终数据流"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/implement.md","reason":"核对实施和验证证据"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/research/integration-map.md","reason":"执行 fail-closed 提交与路径范围审计"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/research/formats.md","reason":"复核协议转换和原生 Responses 保留行为"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/research/provider-pool.md","reason":"复核并发、亲和、额度隔离和前端投影"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/research/gateway-compat.md","reason":"复核 Codex 身份、预提交错误与容量分类"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/research/routing.md","reason":"复核 policy authority 和 lazy retry"}
+{"file":".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md","reason":"原生 Responses 防回归检查"}
+{"file":".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md","reason":"余额调度防回归检查"}
+{"file":".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md","reason":"永久额度阻断防回归检查"}
+{"file":".trellis/spec/aether-gateway/backend/model-capability-test-contract.md","reason":"模型能力检测防回归检查"}
+{"file":".trellis/spec/aether-gateway/backend/quality-guidelines.md","reason":"Gateway 质量合同"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"跨层数据流完整性检查"}

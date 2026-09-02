@@ -1,0 +1,20 @@
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/prd.md","reason":"用户范围、排除项与验收标准"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/design.md","reason":"批次顺序、数据流、冲突保护与范围审计"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/implement.md","reason":"分批实施与验证清单"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/research/integration-map.md","reason":"36 个上游提交的精确分类、拓扑和允许路径"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/research/formats.md","reason":"Gemini Responses Antigravity 补丁链和协议合同"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/research/provider-pool.md","reason":"Key 并发、缓存亲和、模型额度和 UI 数据链"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/research/gateway-compat.md","reason":"Codex 身份、流提交、容量和 DeepSeek 冲突规则"}
+{"file":".trellis/tasks/09-02-sync-selected-upstream-features/research/routing.md","reason":"路由策略权威来源和 lazy sticky retry 合同"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"复用现有 owner，禁止并行实现"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"贯通配置、调度、执行、协议和前端边界"}
+{"file":".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md","reason":"保留原生 Responses 透传、exact body 和首段错误合同"}
+{"file":".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md","reason":"保留余额调度与 sticky 共享过滤"}
+{"file":".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md","reason":"保留永久额度阻断、strong read 与手工恢复"}
+{"file":".trellis/spec/aether-gateway/backend/model-capability-test-contract.md","reason":"保留本地模型能力检测和固定 Endpoint Key 合同"}
+{"file":".trellis/spec/aether-gateway/backend/quality-guidelines.md","reason":"保留上游响应体上限和执行头清理合同"}
+{"file":".trellis/spec/aether-routing-core/backend/index.md","reason":"路由核心包边界"}
+{"file":".trellis/spec/aether-ai-serving/backend/index.md","reason":"候选和 attempt loop 包边界"}
+{"file":".trellis/spec/aether-provider-transport/backend/index.md","reason":"provider transport 包边界"}
+{"file":".trellis/spec/aether-gateway-execution/backend/index.md","reason":"gateway 执行包边界"}
+{"file":".trellis/spec/aether-runtime-state/backend/index.md","reason":"runtime semaphore 包边界"}
