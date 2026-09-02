@@ -14842,6 +14842,7 @@ mod tests {
         assert!(stored_usage.total_tokens > 0);
     }
 
+    /// 验证远程流首个数据帧先把请求标记为 streaming，再接收终态遥测。
     #[tokio::test]
     async fn execute_execution_runtime_stream_records_first_data_as_streaming_before_terminal_telemetry(
     ) {
@@ -14893,19 +14894,6 @@ mod tests {
 
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
-        let state = AppState::new()
-            .expect("app state should build")
-            .with_data_state_for_tests(
-                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
-                    Arc::clone(&request_candidate_repository),
-                    Arc::clone(&usage_repository),
-                ),
-            )
-            .with_usage_runtime_for_tests(UsageRuntimeConfig {
-                enabled: true,
-                ..UsageRuntimeConfig::default()
-            })
-            .with_execution_runtime_override_base_url(format!("http://{addr}"));
         let plan = ExecutionPlan {
             request_id: "req-live-stream-first-data".into(),
             candidate_id: Some("cand-live-stream-first-data".into()),
@@ -14938,6 +14926,20 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                )
+                .with_provider_catalog_reader(Arc::new(provider_catalog_for_plan(&plan, None))),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            })
+            .with_execution_runtime_override_base_url(format!("http://{addr}"));
         let decision = GatewayControlDecision::synthetic(
             "/v1/responses",
             Some("ai_public".to_string()),
@@ -14995,6 +14997,7 @@ mod tests {
         server.abort();
     }
 
+    /// 验证远程流首个协议事件早于可见文本时，首字节与 streaming 状态仍及时落账。
     #[tokio::test]
     async fn execute_execution_runtime_stream_records_first_stream_event_before_visible_text() {
         let listener = crate::test_support::bind_loopback_listener()
@@ -15058,19 +15061,6 @@ mod tests {
 
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
-        let state = AppState::new()
-            .expect("app state should build")
-            .with_data_state_for_tests(
-                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
-                    Arc::clone(&request_candidate_repository),
-                    Arc::clone(&usage_repository),
-                ),
-            )
-            .with_usage_runtime_for_tests(UsageRuntimeConfig {
-                enabled: true,
-                ..UsageRuntimeConfig::default()
-            })
-            .with_execution_runtime_override_base_url(format!("http://{addr}"));
         let plan = ExecutionPlan {
             request_id: "req-live-stream-first-event".into(),
             candidate_id: Some("cand-live-stream-first-event".into()),
@@ -15103,6 +15093,20 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                )
+                .with_provider_catalog_reader(Arc::new(provider_catalog_for_plan(&plan, None))),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            })
+            .with_execution_runtime_override_base_url(format!("http://{addr}"));
         let decision = GatewayControlDecision::synthetic(
             "/v1/chat/completions",
             Some("ai_public".to_string()),
@@ -15161,6 +15165,7 @@ mod tests {
         server.abort();
     }
 
+    /// 验证远程运行时返回 Responses 同步 JSON 时，网关通过真实 Key 准入并桥接为 SSE。
     #[tokio::test]
     async fn execute_execution_runtime_stream_bridges_sync_json_body_from_remote_runtime_to_sse() {
         let listener = crate::test_support::bind_loopback_listener()
@@ -15190,9 +15195,6 @@ mod tests {
                 .expect("server should start");
         });
 
-        let state = AppState::new()
-            .expect("app state should build")
-            .with_execution_runtime_override_base_url(format!("http://{addr}"));
         let plan = ExecutionPlan {
             request_id: "req-remote-runtime-sync-json-stream".into(),
             candidate_id: Some("cand-remote-runtime-sync-json-stream".into()),
@@ -15225,6 +15227,14 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    provider_catalog_for_plan(&plan, None),
+                )),
+            )
+            .with_execution_runtime_override_base_url(format!("http://{addr}"));
         let decision = GatewayControlDecision::synthetic(
             "/v1/responses",
             Some("ai_public".to_string()),
@@ -15269,6 +15279,7 @@ mod tests {
         server.abort();
     }
 
+    /// 验证远程运行时重定向在通过真实 Key 准入后被改写为结构化失败响应。
     #[tokio::test]
     async fn execute_execution_runtime_stream_rewrites_redirect_to_structured_failure() {
         let listener = crate::test_support::bind_loopback_listener()
@@ -15298,23 +15309,6 @@ mod tests {
 
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
-        let data_state =
-            crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
-                Arc::clone(&request_candidate_repository),
-                Arc::clone(&usage_repository),
-            )
-            .with_system_config_values_for_tests([(
-                "request_record_level".to_string(),
-                json!("full"),
-            )]);
-        let state = AppState::new()
-            .expect("app state should build")
-            .with_data_state_for_tests(data_state)
-            .with_usage_runtime_for_tests(UsageRuntimeConfig {
-                enabled: true,
-                ..UsageRuntimeConfig::default()
-            })
-            .with_execution_runtime_override_base_url(format!("http://{addr}"));
         let plan = ExecutionPlan {
             request_id: "req-remote-runtime-stream-redirect".into(),
             candidate_id: Some("cand-remote-runtime-stream-redirect".into()),
@@ -15347,6 +15341,24 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
+        let data_state =
+            crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                Arc::clone(&request_candidate_repository),
+                Arc::clone(&usage_repository),
+            )
+            .with_system_config_values_for_tests([(
+                "request_record_level".to_string(),
+                json!("full"),
+            )])
+            .with_provider_catalog_reader(Arc::new(provider_catalog_for_plan(&plan, None)));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(data_state)
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            })
+            .with_execution_runtime_override_base_url(format!("http://{addr}"));
         let decision = GatewayControlDecision::synthetic(
             "/v1beta/models/gemini-3.1-flash-image-preview:streamGenerateContent",
             Some("ai_public".to_string()),
@@ -15600,6 +15612,7 @@ mod tests {
         server.abort();
     }
 
+    /// 验证本地隧道在首个数据前断开时，通过真实 Key 准入并保留原始错误消息。
     #[tokio::test]
     async fn execute_execution_runtime_stream_returns_client_error_with_local_tunnel_message_before_first_data(
     ) {
@@ -15642,6 +15655,11 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
+        let state = state.with_data_state_for_tests(
+            crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                provider_catalog_for_plan(&plan, None),
+            )),
+        );
         let decision = test_decision();
 
         let state_for_task = state.clone();
@@ -15731,6 +15749,7 @@ mod tests {
         );
     }
 
+    /// 验证本地隧道在响应体开始后失败时，通过真实 Key 准入并输出终态 SSE 错误。
     #[tokio::test]
     async fn execute_execution_runtime_stream_emits_terminal_sse_error_event_after_body_started() {
         let state = AppState::new().expect("app state should build");
@@ -15772,6 +15791,11 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
+        let state = state.with_data_state_for_tests(
+            crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                provider_catalog_for_plan(&plan, None),
+            )),
+        );
         let decision = test_decision();
 
         let state_for_task = state.clone();
