@@ -131,7 +131,7 @@ use crate::orchestration::{
     PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD,
 };
 use crate::provider_pool_demand::{
-    acquire_provider_pool_in_flight_guard, ProviderPoolInFlightGuard,
+    acquire_provider_pool_execution_guard, ProviderPoolInFlightAdmission, ProviderPoolInFlightGuard,
 };
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, persist_local_request_candidate_status_record,
@@ -3863,6 +3863,7 @@ pub(crate) fn execute_execution_runtime_stream<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 创建带重试范围回传的流式候选 Future，供调度器按候选失败继续尝试。
 pub(crate) fn execute_execution_runtime_stream_with_retry_scope<'a>(
     state: &'a AppState,
     plan: ExecutionPlan,
@@ -3903,6 +3904,7 @@ pub(crate) fn execute_execution_runtime_stream_with_retry_scope<'a>(
     })
 }
 
+/// 仅在本地故障转移策略明确停止时，把流式传输错误转换为最终响应。
 async fn maybe_build_stream_transport_error_stop_response(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -3938,6 +3940,8 @@ async fn maybe_build_stream_transport_error_stop_response(
     .map(Some)
 }
 
+/// 执行单个流式候选，并在写入 Pending 前原子获取 Provider Key 与 Pool 在途许可。
+/// 并发饱和只跳过当前候选；取得的许可会传给后续流生命周期统一释放。
 async fn execute_execution_runtime_stream_inner(
     state: &AppState,
     mut plan: ExecutionPlan,
@@ -3966,6 +3970,41 @@ async fn execute_execution_runtime_stream_inner(
         plan_kind,
         report_context.as_ref(),
     );
+    let candidate_started_unix_secs = current_request_candidate_unix_ms();
+    let provider_in_flight_started_at = Instant::now();
+    let mut provider_pool_in_flight_guard =
+        match acquire_provider_pool_execution_guard(state, &plan).await? {
+            ProviderPoolInFlightAdmission::Acquired(guard) => guard,
+            ProviderPoolInFlightAdmission::Saturated { limit } => {
+                if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
+                    *retry_scope = AiAttemptRetryScope::Candidate;
+                }
+                if let Some(snapshot) = request_candidate_status_snapshot.as_ref() {
+                    record_local_request_candidate_status_snapshot(
+                        state,
+                        snapshot,
+                        SchedulerRequestCandidateStatusUpdate {
+                            status: RequestCandidateStatus::Skipped,
+                            status_code: Some(http::StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                            error_type: Some("provider_key_concurrency_limit_reached".to_string()),
+                            error_message: Some(format!(
+                                "provider key concurrency limit reached: {limit}"
+                            )),
+                            latency_ms: Some(0),
+                            started_at_unix_ms: Some(candidate_started_unix_secs),
+                            finished_at_unix_ms: Some(candidate_started_unix_secs),
+                        },
+                    )
+                    .await;
+                }
+                return Ok(None);
+            }
+        };
+    observe_gateway_stage_trace_ms(
+        &mut stage_trace,
+        "stream_provider_in_flight",
+        provider_in_flight_started_at.elapsed().as_millis() as u64,
+    );
     // Inline passthrough records its lifecycle seed after upstream headers are
     // available. Avoid constructing a throwaway seed on the common path.
     let mut lifecycle_seed = (!defer_stream_pending_for_direct_inline)
@@ -3975,7 +4014,6 @@ async fn execute_execution_runtime_stream_inner(
         record_stream_pending_lifecycle(state, seed, &mut stage_trace).await;
         lifecycle_pending_recorded = true;
     }
-    let candidate_started_unix_secs = current_request_candidate_unix_ms();
     if let Some(snapshot) = request_candidate_status_snapshot.clone() {
         record_local_request_candidate_status_snapshot(
             state,
@@ -4014,6 +4052,7 @@ async fn execute_execution_runtime_stream_inner(
         lifecycle_seed,
         lifecycle_pending_recorded,
         candidate_started_unix_secs,
+        provider_pool_in_flight_guard,
     )
     .await;
     if let Err(error) = result.as_ref() {
@@ -4025,6 +4064,7 @@ async fn execute_execution_runtime_stream_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 承接已记录 Pending 的流式执行；`provider_pool_in_flight_guard` 必须覆盖整个上游流。
 async fn execute_execution_runtime_stream_after_pending(
     state: &AppState,
     mut plan: ExecutionPlan,
@@ -4040,6 +4080,7 @@ async fn execute_execution_runtime_stream_after_pending(
     mut lifecycle_seed: Option<LifecycleUsageSeed>,
     mut lifecycle_pending_recorded: bool,
     candidate_started_unix_secs: u64,
+    mut provider_pool_in_flight_guard: Option<ProviderPoolInFlightGuard>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let plan_request_id_for_log = short_request_id(plan.request_id.as_str());
     let provider_name = plan
@@ -4053,20 +4094,6 @@ async fn execute_execution_runtime_stream_after_pending(
         .and_then(|context| context.candidate_index)
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string());
-    let provider_in_flight_started_at = Instant::now();
-    let mut provider_pool_in_flight_guard = acquire_provider_pool_in_flight_guard(
-        state.runtime_state.clone(),
-        &plan.provider_id,
-        plan.request_id.as_str(),
-        plan.candidate_id.as_deref(),
-        key_id.as_str(),
-    )
-    .await;
-    observe_gateway_stage_trace_ms(
-        &mut stage_trace,
-        "stream_provider_in_flight",
-        provider_in_flight_started_at.elapsed().as_millis() as u64,
-    );
     match maybe_execute_grok_stream(&plan, report_context.as_ref()).await {
         Ok(Some(grok_stream)) => {
             return execute_stream_from_frame_stream_with_retry_scope(

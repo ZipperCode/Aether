@@ -15,10 +15,13 @@ use crate::quota::{
 };
 
 #[derive(Debug, Clone)]
+/// Provider 适配器计算单个 Pool 成员信号时可见的目录事实与请求上下文。
 pub struct ProviderPoolMemberInput<'a> {
     pub provider_type: &'a str,
     pub key: &'a StoredProviderCatalogKey,
     pub auth_config: Option<&'a Map<String, Value>>,
+    /// 实际发送给 Provider 的模型名；仅用于模型额度窗口隔离，未知时回退账号快照。
+    pub provider_model_name: Option<&'a str>,
 }
 
 pub trait ProviderPoolAdapter: Send + Sync {

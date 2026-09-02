@@ -421,6 +421,7 @@ fn build_provider_key_account_status_snapshot(
     })
 }
 
+/// 读取或创建 Key 状态快照对象，后续额度同步只增量更新所属字段。
 fn provider_key_status_snapshot_object(
     status_snapshot: Option<&Value>,
 ) -> Option<Map<String, Value>> {
@@ -430,6 +431,7 @@ fn provider_key_status_snapshot_object(
     })
 }
 
+/// 按规范化 Provider 类型提取上游额度元数据桶，不跨 Provider 回退。
 fn provider_quota_metadata_bucket<'a>(
     upstream_metadata: Option<&'a Value>,
     provider_type: &str,
@@ -440,10 +442,22 @@ fn provider_quota_metadata_bucket<'a>(
         .and_then(Value::as_object)
 }
 
+/// 将额度时间戳归一为 Unix 秒，兼容数字、数字字符串与 RFC3339；非法或非正值返回空。
 fn provider_quota_timestamp_unix_secs(value: Option<&Value>) -> Option<u64> {
     let mut parsed = match value {
         Some(Value::Number(number)) => number.as_f64(),
-        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+        Some(Value::String(text)) => {
+            let text = text.trim();
+            if let Ok(timestamp) = text.parse::<f64>() {
+                Some(timestamp)
+            } else {
+                return chrono::DateTime::parse_from_rfc3339(text)
+                    .ok()?
+                    .timestamp()
+                    .try_into()
+                    .ok();
+            }
+        }
         _ => None,
     }?;
     if !parsed.is_finite() || parsed <= 0.0 {
@@ -471,6 +485,7 @@ fn quota_window_reset_seconds(
         .map(|(observed_at, reset_at)| reset_at.saturating_sub(observed_at))
 }
 
+/// 从 ChatGPT Web 元数据读取可信生图上限，并排除旧版占位默认值。
 fn chatgpt_web_image_quota_limit(
     metadata: &Map<String, Value>,
     remaining: Option<f64>,
@@ -504,6 +519,7 @@ fn chatgpt_web_image_quota_limit(
     remaining.filter(|value| *value > 0.0)
 }
 
+/// 判断 ChatGPT Web 生图上限是否仅是旧版 Free 默认值，避免把占位值当真实额度。
 fn chatgpt_web_image_quota_limit_is_legacy_free_default(
     limit: f64,
     limit_source: Option<&str>,
@@ -522,6 +538,7 @@ fn chatgpt_web_image_quota_limit_is_legacy_free_default(
     remaining.is_none_or(|value| value < limit)
 }
 
+/// 将单模型额度元数据投影为统一窗口，并兼容 Provider 的多种重置时间字段别名。
 fn model_quota_window_snapshot(
     model_name: &str,
     item: &Map<String, Value>,
@@ -560,7 +577,10 @@ fn model_quota_window_snapshot(
         .map(|value| value.clamp(0.0, 1.0))
         .or_else(|| used_ratio.map(|value| (1.0 - value).max(0.0)));
     let reset_at = provider_quota_timestamp_unix_secs(
-        item.get("reset_at").or_else(|| item.get("next_reset_at")),
+        item.get("reset_at")
+            .or_else(|| item.get("next_reset_at"))
+            .or_else(|| item.get("reset_time"))
+            .or_else(|| item.get("next_reset_time")),
     );
     let reset_seconds = quota_window_reset_seconds(observed_at_unix_secs, reset_at);
     let is_exhausted = item
@@ -4163,6 +4183,7 @@ mod tests {
         );
     }
 
+    /// 验证 Antigravity 模型窗口保留模型标签，并把 RFC3339 重置时间归一为倒计时。
     #[test]
     fn sync_provider_key_quota_status_snapshot_labels_antigravity_models_by_model_id() {
         let upstream_metadata = json!({
@@ -4187,7 +4208,8 @@ mod tests {
                     },
                     "claude-sonnet-4-6": {
                         "display_name": "Claude Sonnet 4.6 (Thinking)",
-                        "remaining_fraction": 0.3
+                        "remaining_fraction": 0.3,
+                        "reset_time": "2026-04-07T12:34:56Z"
                     }
                 }
             }
@@ -4232,6 +4254,16 @@ mod tests {
             label_for_model("claude-sonnet-4-6"),
             Some(json!("Claude Sonnet 4.6 (Thinking)"))
         );
+        let claude_window = windows
+            .iter()
+            .filter_map(Value::as_object)
+            .find(|window| window.get("model") == Some(&json!("claude-sonnet-4-6")))
+            .expect("Claude quota window should exist");
+        assert_eq!(
+            claude_window.get("reset_at"),
+            Some(&json!(1_775_565_296u64))
+        );
+        assert_eq!(claude_window.get("reset_seconds"), Some(&json!(12_011u64)));
     }
 
     #[test]

@@ -711,13 +711,32 @@ impl RuntimeState {
         }
     }
 
+    /// 构造整个逻辑门共享容量的运行时信号量，不附加资源分区。
     pub fn semaphore(
         &self,
         gate: &'static str,
         limit: usize,
         config: RuntimeSemaphoreConfig,
     ) -> Result<RuntimeSemaphore, RuntimeSemaphoreError> {
-        RuntimeSemaphore::new(self.clone(), gate, limit, config)
+        RuntimeSemaphore::new(self.clone(), gate, None, limit, config)
+    }
+
+    /// 构造按 `resource_key` 隔离容量的运行时信号量。
+    /// 资源键会去除首尾空白且不能为空；memory 仅进程内共享，Redis 可跨实例共享。
+    pub fn keyed_semaphore(
+        &self,
+        gate: &'static str,
+        resource_key: &str,
+        limit: usize,
+        config: RuntimeSemaphoreConfig,
+    ) -> Result<RuntimeSemaphore, RuntimeSemaphoreError> {
+        let resource_key = resource_key.trim();
+        if resource_key.is_empty() {
+            return Err(RuntimeSemaphoreError::InvalidConfiguration(
+                "runtime semaphore resource key cannot be empty".to_string(),
+            ));
+        }
+        RuntimeSemaphore::new(self.clone(), gate, Some(resource_key), limit, config)
     }
 }
 
@@ -1192,6 +1211,7 @@ struct RuntimeSemaphoreState {
     runtime: RuntimeState,
     gate: &'static str,
     limit: usize,
+    /// 后端实际使用的容量键；可包含门名后的资源分区，避免不同 Key 争用同一额度。
     key: String,
     config: RuntimeSemaphoreConfig,
     high_watermark: AtomicUsize,
@@ -1199,9 +1219,11 @@ struct RuntimeSemaphoreState {
 }
 
 impl RuntimeSemaphore {
+    /// 校验租约参数并构造可选资源分区的信号量状态。
     fn new(
         runtime: RuntimeState,
         gate: &'static str,
+        resource_key: Option<&str>,
         limit: usize,
         config: RuntimeSemaphoreConfig,
     ) -> Result<Self, RuntimeSemaphoreError> {
@@ -1222,7 +1244,9 @@ impl RuntimeSemaphore {
         }
         Ok(Self {
             state: Arc::new(RuntimeSemaphoreState {
-                key: format!("admission:{gate}"),
+                key: resource_key
+                    .map(|resource_key| format!("admission:{gate}:{resource_key}"))
+                    .unwrap_or_else(|| format!("admission:{gate}")),
                 runtime,
                 gate,
                 limit,
@@ -1251,11 +1275,14 @@ impl RuntimeSemaphore {
 }
 
 #[derive(Debug)]
+/// 一个已取得的运行时信号量许可；显式释放失败或未释放时由 Drop 安排兜底清理。
 pub struct RuntimeSemaphorePermit {
     state: Arc<RuntimeSemaphoreState>,
     token: String,
     renew_task: JoinHandle<()>,
     healthy: Arc<std::sync::atomic::AtomicBool>,
+    /// 后端已确认删除 token 时为真，防止 Drop 重复安排释放。
+    released: bool,
 }
 
 impl aether_runtime::AdmissionPermitHealth for RuntimeSemaphorePermit {
@@ -1264,8 +1291,24 @@ impl aether_runtime::AdmissionPermitHealth for RuntimeSemaphorePermit {
     }
 }
 
+impl RuntimeSemaphorePermit {
+    /// 立即停止续租并等待后端删除许可；失败时保留 Drop 兜底路径。
+    pub async fn release(mut self) -> Result<(), RuntimeSemaphoreError> {
+        self.renew_task.abort();
+        let result = self.state.release(&self.token).await;
+        if result.is_ok() {
+            self.released = true;
+        }
+        result
+    }
+}
+
 impl Drop for RuntimeSemaphorePermit {
+    /// 对尚未确认释放的许可异步执行幂等清理。
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         self.renew_task.abort();
         let state = Arc::clone(&self.state);
         let token = self.token.clone();
@@ -1282,6 +1325,7 @@ impl Drop for RuntimeSemaphorePermit {
 }
 
 impl RuntimeSemaphoreState {
+    /// 原子尝试占用当前资源分区的一个许可，并启动租约续期任务。
     async fn try_acquire(
         self: &Arc<Self>,
     ) -> Result<RuntimeSemaphorePermit, RuntimeSemaphoreError> {
@@ -1331,6 +1375,7 @@ impl RuntimeSemaphoreState {
             token,
             renew_task,
             healthy,
+            released: false,
         })
     }
 
@@ -1731,6 +1776,44 @@ mod tests {
         drop(permit);
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert_eq!(gate.snapshot().await.expect("snapshot").in_flight, 0);
+    }
+
+    /// 验证相同资源键共享上限，而不同资源键拥有彼此独立的容量。
+    #[tokio::test]
+    async fn memory_keyed_semaphores_isolate_resource_capacity() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let first = runtime
+            .keyed_semaphore(
+                "provider_key",
+                "key-a",
+                1,
+                RuntimeSemaphoreConfig::default(),
+            )
+            .expect("first gate should build");
+        let second = runtime
+            .keyed_semaphore(
+                "provider_key",
+                "key-b",
+                1,
+                RuntimeSemaphoreConfig::default(),
+            )
+            .expect("second gate should build");
+        let permit = first.try_acquire().await.expect("first permit");
+
+        assert!(matches!(
+            first
+                .try_acquire()
+                .await
+                .expect_err("same key should saturate"),
+            RuntimeSemaphoreError::Saturated { .. }
+        ));
+        let second_permit = second
+            .try_acquire()
+            .await
+            .expect("different key should retain independent capacity");
+
+        drop(second_permit);
+        drop(permit);
     }
 
     #[tokio::test(flavor = "current_thread")]

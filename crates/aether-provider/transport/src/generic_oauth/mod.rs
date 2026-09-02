@@ -490,6 +490,7 @@ fn bearer_access_token(authorization: &str) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("bearer") && parts.next().is_none()).then_some(token)
 }
 
+/// 将新 Authorization 值同步到兼容字段，避免刷新后继续使用旧 access token。
 fn synchronize_authorization_overrides(auth_config: &mut Value, authorization: &str) {
     let Some(object) = auth_config.as_object_mut() else {
         return;
@@ -514,6 +515,7 @@ fn synchronize_authorization_overrides(auth_config: &mut Value, authorization: &
     }
 }
 
+/// 将输入 Provider 类型归一到通用 OAuth 模板，未知类型不做猜测。
 fn generic_provider_type(provider_type: &str) -> Option<&'static str> {
     let normalized = provider_type.trim();
     if normalized.eq_ignore_ascii_case("nous") {
@@ -525,11 +527,12 @@ fn generic_provider_type(provider_type: &str) -> Option<&'static str> {
         .map(|template| template.provider_type)
 }
 
+/// 从鉴权配置提取非空刷新令牌，同时兼容标准与旧版字段拼写。
 fn refresh_token_from_auth_config(auth_config: &Value) -> Option<String> {
-    auth_config
-        .as_object()
-        .and_then(|object| object.get("refresh_token"))
-        .and_then(non_empty_string)
+    let object = auth_config.as_object()?;
+    ["refresh_token", "refreshToken"]
+        .iter()
+        .find_map(|field| object.get(*field).and_then(non_empty_string))
 }
 
 fn access_token_from_auth_config(auth_config: &Value) -> Option<String> {
@@ -902,6 +905,50 @@ mod tests {
         assert_eq!(
             current_access_token(&transport, Some(&entry)).as_deref(),
             Some("refreshed-access-a")
+        );
+    }
+
+    /// 验证过期 Antigravity 旧凭据可刷新，并把持久化元数据规范为 `refresh_token`。
+    #[tokio::test]
+    async fn antigravity_expired_legacy_credential_refreshes_and_normalizes_refresh_token() {
+        let mut transport = sample_transport();
+        transport.provider.name = "Antigravity".to_string();
+        transport.provider.provider_type = "antigravity".to_string();
+        transport.key.decrypted_api_key = "stale-access-token".to_string();
+        transport.key.expires_at_unix_secs = Some(1);
+        transport.key.decrypted_auth_config = Some(
+            json!({
+                "provider_type": "antigravity",
+                "refreshToken": "stable-refresh-token",
+                "expires_at": 1,
+            })
+            .to_string(),
+        );
+        let hits = Arc::new(AtomicUsize::new(0));
+        let executor = StaticTokenExecutor {
+            hits: Arc::clone(&hits),
+        };
+        let adapter = GenericOAuthRefreshAdapter::default()
+            .with_token_url_for_tests("antigravity", "https://oauth.example/token");
+
+        assert!(adapter.supports(&transport));
+        assert!(adapter.should_refresh(&transport, None));
+
+        let refreshed = adapter
+            .refresh(&executor, &transport, None)
+            .await
+            .expect("antigravity refresh should succeed")
+            .expect("antigravity refresh should return a cache entry");
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(refreshed.provider_type, "antigravity");
+        assert_eq!(refreshed.auth_header_value, "Bearer fresh-access-token");
+        assert_eq!(
+            refreshed
+                .metadata
+                .as_ref()
+                .map(|metadata| &metadata["refresh_token"]),
+            Some(&json!("stable-refresh-token"))
         );
     }
 

@@ -217,6 +217,7 @@ fn oauth_refresh_candidate(
         && provider_key_is_oauth_managed(key, provider.provider_type.as_str())
 }
 
+/// 判断 agent identity 是否缺少可恢复任务，供后台刷新重新建立授权流程。
 fn agent_identity_needs_task_recovery(
     auth_config: Option<&str>,
     oauth_invalid_reason: Option<&str>,
@@ -232,6 +233,7 @@ fn agent_identity_needs_task_recovery(
         })
 }
 
+/// 比较刷新前后加密凭据与过期时间，判断是否需要持久化并失效相关缓存。
 async fn provider_key_credentials_changed(
     state: &AppState,
     before: &StoredProviderCatalogKey,
@@ -249,6 +251,7 @@ async fn provider_key_credentials_changed(
         || after.expires_at_unix_secs != before.expires_at_unix_secs)
 }
 
+/// 判断鉴权配置是否包含可用刷新令牌，同时接受标准 snake_case 与旧版 camelCase 字段。
 fn auth_config_has_refresh_token(auth_config: Option<&str>) -> bool {
     let Some(auth_config) = auth_config.map(str::trim).filter(|value| !value.is_empty()) else {
         return false;
@@ -256,12 +259,16 @@ fn auth_config_has_refresh_token(auth_config: Option<&str>) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(auth_config) else {
         return false;
     };
-    value
-        .as_object()
-        .and_then(|object| object.get("refresh_token"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    ["refresh_token", "refreshToken"].iter().any(|field| {
+        object
+            .get(*field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    })
 }
 
 fn now_unix_secs() -> u64 {
@@ -273,7 +280,46 @@ fn now_unix_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::agent_identity_needs_task_recovery;
+    use aether_data_contracts::repository::provider_catalog::{
+        StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    };
+
+    use super::{
+        agent_identity_needs_task_recovery, auth_config_has_refresh_token, oauth_refresh_candidate,
+    };
+
+    /// 验证旧版 Antigravity `refreshToken` 仍可进入后台刷新候选。
+    #[test]
+    fn legacy_antigravity_refresh_token_is_refreshable() {
+        assert!(auth_config_has_refresh_token(Some(
+            r#"{"refreshToken":"legacy-refresh-token"}"#,
+        )));
+    }
+
+    /// 验证即将过期且持有加密鉴权配置的 Antigravity OAuth Key 会被选中刷新。
+    #[test]
+    fn expiring_antigravity_oauth_key_is_refresh_candidate() {
+        let provider = StoredProviderCatalogProvider::new(
+            "provider-antigravity".to_string(),
+            "Antigravity".to_string(),
+            None,
+            "antigravity".to_string(),
+        )
+        .expect("provider should build");
+        let mut key = StoredProviderCatalogKey::new(
+            "key-antigravity".to_string(),
+            provider.id.clone(),
+            "Antigravity OAuth".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.encrypted_auth_config = Some("encrypted-auth-config".to_string());
+        key.expires_at_unix_secs = Some(120);
+
+        assert!(oauth_refresh_candidate(&provider, &key, 120));
+    }
 
     #[test]
     fn pending_agent_identity_without_task_is_recoverable() {

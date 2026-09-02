@@ -62,6 +62,7 @@ const POOL_SCORE_SCHEDULE_INTEREST_MIN_INTERVAL_SECS: u64 = 60;
 
 type PoolCatalogKeyContext = PoolMemberSignals;
 
+/// 展开请求中的 Pool 组候选并收集跳过事实；普通候选保持原顺序进入后续执行。
 pub(crate) async fn apply_local_execution_pool_scheduler(
     state: PlannerAppState<'_>,
     candidates: Vec<EligibleLocalExecutionCandidate>,
@@ -102,11 +103,16 @@ pub(crate) async fn apply_local_execution_pool_scheduler(
     (scheduled, skipped)
 }
 
+/// 对一页 Pool 候选统一执行目录、额度、余额和运行时硬过滤。
+///
+/// `provider_model_name` 是本次实际发送给 Provider 的模型名，仅收窄可恢复的模型额度窗口；
+/// 目录缺失、余额下限和管理员恢复型阻断仍保持 Key 级语义。
 async fn schedule_pool_page_candidates(
     state: PlannerAppState<'_>,
     candidates: Vec<EligibleLocalExecutionCandidate>,
     sticky_session_token: Option<&str>,
     effective_pool_config: Option<&AdminProviderPoolConfig>,
+    provider_model_name: Option<&str>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
@@ -130,7 +136,8 @@ async fn schedule_pool_page_candidates(
         entry.1.insert(candidate.candidate.key_id.clone());
     }
 
-    let key_context_by_id = read_pool_catalog_key_contexts_by_id(state, &candidates).await;
+    let key_context_by_id =
+        read_pool_catalog_key_contexts_by_id(state, &candidates, provider_model_name).await;
 
     let mut runtime_by_provider = BTreeMap::new();
     let mut pool_config_by_provider = BTreeMap::new();
@@ -972,7 +979,8 @@ impl<'a> PoolKeyCursor<'a> {
         Some(candidates)
     }
 
-    /// 读取 sticky Key 后以 singleton 复用共享 Pool 调度，避免亲和路径绕过硬过滤。
+    /// 读取 sticky Key 后以 singleton 复用共享 Pool 调度，并携带实际模型名参与额度过滤。
+    /// 亲和命中不会绕过目录、余额或永久阻断等共享硬过滤。
     async fn sticky_candidate(&mut self) -> Option<EligibleLocalExecutionCandidate> {
         let pool_config = self.effective_pool_config.as_ref()?.clone();
         if !admin_provider_pool_cache_affinity_enabled(&pool_config) {
@@ -1030,6 +1038,7 @@ impl<'a> PoolKeyCursor<'a> {
             vec![candidate],
             self.sticky_session_token.as_deref(),
             self.effective_pool_config.as_ref(),
+            Some(self.group.candidate.selected_provider_model_name.as_str()),
         )
         .await;
         self.record_skipped_candidates(&skipped);
@@ -1037,6 +1046,7 @@ impl<'a> PoolKeyCursor<'a> {
         scheduled.pop()
     }
 
+    /// 分页补充候选队列，并用当前 Pool 组的实际 Provider 模型执行同一组共享过滤。
     async fn refill_queued_candidates(&mut self) -> bool {
         let refill_target = self.window_size.max(1) as usize;
 
@@ -1059,6 +1069,7 @@ impl<'a> PoolKeyCursor<'a> {
                 candidates,
                 self.sticky_session_token.as_deref(),
                 self.effective_pool_config.as_ref(),
+                Some(self.group.candidate.selected_provider_model_name.as_str()),
             )
             .await;
             self.record_skipped_candidates(&skipped);
@@ -1430,6 +1441,7 @@ fn pool_candidate_transport_policy_facts(
     }
 }
 
+/// 将数据库候选行还原为当前 Pool 组的精确 Provider、Endpoint 与模型候选。
 fn pool_candidate_from_row(
     group: &EligibleLocalExecutionCandidate,
     row: StoredMinimalCandidateSelectionRow,
@@ -1450,6 +1462,7 @@ fn pool_candidate_from_row(
     candidate
 }
 
+/// 用强读得到的目录 Key 替换 Pool 占位候选，同时保留精确 Endpoint 与模型绑定。
 fn pool_candidate_from_catalog_key(
     group: &EligibleLocalExecutionCandidate,
     key: StoredProviderCatalogKey,
@@ -1470,9 +1483,12 @@ fn pool_candidate_from_catalog_key(
     candidate
 }
 
+/// 强读候选 Key 的目录事实并构建调度上下文；读取失败或缺项时显式标记不可用以关闭候选。
+/// 请求模型只交给 Provider 额度适配器，不改变目录缺失时的 fail-closed 行为。
 async fn read_pool_catalog_key_contexts_by_id(
     state: PlannerAppState<'_>,
     candidates: &[EligibleLocalExecutionCandidate],
+    provider_model_name: Option<&str>,
 ) -> BTreeMap<String, PoolCatalogKeyContext> {
     let mut key_ids = Vec::new();
     let mut provider_type_by_key_id = BTreeMap::<String, String>::new();
@@ -1546,17 +1562,20 @@ async fn read_pool_catalog_key_contexts_by_id(
                 &provider_pool_service,
                 &key,
                 provider_type.as_str(),
+                provider_model_name,
             ),
         );
     }
     contexts
 }
 
+/// 将单个持久化 Key 投影为 Pool 调度信号，并保持余额、永久阻断和模型额度的边界。
 fn build_pool_catalog_key_context(
     state: PlannerAppState<'_>,
     provider_pool_service: &ProviderPoolService,
     key: &StoredProviderCatalogKey,
     provider_type: &str,
+    provider_model_name: Option<&str>,
 ) -> PoolCatalogKeyContext {
     let (health_score, _, _, _, _) = provider_key_health_summary(key);
     let health_score = key
@@ -1575,10 +1594,13 @@ fn build_pool_catalog_key_context(
         .filter(|value| value.is_finite() && *value >= 0.0);
 
     let auth_config = parse_catalog_auth_config_json(state.app(), key);
-    let mut signals =
-        provider_pool_service.member_signals(provider_type, key, auth_config.as_ref());
-    // Provider adapters continue to own resettable quota semantics, while the
-    // persisted runtime block is an unconditional Key-wide scheduling fact.
+    let mut signals = provider_pool_service.member_signals(
+        provider_type,
+        key,
+        auth_config.as_ref(),
+        provider_model_name,
+    );
+    // Provider 适配器只按请求模型判断可恢复额度；持久化运行时阻断始终是整个 Key 的强事实。
     signals.runtime_quota_hard_blocked =
         aether_provider_pool::provider_pool_key_runtime_quota_blocked(key);
     signals.account_blocked |= admin_provider_pool_pure::admin_pool_key_is_known_banned(key);
@@ -1893,10 +1915,12 @@ fn effective_pool_config_for_group(
     Some(pool_config)
 }
 
+/// 判断当前 Pool 是否要求活跃探测集合封闭，防止未探测成员越过热集边界。
 fn should_enforce_active_probe_sealed_pool(pool_config: &AdminProviderPoolConfig) -> bool {
     pool_config.probing_enabled
 }
 
+/// 判断当前活跃探测成员是否低于目标热容量，从而决定是否触发请求级补充探测。
 fn should_trigger_active_probe_burst_for_request(
     pool_config: &AdminProviderPoolConfig,
     runtime: &AdminProviderPoolRuntimeState,
@@ -1911,6 +1935,7 @@ fn should_trigger_active_probe_burst_for_request(
     runtime.provider_desired_hot > 0 && active_count < runtime.provider_desired_hot
 }
 
+/// 把互斥的分配预设映射到既有数据库排序；缓存亲和仅决定未命中时的二级顺序。
 fn pool_key_candidate_order_for_group(
     group: &EligibleLocalExecutionCandidate,
     pool_config: Option<&AdminProviderPoolConfig>,
@@ -1928,17 +1953,17 @@ fn pool_key_candidate_order_for_group(
         })
         .collect::<Vec<_>>();
     let active_presets = ProviderPoolService::with_builtin_adapters()
-        .normalize_scheduling_presets(group.transport.provider.provider_type.as_str(), &presets)
-        .into_iter()
-        .map(|preset| preset.preset)
-        .collect::<Vec<_>>();
+        .normalize_scheduling_presets(group.transport.provider.provider_type.as_str(), &presets);
     if let Some(distribution_mode) = active_presets
         .iter()
-        .find(|preset| pool_distribution_mode_preset(preset.as_str()))
-        .map(String::as_str)
+        .find(|preset| pool_distribution_mode_preset(preset.preset.as_str()))
     {
-        return match distribution_mode {
-            "cache_affinity" => StoredPoolKeyCandidateOrder::CacheAffinity,
+        return match distribution_mode.preset.as_str() {
+            "cache_affinity" => match distribution_mode.mode.as_deref() {
+                Some("lru") => StoredPoolKeyCandidateOrder::Lru,
+                Some("single_account") => StoredPoolKeyCandidateOrder::SingleAccount,
+                _ => StoredPoolKeyCandidateOrder::CacheAffinity,
+            },
             "load_balance" => StoredPoolKeyCandidateOrder::LoadBalance {
                 seed: pool_sort_seed(),
             },
@@ -2255,8 +2280,9 @@ mod tests {
         );
     }
 
+    /// 验证缓存亲和命中优先于配置的 LRU 二级分配顺序。
     #[test]
-    fn pool_scheduler_promotes_sticky_hit_before_other_sorted_keys() {
+    fn pool_scheduler_promotes_sticky_hit_before_lru_secondary_order() {
         let key_a = sample_eligible_candidate(
             "provider-pool",
             "endpoint-1",
@@ -2264,7 +2290,11 @@ mod tests {
             10,
             Some(json!({
                 "pool_advanced": {
-                    "scheduling_presets": [{"preset": "cache_affinity", "enabled": true}]
+                    "scheduling_presets": [{
+                        "preset": "cache_affinity",
+                        "enabled": true,
+                        "mode": "lru"
+                    }]
                 }
             })),
         );
@@ -2275,7 +2305,11 @@ mod tests {
             10,
             Some(json!({
                 "pool_advanced": {
-                    "scheduling_presets": [{"preset": "cache_affinity", "enabled": true}]
+                    "scheduling_presets": [{
+                        "preset": "cache_affinity",
+                        "enabled": true,
+                        "mode": "lru"
+                    }]
                 }
             })),
         );
@@ -2307,6 +2341,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["key-a", "key-b"]
         );
+    }
+
+    /// 验证缓存亲和的单号集中与 LRU 轮号映射到不同的既有排序。
+    #[test]
+    fn cache_affinity_secondary_modes_select_distinct_candidate_orders() {
+        for (mode, expected) in [
+            ("single_account", StoredPoolKeyCandidateOrder::SingleAccount),
+            ("lru", StoredPoolKeyCandidateOrder::Lru),
+        ] {
+            let group = sample_eligible_candidate(
+                "provider-pool",
+                "endpoint-1",
+                "key-a",
+                10,
+                Some(json!({
+                    "pool_advanced": {
+                        "scheduling_presets": [{
+                            "preset": "cache_affinity",
+                            "enabled": true,
+                            "mode": mode
+                        }]
+                    }
+                })),
+            );
+            let config = pool_config_for_candidate(&group).expect("pool config should parse");
+
+            assert!(admin_provider_pool_cache_affinity_enabled(&config));
+            assert_eq!(
+                pool_key_candidate_order_for_group(&group, Some(&config)),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -4691,6 +4757,7 @@ mod tests {
         );
     }
 
+    /// 验证目录快照、鉴权配置和使用统计共同投影为无模型限定的 Pool 信号。
     #[test]
     fn builds_pool_catalog_context_from_status_snapshot_and_auth_config() {
         let mut key = StoredProviderCatalogKey::new(
@@ -4742,6 +4809,7 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "codex",
+            None,
         );
 
         assert_eq!(context.plan_tier.as_deref(), Some("team"));
@@ -4751,6 +4819,7 @@ mod tests {
         assert_eq!(context.catalog_lru_score, Some(1_711_000_123.0));
     }
 
+    /// 验证未指定模型时仍沿用账号快照并忽略已恢复窗口上的陈旧耗尽标志。
     #[test]
     fn pool_catalog_context_ignores_stale_codex_exhausted_snapshot_when_windows_have_capacity() {
         let mut key = sample_catalog_oauth_key("key-stale-exhausted");
@@ -4787,11 +4856,13 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "codex",
+            None,
         );
 
         assert!(!context.quota_exhausted);
     }
 
+    /// 验证缺少模型窗口时仍可从 Codex 账号元数据识别耗尽状态。
     #[test]
     fn pool_catalog_context_marks_codex_metadata_exhausted() {
         let mut key = sample_catalog_oauth_key("key-metadata-exhausted");
@@ -4807,11 +4878,13 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "codex",
+            None,
         );
 
         assert!(context.quota_exhausted);
     }
 
+    /// 验证未指定模型时，Antigravity 等快照型 Provider 保留账号级耗尽回退。
     #[test]
     fn pool_catalog_context_preserves_snapshot_exhaustion_for_snapshot_only_providers() {
         let mut key = sample_catalog_oauth_key("key-antigravity-exhausted");
@@ -4837,11 +4910,61 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "antigravity",
+            None,
         );
 
         assert!(context.quota_exhausted);
     }
 
+    /// 验证目录上下文只用请求模型对应的 Antigravity 窗口判定可恢复额度耗尽。
+    #[test]
+    fn pool_catalog_context_scopes_antigravity_exhaustion_to_requested_model() {
+        let mut key = sample_catalog_oauth_key("key-antigravity-model-quota");
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "antigravity",
+                "exhausted": false,
+                "windows": [
+                    {
+                        "code": "model:gemini-3.1-pro-high",
+                        "scope": "model",
+                        "model": "gemini-3.1-pro-high",
+                        "used_ratio": 1.0,
+                        "is_exhausted": true
+                    },
+                    {
+                        "code": "model:gemini-3-flash-agent",
+                        "scope": "model",
+                        "model": "gemini-3-flash-agent",
+                        "used_ratio": 0.1,
+                        "is_exhausted": false
+                    }
+                ]
+            }
+        }));
+
+        let app = app_state_with_catalog_key(key.clone());
+        let exhausted = build_pool_catalog_key_context(
+            PlannerAppState::new(&app),
+            &ProviderPoolService::with_builtin_adapters(),
+            &key,
+            "antigravity",
+            Some("gemini-3.1-pro-high"),
+        );
+        let available = build_pool_catalog_key_context(
+            PlannerAppState::new(&app),
+            &ProviderPoolService::with_builtin_adapters(),
+            &key,
+            "antigravity",
+            Some("gemini-3-flash-agent"),
+        );
+
+        assert!(exhausted.quota_exhausted);
+        assert!(!available.quota_exhausted);
+    }
+
+    /// 验证已知封禁元数据仍是与请求模型无关的账号级阻断。
     #[test]
     fn pool_catalog_context_marks_known_banned_account_from_metadata() {
         let mut key = sample_catalog_oauth_key("key-account-banned");
@@ -4858,6 +4981,7 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "codex",
+            None,
         );
 
         assert!(context.account_blocked);

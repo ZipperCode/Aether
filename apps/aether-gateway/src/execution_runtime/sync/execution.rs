@@ -84,7 +84,9 @@ use crate::orchestration::{
     LocalOAuthInvalidationEffect, LocalOAuthSuccessEffect, LocalPoolErrorEffect,
     LocalSchedulingStateEffect,
 };
-use crate::provider_pool_demand::acquire_provider_pool_in_flight_guard;
+use crate::provider_pool_demand::{
+    acquire_provider_pool_execution_guard, ProviderPoolInFlightAdmission,
+};
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, record_local_request_candidate_extra_data,
     record_local_request_candidate_status, record_local_request_candidate_status_snapshot,
@@ -2022,6 +2024,7 @@ enum RemoteSyncFallbackOutcome {
 }
 
 #[allow(clippy::too_many_arguments)] // internal function, grouping would add unnecessary indirection
+/// 执行不暴露内部重试状态的同步候选入口。
 pub(crate) async fn execute_execution_runtime_sync(
     state: &AppState,
     request_path: &str,
@@ -2050,6 +2053,7 @@ pub(crate) async fn execute_execution_runtime_sync(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 执行同步候选并向调用方回传候选级或请求级重试范围及可选兜底响应。
 pub(crate) async fn execute_execution_runtime_sync_with_retry_scope(
     state: &AppState,
     request_path: &str,
@@ -2087,6 +2091,8 @@ pub(crate) async fn execute_execution_runtime_sync_with_retry_scope(
 }
 
 #[allow(clippy::too_many_arguments)] // internal function, grouping would add unnecessary indirection
+/// 执行单个同步候选，并在生命周期 Pending 之前原子占用 Provider Key 并发许可。
+/// 饱和时记录可重试的候选级跳过事实，许可则由作用域守卫覆盖完整执行并自动释放。
 async fn execute_execution_runtime_sync_impl(
     state: &AppState,
     request_path: &str,
@@ -2134,6 +2140,32 @@ async fn execute_execution_runtime_sync_impl(
         .unwrap_or_else(|| "-".to_string());
     let candidate_started_at = Instant::now();
     let candidate_started_unix_secs = current_request_candidate_unix_ms();
+    let _provider_pool_in_flight_guard = match acquire_provider_pool_execution_guard(state, &plan)
+        .await?
+    {
+        ProviderPoolInFlightAdmission::Acquired(guard) => guard,
+        ProviderPoolInFlightAdmission::Saturated { limit } => {
+            if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
+                *retry_scope = AiAttemptRetryScope::Candidate;
+            }
+            record_local_request_candidate_status(
+                state,
+                &plan,
+                report_context.as_ref(),
+                SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Skipped,
+                    status_code: Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                    error_type: Some("provider_key_concurrency_limit_reached".to_string()),
+                    error_message: Some(format!("provider key concurrency limit reached: {limit}")),
+                    latency_ms: Some(0),
+                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                    finished_at_unix_ms: Some(candidate_started_unix_secs),
+                },
+            )
+            .await;
+            return Ok(None);
+        }
+    };
     let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
     let usage_data = state.usage_lifecycle_data_state().as_ref().clone();
     state
@@ -2163,14 +2195,6 @@ async fn execute_execution_runtime_sync_impl(
         candidate_started_at,
     );
     let result = (async {
-    let _provider_pool_in_flight_guard = acquire_provider_pool_in_flight_guard(
-        state.runtime_state.clone(),
-        &plan.provider_id,
-        plan_request_id.as_str(),
-        plan_candidate_id.as_deref(),
-        key_id.as_str(),
-    )
-    .await;
     record_sync_execution_active(
         state,
         &plan,

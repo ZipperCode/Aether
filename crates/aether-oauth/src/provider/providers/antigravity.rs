@@ -32,13 +32,24 @@ impl ProviderOAuthAdapter for AntigravityProviderOAuthAdapter {
         }
     }
 
+    /// 构造 Antigravity 授权地址，并强制请求离线访问与同意页以获取可持续刷新令牌。
     fn build_authorize_url(
         &self,
         ctx: &crate::provider::ProviderOAuthTransportContext,
         state: &str,
         code_challenge: Option<&str>,
     ) -> Result<crate::core::OAuthAuthorizeResponse, crate::core::OAuthError> {
-        self.inner.build_authorize_url(ctx, state, code_challenge)
+        let mut response = self.inner.build_authorize_url(ctx, state, code_challenge)?;
+        let mut url = url::Url::parse(&response.authorize_url).map_err(|_| {
+            crate::core::OAuthError::invalid_request("authorize_url must be absolute")
+        })?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("access_type", "offline");
+            query.append_pair("prompt", "consent");
+        }
+        response.authorize_url = url.to_string();
+        Ok(response)
     }
 
     async fn exchange_code(
@@ -112,20 +123,9 @@ mod tests {
 
     struct UnusedExecutor;
 
-    #[async_trait]
-    impl OAuthHttpExecutor for UnusedExecutor {
-        async fn execute(
-            &self,
-            _request: OAuthHttpRequest,
-        ) -> Result<OAuthHttpResponse, crate::core::OAuthError> {
-            unreachable!("metadata probe should not execute network requests")
-        }
-    }
-
-    #[tokio::test]
-    async fn antigravity_probe_marks_forbidden_metadata_invalid() {
-        let adapter = AntigravityProviderOAuthAdapter::default();
-        let ctx = ProviderOAuthTransportContext {
+    /// 构造不发起网络请求的 Antigravity OAuth 测试上下文。
+    fn transport_context() -> ProviderOAuthTransportContext {
+        ProviderOAuthTransportContext {
             provider_id: String::new(),
             provider_type: "antigravity".to_string(),
             endpoint_id: None,
@@ -137,7 +137,48 @@ mod tests {
             endpoint_config: None,
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
-        };
+        }
+    }
+
+    #[async_trait]
+    impl OAuthHttpExecutor for UnusedExecutor {
+        async fn execute(
+            &self,
+            _request: OAuthHttpRequest,
+        ) -> Result<OAuthHttpResponse, crate::core::OAuthError> {
+            unreachable!("metadata probe should not execute network requests")
+        }
+    }
+
+    /// 验证授权地址同时保留 PKCE 参数并请求离线 refresh token。
+    #[test]
+    fn antigravity_authorize_requests_offline_refresh_token() {
+        let adapter = AntigravityProviderOAuthAdapter::default();
+        let response = adapter
+            .build_authorize_url(&transport_context(), "state-1", Some("challenge-1"))
+            .expect("authorize url should build");
+        let url = url::Url::parse(&response.authorize_url).expect("authorize url should parse");
+        let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            query.get("access_type").map(|value| value.as_ref()),
+            Some("offline")
+        );
+        assert_eq!(
+            query.get("prompt").map(|value| value.as_ref()),
+            Some("consent")
+        );
+        assert_eq!(
+            query.get("code_challenge").map(|value| value.as_ref()),
+            Some("challenge-1")
+        );
+    }
+
+    /// 验证共享测试上下文仍能把禁止访问的账号元数据识别为无效。
+    #[tokio::test]
+    async fn antigravity_probe_marks_forbidden_metadata_invalid() {
+        let adapter = AntigravityProviderOAuthAdapter::default();
+        let ctx = transport_context();
         let account = ProviderOAuthAccount {
             provider_type: "antigravity".to_string(),
             access_token: "access-token".to_string(),

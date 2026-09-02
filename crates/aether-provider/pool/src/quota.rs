@@ -10,6 +10,7 @@ use crate::service::ProviderPoolService;
 /// 标准余额快照的固定内部调度下限；各币种独立比较，不做汇率换算。
 const PROVIDER_POOL_MINIMUM_SCHEDULABLE_BALANCE: f64 = 1.0;
 
+/// 在没有请求模型上下文时判断 Key 的账号级可恢复额度是否耗尽。
 pub fn provider_pool_key_account_quota_exhausted(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
@@ -19,6 +20,7 @@ pub fn provider_pool_key_account_quota_exhausted(
         provider_type,
         key,
         auth_config: None,
+        provider_model_name: None,
     })
 }
 
@@ -86,11 +88,13 @@ pub fn provider_pool_key_quota_hard_blocked(
         provider_type,
         key,
         auth_config: None,
+        provider_model_name: None,
     })
 }
 
-/// Returns whether runtime error classification installed a persistent,
-/// administrator-recoverable quota scheduling block for this exact Key.
+/// 判断运行时错误分类是否为当前 Key 写入了需管理员恢复的持久额度阻断。
+///
+/// 该状态属于 Key 级强事实，不随请求模型切换而解除。
 pub fn provider_pool_key_runtime_quota_blocked(key: &StoredProviderCatalogKey) -> bool {
     key.status_snapshot
         .as_ref()
@@ -104,6 +108,61 @@ pub fn provider_pool_key_runtime_quota_blocked(key: &StoredProviderCatalogKey) -
                     .and_then(Value::as_str)
                     .is_some_and(|code| code.eq_ignore_ascii_case("quota_exhausted"))
         })
+}
+
+/// 按请求使用的 Provider 模型筛选额度窗口，并判断该模型族是否仍处于耗尽状态。
+///
+/// Antigravity 只匹配模型名完全一致的窗口；Codex 将 Spark 与标准模型族分开。
+/// 找不到匹配窗口时返回 `None`，调用方必须回退账号快照语义，不能据此直接放行。
+pub(crate) fn provider_pool_model_quota_exhausted(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    provider_model_name: &str,
+) -> Option<bool> {
+    let quota_snapshot = provider_pool_member_quota_snapshot(key, provider_type)?;
+    let windows = quota_snapshot.get("windows")?.as_array()?;
+    let normalized_provider = provider_type.trim().to_ascii_lowercase();
+    let normalized_model = provider_model_name.trim().to_ascii_lowercase();
+
+    // 该回调只界定本次请求可见的窗口，不改变余额和持久运行时阻断的 Key 级语义。
+    let matches_window = |window: &Map<String, Value>| {
+        let code = window
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if normalized_provider == "codex" {
+            let spark_model = normalized_model.contains("spark");
+            return code.starts_with("spark_") == spark_model;
+        }
+        if normalized_provider == "antigravity" {
+            return window
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|model| model.trim().eq_ignore_ascii_case(&normalized_model));
+        }
+        false
+    };
+
+    let matching_windows = windows
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|window| matches_window(window))
+        .collect::<Vec<_>>();
+    if matching_windows.is_empty() {
+        return None;
+    }
+
+    let now_unix_secs = provider_pool_current_unix_secs();
+    let snapshot_observed_at = provider_pool_timestamp_unix_secs(quota_snapshot.get("observed_at"))
+        .or_else(|| provider_pool_timestamp_unix_secs(quota_snapshot.get("updated_at")));
+    Some(matching_windows.iter().any(|window| {
+        provider_pool_quota_window_is_exhausted(window)
+            && !now_unix_secs.is_some_and(|now| {
+                provider_pool_reset_deadline_elapsed(window, snapshot_observed_at, now)
+            })
+    }))
 }
 
 pub fn provider_pool_member_quota_snapshot<'a>(

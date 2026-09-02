@@ -6725,6 +6725,7 @@ mod tests {
         assert!(parsed.get("secondary_used_percent").is_none());
     }
 
+    /// 验证 Antigravity 不透明 reset-credit 项保留显示名与原始 RFC3339 重置时间。
     #[test]
     fn parses_antigravity_usage_response_labels_opaque_reset_credit_keys() {
         let parsed = parse_antigravity_usage_response(
@@ -6752,6 +6753,10 @@ mod tests {
             parsed["models"]["RateLimitResetCredit_05cbb6eeeb9c81918e011d8300f9ebfb"]
                 ["display_name"],
             json!("Key-1")
+        );
+        assert_eq!(
+            parsed["models"]["RateLimitResetCredit_05cbb6eeeb9c81918e011d8300f9ebfb"]["reset_time"],
+            json!("2030-01-01T00:00:00Z")
         );
         assert_eq!(
             parsed["models"]["gemini-3-pro-preview"]["display_name"],

@@ -4,14 +4,21 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aether_runtime_state::RuntimeState;
+use aether_contracts::ExecutionPlan;
+use aether_runtime_state::{
+    RuntimeSemaphoreConfig, RuntimeSemaphoreError, RuntimeSemaphorePermit, RuntimeState,
+};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::{AppState, GatewayError};
+
 const PROVIDER_POOL_IN_FLIGHT_TOKENS_PREFIX: &str = "ap:provider_pool:in_flight";
+/// Provider Key 原子并发门的命名空间；具体资源键由 Key ID 隔离。
+const PROVIDER_KEY_CONCURRENCY_GATE: &str = "provider_key";
 const PROVIDER_POOL_DEMAND_SNAPSHOT_PREFIX: &str = "ap:provider_pool:demand";
 const PROVIDER_POOL_BURST_PENDING_PREFIX: &str = "ap:quota_probe:burst_pending";
 const PROVIDER_POOL_IN_FLIGHT_TOKEN_TTL_MS: u64 = 120_000;
@@ -40,12 +47,26 @@ pub(crate) struct ProviderPoolDemandSnapshot {
     pub(crate) sampled_at_unix_ms: u64,
 }
 
+/// 同时持有 Provider 在途统计与可选 Key 并发许可的生命周期守卫。
 pub(crate) struct ProviderPoolInFlightGuard {
     kind: ProviderPoolInFlightGuardKind,
+    /// 正数 `concurrent_limit` 对应的许可；无上限时为空，随守卫统一释放。
+    provider_key_permit: Option<RuntimeSemaphorePermit>,
     released: bool,
 }
 
+/// 执行前 Key 并发 admission 的结果；饱和与基础设施错误分开表达。
+pub(crate) enum ProviderPoolInFlightAdmission {
+    /// 已准入；无 Provider 统计且无 Key 上限时守卫可为空。
+    Acquired(Option<ProviderPoolInFlightGuard>),
+    /// 当前 Key 已达到原子并发上限，调用方应跳过候选或返回 429。
+    Saturated { limit: usize },
+}
+
+/// Provider 在途统计的后端形态；它与同一守卫中的 Key 许可相互独立。
 enum ProviderPoolInFlightGuardKind {
+    /// Provider 统计关闭或不可用，但仍可能持有必须释放的 Key 许可。
+    Disabled,
     Local {
         provider_id: String,
         counter: Arc<AtomicUsize>,
@@ -60,15 +81,20 @@ enum ProviderPoolInFlightGuardKind {
 }
 
 impl ProviderPoolInFlightGuard {
+    /// 显式释放守卫中的 Provider 统计与 Key 许可；重复调用由内部状态阻止。
     pub(crate) async fn release(mut self) {
         self.release_inner().await;
     }
 
+    /// 执行可取消的释放流程；运行时删除失败时保留未释放状态交给 Drop 重试。
     async fn release_inner(&mut self) {
         if self.released {
             return;
         }
         match &mut self.kind {
+            ProviderPoolInFlightGuardKind::Disabled => {
+                self.released = true;
+            }
             ProviderPoolInFlightGuardKind::Local {
                 provider_id,
                 counter,
@@ -101,16 +127,28 @@ impl ProviderPoolInFlightGuard {
                 }
             }
         }
+        if self.released {
+            if let Some(provider_key_permit) = self.provider_key_permit.take() {
+                if let Err(err) = provider_key_permit.release().await {
+                    debug!(
+                        error = ?err,
+                        "gateway provider pool demand: failed to release provider key permit; scheduling drop fallback"
+                    );
+                }
+            }
+        }
     }
 }
 
 impl Drop for ProviderPoolInFlightGuard {
+    /// 为未显式释放的 Provider token 安排兜底清理；Key 许可由字段析构继续释放。
     fn drop(&mut self) {
         if self.released {
             return;
         }
         self.released = true;
         match &mut self.kind {
+            ProviderPoolInFlightGuardKind::Disabled => {}
             ProviderPoolInFlightGuardKind::Local {
                 provider_id,
                 counter,
@@ -247,6 +285,7 @@ fn provider_pool_in_flight_mode() -> ProviderPoolInFlightMode {
     })
 }
 
+/// 解析 Provider 在途统计模式；未知值安全回退到单进程本地计数。
 fn parse_provider_pool_in_flight_mode(value: Option<&str>) -> ProviderPoolInFlightMode {
     match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("runtime" | "redis" | "distributed") => ProviderPoolInFlightMode::Runtime,
@@ -255,6 +294,7 @@ fn parse_provider_pool_in_flight_mode(value: Option<&str>) -> ProviderPoolInFlig
     }
 }
 
+/// 为分布式 Provider 在途 token 启动续期任务，停止标志或任务取消都会结束循环。
 fn spawn_in_flight_renewal(
     runtime: Arc<RuntimeState>,
     tokens_key: String,
@@ -283,6 +323,7 @@ fn spawn_in_flight_renewal(
     })
 }
 
+/// 获取旧版 Provider 在途统计守卫；该兼容入口不施加 Key 并发上限。
 pub(crate) async fn acquire_provider_pool_in_flight_guard(
     runtime: Arc<RuntimeState>,
     provider_id: &str,
@@ -290,32 +331,85 @@ pub(crate) async fn acquire_provider_pool_in_flight_guard(
     candidate_id: Option<&str>,
     key_id: &str,
 ) -> Option<ProviderPoolInFlightGuard> {
+    acquire_provider_pool_in_flight_guard_with_key_limit(
+        runtime,
+        provider_id,
+        request_id,
+        candidate_id,
+        key_id,
+        None,
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 先原子获取指定 Key 的并发许可，再与 Provider 在途统计合并为一个守卫。
+/// `None` 或 `0` 表示不限制；饱和和运行时异常原样返回供执行入口分类。
+pub(crate) async fn acquire_provider_pool_in_flight_guard_with_key_limit(
+    runtime: Arc<RuntimeState>,
+    provider_id: &str,
+    request_id: &str,
+    candidate_id: Option<&str>,
+    key_id: &str,
+    concurrent_limit: Option<usize>,
+) -> Result<Option<ProviderPoolInFlightGuard>, RuntimeSemaphoreError> {
+    let provider_key_permit = match concurrent_limit.filter(|limit| *limit > 0) {
+        Some(limit) => Some(
+            runtime
+                .keyed_semaphore(
+                    PROVIDER_KEY_CONCURRENCY_GATE,
+                    key_id,
+                    limit,
+                    RuntimeSemaphoreConfig::default(),
+                )?
+                .try_acquire()
+                .await?,
+        ),
+        None => None,
+    };
     let provider_id = provider_id.trim();
     if provider_id.is_empty() {
-        return None;
+        return Ok(
+            provider_key_permit.map(|provider_key_permit| ProviderPoolInFlightGuard {
+                kind: ProviderPoolInFlightGuardKind::Disabled,
+                provider_key_permit: Some(provider_key_permit),
+                released: false,
+            }),
+        );
     }
 
     match provider_pool_in_flight_mode() {
-        ProviderPoolInFlightMode::Off => return None,
+        ProviderPoolInFlightMode::Off => {
+            return Ok(
+                provider_key_permit.map(|provider_key_permit| ProviderPoolInFlightGuard {
+                    kind: ProviderPoolInFlightGuardKind::Disabled,
+                    provider_key_permit: Some(provider_key_permit),
+                    released: false,
+                }),
+            );
+        }
         ProviderPoolInFlightMode::Local => {
             let counter = increment_local_provider_in_flight(provider_id);
-            return Some(ProviderPoolInFlightGuard {
+            return Ok(Some(ProviderPoolInFlightGuard {
                 kind: ProviderPoolInFlightGuardKind::Local {
                     provider_id: provider_id.to_string(),
                     counter,
                 },
+                provider_key_permit,
                 released: false,
-            });
+            }));
         }
         ProviderPoolInFlightMode::Runtime if runtime.is_memory() => {
             let counter = increment_local_provider_in_flight(provider_id);
-            return Some(ProviderPoolInFlightGuard {
+            return Ok(Some(ProviderPoolInFlightGuard {
                 kind: ProviderPoolInFlightGuardKind::Local {
                     provider_id: provider_id.to_string(),
                     counter,
                 },
+                provider_key_permit,
                 released: false,
-            });
+            }));
         }
         ProviderPoolInFlightMode::Runtime => {}
     }
@@ -335,7 +429,13 @@ pub(crate) async fn acquire_provider_pool_in_flight_guard(
                 error = ?err,
                 "gateway provider pool demand: failed to acquire in-flight token"
             );
-            return None;
+            return Ok(
+                provider_key_permit.map(|provider_key_permit| ProviderPoolInFlightGuard {
+                    kind: ProviderPoolInFlightGuardKind::Disabled,
+                    provider_key_permit: Some(provider_key_permit),
+                    released: false,
+                }),
+            );
         }
         Err(_) => {
             debug!(
@@ -343,7 +443,13 @@ pub(crate) async fn acquire_provider_pool_in_flight_guard(
                 timeout_ms = provider_pool_in_flight_acquire_timeout().as_millis() as u64,
                 "gateway provider pool demand: skipped in-flight token after acquire timeout"
             );
-            return None;
+            return Ok(
+                provider_key_permit.map(|provider_key_permit| ProviderPoolInFlightGuard {
+                    kind: ProviderPoolInFlightGuardKind::Disabled,
+                    provider_key_permit: Some(provider_key_permit),
+                    released: false,
+                }),
+            );
         }
     }
 
@@ -355,7 +461,7 @@ pub(crate) async fn acquire_provider_pool_in_flight_guard(
         stop_renewal.clone(),
     );
 
-    Some(ProviderPoolInFlightGuard {
+    Ok(Some(ProviderPoolInFlightGuard {
         kind: ProviderPoolInFlightGuardKind::Runtime {
             runtime,
             tokens_key,
@@ -363,8 +469,48 @@ pub(crate) async fn acquire_provider_pool_in_flight_guard(
             stop_renewal,
             renew_handle: Some(renew_handle),
         },
+        provider_key_permit,
         released: false,
-    })
+    }))
+}
+
+/// 从目录强读执行计划 Key 的最新并发上限，并转换为网关统一 admission 结果。
+/// 目录读取失败、Key 缺失或 Provider 不匹配均关闭执行，避免无法确认限制时静默绕过。
+pub(crate) async fn acquire_provider_pool_execution_guard(
+    state: &AppState,
+    plan: &ExecutionPlan,
+) -> Result<ProviderPoolInFlightAdmission, GatewayError> {
+    let key = state
+        .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(&plan.key_id))
+        .await?
+        .into_iter()
+        .find(|key| key.id == plan.key_id && key.provider_id == plan.provider_id)
+        .ok_or_else(|| {
+            GatewayError::Internal(format!(
+                "provider key catalog state unavailable: {}",
+                plan.key_id
+            ))
+        })?;
+    let concurrent_limit = key
+        .concurrent_limit
+        .filter(|limit| *limit > 0)
+        .and_then(|limit| usize::try_from(limit).ok());
+    match acquire_provider_pool_in_flight_guard_with_key_limit(
+        state.runtime_state.clone(),
+        &plan.provider_id,
+        &plan.request_id,
+        plan.candidate_id.as_deref(),
+        &plan.key_id,
+        concurrent_limit,
+    )
+    .await
+    {
+        Ok(guard) => Ok(ProviderPoolInFlightAdmission::Acquired(guard)),
+        Err(RuntimeSemaphoreError::Saturated { limit, .. }) => {
+            Ok(ProviderPoolInFlightAdmission::Saturated { limit })
+        }
+        Err(error) => Err(GatewayError::Internal(error.to_string())),
+    }
 }
 
 pub(crate) async fn provider_pool_live_in_flight_count(
@@ -584,6 +730,51 @@ mod tests {
             provider_pool_live_in_flight_count(runtime.as_ref(), provider_id).await,
             0
         );
+    }
+
+    /// 验证同一 Key 饱和时拒绝第二个守卫，并在显式释放后恢复容量。
+    #[tokio::test]
+    async fn provider_key_limit_rejects_concurrent_guard_until_release() {
+        let runtime = Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
+        let first = acquire_provider_pool_in_flight_guard_with_key_limit(
+            runtime.clone(),
+            "provider-limit",
+            "request-1",
+            Some("candidate-1"),
+            "key-limit",
+            Some(1),
+        )
+        .await
+        .expect("first admission should resolve")
+        .expect("first guard should be acquired");
+
+        let second = acquire_provider_pool_in_flight_guard_with_key_limit(
+            runtime.clone(),
+            "provider-limit",
+            "request-2",
+            Some("candidate-2"),
+            "key-limit",
+            Some(1),
+        )
+        .await;
+        assert!(matches!(
+            second,
+            Err(RuntimeSemaphoreError::Saturated { limit: 1, .. })
+        ));
+
+        first.release().await;
+        let replacement = acquire_provider_pool_in_flight_guard_with_key_limit(
+            runtime,
+            "provider-limit",
+            "request-3",
+            Some("candidate-3"),
+            "key-limit",
+            Some(1),
+        )
+        .await
+        .expect("replacement admission should resolve")
+        .expect("replacement guard should acquire after release");
+        drop(replacement);
     }
 
     #[tokio::test]

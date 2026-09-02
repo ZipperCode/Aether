@@ -7,6 +7,7 @@ use crate::capability::ProviderPoolCapability;
 use crate::provider::ProviderPoolAdapter;
 use crate::service::ProviderPoolService;
 
+/// 归一化 Provider 的互斥分配预设与策略预设，保留适配器声明的可用能力。
 pub fn normalize_provider_scheduling_presets(
     adapter: &dyn ProviderPoolAdapter,
     scheduling_presets: &[PoolSchedulingPreset],
@@ -83,6 +84,7 @@ pub fn normalize_provider_scheduling_presets(
     normalized
 }
 
+/// 构建管理端可选调度预设，其中缓存亲和公开首次分配的二级模式与默认值。
 pub fn build_admin_pool_scheduling_presets_payload() -> Value {
     let service = ProviderPoolService::with_builtin_adapters();
     json!([
@@ -94,14 +96,7 @@ pub fn build_admin_pool_scheduling_presets_payload() -> Value {
             "依据 LRU 时间戳（最近未使用优先）",
             &service,
         ),
-        provider_pool_preset_payload(
-            "cache_affinity",
-            "缓存亲和",
-            "优先复用最近使用过的 Key，利用 Prompt Caching",
-            None,
-            "依据 LRU 时间戳（最近使用优先，与 LRU 轮转相反）",
-            &service,
-        ),
+        cache_affinity_preset_payload(&service),
         provider_pool_preset_payload(
             "cost_first",
             "成本优先",
@@ -220,6 +215,24 @@ fn legacy_free_team_first_preset_payload(service: &ProviderPoolService) -> Value
     payload
 }
 
+/// 构建缓存亲和预设元数据；sticky 命中固定优先，子模式只控制未命中的初始分配。
+fn cache_affinity_preset_payload(service: &ProviderPoolService) -> Value {
+    let mut payload = provider_pool_preset_payload(
+        "cache_affinity",
+        "缓存亲和",
+        "同一用户持续复用 Key，首次分配可集中或轮转",
+        None,
+        "先复用用户粘性 Key，未命中时按所选二级模式分配",
+        service,
+    );
+    payload["modes"] = json!([
+        {"value": "single_account", "label": "单号优先"},
+        {"value": "lru", "label": "LRU 轮号"}
+    ]);
+    payload["default_mode"] = json!("single_account");
+    payload
+}
+
 fn provider_pool_preset_payload(
     name: &'static str,
     label: &'static str,
@@ -256,6 +269,7 @@ fn provider_pool_preset_payload(
     })
 }
 
+/// 根据 Provider 能力判断预设是否可用；普通分配模式无需额外能力。
 fn provider_pool_supports_preset(adapter: &dyn ProviderPoolAdapter, preset: &str) -> bool {
     match preset {
         "free_first" | "free_team_first" | "plus_first" | "pro_first" | "team_first" => adapter
@@ -268,9 +282,37 @@ fn provider_pool_supports_preset(adapter: &dyn ProviderPoolAdapter, preset: &str
     }
 }
 
+/// 返回预设所属的互斥组；四种初始分配方式在同一时刻只能启用一种。
 fn provider_pool_preset_mutex_group(preset: &str) -> Option<&'static str> {
     match preset {
         "lru" | "cache_affinity" | "load_balance" | "single_account" => Some("distribution_mode"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_admin_pool_scheduling_presets_payload;
+    use serde_json::json;
+
+    /// 验证缓存亲和向管理端公开单号优先、LRU 轮号及默认单号模式。
+    #[test]
+    fn cache_affinity_preset_exposes_secondary_distribution_modes() {
+        let payload = build_admin_pool_scheduling_presets_payload();
+        let cache_affinity = payload
+            .as_array()
+            .expect("preset payload should be an array")
+            .iter()
+            .find(|preset| preset["name"] == "cache_affinity")
+            .expect("cache affinity preset should exist");
+
+        assert_eq!(cache_affinity["default_mode"], json!("single_account"));
+        assert_eq!(
+            cache_affinity["modes"],
+            json!([
+                {"value": "single_account", "label": "单号优先"},
+                {"value": "lru", "label": "LRU 轮号"}
+            ])
+        );
     }
 }

@@ -212,7 +212,7 @@
                 :class="getPoolKeyRowClass(key.key_id)"
               >
                 <TableCell
-                  class="px-4 py-3"
+                  class="px-4 py-3 align-top"
                 >
                   <div class="flex min-w-0 items-center gap-2">
                     <Checkbox
@@ -333,7 +333,7 @@
                 </TableCell>
                 <TableCell
                   v-if="showAccountQuotaColumn"
-                  class="py-3 align-middle"
+                  class="py-3 align-top"
                 >
                   <PoolKeyQuotaPanel
                     :items="quotaProgressDisplayMap[key.key_id] || []"
@@ -343,26 +343,31 @@
                     :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
                     :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
                     :text-class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
+                    :reset-credit-text="getCodexResetCreditCountText(key)"
+                    :reset-credit-items="getCodexResetCreditItemTexts(key)"
+                    :can-consume-reset-credit="canConsumeCodexResetCredit(key)"
+                    :consuming-reset-credit="consumingCodexResetCreditKeyId === key.key_id"
+                    @consume-reset-credit="handleConsumeCodexResetCredit(key)"
                   />
                 </TableCell>
-                <TableCell class="py-3 px-2 align-middle">
+                <TableCell class="py-3 px-2 align-top">
                   <PoolKeyStatsPanel
                     :cycle="isPoolKeyCycleStatsDisplay(key)"
                     :cycle-groups="getPoolKeyCycleStatsGroups(key)"
                     :account-metrics="getPoolKeyAccountStatsMetrics(key)"
                   />
                 </TableCell>
-                <TableCell class="py-3 text-center">
+                <TableCell class="py-3 text-center align-top">
                   <span class="text-[10px] text-muted-foreground whitespace-nowrap">
                     {{ keyUiStateMap[key.key_id]?.importedAtRelative || '-' }}
                   </span>
                 </TableCell>
-                <TableCell class="py-3 text-center">
+                <TableCell class="py-3 text-center align-top">
                   <span class="text-[10px] text-muted-foreground whitespace-nowrap">
                     {{ keyUiStateMap[key.key_id]?.lastUsedRelative || '-' }}
                   </span>
                 </TableCell>
-                <TableCell class="py-3 text-center align-middle">
+                <TableCell class="py-3 text-center align-top">
                   <div class="inline-flex items-center justify-center gap-1">
                     <span class="font-mono text-xs tabular-nums text-foreground/90">
                       {{ formatPoolScore(key.pool_score?.score) }}
@@ -423,7 +428,7 @@
                     </Popover>
                   </div>
                 </TableCell>
-                <TableCell class="py-3 text-center">
+                <TableCell class="py-3 text-center align-top">
                   <Badge
                     :variant="keyUiStateMap[key.key_id]?.schedulingBadgeVariant || 'default'"
                     class="text-[10px]"
@@ -432,7 +437,7 @@
                     {{ keyUiStateMap[key.key_id]?.schedulingBadgeLabel }}
                   </Badge>
                 </TableCell>
-                <TableCell class="py-3 px-2 align-middle">
+                <TableCell class="py-3 px-2 align-top">
                   <div class="flex justify-center gap-0.5">
                     <Button
                       v-if="key.cooldown_reason"
@@ -747,7 +752,12 @@
                 :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
                 :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
                 :text-class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
+                :reset-credit-text="getCodexResetCreditCountText(key)"
+                :reset-credit-items="getCodexResetCreditItemTexts(key)"
+                :can-consume-reset-credit="canConsumeCodexResetCredit(key)"
+                :consuming-reset-credit="consumingCodexResetCreditKeyId === key.key_id"
                 variant="mobile"
+                @consume-reset-credit="handleConsumeCodexResetCredit(key)"
               />
 
               <div class="flex items-center gap-0.5">
@@ -1127,6 +1137,7 @@ import {
   deleteEndpointKey,
   updateProviderKey,
   refreshProviderQuota,
+  consumeCodexResetCredit,
   resetProviderKeyCycleStats,
   clearQuotaExhausted,
 } from '@/api/endpoints/keys'
@@ -1187,6 +1198,23 @@ import {
 } from '@/features/pool/utils/poolStatsDisplay'
 import { resetCodexCycleUsageWindows } from '@/features/pool/utils/poolCycleStats'
 import { mergePoolKeyQuotaSnapshots } from '@/features/pool/utils/poolQuotaRefresh'
+import {
+  dedupeAntigravityQuotaItemsByLabel,
+  resolveAntigravityQuotaLabel,
+  summarizeAntigravityQuotaItems,
+} from '@/features/providers/utils/antigravityQuota'
+import {
+  clearPendingCodexResetCreditIdempotencyKey,
+  clearPendingCodexResetCreditIdempotencyKeyForOutcome,
+  createCodexResetCreditIdempotencyKey,
+  formatCodexResetCreditCount,
+  formatCodexResetCreditExpiresAt,
+  getCodexResetCreditAvailableCount,
+  getCodexResetCreditReservationIdempotencyKey,
+  getVisibleCodexResetCreditItems,
+  readPendingCodexResetCreditIdempotencyKey,
+  rememberPendingCodexResetCreditIdempotencyKey,
+} from '@/features/providers/components/codex-reset-credit-display'
 import { getCodexQuotaWindowPresentation } from '@/utils/codexQuotaWindow'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 import { formatOAuthPlanType, getOAuthPlanTypeClass } from '@/utils/oauthPlanType'
@@ -1985,6 +2013,8 @@ const sortOrder = ref<PoolManagementSortOrder>(restoredViewState.sortOrder)
 const hasPoolKeyFilters = computed(() => searchQuery.value.trim().length > 0 || statusFilter.value !== 'all')
 const MANUAL_QUOTA_REFRESH_COOLDOWN_SECONDS = 5 * 60
 const refreshingOAuthKeyId = ref<string | null>(null)
+/** 当前正在消耗重置机会的 Codex Key；全页同一时刻只允许一个请求。 */
+const consumingCodexResetCreditKeyId = ref<string | null>(null)
 const resettingCycleKeyId = ref<string | null>(null)
 const restoringQuotaKeyId = ref<string | null>(null)
 const savingProxyKeyId = ref<string | null>(null)
@@ -2108,9 +2138,12 @@ watch(
   },
   { immediate: true },
 )
+/** Pool 页面内部额度行，保留真实窗口时间与可选家族范围。 */
 interface QuotaProgressItem {
   label: string
   remainingPercent: number
+  /** 仅用于兼容紧凑数字布局；最终 Antigravity 家族摘要使用普通进度条。 */
+  numericOnly?: boolean
   sortOrder?: number
   detail?: string
   resetAtSeconds?: number | null
@@ -2119,6 +2152,7 @@ interface QuotaProgressItem {
   allowDynamicReset?: boolean
 }
 
+/** 传给额度展示组件的已格式化行模型。 */
 interface QuotaProgressDisplayItem {
   label: string
   remainingPercent: number
@@ -2126,6 +2160,8 @@ interface QuotaProgressDisplayItem {
   meterText: string
   barClass: string
   meterClass: string
+  /** 是否隐藏进度条并采用紧凑数字网格。 */
+  numericOnly?: boolean
 }
 
 type PoolKeyUiState = {
@@ -2154,6 +2190,7 @@ type PoolKeyUiState = {
   modelFetchTitle: string
 }
 
+/** 为当前页每个 Key 解析 Provider 专用额度行，供桌面与移动端共用。 */
 const quotaProgressMap = computed<Record<string, QuotaProgressItem[]>>(() => {
   const map: Record<string, QuotaProgressItem[]> = {}
   for (const key of keyPage.value.keys) {
@@ -2162,6 +2199,7 @@ const quotaProgressMap = computed<Record<string, QuotaProgressItem[]>>(() => {
   return map
 })
 
+/** 将每个 Key 的业务额度行转换为稳定的文字、颜色和布局属性。 */
 const quotaProgressDisplayMap = computed<Record<string, QuotaProgressDisplayItem[]>>(() => {
   const map: Record<string, QuotaProgressDisplayItem[]> = {}
   for (const key of keyPage.value.keys) {
@@ -2169,9 +2207,12 @@ const quotaProgressDisplayMap = computed<Record<string, QuotaProgressDisplayItem
       label: getQuotaProgressLabel(item.label),
       remainingPercent: item.remainingPercent,
       resetText: getQuotaProgressResetDisplayText(item),
-      meterText: getQuotaProgressMeterDisplayText(item),
+      meterText: item.numericOnly
+        ? item.detail || formatQuotaValue(item.remainingPercent)
+        : getQuotaProgressMeterDisplayText(item),
       barClass: getQuotaRemainingBarColorByRemaining(item.remainingPercent),
       meterClass: getQuotaRemainingClassByRemaining(item.remainingPercent),
+      numericOnly: item.numericOnly,
     }))
   }
   return map
@@ -2319,6 +2360,7 @@ function isManualInactiveReason(reason: { code?: string; source?: string }): boo
   return code === 'inactive' || code === 'manual_disabled'
 }
 
+/** 在单 Key 启停成功后同步当前页和 Provider 汇总计数。 */
 function applyPoolKeyActiveState(key: PoolKeyDetail, nextStatus: boolean): void {
   const previousStatus = key.is_active
   key.is_active = nextStatus
@@ -2371,8 +2413,120 @@ function applyPoolKeyActiveState(key: PoolKeyDetail, nextStatus: boolean): void 
   }
 }
 
+/** 把批量额度刷新结果增量写回当前页，不重载并丢失本地 UI 状态。 */
 function applyQuotaRefreshResultToCurrentPage(result: Awaited<ReturnType<typeof refreshProviderQuota>>): void {
   keyPage.value.keys = mergePoolKeyQuotaSnapshots(keyPage.value.keys, result.results)
+}
+
+/** 仅从 Codex 额度快照读取重置机会，避免把其他 Provider 的同名字段误用。 */
+function getCodexResetCredits(key: PoolKeyDetail) {
+  return getQuotaSnapshotProviderType(key) === 'codex'
+    ? key.status_snapshot?.quota?.reset_credits ?? null
+    : null
+}
+
+/** 读取 Codex 凭据代际；`undefined` 表示服务端尚未提供并发安全的代际信息。 */
+function getCodexCredentialGeneration(key: PoolKeyDetail): string | null | undefined {
+  const codex = key.upstream_metadata?.codex
+  return codex && typeof codex === 'object'
+    ? codex.credential_generation?.trim() || null
+    : undefined
+}
+
+/** 优先恢复服务端 reservation，其次读取同凭据代际下的本地幂等键。 */
+function getPendingCodexResetCreditIdempotencyKey(key: PoolKeyDetail): string | null {
+  const codex = key.upstream_metadata?.codex
+  const serverReservation = getCodexResetCreditReservationIdempotencyKey(codex)
+  if (serverReservation) return serverReservation
+  const generation = getCodexCredentialGeneration(key)
+  return generation === undefined
+    ? null
+    : readPendingCodexResetCreditIdempotencyKey(key.key_id, generation)
+}
+
+/** 构建可见重置机会总数；既无额度也无待完成请求时不显示。 */
+function getCodexResetCreditCountText(key: PoolKeyDetail): string | null {
+  const count = getCodexResetCreditAvailableCount(getCodexResetCredits(key))
+  return count === null && !getPendingCodexResetCreditIdempotencyKey(key)
+    ? null
+    : formatCodexResetCreditCount(count)
+}
+
+/** 返回最多三条即将到期的重置机会说明，供 Pool 紧凑展示。 */
+function getCodexResetCreditItemTexts(key: PoolKeyDetail): string[] {
+  return getVisibleCodexResetCreditItems(getCodexResetCredits(key), undefined, 3)
+    .map(item => `${item.displayKey} ${formatCodexResetCreditExpiresAt(item.expiresAt)}`)
+}
+
+/** 校验 Provider、凭据代际、可用机会和全页互斥状态后决定是否允许消费。 */
+function canConsumeCodexResetCredit(key: PoolKeyDetail): boolean {
+  return getQuotaSnapshotProviderType(key) === 'codex'
+    && getCodexCredentialGeneration(key) !== undefined
+    && (getPendingCodexResetCreditIdempotencyKey(key) !== null
+      || (getCodexResetCreditAvailableCount(getCodexResetCredits(key)) ?? 0) > 0)
+    && consumingCodexResetCreditKeyId.value === null
+}
+
+/**
+ * 以凭据代际绑定的幂等键消费一次 Codex 重置机会，并把返回快照合并到当前页。
+ * 非终态保留幂等键供重试；凭据已变化时清除旧键，避免跨账号重放。
+ */
+async function handleConsumeCodexResetCredit(key: PoolKeyDetail): Promise<void> {
+  if (!canConsumeCodexResetCredit(key)) return
+  const generation = getCodexCredentialGeneration(key)
+  if (generation === undefined) return
+  const pendingIdempotencyKey = getPendingCodexResetCreditIdempotencyKey(key)
+  const confirmed = await confirm({
+    title: '确认使用 Codex 重置机会',
+    message: pendingIdempotencyKey
+      ? '将继续确认上次尚未完成的 Codex 重置请求。'
+      : '将消耗 1 次 Codex 重置机会，完成后自动刷新账号额度。',
+    confirmText: '确认重置',
+    cancelText: '取消',
+    variant: 'warning',
+  })
+  if (!confirmed) return
+
+  consumingCodexResetCreditKeyId.value = key.key_id
+  try {
+    const idempotencyKey = pendingIdempotencyKey
+      || readPendingCodexResetCreditIdempotencyKey(key.key_id, generation)
+      || createCodexResetCreditIdempotencyKey()
+    rememberPendingCodexResetCreditIdempotencyKey(key.key_id, idempotencyKey, generation)
+    const result = await consumeCodexResetCredit(key.key_id, {
+      idempotency_key: idempotencyKey,
+      expected_credential_generation: generation,
+    })
+    clearPendingCodexResetCreditIdempotencyKeyForOutcome(key.key_id, result.outcome)
+    keyPage.value.keys = mergePoolKeyQuotaSnapshots(keyPage.value.keys, [{
+      key_id: result.key_id,
+      key_name: key.key_name,
+      status: result.refresh_status === 'success' ? 'success' : result.status as 'success',
+      metadata: result.metadata,
+      quota_snapshot: result.quota_snapshot,
+    }])
+    if (result.outcome === 'reset' || result.outcome === 'already_redeemed') {
+      success('Codex 重置机会已使用，账号额度已刷新')
+    } else {
+      showWarning(result.message || '重置请求已处理，请查看最新额度')
+    }
+  } catch (err: unknown) {
+    const responseData = typeof err === 'object' && err !== null && 'response' in err
+      ? (err as { response?: { data?: Record<string, unknown> } }).response?.data
+      : undefined
+    if (responseData?.outcome === 'credential_changed') {
+      clearPendingCodexResetCreditIdempotencyKey(key.key_id)
+    } else if (typeof responseData?.active_idempotency_key === 'string') {
+      rememberPendingCodexResetCreditIdempotencyKey(
+        key.key_id,
+        responseData.active_idempotency_key,
+        generation,
+      )
+    }
+    showError(parseApiError(err, 'Codex 重置机会使用失败'))
+  } finally {
+    consumingCodexResetCreditKeyId.value = null
+  }
 }
 
 function normalizeQuotaUpdatedAt(raw: number | null | undefined): number | null {
@@ -2595,6 +2749,7 @@ watch(searchQuery, () => {
   }, 300)
 })
 
+/** 将 Pool 列表鉴权类型归一为编辑表单支持的枚举，不改动已存凭据内容。 */
 function normalizeAuthTypeForEdit(key: PoolKeyDetail): EndpointAPIKey['auth_type'] {
   if (isOAuthManagedCredential(key)) return 'oauth'
   if (isServiceAccountCredential(key)) return 'service_account'
@@ -2602,6 +2757,7 @@ function normalizeAuthTypeForEdit(key: PoolKeyDetail): EndpointAPIKey['auth_type
   return 'api_key'
 }
 
+/** 将 Pool Key 快照转换为编辑表单模型，并保留可空并发上限。 */
 function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
   const nowIso = new Date().toISOString()
   return {
@@ -2623,6 +2779,7 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     rate_multipliers: key.rate_multipliers ?? null,
     internal_priority: key.internal_priority ?? 50,
     rpm_limit: key.rpm_limit ?? null,
+    concurrent_limit: key.concurrent_limit ?? null,
     allowed_models: key.allowed_models ?? null,
     capabilities: key.capabilities ?? null,
     cache_ttl_minutes: key.cache_ttl_minutes ?? 5,
@@ -3872,6 +4029,10 @@ function getGeminiCliQuotaWindowLabel(window: QuotaWindowSnapshot): string {
   return label || code || '模型'
 }
 
+/**
+ * 将统一额度快照投影为 Provider 专用展示行。
+ * Antigravity 复用共享家族摘要，并让最低剩余窗口携带真实重置倒计时。
+ */
 function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressItem[] {
   const quota = getQuotaSnapshot(key)
   if (!quota) return []
@@ -4049,20 +4210,23 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
   if (providerType === 'antigravity') {
     const windows = getQuotaSnapshotWindowsByScope(quota, 'model')
     if (windows.length === 0) return []
-
-    const remainingPercents = windows
-      .map(getQuotaWindowRemainingPercent)
-      .filter((value): value is number => value != null)
-    if (remainingPercents.length === 0) return []
-
-    return [{
-      label: '最低',
-      remainingPercent: Math.min(...remainingPercents),
-      detail: `${windows.length} 模型`,
-      resetAtSeconds: null,
-      resetSeconds: null,
-      updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
-    }]
+    const opaqueDisplayIndex = { value: 1 }
+    return summarizeAntigravityQuotaItems(dedupeAntigravityQuotaItemsByLabel(windows
+      .map((window): (QuotaProgressItem & { model: string, resetSeconds: number | null }) | null => {
+        const remainingPercent = getQuotaWindowRemainingPercent(window)
+        if (remainingPercent == null) return null
+        const model = String(window.model || window.code || '').trim().replace(/^model:/i, '')
+        return {
+          model,
+          label: resolveAntigravityQuotaLabel(model, window.label, opaqueDisplayIndex),
+          remainingPercent,
+          resetAtSeconds: normalizeUnixSeconds(window.reset_at ?? quota.reset_at ?? null),
+          resetSeconds: normalizeRemainingSeconds(window.reset_seconds ?? quota.reset_seconds ?? null),
+          updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+          allowDynamicReset: true,
+        }
+      })
+        .filter((item): item is QuotaProgressItem & { model: string, resetSeconds: number | null } => item != null)))
   }
 
   if (providerType === 'gemini_cli') {

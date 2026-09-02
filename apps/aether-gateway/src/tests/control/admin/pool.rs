@@ -701,6 +701,7 @@ async fn gateway_handles_admin_pool_trailing_slash_routes_locally_with_trusted_a
     upstream_handle.abort();
 }
 
+/// 验证 Pool 列表同时回传并发上限、用量汇总与可空 LRU 分数。
 #[tokio::test]
 async fn gateway_pool_list_includes_usage_totals_and_nullable_lru_score() {
     let provider = sample_provider("provider-openai", "openai", 10).with_transport_fields(
@@ -725,6 +726,7 @@ async fn gateway_pool_list_includes_usage_totals_and_nullable_lru_score() {
         "sk-usage",
     );
     key.name = "usage key".to_string();
+    key.concurrent_limit = Some(5);
     key.request_count = Some(1566);
     key.total_tokens = 187_327_321;
     key.total_cost_usd = 93.1319297;
@@ -757,6 +759,7 @@ async fn gateway_pool_list_includes_usage_totals_and_nullable_lru_score() {
     .expect("json body should parse");
     let keys = payload["keys"].as_array().expect("keys should be array");
     assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["concurrent_limit"], json!(5));
     assert_eq!(keys[0]["request_count"], json!(1566));
     assert_eq!(keys[0]["total_tokens"], json!(187_327_321u64));
     assert_eq!(keys[0]["total_cost_usd"], json!("93.13192970"));
@@ -5124,6 +5127,7 @@ async fn gateway_handles_admin_pool_batch_action_locally_with_trusted_admin_prin
     upstream_handle.abort();
 }
 
+/// 验证批量设置可持久化并回读共享 Pool Key 的并发上限与模型配置。
 #[tokio::test]
 async fn gateway_batch_updates_shared_pool_key_configuration() {
     let provider = sample_provider("provider-openai", "openai", 10).with_transport_fields(
@@ -5182,6 +5186,7 @@ async fn gateway_batch_updates_shared_pool_key_configuration() {
                 "api_formats": ["openai:responses"],
                 "internal_priority": 7,
                 "rpm_limit": null,
+                "concurrent_limit": 6,
                 "auto_fetch_models": false,
                 "allowed_models": ["gpt-5.6-sol", "gpt-5.6-luna"],
                 "locked_models": [],
@@ -5207,6 +5212,7 @@ async fn gateway_batch_updates_shared_pool_key_configuration() {
         assert_eq!(key.allow_auth_channel_mismatch_formats, Some(json!([])));
         assert_eq!(key.internal_priority, 7);
         assert_eq!(key.rpm_limit, None);
+        assert_eq!(key.concurrent_limit, Some(6));
         assert_eq!(key.learned_rpm_limit, None);
         assert!(!key.auto_fetch_models);
         assert_eq!(

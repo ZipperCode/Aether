@@ -70,6 +70,7 @@ fn pool_score_weight(object: &Map<String, Value>, names: &[&str], current: f64) 
         .unwrap_or(current)
 }
 
+/// 解析 Pool 评分权重并过滤非法数值，缺失项沿用默认配置。
 fn parse_pool_score_weights(
     raw_weights: Option<&Map<String, Value>>,
     current: PoolMemberScoreWeights,
@@ -103,6 +104,7 @@ fn parse_pool_score_weights(
     }
 }
 
+/// 从 Pool 高级配置解析成员评分规则，并统一应用默认值与有效范围。
 fn parse_pool_score_rules(pool_advanced: &Map<String, Value>) -> PoolMemberScoreRules {
     let mut rules = PoolMemberScoreRules::default();
 
@@ -165,8 +167,17 @@ fn parse_pool_score_rules(pool_advanced: &Map<String, Value>) -> PoolMemberScore
     rules.effective()
 }
 
+/// 归一化带子模式的 Pool 预设；缓存亲和缺失或非法时固定回退单号优先。
 fn normalize_pool_preset_mode(preset: &str, raw_mode: Option<&Value>) -> Option<String> {
     match preset {
+        "cache_affinity" => Some(
+            raw_mode
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| matches!(*value, "single_account" | "lru"))
+                .unwrap_or("single_account")
+                .to_string(),
+        ),
         "free_team_first" | "free_first" | "team_first" | "plus_first" | "pro_first" => {
             let default_mode = match preset {
                 "free_team_first" => "both",

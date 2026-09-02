@@ -142,17 +142,20 @@ impl ProviderPoolService {
         )
     }
 
+    /// 汇总指定 Key 的 Pool 调度信号，并将可选 Provider 模型名传给额度适配器。
     pub fn member_signals(
         &self,
         provider_type: &str,
         key: &StoredProviderCatalogKey,
         auth_config: Option<&Map<String, Value>>,
+        provider_model_name: Option<&str>,
     ) -> aether_pool_core::PoolMemberSignals {
         let adapter = self.adapter(provider_type);
         let input = ProviderPoolMemberInput {
             provider_type,
             key,
             auth_config,
+            provider_model_name,
         };
         adapter.member_signals(&input)
     }

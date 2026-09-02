@@ -368,16 +368,16 @@ impl ProviderOAuthAdapter for GenericProviderOAuthAdapter {
             .await
     }
 
+    /// 使用已保存的刷新令牌换取新凭据，并兼容 Antigravity 旧版 camelCase 字段。
     async fn refresh(
         &self,
         executor: &dyn OAuthHttpExecutor,
         ctx: &ProviderOAuthTransportContext,
         account: &ProviderOAuthAccount,
     ) -> Result<ProviderOAuthTokenSet, OAuthError> {
-        let refresh_token = account
-            .auth_config
-            .get("refresh_token")
-            .and_then(Value::as_str)
+        let refresh_token = ["refresh_token", "refreshToken"]
+            .iter()
+            .find_map(|field| account.auth_config.get(*field).and_then(Value::as_str))
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| OAuthError::invalid_request("auth_config missing refresh_token"))?;

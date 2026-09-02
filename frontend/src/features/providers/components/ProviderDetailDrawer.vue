@@ -397,12 +397,13 @@
                         />
                         <div class="grid grid-cols-2 gap-3">
                           <ProviderQuotaProgressRow
-                            v-for="item in getAntigravityQuotaPreviewForKey(key)"
+                            v-for="item in getAntigravityQuotaSummaryForKey(key)"
                             :key="item.model"
                             :label="item.label"
-                            :title="item.model"
+                            :title="item.label"
                             :used-percent="item.usedPercent"
                             :remaining-percent="item.remainingPercent"
+                            :meter-text="item.detail"
                             :meter-class="getQuotaRemainingClass(item.usedPercent)"
                             :bar-class="getQuotaRemainingBarColor(item.usedPercent)"
                           >
@@ -422,14 +423,6 @@
                               </div>
                             </template>
                           </ProviderQuotaProgressRow>
-                          <button
-                            v-if="getAntigravityQuotaHiddenCountForKey(key) > 0"
-                            type="button"
-                            class="col-span-2 text-left text-[10px] text-muted-foreground hover:text-foreground transition-colors"
-                            @click="openAntigravityQuotaDialog(key)"
-                          >
-                            {{ legacyT('另有') }} {{ getAntigravityQuotaHiddenCountForKey(key) }} {{ legacyT('个模型，查看全部') }}
-                          </button>
                         </div>
                       </template>
                     </div>
@@ -1012,6 +1005,7 @@ import {
   compareAntigravityQuotaItems,
   dedupeAntigravityQuotaItemsByLabel,
   resolveAntigravityQuotaLabel,
+  summarizeAntigravityQuotaItems,
 } from '@/features/providers/utils/antigravityQuota'
 import {
   deleteEndpointKey,
@@ -3552,12 +3546,15 @@ function isCodexTeamPlan(key: EndpointAPIKey): boolean {
   return planType !== undefined && planType !== 'free'
 }
 
+/** Provider 抽屉中的 Antigravity 原始模型额度与家族摘要字段。 */
 interface AntigravityQuotaItem {
   model: string
   label: string
   usedPercent: number
   remainingPercent: number
   resetSeconds: number | null
+  /** 家族内剩余百分比的单值或范围文字。 */
+  detail?: string
 }
 
 interface GeminiCliQuotaItem {
@@ -3658,6 +3655,7 @@ function secondsUntilReset(resetTime: string): number | null {
   return diff > 0 ? diff : 0
 }
 
+/** 将原始绝对重置时间换算为详情页使用的非负倒计时秒数。 */
 function secondsUntilUnixReset(resetAt: number | string | null | undefined): number | null {
   const numericResetAt = Number(resetAt)
   if (!Number.isFinite(numericResetAt) || numericResetAt <= 0) return null
@@ -3677,6 +3675,7 @@ function coerceAntigravityRemainingFraction(value: number | string | null | unde
   return Math.min(Math.max(numericValue, 0), 1)
 }
 
+/** 从 Antigravity 原始元数据构建完整模型额度列表，供快照缺失时回退。 */
 function getAntigravityQuotaItems(metadata: UpstreamMetadata | null | undefined): AntigravityQuotaItem[] {
   const quotaByModel = metadata?.antigravity?.quota_by_model
   if (!quotaByModel || typeof quotaByModel !== 'object') return []
@@ -3719,6 +3718,7 @@ function getAntigravityQuotaItems(metadata: UpstreamMetadata | null | undefined)
   return dedupeAntigravityQuotaItemsByLabel(items)
 }
 
+/** 从 Key 的统一额度快照构建原始 Antigravity 模型条目与倒计时。 */
 function getAntigravityQuotaItemsFromSnapshot(key: EndpointAPIKey): AntigravityQuotaItem[] {
   const quota = getQuotaSnapshotForProvider(key, 'antigravity')
   const windows = getQuotaWindowByScope(quota, 'model')
@@ -3763,20 +3763,16 @@ function getAntigravityQuotaItemsFromSnapshot(key: EndpointAPIKey): AntigravityQ
   return dedupeAntigravityQuotaItemsByLabel(items)
 }
 
-const ANTIGRAVITY_QUOTA_PREVIEW_LIMIT = 6
-
+/** 优先采用统一快照，缺失时才回退 Provider 原始元数据中的模型额度。 */
 function getAntigravityQuotaItemsForKey(key: EndpointAPIKey): AntigravityQuotaItem[] {
   const snapshotItems = getAntigravityQuotaItemsFromSnapshot(key)
   if (snapshotItems.length > 0) return snapshotItems
   return getAntigravityQuotaItems(key.upstream_metadata)
 }
 
-function getAntigravityQuotaPreviewForKey(key: EndpointAPIKey): AntigravityQuotaItem[] {
-  return getAntigravityQuotaItemsForKey(key).slice(0, ANTIGRAVITY_QUOTA_PREVIEW_LIMIT)
-}
-
-function getAntigravityQuotaHiddenCountForKey(key: EndpointAPIKey): number {
-  return Math.max(getAntigravityQuotaItemsForKey(key).length - ANTIGRAVITY_QUOTA_PREVIEW_LIMIT, 0)
+/** 将当前 Key 的原始模型额度统一汇总为与 Pool、详情弹窗相同的两组展示。 */
+function getAntigravityQuotaSummaryForKey(key: EndpointAPIKey): AntigravityQuotaItem[] {
+  return summarizeAntigravityQuotaItems(getAntigravityQuotaItemsForKey(key))
 }
 
 function getResetCountdownText(

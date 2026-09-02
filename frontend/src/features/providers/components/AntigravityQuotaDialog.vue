@@ -8,7 +8,7 @@
     @update:model-value="$emit('update:open', $event)"
   >
     <template
-      v-if="providerId && items.length > 0"
+      v-if="providerId && rawItems.length > 0"
       #header-actions
     >
       <DropdownMenu :modal="false">
@@ -32,7 +32,7 @@
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
           <DropdownMenuItem
-            v-for="item in items"
+            v-for="item in rawItems"
             :key="item.model"
             :title="item.model"
             @select="handleTestModel(item.model)"
@@ -56,13 +56,13 @@
             <div class="min-w-0 flex-1 mr-2">
               <div
                 class="text-muted-foreground truncate"
-                :title="item.model"
+                :title="item.label"
               >
                 {{ item.label }}
               </div>
             </div>
             <span :class="getQuotaRemainingClass(item.usedPercent)">
-              {{ item.remainingPercent.toFixed(1) }}%
+              {{ item.detail || `${item.remainingPercent.toFixed(1)}%` }}
             </span>
           </div>
           <div class="relative w-full h-1.5 bg-border rounded-full overflow-hidden">
@@ -122,6 +122,7 @@ import {
   compareAntigravityQuotaItems,
   dedupeAntigravityQuotaItemsByLabel,
   resolveAntigravityQuotaLabel,
+  summarizeAntigravityQuotaItems,
 } from '@/features/providers/utils/antigravityQuota'
 
 const props = defineProps<{
@@ -137,12 +138,15 @@ defineEmits<{
   'update:open': [value: boolean]
 }>()
 
+/** Antigravity 原始模型额度与可选家族范围展示字段。 */
 interface QuotaItem {
   model: string
   label: string
   usedPercent: number
   remainingPercent: number
   resetSeconds: number | null
+  /** 汇总行的百分比单值或范围；原始测试模型条目可为空。 */
+  detail?: string
 }
 
 const { error: showError, success: showSuccess } = useToast()
@@ -185,6 +189,7 @@ function coerceRemainingFraction(value: unknown): number | null {
   return Math.min(Math.max(numericValue, 0), 1)
 }
 
+/** 将绝对 Unix 重置时间换算为非负剩余秒数，非法输入返回空。 */
 function secondsUntilUnixReset(resetAt: unknown): number | null {
   const numericResetAt = Number(resetAt)
   if (!Number.isFinite(numericResetAt) || numericResetAt <= 0) return null
@@ -192,6 +197,7 @@ function secondsUntilUnixReset(resetAt: unknown): number | null {
   return Math.max(Math.floor(numericResetAt - now), 0)
 }
 
+/** 从统一 quota windows 构建原始模型条目，并保留模型 ID 供测试选择。 */
 function buildItemsFromQuotaSnapshot(quota: QuotaStatusSnapshot | null | undefined): QuotaItem[] {
   if (!quota) return []
 
@@ -236,7 +242,8 @@ function buildItemsFromQuotaSnapshot(quota: QuotaStatusSnapshot | null | undefin
   return dedupeAntigravityQuotaItemsByLabel(items)
 }
 
-const items = computed<QuotaItem[]>(() => {
+/** 保留所有真实模型条目供“测试模型”下拉选择，不能被两行摘要替代。 */
+const rawItems = computed<QuotaItem[]>(() => {
   const snapshotItems = buildItemsFromQuotaSnapshot(props.quotaSnapshot)
   if (snapshotItems.length > 0) return snapshotItems
 
@@ -287,6 +294,9 @@ const items = computed<QuotaItem[]>(() => {
   result.sort(compareAntigravityQuotaItems)
   return dedupeAntigravityQuotaItemsByLabel(result)
 })
+
+/** 将可视额度卡统一投影为两个家族摘要，原始模型集合仍由 `rawItems` 持有。 */
+const items = computed<QuotaItem[]>(() => summarizeAntigravityQuotaItems(rawItems.value))
 
 async function handleTestModel(modelName: string) {
   if (!props.providerId || testingModel.value) return

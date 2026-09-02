@@ -152,6 +152,8 @@ export interface PoolKeyDetail {
   rate_multipliers?: Record<string, number> | null
   internal_priority?: number
   rpm_limit?: number | null
+  /** Key 的执行并发上限；空值或非正值表示不限制。 */
+  concurrent_limit?: number | null
   cache_ttl_minutes?: number
   max_probe_interval_minutes?: number
   note?: string | null

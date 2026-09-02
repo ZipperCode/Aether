@@ -1,9 +1,24 @@
+/** 可参与 Antigravity 排序和家族汇总的原始模型额度条目。 */
 export interface AntigravityQuotaSortableItem {
   model: string
   label: string
   remainingPercent: number
   resetSeconds: number | null
+  /** 汇总后的百分比文字；单值与范围都已包含百分号。 */
+  detail?: string
 }
+
+/**
+ * 最终只展示的额度家族及其模型匹配回调。
+ * tab、chat 与不透明 reset-credit 桶故意不匹配，因此不会进入摘要。
+ */
+const ANTIGRAVITY_QUOTA_GROUPS = [
+  { label: 'Gemini额度', matches: (model: string) => model.startsWith('gemini-') },
+  {
+    label: 'Claude & ChatGPT',
+    matches: (model: string) => model.startsWith('claude-') || model.startsWith('gpt-'),
+  },
+] as const
 
 const ANTIGRAVITY_MODEL_LABELS: Record<string, string> = {
   'gemini-pro-agent': 'Gemini 3.1 Pro (High)',
@@ -90,6 +105,7 @@ function getAntigravityModelPriority(model: string): number {
   return 850
 }
 
+/** 按模型重要性、重置时间、剩余额度与稳定名称排序原始条目。 */
 export function compareAntigravityQuotaItems<T extends AntigravityQuotaSortableItem>(
   a: T,
   b: T,
@@ -101,6 +117,7 @@ export function compareAntigravityQuotaItems<T extends AntigravityQuotaSortableI
     || a.model.localeCompare(b.model)
 }
 
+/** 按可见标签去重原始条目，并保留排序更优、重置更近或额度更低的代表窗口。 */
 export function dedupeAntigravityQuotaItemsByLabel<T extends AntigravityQuotaSortableItem>(
   items: T[],
 ): T[] {
@@ -114,4 +131,46 @@ export function dedupeAntigravityQuotaItemsByLabel<T extends AntigravityQuotaSor
     }
   }
   return Array.from(selectedByLabel.values()).sort(compareAntigravityQuotaItems)
+}
+
+/**
+ * 将原始模型额度压缩为 Gemini 与 Claude/ChatGPT 两组。
+ * 每组采用最低剩余值控制进度条，并保留该真实窗口的重置倒计时与 min-max 文字。
+ */
+export function summarizeAntigravityQuotaItems<T extends AntigravityQuotaSortableItem>(
+  items: T[],
+): T[] {
+  const itemsByGroup = new Map<string, T[]>()
+  for (const item of items) {
+    const normalizedModel = item.model.trim().toLowerCase().replace(/^model:/, '')
+    const group = ANTIGRAVITY_QUOTA_GROUPS.find(candidate => candidate.matches(normalizedModel))
+    if (!group) continue
+    const groupedItems = itemsByGroup.get(group.label) ?? []
+    groupedItems.push(item)
+    itemsByGroup.set(group.label, groupedItems)
+  }
+
+  return ANTIGRAVITY_QUOTA_GROUPS.map(group => group.label)
+    .map((label) => {
+      const groupedItems = itemsByGroup.get(label)
+      if (!groupedItems?.length) return undefined
+      const remainingValues = groupedItems
+        .map(item => item.remainingPercent)
+        .sort((left, right) => left - right)
+      const minRemaining = remainingValues[0] ?? 0
+      const maxRemaining = remainingValues.at(-1) ?? minRemaining
+      const selected = groupedItems.find(item => item.remainingPercent === minRemaining) ?? groupedItems[0]
+      const detail = Math.abs(maxRemaining - minRemaining) < 1e-6
+        ? formatAntigravityQuotaValue(minRemaining)
+        : `${formatAntigravityQuotaValue(minRemaining)}–${formatAntigravityQuotaValue(maxRemaining)}`
+      return { ...selected, label, remainingPercent: minRemaining, detail }
+    })
+    .filter((item): item is T => item !== undefined)
+}
+
+/** 格式化摘要百分比：整数不补小数，非整数保留一位并统一附加百分号。 */
+function formatAntigravityQuotaValue(value: number): string {
+  const rounded = Math.round(value)
+  const formatted = Math.abs(value - rounded) < 1e-6 ? String(rounded) : value.toFixed(1)
+  return `${formatted}%`
 }

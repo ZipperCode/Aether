@@ -953,6 +953,7 @@ fn admin_pool_build_account_quota(
     None
 }
 
+/// 计算 Pool 管理载荷使用的 Key 健康分，并约束到可展示范围。
 fn admin_pool_health_score(key: &StoredProviderCatalogKey) -> f64 {
     let scores = key
         .health_by_format
@@ -974,6 +975,7 @@ fn admin_pool_health_score(key: &StoredProviderCatalogKey) -> f64 {
     }
 }
 
+/// 汇总管理端 Pool 调度状态、阻断原因与可操作恢复信息。
 fn admin_pool_scheduling_payload(
     key: &StoredProviderCatalogKey,
     cooldown_reason: Option<&str>,
@@ -1120,6 +1122,7 @@ fn admin_pool_scheduling_payload(
         Vec::new(),
     )
 }
+/// 构建 Pool 管理页的 Key 快照，包含执行 admission 使用的可空并发上限。
 pub(super) fn build_admin_pool_key_payload(
     state: &AdminAppState<'_>,
     provider_type: &str,
@@ -1390,6 +1393,7 @@ pub(super) fn build_admin_pool_key_payload(
         json!(key.internal_priority),
     );
     payload.insert("rpm_limit".to_string(), json!(key.rpm_limit));
+    payload.insert("concurrent_limit".to_string(), json!(key.concurrent_limit));
     payload.insert(
         "cache_ttl_minutes".to_string(),
         json!(key.cache_ttl_minutes),

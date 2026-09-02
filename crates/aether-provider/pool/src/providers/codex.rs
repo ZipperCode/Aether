@@ -12,8 +12,8 @@ use crate::provider::{
 use crate::quota::{
     provider_pool_current_unix_secs, provider_pool_json_bool, provider_pool_json_f64,
     provider_pool_member_quota_snapshot, provider_pool_metadata_bucket,
-    provider_pool_quota_snapshot_exhausted_decision, provider_pool_reset_deadline_elapsed,
-    provider_pool_timestamp_unix_secs,
+    provider_pool_model_quota_exhausted, provider_pool_quota_snapshot_exhausted_decision,
+    provider_pool_reset_deadline_elapsed, provider_pool_timestamp_unix_secs,
 };
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
 
@@ -48,7 +48,13 @@ impl ProviderPoolAdapter for CodexProviderPoolAdapter {
         }]
     }
 
+    /// 按请求模型隔离 Codex 标准与 Spark 窗口；无法分类时保留既有账号级判定。
     fn quota_exhausted(&self, input: &ProviderPoolMemberInput<'_>) -> bool {
+        if let Some(exhausted) = input.provider_model_name.and_then(|model| {
+            provider_pool_model_quota_exhausted(input.key, input.provider_type, model)
+        }) {
+            return exhausted;
+        }
         if let Some(quota_snapshot) =
             provider_pool_member_quota_snapshot(input.key, input.provider_type)
         {
@@ -75,7 +81,14 @@ impl ProviderPoolAdapter for CodexProviderPoolAdapter {
             .is_some_and(quota_exhausted_from_bucket)
     }
 
+    /// 模型窗口可精确判定时不把可恢复的账号快照耗尽升级为硬阻断。
+    /// 管理员恢复型运行时阻断由上层独立的 Key 级信号继续强制执行。
     fn quota_hard_blocked(&self, input: &ProviderPoolMemberInput<'_>) -> bool {
+        if input.provider_model_name.is_some_and(|model| {
+            provider_pool_model_quota_exhausted(input.key, input.provider_type, model).is_some()
+        }) {
+            return false;
+        }
         codex_explicit_quota_block_active(input.key, input.provider_type)
     }
 

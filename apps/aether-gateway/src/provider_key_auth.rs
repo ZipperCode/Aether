@@ -83,6 +83,7 @@ impl ProviderKeyAuthSemantics {
     }
 }
 
+/// 判断 Provider Key 是否具备 OAuth 刷新条件，并兼容 Antigravity 旧版刷新令牌字段。
 pub(crate) fn provider_key_can_refresh_oauth(
     auth_semantics: ProviderKeyAuthSemantics,
     provider_type: &str,
@@ -90,11 +91,15 @@ pub(crate) fn provider_key_can_refresh_oauth(
 ) -> bool {
     auth_semantics.can_refresh_oauth()
         && (provider_key_auth_config_is_agent_identity(provider_type, auth_config)
-            || auth_config
-                .and_then(|config| config.get("refresh_token"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty()))
+            || auth_config.is_some_and(|config| {
+                ["refresh_token", "refreshToken"].iter().any(|field| {
+                    config
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .is_some_and(|value| !value.is_empty())
+                })
+            }))
 }
 
 pub(crate) fn provider_key_can_export_oauth(
@@ -403,6 +408,7 @@ mod tests {
         );
     }
 
+    /// 验证 OAuth 刷新能力要求真实刷新凭据，并接受 Antigravity 的旧版字段拼写。
     #[test]
     fn refresh_capability_requires_stored_refresh_token() {
         let semantics = provider_key_auth_semantics(&sample_key("oauth"), "codex");
@@ -425,6 +431,11 @@ mod tests {
             semantics,
             "codex",
             json!({ "refresh_token": "refresh-token" }).as_object()
+        ));
+        assert!(provider_key_can_refresh_oauth(
+            provider_key_auth_semantics(&sample_key("oauth"), "antigravity"),
+            "antigravity",
+            json!({ "refreshToken": "legacy-refresh-token" }).as_object()
         ));
         assert!(provider_key_can_refresh_oauth(
             semantics,

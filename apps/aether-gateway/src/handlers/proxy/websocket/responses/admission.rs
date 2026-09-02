@@ -11,7 +11,7 @@ use aether_contracts::ExecutionPlan;
 
 use crate::execution_runtime::acquire_upstream_execution_gate;
 use crate::provider_pool_demand::{
-    acquire_provider_pool_in_flight_guard, ProviderPoolInFlightGuard,
+    acquire_provider_pool_execution_guard, ProviderPoolInFlightAdmission, ProviderPoolInFlightGuard,
 };
 use crate::upstream_admission::UpstreamTargetAdmissionPermit;
 use crate::{AppState, GatewayError};
@@ -24,6 +24,8 @@ pub(crate) struct ResponsesWebSocketTurnAdmission {
 }
 
 impl ResponsesWebSocketTurnAdmission {
+    /// 为单个 WebSocket turn 获取全局、上游目标与 Provider Key 三层容量许可。
+    /// Key 饱和会在连接级资源释放后返回 429，空闲连接本身不占用该许可。
     pub(crate) async fn acquire(
         state: &AppState,
         plan: &ExecutionPlan,
@@ -41,14 +43,17 @@ impl ResponsesWebSocketTurnAdmission {
                 return Err(error);
             }
         };
-        let provider_pool = acquire_provider_pool_in_flight_guard(
-            state.runtime_state.clone(),
-            &plan.provider_id,
-            &plan.request_id,
-            plan.candidate_id.as_deref(),
-            &plan.key_id,
-        )
-        .await;
+        let provider_pool = match acquire_provider_pool_execution_guard(state, plan).await? {
+            ProviderPoolInFlightAdmission::Acquired(guard) => guard,
+            ProviderPoolInFlightAdmission::Saturated { limit } => {
+                drop(upstream_target);
+                drop(upstream_execution);
+                return Err(GatewayError::Client {
+                    status: http::StatusCode::TOO_MANY_REQUESTS,
+                    message: format!("上游账号并发已达上限 ({limit})"),
+                });
+            }
+        };
 
         Ok(Self {
             upstream_execution,

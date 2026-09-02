@@ -6,7 +6,9 @@ use serde_json::json;
 use crate::capability::ProviderPoolCapabilities;
 use crate::provider::{
     provider_pool_endpoint_format_matches, provider_pool_matching_endpoint, ProviderPoolAdapter,
+    ProviderPoolMemberInput,
 };
+use crate::quota::provider_pool_model_quota_exhausted;
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
 
 pub const ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";
@@ -24,6 +26,22 @@ impl ProviderPoolAdapter for AntigravityProviderPoolAdapter {
             quota_refresh: true,
             ..ProviderPoolCapabilities::default()
         }
+    }
+
+    /// 优先判断请求模型对应的 Antigravity 窗口；无匹配窗口时回退账号快照。
+    fn quota_exhausted(&self, input: &ProviderPoolMemberInput<'_>) -> bool {
+        input
+            .provider_model_name
+            .and_then(|model| {
+                provider_pool_model_quota_exhausted(input.key, input.provider_type, model)
+            })
+            .unwrap_or_else(|| {
+                crate::quota::provider_pool_quota_snapshot_exhausted_decision(
+                    input.key,
+                    input.provider_type,
+                )
+                .unwrap_or(false)
+            })
     }
 
     fn quota_refresh_endpoint(

@@ -265,6 +265,49 @@ describe('pool key display panels', () => {
     root.remove()
   })
 
+  /** 验证最终 Antigravity 家族摘要使用进度条、百分号范围和重置时间。 */
+  it('renders Antigravity quota summaries with progress tracks', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [
+        {
+          label: 'Gemini额度',
+          remainingPercent: 90.6,
+          resetText: '1h 后重置',
+          meterText: '90.6%–100%',
+          barClass: 'bg-emerald-500',
+          meterClass: 'text-emerald-600',
+        },
+        {
+          label: 'Claude & ChatGPT',
+          remainingPercent: 100,
+          resetText: '1h 后重置',
+          meterText: '100%',
+          barClass: 'bg-emerald-500',
+          meterClass: 'text-emerald-600',
+        },
+      ],
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    expect(root.querySelector('[data-testid="pool-quota-rows"]')?.className).toContain('space-y-2')
+    expect(Array.from(root.querySelectorAll('[data-testid="pool-quota-period-label"]')).map(node => node.textContent)).toEqual([
+      'Gemini额度',
+      'Claude & ChatGPT',
+    ])
+    expect(Array.from(root.querySelectorAll('[data-testid="pool-quota-meter-text"]')).map(node => node.textContent)).toEqual(['90.6%–100%', '100%'])
+    expect(root.querySelectorAll('[data-testid="pool-quota-progress-track"]')).toHaveLength(2)
+    expect(Array.from(root.querySelectorAll('[data-testid="pool-quota-reset-text"]')).map(node => node.textContent)).toEqual([
+      '1h 后重置',
+      '1h 后重置',
+    ])
+
+    app.unmount()
+    root.remove()
+  })
+
   it('shows successful model-probe evidence for an ambiguous Zhipu quota', () => {
     const root = document.createElement('div')
     document.body.appendChild(root)
