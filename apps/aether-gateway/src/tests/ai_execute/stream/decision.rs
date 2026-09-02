@@ -2056,6 +2056,7 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
         .expect("endpoint transport should build")
     }
 
+    /// 构造带格式级优先级的流式故障转移 Key，用于验证请求策略排序。
     fn sample_provider_catalog_key(
         key_id: &str,
         provider_id: &str,
@@ -2220,7 +2221,8 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
                             .to_string(),
                     });
 
-                let frames = if attempt == 1 {
+                // 默认粘性预算让首 Key 尝试两次；两次均失败后才进入备用候选。
+                let frames = if attempt <= 2 {
                     concat!(
                         "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":429,\"headers\":{\"content-type\":\"application/json\"}}}\n",
                         "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"{\\\"error\\\":{\\\"message\\\":\\\"rate limited\\\",\\\"type\\\":\\\"rate_limit_error\\\"}}\"}}\n",
@@ -2362,14 +2364,24 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
             .lock()
             .expect("mutex should lock")
             .len()
-            >= 2
+            >= 3
     })
     .await;
     let seen_execution_runtime_requests = seen_execution_runtime
         .lock()
         .expect("mutex should lock")
         .clone();
-    assert_eq!(seen_execution_runtime_requests.len(), 2);
+    // 默认总尝试数为 2：首 Key 同 Key 重试一次，再切换到只尝试一次的备用候选。
+    assert_eq!(seen_execution_runtime_requests.len(), 3);
+    assert_eq!(
+        seen_execution_runtime_requests
+            .iter()
+            .filter(|request| {
+                request.url == "https://api.openai.primary.example/chat/completions"
+            })
+            .count(),
+        2
+    );
     let primary_request = seen_execution_runtime_requests
         .iter()
         .find(|request| request.url == "https://api.openai.primary.example/chat/completions")
@@ -2404,7 +2416,15 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
         .list_by_request_id("trace-openai-chat-local-stream-failover-123")
         .await
         .expect("request candidate trace should read");
-    assert_eq!(stored_candidates.len(), 2);
+    assert_eq!(stored_candidates.len(), 3);
+    assert_eq!(
+        stored_candidates
+            .iter()
+            .filter(|candidate| candidate.status == RequestCandidateStatus::Failed)
+            .count(),
+        2,
+        "both sticky-key attempts on the primary should be recorded as failed"
+    );
     let failed_candidate = stored_candidates
         .iter()
         .find(|candidate| {
@@ -2465,7 +2485,7 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
 
     assert_eq!(
         execution_runtime_hits.load(std::sync::atomic::Ordering::SeqCst),
-        2
+        3
     );
     assert_eq!(*decision_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*plan_hits.lock().expect("mutex should lock"), 0);

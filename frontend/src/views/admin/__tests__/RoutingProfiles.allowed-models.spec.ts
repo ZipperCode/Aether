@@ -131,11 +131,32 @@ vi.mock('@/components/ui', async () => {
     },
   })
 
+  /** 用按钮模拟受控 Switch，验证路由默认策略的布尔开关。 */
+  const Switch = defineComponent({
+    inheritAttrs: false,
+    props: {
+      modelValue: { type: Boolean, default: false },
+      disabled: Boolean,
+    },
+    emits: ['update:modelValue'],
+    setup(props, { attrs, emit }) {
+      return () => h('button', {
+        ...attrs,
+        type: 'button',
+        role: 'switch',
+        'aria-checked': props.modelValue,
+        disabled: props.disabled,
+        onClick: () => emit('update:modelValue', !props.modelValue),
+      })
+    },
+  })
+
   return {
     Badge: wrapper(),
     Button,
     Card: wrapper('section'),
     Input,
+    Switch,
     Table: wrapper('table'),
     TableBody: wrapper('tbody'),
     TableCard: wrapper(),
@@ -179,6 +200,7 @@ vi.mock('@/features/routing/components', async () => {
 let app: App | undefined
 let root: HTMLElement | undefined
 
+/** 构造含完整默认策略字段的路由组测试数据。 */
 function routingGroup(
   allowedModels: string[] = [],
   overrides: Partial<RoutingGroupRecord> = {},
@@ -195,6 +217,7 @@ function routingGroup(
         priority_mode: 'provider',
         scheduling_mode: 'cache_affinity',
         keep_priority_on_conversion: false,
+        sticky_key_attempts: 2,
       },
       model_policies: [],
       rules: [],

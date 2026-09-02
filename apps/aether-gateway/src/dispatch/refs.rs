@@ -126,6 +126,7 @@ mod tests {
         }
     }
 
+    /// 构造带路由编排元数据的最小候选，用于验证 dispatch 引用往返。
     fn sample_eligible(kind: LocalExecutionCandidateKind) -> EligibleLocalExecutionCandidate {
         EligibleLocalExecutionCandidate {
             kind,
@@ -208,6 +209,7 @@ mod tests {
                 pool_key_index: None,
                 pool_key_lease: None,
                 scheduler_affinity_epoch: None,
+                sticky_key_attempts: None,
             },
             ranking: None,
         }

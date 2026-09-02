@@ -1739,10 +1739,26 @@ mod tests {
         }
     }
 
+    /// 构造不启用同 Key 重试的图片心跳尝试，用于只验证候选故障转移。
     fn test_openai_image_heartbeat_attempt(
         candidate_index: u32,
         endpoint_id: &str,
         candidate_id: &str,
+    ) -> AiSyncAttempt {
+        test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
+            candidate_index,
+            endpoint_id,
+            candidate_id,
+            1,
+        )
+    }
+
+    /// 固定同 Key 总尝试次数，分别验证候选切换和默认延迟重试，避免两个预算相互干扰。
+    fn test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
+        candidate_index: u32,
+        endpoint_id: &str,
+        candidate_id: &str,
+        sticky_key_attempts: u32,
     ) -> AiSyncAttempt {
         AiSyncAttempt {
             plan: test_openai_image_heartbeat_plan(endpoint_id, candidate_id),
@@ -1750,6 +1766,7 @@ mod tests {
             report_context: Some(json!({
                 "candidate_index": candidate_index,
                 "retry_index": 0,
+                "sticky_key_attempts": sticky_key_attempts,
             })),
         }
     }
@@ -1896,6 +1913,7 @@ mod tests {
         }
     }
 
+    /// 构造标准文本心跳尝试，并固定报告中的候选身份。
     fn test_standard_text_heartbeat_attempt(
         candidate_index: u32,
         endpoint_id: &str,
@@ -1908,6 +1926,8 @@ mod tests {
             report_context: Some(json!({
                 "candidate_index": candidate_index,
                 "retry_index": 0,
+                // 固定一次尝试，使该辅助数据只验证候选故障转移而非默认同 Key 重试。
+                "sticky_key_attempts": 1,
                 "client_api_format": client_api_format,
                 "provider_api_format": client_api_format,
             })),
@@ -2157,6 +2177,111 @@ mod tests {
         assert_eq!(body, json!({"data": [{"b64_json": "second-candidate"}]}));
     }
 
+    /// 验证图片心跳在切换候选前按需完成首候选的同 Key 重试，且每次生成新候选 ID。
+    #[tokio::test]
+    async fn openai_image_sync_heartbeat_retries_sticky_key_lazily_before_failover() {
+        let seen_plans = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let seen_plans_for_override = Arc::clone(&seen_plans);
+        // 执行准入会强读 Key 目录；测试显式提供与计划一致的活跃 Key，不能绕过生产合同。
+        let catalog_key =
+            aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
+                "key-openai".to_string(),
+                "provider-openai".to_string(),
+                "test-key".to_string(),
+                "api_key".to_string(),
+                Some(json!(["openai:image"])),
+                true,
+            )
+            .expect("catalog key should build");
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository::seed(
+                        Vec::new(),
+                        Vec::new(),
+                        vec![catalog_key],
+                    ),
+                )),
+            )
+            .with_execution_runtime_sync_override_for_tests(move |plan| {
+                seen_plans_for_override
+                    .lock()
+                    .expect("mutex should lock")
+                    .push((plan.endpoint_id.clone(), plan.candidate_id.clone()));
+                if plan.endpoint_id == "endpoint-retry" {
+                    Ok(test_openai_image_execution_result(
+                        plan,
+                        StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                        json!({"error": {"message": "retry this candidate"}}),
+                    ))
+                } else {
+                    Ok(test_openai_image_execution_result(
+                        plan,
+                        StatusCode::OK.as_u16(),
+                        json!({"data": [{"b64_json": "second-candidate"}]}),
+                    ))
+                }
+            });
+        // 首 Key 共尝试三次；只预先物化一次，其余两次均在失败后派生。
+        let attempts = vec![
+            test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
+                0,
+                "endpoint-retry",
+                "candidate-retry",
+                3,
+            ),
+            test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
+                1,
+                "endpoint-success",
+                "candidate-success",
+                3,
+            ),
+        ];
+        let outcome = execute_openai_image_sync_heartbeat_attempts(
+            state,
+            "/v1/images/generations".to_string(),
+            "trace-image-heartbeat-sticky-retry".to_string(),
+            test_openai_image_heartbeat_decision(),
+            TEST_OPENAI_IMAGE_SYNC_PLAN_KIND.to_string(),
+            attempts,
+            ProviderTransferTracker::default(),
+            Instant::now(),
+        )
+        .await
+        .expect("heartbeat attempts should execute");
+        let LocalExecutionRequestOutcome::Responded(response) = outcome else {
+            panic!("second candidate should return a response");
+        };
+        let bytes = openai_image_sync_heartbeat_response_body_bytes(response).await;
+        let body: Value = serde_json::from_slice(&bytes).expect("body should decode");
+
+        let seen_plans = seen_plans.lock().expect("mutex should lock").clone();
+        assert_eq!(
+            seen_plans
+                .iter()
+                .map(|(endpoint_id, _)| endpoint_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "endpoint-retry",
+                "endpoint-retry",
+                "endpoint-retry",
+                "endpoint-success"
+            ]
+        );
+        let sticky_candidate_ids = seen_plans[..3]
+            .iter()
+            .map(|(_, candidate_id)| candidate_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            sticky_candidate_ids.len(),
+            3,
+            "each derived same-key retry must carry a fresh candidate id"
+        );
+        assert_eq!(body, json!({"data": [{"b64_json": "second-candidate"}]}));
+    }
+
+    /// 验证图片心跳即使存在粘性预算，也服从 Provider 转移次数上限。
     #[tokio::test]
     async fn openai_image_sync_heartbeat_honors_provider_transfer_limit() {
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -2190,6 +2315,7 @@ mod tests {
             attempt.report_context = Some(json!({
                 "candidate_index": index,
                 "retry_index": 0,
+                "sticky_key_attempts": 1,
                 "local_failover_policy": {
                     "max_transfer_count": 1,
                     "max_transfer_timeout_seconds": 0

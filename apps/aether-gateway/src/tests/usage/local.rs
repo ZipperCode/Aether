@@ -745,6 +745,7 @@ fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exhaust_af
     );
 }
 
+/// 执行“唯一 Chat 候选及其默认同 Key 重试均失败”的用量与候选记录验证。
 async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exhaust_after_retryable_sync_failure_impl(
 ) {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
@@ -887,9 +888,12 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
         .list_by_request_id("trace-openai-chat-local-report-sync-failure-123")
         .await
         .expect("request candidate trace should read");
-    assert_eq!(stored_candidates.len(), 1);
-    assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Failed);
-    assert_eq!(stored_candidates[0].status_code, Some(503));
+    // 唯一候选即首位粘性 Key：默认策略先同 Key 重试一次，再判定请求耗尽。
+    assert_eq!(stored_candidates.len(), 2);
+    for candidate in &stored_candidates {
+        assert_eq!(candidate.status, RequestCandidateStatus::Failed);
+        assert_eq!(candidate.status_code, Some(503));
+    }
 }
 
 #[test]
@@ -900,6 +904,7 @@ fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable_witho
     );
 }
 
+/// 执行“同步传输不可用且无计划回退”的失败用量记录验证。
 async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable_without_plan_fallback_impl(
 ) {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
@@ -969,7 +974,8 @@ async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable
     let response = send_request(gateway, request).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(*execution_hits.lock().expect("mutex should lock"), 1);
+    // 首位粘性 Key 在耗尽前会同 Key 重试一次。
+    assert_eq!(*execution_hits.lock().expect("mutex should lock"), 2);
 
     let stored_usage = wait_for_usage_status(
         usage_repository.as_ref(),
@@ -994,15 +1000,15 @@ async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable
         .list_by_request_id("trace-openai-chat-local-transport-unavailable-123")
         .await
         .expect("request candidate trace should read");
-    assert_eq!(stored_candidates.len(), 1);
-    assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Failed);
-    assert!(stored_candidates[0]
-        .latency_ms
-        .is_some_and(|value| value >= 5));
-    assert_eq!(
-        stored_candidates[0].error_type.as_deref(),
-        Some("execution_runtime_unavailable")
-    );
+    assert_eq!(stored_candidates.len(), 2);
+    for candidate in &stored_candidates {
+        assert_eq!(candidate.status, RequestCandidateStatus::Failed);
+        assert!(candidate.latency_ms.is_some_and(|value| value >= 5));
+        assert_eq!(
+            candidate.error_type.as_deref(),
+            Some("execution_runtime_unavailable")
+        );
+    }
 }
 
 #[test]
@@ -1793,6 +1799,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
         }
     }
 
+    /// 构造 Claude CLI 本地运行态缺失场景的 Provider。
     fn sample_provider_catalog_provider() -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             "provider-claude-cli-usage-local-miss-1".to_string(),
@@ -1806,7 +1813,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
             false,
             false,
             None,
-            Some(2),
+            Some(1),
             None,
             Some(20.0),
             None,
@@ -1814,6 +1821,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
         )
     }
 
+    /// 构造 Claude CLI 本地运行态缺失场景的 Responses Endpoint。
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
         StoredProviderCatalogEndpoint::new(
             "endpoint-claude-cli-usage-local-miss-1".to_string(),
@@ -1828,7 +1836,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
             "https://right.codes/codex".to_string(),
             None,
             None,
-            Some(2),
+            Some(1),
             Some("/v1/messages".to_string()),
             None,
             None,
@@ -2122,6 +2130,7 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
         }
     }
 
+    /// 构造大请求 Claude CLI 本地运行态缺失场景的 Provider。
     fn sample_provider_catalog_provider() -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             "provider-claude-cli-usage-local-miss-large-1".to_string(),
@@ -2135,7 +2144,7 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
             false,
             false,
             None,
-            Some(2),
+            Some(1),
             None,
             Some(20.0),
             None,
@@ -2143,6 +2152,7 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
         )
     }
 
+    /// 构造大请求 Claude CLI 本地运行态缺失场景的 Responses Endpoint。
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
         StoredProviderCatalogEndpoint::new(
             "endpoint-claude-cli-usage-local-miss-large-1".to_string(),
@@ -2157,7 +2167,7 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
             "https://right.codes/codex".to_string(),
             None,
             None,
-            Some(2),
+            Some(1),
             Some("/v1/messages".to_string()),
             None,
             None,

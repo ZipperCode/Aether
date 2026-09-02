@@ -23,7 +23,9 @@ use crate::ai_serving::{
 use crate::orchestration::LocalExecutionCandidateMetadata;
 use crate::stage_metrics::observe_gateway_stage_ms;
 
-use super::candidate_ranking::rank_eligible_local_execution_candidates;
+use super::candidate_ranking::{
+    rank_eligible_local_execution_candidates, scheduler_ordering_config_for_routing_policy,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EligibleLocalExecutionCandidate {
@@ -335,6 +337,7 @@ async fn resolve_and_rank_local_execution_candidates_with_mode(
     .await
 }
 
+/// 展开 Pool 后按请求路由策略统一重排候选，并把粘性尝试预算附加到结果。
 #[allow(clippy::too_many_arguments)]
 async fn resolve_and_rank_local_execution_candidates_with_pool_expansion(
     state: PlannerAppState<'_>,
@@ -378,8 +381,18 @@ async fn resolve_and_rank_local_execution_candidates_with_pool_expansion(
                 "candidate_resolution_core",
                 started_at.elapsed().as_millis() as u64,
             );
+            let sticky_key_attempts = if outcome.eligible_candidates.is_empty() {
+                None
+            } else {
+                Some(
+                    scheduler_ordering_config_for_routing_policy(state, routing_policy)
+                        .await
+                        .sticky_key_attempts,
+                )
+            };
             for candidate in &mut outcome.eligible_candidates {
                 candidate.orchestration.scheduler_affinity_epoch = Some(scheduler_affinity_epoch);
+                candidate.orchestration.sticky_key_attempts = sticky_key_attempts;
             }
             (outcome.eligible_candidates, outcome.skipped_candidates)
         }

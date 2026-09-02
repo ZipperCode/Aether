@@ -21,6 +21,7 @@ use super::super::{
 };
 use super::support::{sample_auth_snapshot, sample_provider, sample_row};
 
+/// 验证兼容型能力只提升匹配 Key，不会把其他可用 Key 硬过滤掉。
 #[tokio::test]
 async fn compatible_required_capability_prefers_matching_keys_without_hard_filtering() {
     let mut higher_priority = sample_row();
@@ -65,6 +66,7 @@ async fn compatible_required_capability_prefers_matching_keys_without_hard_filte
         None,
         None,
         100,
+        None,
     )
     .await
     .expect("selection should succeed");
@@ -74,6 +76,7 @@ async fn compatible_required_capability_prefers_matching_keys_without_hard_filte
     assert_eq!(selection[1].provider_id, "provider-a");
 }
 
+/// 验证独占型能力仍只保留明确匹配的 Key。
 #[tokio::test]
 async fn exclusive_required_capability_keeps_hard_filtering_only_matching_keys() {
     let mut incompatible = sample_row();
@@ -120,6 +123,7 @@ async fn exclusive_required_capability_keeps_hard_filtering_only_matching_keys()
         None,
         None,
         100,
+        None,
     )
     .await
     .expect("selection should succeed");
@@ -129,6 +133,7 @@ async fn exclusive_required_capability_keeps_hard_filtering_only_matching_keys()
     assert_eq!(selection[0].key_id, "key-b");
 }
 
+/// 验证无模型能力选择仍使用会话级缓存亲和和显式排序配置。
 #[tokio::test]
 async fn required_capability_without_model_uses_session_scoped_affinity() {
     let mut fallback = sample_row();
@@ -196,6 +201,7 @@ async fn required_capability_without_model_uses_session_scoped_affinity() {
         Some(&auth_snapshot),
         Some(&client_session_affinity),
         100,
+        None,
     )
     .await
     .expect("selection should succeed");
@@ -205,6 +211,7 @@ async fn required_capability_without_model_uses_session_scoped_affinity() {
     assert_eq!(selection[0].key_id, "key-b");
 }
 
+/// 验证所有模型均被 API Key 并发上限阻断时返回精确阻断信号。
 #[tokio::test]
 async fn required_capability_reports_auth_limit_signal_when_every_model_is_blocked_by_api_key_concurrency(
 ) {
@@ -273,6 +280,7 @@ async fn required_capability_reports_auth_limit_signal_when_every_model_is_block
             Some(&auth_snapshot),
             None,
             100,
+            None,
         )
         .await
         .expect("selection should succeed");

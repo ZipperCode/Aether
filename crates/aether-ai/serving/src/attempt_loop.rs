@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+/// 统一描述可执行候选尝试，并允许实现按需复制同 Key 重试所需的最小状态。
 pub trait AiExecutionAttempt {
     fn execution_plan(&self) -> &aether_contracts::ExecutionPlan;
 
@@ -13,9 +14,21 @@ pub trait AiExecutionAttempt {
     fn report_context_ref(&self) -> Option<&serde_json::Value> {
         None
     }
+
+    /// 用给定重试序号和新候选 ID 复制一次同 Key 尝试；不支持复制的实现返回空。
+    fn with_same_key_retry(&self, _retry_index: u32, _candidate_id: String) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
+/// 报告上下文中的粘性 Key 总尝试数字段，供执行循环按需派生重试。
+pub const STICKY_KEY_ATTEMPTS_REPORT_FIELD: &str = "sticky_key_attempts";
+
 #[derive(Debug)]
+/// 执行循环终态：成功、带耗尽证据的延迟响应、完全耗尽或没有路径。
 pub enum AiAttemptLoopOutcome<Response, Exhaustion> {
     Responded(Response),
     Deferred {
@@ -61,6 +74,7 @@ impl<Response> AiAttemptExecutionOutcome<Response> {
 }
 
 #[async_trait]
+/// 将通用尝试循环与具体传输执行、跳过判定、持久化和耗尽构造解耦的端口。
 pub trait AiAttemptLoopPort<Attempt>: Send + Sync
 where
     Attempt: AiExecutionAttempt + Send + Sync + 'static,
@@ -86,6 +100,14 @@ where
         Ok(())
     }
 
+    /// 候选级失败后按需返回下一次同 Key 尝试；粘性预算耗尽时返回空。
+    async fn next_same_key_retry(
+        &self,
+        _attempt: &Attempt,
+    ) -> Result<Option<Attempt>, Self::Error> {
+        Ok(None)
+    }
+
     async fn mark_unused_attempts(&self, attempts: Vec<Attempt>) -> Result<(), Self::Error>;
 
     async fn build_exhaustion(
@@ -95,6 +117,8 @@ where
     ) -> Result<Self::Exhaustion, Self::Error>;
 }
 
+/// 串行执行已物化候选，并在候选级失败后优先运行按需派生的同 Key 重试。
+/// 延迟响应始终使用产生该响应的计划和报告上下文构造耗尽证据。
 pub async fn run_ai_attempt_loop<Port, Attempt>(
     port: &Port,
     attempts: Vec<Attempt>,
@@ -104,11 +128,15 @@ where
     Attempt: AiExecutionAttempt + Send + Sync + 'static,
 {
     let mut remaining = attempts.into_iter();
+    let mut pending_same_key_retry: Option<Attempt> = None;
     let mut last_attempted = None;
     let mut retry_filters: Vec<AiAttemptRetryFilter> = Vec::new();
     let mut fallback = None;
 
-    while let Some(attempt) = remaining.next() {
+    loop {
+        let Some(attempt) = pending_same_key_retry.take().or_else(|| remaining.next()) else {
+            break;
+        };
         if retry_filters.iter().any(|filter| filter.matches(&attempt))
             || port.should_skip_attempt(&attempt).await?
         {
@@ -140,14 +168,15 @@ where
                         attempt.report_context(),
                     ));
                 }
-                if scope != AiAttemptRetryScope::Candidate {
+                if scope == AiAttemptRetryScope::Candidate {
+                    pending_same_key_retry = port.next_same_key_retry(&attempt).await?;
+                } else {
                     retry_filters.push(AiAttemptRetryFilter::new(&attempt, scope));
                 }
             }
         }
 
-        // Exhaustion diagnostics are only needed after an attempt fails. Keep
-        // the common successful path free of a deep plan/report-context clone.
+        // 仅失败路径需要耗尽诊断，成功热路径不提前深拷贝计划和报告上下文。
         last_attempted = Some((attempt.execution_plan().clone(), attempt.report_context()));
     }
 
@@ -201,6 +230,31 @@ impl AiAttemptRetryFilter {
     }
 }
 
+/// 复制同 Key 重试的计划和报告上下文；只更新候选 ID 与重试序号，其余请求保持不变。
+fn same_key_retry_parts(
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    retry_index: u32,
+    candidate_id: String,
+) -> (aether_contracts::ExecutionPlan, Option<serde_json::Value>) {
+    let mut plan = plan.clone();
+    plan.candidate_id = Some(candidate_id.clone());
+    let report_context = report_context.cloned().map(|mut value| {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "candidate_id".to_string(),
+                serde_json::Value::String(candidate_id),
+            );
+            object.insert(
+                "retry_index".to_string(),
+                serde_json::Value::Number(retry_index.into()),
+            );
+        }
+        value
+    });
+    (plan, report_context)
+}
+
 impl AiExecutionAttempt for crate::dto::AiSyncAttempt {
     fn execution_plan(&self) -> &aether_contracts::ExecutionPlan {
         &self.plan
@@ -216,6 +270,21 @@ impl AiExecutionAttempt for crate::dto::AiSyncAttempt {
 
     fn report_context_ref(&self) -> Option<&serde_json::Value> {
         self.report_context.as_ref()
+    }
+
+    /// 复制同步尝试并写入新的候选 ID 与重试序号。
+    fn with_same_key_retry(&self, retry_index: u32, candidate_id: String) -> Option<Self> {
+        let (plan, report_context) = same_key_retry_parts(
+            &self.plan,
+            self.report_context.as_ref(),
+            retry_index,
+            candidate_id,
+        );
+        Some(Self {
+            plan,
+            report_kind: self.report_kind.clone(),
+            report_context,
+        })
     }
 }
 
@@ -234,6 +303,21 @@ impl AiExecutionAttempt for crate::dto::AiStreamAttempt {
 
     fn report_context_ref(&self) -> Option<&serde_json::Value> {
         self.report_context.as_ref()
+    }
+
+    /// 复制流式尝试并写入新的候选 ID 与重试序号。
+    fn with_same_key_retry(&self, retry_index: u32, candidate_id: String) -> Option<Self> {
+        let (plan, report_context) = same_key_retry_parts(
+            &self.plan,
+            self.report_context.as_ref(),
+            retry_index,
+            candidate_id,
+        );
+        Some(Self {
+            plan,
+            report_kind: self.report_kind.clone(),
+            report_context,
+        })
     }
 }
 

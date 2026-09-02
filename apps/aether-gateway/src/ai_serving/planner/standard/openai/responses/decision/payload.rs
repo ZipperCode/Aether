@@ -57,6 +57,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
 /// the ordinary HTTP/plan-builder path. The explicit mode is carried all the
 /// way to body normalization because a JSON `type` field is not a reliable
 /// transport discriminator once body rules and conversions have run.
+/// 为 Responses HTTP/WS 候选构造执行载荷，并统一传递路由粘性尝试预算。
 pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_candidate_with_websocket_mode(
     state: &AppState,
     parts: &http::request::Parts,
@@ -195,6 +196,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
                 client_session_affinity: input.client_session_affinity.as_ref(),
                 routing_policy: input.routing_policy.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
+                sticky_key_attempts: eligible.orchestration.sticky_key_attempts,
                 client_requested_stream: body_json
                     .get("stream")
                     .and_then(serde_json::Value::as_bool)

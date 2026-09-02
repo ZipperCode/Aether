@@ -24,6 +24,7 @@ use super::request::{
 use super::support::{LocalOpenAiChatCandidateAttempt, LocalOpenAiChatDecisionInput};
 
 #[allow(clippy::too_many_arguments)]
+/// 为 OpenAI Chat 候选构造执行载荷，并保留请求级路由重试预算。
 pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate(
     state: &AppState,
     parts: &http::request::Parts,
@@ -195,6 +196,7 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
                 client_session_affinity: input.client_session_affinity.as_ref(),
                 routing_policy: input.routing_policy.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
+                sticky_key_attempts: eligible.orchestration.sticky_key_attempts,
                 client_requested_stream: body_json
                     .get("stream")
                     .and_then(serde_json::Value::as_bool)

@@ -4,7 +4,7 @@ use aether_ai_serving::{
     build_ai_execution_report_context,
     insert_provider_stream_event_api_format as insert_ai_provider_stream_event_api_format,
     provider_stream_event_api_format_for_provider_type as ai_provider_stream_event_api_format_for_provider_type,
-    AiExecutionReportContextParts, AiRequestOrigin,
+    AiExecutionReportContextParts, AiRequestOrigin, STICKY_KEY_ATTEMPTS_REPORT_FIELD,
 };
 use aether_routing_core::ResolvedRoutingPolicy;
 use aether_runtime_state::RuntimeLockLease;
@@ -25,6 +25,7 @@ use crate::orchestration::{
 };
 use crate::scheduler::affinity::insert_scheduler_affinity_policy_report_context_field;
 
+/// 构造一次本地执行报告上下文所需的请求、候选、路由及运行态字段集合。
 pub(crate) struct LocalExecutionReportContextParts<'a> {
     pub(crate) auth_context: &'a ExecutionRuntimeAuthContext,
     pub(crate) request_id: &'a str,
@@ -59,6 +60,8 @@ pub(crate) struct LocalExecutionReportContextParts<'a> {
     pub(crate) client_session_affinity: Option<&'a ClientSessionAffinity>,
     pub(crate) routing_policy: Option<&'a ResolvedRoutingPolicy>,
     pub(crate) scheduler_affinity_epoch: Option<u64>,
+    /// 路由策略给出的首 Key 总尝试预算，由执行循环读取并按需派生重试。
+    pub(crate) sticky_key_attempts: Option<u32>,
     pub(crate) client_requested_stream: bool,
     pub(crate) upstream_is_stream: bool,
     pub(crate) has_envelope: bool,
@@ -66,6 +69,7 @@ pub(crate) struct LocalExecutionReportContextParts<'a> {
     pub(crate) extra_fields: Map<String, Value>,
 }
 
+/// 组装持久化与执行共用的报告上下文，并写入粘性重试预算和 Pool 元数据。
 pub(crate) fn build_local_execution_report_context(
     parts: LocalExecutionReportContextParts<'_>,
 ) -> Value {
@@ -122,6 +126,12 @@ pub(crate) fn build_local_execution_report_context(
         extra_fields.insert(
             SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD.to_string(),
             Value::Number(epoch.into()),
+        );
+    }
+    if let Some(sticky_key_attempts) = parts.sticky_key_attempts {
+        extra_fields.insert(
+            STICKY_KEY_ATTEMPTS_REPORT_FIELD.to_string(),
+            Value::Number(sticky_key_attempts.into()),
         );
     }
     insert_request_path_fields(
@@ -274,6 +284,7 @@ mod tests {
         );
     }
 
+    /// 验证报告上下文保留请求来源、会话亲和与路由尝试预算。
     #[test]
     fn local_execution_report_context_records_request_origin_and_session_affinity() {
         let auth_context = ExecutionRuntimeAuthContext {
@@ -330,6 +341,7 @@ mod tests {
                 client_session_affinity: Some(&client_session_affinity),
                 routing_policy: None,
                 scheduler_affinity_epoch: None,
+                sticky_key_attempts: None,
                 client_requested_stream: false,
                 upstream_is_stream: false,
                 has_envelope: false,
@@ -360,6 +372,7 @@ mod tests {
         );
     }
 
+    /// 验证 Gemini 流式路径会被识别为客户端流请求并保留报告字段。
     #[test]
     fn local_execution_report_context_treats_stream_generate_content_path_as_client_stream() {
         let auth_context = ExecutionRuntimeAuthContext {
@@ -413,6 +426,7 @@ mod tests {
                 client_session_affinity: None,
                 routing_policy: None,
                 scheduler_affinity_epoch: None,
+                sticky_key_attempts: None,
                 client_requested_stream: false,
                 upstream_is_stream: true,
                 has_envelope: false,
@@ -428,6 +442,7 @@ mod tests {
         );
     }
 
+    /// 验证转发的 TLS 指纹与新增路由字段可同时写入报告上下文。
     #[test]
     fn local_execution_report_context_records_forwarded_tls_fingerprint() {
         let auth_context = ExecutionRuntimeAuthContext {
@@ -480,6 +495,7 @@ mod tests {
                 client_session_affinity: None,
                 routing_policy: None,
                 scheduler_affinity_epoch: None,
+                sticky_key_attempts: None,
                 client_requested_stream: false,
                 upstream_is_stream: false,
                 has_envelope: false,

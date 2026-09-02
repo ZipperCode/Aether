@@ -21,6 +21,7 @@ use super::request::resolve_local_openai_image_candidate_payload_parts;
 use super::support::{LocalOpenAiImageCandidateAttempt, LocalOpenAiImageDecisionInput};
 use super::LocalOpenAiImageSpec;
 
+/// 为 OpenAI 图片候选构造执行载荷，并附加路由粘性尝试预算。
 pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidate(
     state: &AppState,
     parts: &http::request::Parts,
@@ -122,6 +123,7 @@ pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidat
             client_session_affinity: input.client_session_affinity.as_ref(),
             routing_policy: input.routing_policy.as_ref(),
             scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
+            sticky_key_attempts: eligible.orchestration.sticky_key_attempts,
             client_requested_stream: spec_metadata.require_streaming,
             upstream_is_stream,
             has_envelope: false,

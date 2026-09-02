@@ -255,6 +255,11 @@ where
         Ok(())
     }
 
+    /// 为同步执行按路由预算延迟派生下一次同 Key 尝试，预算耗尽时返回空。
+    async fn next_same_key_retry(&self, attempt: &T) -> Result<Option<T>, Self::Error> {
+        Ok(crate::orchestration::next_same_key_retry_attempt(attempt))
+    }
+
     async fn record_attempt_failed(&self, attempt: &T) -> Result<(), Self::Error> {
         record_provider_transfer_attempt_failed(
             self.state,
@@ -782,6 +787,8 @@ async fn record_provider_transfer_attempt_failed<Attempt>(
     }
 }
 
+/// 逐个拉取动态候选，并在候选级失败后优先执行按需派生的同 Key 重试。
+/// 返回前会清理未使用候选；延迟响应继续携带产生它的计划与耗尽上下文。
 async fn run_dynamic_attempt_loop<Port, Source, Attempt>(
     port: &Port,
     source: &mut Source,
@@ -801,18 +808,30 @@ where
 {
     let mut last_attempted = None;
     let mut fallback = None;
+    // 候选级失败派生出的同 Key 重试必须先执行，之后才向动态来源申请下一候选。
+    let mut pending_same_key_retry: Option<Attempt> = None;
 
     loop {
-        let next_started_at = std::time::Instant::now();
-        let next_attempt =
-            next_execution_attempt_with_timeout(source, trace_id, plan_kind, planning_timeout)
+        let attempt = match pending_same_key_retry.take() {
+            Some(attempt) => attempt,
+            None => {
+                let next_started_at = std::time::Instant::now();
+                let next_attempt = next_execution_attempt_with_timeout(
+                    source,
+                    trace_id,
+                    plan_kind,
+                    planning_timeout,
+                )
                 .await?;
-        observe_gateway_stage_ms(
-            "stream_candidate_next",
-            next_started_at.elapsed().as_millis() as u64,
-        );
-        let Some(attempt) = next_attempt else {
-            break;
+                observe_gateway_stage_ms(
+                    "stream_candidate_next",
+                    next_started_at.elapsed().as_millis() as u64,
+                );
+                let Some(attempt) = next_attempt else {
+                    break;
+                };
+                attempt
+            }
         };
         if port.should_skip_attempt(&attempt).await? {
             let provider_id = attempt.execution_plan().provider_id.clone();
@@ -855,6 +874,9 @@ where
                         attempt.execution_plan().clone(),
                         attempt.report_context(),
                     ));
+                }
+                if scope == AiAttemptRetryScope::Candidate {
+                    pending_same_key_retry = port.next_same_key_retry(&attempt).await?;
                 }
                 apply_attempt_retry_scope(source, &attempt, scope).await?;
             }
@@ -973,6 +995,11 @@ where
     async fn record_attempt_started(&self, attempt: &T) -> Result<(), Self::Error> {
         record_provider_transfer_attempt_started(self.transfer_tracker, attempt).await;
         Ok(())
+    }
+
+    /// 为流式执行按路由预算延迟派生下一次同 Key 尝试，预算耗尽时返回空。
+    async fn next_same_key_retry(&self, attempt: &T) -> Result<Option<T>, Self::Error> {
+        Ok(crate::orchestration::next_same_key_retry_attempt(attempt))
     }
 
     async fn record_attempt_failed(&self, attempt: &T) -> Result<(), Self::Error> {

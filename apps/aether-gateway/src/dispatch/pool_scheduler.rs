@@ -714,6 +714,7 @@ impl<'a> PoolKeyCursor<'a> {
         Some(candidates)
     }
 
+    /// 分页读取路由允许的 Pool Key，并按候选格式的 Key 优先级和现有额度条件排序。
     async fn next_routing_allowed_candidates(
         &mut self,
     ) -> Option<Vec<EligibleLocalExecutionCandidate>> {
@@ -775,19 +776,28 @@ impl<'a> PoolKeyCursor<'a> {
                         return None;
                     }
                 };
+                let api_format = self.group.candidate.endpoint_api_format.as_str();
                 rows.sort_by(|left, right| {
-                    let left_priority = self
-                        .routing_overlay
-                        .as_ref()
-                        .map_or(left.key_internal_priority, |overlay| {
-                            overlay.key_priority(&left.key_id, left.key_internal_priority)
-                        });
-                    let right_priority = self
-                        .routing_overlay
-                        .as_ref()
-                        .map_or(right.key_internal_priority, |overlay| {
-                            overlay.key_priority(&right.key_id, right.key_internal_priority)
-                        });
+                    let left_priority = self.routing_overlay.as_ref().map_or(
+                        left.key_internal_priority,
+                        |overlay| {
+                            overlay.key_priority_for_format(
+                                &left.key_id,
+                                api_format,
+                                left.key_internal_priority,
+                            )
+                        },
+                    );
+                    let right_priority = self.routing_overlay.as_ref().map_or(
+                        right.key_internal_priority,
+                        |overlay| {
+                            overlay.key_priority_for_format(
+                                &right.key_id,
+                                api_format,
+                                right.key_internal_priority,
+                            )
+                        },
+                    );
                     left_priority
                         .cmp(&right_priority)
                         .then(left.key_id.cmp(&right.key_id))
@@ -2051,16 +2061,19 @@ fn pool_runtime_state(runtime: &AdminProviderPoolRuntimeState) -> PoolRuntimeSta
     }
 }
 
+/// 将 Pool 分组索引与租约附加到候选，同时保留请求级粘性尝试预算和亲和纪元。
 fn apply_pool_orchestration(
     mut candidate: EligibleLocalExecutionCandidate,
     orchestration: PoolCandidateOrchestration,
 ) -> EligibleLocalExecutionCandidate {
     let scheduler_affinity_epoch = candidate.orchestration.scheduler_affinity_epoch;
+    let sticky_key_attempts = candidate.orchestration.sticky_key_attempts;
     candidate.orchestration = LocalExecutionCandidateMetadata {
         candidate_group_id: orchestration.candidate_group_id,
         pool_key_index: orchestration.pool_key_index,
         pool_key_lease: None,
         scheduler_affinity_epoch,
+        sticky_key_attempts,
     };
     candidate
 }
@@ -2218,6 +2231,7 @@ mod tests {
         );
     }
 
+    /// 验证 Pool 排序结果携带组索引、Key 索引、租约及粘性尝试预算。
     #[test]
     fn pool_scheduler_attaches_group_and_pool_metadata_to_ranked_candidates() {
         let pool_first = sample_eligible_candidate(
@@ -2267,6 +2281,7 @@ mod tests {
                 pool_key_index: Some(0),
                 pool_key_lease: None,
                 scheduler_affinity_epoch: None,
+                sticky_key_attempts: None,
             }
         );
         assert_eq!(reordered[1].orchestration.pool_key_index, Some(1));
@@ -2284,6 +2299,7 @@ mod tests {
                 pool_key_index: None,
                 pool_key_lease: None,
                 scheduler_affinity_epoch: None,
+                sticky_key_attempts: None,
             }
         );
     }
@@ -5389,6 +5405,7 @@ mod tests {
         }
     }
 
+    /// 构造仅允许指定 Key 的路由策略，供 Pool 过滤与排序测试复用。
     fn routing_policy_with_allowed_keys<const N: usize>(
         key_ids: [&str; N],
     ) -> ResolvedRoutingPolicy {
@@ -5401,6 +5418,7 @@ mod tests {
             priority_mode: RoutingSetPriorityMode::Provider,
             scheduling_mode: RoutingSchedulingMode::CacheAffinity,
             keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
             ranking_overlay: RankingOverlay {
                 allowed_keys: key_ids.into_iter().map(str::to_string).collect(),
                 ..RankingOverlay::default()

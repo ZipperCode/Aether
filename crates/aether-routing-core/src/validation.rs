@@ -245,6 +245,7 @@ mod tests {
         }
     }
 
+    /// 验证 Provider 请求阶段仍拒绝排序类动作及其新增字段。
     #[test]
     fn rejects_non_mutation_actions_in_provider_request_phase() {
         let actions = [
@@ -271,6 +272,7 @@ mod tests {
                     priority_mode: None,
                     scheduling_mode: None,
                     keep_priority_on_conversion: Some(true),
+                    sticky_key_attempts: None,
                 },
                 "set_scheduling",
             ),
@@ -285,6 +287,7 @@ mod tests {
                 RoutingAction::SetKeyPriority {
                     key_id: "key-1".to_string(),
                     priority: 1,
+                    api_format: None,
                 },
                 "set_key_priority",
             ),

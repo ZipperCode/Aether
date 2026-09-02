@@ -530,6 +530,7 @@ async fn detail_model_rows_for_client_format(
     retain_routable_model_rows(state, rows, api_format, auth_snapshot, now_unix_secs).await
 }
 
+/// 仅保留当前格式和凭据可实际路由的模型目录行；无请求级策略时沿用系统默认排序。
 async fn retain_routable_model_rows(
     state: &AppState,
     rows: Vec<StoredModelCatalogEntry>,
@@ -550,6 +551,7 @@ async fn retain_routable_model_rows(
                     None,
                     now_unix_secs,
                     false,
+                    None,
                 )
                 .await
                 .map(|candidates| (!candidates.is_empty()).then_some(row))

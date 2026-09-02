@@ -33,6 +33,7 @@ use crate::{
 use super::request::resolve_local_standard_candidate_payload_parts;
 use super::{LocalStandardCandidateAttempt, LocalStandardDecisionInput, LocalStandardSpec};
 
+/// 为标准协议候选构造执行载荷，并将路由粘性预算传入报告上下文。
 pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
     state: &AppState,
     parts: &http::request::Parts,
@@ -146,6 +147,7 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
                 client_session_affinity: input.client_session_affinity.as_ref(),
                 routing_policy: input.routing_policy.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
+                sticky_key_attempts: eligible.orchestration.sticky_key_attempts,
                 client_requested_stream: body_json
                     .get("stream")
                     .and_then(serde_json::Value::as_bool)

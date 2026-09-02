@@ -99,6 +99,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
         }
     }
 
+    /// 构造“跳过本地候选”场景的 Provider，并固定其传输与转移配置。
     fn sample_provider_catalog_provider() -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             "provider-openai-skip-local-1".to_string(),
@@ -112,7 +113,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
             false,
             false,
             None,
-            Some(2),
+            Some(1),
             None,
             Some(20.0),
             None,
@@ -120,6 +121,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
         )
     }
 
+    /// 构造“跳过本地候选”场景的 Chat Endpoint。
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
         StoredProviderCatalogEndpoint::new(
             "endpoint-openai-skip-local-1".to_string(),
@@ -134,7 +136,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
             "https://api.openai.skip.example".to_string(),
             None,
             None,
-            Some(2),
+            Some(1),
             None,
             None,
             None,
@@ -507,6 +509,7 @@ async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_ch
         }
     }
 
+    /// 构造本地运行态缺失场景的 Provider，并固定候选转移上限。
     fn sample_provider_catalog_provider() -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             "provider-openai-local-miss-1".to_string(),
@@ -520,7 +523,7 @@ async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_ch
             false,
             false,
             None,
-            Some(2),
+            Some(1),
             None,
             Some(20.0),
             None,
@@ -528,6 +531,7 @@ async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_ch
         )
     }
 
+    /// 构造本地运行态缺失场景的 Codex Endpoint。
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
         StoredProviderCatalogEndpoint::new(
             "endpoint-openai-local-miss-1".to_string(),
@@ -542,7 +546,7 @@ async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_ch
             "https://chatgpt.com/backend-api/codex".to_string(),
             None,
             None,
-            Some(2),
+            Some(1),
             None,
             None,
             None,
@@ -786,6 +790,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
         }
     }
 
+    /// 按参数构造同步故障转移 Provider，并保留每 Provider 的转移限制。
     fn sample_provider_catalog_provider(
         provider_id: &str,
         provider_name: &str,
@@ -802,7 +807,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
             false,
             false,
             None,
-            Some(2),
+            Some(1),
             None,
             Some(20.0),
             None,
@@ -810,6 +815,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
         )
     }
 
+    /// 按参数构造同步故障转移 Endpoint，用于验证候选间切换。
     fn sample_provider_catalog_endpoint(
         endpoint_id: &str,
         provider_id: &str,
@@ -828,7 +834,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
             base_url.to_string(),
             None,
             None,
-            Some(2),
+            Some(1),
             None,
             None,
             None,
@@ -837,6 +843,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
         .expect("endpoint transport should build")
     }
 
+    /// 构造带格式级全局优先级的同步故障转移 Key。
     fn sample_provider_catalog_key(
         key_id: &str,
         provider_id: &str,
@@ -970,7 +977,8 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
                             .to_string(),
                     });
 
-                if attempt == 1 {
+                // 默认粘性预算让首 Key 尝试两次；两次均失败后才进入备用候选。
+                if attempt <= 2 {
                     return Json(json!({
                         "request_id": "trace-openai-chat-local-failover-123",
                         "status_code": 401,
@@ -1125,56 +1133,62 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
         .lock()
         .expect("mutex should lock")
         .clone();
-    assert_eq!(seen_execution_runtime_requests.len(), 2);
+    // 默认总尝试数为 2：首 Key 同 Key 重试一次，再切换到只尝试一次的备用候选。
+    assert_eq!(seen_execution_runtime_requests.len(), 3);
+    for primary_request in &seen_execution_runtime_requests[..2] {
+        assert_eq!(
+            primary_request.trace_id,
+            "trace-openai-chat-local-failover-123"
+        );
+        assert_eq!(
+            primary_request.url,
+            "https://api.openai.primary.example/chat/completions"
+        );
+        assert_eq!(
+            primary_request.authorization,
+            "Bearer sk-upstream-openai-primary"
+        );
+    }
     assert_eq!(
-        seen_execution_runtime_requests[0].trace_id,
-        "trace-openai-chat-local-failover-123"
-    );
-    assert_eq!(
-        seen_execution_runtime_requests[0].url,
-        "https://api.openai.primary.example/chat/completions"
-    );
-    assert_eq!(
-        seen_execution_runtime_requests[0].authorization,
-        "Bearer sk-upstream-openai-primary"
-    );
-    assert_eq!(
-        seen_execution_runtime_requests[1].url,
+        seen_execution_runtime_requests[2].url,
         "https://api.openai.backup.example/chat/completions"
     );
     assert_eq!(
-        seen_execution_runtime_requests[1].model,
+        seen_execution_runtime_requests[2].model,
         "gpt-5-upstream-backup"
     );
     assert_eq!(
-        seen_execution_runtime_requests[1].authorization,
+        seen_execution_runtime_requests[2].authorization,
         "Bearer sk-upstream-openai-backup"
     );
     let stored_candidates = request_candidate_repository
         .list_by_request_id("trace-openai-chat-local-failover-123")
         .await
         .expect("request candidate trace should read");
-    assert_eq!(stored_candidates.len(), 2);
-    assert_eq!(stored_candidates[0].candidate_index, 0);
-    assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Failed);
-    assert_eq!(stored_candidates[0].status_code, Some(401));
-    assert_eq!(
-        stored_candidates[0].error_message.as_deref(),
-        Some("invalid auth token")
-    );
-    let failed_upstream_response = stored_candidates[0]
-        .extra_data
-        .as_ref()
-        .and_then(|value| value.get("upstream_response"))
-        .expect("failed candidate should keep its upstream response");
-    assert_eq!(failed_upstream_response["status_code"], json!(401));
-    assert_eq!(
-        failed_upstream_response["body"]["error"]["message"],
-        json!("invalid auth token")
-    );
-    assert_eq!(stored_candidates[1].candidate_index, 1);
-    assert_eq!(stored_candidates[1].status, RequestCandidateStatus::Success);
-    assert_eq!(stored_candidates[1].status_code, Some(200));
+    assert_eq!(stored_candidates.len(), 3);
+    for (retry_index, failed_candidate) in stored_candidates[..2].iter().enumerate() {
+        assert_eq!(failed_candidate.candidate_index, 0);
+        assert_eq!(failed_candidate.retry_index, retry_index as u32);
+        assert_eq!(failed_candidate.status, RequestCandidateStatus::Failed);
+        assert_eq!(failed_candidate.status_code, Some(401));
+        assert_eq!(
+            failed_candidate.error_message.as_deref(),
+            Some("invalid auth token")
+        );
+        let failed_upstream_response = failed_candidate
+            .extra_data
+            .as_ref()
+            .and_then(|value| value.get("upstream_response"))
+            .expect("failed candidate should keep its upstream response");
+        assert_eq!(failed_upstream_response["status_code"], json!(401));
+        assert_eq!(
+            failed_upstream_response["body"]["error"]["message"],
+            json!("invalid auth token")
+        );
+    }
+    assert_eq!(stored_candidates[2].candidate_index, 1);
+    assert_eq!(stored_candidates[2].status, RequestCandidateStatus::Success);
+    assert_eq!(stored_candidates[2].status_code, Some(200));
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(
@@ -1184,7 +1198,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
 
     assert_eq!(
         *execution_runtime_hits.lock().expect("mutex should lock"),
-        2
+        3
     );
     assert_eq!(*decision_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*plan_hits.lock().expect("mutex should lock"), 0);

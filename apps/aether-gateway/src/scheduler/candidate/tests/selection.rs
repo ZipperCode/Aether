@@ -55,6 +55,7 @@ async fn select_candidate(
     .await
 }
 
+/// 使用测试存储收集候选，并显式传入默认排序配置。
 async fn collect_selectable_candidates(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
     runtime_state: &AppState,
@@ -75,6 +76,7 @@ async fn collect_selectable_candidates(
         None,
         now_unix_secs,
         false,
+        None,
     )
     .await
 }

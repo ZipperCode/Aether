@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+/// 构造管理端全局模型路由预览，并使用与实际请求一致的有效排序配置。
 pub(crate) async fn build_admin_global_model_routing_payload(
     state: &AdminAppState<'_>,
     global_model_id: &str,
@@ -97,27 +98,13 @@ pub(crate) async fn build_admin_global_model_routing_payload(
             .push(key);
     }
 
-    let scheduling_mode = state
-        .read_system_config_json_value("scheduling_mode")
+    // 有效默认调度先读系统默认路由组，再回退旧系统配置键。
+    let ordering_config = crate::scheduler::config::read_scheduler_ordering_config(state.app())
         .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "cache_affinity".to_string());
-    let priority_mode = state
-        .read_system_config_json_value("provider_priority_mode")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "provider".to_string());
-    let keep_priority_on_conversion = state
-        .read_system_config_json_value("keep_priority_on_conversion")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+        .unwrap_or_default();
+    let scheduling_mode = ordering_config.scheduling_mode_str().to_string();
+    let priority_mode = ordering_config.priority_mode_str().to_string();
+    let keep_priority_on_conversion = ordering_config.keep_priority_on_conversion;
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())

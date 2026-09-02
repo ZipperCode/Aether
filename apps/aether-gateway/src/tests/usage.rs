@@ -109,6 +109,7 @@ pub(super) fn sample_local_openai_candidate_row() -> StoredMinimalCandidateSelec
     }
 }
 
+/// 构造用量测试的本地 OpenAI Provider，并固定候选转移配置。
 pub(super) fn sample_local_openai_provider() -> StoredProviderCatalogProvider {
     StoredProviderCatalogProvider::new(
         "provider-openai-usage-local-1".to_string(),
@@ -122,7 +123,7 @@ pub(super) fn sample_local_openai_provider() -> StoredProviderCatalogProvider {
         false,
         false,
         None,
-        Some(2),
+        Some(1),
         None,
         Some(20.0),
         None,
@@ -130,6 +131,7 @@ pub(super) fn sample_local_openai_provider() -> StoredProviderCatalogProvider {
     )
 }
 
+/// 构造用量测试的本地 OpenAI Chat Endpoint。
 pub(super) fn sample_local_openai_endpoint() -> StoredProviderCatalogEndpoint {
     StoredProviderCatalogEndpoint::new(
         "endpoint-openai-usage-local-1".to_string(),
@@ -144,7 +146,7 @@ pub(super) fn sample_local_openai_endpoint() -> StoredProviderCatalogEndpoint {
         "https://api.openai.example/v1".to_string(),
         None,
         None,
-        Some(2),
+        Some(1),
         None,
         None,
         None,

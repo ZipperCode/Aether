@@ -151,6 +151,7 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
         }
     }
 
+    /// 按候选 API 格式读取可用项，并传入请求级排序配置。
     async fn list_candidates_for_api_format(
         &self,
         candidate_api_format: &str,
@@ -172,6 +173,8 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
                 self.ranking_seed,
                 false,
                 self.request_operation,
+                self.routing_policy
+                    .map(SchedulerOrderingConfig::from_routing_policy),
             )
             .await?;
 
@@ -1192,6 +1195,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             || self.exhausted_api_formats.contains(&normalized_api_format)
     }
 
+    /// 将存储行解析为分页候选结果，并在最终全局排序前保留分页边界状态。
     async fn build_page_outcome_from_rows(
         &mut self,
         candidate_api_format: &str,
@@ -1317,6 +1321,9 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                     .then_some(self.client_session_affinity.as_ref())
                     .flatten(),
                 self.ranking_seed,
+                self.routing_policy
+                    .as_ref()
+                    .map(SchedulerOrderingConfig::from_routing_policy),
             )
             .await?;
         let skipped_candidates = skipped_candidates
@@ -1881,6 +1888,7 @@ mod tests {
             .is_none());
     }
 
+    /// 验证路由策略会先收集候选分页，再统一执行最终优先级排序。
     #[tokio::test]
     async fn routing_policy_collects_candidate_pages_before_final_ranking() {
         let rows = (0..300)
@@ -1911,6 +1919,7 @@ mod tests {
             priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
             scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
             keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
             ranking_overlay: Default::default(),
             mutation_plan: Default::default(),
             pool_policy_overrides: Default::default(),
@@ -1950,6 +1959,7 @@ mod tests {
             .is_none());
     }
 
+    /// 验证无显式路由策略时按 API 格式分页仍受最大扫描行数约束。
     #[tokio::test]
     async fn routing_fallback_uses_bounded_api_format_pages() {
         let repository = Arc::new(PagedFallbackRepository::new(
@@ -1974,6 +1984,7 @@ mod tests {
             priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
             scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
             keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
             ranking_overlay: Default::default(),
             mutation_plan: Default::default(),
             pool_policy_overrides: Default::default(),
@@ -2644,6 +2655,7 @@ mod tests {
         );
     }
 
+    /// 验证固定排序且保留转换优先级时，Codex Responses 候选保持首选。
     #[tokio::test]
     async fn fixed_order_prefers_codex_responses_when_conversion_keeps_priority() {
         let mut codex = standard_candidate_row("provider-codex", "openai:responses", 0);
@@ -2684,14 +2696,15 @@ mod tests {
                 candidate_repository,
             )
             .with_encryption_key_for_tests("development-key")
+            // 旧配置故意与路由策略相反，用于证明已解析策略是排序唯一来源。
             .with_system_config_values_for_tests([
                 (
                     "scheduling_mode".to_string(),
-                    serde_json::json!("fixed_order"),
+                    serde_json::json!("cache_affinity"),
                 ),
                 (
                     "keep_priority_on_conversion".to_string(),
-                    serde_json::json!(true),
+                    serde_json::json!(false),
                 ),
             ]);
         let app = AppState::new()
@@ -2708,7 +2721,8 @@ mod tests {
             resolved_model: "gpt-5.4-mini".to_string(),
             priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
             scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
-            keep_priority_on_conversion: false,
+            keep_priority_on_conversion: true,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
             ranking_overlay: Default::default(),
             mutation_plan: Default::default(),
             pool_policy_overrides: Default::default(),

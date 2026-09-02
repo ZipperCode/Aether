@@ -9,8 +9,6 @@ pub trait AiAvailableCandidatePersistencePort: Send + Sync {
     type ExtraData: Clone + Send + Sync;
     type Error: Send;
 
-    fn attempt_slot_count(&self, candidate: &Self::Candidate) -> u32;
-
     fn build_extra_data(&self, candidate: &Self::Candidate) -> Option<Self::ExtraData>;
 
     fn generate_candidate_id(&self) -> String;
@@ -35,6 +33,7 @@ pub trait AiAvailableCandidatePersistencePort: Send + Sync {
     ) -> Self::Attempt;
 }
 
+/// 持久化可用候选并为每个候选只生成一次初始尝试；同 Key 重试由执行阶段按需派生。
 pub async fn run_ai_available_candidate_persistence<Port>(
     port: &Port,
     candidates: Vec<Port::Candidate>,
@@ -42,50 +41,26 @@ pub async fn run_ai_available_candidate_persistence<Port>(
 where
     Port: AiAvailableCandidatePersistencePort,
 {
-    let total_attempts = candidates
-        .iter()
-        .map(|candidate| port.attempt_slot_count(candidate) as usize)
-        .sum();
-    let mut materialized = Vec::with_capacity(total_attempts);
+    // 每个候选只物化一次，粘性预算不会扩大前置候选集合。
+    let mut materialized = Vec::with_capacity(candidates.len());
 
     for (candidate_index, candidate) in candidates.into_iter().enumerate() {
         let candidate_index = candidate_index as u32;
-        let attempt_slots = port.attempt_slot_count(&candidate).max(1);
         let extra_data = port.build_extra_data(&candidate);
-        let mut owned_candidate = Some(candidate);
-
-        for retry_index in 0..attempt_slots {
-            let candidate = owned_candidate
-                .as_ref()
-                .expect("candidate should remain available until final retry");
-            let generated_candidate_id = port.generate_candidate_id();
-            let candidate_id = if port.should_persist_available_candidate(candidate) {
-                port.persist_available_candidate(
-                    candidate,
-                    candidate_index,
-                    retry_index,
-                    generated_candidate_id.as_str(),
-                    extra_data.clone(),
-                )
-                .await?
-            } else {
-                generated_candidate_id
-            };
-
-            let candidate = if retry_index + 1 == attempt_slots {
-                owned_candidate
-                    .take()
-                    .expect("final retry should consume owned candidate")
-            } else {
-                candidate.clone()
-            };
-            materialized.push(port.build_attempt(
-                candidate,
+        let generated_candidate_id = port.generate_candidate_id();
+        let candidate_id = if port.should_persist_available_candidate(&candidate) {
+            port.persist_available_candidate(
+                &candidate,
                 candidate_index,
-                retry_index,
-                candidate_id,
-            ));
-        }
+                0,
+                generated_candidate_id.as_str(),
+                extra_data,
+            )
+            .await?
+        } else {
+            generated_candidate_id
+        };
+        materialized.push(port.build_attempt(candidate, candidate_index, 0, candidate_id));
     }
 
     Ok(materialized)
@@ -177,7 +152,6 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestCandidate {
         id: &'static str,
-        attempt_slots: u32,
         persist: bool,
     }
 
@@ -215,10 +189,6 @@ mod tests {
         type Attempt = TestAttempt;
         type ExtraData = String;
         type Error = std::convert::Infallible;
-
-        fn attempt_slot_count(&self, candidate: &Self::Candidate) -> u32 {
-            candidate.attempt_slots
-        }
 
         fn build_extra_data(&self, candidate: &Self::Candidate) -> Option<Self::ExtraData> {
             Some(format!("extra:{}", candidate.id))
@@ -298,8 +268,9 @@ mod tests {
         }
     }
 
+    /// 验证每个可用候选只预先持久化一个尝试，同 Key 重试留给执行循环按需派生。
     #[tokio::test]
-    async fn available_persistence_expands_candidates_into_retry_attempts() {
+    async fn available_persistence_materializes_one_attempt_per_candidate() {
         let port = TestPort::default();
 
         let attempts = run_ai_available_candidate_persistence(
@@ -307,12 +278,10 @@ mod tests {
             vec![
                 TestCandidate {
                     id: "a",
-                    attempt_slots: 2,
                     persist: true,
                 },
                 TestCandidate {
                     id: "b",
-                    attempt_slots: 1,
                     persist: false,
                 },
             ],
@@ -320,6 +289,7 @@ mod tests {
         .await
         .unwrap();
 
+        // 同 Key 重试不预先物化，失败后由执行循环按需派生。
         assert_eq!(
             attempts,
             [
@@ -330,25 +300,16 @@ mod tests {
                     candidate_id: "stored-candidate-1".to_string(),
                 },
                 TestAttempt {
-                    id: "a",
-                    candidate_index: 0,
-                    retry_index: 1,
-                    candidate_id: "stored-candidate-2".to_string(),
-                },
-                TestAttempt {
                     id: "b",
                     candidate_index: 1,
                     retry_index: 0,
-                    candidate_id: "candidate-3".to_string(),
+                    candidate_id: "candidate-2".to_string(),
                 },
             ]
         );
         assert_eq!(
             port.calls.lock().unwrap().as_slice(),
-            [
-                "available:a:0:0:candidate-1:extra:a",
-                "available:a:0:1:candidate-2:extra:a",
-            ]
+            ["available:a:0:0:candidate-1:extra:a"]
         );
     }
 

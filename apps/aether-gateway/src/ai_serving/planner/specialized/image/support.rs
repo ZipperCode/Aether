@@ -27,6 +27,7 @@ use crate::ai_serving::{
 };
 use crate::client_session_affinity::client_session_affinity_from_parts;
 use crate::clock::current_unix_secs;
+use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::{AppState, GatewayError};
 use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
 
@@ -112,6 +113,7 @@ fn resolve_local_openai_image_auth_context(
     resolve_local_decision_execution_runtime_auth_context(decision)
 }
 
+/// 按请求路由策略列出 OpenAI 图片初始候选尝试。
 pub(super) async fn list_local_openai_image_candidate_attempts(
     state: &AppState,
     trace_id: &str,
@@ -135,6 +137,10 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
                 input.client_session_affinity.as_ref(),
                 current_unix_secs(),
                 false,
+                input
+                    .routing_policy
+                    .as_ref()
+                    .map(SchedulerOrderingConfig::from_routing_policy),
             )
             .await
         {
@@ -186,6 +192,7 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
     Some(attempts)
 }
 
+/// 构造 OpenAI 图片动态候选来源，供失败后继续按策略取下一候选。
 pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
     state: &'a AppState,
     trace_id: &str,
@@ -209,6 +216,10 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
                 input.client_session_affinity.as_ref(),
                 current_unix_secs(),
                 false,
+                input
+                    .routing_policy
+                    .as_ref()
+                    .map(SchedulerOrderingConfig::from_routing_policy),
             )
             .await
         {

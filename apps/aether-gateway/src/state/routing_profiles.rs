@@ -4,11 +4,87 @@ use aether_data_contracts::repository::routing_profiles::{
     StoredRoutingGroup, StoredRoutingGroupBinding, StoredRoutingGroupVersion,
     UpdateRoutingGroupBindingRecord, UpdateRoutingGroupRecord,
 };
+use aether_routing_core::RoutingGroupConfig;
 use std::sync::Arc;
+use tracing::warn;
 
 use super::{AppState, GatewayError};
 
+/// 从旧配置引导创建的系统默认路由组基础名称；冲突时追加随机后缀。
+const BOOTSTRAP_SYSTEM_DEFAULT_ROUTING_GROUP_NAME: &str = "system-default";
+
 impl AppState {
+    /// 确保存在系统默认路由组；缺失时尽力从旧调度配置创建并发布。
+    /// 无路由存储、只读存储或已有默认组时返回空，不阻断进程启动。
+    pub async fn ensure_system_default_routing_group(
+        &self,
+    ) -> Result<Option<StoredRoutingGroup>, std::io::Error> {
+        self.ensure_system_default_routing_group_inner()
+            .await
+            .map_err(|err| std::io::Error::other(format!("{err:?}")))
+    }
+
+    /// 执行系统默认组的幂等创建，并保留旧调度配置的当前行为作为初始策略。
+    pub(crate) async fn ensure_system_default_routing_group_inner(
+        &self,
+    ) -> Result<Option<StoredRoutingGroup>, GatewayError> {
+        if !self.has_routing_group_data_reader() {
+            return Ok(None);
+        }
+        if self
+            .find_routing_group(RoutingGroupLookupKey::SystemDefault)
+            .await?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        if !self.has_routing_group_data_writer() {
+            warn!(
+                event_name = "routing_system_default_bootstrap_skipped",
+                log_type = "event",
+                "no system default routing group exists and routing storage is read-only; scheduler falls back to legacy system config"
+            );
+            return Ok(None);
+        }
+
+        let legacy = crate::scheduler::config::read_legacy_scheduler_ordering_config(self).await?;
+        let config = RoutingGroupConfig {
+            default_policy: legacy.to_routing_default_policy(),
+            ..RoutingGroupConfig::default()
+        };
+        let config_json = serde_json::to_value(config)
+            .map_err(|err| GatewayError::Internal(format!("serialize routing config: {err}")))?;
+
+        let name = if self
+            .find_routing_group(RoutingGroupLookupKey::Name(
+                BOOTSTRAP_SYSTEM_DEFAULT_ROUTING_GROUP_NAME,
+            ))
+            .await?
+            .is_some()
+        {
+            format!(
+                "{BOOTSTRAP_SYSTEM_DEFAULT_ROUTING_GROUP_NAME}-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            )
+        } else {
+            BOOTSTRAP_SYSTEM_DEFAULT_ROUTING_GROUP_NAME.to_string()
+        };
+        let now = crate::clock::current_unix_secs() as i64;
+        self.create_routing_group(CreateRoutingGroupRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            description: Some("自动从旧版调度配置迁移生成的系统默认策略".to_string()),
+            enabled: true,
+            is_system_default: true,
+            config_json,
+            version: 1,
+            created_at: now,
+            updated_at: now,
+            published_at: Some(now),
+        })
+        .await
+    }
+
     pub(crate) fn has_routing_group_data_reader(&self) -> bool {
         self.data.has_routing_group_reader()
     }

@@ -3,7 +3,7 @@ use aether_ai_serving::{
     AiCandidateRankingPort, AiRankableCandidateParts, AiRankingContextConfig,
     AiRankingSchedulingMode,
 };
-use aether_routing_core::{ResolvedRoutingPolicy, RoutingSchedulingMode, RoutingSetPriorityMode};
+use aether_routing_core::ResolvedRoutingPolicy;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -184,38 +184,18 @@ fn ai_ranking_scheduling_mode(mode: SchedulerSchedulingMode) -> AiRankingSchedul
     }
 }
 
+/// 解析请求排序配置：已有路由策略时以其为唯一来源，否则读取系统默认组及旧配置兜底。
 pub(crate) async fn scheduler_ordering_config_for_routing_policy(
     state: PlannerAppState<'_>,
     routing_policy: Option<&ResolvedRoutingPolicy>,
 ) -> SchedulerOrderingConfig {
-    let system_config = read_scheduler_ordering_config_or_default(state).await;
     match routing_policy {
-        Some(policy) => {
-            let mut config = scheduler_ordering_config_from_routing_policy(policy);
-            config.keep_priority_on_conversion |= system_config.keep_priority_on_conversion;
-            config
-        }
-        None => system_config,
+        Some(policy) => SchedulerOrderingConfig::from_routing_policy(policy),
+        None => read_scheduler_ordering_config_or_default(state).await,
     }
 }
 
-fn scheduler_ordering_config_from_routing_policy(
-    policy: &ResolvedRoutingPolicy,
-) -> SchedulerOrderingConfig {
-    SchedulerOrderingConfig {
-        priority_mode: match policy.priority_mode {
-            RoutingSetPriorityMode::Provider => SchedulerPriorityMode::Provider,
-            RoutingSetPriorityMode::GlobalKey => SchedulerPriorityMode::GlobalKey,
-        },
-        scheduling_mode: match policy.scheduling_mode {
-            RoutingSchedulingMode::FixedOrder => SchedulerSchedulingMode::FixedOrder,
-            RoutingSchedulingMode::CacheAffinity => SchedulerSchedulingMode::CacheAffinity,
-            RoutingSchedulingMode::LoadBalance => SchedulerSchedulingMode::LoadBalance,
-        },
-        keep_priority_on_conversion: policy.keep_priority_on_conversion,
-    }
-}
-
+/// 将模型路由覆盖应用到候选优先级，格式级 Key 覆盖优先于全局 Key 值。
 fn routing_overlaid_candidate(
     routing_policy: Option<&ResolvedRoutingPolicy>,
     kind: LocalExecutionCandidateKind,
@@ -231,14 +211,26 @@ fn routing_overlaid_candidate(
     let overlaid_key_priority = match kind {
         LocalExecutionCandidateKind::SingleKey => policy
             .ranking_overlay
-            .key_priority_overrides
-            .get(candidate.key_id.as_str()),
+            .key_priority_override_matching_format(candidate.key_id.as_str(), |format| {
+                crate::ai_serving::api_format_alias_matches(
+                    format,
+                    candidate.endpoint_api_format.as_str(),
+                )
+            })
+            .or_else(|| {
+                policy
+                    .ranking_overlay
+                    .key_priority_overrides
+                    .get(candidate.key_id.as_str())
+                    .copied()
+            }),
         LocalExecutionCandidateKind::PoolGroup => policy
             .ranking_overlay
             .pool_priority_overrides
-            .get(candidate.provider_id.as_str()),
+            .get(candidate.provider_id.as_str())
+            .copied(),
     };
-    if let Some(overlaid_key_priority) = overlaid_key_priority.copied() {
+    if let Some(overlaid_key_priority) = overlaid_key_priority {
         overlaid.key_internal_priority = overlaid_key_priority;
         overlaid.key_global_priority_for_format = Some(overlaid_key_priority);
     }
@@ -363,6 +355,7 @@ mod tests {
         }
     }
 
+    /// 验证未配置覆盖时保留候选自身的 Provider、Key 和格式优先级。
     #[test]
     fn routing_policy_priorities_fall_back_to_candidate_priorities() {
         let mut candidate = sample_candidate("endpoint-1", "key-1");
@@ -378,6 +371,7 @@ mod tests {
             priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
             scheduling_mode: aether_routing_core::RoutingSchedulingMode::CacheAffinity,
             keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
             ranking_overlay: aether_routing_core::RankingOverlay::default(),
             mutation_plan: Default::default(),
             pool_policy_overrides: BTreeMap::new(),
@@ -395,8 +389,9 @@ mod tests {
         assert_eq!(overlaid.key_global_priority_for_format, Some(2));
     }
 
+    /// 验证已解析路由策略是转换优先级的唯一全局来源，不再混入旧系统开关。
     #[tokio::test]
-    async fn routing_policy_inherits_global_conversion_priority_override() {
+    async fn routing_policy_ignores_legacy_global_conversion_priority_override() {
         let data_state = GatewayDataState::default().with_system_config_values_for_tests([(
             "keep_priority_on_conversion".to_string(),
             json!(true),
@@ -413,6 +408,7 @@ mod tests {
             priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
             scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
             keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
             ranking_overlay: Default::default(),
             mutation_plan: Default::default(),
             pool_policy_overrides: Default::default(),
@@ -429,9 +425,13 @@ mod tests {
             ordering.scheduling_mode,
             crate::scheduler::config::SchedulerSchedulingMode::FixedOrder
         );
-        assert!(ordering.keep_priority_on_conversion);
+        assert!(
+            !ordering.keep_priority_on_conversion,
+            "a resolved routing policy must not inherit the legacy system-config flag"
+        );
     }
 
+    /// 验证 Pool 组在全局 Key 模式下使用 Pool 优先级槽，而非代表 Key 的格式优先级。
     #[test]
     fn routing_policy_uses_pool_priority_for_pool_group_global_key_slot() {
         let mut candidate = sample_candidate("endpoint-1", "representative-key");
@@ -447,6 +447,7 @@ mod tests {
             priority_mode: aether_routing_core::RoutingSetPriorityMode::GlobalKey,
             scheduling_mode: aether_routing_core::RoutingSchedulingMode::CacheAffinity,
             keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
             ranking_overlay: aether_routing_core::RankingOverlay {
                 pool_priority_overrides: BTreeMap::from([("provider-1".to_string(), 4)]),
                 key_priority_overrides: BTreeMap::from([("representative-key".to_string(), 1)]),

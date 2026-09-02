@@ -1782,6 +1782,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .block_on(run())
 }
 
+/// 组合网关运行态并启动服务；数据就绪后尽力引导系统默认路由组。
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     if let Some(command) = args.command.as_ref() {
@@ -2096,6 +2097,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     state.bootstrap_admin_from_env().await?;
+    match state.ensure_system_default_routing_group().await {
+        Ok(Some(group)) => {
+            info!(
+                group_id = %group.id,
+                group_name = %group.name,
+                "created system default routing group from legacy scheduler config"
+            );
+        }
+        Ok(None) => {}
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to bootstrap system default routing group; scheduler falls back to legacy system config"
+            );
+        }
+    }
     match state.prewarm_chat_pii_redaction_runtime_config().await {
         Ok(enabled) => {
             info!(

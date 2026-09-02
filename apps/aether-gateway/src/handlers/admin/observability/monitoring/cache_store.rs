@@ -261,19 +261,14 @@ async fn list_admin_monitoring_cache_affinity_records_matching(
     Ok(records)
 }
 
+/// 构造监控缓存快照，并记录系统默认路由组解析出的实际调度模式。
 pub(super) async fn build_admin_monitoring_cache_snapshot(
     state: &AdminAppState<'_>,
 ) -> Result<AdminMonitoringCacheSnapshot, GatewayError> {
-    let scheduling_mode = state
-        .read_system_config_json_value("scheduling_mode")
-        .await?
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "cache_affinity".to_string());
-    let provider_priority_mode = state
-        .read_system_config_json_value("provider_priority_mode")
-        .await?
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "provider".to_string());
+    let ordering_config =
+        crate::scheduler::config::read_scheduler_ordering_config(state.app()).await?;
+    let scheduling_mode = ordering_config.scheduling_mode_str().to_string();
+    let provider_priority_mode = ordering_config.priority_mode_str().to_string();
 
     let now = chrono::Utc::now();
     let usage_summary = if state.has_usage_data_reader() {

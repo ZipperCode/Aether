@@ -8,9 +8,12 @@ use crate::constants::{
     API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS, API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS,
 };
 use crate::scheduler::candidate::SchedulerSkippedCandidate;
+use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::GatewayError;
 
 impl<'a> PlannerAppState<'a> {
+    /// 列出可选候选；显式排序配置来自请求路由策略，空值回退运行态默认策略。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates(
         self,
         api_format: &str,
@@ -21,6 +24,7 @@ impl<'a> PlannerAppState<'a> {
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
         enable_model_directives: bool,
+        ordering_config: Option<SchedulerOrderingConfig>,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
         crate::scheduler::candidate::list_selectable_candidates(
             self.app().data.as_ref(),
@@ -33,10 +37,13 @@ impl<'a> PlannerAppState<'a> {
             client_session_affinity,
             now_unix_secs,
             enable_model_directives,
+            ordering_config,
         )
         .await
     }
 
+    /// 列出可选候选及跳过原因，并把请求排序配置传递到统一预选器。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates_with_skip_reasons(
         self,
         api_format: &str,
@@ -47,6 +54,7 @@ impl<'a> PlannerAppState<'a> {
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
         enable_model_directives: bool,
+        ordering_config: Option<SchedulerOrderingConfig>,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -64,10 +72,13 @@ impl<'a> PlannerAppState<'a> {
             now_unix_secs,
             enable_model_directives,
             None,
+            ordering_config,
         )
         .await
     }
 
+    /// 按请求操作列出候选及跳过原因；并发额度短暂占满时在限定窗口内重读。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates_with_skip_reasons_for_request_operation(
         self,
         api_format: &str,
@@ -79,6 +90,7 @@ impl<'a> PlannerAppState<'a> {
         now_unix_secs: u64,
         enable_model_directives: bool,
         request_operation: Option<&str>,
+        ordering_config: Option<SchedulerOrderingConfig>,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -103,6 +115,7 @@ impl<'a> PlannerAppState<'a> {
                 attempt_now_unix_secs,
                 enable_model_directives,
                 request_operation,
+                ordering_config,
             )
             .await?;
 
@@ -123,6 +136,8 @@ impl<'a> PlannerAppState<'a> {
         }
     }
 
+    /// 对调用方枚举出的候选应用权限、亲和和请求级排序配置。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
         self,
         api_format: &str,
@@ -132,6 +147,7 @@ impl<'a> PlannerAppState<'a> {
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
+        ordering_config: Option<SchedulerOrderingConfig>,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -148,10 +164,13 @@ impl<'a> PlannerAppState<'a> {
             auth_snapshot,
             client_session_affinity,
             now_unix_secs,
+            ordering_config,
         )
         .await
     }
 
+    /// 在没有请求模型名时按独占能力选择候选，并沿用请求级或系统默认排序。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates_for_required_capability_without_requested_model(
         self,
         candidate_api_format: &str,
@@ -160,6 +179,7 @@ impl<'a> PlannerAppState<'a> {
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
+        ordering_config: Option<SchedulerOrderingConfig>,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
         let wait_timeout = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS);
         let wait_interval = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS.max(1));
@@ -176,6 +196,7 @@ impl<'a> PlannerAppState<'a> {
                 auth_snapshot,
                 client_session_affinity,
                 attempt_now_unix_secs,
+                ordering_config,
             )
             .await?;
 

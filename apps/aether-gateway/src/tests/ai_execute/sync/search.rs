@@ -127,6 +127,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         }
     }
 
+    /// 构造搜索同步测试的 Provider，并固定候选转移配置。
     fn provider() -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             "provider-codex-search-1".to_string(),
@@ -140,7 +141,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
             false,
             false,
             None,
-            Some(2),
+            Some(1),
             None,
             Some(900.0),
             None,
@@ -148,6 +149,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         )
     }
 
+    /// 构造搜索同步测试的 OpenAI Search Endpoint。
     fn endpoint() -> StoredProviderCatalogEndpoint {
         StoredProviderCatalogEndpoint::new(
             "endpoint-codex-search-1".to_string(),
@@ -162,7 +164,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
             "https://chatgpt.com/backend-api/codex".to_string(),
             None,
             None,
-            Some(2),
+            Some(1),
             None,
             None,
             None,
@@ -171,6 +173,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         .expect("endpoint transport should build")
     }
 
+    /// 构造搜索同步测试使用的格式受限 Key。
     fn key() -> StoredProviderCatalogKey {
         let auth_config = encrypt_python_fernet_plaintext(
             DEVELOPMENT_ENCRYPTION_KEY,
@@ -570,9 +573,11 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         .filter(|plan| plan["request_id"] == "trace-search-failover-1")
         .map(|plan| plan["provider_id"].clone())
         .collect::<Vec<_>>();
+    // 默认总尝试数为 2：首 Provider 同 Key 重试一次后才转移到下一 Provider。
     assert_eq!(
         failover_plans,
         vec![
+            json!("provider-codex-search-1"),
             json!("provider-codex-search-1"),
             json!("provider-codex-search-2")
         ]
@@ -581,17 +586,16 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         .list_by_request_id("trace-search-failover-1")
         .await
         .expect("failover request candidates should read");
-    assert_eq!(failover_candidates.len(), 2);
+    assert_eq!(failover_candidates.len(), 3);
+    for failed_candidate in &failover_candidates[..2] {
+        assert_eq!(failed_candidate.status, RequestCandidateStatus::Failed);
+        assert_eq!(failed_candidate.status_code, Some(500));
+    }
     assert_eq!(
-        failover_candidates[0].status,
-        RequestCandidateStatus::Failed
-    );
-    assert_eq!(failover_candidates[0].status_code, Some(500));
-    assert_eq!(
-        failover_candidates[1].status,
+        failover_candidates[2].status,
         RequestCandidateStatus::Success
     );
-    assert_eq!(failover_candidates[1].status_code, Some(200));
+    assert_eq!(failover_candidates[2].status_code, Some(200));
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

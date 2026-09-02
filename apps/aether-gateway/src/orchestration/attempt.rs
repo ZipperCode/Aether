@@ -1,8 +1,9 @@
+use aether_ai_serving::{AiExecutionAttempt, STICKY_KEY_ATTEMPTS_REPORT_FIELD};
+use aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS;
 use aether_runtime_state::RuntimeLockLease;
 use aether_scheduler_core::parse_request_candidate_report_context;
 use serde_json::Value;
-
-use crate::provider_transport::GatewayProviderTransportSnapshot;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExecutionAttemptIdentity {
@@ -27,11 +28,14 @@ impl ExecutionAttemptIdentity {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// 从报告上下文恢复的候选编排元数据，供 Pool、亲和和粘性重试共同使用。
 pub(crate) struct LocalExecutionCandidateMetadata {
     pub(crate) candidate_group_id: Option<String>,
     pub(crate) pool_key_index: Option<u32>,
     pub(crate) pool_key_lease: Option<RuntimeLockLease>,
     pub(crate) scheduler_affinity_epoch: Option<u64>,
+    /// 本请求生效的路由粘性总尝试数；为空时使用策略默认值。
+    pub(crate) sticky_key_attempts: Option<u32>,
 }
 
 pub(crate) const SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD: &str = "scheduler_affinity_epoch";
@@ -41,6 +45,9 @@ pub(crate) const POOL_KEY_LEASE_OWNER_REPORT_FIELD: &str = "pool_key_lease_owner
 pub(crate) const POOL_KEY_LEASE_TOKEN_REPORT_FIELD: &str = "pool_key_lease_token";
 pub(crate) const POOL_KEY_LEASE_FENCING_REPORT_FIELD: &str = "pool_key_lease_fencing_token";
 pub(crate) const POOL_KEY_LEASE_TTL_MS_REPORT_FIELD: &str = "pool_key_lease_ttl_ms";
+
+/// Pool Key 用 `pool_key_index * STRIDE + retry_index` 编码序号，保证组内顺序不冲突。
+pub(crate) const POOL_KEY_RETRY_INDEX_STRIDE: u32 = 100;
 
 pub(crate) fn attempt_identity_from_report_context(
     report_context: Option<&Value>,
@@ -55,6 +62,7 @@ pub(crate) fn attempt_identity_from_report_context(
     })
 }
 
+/// 从报告上下文读取 Pool 分组、租约、亲和纪元和粘性尝试预算。
 pub(crate) fn local_execution_candidate_metadata_from_report_context(
     report_context: Option<&Value>,
 ) -> LocalExecutionCandidateMetadata {
@@ -72,6 +80,10 @@ pub(crate) fn local_execution_candidate_metadata_from_report_context(
         scheduler_affinity_epoch: report_context
             .and_then(|value| value.get(SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD))
             .and_then(Value::as_u64),
+        sticky_key_attempts: report_context
+            .and_then(|value| value.get(STICKY_KEY_ATTEMPTS_REPORT_FIELD))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
     }
 }
 
@@ -140,58 +152,43 @@ fn pool_key_lease_from_report_context(report_context: Option<&Value>) -> Option<
     })
 }
 
-pub(crate) fn build_local_attempt_identities(
-    candidate_index: u32,
-    transport: &GatewayProviderTransportSnapshot,
-) -> Vec<ExecutionAttemptIdentity> {
-    let attempt_slots = local_attempt_slot_count(transport);
-    (0..attempt_slots)
-        .map(|retry_index| ExecutionAttemptIdentity::new(candidate_index, retry_index))
-        .collect()
+/// 计算下一次同 Key 尝试的重试序号；候选预算耗尽时返回空。
+/// 只有排序第一的候选可重试，后续候选各执行一次；`sticky_key_attempts` 表示总尝试数，
+/// `0` 和 `1` 均不产生重试。Pool 内也只有第一个 Key 可重试，且序号不得越过 Key 步长。
+pub(crate) fn next_same_key_retry_index(
+    identity: ExecutionAttemptIdentity,
+    sticky_key_attempts: Option<u32>,
+) -> Option<u32> {
+    if identity.candidate_index != 0 {
+        return None;
+    }
+    let pool_limit = match identity.pool_key_index {
+        None => u32::MAX,
+        Some(0) => POOL_KEY_RETRY_INDEX_STRIDE,
+        Some(_) => return None,
+    };
+    let budget = sticky_key_attempts.unwrap_or(DEFAULT_STICKY_KEY_ATTEMPTS);
+    let attempts_so_far = identity.retry_index.checked_add(1)?;
+    if attempts_so_far >= budget || attempts_so_far >= pool_limit {
+        return None;
+    }
+    Some(attempts_so_far)
 }
 
-pub(crate) fn local_attempt_slot_count(transport: &GatewayProviderTransportSnapshot) -> u32 {
-    local_attempt_slots_from_transport(transport).unwrap_or(1)
-}
-
-/// For endpoint/provider table fields, `2` is the legacy admin default and is
-/// treated as "not explicitly configured" so existing local-execution behaviour
-/// (one attempt slot per candidate) stays unchanged. Values `0`, `1`, and `>2`
-/// are treated as explicit.
-const LEGACY_DEFAULT_MAX_RETRIES: u32 = 2;
-
-/// Upper bound on local attempt slots. This is intentionally stricter than
-/// admin max_retries validation to prevent unbounded pre-materialization from
-/// arbitrarily large JSON config values.
-const MAX_LOCAL_ATTEMPT_SLOTS: u32 = 99;
-
-fn local_attempt_slots_from_transport(transport: &GatewayProviderTransportSnapshot) -> Option<u32> {
-    let rules = transport
-        .provider
-        .config
-        .as_ref()
-        .and_then(|config| config.get("failover_rules"))
-        .and_then(Value::as_object);
-
-    rules
-        .and_then(|value| value.get("max_retries"))
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .or_else(|| {
-            transport
-                .endpoint
-                .max_retries
-                .and_then(|value| u32::try_from(value).ok())
-                .filter(|&value| value != LEGACY_DEFAULT_MAX_RETRIES)
-        })
-        .or_else(|| {
-            transport
-                .provider
-                .max_retries
-                .and_then(|value| u32::try_from(value).ok())
-                .filter(|&value| value != LEGACY_DEFAULT_MAX_RETRIES)
-        })
-        .map(|value| value.clamp(1, MAX_LOCAL_ATTEMPT_SLOTS))
+/// 候选级失败后从报告上下文读取身份和预算，按需派生下一次同 Key 尝试及新候选 ID。
+pub(crate) fn next_same_key_retry_attempt<A: AiExecutionAttempt>(attempt: &A) -> Option<A> {
+    let owned_report_context = attempt
+        .report_context_ref()
+        .is_none()
+        .then(|| attempt.report_context())
+        .flatten();
+    let report_context = attempt
+        .report_context_ref()
+        .or(owned_report_context.as_ref());
+    let identity = attempt_identity_from_report_context(report_context)?;
+    let metadata = local_execution_candidate_metadata_from_report_context(report_context);
+    let retry_index = next_same_key_retry_index(identity, metadata.sticky_key_attempts)?;
+    attempt.with_same_key_retry(retry_index, Uuid::new_v4().to_string())
 }
 
 #[cfg(test)]
@@ -199,275 +196,147 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        attempt_identity_from_report_context, build_local_attempt_identities,
-        local_execution_candidate_metadata_from_report_context, ExecutionAttemptIdentity,
-        LocalExecutionCandidateMetadata,
+        attempt_identity_from_report_context,
+        local_execution_candidate_metadata_from_report_context, next_same_key_retry_attempt,
+        next_same_key_retry_index, ExecutionAttemptIdentity, LocalExecutionCandidateMetadata,
+        POOL_KEY_RETRY_INDEX_STRIDE,
     };
-    use crate::provider_transport::snapshot::{
-        GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
-        GatewayProviderTransportProvider, GatewayProviderTransportSnapshot,
-    };
+    use aether_ai_serving::{AiExecutionAttempt, AiSyncAttempt};
     use aether_runtime_state::RuntimeLockLease;
 
-    fn sample_transport(
-        provider_max_retries: Option<i32>,
-        endpoint_max_retries: Option<i32>,
-        provider_config: Option<serde_json::Value>,
-    ) -> GatewayProviderTransportSnapshot {
-        GatewayProviderTransportSnapshot {
-            provider: GatewayProviderTransportProvider {
-                id: "provider-1".to_string(),
-                name: "OpenAI".to_string(),
-                provider_type: "llm".to_string(),
-                website: None,
-                is_active: true,
-                keep_priority_on_conversion: false,
-                enable_format_conversion: true,
-                concurrent_limit: None,
-                max_retries: provider_max_retries,
-                proxy: None,
-                request_timeout_secs: None,
-                stream_first_byte_timeout_secs: None,
-                config: provider_config,
-            },
-            endpoint: GatewayProviderTransportEndpoint {
-                id: "endpoint-1".to_string(),
-                provider_id: "provider-1".to_string(),
-                api_format: "openai:chat".to_string(),
-                api_family: Some("openai".to_string()),
-                endpoint_kind: Some("chat".to_string()),
-                is_active: true,
-                base_url: "https://example.com".to_string(),
-                header_rules: None,
-                body_rules: None,
-                max_retries: endpoint_max_retries,
-                custom_path: None,
-                config: None,
-                format_acceptance_config: None,
-                proxy: None,
-            },
-            key: GatewayProviderTransportKey {
-                id: "key-1".to_string(),
-                provider_id: "provider-1".to_string(),
-                name: "primary".to_string(),
-                auth_type: "bearer".to_string(),
-                is_active: true,
-                api_formats: None,
-                auth_type_by_format: None,
-                allow_auth_channel_mismatch_formats: None,
+    /// 验证缺省预算为两次总尝试，即首候选只重试一次。
+    #[test]
+    fn first_candidate_defaults_to_one_same_key_retry() {
+        assert_eq!(
+            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 0), None),
+            Some(1)
+        );
+        assert_eq!(
+            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 1), None),
+            None
+        );
+    }
 
-                allowed_models: None,
-                capabilities: None,
-                rate_multipliers: None,
-                global_priority_by_format: None,
-                expires_at_unix_secs: None,
-                proxy: None,
-                fingerprint: None,
-                upstream_metadata: None,
-                decrypted_api_key: "secret".to_string(),
-                decrypted_auth_config: None,
-            },
+    /// 验证显式预算直接控制首候选总尝试数，且普通候选不额外截断大预算。
+    #[test]
+    fn first_candidate_uses_policy_sticky_key_attempts_without_upper_bound() {
+        assert_eq!(
+            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 2), Some(3)),
+            None
+        );
+        assert_eq!(
+            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 1), Some(3)),
+            Some(2)
+        );
+        assert_eq!(
+            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 4_999), Some(10_000)),
+            Some(5_000)
+        );
+    }
+
+    /// 验证预算为零或一时均只执行初始尝试。
+    #[test]
+    fn zero_and_one_mean_single_attempt() {
+        assert_eq!(
+            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 0), Some(0)),
+            None
+        );
+        assert_eq!(
+            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 0), Some(1)),
+            None
+        );
+    }
+
+    /// 验证进入故障转移后的非首候选不会停留在同一 Key 重试。
+    #[test]
+    fn failover_candidates_never_retry_on_the_same_key() {
+        for candidate_index in 1..5 {
+            assert_eq!(
+                next_same_key_retry_index(ExecutionAttemptIdentity::new(candidate_index, 0), None),
+                None
+            );
+            assert_eq!(
+                next_same_key_retry_index(
+                    ExecutionAttemptIdentity::new(candidate_index, 0),
+                    Some(50)
+                ),
+                None
+            );
         }
     }
 
+    /// 验证 Pool 仅允许首 Key 在编码步长内重试，避免与下一 Key 的序号冲突。
     #[test]
-    fn build_local_attempt_identities_defaults_to_single_attempt() {
-        let identities = build_local_attempt_identities(3, &sample_transport(None, None, None));
+    fn pool_groups_only_retry_their_first_key_within_the_stride() {
+        let first_pool_key = ExecutionAttemptIdentity::new(0, 0).with_pool_key_index(Some(0));
+        assert_eq!(next_same_key_retry_index(first_pool_key, Some(3)), Some(1));
 
-        assert_eq!(identities, vec![ExecutionAttemptIdentity::new(3, 0)]);
-    }
-
-    #[test]
-    fn build_local_attempt_identities_prefer_failover_rules_over_endpoint_and_provider() {
-        let identities = build_local_attempt_identities(
-            1,
-            &sample_transport(
-                Some(5),
-                Some(4),
-                Some(json!({
-                    "failover_rules": {
-                        "max_retries": 2
-                    }
-                })),
-            ),
-        );
-
+        let at_stride_limit = ExecutionAttemptIdentity::new(0, POOL_KEY_RETRY_INDEX_STRIDE - 1)
+            .with_pool_key_index(Some(0));
         assert_eq!(
-            identities,
-            vec![
-                ExecutionAttemptIdentity::new(1, 0),
-                ExecutionAttemptIdentity::new(1, 1),
-            ]
+            next_same_key_retry_index(at_stride_limit, Some(10_000)),
+            None
         );
-    }
 
-    #[test]
-    fn build_local_attempt_identities_falls_back_to_endpoint_max_retries() {
-        let identities =
-            build_local_attempt_identities(2, &sample_transport(Some(5), Some(3), None));
-
+        let second_pool_key = ExecutionAttemptIdentity::new(0, POOL_KEY_RETRY_INDEX_STRIDE)
+            .with_pool_key_index(Some(1));
         assert_eq!(
-            identities,
-            vec![
-                ExecutionAttemptIdentity::new(2, 0),
-                ExecutionAttemptIdentity::new(2, 1),
-                ExecutionAttemptIdentity::new(2, 2),
-            ]
+            next_same_key_retry_index(second_pool_key, Some(10_000)),
+            None
         );
     }
 
+    /// 验证派生重试只更新候选 ID 与重试序号，其余执行上下文保持不变。
     #[test]
-    fn build_local_attempt_identities_falls_back_to_provider_max_retries() {
-        let identities = build_local_attempt_identities(0, &sample_transport(Some(4), None, None));
+    fn next_same_key_retry_attempt_rewrites_candidate_id_and_retry_index() {
+        let attempt = AiSyncAttempt {
+            plan: aether_contracts::ExecutionPlan {
+                request_id: "trace-1".to_string(),
+                candidate_id: Some("candidate-a".to_string()),
+                provider_name: None,
+                provider_id: "provider-1".to_string(),
+                endpoint_id: "endpoint-1".to_string(),
+                key_id: "key-1".to_string(),
+                method: "POST".to_string(),
+                url: "https://example.com".to_string(),
+                headers: Default::default(),
+                content_type: None,
+                content_encoding: None,
+                body: aether_contracts::RequestBody {
+                    json_body: None,
+                    body_bytes_b64: None,
+                    body_ref: None,
+                },
+                stream: false,
+                client_api_format: "openai:chat".to_string(),
+                provider_api_format: "openai:chat".to_string(),
+                model_name: None,
+                proxy: None,
+                transport_profile: None,
+                timeouts: None,
+            },
+            report_kind: None,
+            report_context: Some(json!({
+                "candidate_id": "candidate-a",
+                "candidate_index": 0,
+                "retry_index": 0,
+                "sticky_key_attempts": 2,
+            })),
+        };
 
-        assert_eq!(
-            identities,
-            vec![
-                ExecutionAttemptIdentity::new(0, 0),
-                ExecutionAttemptIdentity::new(0, 1),
-                ExecutionAttemptIdentity::new(0, 2),
-                ExecutionAttemptIdentity::new(0, 3),
-            ]
+        let retry = next_same_key_retry_attempt(&attempt).expect("one same-key retry remains");
+        let retry_candidate_id = retry.plan.candidate_id.clone().expect("fresh candidate id");
+        assert_ne!(retry_candidate_id, "candidate-a");
+        assert_eq!(retry.plan.key_id, "key-1");
+        let context = retry.report_context_ref().expect("context retained");
+        assert_eq!(context["candidate_id"], json!(retry_candidate_id));
+        assert_eq!(context["retry_index"], json!(1));
+        assert_eq!(context["candidate_index"], json!(0));
+
+        assert!(
+            next_same_key_retry_attempt(&retry).is_none(),
+            "budget of 2 attempts is exhausted after one retry"
         );
-    }
-
-    #[test]
-    fn build_local_attempt_identities_endpoint_overrides_provider() {
-        let identities =
-            build_local_attempt_identities(7, &sample_transport(Some(10), Some(3), None));
-
-        assert_eq!(
-            identities,
-            vec![
-                ExecutionAttemptIdentity::new(7, 0),
-                ExecutionAttemptIdentity::new(7, 1),
-                ExecutionAttemptIdentity::new(7, 2),
-            ]
-        );
-    }
-
-    #[test]
-    fn build_local_attempt_identities_default_two_treated_as_unset() {
-        let identities =
-            build_local_attempt_identities(5, &sample_transport(Some(2), Some(2), None));
-
-        assert_eq!(identities, vec![ExecutionAttemptIdentity::new(5, 0)]);
-    }
-
-    #[test]
-    fn build_local_attempt_identities_endpoint_two_falls_back_to_provider_ten() {
-        let identities =
-            build_local_attempt_identities(1, &sample_transport(Some(10), Some(2), None));
-
-        assert_eq!(
-            identities,
-            vec![
-                ExecutionAttemptIdentity::new(1, 0),
-                ExecutionAttemptIdentity::new(1, 1),
-                ExecutionAttemptIdentity::new(1, 2),
-                ExecutionAttemptIdentity::new(1, 3),
-                ExecutionAttemptIdentity::new(1, 4),
-                ExecutionAttemptIdentity::new(1, 5),
-                ExecutionAttemptIdentity::new(1, 6),
-                ExecutionAttemptIdentity::new(1, 7),
-                ExecutionAttemptIdentity::new(1, 8),
-                ExecutionAttemptIdentity::new(1, 9),
-            ]
-        );
-    }
-
-    #[test]
-    fn build_local_attempt_identities_failover_rules_zero_produces_one_slot() {
-        let identities = build_local_attempt_identities(
-            1,
-            &sample_transport(
-                Some(5),
-                Some(4),
-                Some(json!({
-                    "failover_rules": {
-                        "max_retries": 0
-                    }
-                })),
-            ),
-        );
-
-        assert_eq!(identities, vec![ExecutionAttemptIdentity::new(1, 0)]);
-    }
-
-    #[test]
-    fn build_local_attempt_identities_endpoint_zero_produces_one_slot() {
-        let identities =
-            build_local_attempt_identities(3, &sample_transport(Some(5), Some(0), None));
-
-        assert_eq!(identities, vec![ExecutionAttemptIdentity::new(3, 0)]);
-    }
-
-    #[test]
-    fn build_local_attempt_identities_provider_zero_produces_one_slot() {
-        let identities = build_local_attempt_identities(3, &sample_transport(Some(0), None, None));
-
-        assert_eq!(identities, vec![ExecutionAttemptIdentity::new(3, 0)]);
-    }
-
-    #[test]
-    fn build_local_attempt_identities_provider_ten_creates_ten_slots() {
-        let identities = build_local_attempt_identities(2, &sample_transport(Some(10), None, None));
-
-        assert_eq!(identities.len(), 10);
-        assert_eq!(identities[0], ExecutionAttemptIdentity::new(2, 0));
-        assert_eq!(identities[9], ExecutionAttemptIdentity::new(2, 9));
-    }
-
-    #[test]
-    fn build_local_attempt_identities_failover_rules_over_limit_clamped_to_max() {
-        let identities = build_local_attempt_identities(
-            0,
-            &sample_transport(
-                Some(3),
-                Some(5),
-                Some(json!({
-                    "failover_rules": {
-                        "max_retries": 1000
-                    }
-                })),
-            ),
-        );
-
-        assert_eq!(identities.len(), 99);
-    }
-
-    #[test]
-    fn build_local_attempt_identities_failover_rules_u32_max_clamped_to_max() {
-        let identities = build_local_attempt_identities(
-            0,
-            &sample_transport(
-                None,
-                None,
-                Some(json!({
-                    "failover_rules": {
-                        "max_retries": u32::MAX
-                    }
-                })),
-            ),
-        );
-
-        assert_eq!(identities.len(), 99);
-    }
-
-    #[test]
-    fn build_local_attempt_identities_endpoint_over_limit_clamped_to_max() {
-        let identities =
-            build_local_attempt_identities(0, &sample_transport(None, Some(2000), None));
-
-        assert_eq!(identities.len(), 99);
-    }
-
-    #[test]
-    fn build_local_attempt_identities_provider_over_limit_clamped_to_max() {
-        let identities =
-            build_local_attempt_identities(0, &sample_transport(Some(5000), None, None));
-
-        assert_eq!(identities.len(), 99);
     }
 
     #[test]
@@ -489,6 +358,7 @@ mod tests {
         );
     }
 
+    /// 验证候选报告可完整恢复分组、Pool Key、租约和粘性预算。
     #[test]
     fn parse_candidate_metadata_from_report_context_reads_group_and_pool_metadata() {
         let metadata = local_execution_candidate_metadata_from_report_context(Some(&json!({
@@ -499,6 +369,7 @@ mod tests {
             "pool_key_lease_token": "gateway-1:token-1",
             "pool_key_lease_fencing_token": 7,
             "pool_key_lease_ttl_ms": 900000,
+            "sticky_key_attempts": 3,
         })));
 
         assert_eq!(
@@ -514,6 +385,7 @@ mod tests {
                     ttl_ms: 900000,
                 }),
                 scheduler_affinity_epoch: None,
+                sticky_key_attempts: Some(3),
             }
         );
     }

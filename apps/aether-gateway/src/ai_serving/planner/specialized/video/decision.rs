@@ -18,6 +18,7 @@ use super::request::resolve_local_video_create_candidate_payload_parts;
 use super::support::{LocalVideoCreateCandidateAttempt, LocalVideoCreateDecisionInput};
 use super::LocalVideoCreateSpec;
 
+/// 为视频创建候选构造执行载荷，并附加路由粘性尝试预算。
 pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidate(
     state: &AppState,
     parts: &http::request::Parts,
@@ -90,6 +91,7 @@ pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidat
         client_session_affinity: input.client_session_affinity.as_ref(),
         routing_policy: input.routing_policy.as_ref(),
         scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
+        sticky_key_attempts: eligible.orchestration.sticky_key_attempts,
         client_requested_stream: false,
         upstream_is_stream: false,
         has_envelope: false,
