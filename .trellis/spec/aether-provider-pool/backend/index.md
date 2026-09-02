@@ -21,6 +21,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Balance-Aware Key Scheduling](./balance-scheduling-contract.md) | Cross-package balance eligibility, refresh, sticky, and cache contract | Current |
 | [Runtime Key Quota Block](./runtime-quota-block-contract.md) | Persistent quota evidence, unified scheduling, and manual recovery contract | Current |
+| [Key Admission, Affinity, and Model Quota](./key-admission-affinity-model-quota-contract.md) | Atomic per-Key concurrency, cache-affinity modes, and model-scoped quota | Current |
 
 ---
 

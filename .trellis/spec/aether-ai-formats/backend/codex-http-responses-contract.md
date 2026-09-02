@@ -10,7 +10,7 @@ The supported Codex HTTP relay surface is intentionally narrower than the full O
 - `POST /v1/responses/compact`
 - HTTP SSE returned by `POST /v1/responses`
 
-Responses WebSocket mode, `previous_response_id`, retrieve/delete/cancel/input-items/input-tokens resource operations, and Aether-owned Response persistence are separate product work. Do not infer them from the general OpenAI API reference.
+Responses WebSocket create-turn transport is supported and shares the stable logical-turn identity contract documented in [Codex Logical Identity Convergence](../../aether-gateway-execution/backend/codex-logical-identity-contract.md). `previous_response_id`, retrieve/delete/cancel/input-items/input-tokens resource operations, and Aether-owned Response persistence remain separate product work. Do not infer them from the general OpenAI API reference.
 
 The client baseline was verified against OpenAI Codex commit `3929c99a97d1aa0fb8000903a4b57b24fbabe742`. Re-check the current Codex source before expanding or removing fields because this external contract can drift.
 
