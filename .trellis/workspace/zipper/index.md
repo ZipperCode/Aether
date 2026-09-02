@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 10
-- **Last Active**: 2026-08-30
+- **Total Sessions**: 11
+- **Last Active**: 2026-09-03
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~252 | Active |
+| `journal-1.md` | ~279 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 11 | 2026-09-03 | 同步上游路由、Provider Pool 与协议兼容功能 | `f485ae016`, `09c4aab9e`, `02ac8aac0`, `72994512b`, `9a3f17acd`, `192782763` | `master` |
 | 10 | 2026-08-30 | 模型能力检测与 v0.7.26 发布准备 | `6d537bae3` | `master` |
 | 9 | 2026-08-28 | 优化同格式请求与流式热路径 | `37e42296c` | `master` |
 | 8 | 2026-08-24 | 发布 Aether v0.7.25 | `7a42452f2bb9d9a34cdd9a8263df2365c4cc5eaf`, `3ab6787a9e33746387e849174f9c93b632d4deac`, `beb1ef6b78f4c82f65301c3ead4dd61b3a248477`, `b31b8ebb41dfaaaf7f60872c4fa89ed9aaff3478`, `ec32c696d9b93e63de5c1333cddb34c6bcc7df9e`, `92def9b5012f0e5c2db148aa45310de675d51bf5`, `1ed38e84518366d8a547c2e2a27c3496b8de3cd8` | `master` |

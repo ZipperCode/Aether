@@ -250,3 +250,30 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 11: 同步上游路由、Provider Pool 与协议兼容功能
+
+**Date**: 2026-09-03
+**Task**: 同步上游路由、Provider Pool 与协议兼容功能
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+同步用户选定的上游第 1、3、4、5 组能力：路由策略与按需粘性重试、Key 并发和缓存亲和及模型额度、Codex/网关流式兼容、Gemini/Responses 协议修复；保留 fork 合同，排除 VSCodex、套餐撤销、通用 Usage API 与 Nightly，完成验证、fast-forward 合并和临时 worktree 清理。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f485ae016` | (see git log) |
+| `09c4aab9e` | (see git log) |
+| `02ac8aac0` | (see git log) |
+| `72994512b` | (see git log) |
+| `9a3f17acd` | (see git log) |
+| `192782763` | (see git log) |
+
+### Status
+
+[OK] **Completed**
