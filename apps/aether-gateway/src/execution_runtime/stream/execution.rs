@@ -15480,6 +15480,7 @@ mod tests {
         server.abort();
     }
 
+    /// 验证远程运行时返回图片同步 JSON 时，网关在通过真实 Key 准入后转换为图片 SSE。
     #[tokio::test]
     async fn execute_execution_runtime_stream_bridges_openai_image_sync_json_from_remote_runtime_to_image_sse(
     ) {
@@ -15510,9 +15511,6 @@ mod tests {
                 .expect("server should start");
         });
 
-        let state = AppState::new()
-            .expect("app state should build")
-            .with_execution_runtime_override_base_url(format!("http://{addr}"));
         let plan = ExecutionPlan {
             request_id: "req-remote-runtime-image-sync-json-stream".into(),
             candidate_id: Some("cand-remote-runtime-image-sync-json-stream".into()),
@@ -15545,6 +15543,15 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
+        // Key 并发准入会强读目录；测试显式复用与执行计划一致的目录夹具。
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    provider_catalog_for_plan(&plan, None),
+                )),
+            )
+            .with_execution_runtime_override_base_url(format!("http://{addr}"));
         let decision = GatewayControlDecision::synthetic(
             "/v1/images/generations",
             Some("ai_public".to_string()),
