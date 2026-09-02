@@ -340,12 +340,14 @@ impl StreamingStandardTerminalObserver {
         self.provider = TerminalStreamParser::for_api_format(provider_api_format.as_str());
     }
 
+    /// 按到达顺序汇总一批规范流帧，确保终态状态机与单帧观测保持一致。
     fn observe_frames(&mut self, frames: Vec<CanonicalStreamFrame>) {
         for frame in frames {
             self.observe_frame(frame);
         }
     }
 
+    /// 将规范流帧合并进终态摘要，并把不受支持的 Gemini 终止原因标为解析失败。
     fn observe_frame(&mut self, frame: CanonicalStreamFrame) {
         let CanonicalStreamFrame { id, model, event } = frame;
         let summary = self
@@ -377,6 +379,13 @@ impl StreamingStandardTerminalObserver {
                 finish_reason,
                 usage,
             } => {
+                if let Some(parser_error) = finish_reason
+                    .as_deref()
+                    .filter(|reason| !canonical_stream_finish_reason_is_supported(reason))
+                    .map(|reason| format!("unsupported provider stream finish reason: {reason}"))
+                {
+                    summary.parser_error.get_or_insert(parser_error);
+                }
                 summary.finish_reason = finish_reason;
                 summary.standardized_usage = usage.map(standardized_usage_from_canonical);
                 summary.observed_finish = true;
@@ -781,6 +790,7 @@ mod tests {
         format!("data: {}\n", value).into_bytes()
     }
 
+    /// 提取测试输出中的 JSON `data:` 事件，并忽略协议终止标记。
     fn json_data_events(bytes: &[u8]) -> Vec<Value> {
         String::from_utf8_lossy(bytes)
             .lines()
@@ -790,8 +800,52 @@ mod tests {
             .collect()
     }
 
+    /// 构造只有 `event:` 行的测试输入，用于验证跨行状态不会提前提交。
     fn event_only_line(event: &str) -> Vec<u8> {
         format!("event: {event}\n").into_bytes()
+    }
+
+    /// 验证 Gemini 畸形函数调用终止原因进入失败摘要，而不是记作正常完成。
+    #[test]
+    fn terminal_observer_marks_malformed_gemini_function_call_as_failure() {
+        let context = report_context("gemini:generate_content", "openai:responses");
+        let mut observer = StreamingStandardTerminalObserver::default();
+        observer
+            .push_line(
+                &context,
+                data_line(json!({
+                    "response": {
+                        "responseId": "resp_malformed_tool_call",
+                        "modelVersion": "gemini-3.7-flash-tiered",
+                        "candidates": [{
+                            "index": 0,
+                            "content": {
+                                "role": "model",
+                                "parts": [{"thoughtSignature": "signature", "text": ""}]
+                            },
+                            "finishReason": "MALFORMED_FUNCTION_CALL",
+                            "finishMessage": "Malformed function call: Function call is empty - no input to parse."
+                        }]
+                    },
+                    "responseId": "resp_malformed_tool_call"
+                })),
+            )
+            .expect("Gemini terminal frame should parse");
+
+        let summary = observer
+            .finish(&context)
+            .expect("terminal observation should finish")
+            .expect("Gemini terminal frame should produce a summary");
+
+        assert!(summary.observed_finish);
+        assert_eq!(
+            summary.finish_reason.as_deref(),
+            Some("MALFORMED_FUNCTION_CALL")
+        );
+        assert_eq!(
+            summary.parser_error.as_deref(),
+            Some("unsupported provider stream finish reason: MALFORMED_FUNCTION_CALL")
+        );
     }
 
     #[test]
@@ -1258,6 +1312,7 @@ mod tests {
         assert!(!sse.contains("HelloHello"));
     }
 
+    /// 验证以 Chat 为上游的 Responses 工具调用元数据会转成客户端可识别的 tool_calls。
     #[test]
     fn transforms_chat_backed_function_call_metadata_to_chat_tool_calls() {
         let report_context = report_context("openai:responses", "openai:chat");
@@ -1310,6 +1365,7 @@ mod tests {
         assert!(!sse.contains("\"metadata\""));
     }
 
+    /// 验证 Responses `keepalive` 与 `ping` 在转换为 Chat 时均作为无语义事件忽略。
     #[test]
     fn ignores_openai_responses_keepalive_events_for_chat_clients() {
         let report_context = report_context("openai:responses", "openai:chat");
@@ -1326,6 +1382,17 @@ mod tests {
             )
             .expect("keepalive should be ignored");
         assert!(keepalive.is_empty());
+
+        let ping = matrix
+            .transform_line(
+                &report_context,
+                data_line(json!({
+                    "type": "ping",
+                    "cost": "0",
+                })),
+            )
+            .expect("provider ping should be ignored");
+        assert!(ping.is_empty());
 
         for line in [
             data_line(json!({

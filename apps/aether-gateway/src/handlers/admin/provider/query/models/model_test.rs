@@ -2884,6 +2884,7 @@ async fn provider_query_execute_antigravity_test_candidate(
     })
 }
 
+/// 执行固定 Grok 测试候选；该分支与标准候选共享模型能力测试的精确绑定约束。
 async fn provider_query_execute_grok_test_candidate(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
@@ -3055,6 +3056,7 @@ async fn provider_query_execute_grok_test_candidate(
     })
 }
 
+/// 执行固定 Provider/Endpoint/Key 的标准模型测试，并用最终映射模型选择 DeepSeek replay 策略。
 async fn provider_query_execute_standard_test_candidate(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
@@ -3291,6 +3293,7 @@ async fn provider_query_execute_standard_test_candidate(
                     crate::ai_serving::openai_responses_reasoning_replay_policy(
                         transport.provider.provider_type.as_str(),
                         transport.endpoint.base_url.as_str(),
+                        request_model,
                     ),
                 )
             else {
@@ -3352,6 +3355,7 @@ async fn provider_query_execute_standard_test_candidate(
         crate::ai_serving::openai_responses_reasoning_replay_policy(
             transport.provider.provider_type.as_str(),
             transport.endpoint.base_url.as_str(),
+            request_model,
         ),
     )
     .is_err()

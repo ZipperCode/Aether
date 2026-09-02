@@ -94,6 +94,7 @@ pub(crate) struct LocalOpenAiChatCandidatePayloadParts {
 #[derive(Default)]
 pub(crate) struct LocalOpenAiChatRequestPreparation;
 
+/// 判断 Provider 格式是否属于 Grok 文本请求可复用的标准集合。
 fn is_grok_text_provider_api_format(provider_api_format: &str) -> bool {
     matches!(
         crate::ai_serving::normalize_api_format_alias(provider_api_format).as_str(),
@@ -101,6 +102,7 @@ fn is_grok_text_provider_api_format(provider_api_format: &str) -> bool {
     )
 }
 
+/// 完成 Chat Provider 正文规则，并按正文中的最终模型应用 DeepSeek 工具思考兼容。
 fn finalize_openai_chat_provider_request_body(
     provider_request_body: &mut Value,
     custom_directive_mapping: Option<&Value>,
@@ -159,6 +161,7 @@ fn finalize_openai_chat_provider_request_body(
         openai_responses_reasoning_replay_policy(
             transport.provider.provider_type.as_str(),
             transport.endpoint.base_url.as_str(),
+            mapped_model,
         ),
     )
     .err()

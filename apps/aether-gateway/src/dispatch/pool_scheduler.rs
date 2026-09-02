@@ -585,6 +585,7 @@ impl<'a> PoolKeyCursor<'a> {
         })
     }
 
+    /// 只记录一次 Pool 耗尽事件，并同步每个真实跳过原因到请求级运行时诊断。
     pub(crate) fn log_exhausted(&mut self) {
         if self.exhausted_logged {
             return;
@@ -606,6 +607,7 @@ impl<'a> PoolKeyCursor<'a> {
         self.record_runtime_miss_pool_exhaustion_skip_reason();
     }
 
+    /// 将 Pool 内每一种真实跳过原因写入运行时诊断，避免聚合原因掩盖容量与额度差异。
     fn record_runtime_miss_pool_exhaustion_skip_reason(&mut self) {
         if self.exhaustion_skip_recorded
             || !self.record_runtime_miss_diagnostic
@@ -617,11 +619,17 @@ impl<'a> PoolKeyCursor<'a> {
             return;
         };
         self.exhaustion_skip_recorded = true;
-        record_local_runtime_candidate_skip_reason(
-            self.state.app(),
-            trace_id,
-            self.runtime_miss_pool_exhaustion_skip_reason(),
-        );
+        if self.skip_reason_counts.is_empty() {
+            record_local_runtime_candidate_skip_reason(
+                self.state.app(),
+                trace_id,
+                "pool_group_exhausted",
+            );
+            return;
+        }
+        for reason in self.skip_reason_counts.keys() {
+            record_local_runtime_candidate_skip_reason(self.state.app(), trace_id, reason);
+        }
     }
 
     fn runtime_miss_pool_exhaustion_skip_reason(&self) -> &'static str {
@@ -3421,6 +3429,7 @@ mod tests {
         ));
     }
 
+    /// 验证路由强制 LRU 时会重新计算派生排序状态，而非复用旧分配模式缓存。
     #[test]
     fn routing_pool_lru_override_recomputes_derived_lru_state() {
         let group = sample_eligible_candidate(
@@ -3458,6 +3467,7 @@ mod tests {
         );
     }
 
+    /// 验证 Pool 未返回 Key 时会记录真实耗尽原因，供最终 429/503 分类使用。
     #[test]
     fn pool_key_cursor_records_runtime_miss_when_exhausted_without_returning_key() {
         let app = AppState::new().expect("state should build");
@@ -3491,8 +3501,12 @@ mod tests {
             .take_local_execution_runtime_miss_diagnostic(trace_id)
             .expect("runtime miss diagnostic should exist");
         assert_eq!(diagnostic.reason, "all_candidates_skipped");
-        assert_eq!(diagnostic.skipped_candidate_count, Some(1));
+        assert_eq!(diagnostic.skipped_candidate_count, Some(2));
         assert_eq!(diagnostic.skip_reasons.get("pool_cooldown"), Some(&1));
+        assert_eq!(
+            diagnostic.skip_reasons.get("transport_snapshot_missing"),
+            Some(&1)
+        );
     }
 
     #[tokio::test]

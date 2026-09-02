@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 
+/// 仅凭明确 Provider 类型或经 URL 解析验证的 DeepSeek 主机识别上游，拒绝路径/userinfo 伪装。
 pub(crate) fn is_deepseek_provider(provider_type: &str, base_url: &str) -> bool {
     let provider_type = provider_type.trim().to_ascii_lowercase();
     if matches!(
@@ -15,17 +16,35 @@ pub(crate) fn is_deepseek_provider(provider_type: &str, base_url: &str) -> bool 
     host == "deepseek.com" || host.ends_with(".deepseek.com")
 }
 
+/// 从命名空间或路由前缀后的最终模型叶子识别 DeepSeek 模型。
+fn is_deepseek_model(provider_model: &str) -> bool {
+    let provider_model = provider_model.trim().to_ascii_lowercase();
+    let leaf = provider_model
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(provider_model.as_str());
+    leaf == "deepseek" || leaf.starts_with("deepseek-") || leaf.starts_with("deepseek_")
+}
+
+/// 合并类型、可信主机和最终映射模型三类证据，支持域名无关的自定义中继。
+fn is_deepseek_upstream(provider_type: &str, base_url: &str, provider_model: &str) -> bool {
+    is_deepseek_provider(provider_type, base_url) || is_deepseek_model(provider_model)
+}
+
+/// 根据最终 Provider 模型选择 reasoning replay；DeepSeek 保留 opaque 内容，OpenAI 使用 item ID。
 pub(crate) fn openai_responses_reasoning_replay_policy(
     provider_type: &str,
     base_url: &str,
+    provider_model: &str,
 ) -> crate::ai_serving::OpenAiResponsesReasoningReplayPolicy {
-    if is_deepseek_provider(provider_type, base_url) {
+    if is_deepseek_upstream(provider_type, base_url, provider_model) {
         crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque
     } else {
         crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds
     }
 }
 
+/// 仅对经证据识别的 DeepSeek 请求应用工具调用思考兼容，并按最终 API 格式分派。
 pub(crate) fn apply_deepseek_tool_call_thinking_compat(
     provider_request_body: &mut Value,
     provider_type: &str,
@@ -33,7 +52,11 @@ pub(crate) fn apply_deepseek_tool_call_thinking_compat(
     provider_api_format: &str,
     original_request_body: Option<&Value>,
 ) {
-    if !is_deepseek_provider(provider_type, base_url) {
+    let provider_model = provider_request_body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !is_deepseek_upstream(provider_type, base_url, provider_model) {
         return;
     }
 
@@ -252,6 +275,7 @@ fn ensure_claude_assistant_message_has_thinking_block(
     }
 }
 
+/// 判断 Claude 内容块是否为 thinking 类型，供 DeepSeek 历史兼容避免重复插入。
 fn is_claude_thinking_block(block: &Value) -> bool {
     block
         .get("type")
@@ -268,6 +292,7 @@ mod tests {
         openai_responses_reasoning_replay_policy,
     };
 
+    /// 验证 Provider 类型、严格主机与最终模型证据的正反识别边界。
     #[test]
     fn detects_deepseek_provider_by_type_or_host() {
         assert!(is_deepseek_provider(
@@ -302,15 +327,40 @@ mod tests {
         ));
         assert!(!is_deepseek_provider("custom", "ftp://api.deepseek.com/v1"));
         assert_eq!(
-            openai_responses_reasoning_replay_policy("custom", "https://api.deepseek.com/v1"),
+            openai_responses_reasoning_replay_policy(
+                "custom",
+                "https://api.deepseek.com/v1",
+                "deepseek-v4-flash",
+            ),
             crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque
         );
         assert_eq!(
-            openai_responses_reasoning_replay_policy("openai", "https://api.openai.com/v1"),
+            openai_responses_reasoning_replay_policy(
+                "openai",
+                "https://api.openai.com/v1",
+                "gpt-5.6-sol",
+            ),
+            crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds
+        );
+        assert_eq!(
+            openai_responses_reasoning_replay_policy(
+                "custom",
+                "https://api.b.ai/v1",
+                "deepseek-v4-flash",
+            ),
+            crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque
+        );
+        assert_eq!(
+            openai_responses_reasoning_replay_policy(
+                "custom",
+                "https://api.b.ai/v1",
+                "not-deepseek-compatible",
+            ),
             crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds
         );
     }
 
+    /// 验证自定义 DeepSeek 主机保留生产形态 opaque reasoning，而 OpenAI 路径清理它。
     #[test]
     fn custom_deepseek_host_preserves_production_shaped_opaque_reasoning_replay() {
         let reasoning_items = (0..66)
@@ -330,8 +380,11 @@ mod tests {
             "input": reasoning_items.clone(),
             "future_request_field": {"preserve": true}
         });
-        let replay_policy =
-            openai_responses_reasoning_replay_policy("custom", "https://api.deepseek.com/v1");
+        let replay_policy = openai_responses_reasoning_replay_policy(
+            "custom",
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-flash",
+        );
         let mut provider_body = crate::ai_serving::build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy(
             &request,
             "openai:responses",
@@ -373,7 +426,11 @@ mod tests {
             crate::ai_serving::strip_incompatible_openai_responses_reasoning_items_with_policy(
                 &mut deepseek,
                 "openai:responses",
-                openai_responses_reasoning_replay_policy("custom", "https://api.deepseek.com/v1"),
+                openai_responses_reasoning_replay_policy(
+                    "custom",
+                    "https://api.deepseek.com/v1",
+                    "deepseek-v4-flash",
+                ),
             ),
             0
         );
@@ -383,13 +440,18 @@ mod tests {
             crate::ai_serving::strip_incompatible_openai_responses_reasoning_items_with_policy(
                 &mut openai,
                 "openai:responses",
-                openai_responses_reasoning_replay_policy("openai", "https://api.openai.com/v1"),
+                openai_responses_reasoning_replay_policy(
+                    "openai",
+                    "https://api.openai.com/v1",
+                    "gpt-5.6-sol",
+                ),
             ),
             66
         );
         assert_eq!(openai["input"].as_array().map(Vec::len), Some(0));
     }
 
+    /// 验证标准 DeepSeek Chat 工具历史补齐 thinking 与空 reasoning 内容。
     #[test]
     fn openai_chat_deepseek_adds_thinking_and_empty_reasoning_content() {
         let mut body = json!({
@@ -415,6 +477,54 @@ mod tests {
 
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["messages"][1]["reasoning_content"], "");
+    }
+
+    /// 验证域名无关的自定义中继可凭最终 DeepSeek 模型启用兼容。
+    #[test]
+    fn custom_relay_deepseek_model_adds_chat_thinking_compat() {
+        let mut body = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "user", "content": "inspect the repository"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "inspect", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "done"}
+            ]
+        });
+
+        apply_deepseek_tool_call_thinking_compat(
+            &mut body,
+            "custom",
+            "https://api.b.ai/v1",
+            "openai:chat",
+            None,
+        );
+
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+    }
+
+    /// 验证仅名称包含 DeepSeek 子串但不符合模型叶子规则时不改写请求。
+    #[test]
+    fn custom_relay_non_deepseek_model_is_not_rewritten() {
+        let original = json!({
+            "model": "not-deepseek-compatible",
+            "messages": [{"role": "assistant", "content": "done"}]
+        });
+        let mut body = original.clone();
+
+        apply_deepseek_tool_call_thinking_compat(
+            &mut body,
+            "custom",
+            "https://api.b.ai/v1",
+            "openai:chat",
+            None,
+        );
+
+        assert_eq!(body, original);
     }
 
     #[test]

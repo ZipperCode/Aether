@@ -292,6 +292,7 @@ pub(crate) fn snapshot_local_request_candidate_status(
     })
 }
 
+/// 将候选状态记录写入持久层；写入失败只记录诊断，不改变主请求结果。
 pub(crate) async fn persist_local_request_candidate_status_record(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     record: UpsertRequestCandidateRecord,
@@ -357,13 +358,14 @@ pub(crate) async fn persist_local_request_candidate_status_record(
     }
 }
 
+/// 记录本地候选状态并投影可审计的跳过原因；无候选 ID 的计划不写记录。
 pub(crate) async fn record_local_request_candidate_status(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
     status_update: SchedulerRequestCandidateStatusUpdate,
 ) {
-    let Some(record) =
+    let Some(mut record) =
         build_local_request_candidate_status_record(LocalRequestCandidateStatusRecordInput {
             plan,
             report_context,
@@ -372,9 +374,12 @@ pub(crate) async fn record_local_request_candidate_status(
     else {
         return;
     };
+    record.skip_reason =
+        local_request_candidate_skip_reason(record.status, record.error_type.as_deref());
     persist_local_request_candidate_status_record(state, record).await;
 }
 
+/// 为当前候选补充有界扩展数据，并保持已有状态与时间戳不变。
 pub(crate) async fn record_local_request_candidate_extra_data(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     plan: &ExecutionPlan,
@@ -416,6 +421,7 @@ pub(crate) async fn record_local_request_candidate_extra_data(
     persist_local_request_candidate_status_record(state, record).await;
 }
 
+/// 从执行前快照和状态更新构造持久记录，保留并发饱和的精确 `skip_reason`。
 fn build_local_request_candidate_status_snapshot_record(
     snapshot: &LocalRequestCandidateStatusSnapshot,
     status_update: SchedulerRequestCandidateStatusUpdate,
@@ -429,6 +435,7 @@ fn build_local_request_candidate_status_snapshot_record(
         started_at_unix_ms,
         finished_at_unix_ms,
     } = status_update;
+    let skip_reason = local_request_candidate_skip_reason(status, error_type.as_deref());
     UpsertRequestCandidateRecord {
         id: snapshot.candidate_id.clone(),
         request_id: snapshot.request_id.clone(),
@@ -442,7 +449,7 @@ fn build_local_request_candidate_status_snapshot_record(
         endpoint_id: Some(snapshot.endpoint_id.clone()),
         key_id: Some(snapshot.key_id.clone()),
         status,
-        skip_reason: None,
+        skip_reason,
         is_cached: None,
         status_code,
         error_type,
@@ -457,6 +464,18 @@ fn build_local_request_candidate_status_snapshot_record(
     }
 }
 
+/// 只把候选级并发饱和错误映射为跳过原因，其他错误类型仍由既有状态语义处理。
+fn local_request_candidate_skip_reason(
+    status: RequestCandidateStatus,
+    error_type: Option<&str>,
+) -> Option<String> {
+    (status == RequestCandidateStatus::Skipped)
+        .then_some(error_type)
+        .flatten()
+        .filter(|reason| *reason == "provider_key_concurrency_limit_reached")
+        .map(ToOwned::to_owned)
+}
+
 pub(crate) fn try_enqueue_local_request_candidate_status_snapshot(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     snapshot: &LocalRequestCandidateStatusSnapshot,
@@ -469,6 +488,7 @@ pub(crate) fn try_enqueue_local_request_candidate_status_snapshot(
     state.try_enqueue_request_candidate_status(record)
 }
 
+/// 异步持久化一个已捕获身份的候选状态快照。
 pub(crate) async fn record_local_request_candidate_status_snapshot(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     snapshot: &LocalRequestCandidateStatusSnapshot,
@@ -1022,6 +1042,7 @@ mod tests {
         }
     }
 
+    /// 构造候选状态测试使用的最小稳定执行计划。
     fn sample_plan() -> ExecutionPlan {
         ExecutionPlan {
             request_id: "req-request-candidate-seed-123".to_string(),
@@ -1046,6 +1067,7 @@ mod tests {
         }
     }
 
+    /// 验证 Streaming 状态使用同步队列快路径，避免流已开始后丢失候选状态。
     #[test]
     fn streaming_snapshot_uses_synchronous_status_enqueue_fast_path() {
         let mut plan = sample_plan();
@@ -1076,6 +1098,41 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, RequestCandidateStatus::Streaming);
         assert_eq!(records[0].status_code, Some(200));
+    }
+
+    /// 验证饱和 Key 的候选快照持久化精确容量原因与 429 状态。
+    #[test]
+    fn saturated_provider_key_snapshot_persists_capacity_skip_reason() {
+        let mut plan = sample_plan();
+        plan.candidate_id = Some("candidate-provider-key-saturated".to_string());
+        let snapshot = snapshot_local_request_candidate_status(&plan, None)
+            .expect("candidate snapshot should build");
+        let writer = SynchronousStatusWriter::default();
+
+        try_enqueue_local_request_candidate_status_snapshot(
+            &writer,
+            &snapshot,
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Skipped,
+                status_code: Some(429),
+                error_type: Some("provider_key_concurrency_limit_reached".to_string()),
+                error_message: Some("provider key concurrency limit reached: 1".to_string()),
+                latency_ms: Some(0),
+                started_at_unix_ms: Some(123),
+                finished_at_unix_ms: Some(123),
+            },
+        )
+        .expect("saturated status should use the synchronous enqueue path");
+
+        let records = writer
+            .records
+            .lock()
+            .expect("synchronous status records lock");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].skip_reason.as_deref(),
+            Some("provider_key_concurrency_limit_reached")
+        );
     }
 
     fn sample_minimal_candidate() -> SchedulerMinimalCandidateSelectionCandidate {

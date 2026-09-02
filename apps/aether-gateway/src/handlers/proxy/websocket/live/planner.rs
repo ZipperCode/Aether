@@ -40,15 +40,20 @@ const MAX_LIVE_MODEL_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Live 上游使用的凭据通道；两种通道都可复用相同的 Codex 指纹上下文。
 pub(super) enum LiveAuthMode {
     ApiKey,
     ChatGptOauth,
 }
 
 #[derive(Debug)]
+/// 一次 Codex Live 规划的完整候选；规划与后续 admission 必须共享同一身份上下文。
 pub(super) struct PlannedLiveCandidate {
     pub(super) execution: AiExecutionDecision,
     pub(super) pinned_candidate: ResponsesWebSocketPinnedCandidate,
+    /// 规划时冻结的逻辑 turn 指纹，上游 URL 解析后的 admission 不得重新生成。
+    pub(super) codex_fingerprint_context:
+        aether_provider_transport::CodexFingerprintConvergenceContext,
     pub(super) client_model: String,
     pub(super) provider_model: String,
     pub(super) auth_mode: LiveAuthMode,
@@ -187,6 +192,7 @@ impl Drop for LivePoolLeaseGuard {
     }
 }
 
+/// 在可取消作用域内规划 Live 候选，并保证取消时清理本请求的运行时缺失诊断。
 pub(super) async fn plan_live_candidate(
     state: &AppState,
     trace_id: &str,
@@ -215,6 +221,7 @@ pub(super) async fn plan_live_candidate(
     })
 }
 
+/// 规划一个 Live 候选，并在请求 `Parts` 上一次性解析 Codex 指纹上下文。
 async fn plan_live_candidate_inner(
     state: &AppState,
     trace_id: &str,
@@ -228,8 +235,9 @@ async fn plan_live_candidate_inner(
     if validate_model(client_model).is_err() || client_model.len() > MAX_LIVE_MODEL_BYTES {
         return Ok(None);
     }
-    let parts = build_live_planning_parts(headers, remote_addr);
+    let mut parts = build_live_planning_parts(headers, remote_addr);
     let body = json!({"model": client_model, "input": []});
+    crate::ai_serving::codex_context::install_codex_fingerprint_context_slot(&mut parts);
     let execution = maybe_build_pinned_stream_local_same_format_provider_decision_payload(
         state,
         &parts,
@@ -338,6 +346,8 @@ async fn plan_live_candidate_inner(
     Ok(Some(PlannedLiveCandidate {
         execution,
         pinned_candidate,
+        codex_fingerprint_context:
+            crate::ai_serving::codex_context::resolve_codex_fingerprint_context(&parts, &body),
         client_model: client_model.to_string(),
         provider_model,
         auth_mode,
@@ -530,6 +540,7 @@ pub(super) fn live_sideband_url(
     }
 }
 
+/// 规范化 Live/Realtime 升级头；指纹收敛随后会用逻辑 turn 身份覆盖会话相关头。
 pub(super) fn apply_live_headers(
     headers: &mut std::collections::BTreeMap<String, String>,
     seed: &str,
@@ -554,13 +565,18 @@ pub(super) fn apply_live_headers(
     replace_header(headers, "x-session-id", session_id.as_str());
 }
 
+/// 从已规划候选构建实际 Live admission，恢复原上下文后再应用最终 URL 和头部。
 pub(super) fn build_live_stream_admission_attempt(
     candidate: &PlannedLiveCandidate,
     headers: &HeaderMap,
     remote_addr: &SocketAddr,
     upstream_url: String,
 ) -> Result<Option<AiStreamAttempt>, GatewayError> {
-    let parts = build_live_planning_parts(headers, remote_addr);
+    let mut parts = build_live_planning_parts(headers, remote_addr);
+    crate::ai_serving::codex_context::restore_codex_logical_turn_context(
+        &mut parts,
+        &candidate.codex_fingerprint_context,
+    );
     let body = json!({"model": candidate.client_model.as_str(), "input": []});
     let mut execution = candidate.execution.clone();
     execution.upstream_url = Some(upstream_url);
@@ -873,6 +889,7 @@ mod tests {
             .is_none());
     }
 
+    /// 验证取消 Live 规划会清理临时运行时缺失诊断，不污染后续请求。
     #[tokio::test]
     async fn cancelling_live_planning_clears_the_runtime_miss_diagnostic() {
         let state = AppState::new().expect("gateway state should build");
@@ -903,6 +920,7 @@ mod tests {
             .is_none());
     }
 
+    /// 构造带固定逻辑 turn 上下文的测试候选，避免测试本身引入随机身份。
     fn candidate(url: &str, auth_mode: LiveAuthMode) -> PlannedLiveCandidate {
         let execution: AiExecutionDecision = serde_json::from_value(json!({
             "action": "stream",
@@ -922,6 +940,11 @@ mod tests {
                 "key-1",
             )
             .unwrap(),
+            codex_fingerprint_context:
+                aether_provider_transport::CodexFingerprintConvergenceContext::new(
+                    "test-live-turn",
+                    1,
+                ),
             client_model: "global-model".to_string(),
             provider_model: "provider-model".to_string(),
             auth_mode,

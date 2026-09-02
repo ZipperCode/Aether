@@ -808,6 +808,7 @@ mod continuation_fingerprint_tests {
         );
     }
 
+    /// 验证正文规则使用的头部参与规范化指纹，防止重规划复用不相同的请求。
     #[test]
     fn normalization_fingerprint_tracks_headers_used_by_body_rule_conditions() {
         let body_rules = json!([{
@@ -843,6 +844,7 @@ mod continuation_fingerprint_tests {
 /// Builds one upstream decision for a Responses WebSocket turn. The session
 /// reuses this decision for same-model turns and invokes the planner again when
 /// a later `response.create` changes the public model.
+/// 中文边界：每次逻辑 turn 的身份上下文随决策输入传递，重新规划不能重新采样请求身份。
 pub(crate) async fn maybe_build_responses_websocket_decision(
     state: &AppState,
     parts: &http::request::Parts,
@@ -1005,6 +1007,7 @@ pub(crate) async fn maybe_build_responses_websocket_decision(
                 reasoning_replay_policy: openai_responses_reasoning_replay_policy(
                     transport.provider.provider_type.as_str(),
                     transport.endpoint.base_url.as_str(),
+                    mapped_model.as_str(),
                 ),
                 model_directive_patch: input
                     .model_directive_policy

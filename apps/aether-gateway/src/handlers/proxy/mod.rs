@@ -106,6 +106,12 @@ const LOCAL_EXECUTION_LOOP_DETECTED_DETAIL: &str =
     "Gateway detected an execution runtime request loop back into the local frontdoor";
 const AUTH_API_KEY_CONCURRENCY_LIMIT_REACHED_DETAIL: &str =
     "当前调用方 API Key 并发请求数已达上限，请稍后重试";
+const PROVIDER_KEY_CAPACITY_LIMIT_REACHED_DETAIL: &str =
+    "所有可用上游账号当前均已达到并发或 RPM 上限，请稍后重试";
+const PROVIDER_KEY_CAPACITY_LIMIT_SKIP_REASONS: &[&str] = &[
+    "provider_key_concurrency_limit_reached",
+    "key_rpm_exhausted",
+];
 const LOCAL_EXECUTION_PLANNING_TIMEOUT_DETAIL: &str =
     "当前 AI 请求在本地执行规划阶段超时，请稍后重试";
 const EXECUTION_PATH_TUNNEL_AFFINITY_FORWARD: &str = "tunnel_affinity_forward";
@@ -938,6 +944,7 @@ async fn build_sync_aware_affinity_forward_response(
     )
 }
 
+/// 公开代理入口；建立请求级诊断作用域后委托主流程并统一返回网关错误。
 pub(crate) async fn proxy_request(
     State(state): State<AppState>,
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
@@ -951,6 +958,7 @@ pub(crate) async fn proxy_request(
     .await
 }
 
+/// 执行公开代理请求主流程；在拆分请求并进入任一候选规划前安装共享 Codex 上下文槽位。
 async fn proxy_request_inner(
     state: AppState,
     remote_addr: std::net::SocketAddr,
@@ -1093,6 +1101,7 @@ async fn proxy_request_inner(
         ),
     }
     let (mut parts, body) = request.into_parts();
+    crate::ai_serving::codex_context::install_codex_fingerprint_context_slot(&mut parts);
     let redaction_slot = crate::privacy::RedactionSessionSlot::default();
     parts.extensions.insert(redaction_slot.clone());
     parts
@@ -1961,12 +1970,23 @@ async fn proxy_request_inner(
             .all_candidates_skipped_for_reason(AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON)
             || local_execution_runtime_miss_context
                 .all_candidates_skipped_for_reason(LEGACY_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON);
-        let local_execution_runtime_miss_detail = (!auth_api_key_concurrency_limited)
-            .then(|| {
+        let provider_key_capacity_limited = local_execution_runtime_miss_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic_is_provider_key_capacity_limited(Some(diagnostic)))
+            .unwrap_or_else(|| {
                 local_execution_runtime_miss_context
-                    .all_provider_request_body_build_failures_detail()
+                    .all_candidates_skipped_for_reasons(PROVIDER_KEY_CAPACITY_LIMIT_SKIP_REASONS)
+            });
+        let local_execution_runtime_miss_detail = provider_key_capacity_limited
+            .then_some(PROVIDER_KEY_CAPACITY_LIMIT_REACHED_DETAIL.to_string())
+            .or_else(|| {
+                (!auth_api_key_concurrency_limited)
+                    .then(|| {
+                        local_execution_runtime_miss_context
+                            .all_provider_request_body_build_failures_detail()
+                    })
+                    .flatten()
             })
-            .flatten()
             .or_else(|| {
                 local_execution_runtime_miss_detail(
                     control_decision,
@@ -2082,7 +2102,7 @@ async fn proxy_request_inner(
         let mut response = build_local_http_error_response(
             &trace_id,
             control_decision,
-            http::StatusCode::SERVICE_UNAVAILABLE,
+            local_execution_runtime_miss_status(provider_key_capacity_limited),
             local_execution_runtime_miss_client_message(
                 local_execution_runtime_miss_detail.as_str(),
             )
@@ -2132,6 +2152,7 @@ async fn proxy_request_inner(
     ))
 }
 
+/// 结合调用方并发、Provider Key 容量和路由类型生成面向客户端的本地失败详情。
 fn local_execution_runtime_miss_detail(
     decision: Option<&GatewayControlDecision>,
     diagnostic: Option<&LocalExecutionRuntimeMissDiagnostic>,
@@ -2361,6 +2382,7 @@ fn local_execution_runtime_miss_skip_reason_label(reason: &str) -> &str {
     }
 }
 
+/// 把执行模式投影为稳定中文文案，供本地候选失败详情复用。
 fn local_execution_runtime_miss_request_mode(stream_request: bool) -> &'static str {
     if stream_request {
         "流式"
@@ -2369,6 +2391,7 @@ fn local_execution_runtime_miss_request_mode(stream_request: bool) -> &'static s
     }
 }
 
+/// 为已识别的公开 AI 路由生成可读标签，未知路径使用通用名称。
 fn local_execution_runtime_miss_route_label(
     decision: Option<&GatewayControlDecision>,
 ) -> &'static str {
@@ -2394,6 +2417,7 @@ fn local_execution_runtime_miss_route_label(
     }
 }
 
+/// 判断本地失败是否由调用方 API Key 并发限制单独造成。
 fn diagnostic_is_auth_api_key_concurrency_limited(
     diagnostic: Option<&LocalExecutionRuntimeMissDiagnostic>,
 ) -> bool {
@@ -2408,6 +2432,33 @@ fn diagnostic_is_auth_api_key_concurrency_limited(
             }))
 }
 
+/// 仅当单一原因或全部候选原因都属于 Key 并发/RPM 容量时判定为可重试容量不足。
+fn diagnostic_is_provider_key_capacity_limited(
+    diagnostic: Option<&LocalExecutionRuntimeMissDiagnostic>,
+) -> bool {
+    let Some(diagnostic) = diagnostic else {
+        return false;
+    };
+    PROVIDER_KEY_CAPACITY_LIMIT_SKIP_REASONS.contains(&diagnostic.reason.as_str())
+        || (diagnostic.candidate_count.is_some_and(|candidate_count| {
+            candidate_count > 0
+                && diagnostic.skipped_candidate_count.unwrap_or(0) >= candidate_count
+        }) && !diagnostic.skip_reasons.is_empty()
+            && diagnostic.skip_reasons.iter().all(|(reason, count)| {
+                PROVIDER_KEY_CAPACITY_LIMIT_SKIP_REASONS.contains(&reason.as_str()) && *count > 0
+            }))
+}
+
+/// 将纯容量耗尽映射为 429，其他候选缺失保持 503，避免误报永久额度或基础设施故障。
+fn local_execution_runtime_miss_status(provider_key_capacity_limited: bool) -> http::StatusCode {
+    if provider_key_capacity_limited {
+        http::StatusCode::TOO_MANY_REQUESTS
+    } else {
+        http::StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// 根据公开 AI 路由选择稳定的本地执行失败详情；非 AI 路由不覆盖通用错误。
 fn local_execution_runtime_miss_route_detail(
     decision: Option<&GatewayControlDecision>,
 ) -> Option<&'static str> {
@@ -2446,14 +2497,15 @@ mod tests {
 
     use super::{
         api_key_remote_ip_allowed, buffer_and_normalize_request_body,
-        diagnostic_is_auth_api_key_concurrency_limited, local_execution_runtime_miss_detail,
-        owner_forward_request_is_stream, restore_redacted_stream_execution_response,
-        restore_redacted_sync_execution_response, routing_overlay_allows_affinity_target,
-        GatewayControlDecision, LocalExecutionRuntimeMissDiagnostic, RequestBodyBufferError,
-        RequestBodyBufferPolicy,
+        diagnostic_is_auth_api_key_concurrency_limited,
+        diagnostic_is_provider_key_capacity_limited, local_execution_runtime_miss_detail,
+        local_execution_runtime_miss_status, owner_forward_request_is_stream,
+        restore_redacted_stream_execution_response, restore_redacted_sync_execution_response,
+        routing_overlay_allows_affinity_target, GatewayControlDecision,
+        LocalExecutionRuntimeMissDiagnostic, RequestBodyBufferError, RequestBodyBufferPolicy,
     };
     use axum::body::{to_bytes, Body, Bytes};
-    use axum::http::{header, HeaderMap, HeaderValue, Method, Response};
+    use axum::http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode};
     use serde_json::json;
     use tokio::sync::Semaphore;
 
@@ -2906,6 +2958,7 @@ mod tests {
         )));
     }
 
+    /// 验证调用方 API Key 并发诊断优先于普通候选缺失文案。
     #[test]
     fn runtime_miss_detail_prefers_api_key_concurrency_message_when_classified_from_context() {
         let decision = GatewayControlDecision::synthetic(
@@ -2931,6 +2984,46 @@ mod tests {
         assert_eq!(
             detail.as_deref(),
             Some("当前调用方 API Key 并发请求数已达上限，请稍后重试")
+        );
+    }
+
+    /// 验证只有全部跳过原因都属于容量集合时才返回 429，混合额度原因保持 503。
+    #[test]
+    fn provider_key_capacity_requires_every_skip_reason_to_be_capacity_related() {
+        let capacity_limited = LocalExecutionRuntimeMissDiagnostic {
+            reason: "candidate_evaluation_incomplete".to_string(),
+            candidate_count: Some(2),
+            skipped_candidate_count: Some(2),
+            skip_reasons: std::collections::BTreeMap::from([
+                ("provider_key_concurrency_limit_reached".to_string(), 1),
+                ("key_rpm_exhausted".to_string(), 1),
+            ]),
+            ..LocalExecutionRuntimeMissDiagnostic::default()
+        };
+        let mixed_failure = LocalExecutionRuntimeMissDiagnostic {
+            reason: "all_candidates_skipped".to_string(),
+            candidate_count: Some(2),
+            skipped_candidate_count: Some(2),
+            skip_reasons: std::collections::BTreeMap::from([
+                ("provider_key_concurrency_limit_reached".to_string(), 1),
+                ("account_quota_exhausted".to_string(), 1),
+            ]),
+            ..LocalExecutionRuntimeMissDiagnostic::default()
+        };
+
+        assert!(diagnostic_is_provider_key_capacity_limited(Some(
+            &capacity_limited
+        )));
+        assert!(!diagnostic_is_provider_key_capacity_limited(Some(
+            &mixed_failure
+        )));
+        assert_eq!(
+            local_execution_runtime_miss_status(true),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            local_execution_runtime_miss_status(false),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 }

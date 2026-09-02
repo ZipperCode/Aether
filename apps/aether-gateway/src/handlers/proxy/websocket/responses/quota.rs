@@ -68,6 +68,7 @@ pub(super) async fn detach_exhausted_upstream(
     );
 }
 
+/// 记录当前绑定 Key 的配额排除窗口，并返回用于重规划审计的 Key 与截止时间。
 pub(super) fn record_exhausted_bound_key(
     bound: &mut BoundResponsesConnection,
     reset_at_unix_secs: Option<u64>,
@@ -98,6 +99,7 @@ pub(super) fn record_exhausted_bound_key(
 /// 前置条件写进签名：规划要读 health / adaptive / pool 状态，而这些是上一个
 /// attempt 结算时才投射的；它的 pool key lease 也要先释放，否则替代 key 的挑选
 /// 会看到一把仍被占用的 key。
+/// 配额重试恢复当前逻辑 turn 的原 Codex 指纹上下文，不能把重试伪装成新 turn。
 pub(super) async fn retry_active_turn_after_quota_exhaustion(
     bound: &mut BoundResponsesConnection,
     state: &AppState,
@@ -146,6 +148,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
     };
     let turn_index = active.turn_index;
     let logical_turn_id = active.logical_turn_id.clone();
+    let codex_fingerprint_context = active.codex_fingerprint_context.clone();
     let turn_attempt = active.turn_attempt;
 
     let retry_exclusion_until_unix_secs = bound
@@ -154,7 +157,13 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
     let exhausted_key = record_exhausted_bound_key(bound, retry_exclusion_until_unix_secs);
     let exhausted_key_id = exhausted_key.as_ref().map(|(key_id, _)| key_id.clone());
 
-    let planning_parts = build_planning_parts(context);
+    let mut planning_parts = build_planning_parts(context);
+    if let Some(codex_fingerprint_context) = codex_fingerprint_context.as_ref() {
+        crate::ai_serving::codex_context::restore_codex_logical_turn_context(
+            &mut planning_parts,
+            codex_fingerprint_context,
+        );
+    }
     let turn_request_id = Uuid::new_v4().to_string();
     let now_unix_secs = current_unix_secs();
     let excluded_key_ids = bound.exhausted_exclusions.key_ids(now_unix_secs);

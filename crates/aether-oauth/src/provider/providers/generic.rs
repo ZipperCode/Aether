@@ -17,6 +17,39 @@ use super::claude_code::{
     CLAUDE_CODE_PROVIDER_TYPE, CLAUDE_CODE_REDIRECT_URI, CLAUDE_CODE_TOKEN_URL,
 };
 
+/// Codex OAuth 元数据中保存稳定账号成员指纹的字段名。
+const CODEX_IDENTITY_FINGERPRINT_FIELD: &str = "codex_identity_fingerprint";
+/// 指纹域分隔版本；升级算法时必须更换版本，避免新旧种子混用。
+const CODEX_IDENTITY_FINGERPRINT_VERSION: &str = "codex-persisted-fingerprint:v1";
+
+/// 从账号和成员声明派生不含明文身份的稳定指纹。
+/// 至少需要一个成员标识；账号存在时用于隔离同一成员在不同工作区的身份。
+pub fn derive_codex_identity_fingerprint(
+    account_id: Option<&str>,
+    account_user_id: Option<&str>,
+    user_id: Option<&str>,
+    email: Option<&str>,
+) -> Option<String> {
+    let account = normalized_codex_identity_value(account_id);
+    let member = normalized_codex_identity_value(account_user_id)
+        .or_else(|| normalized_codex_identity_value(user_id))
+        .or_else(|| normalized_codex_identity_value(email))?;
+
+    let mut digest = Sha256::new();
+    digest.update(CODEX_IDENTITY_FINGERPRINT_VERSION.as_bytes());
+    digest.update([0]);
+    digest.update(account.as_deref().unwrap_or("").as_bytes());
+    digest.update([0]);
+    digest.update(member.as_bytes());
+    let digest = digest.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    Some(format!("{CODEX_IDENTITY_FINGERPRINT_VERSION}:{encoded}"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenericProviderOAuthTemplate {
     pub provider_type: &'static str,
@@ -143,6 +176,7 @@ impl GenericProviderOAuthAdapter {
             .unwrap_or_else(|| self.template.token_url.to_string())
     }
 
+    /// 按提供商模板交换授权码或刷新令牌，并把返回凭据规范化为统一令牌集。
     async fn exchange_grant(
         &self,
         executor: &dyn OAuthHttpExecutor,
@@ -265,6 +299,7 @@ impl GenericProviderOAuthAdapter {
         self.token_set_from_payload(payload)
     }
 
+    /// 将 OAuth token 响应归一为持久账号，并补齐不会随 access token 轮换的 Codex 指纹。
     fn token_set_from_payload(&self, payload: Value) -> Result<ProviderOAuthTokenSet, OAuthError> {
         let token_set = OAuthTokenSet::from_token_payload(payload.clone())
             .ok_or_else(|| OAuthError::invalid_response("token response missing access_token"))?;
@@ -287,6 +322,7 @@ impl GenericProviderOAuthAdapter {
             auth_config.insert("scope".to_string(), json!(scope));
         }
         enrich_generic_identity(self.template.provider_type, &mut auth_config, &payload);
+        ensure_codex_identity_fingerprint(self.template.provider_type, &mut auth_config);
         Ok(ProviderOAuthTokenSet {
             token_set,
             auth_config: Value::Object(auth_config),
@@ -352,6 +388,7 @@ impl ProviderOAuthAdapter for GenericProviderOAuthAdapter {
         .await
     }
 
+    /// 导入刷新令牌并立即交换有效访问凭据，空令牌按无效请求拒绝。
     async fn import_credentials(
         &self,
         executor: &dyn OAuthHttpExecutor,
@@ -369,6 +406,7 @@ impl ProviderOAuthAdapter for GenericProviderOAuthAdapter {
     }
 
     /// 使用已保存的刷新令牌换取新凭据，并兼容 Antigravity 旧版 camelCase 字段。
+    /// 使用 refresh token 换取凭据；上游未轮换 refresh token 时保留旧身份元数据。
     async fn refresh(
         &self,
         executor: &dyn OAuthHttpExecutor,
@@ -384,6 +422,16 @@ impl ProviderOAuthAdapter for GenericProviderOAuthAdapter {
         let mut refreshed = self
             .exchange_grant(executor, ctx, "refresh_token", refresh_token, None, None)
             .await?;
+        let existing_codex_identity_fingerprint = self
+            .template
+            .provider_type
+            .eq_ignore_ascii_case("codex")
+            .then(|| {
+                codex_identity_fingerprint_value(&account.auth_config).or_else(|| {
+                    derive_codex_identity_fingerprint_from_auth_config(&account.auth_config)
+                })
+            })
+            .flatten();
 
         // Refresh responses often omit stable account metadata, and some providers
         // do not rotate refresh_token on every refresh. Preserve the stored config
@@ -399,11 +447,19 @@ impl ProviderOAuthAdapter for GenericProviderOAuthAdapter {
                 refreshed.token_set.refresh_token = Some(refresh_token.to_string());
                 merged.insert("refresh_token".to_string(), json!(refresh_token));
             }
+            if let Some(fingerprint) = existing_codex_identity_fingerprint {
+                merged.insert(
+                    CODEX_IDENTITY_FINGERPRINT_FIELD.to_string(),
+                    Value::String(fingerprint),
+                );
+            }
+            ensure_codex_identity_fingerprint(self.template.provider_type, &mut merged);
             refreshed.auth_config = Value::Object(merged);
         }
         Ok(refreshed)
     }
 
+    /// 将已保存账号解析成实际请求使用的 Bearer 授权信息。
     fn resolve_request_auth(
         &self,
         account: &ProviderOAuthAccount,
@@ -411,7 +467,13 @@ impl ProviderOAuthAdapter for GenericProviderOAuthAdapter {
         Ok(account.request_bearer_auth())
     }
 
+    /// 返回账号去重指纹；Codex 优先使用已持久化的成员指纹，避免 access token 轮换漂移。
     fn account_fingerprint(&self, account: &ProviderOAuthAccount) -> Option<String> {
+        if self.template.provider_type.eq_ignore_ascii_case("codex") {
+            return codex_identity_fingerprint_value(&account.auth_config).or_else(|| {
+                derive_codex_identity_fingerprint_from_auth_config(&account.auth_config)
+            });
+        }
         let refresh_token = account
             .auth_config
             .get("refresh_token")
@@ -463,6 +525,7 @@ fn truncate_body(body: &str) -> String {
     }
 }
 
+/// 对敏感值生成不可逆短指纹，仅用于稳定去重，不返回原始凭据。
 fn secret_fingerprint(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     let mut fingerprint = String::with_capacity(16);
@@ -473,6 +536,95 @@ fn secret_fingerprint(value: &str) -> String {
     fingerprint
 }
 
+/// 从兼容的 snake、kebab 或 camel 字段读取已持久化 Codex 指纹。
+fn codex_identity_fingerprint_value(auth_config: &Value) -> Option<String> {
+    [
+        CODEX_IDENTITY_FINGERPRINT_FIELD,
+        "codex-identity-fingerprint",
+        "codexIdentityFingerprint",
+    ]
+    .iter()
+    .find_map(|field| auth_config.get(*field).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(ToOwned::to_owned)
+}
+
+/// 按字段优先级读取并小写规范化一个非空 Codex 身份声明。
+fn codex_identity_claim(auth_config: &Value, fields: &[&str]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| auth_config.get(*field).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+/// 规范化可选身份值；空白视为缺失，大小写不参与身份区分。
+fn normalized_codex_identity_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+/// 从历史及当前 auth-config 字段组合推导账号成员指纹，不读取 access token 本身。
+fn derive_codex_identity_fingerprint_from_auth_config(auth_config: &Value) -> Option<String> {
+    let account = codex_identity_claim(
+        auth_config,
+        &[
+            "account_id",
+            "accountId",
+            "chatgpt_account_id",
+            "chatgptAccountId",
+        ],
+    );
+    let account_user = codex_identity_claim(
+        auth_config,
+        &[
+            "account_user_id",
+            "accountUserId",
+            "chatgpt_account_user_id",
+            "chatgptAccountUserId",
+        ],
+    );
+    let user = codex_identity_claim(
+        auth_config,
+        &["user_id", "userId", "chatgpt_user_id", "chatgptUserId"],
+    );
+    let email = codex_identity_claim(
+        auth_config,
+        &["email", "email_address", "emailAddress", "outlook_email"],
+    );
+
+    derive_codex_identity_fingerprint(
+        account.as_deref(),
+        account_user.as_deref(),
+        user.as_deref(),
+        email.as_deref(),
+    )
+}
+
+/// 对 Codex 凭据补齐稳定指纹；已有兼容字段优先，其他 Provider 保持原样。
+fn ensure_codex_identity_fingerprint(
+    provider_type: &str,
+    auth_config: &mut serde_json::Map<String, Value>,
+) {
+    if !provider_type.eq_ignore_ascii_case("codex") {
+        return;
+    }
+    let auth_config_value = Value::Object(auth_config.clone());
+    let fingerprint = codex_identity_fingerprint_value(&auth_config_value)
+        .or_else(|| derive_codex_identity_fingerprint_from_auth_config(&auth_config_value));
+    if let Some(fingerprint) = fingerprint {
+        auth_config.insert(
+            CODEX_IDENTITY_FINGERPRINT_FIELD.to_string(),
+            Value::String(fingerprint),
+        );
+    }
+}
+
+/// 从 token 响应和 JWT 声明补充通用账号元数据，并在最后固化 Codex 指纹。
 fn enrich_generic_identity(
     provider_type: &str,
     auth_config: &mut serde_json::Map<String, Value>,
@@ -481,12 +633,21 @@ fn enrich_generic_identity(
     if let Some(object) = token_payload.as_object() {
         for field in [
             "email",
+            "email_address",
+            "emailAddress",
+            "outlook_email",
             "account_id",
+            "accountId",
             "account_user_id",
+            "accountUserId",
             "plan_type",
             "user_id",
+            "userId",
             "account_name",
             "is_fedramp",
+            CODEX_IDENTITY_FINGERPRINT_FIELD,
+            "codex-identity-fingerprint",
+            "codexIdentityFingerprint",
         ] {
             if !auth_config.contains_key(field) {
                 if let Some(value) = object.get(field).cloned() {
@@ -566,8 +727,11 @@ fn enrich_generic_identity(
                 .get("https://api.openai.com/profile")
                 .and_then(Value::as_object)
             {
-                if let Some(value) = profile.get("email").cloned() {
-                    auth_config.entry("email".to_string()).or_insert(value);
+                for field in ["email", "email_address", "emailAddress", "outlook_email"] {
+                    if let Some(value) = profile.get(field).cloned() {
+                        auth_config.entry("email".to_string()).or_insert(value);
+                        break;
+                    }
                 }
             }
         }
@@ -634,6 +798,7 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(value_to_string)
 }
 
+/// 读取并清理非空字符串字段；其他 JSON 类型和空白值均视为缺失。
 fn value_to_string(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -642,6 +807,7 @@ fn value_to_string(value: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// 无验签解析本地已获取 token 的声明，仅用于元数据投影；失败时返回缺失而不影响授权。
 fn decode_jwt_claims(token: &str) -> Option<serde_json::Map<String, Value>> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let payload = token.split('.').nth(1)?;
@@ -654,13 +820,16 @@ fn decode_jwt_claims(token: &str) -> Option<serde_json::Map<String, Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{enrich_generic_identity, template_for_provider_type, GenericProviderOAuthAdapter};
+    use super::{
+        derive_codex_identity_fingerprint, enrich_generic_identity, template_for_provider_type,
+        GenericProviderOAuthAdapter, CODEX_IDENTITY_FINGERPRINT_FIELD,
+    };
     use crate::network::{OAuthHttpExecutor, OAuthHttpRequest, OAuthHttpResponse};
     use crate::provider::ProviderOAuthAdapter;
     use crate::provider::{ProviderOAuthAccount, ProviderOAuthTransportContext};
     use async_trait::async_trait;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
@@ -671,6 +840,7 @@ mod tests {
         assert!(template_for_provider_type("kiro").is_none());
     }
 
+    /// 验证通用适配器暴露正确的提供商类型及刷新令牌导入能力。
     #[test]
     fn generic_adapter_exposes_provider_type() {
         let adapter = GenericProviderOAuthAdapter::for_provider_type("codex")
@@ -679,6 +849,15 @@ mod tests {
         assert!(adapter.capabilities().supports_refresh_token_import);
     }
 
+    /// 构造测试用 JWT 形状，只验证声明提取，不模拟签名校验。
+    fn encoded_jwt(claims: &Value) -> String {
+        format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("claims should encode"))
+        )
+    }
+
+    /// 验证 FedRAMP 工作区声明也能投影为 Codex 账号身份。
     #[test]
     fn codex_identity_extracts_fedramp_workspace_claim() {
         let claims = json!({
@@ -687,10 +866,7 @@ mod tests {
                 "chatgpt_account_is_fedramp": true
             }
         });
-        let token = format!(
-            "header.{}.signature",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims should encode"))
-        );
+        let token = encoded_jwt(&claims);
         let mut auth_config = serde_json::Map::new();
 
         enrich_generic_identity("codex", &mut auth_config, &json!({"access_token": token}));
@@ -699,13 +875,83 @@ mod tests {
         assert_eq!(auth_config.get("is_fedramp"), Some(&json!(true)));
     }
 
+    /// 验证持久指纹按工作区成员隔离，并且 access token 轮换不改变它。
+    #[test]
+    fn codex_persisted_fingerprint_is_member_scoped_and_token_independent() {
+        let adapter = GenericProviderOAuthAdapter::for_provider_type("codex")
+            .expect("codex adapter should exist");
+        let claims = json!({
+            "sub": "global-user-1",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "workspace-1",
+                "chatgpt_account_user_id": "member-1"
+            }
+        });
+        let rotated_claims = json!({
+            "sub": "global-user-1",
+            "iat": 12345,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "WORKSPACE-1",
+                "chatgpt_account_user_id": "MEMBER-1"
+            }
+        });
+        let other_member_claims = json!({
+            "sub": "global-user-2",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "workspace-1",
+                "chatgpt_account_user_id": "member-2"
+            }
+        });
+
+        let first = adapter
+            .token_set_from_payload(json!({"access_token": encoded_jwt(&claims)}))
+            .expect("first token should parse");
+        let rotated = adapter
+            .token_set_from_payload(json!({"access_token": encoded_jwt(&rotated_claims)}))
+            .expect("rotated token should parse");
+        let other_member = adapter
+            .token_set_from_payload(json!({"access_token": encoded_jwt(&other_member_claims)}))
+            .expect("other member token should parse");
+
+        let first_fingerprint = first.auth_config[CODEX_IDENTITY_FINGERPRINT_FIELD]
+            .as_str()
+            .expect("persisted fingerprint")
+            .to_string();
+        assert!(first_fingerprint.starts_with("codex-persisted-fingerprint:v1:"));
+        assert_eq!(
+            rotated.auth_config[CODEX_IDENTITY_FINGERPRINT_FIELD].as_str(),
+            Some(first_fingerprint.as_str())
+        );
+        assert_ne!(
+            other_member.auth_config[CODEX_IDENTITY_FINGERPRINT_FIELD].as_str(),
+            Some(first_fingerprint.as_str())
+        );
+
+        let account = ProviderOAuthAccount {
+            provider_type: "codex".to_string(),
+            access_token: "unrelated-rotated-token".to_string(),
+            auth_config: first.auth_config,
+            expires_at_unix_secs: None,
+            identity: BTreeMap::new(),
+        };
+        assert_eq!(
+            adapter.account_fingerprint(&account).as_deref(),
+            Some(first_fingerprint.as_str())
+        );
+    }
+
     #[derive(Debug, Clone)]
+    /// 捕获 refresh 请求并返回固定载荷的测试执行器。
     struct StaticExecutor {
+        /// 最近一次请求，供测试验证刷新参数。
         seen_request: Arc<Mutex<Option<OAuthHttpRequest>>>,
+        /// 每次执行返回的确定性 token 响应。
+        response_payload: Value,
     }
 
     #[async_trait]
     impl OAuthHttpExecutor for StaticExecutor {
+        /// 记录请求并返回固定成功响应，不执行真实网络访问。
         async fn execute(
             &self,
             request: OAuthHttpRequest,
@@ -713,25 +959,39 @@ mod tests {
             *self.seen_request.lock().expect("mutex should lock") = Some(request);
             Ok(OAuthHttpResponse {
                 status_code: 200,
-                body_text: json!({
-                    "access_token": "new-access-token",
-                    "expires_in": 3600
-                })
-                .to_string(),
+                body_text: self.response_payload.to_string(),
                 json_body: None,
             })
         }
     }
 
+    /// 验证上游不返回新 refresh token 时仍保留旧 refresh token 和原成员指纹。
     #[tokio::test]
     async fn refresh_preserves_existing_metadata_when_refresh_token_is_not_rotated() {
         let seen_request = Arc::new(Mutex::new(None));
+        let refreshed_token = encoded_jwt(&json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-123",
+                "chatgpt_account_user_id": "replacement-member"
+            }
+        }));
         let executor = StaticExecutor {
             seen_request: Arc::clone(&seen_request),
+            response_payload: json!({
+                "access_token": refreshed_token,
+                "expires_in": 3600
+            }),
         };
         let adapter = GenericProviderOAuthAdapter::for_provider_type("codex")
             .expect("codex adapter should exist")
             .with_token_url_override("https://auth.example.test/token");
+        let expected_legacy_fingerprint = derive_codex_identity_fingerprint(
+            Some("acct-123"),
+            Some("original-member"),
+            None,
+            Some("alice@example.com"),
+        )
+        .expect("legacy identity should produce a fingerprint");
         let ctx = ProviderOAuthTransportContext {
             provider_id: "provider-1".to_string(),
             provider_type: "codex".to_string(),
@@ -753,6 +1013,7 @@ mod tests {
                 "refresh_token": "old-refresh-token",
                 "email": "alice@example.com",
                 "account_id": "acct-123",
+                "account_user_id": "original-member",
                 "updated_at": 1
             }),
             expires_at_unix_secs: Some(1),
@@ -764,7 +1025,7 @@ mod tests {
             .await
             .expect("refresh should succeed");
 
-        assert_eq!(refreshed.token_set.access_token, "new-access-token");
+        assert_eq!(refreshed.token_set.access_token, refreshed_token);
         assert_eq!(
             refreshed.token_set.refresh_token.as_deref(),
             Some("old-refresh-token")
@@ -772,6 +1033,10 @@ mod tests {
         assert_eq!(refreshed.auth_config["email"], "alice@example.com");
         assert_eq!(refreshed.auth_config["account_id"], "acct-123");
         assert_eq!(refreshed.auth_config["refresh_token"], "old-refresh-token");
+        assert_eq!(
+            refreshed.auth_config[CODEX_IDENTITY_FINGERPRINT_FIELD].as_str(),
+            Some(expected_legacy_fingerprint.as_str())
+        );
 
         let seen = seen_request
             .lock()

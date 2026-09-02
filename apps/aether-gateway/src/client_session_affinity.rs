@@ -15,12 +15,37 @@ pub(crate) enum ClientSessionSignalSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// 归一化后的客户端会话范围，用于调度亲和而不暴露原始请求载荷。
 pub(crate) struct ClientSessionScope {
     pub(crate) client_family: String,
     pub(crate) session_id: String,
     pub(crate) agent_id: Option<String>,
     pub(crate) account_hint: Option<String>,
     pub(crate) source: ClientSessionSignalSource,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// 从一次 Codex 请求提取的会话、turn 与缓存信号；各字段按独立优先级解析。
+pub(crate) struct CodexRequestSignals {
+    /// 用于调度亲和的根会话标识。
+    pub(crate) session_id: Option<String>,
+    /// 原生 thread 标识；存在时优先于会话派生值。
+    pub(crate) thread_id: Option<String>,
+    /// 客户端逻辑 turn 标识，不得用普通 request-id 代替。
+    pub(crate) turn_id: Option<String>,
+    /// 客户端显式缓存键；仅在最终正文仍保留时参与传输收敛。
+    pub(crate) prompt_cache_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `x-codex-turn-metadata` 内部可识别的最小身份字段集合。
+struct CodexTurnMetadataSignals {
+    /// 嵌套会话标识。
+    session_id: Option<String>,
+    /// 嵌套 thread 标识。
+    thread_id: Option<String>,
+    /// 嵌套 turn 标识。
+    turn_id: Option<String>,
 }
 
 impl ClientSessionScope {
@@ -124,6 +149,7 @@ fn client_session_scope_from_api_request(
     client_session_scope_from_request(headers, body_json)
 }
 
+/// 依次使用显式 Aether、已识别客户端和通用适配器解析一个会话范围。
 pub(crate) fn client_session_scope_from_request(
     headers: &http::HeaderMap,
     body_json: Option<&Value>,
@@ -134,6 +160,14 @@ pub(crate) fn client_session_scope_from_request(
         .or_else(|| extract_scope_for_client_family(&request, client_family.as_str()))
         .or_else(|| extract_generic_scope_for_client_family(&request, client_family.as_str()))
         .or_else(|| extract_scope_from_other_specific_adapters(&request, client_family.as_str()))
+}
+
+/// 从 HTTP 头和可选正文统一提取 Codex 信号，供亲和与指纹上下文共享同一解析规则。
+pub(crate) fn codex_request_signals_from_request(
+    headers: &http::HeaderMap,
+    body_json: Option<&Value>,
+) -> CodexRequestSignals {
+    extract_codex_request_signals(&ClientSessionRequest { headers, body_json })
 }
 
 fn codex_search_session_scope(request: &ClientSessionRequest<'_>) -> Option<ClientSessionScope> {
@@ -401,36 +435,16 @@ impl ClientSessionScopeAdapter for CodexSessionScopeAdapter {
         "codex"
     }
 
+    /// 通过 Codex 用户代理或账号头识别请求，不读取凭据内容。
     fn detect(&self, request: &ClientSessionRequest<'_>) -> bool {
         header_contains(request.headers, http::header::USER_AGENT.as_str(), "codex")
             || header_contains(request.headers, "originator", "codex")
             || header_value_str(request.headers, "chatgpt-account-id").is_some()
     }
 
+    /// 使用与指纹上下文相同的 Codex 会话优先级，避免调度亲和与传输身份分叉。
     fn extract_scope(&self, request: &ClientSessionRequest<'_>) -> Option<ClientSessionScope> {
-        header_value_str(request.headers, "session-id")
-            .or_else(|| header_value_str(request.headers, "thread-id"))
-            .or_else(|| header_value_str(request.headers, "session_id"))
-            .or_else(|| header_value_str(request.headers, "conversation_id"))
-            .map(|root_session| {
-                ClientSessionScope::new(
-                    self.family(),
-                    root_session,
-                    None,
-                    header_value_str(request.headers, "chatgpt-account-id"),
-                    ClientSessionSignalSource::Header,
-                )
-            })
-            .or_else(|| {
-                let body_session = GenericSessionScopeAdapter.extract_scope(request)?;
-                Some(ClientSessionScope::new(
-                    self.family(),
-                    body_session.session_id,
-                    body_session.agent_id,
-                    header_value_str(request.headers, "chatgpt-account-id"),
-                    body_session.source,
-                ))
-            })
+        codex_request_session_scope_from_request(request)
     }
 }
 
@@ -763,6 +777,7 @@ fn claude_code_session_id_from_body(body: &Value) -> Option<&str> {
     })
 }
 
+/// 从 Aether 自有会话头建立最高优先级范围，并保留可选 agent 隔离维度。
 fn explicit_aether_session_scope(
     request: &ClientSessionRequest<'_>,
     client_family: &str,
@@ -776,6 +791,170 @@ fn explicit_aether_session_scope(
         None,
         ClientSessionSignalSource::ExplicitAetherHeader,
     ))
+}
+
+/// 按字段独立优先级解析 Codex 请求，避免 session、thread、turn 相互错误覆盖。
+fn extract_codex_request_signals(request: &ClientSessionRequest<'_>) -> CodexRequestSignals {
+    let body_client_metadata = request
+        .body_json
+        .and_then(|body| body.get("client_metadata"))
+        .and_then(Value::as_object);
+    let body_turn_metadata = codex_turn_metadata_signals(
+        body_client_metadata.and_then(|metadata| metadata.get("x-codex-turn-metadata")),
+    );
+    let header_turn_metadata = header_value_str(request.headers, "x-codex-turn-metadata")
+        .map(|raw| parse_codex_turn_metadata(&raw))
+        .unwrap_or_default();
+
+    let native_thread_id = header_value_str(request.headers, "thread-id")
+        .or_else(|| {
+            body_client_metadata
+                .and_then(|metadata| value_at_map_path(metadata, "thread_id"))
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| body_turn_metadata.thread_id.clone());
+    let turn_id = body_client_metadata
+        .and_then(|metadata| value_at_map_path(metadata, "turn_id"))
+        .map(ToOwned::to_owned)
+        .or_else(|| body_turn_metadata.turn_id.clone())
+        .or_else(|| {
+            request
+                .body_json
+                .and_then(|body| value_at_path(body, &["turn_id"]))
+                .map(ToOwned::to_owned)
+        })
+        .or(header_turn_metadata.turn_id);
+    let prompt_cache_key = request
+        .body_json
+        .and_then(|body| value_at_path(body, &["prompt_cache_key"]))
+        .map(ToOwned::to_owned);
+    let session_id =
+        codex_request_session_scope(request, &body_turn_metadata).map(|scope| scope.session_id);
+    let thread_id = native_thread_id.or_else(|| session_id.clone());
+
+    CodexRequestSignals {
+        session_id,
+        thread_id,
+        turn_id,
+        prompt_cache_key,
+    }
+}
+
+/// 从请求构建 Codex 会话范围，并复用已经解析的嵌套 turn 元数据。
+fn codex_request_session_scope_from_request(
+    request: &ClientSessionRequest<'_>,
+) -> Option<ClientSessionScope> {
+    let body_turn_metadata = codex_turn_metadata_signals(
+        request
+            .body_json
+            .and_then(|body| body.get("client_metadata"))
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("x-codex-turn-metadata")),
+    );
+    codex_request_session_scope(request, &body_turn_metadata)
+}
+
+/// 按 Aether 显式头、Codex 原生头、正文元数据和通用回退解析会话范围。
+fn codex_request_session_scope(
+    request: &ClientSessionRequest<'_>,
+    body_turn_metadata: &CodexTurnMetadataSignals,
+) -> Option<ClientSessionScope> {
+    if let Some(scope) = explicit_aether_session_scope(request, CodexSessionScopeAdapter.family()) {
+        return Some(scope);
+    }
+
+    if let Some(root_session) = header_value_str(request.headers, "session-id")
+        .or_else(|| header_value_str(request.headers, "thread-id"))
+        .or_else(|| header_value_str(request.headers, "session_id"))
+        .or_else(|| header_value_str(request.headers, "conversation_id"))
+        .or_else(|| header_value_str(request.headers, "x-session-id"))
+    {
+        return Some(codex_session_scope(
+            request,
+            root_session,
+            None,
+            ClientSessionSignalSource::Header,
+        ));
+    }
+
+    let body_client_metadata = request
+        .body_json
+        .and_then(|body| body.get("client_metadata"))
+        .and_then(Value::as_object);
+    if let Some(root_session) = body_client_metadata
+        .and_then(|metadata| value_at_map_path(metadata, "session_id"))
+        .or_else(|| {
+            body_client_metadata.and_then(|metadata| value_at_map_path(metadata, "thread_id"))
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| body_turn_metadata.session_id.clone())
+        .or_else(|| body_turn_metadata.thread_id.clone())
+    {
+        return Some(codex_session_scope(
+            request,
+            root_session,
+            None,
+            ClientSessionSignalSource::Body,
+        ));
+    }
+
+    let generic = GenericSessionScopeAdapter.extract_scope(request)?;
+    Some(codex_session_scope(
+        request,
+        generic.session_id,
+        generic.agent_id,
+        generic.source,
+    ))
+}
+
+/// 构造 Codex 会话范围，并附加账号提示以防跨账号亲和碰撞。
+fn codex_session_scope(
+    request: &ClientSessionRequest<'_>,
+    session_id: String,
+    agent_id: Option<String>,
+    source: ClientSessionSignalSource,
+) -> ClientSessionScope {
+    ClientSessionScope::new(
+        CodexSessionScopeAdapter.family(),
+        session_id,
+        agent_id,
+        header_value_str(request.headers, "chatgpt-account-id"),
+        source,
+    )
+}
+
+/// 同时接受对象或 JSON 字符串形态的嵌套 turn 元数据，其他类型返回空信号。
+fn codex_turn_metadata_signals(value: Option<&Value>) -> CodexTurnMetadataSignals {
+    match value {
+        Some(Value::Object(metadata)) => codex_turn_metadata_signals_from_map(metadata),
+        Some(Value::String(raw)) => parse_codex_turn_metadata(raw),
+        _ => CodexTurnMetadataSignals::default(),
+    }
+}
+
+/// 解析头部中的 JSON turn 元数据；畸形内容安全回退为空信号。
+fn parse_codex_turn_metadata(raw: &str) -> CodexTurnMetadataSignals {
+    serde_json::from_str::<Map<String, Value>>(raw)
+        .map(|metadata| codex_turn_metadata_signals_from_map(&metadata))
+        .unwrap_or_default()
+}
+
+/// 从 turn 元数据对象读取三个已知字符串字段，不接纳其他字段作为身份。
+fn codex_turn_metadata_signals_from_map(metadata: &Map<String, Value>) -> CodexTurnMetadataSignals {
+    CodexTurnMetadataSignals {
+        session_id: value_at_map_path(metadata, "session_id").map(ToOwned::to_owned),
+        thread_id: value_at_map_path(metadata, "thread_id").map(ToOwned::to_owned),
+        turn_id: value_at_map_path(metadata, "turn_id").map(ToOwned::to_owned),
+    }
+}
+
+/// 读取对象中的非空字符串字段，统一执行 trim 与空值过滤。
+fn value_at_map_path<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn normalize_session_key(
@@ -813,12 +992,14 @@ fn value_at_path<'a>(body: &'a Value, path: &[&str]) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+/// 不区分大小写检查一个可读头部是否包含客户端识别标记。
 fn header_contains(headers: &http::HeaderMap, key: &str, needle: &str) -> bool {
     header_value_str(headers, key)
         .map(|value| value.to_ascii_lowercase().contains(needle))
         .unwrap_or(false)
 }
 
+/// 不区分大小写判断是否存在指定前缀的头部，用于识别客户端家族而不读取敏感值。
 fn has_header_with_prefix(headers: &http::HeaderMap, prefix: &str) -> bool {
     headers
         .keys()
@@ -831,11 +1012,25 @@ mod tests {
         client_session_affinity_from_api_request,
         client_session_affinity_from_report_context_value, client_session_affinity_from_request,
         client_session_affinity_report_context_value, client_session_scope_from_request,
-        ClientSessionSignalSource, AETHER_AGENT_ID_HEADER, AETHER_SESSION_ID_HEADER,
+        codex_request_signals_from_request, ClientSessionSignalSource, AETHER_AGENT_ID_HEADER,
+        AETHER_SESSION_ID_HEADER,
     };
     use aether_scheduler_core::ClientSessionAffinity;
-    use http::{HeaderMap, HeaderValue};
+    use http::{HeaderMap, HeaderName, HeaderValue};
     use serde_json::json;
+
+    /// 构造测试请求头，并在输入非法时立即失败以避免掩盖优先级断言。
+    fn request_headers(values: &[(&str, &str)]) -> HeaderMap {
+        values
+            .iter()
+            .map(|(name, value)| {
+                (
+                    HeaderName::from_bytes(name.as_bytes()).expect("valid test header name"),
+                    HeaderValue::from_bytes(value.as_bytes()).expect("valid test header value"),
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn unknown_adapter_extracts_body_session_and_agent() {
@@ -880,6 +1075,7 @@ mod tests {
         );
     }
 
+    /// 验证 Codex 原生 session 头可生成预期会话范围。
     #[test]
     fn codex_adapter_extracts_header_session() {
         let mut headers = HeaderMap::new();
@@ -900,6 +1096,7 @@ mod tests {
         );
     }
 
+    /// 验证正文会话信号优先于无业务语义的请求 ID，避免每请求破坏亲和。
     #[test]
     fn codex_adapter_uses_body_session_instead_of_request_id() {
         let mut headers = HeaderMap::new();
@@ -931,6 +1128,282 @@ mod tests {
             affinity.session_key.as_deref(),
             Some("account=account-1;session=prompt-session-1")
         );
+    }
+
+    /// 验证 Codex 会话信号按显式 Aether 头、原生头、正文和通用字段依次回退。
+    #[test]
+    fn codex_request_signals_apply_session_precedence() {
+        let cases = vec![
+            (
+                request_headers(&[
+                    (AETHER_SESSION_ID_HEADER, "aether-session"),
+                    ("session-id", "header-session"),
+                ]),
+                json!({"client_metadata": {"session_id": "body-session"}}),
+                "aether-session",
+                ClientSessionSignalSource::ExplicitAetherHeader,
+            ),
+            (
+                request_headers(&[
+                    ("session-id", "header-session"),
+                    ("thread-id", "header-thread"),
+                    ("session_id", "header-session-underscore"),
+                    ("conversation_id", "header-conversation"),
+                ]),
+                json!({"client_metadata": {"session_id": "body-session"}}),
+                "header-session",
+                ClientSessionSignalSource::Header,
+            ),
+            (
+                request_headers(&[
+                    ("thread-id", "header-thread"),
+                    ("session_id", "header-session-underscore"),
+                    ("conversation_id", "header-conversation"),
+                ]),
+                json!({"client_metadata": {"session_id": "body-session"}}),
+                "header-thread",
+                ClientSessionSignalSource::Header,
+            ),
+            (
+                request_headers(&[
+                    ("session_id", "header-session-underscore"),
+                    ("conversation_id", "header-conversation"),
+                ]),
+                json!({"client_metadata": {"session_id": "body-session"}}),
+                "header-session-underscore",
+                ClientSessionSignalSource::Header,
+            ),
+            (
+                request_headers(&[("conversation_id", "header-conversation")]),
+                json!({"client_metadata": {"session_id": "body-session"}}),
+                "header-conversation",
+                ClientSessionSignalSource::Header,
+            ),
+            (
+                HeaderMap::new(),
+                json!({
+                    "prompt_cache_key": "prompt-cache",
+                    "client_metadata": {
+                        "session_id": "body-session",
+                        "thread_id": "body-thread",
+                        "x-codex-turn-metadata": {
+                            "session_id": "nested-session",
+                            "thread_id": "nested-thread"
+                        }
+                    }
+                }),
+                "body-session",
+                ClientSessionSignalSource::Body,
+            ),
+            (
+                HeaderMap::new(),
+                json!({
+                    "prompt_cache_key": "prompt-cache",
+                    "client_metadata": {
+                        "thread_id": "body-thread",
+                        "x-codex-turn-metadata": {"session_id": "nested-session"}
+                    }
+                }),
+                "body-thread",
+                ClientSessionSignalSource::Body,
+            ),
+            (
+                HeaderMap::new(),
+                json!({
+                    "prompt_cache_key": "prompt-cache",
+                    "client_metadata": {
+                        "x-codex-turn-metadata": {
+                            "session_id": "nested-session",
+                            "thread_id": "nested-thread"
+                        }
+                    }
+                }),
+                "nested-session",
+                ClientSessionSignalSource::Body,
+            ),
+            (
+                HeaderMap::new(),
+                json!({
+                    "prompt_cache_key": "prompt-cache",
+                    "client_metadata": {
+                        "x-codex-turn-metadata": json!({
+                            "thread_id": "nested-thread"
+                        }).to_string()
+                    }
+                }),
+                "nested-thread",
+                ClientSessionSignalSource::Body,
+            ),
+            (
+                HeaderMap::new(),
+                json!({
+                    "prompt_cache_key": "prompt-cache",
+                    "conversation_id": "generic-conversation"
+                }),
+                "prompt-cache",
+                ClientSessionSignalSource::Body,
+            ),
+            (
+                HeaderMap::new(),
+                json!({"metadata": {"session_id": "generic-session"}}),
+                "generic-session",
+                ClientSessionSignalSource::Body,
+            ),
+        ];
+
+        for (headers, body, expected_session_id, expected_source) in cases {
+            let signals = codex_request_signals_from_request(&headers, Some(&body));
+            assert_eq!(signals.session_id.as_deref(), Some(expected_session_id));
+
+            let mut codex_headers = headers;
+            codex_headers.insert(
+                http::header::USER_AGENT,
+                HeaderValue::from_static("codex_cli_rs/0.144.1"),
+            );
+            let scope = client_session_scope_from_request(&codex_headers, Some(&body))
+                .expect("Codex scope should reuse the native signal precedence");
+            assert_eq!(scope.client_family, "codex");
+            assert_eq!(scope.session_id, expected_session_id);
+            assert_eq!(scope.source, expected_source);
+        }
+    }
+
+    /// 验证 thread 与缓存键独立提取，不因 session 来源不同而相互覆盖。
+    #[test]
+    fn codex_request_signals_extract_thread_and_prompt_cache_independently() {
+        let body = json!({
+            "prompt_cache_key": "prompt-cache",
+            "client_metadata": {
+                "thread_id": "body-thread",
+                "x-codex-turn-metadata": {"thread_id": "nested-thread"}
+            }
+        });
+        let headers = request_headers(&[("thread-id", "header-thread")]);
+        let header_signals = codex_request_signals_from_request(&headers, Some(&body));
+        assert_eq!(header_signals.thread_id.as_deref(), Some("header-thread"));
+        assert_eq!(
+            header_signals.prompt_cache_key.as_deref(),
+            Some("prompt-cache")
+        );
+
+        let body_signals = codex_request_signals_from_request(&HeaderMap::new(), Some(&body));
+        assert_eq!(body_signals.thread_id.as_deref(), Some("body-thread"));
+
+        let nested_body = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": json!({
+                    "thread_id": "nested-thread"
+                }).to_string()
+            }
+        });
+        let nested_signals =
+            codex_request_signals_from_request(&HeaderMap::new(), Some(&nested_body));
+        assert_eq!(nested_signals.thread_id.as_deref(), Some("nested-thread"));
+
+        let session_only_body = json!({"client_metadata": {"session_id": "body-session"}});
+        let session_only_signals =
+            codex_request_signals_from_request(&HeaderMap::new(), Some(&session_only_body));
+        assert_eq!(
+            session_only_signals.thread_id.as_deref(),
+            Some("body-session")
+        );
+    }
+
+    /// 验证 Codex Live 的 `x-session-id` 可作为会话范围来源。
+    #[test]
+    fn codex_request_signals_use_live_session_header() {
+        let headers = request_headers(&[("x-session-id", "live-session")]);
+        let signals = codex_request_signals_from_request(&headers, None);
+
+        assert_eq!(signals.session_id.as_deref(), Some("live-session"));
+        assert_eq!(signals.thread_id.as_deref(), Some("live-session"));
+    }
+
+    /// 验证 Responses 原生 session 头优先于 Live 的兼容会话头。
+    #[test]
+    fn codex_request_signals_prefer_responses_session_header_over_live_session_header() {
+        let headers = request_headers(&[
+            ("session-id", "responses-session"),
+            ("x-session-id", "live-session"),
+        ]);
+        let signals = codex_request_signals_from_request(&headers, None);
+
+        assert_eq!(signals.session_id.as_deref(), Some("responses-session"));
+        assert_eq!(signals.thread_id.as_deref(), Some("responses-session"));
+    }
+
+    /// 验证 turn 标识按正文元数据、嵌套元数据和头部元数据的既定顺序解析。
+    #[test]
+    fn codex_request_signals_apply_turn_precedence() {
+        let headers = request_headers(&[("x-codex-turn-metadata", r#"{"turn_id":"header-turn"}"#)]);
+        let direct_body = json!({
+            "turn_id": "top-level-turn",
+            "client_metadata": {
+                "turn_id": "body-turn",
+                "x-codex-turn-metadata": {"turn_id": "nested-turn"}
+            }
+        });
+        assert_eq!(
+            codex_request_signals_from_request(&headers, Some(&direct_body))
+                .turn_id
+                .as_deref(),
+            Some("body-turn")
+        );
+
+        let nested_object_body = json!({
+            "turn_id": "top-level-turn",
+            "client_metadata": {
+                "x-codex-turn-metadata": {"turn_id": "nested-object-turn"}
+            }
+        });
+        assert_eq!(
+            codex_request_signals_from_request(&headers, Some(&nested_object_body))
+                .turn_id
+                .as_deref(),
+            Some("nested-object-turn")
+        );
+
+        let nested_string_body = json!({
+            "turn_id": "top-level-turn",
+            "client_metadata": {
+                "x-codex-turn-metadata": json!({
+                    "turn_id": "nested-string-turn"
+                }).to_string()
+            }
+        });
+        assert_eq!(
+            codex_request_signals_from_request(&headers, Some(&nested_string_body))
+                .turn_id
+                .as_deref(),
+            Some("nested-string-turn")
+        );
+
+        let top_level_body = json!({
+            "turn_id": "top-level-turn",
+            "client_metadata": {"x-codex-turn-metadata": "not-json"}
+        });
+        assert_eq!(
+            codex_request_signals_from_request(&headers, Some(&top_level_body))
+                .turn_id
+                .as_deref(),
+            Some("top-level-turn")
+        );
+        assert_eq!(
+            codex_request_signals_from_request(&headers, None)
+                .turn_id
+                .as_deref(),
+            Some("header-turn")
+        );
+    }
+
+    /// 验证普通请求 ID 不会被误当成逻辑 turn 身份。
+    #[test]
+    fn codex_request_signals_ignore_client_request_id() {
+        let headers = request_headers(&[("x-client-request-id", "request-only-id")]);
+        let signals =
+            codex_request_signals_from_request(&headers, Some(&json!({"model": "gpt-5"})));
+
+        assert_eq!(signals, super::CodexRequestSignals::default());
     }
 
     #[test]

@@ -78,6 +78,7 @@ use super::support::{
 };
 use super::LocalOpenAiResponsesSpec;
 
+/// 判断 Responses 候选是否可进入 Grok 标准文本正文路径。
 fn is_grok_text_provider_api_format(provider_api_format: &str) -> bool {
     matches!(
         crate::ai_serving::normalize_api_format_alias(provider_api_format).as_str(),
@@ -194,6 +195,7 @@ pub(crate) struct LocalOpenAiResponsesCandidatePayloadParts {
     pub(super) request_redacted: bool,
 }
 
+/// 兼容普通 Responses 调用方的候选解析入口，并显式选择非 WebSocket 模式。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
     state: &AppState,
@@ -221,6 +223,7 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
     .await
 }
 
+/// 解析 Responses 候选载荷；WebSocket 与 HTTP 均使用最终模型选择 reasoning replay 策略。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts_with_websocket_mode(
     state: &AppState,
@@ -438,6 +441,7 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts_with_
     let reasoning_replay_policy = openai_responses_reasoning_replay_policy(
         transport.provider.provider_type.as_str(),
         transport.endpoint.base_url.as_str(),
+        mapped_model.as_str(),
     );
     let redaction = resolve_provider_chat_pii_redaction(
         state,

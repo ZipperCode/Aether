@@ -13,6 +13,7 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
 
 use crate::ai_serving::planner::common::extract_standard_requested_model;
+use crate::ai_serving::transport::CodexFingerprintConvergenceContext;
 use crate::ai_serving::{
     ClientSurface, ExecutionRuntimeAuthContext, GatewayAuthApiKeySnapshot,
     GatewayCredentialCarrier, GatewayProviderTransportSnapshot, PlannerAppState,
@@ -46,6 +47,7 @@ pub(crate) struct ResolvedLocalDecisionAuthInput {
 }
 
 #[derive(Debug, Clone)]
+/// 规划一个请求模型所需的鉴权、路由、会话身份、指令和 Endpoint 能力上下文。
 pub(crate) struct LocalRequestedModelDecisionInput {
     pub(crate) auth_context: ExecutionRuntimeAuthContext,
     pub(crate) requested_model: String,
@@ -55,7 +57,8 @@ pub(crate) struct LocalRequestedModelDecisionInput {
     pub(crate) client_surface: Option<ClientSurface>,
     pub(crate) gateway_credential_carrier: Option<GatewayCredentialCarrier>,
     pub(crate) client_session_affinity: Option<ClientSessionAffinity>,
-    pub(crate) original_client_session_id: Option<String>,
+    /// 当前逻辑 turn 的不可变 Codex 指纹上下文，所有候选与重规划必须复用。
+    pub(crate) codex_fingerprint_context: Option<CodexFingerprintConvergenceContext>,
     pub(crate) routing_policy: Option<ResolvedRoutingPolicy>,
     pub(crate) routing_trace_seed: Option<RoutingDecisionTrace>,
     pub(crate) routing_context: Option<LocalRoutingRequestContext>,
@@ -146,6 +149,7 @@ impl LocalRequestedModelDecisionInput {
     }
 }
 
+/// 兼容普通 HTTP 调用方应用终态路由规则，并委托显式 WebSocket 模式版本完成收敛。
 pub(crate) fn apply_provider_request_routing_policy_to_decision(
     input: &LocalRequestedModelDecisionInput,
     decision: &mut AiExecutionDecision,
@@ -161,6 +165,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision(
 /// mutate the body and therefore require a second provider-contract pass; the
 /// pass must use the same explicit continuation mode as the first pass rather
 /// than guessing from JSON fields.
+/// 中文边界：所有 Provider 正文与头部规则完成后才执行身份收敛，避免恢复被规则删除的字段。
 pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_mode(
     input: &LocalRequestedModelDecisionInput,
     decision: &mut AiExecutionDecision,
@@ -216,7 +221,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
                 provider_api_format.as_str(),
             );
         }
-        apply_codex_oauth_fingerprint_convergence_to_decision(
+        apply_codex_fingerprint_convergence_to_decision(
             input,
             decision,
             transport,
@@ -279,7 +284,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
                 provider_api_format.as_str(),
             );
         }
-        apply_codex_oauth_fingerprint_convergence_to_decision(
+        apply_codex_fingerprint_convergence_to_decision(
             input,
             decision,
             transport,
@@ -340,6 +345,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
                     crate::ai_serving::openai_responses_reasoning_replay_policy(
                         transport.provider.provider_type.as_str(),
                         transport.endpoint.base_url.as_str(),
+                        provider_model.as_str(),
                     )
                 })
                 .unwrap_or_default();
@@ -404,7 +410,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
     if original_provider_request_body.is_some() {
         decision.provider_request_body = Some(provider_request_body);
     }
-    apply_codex_oauth_fingerprint_convergence_to_decision(
+    apply_codex_fingerprint_convergence_to_decision(
         input,
         decision,
         transport,
@@ -414,7 +420,8 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
     Ok(())
 }
 
-fn apply_codex_oauth_fingerprint_convergence_to_decision(
+/// 在终态 Provider 请求上应用已冻结的 Codex 上下文，并同步决策中的最终缓存键。
+fn apply_codex_fingerprint_convergence_to_decision(
     input: &LocalRequestedModelDecisionInput,
     decision: &mut AiExecutionDecision,
     transport: Option<&GatewayProviderTransportSnapshot>,
@@ -425,13 +432,24 @@ fn apply_codex_oauth_fingerprint_convergence_to_decision(
     else {
         return;
     };
-    crate::ai_serving::transport::apply_codex_oauth_fingerprint_convergence(
+    let Some(context) = input.codex_fingerprint_context.as_ref() else {
+        return;
+    };
+    let applied = crate::ai_serving::transport::apply_codex_fingerprint_convergence_with_context(
         transport,
         provider_api_format,
-        input.original_client_session_id.as_deref(),
+        context,
         &mut decision.provider_request_headers,
         provider_request_body,
     );
+    if applied {
+        decision.prompt_cache_key = provider_request_body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+    }
 }
 
 struct GatewayAuthenticatedDecisionInputPort<'a> {
@@ -492,6 +510,7 @@ impl AiAuthenticatedDecisionInputPort for GatewayAuthenticatedDecisionInputPort<
             .await)
     }
 
+    /// 把鉴权端口结果封装为本地规划输入，不提前猜测请求级路由或身份字段。
     fn build_resolved_input(
         &self,
         auth_context: Self::AuthContext,
@@ -507,6 +526,7 @@ impl AiAuthenticatedDecisionInputPort for GatewayAuthenticatedDecisionInputPort<
     }
 }
 
+/// 从鉴权解析结果创建模型决策输入；请求级身份、路由和 Endpoint 能力由后续阶段附加。
 pub(crate) fn build_local_requested_model_decision_input(
     resolved_input: ResolvedLocalDecisionAuthInput,
     requested_model: String,
@@ -520,7 +540,7 @@ pub(crate) fn build_local_requested_model_decision_input(
         client_surface: None,
         gateway_credential_carrier: None,
         client_session_affinity: None,
-        original_client_session_id: None,
+        codex_fingerprint_context: None,
         routing_policy: None,
         routing_trace_seed: None,
         routing_context: None,
@@ -531,6 +551,7 @@ pub(crate) fn build_local_requested_model_decision_input(
     }
 }
 
+/// 解析并附加请求路由上下文，同时只采集一次 Codex 指纹信号供后续候选复用。
 pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
     state: &AppState,
     parts: &http::request::Parts,
@@ -538,7 +559,8 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
     body_json: &Value,
     client_api_format: &str,
 ) -> Result<(), GatewayError> {
-    input.original_client_session_id = original_client_session_id_from_headers(&parts.headers);
+    input.codex_fingerprint_context =
+        Some(crate::ai_serving::codex_context::resolve_codex_fingerprint_context(parts, body_json));
     let explicit_group = routing_header_value_str(&parts.headers, ROUTING_GROUP_HEADER);
     let selected_group = match state.routing_group_read_repository() {
         Some(repository) => {
@@ -789,12 +811,6 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
     Ok(())
 }
 
-fn original_client_session_id_from_headers(headers: &HeaderMap) -> Option<String> {
-    routing_header_value_str(headers, "session-id")
-        .or_else(|| routing_header_value_str(headers, "session_id"))
-        .or_else(|| routing_header_value_str(headers, "x-session-id"))
-}
-
 fn try_attach_static_default_routing_policy_to_input(
     input: &mut LocalRequestedModelDecisionInput,
     parts: &http::request::Parts,
@@ -990,6 +1006,7 @@ fn header_map_to_btree_headers(headers: &HeaderMap) -> BTreeMap<String, String> 
         .collect()
 }
 
+/// 把最终 Provider 请求变更写入报告上下文，供调试与后续执行读取同一事实。
 fn update_report_context_provider_request_mutation(
     decision: &mut AiExecutionDecision,
     policy: &ResolvedRoutingPolicy,
@@ -1037,6 +1054,7 @@ fn update_report_context_provider_request_mutation(
     );
 }
 
+/// 确保报告上下文携带最终路由轨迹，并保留已经记录的其他执行诊断。
 fn ensure_report_context_routing_trace(
     input: &LocalRequestedModelDecisionInput,
     decision: &mut AiExecutionDecision,
@@ -1157,38 +1175,6 @@ mod tests {
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
         GatewayProviderTransportProvider,
     };
-
-    #[test]
-    fn original_client_session_id_accepts_live_header_as_fallback() {
-        let headers = HeaderMap::from_iter([(
-            HeaderName::from_static("x-session-id"),
-            HeaderValue::from_static("live-thread-1"),
-        )]);
-
-        assert_eq!(
-            original_client_session_id_from_headers(&headers).as_deref(),
-            Some("live-thread-1")
-        );
-    }
-
-    #[test]
-    fn original_client_session_id_prefers_responses_headers_over_live_fallback() {
-        let headers = HeaderMap::from_iter([
-            (
-                HeaderName::from_static("session-id"),
-                HeaderValue::from_static("responses-session"),
-            ),
-            (
-                HeaderName::from_static("x-session-id"),
-                HeaderValue::from_static("live-thread"),
-            ),
-        ]);
-
-        assert_eq!(
-            original_client_session_id_from_headers(&headers).as_deref(),
-            Some("responses-session")
-        );
-    }
 
     #[test]
     fn explicit_routing_selection_cache_key_is_principal_specific() {
@@ -1811,6 +1797,7 @@ mod tests {
         assert!(input.routing_context.is_none());
     }
 
+    /// 验证路由规则对正文、头部和报告上下文的变更保持一致。
     #[test]
     fn provider_request_routing_policy_mutates_decision_body_headers_and_report_context() {
         let input = sample_decision_input();
@@ -1845,6 +1832,7 @@ mod tests {
         );
     }
 
+    /// 验证无路由上下文、静态路由与动态路由的所有成功出口均执行同一指纹收敛。
     #[test]
     fn codex_fingerprint_convergence_runs_at_every_provider_routing_success_exit() {
         let transport = sample_codex_fingerprint_transport();
@@ -1861,7 +1849,13 @@ mod tests {
         });
         let mut with_mutation = sample_decision_input();
         for input in [&mut no_context, &mut empty_mutation, &mut with_mutation] {
-            input.original_client_session_id = Some("client-session-1".to_string());
+            input.codex_fingerprint_context = Some(
+                CodexFingerprintConvergenceContext::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    1_756_668_000_000,
+                )
+                .with_original_client_session_id("client-session-1".to_string()),
+            );
         }
 
         let mut stable_identity = None;
@@ -1908,6 +1902,10 @@ mod tests {
                 .provider_request_body
                 .as_ref()
                 .expect("request body");
+            assert_eq!(
+                decision.prompt_cache_key.as_deref(),
+                body.get("prompt_cache_key").and_then(Value::as_str)
+            );
             assert_eq!(
                 body["prompt_cache_key"],
                 "172c39e6-c0a0-5a70-8b63-e0f8e0d185a3"
@@ -2016,6 +2014,7 @@ mod tests {
         }
     }
 
+    /// 验证所有路由变更完成后才生成终态 Codex 缓存身份头。
     #[test]
     fn codex_prompt_cache_identity_headers_are_terminal_after_routing_mutations() {
         let mut input = sample_decision_input();
@@ -2071,6 +2070,7 @@ mod tests {
         );
     }
 
+    /// 验证正文规则删除缓存身份后，传输收敛不会从旧头或上下文恢复该字段。
     #[test]
     fn codex_prompt_cache_identity_headers_fail_closed_after_body_identity_removal() {
         let mut input = sample_decision_input();
@@ -2112,6 +2112,7 @@ mod tests {
 
         let body = decision.provider_request_body.as_ref().expect("body");
         assert!(body.get("prompt_cache_key").is_none());
+        assert!(decision.prompt_cache_key.is_none());
         assert!(body.get("client_metadata").is_none());
         assert!(!decision.provider_request_headers.contains_key("session-id"));
         assert!(!decision.provider_request_headers.contains_key("thread-id"));

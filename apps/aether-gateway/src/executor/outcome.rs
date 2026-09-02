@@ -111,6 +111,7 @@ impl LocalExecutionRuntimeMissContext {
         self.candidate_contexts.len()
     }
 
+    /// 判断所有持久候选是否都因同一精确原因跳过；空原因或空候选不成立。
     pub(crate) fn all_candidates_skipped_for_reason(&self, reason: &str) -> bool {
         let reason = reason.trim();
         if reason.is_empty() || self.candidate_contexts.is_empty() {
@@ -125,6 +126,23 @@ impl LocalExecutionRuntimeMissContext {
                     .as_deref()
                     .map(str::trim)
                     .is_some_and(|value| value == reason)
+        })
+    }
+
+    /// 判断所有持久候选是否都以允许集合中的原因跳过；空候选或空集合均返回 `false`。
+    pub(crate) fn all_candidates_skipped_for_reasons(&self, reasons: &[&str]) -> bool {
+        if reasons.is_empty() || self.candidate_contexts.is_empty() {
+            return false;
+        }
+
+        self.candidate_contexts.iter().all(|candidate| {
+            candidate.candidate.status == RequestCandidateStatus::Skipped
+                && candidate
+                    .candidate
+                    .skip_reason
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| reasons.contains(&value))
         })
     }
 

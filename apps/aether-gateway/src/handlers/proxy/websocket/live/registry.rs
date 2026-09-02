@@ -687,6 +687,7 @@ mod tests {
         Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()))
     }
 
+    /// 构造测试用稳定 Live 绑定，供注册表重连与候选恢复检查复用。
     fn binding(client_model: &str) -> LiveCallBinding {
         LiveCallBinding {
             schema_version: SCHEMA_VERSION,
@@ -704,6 +705,7 @@ mod tests {
         }
     }
 
+    /// 从既有绑定构造测试候选，并补入确定性的 Codex 指纹上下文。
     fn candidate_for_binding(binding: &LiveCallBinding) -> PlannedLiveCandidate {
         let execution: crate::ai_serving::AiExecutionDecision =
             serde_json::from_value(serde_json::json!({
@@ -718,6 +720,11 @@ mod tests {
         PlannedLiveCandidate {
             execution,
             pinned_candidate: binding.pinned_candidate.clone(),
+            codex_fingerprint_context:
+                aether_provider_transport::CodexFingerprintConvergenceContext::new(
+                    "test-live-turn",
+                    1,
+                ),
             client_model: binding.client_model.clone(),
             provider_model: binding.provider_model.clone(),
             auth_mode: binding.auth_mode,

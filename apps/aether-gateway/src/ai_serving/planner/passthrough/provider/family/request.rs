@@ -100,6 +100,7 @@ pub(crate) fn resolve_same_format_provider_transport_unsupported_reason_for_trac
     )
 }
 
+/// 同格式候选完成映射、鉴权、兼容编辑和脱敏后的终态载荷集合。
 pub(crate) struct LocalSameFormatProviderCandidatePayloadParts {
     pub(super) transport: Arc<GatewayProviderTransportSnapshot>,
     pub(super) is_antigravity: bool,
@@ -119,6 +120,7 @@ pub(crate) struct LocalSameFormatProviderCandidatePayloadParts {
     pub(super) request_redacted: bool,
 }
 
+/// 解析同格式候选的最终载荷，并把最终 Provider 模型传入 DeepSeek/Codex 兼容决策。
 pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     state: &AppState,
     parts: &http::request::Parts,
@@ -183,6 +185,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     let reasoning_replay_policy = openai_responses_reasoning_replay_policy(
         prepared.transport.provider.provider_type.as_str(),
         prepared.transport.endpoint.base_url.as_str(),
+        prepared.mapped_model.as_str(),
     );
     let redaction = resolve_provider_chat_pii_redaction(
         state,

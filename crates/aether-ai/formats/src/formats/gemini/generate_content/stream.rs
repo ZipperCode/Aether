@@ -165,7 +165,13 @@ impl GeminiProviderState {
                 && candidate_object.keys().any(|field| {
                     !matches!(
                         field.as_str(),
-                        "index" | "content" | "finishReason" | "finish_reason"
+                        "index"
+                            | "content"
+                            | "finishReason"
+                            | "finish_reason"
+                            // Gemini 会随异常终止原因附带说明；它是已知元数据，不应触发未知字段拒绝。
+                            | "finishMessage"
+                            | "finish_message"
                     )
                 })
             {
@@ -215,7 +221,8 @@ impl GeminiProviderState {
                 };
                 if cross_format && audit_gemini_cross_format_response_part(part_object).is_err() {
                     out.push(self.unknown_frame(report_context, part.clone()));
-                    return Ok(out);
+                    // 保留未知事件的 fail-closed 语义，同时继续读取候选终止原因供终态观察器记账。
+                    break;
                 }
                 let reasoning_signature = part_object
                     .get("thoughtSignature")

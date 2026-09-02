@@ -75,6 +75,7 @@ pub(crate) struct LocalStandardCandidatePayloadParts {
     pub(super) agent_bridge: Option<Value>,
 }
 
+/// 判断 Grok 文本 Provider 是否使用可执行标准正文兼容的格式集合。
 fn is_grok_text_provider_api_format(provider_api_format: &str) -> bool {
     matches!(
         crate::ai_serving::normalize_api_format_alias(provider_api_format).as_str(),
@@ -265,6 +266,7 @@ fn sanitize_claude_request_redacted_thinking_for_deepseek(body_json: &mut Value)
         .unwrap_or(false)
 }
 
+/// 对非原生 Claude 目标清理不可转发的 thinking 签名，同时保留原生 Claude 的完整语义。
 fn apply_non_native_claude_thinking_signature_compat(
     provider_request_body: &mut Value,
     provider_api_format: &str,
@@ -290,6 +292,7 @@ fn apply_non_native_claude_thinking_signature_compat(
     let _ = sanitize_claude_request_thinking_signatures_for_non_native(provider_request_body);
 }
 
+/// 解析标准候选的最终载荷，确保兼容策略基于映射后的 Provider 模型而非客户端别名。
 pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     state: &AppState,
     parts: &http::request::Parts,
@@ -599,6 +602,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     let reasoning_replay_policy = openai_responses_reasoning_replay_policy(
         transport.provider.provider_type.as_str(),
         transport.endpoint.base_url.as_str(),
+        prepared_candidate.mapped_model.as_str(),
     );
     let redaction = resolve_provider_chat_pii_redaction(
         state,
