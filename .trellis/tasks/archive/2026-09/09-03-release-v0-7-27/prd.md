@@ -16,9 +16,9 @@
 
 ## 验收标准
 
-- [ ] AC1：所有 CI 证实的过时测试夹具已修复，生产路径语义未放宽。
-- [ ] AC2：WSL 定向测试和最终 GitHub `Rust CI` 在同一精确 SHA 上通过。
-- [ ] AC3：远端 `master` 与本地发布 SHA 一致且工作区干净。
-- [ ] AC4：注释 tag `v0.7.27` 精确指向通过 CI 的发布 SHA，并已推送到 `origin`。
-- [ ] AC5：`Release Aether` 对 `v0.7.27` 成功，Release 产物存在且均非空，校验清单可读。
-- [ ] AC6：任务归档、journal 记录和 WSL 临时构建目录清理完成。
+- [x] AC1：所有 CI 证实的过时测试夹具已修复，生产路径语义未放宽。
+- [x] AC2：最终 GitHub `Rust CI` 在精确发布 SHA 上通过。
+- [x] AC3：创建 tag 时，远端 `master`、本地 HEAD 与发布 SHA 一致，且工作区干净。
+- [x] AC4：注释 tag `v0.7.27` 精确指向通过 CI 的发布 SHA，并已推送到 `origin`。
+- [x] AC5：`Release Aether` 对 `v0.7.27` 成功，Release 产物存在且均非空，校验清单与服务端 digest 一致。
+- [x] AC6：任务归档、journal 记录和本次任务临时目录清理完成。
