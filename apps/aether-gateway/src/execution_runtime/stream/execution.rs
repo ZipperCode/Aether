@@ -15616,20 +15616,6 @@ mod tests {
     #[tokio::test]
     async fn execute_execution_runtime_stream_returns_client_error_with_local_tunnel_message_before_first_data(
     ) {
-        let state = AppState::new().expect("app state should build");
-        let tunnel_app = state.tunnel.app_state();
-        let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
-        let (proxy_close_tx, _) = watch::channel(false);
-        tunnel_app.hub.register_proxy(Arc::new(TunnelProxyConn::new(
-            901,
-            "node-1".to_string(),
-            "Node 1".to_string(),
-            proxy_tx,
-            proxy_close_tx,
-            16,
-            2,
-        )));
-
         let plan = ExecutionPlan {
             request_id: "req-client-stream-error-1".into(),
             candidate_id: Some("cand-client-stream-error-1".into()),
@@ -15655,11 +15641,25 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
-        let state = state.with_data_state_for_tests(
-            crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
-                provider_catalog_for_plan(&plan, None),
-            )),
-        );
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    provider_catalog_for_plan(&plan, None),
+                )),
+            );
+        let tunnel_app = state.tunnel.app_state();
+        let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
+        let (proxy_close_tx, _) = watch::channel(false);
+        tunnel_app.hub.register_proxy(Arc::new(TunnelProxyConn::new(
+            901,
+            "node-1".to_string(),
+            "Node 1".to_string(),
+            proxy_tx,
+            proxy_close_tx,
+            16,
+            2,
+        )));
         let decision = test_decision();
 
         let state_for_task = state.clone();
@@ -15681,7 +15681,11 @@ mod tests {
             .await
         });
 
-        let request_headers = match proxy_rx.recv().await.expect("headers frame should arrive") {
+        let request_headers = match tokio::time::timeout(Duration::from_secs(5), proxy_rx.recv())
+            .await
+            .expect("headers frame should arrive before timeout")
+            .expect("headers frame should arrive")
+        {
             Message::Binary(data) => data,
             other => panic!("unexpected message: {other:?}"),
         };
@@ -15689,7 +15693,11 @@ mod tests {
             .expect("request header frame should parse");
         assert_eq!(request_header.msg_type, tunnel_protocol::REQUEST_HEADERS);
 
-        let request_body = match proxy_rx.recv().await.expect("body frame should arrive") {
+        let request_body = match tokio::time::timeout(Duration::from_secs(5), proxy_rx.recv())
+            .await
+            .expect("body frame should arrive before timeout")
+            .expect("body frame should arrive")
+        {
             Message::Binary(data) => data,
             other => panic!("unexpected message: {other:?}"),
         };
@@ -15724,8 +15732,9 @@ mod tests {
             .handle_proxy_frame(901, &mut response_error_frame)
             .await;
 
-        let response = execution_task
+        let response = tokio::time::timeout(Duration::from_secs(5), execution_task)
             .await
+            .expect("execution task should complete after the pre-body tunnel error")
             .expect("execution task should complete")
             .expect("execution should succeed")
             .expect("execution should return a client response");
@@ -15752,20 +15761,6 @@ mod tests {
     /// 验证本地隧道在响应体开始后失败时，通过真实 Key 准入并输出终态 SSE 错误。
     #[tokio::test]
     async fn execute_execution_runtime_stream_emits_terminal_sse_error_event_after_body_started() {
-        let state = AppState::new().expect("app state should build");
-        let tunnel_app = state.tunnel.app_state();
-        let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
-        let (proxy_close_tx, _) = watch::channel(false);
-        tunnel_app.hub.register_proxy(Arc::new(TunnelProxyConn::new(
-            902,
-            "node-1".to_string(),
-            "Node 1".to_string(),
-            proxy_tx,
-            proxy_close_tx,
-            16,
-            2,
-        )));
-
         let plan = ExecutionPlan {
             request_id: "req-client-stream-sse-error-1".into(),
             candidate_id: Some("cand-client-stream-sse-error-1".into()),
@@ -15791,11 +15786,25 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
-        let state = state.with_data_state_for_tests(
-            crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
-                provider_catalog_for_plan(&plan, None),
-            )),
-        );
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    provider_catalog_for_plan(&plan, None),
+                )),
+            );
+        let tunnel_app = state.tunnel.app_state();
+        let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
+        let (proxy_close_tx, _) = watch::channel(false);
+        tunnel_app.hub.register_proxy(Arc::new(TunnelProxyConn::new(
+            902,
+            "node-1".to_string(),
+            "Node 1".to_string(),
+            proxy_tx,
+            proxy_close_tx,
+            16,
+            2,
+        )));
         let decision = test_decision();
 
         let state_for_task = state.clone();
@@ -15817,7 +15826,11 @@ mod tests {
             .await
         });
 
-        let request_headers = match proxy_rx.recv().await.expect("headers frame should arrive") {
+        let request_headers = match tokio::time::timeout(Duration::from_secs(5), proxy_rx.recv())
+            .await
+            .expect("headers frame should arrive before timeout")
+            .expect("headers frame should arrive")
+        {
             Message::Binary(data) => data,
             other => panic!("unexpected message: {other:?}"),
         };
@@ -15825,7 +15838,11 @@ mod tests {
             .expect("request header frame should parse");
         assert_eq!(request_header.msg_type, tunnel_protocol::REQUEST_HEADERS);
 
-        let request_body = match proxy_rx.recv().await.expect("body frame should arrive") {
+        let request_body = match tokio::time::timeout(Duration::from_secs(5), proxy_rx.recv())
+            .await
+            .expect("body frame should arrive before timeout")
+            .expect("body frame should arrive")
+        {
             Message::Binary(data) => data,
             other => panic!("unexpected message: {other:?}"),
         };
@@ -15854,15 +15871,17 @@ mod tests {
             request_header.stream_id,
             tunnel_protocol::RESPONSE_BODY,
             0,
-            b"data: hello\n\n",
+            // 预提交门禁只在合法语义事件后交付响应，避免测试在注入终态错误前互锁。
+            b"data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
         );
         tunnel_app
             .hub
             .handle_proxy_frame(902, &mut response_body_frame)
             .await;
 
-        let response = execution_task
+        let response = tokio::time::timeout(Duration::from_secs(5), execution_task)
             .await
+            .expect("execution task should complete after the first semantic event")
             .expect("execution task should complete")
             .expect("execution should succeed")
             .expect("execution should return a client response");
@@ -15889,8 +15908,11 @@ mod tests {
             .handle_proxy_frame(902, &mut response_error_frame)
             .await;
 
-        let body = body_task.await.expect("body task should complete");
-        assert!(body.contains("data: hello\n\n"));
+        let body = tokio::time::timeout(Duration::from_secs(5), body_task)
+            .await
+            .expect("body task should complete after the tunnel error")
+            .expect("body task should complete");
+        assert!(body.contains("\"content\":\"hello\""));
         assert!(body.contains("data: {\"error\":"));
         assert!(body.contains(original_error));
         assert!(body.contains("data: [DONE]\n\n"));

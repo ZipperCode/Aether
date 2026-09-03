@@ -108,6 +108,9 @@ Antigravity metadata flows through
 - Runtime-state: keyed resources isolate capacity and permits release correctly.
 - Gateway: sync, stream, Responses WS, and Live admission/release; saturation
   skip persistence; all-capacity 429 versus mixed-reason 503.
+- Gateway fixtures must install the final `GatewayDataState` before registering
+  local tunnel proxies because `with_data_state_for_tests` rebuilds
+  `EmbeddedTunnelState` and discards earlier hub registrations.
 - Provider Pool/Gateway: both cache-affinity secondary modes, existing balance
   and runtime-quota fallbacks, and strong-read Pool behavior.
 - Provider Pool: model A exhaustion does not block model B for Antigravity and
