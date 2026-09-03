@@ -1644,10 +1644,12 @@ pub(crate) fn decision_payload_is_direct_execution(payload: &AiExecutionDecision
 mod tests {
     use super::*;
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
     use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, StoredRequestCandidate,
     };
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
     use aether_data_contracts::repository::usage::{UsageBodyCaptureState, UsageReadRepository};
     use aether_usage_runtime::UsageRuntimeConfig;
     use futures_util::StreamExt;
@@ -1771,6 +1773,33 @@ mod tests {
         }
     }
 
+    /// 从心跳尝试的执行计划生成去重的活跃 Key 目录，确保测试走生产强一致准入而不伪造旁路。
+    fn heartbeat_provider_catalog(
+        attempts: &[AiSyncAttempt],
+    ) -> InMemoryProviderCatalogReadRepository {
+        let mut keys = std::collections::BTreeMap::new();
+        for attempt in attempts {
+            let plan = &attempt.plan;
+            keys.entry((plan.provider_id.clone(), plan.key_id.clone()))
+                .or_insert_with(|| {
+                    StoredProviderCatalogKey::new(
+                        plan.key_id.clone(),
+                        plan.provider_id.clone(),
+                        plan.key_id.clone(),
+                        "api_key".to_string(),
+                        None,
+                        true,
+                    )
+                    .expect("heartbeat catalog key should build")
+                });
+        }
+        InMemoryProviderCatalogReadRepository::seed(
+            Vec::new(),
+            Vec::new(),
+            keys.into_values().collect(),
+        )
+    }
+
     fn test_openai_image_execution_result(
         plan: &aether_contracts::ExecutionPlan,
         status_code: u16,
@@ -1798,18 +1827,27 @@ mod tests {
         }
     }
 
+    /// 构造带用量仓储、真实 Key 目录和同步执行替身的心跳测试状态。
     fn heartbeat_usage_test_state(
         response_body: Value,
     ) -> (AppState, Arc<InMemoryUsageReadRepository>) {
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let catalog_attempts = [test_openai_image_heartbeat_attempt(
+            0,
+            "endpoint-success",
+            "candidate-success",
+        )];
         let state = AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(
                 crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
                     request_candidate_repository,
                     Arc::clone(&usage_repository),
-                ),
+                )
+                .with_provider_catalog_reader(Arc::new(heartbeat_provider_catalog(
+                    &catalog_attempts,
+                ))),
             )
             .with_usage_runtime_for_tests(UsageRuntimeConfig {
                 enabled: true,
@@ -2129,12 +2167,22 @@ mod tests {
         );
     }
 
+    /// 验证图片同步心跳在首候选可重试失败后切换到第二候选，并保持真实 Key 准入。
     #[tokio::test]
     async fn openai_image_sync_heartbeat_attempts_retry_first_candidate_then_return_second() {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_for_override = Arc::clone(&call_count);
+        let attempts = vec![
+            test_openai_image_heartbeat_attempt(0, "endpoint-retry", "candidate-retry"),
+            test_openai_image_heartbeat_attempt(1, "endpoint-success", "candidate-success"),
+        ];
         let state = AppState::new()
             .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    heartbeat_provider_catalog(&attempts),
+                )),
+            )
             .with_execution_runtime_sync_override_for_tests(move |plan| {
                 call_count_for_override.fetch_add(1, Ordering::SeqCst);
                 if plan.endpoint_id == "endpoint-retry" {
@@ -2151,10 +2199,6 @@ mod tests {
                     ))
                 }
             });
-        let attempts = vec![
-            test_openai_image_heartbeat_attempt(0, "endpoint-retry", "candidate-retry"),
-            test_openai_image_heartbeat_attempt(1, "endpoint-success", "candidate-success"),
-        ];
         let outcome = execute_openai_image_sync_heartbeat_attempts(
             state,
             "/v1/images/generations".to_string(),
@@ -2182,26 +2226,26 @@ mod tests {
     async fn openai_image_sync_heartbeat_retries_sticky_key_lazily_before_failover() {
         let seen_plans = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
         let seen_plans_for_override = Arc::clone(&seen_plans);
-        // 执行准入会强读 Key 目录；测试显式提供与计划一致的活跃 Key，不能绕过生产合同。
-        let catalog_key =
-            aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
-                "key-openai".to_string(),
-                "provider-openai".to_string(),
-                "test-key".to_string(),
-                "api_key".to_string(),
-                Some(json!(["openai:image"])),
-                true,
-            )
-            .expect("catalog key should build");
+        // 首 Key 共尝试三次；只预先物化一次，其余两次均在失败后派生。
+        let attempts = vec![
+            test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
+                0,
+                "endpoint-retry",
+                "candidate-retry",
+                3,
+            ),
+            test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
+                1,
+                "endpoint-success",
+                "candidate-success",
+                3,
+            ),
+        ];
         let state = AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(
                 crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
-                    aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository::seed(
-                        Vec::new(),
-                        Vec::new(),
-                        vec![catalog_key],
-                    ),
+                    heartbeat_provider_catalog(&attempts),
                 )),
             )
             .with_execution_runtime_sync_override_for_tests(move |plan| {
@@ -2223,21 +2267,6 @@ mod tests {
                     ))
                 }
             });
-        // 首 Key 共尝试三次；只预先物化一次，其余两次均在失败后派生。
-        let attempts = vec![
-            test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
-                0,
-                "endpoint-retry",
-                "candidate-retry",
-                3,
-            ),
-            test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
-                1,
-                "endpoint-success",
-                "candidate-success",
-                3,
-            ),
-        ];
         let outcome = execute_openai_image_sync_heartbeat_attempts(
             state,
             "/v1/images/generations".to_string(),
@@ -2286,24 +2315,6 @@ mod tests {
     async fn openai_image_sync_heartbeat_honors_provider_transfer_limit() {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_for_override = Arc::clone(&call_count);
-        let state = AppState::new()
-            .expect("state should build")
-            .with_execution_runtime_sync_override_for_tests(move |plan| {
-                call_count_for_override.fetch_add(1, Ordering::SeqCst);
-                if plan.provider_id == "provider-fallback" {
-                    Ok(test_openai_image_execution_result(
-                        plan,
-                        StatusCode::OK.as_u16(),
-                        json!({"data": [{"b64_json": "fallback-provider"}]}),
-                    ))
-                } else {
-                    Ok(test_openai_image_execution_result(
-                        plan,
-                        StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                        json!({"error": {"message": "retry another key"}}),
-                    ))
-                }
-            });
         let mut attempts = vec![
             test_openai_image_heartbeat_attempt(0, "endpoint-key-1", "candidate-key-1"),
             test_openai_image_heartbeat_attempt(1, "endpoint-key-2", "candidate-key-2"),
@@ -2324,6 +2335,29 @@ mod tests {
         }
         attempts[3].plan.provider_id = "provider-fallback".to_string();
         attempts[3].plan.key_id = "key-fallback".to_string();
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    heartbeat_provider_catalog(&attempts),
+                )),
+            )
+            .with_execution_runtime_sync_override_for_tests(move |plan| {
+                call_count_for_override.fetch_add(1, Ordering::SeqCst);
+                if plan.provider_id == "provider-fallback" {
+                    Ok(test_openai_image_execution_result(
+                        plan,
+                        StatusCode::OK.as_u16(),
+                        json!({"data": [{"b64_json": "fallback-provider"}]}),
+                    ))
+                } else {
+                    Ok(test_openai_image_execution_result(
+                        plan,
+                        StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                        json!({"error": {"message": "retry another key"}}),
+                    ))
+                }
+            });
 
         let outcome = execute_openai_image_sync_heartbeat_attempts(
             state,
@@ -2716,12 +2750,32 @@ mod tests {
         assert_eq!(body["error"]["upstream_status"], json!(502));
     }
 
+    /// 验证标准文本同步心跳在首候选可重试失败后切换到第二候选，并保持真实 Key 准入。
     #[tokio::test]
     async fn standard_text_sync_heartbeat_attempts_retry_first_candidate_then_return_second() {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_for_override = Arc::clone(&call_count);
+        let attempts = vec![
+            test_standard_text_heartbeat_attempt(
+                0,
+                "endpoint-retry",
+                "candidate-retry",
+                "openai:responses:compact",
+            ),
+            test_standard_text_heartbeat_attempt(
+                1,
+                "endpoint-success",
+                "candidate-success",
+                "openai:responses:compact",
+            ),
+        ];
         let state = AppState::new()
             .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    heartbeat_provider_catalog(&attempts),
+                )),
+            )
             .with_execution_runtime_sync_override_for_tests(move |plan| {
                 call_count_for_override.fetch_add(1, Ordering::SeqCst);
                 if plan.endpoint_id == "endpoint-retry" {
@@ -2738,20 +2792,6 @@ mod tests {
                     ))
                 }
             });
-        let attempts = vec![
-            test_standard_text_heartbeat_attempt(
-                0,
-                "endpoint-retry",
-                "candidate-retry",
-                "openai:responses:compact",
-            ),
-            test_standard_text_heartbeat_attempt(
-                1,
-                "endpoint-success",
-                "candidate-success",
-                "openai:responses:compact",
-            ),
-        ];
         let (parts, _) = http::Request::builder()
             .method(http::Method::POST)
             .uri("/v1/responses")

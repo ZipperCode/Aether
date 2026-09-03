@@ -10963,33 +10963,30 @@ mod tests {
         let request_id = "req-frame-stream-deferred-pending";
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        // 监听但不接收连接，让执行稳定停在等待响应头阶段，不依赖真实外网上游。
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let mut plan = codex_cyber_policy_plan(request_id);
+        plan.url = format!("http://{addr}/responses");
         let state = AppState::new()
             .expect("app state should build")
             .with_data_state_for_tests(
                 crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
                     Arc::clone(&request_candidate_repository),
                     Arc::clone(&usage_repository),
-                ),
+                )
+                .attach_provider_catalog_repository_for_tests(Arc::new(
+                    provider_catalog_for_plan(&plan, None),
+                )),
             )
             .with_usage_runtime_for_tests(UsageRuntimeConfig {
                 enabled: true,
                 ..UsageRuntimeConfig::default()
             });
-        let mut plan = codex_cyber_policy_plan(request_id);
-        plan.endpoint_id = "missing-endpoint".to_string();
-        plan.key_id = "missing-key".to_string();
-        let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-            Vec::<StoredProviderCatalogProvider>::new(),
-            Vec::<StoredProviderCatalogEndpoint>::new(),
-            Vec::<StoredProviderCatalogKey>::new(),
-        ));
-        let state = state.with_data_state_for_tests(
-            crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
-                Arc::clone(&request_candidate_repository),
-                Arc::clone(&usage_repository),
-            )
-            .attach_provider_catalog_repository_for_tests(provider_catalog),
-        );
         let state_for_execution = state.clone();
         let execution = tokio::spawn(async move {
             execute_execution_runtime_stream(

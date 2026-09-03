@@ -3768,8 +3768,10 @@ async fn execute_sync_via_remote_execution_runtime(
 mod tests {
     use super::*;
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
     use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
     use aether_data_contracts::repository::usage::UsageReadRepository;
     use aether_usage_runtime::UsageRuntimeConfig;
     use futures_util::{pin_mut, StreamExt as _};
@@ -3800,6 +3802,22 @@ mod tests {
             transport_profile: None,
             timeouts: None,
         }
+    }
+
+    /// 按执行计划构造仅含匹配活跃 Key 的目录，使同步执行测试经过生产强一致准入。
+    fn provider_catalog_for_test_plan(
+        plan: &ExecutionPlan,
+    ) -> InMemoryProviderCatalogReadRepository {
+        let key = StoredProviderCatalogKey::new(
+            plan.key_id.clone(),
+            plan.provider_id.clone(),
+            "test-key".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("catalog key should build");
+        InMemoryProviderCatalogReadRepository::seed(Vec::new(), Vec::new(), vec![key])
     }
 
     fn test_gemini_chat_plan() -> ExecutionPlan {
@@ -4006,18 +4024,24 @@ mod tests {
         assert_eq!(body["error"]["message"], "Upstream response too large");
     }
 
+    /// 验证本地同步执行缺少兼容 Endpoint 时，在真实 Key 准入后按 credential 范围重试且不惩罚 Key。
     #[tokio::test]
     async fn no_local_sync_plans_retries_at_credential_scope_without_key_penalty() {
         let request_id = "req-sync-endpoint-capability-mismatch";
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let mut plan = test_openai_image_plan(false);
+        plan.request_id = request_id.to_string();
+        plan.client_api_format = "openai:responses".to_string();
+        plan.provider_api_format = "openai:responses".to_string();
         let state = AppState::new()
             .expect("app state should build")
             .with_data_state_for_tests(
                 crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
                     Arc::clone(&request_candidate_repository),
                     Arc::clone(&usage_repository),
-                ),
+                )
+                .with_provider_catalog_reader(Arc::new(provider_catalog_for_test_plan(&plan))),
             )
             .with_usage_runtime_for_tests(UsageRuntimeConfig {
                 enabled: true,
@@ -4050,10 +4074,6 @@ mod tests {
                     error: None,
                 })
             });
-        let mut plan = test_openai_image_plan(false);
-        plan.request_id = request_id.to_string();
-        plan.client_api_format = "openai:responses".to_string();
-        plan.provider_api_format = "openai:responses".to_string();
         let plan_endpoint_id = plan.endpoint_id.clone();
         let plan_key_id = plan.key_id.clone();
         let outcome = execute_execution_runtime_sync_with_retry_scope(
@@ -4686,23 +4706,11 @@ mod tests {
         server.abort();
     }
 
+    /// 验证同步请求通过真实 Key 准入后，在上游响应头返回前已记录 active 用量与候选状态。
     #[tokio::test]
     async fn sync_execution_active_marks_usage_before_response_headers() {
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
-        let state = AppState::new()
-            .expect("gateway state should build")
-            .with_data_state_for_tests(
-                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
-                    Arc::clone(&request_candidate_repository),
-                    Arc::clone(&usage_repository),
-                ),
-            )
-            .with_usage_runtime_for_tests(UsageRuntimeConfig {
-                enabled: true,
-                ..UsageRuntimeConfig::default()
-            });
-
         let listener = crate::test_support::bind_loopback_listener()
             .await
             .expect("listener should bind");
@@ -4737,6 +4745,19 @@ mod tests {
             "model": "gpt-5",
             "messages": [{"role": "user", "content": "slow headers"}],
         }));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                )
+                .with_provider_catalog_reader(Arc::new(provider_catalog_for_test_plan(&plan))),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
         let report_context = Some(json!({
             "candidate_index": 0,
             "retry_index": 0,
@@ -4771,8 +4792,9 @@ mod tests {
             .await
         });
 
-        request_seen_rx
+        tokio::time::timeout(Duration::from_secs(5), request_seen_rx)
             .await
+            .expect("upstream request should be observed before timeout")
             .expect("upstream request should be observed");
         let mut active_usage = None;
         for _ in 0..50 {
