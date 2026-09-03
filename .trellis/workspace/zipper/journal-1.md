@@ -277,3 +277,29 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 12: 发布 v0.7.27 并修复同步后 CI
+
+**Date**: 2026-09-03
+**Task**: 发布 v0.7.27 并修复同步后 CI
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+补齐强准入后的流式、同步、心跳和视频测试夹具；精确 SHA 的 Rust CI 全绿，发布 v0.7.27 并核验多架构资产与校验和。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d0ef009cc` | (see git log) |
+| `debf52535` | (see git log) |
+| `d24695454` | (see git log) |
+| `fa4d32da2` | (see git log) |
+| `94ddca675` | (see git log) |
+
+### Status
+
+[OK] **Completed**
