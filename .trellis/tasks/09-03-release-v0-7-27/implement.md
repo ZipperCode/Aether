@@ -9,6 +9,7 @@
 - [x] 修复 deferred pending 测试，使其同时满足真实 Key 准入和等待 headers 的业务目标。
 - [x] 补齐同步执行与 heartbeat 的强准入 Key 目录夹具，并为等待上游的测试增加有限超时。
 - [x] 完成 `cargo fmt --all --check` 和 `git diff --check`；按用户要求停止本地编译，后续仅以 GitHub CI 认证。
+- [x] GitHub run `33704528677` 定位 2 个视频跟进请求旧夹具；补齐其实时 Key 目录，tag 仍未创建。
 
 ## 发布
 
