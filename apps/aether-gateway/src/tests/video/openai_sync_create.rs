@@ -740,12 +740,27 @@ async fn gateway_executes_openai_video_remix_via_data_backed_local_follow_up_wit
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    // 数据快照负责还原传输参数；目录夹具负责满足执行前的实时 Key 强准入。
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        Vec::new(),
+        Vec::new(),
+        vec![StoredProviderCatalogKey::new(
+            "key-openai-video-local-1".to_string(),
+            "provider-openai-video-local-1".to_string(),
+            "video-key".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("provider catalog key should build")],
+    ));
     let gateway_state = build_state_with_execution_runtime_override(execution_runtime_url)
         .with_data_state_for_tests(
         crate::data::GatewayDataState::with_video_task_and_request_candidate_repository_for_tests(
             repository,
             Arc::clone(&request_candidate_repository),
-        ),
+        )
+        .attach_provider_catalog_repository_for_tests(provider_catalog_repository),
     );
     let gateway = build_router_with_state(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
