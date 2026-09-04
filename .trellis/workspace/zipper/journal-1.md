@@ -303,3 +303,26 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 13: 修复上游模型自由关联 Global Model
+
+**Date**: 2026-09-04
+**Task**: 修复上游模型自由关联 Global Model
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+关联模型可将任意 Global Model 映射到真实上游模型，并携带 Endpoint 精确绑定；保留同名自动匹配、旧批量推断、自定义映射和异步会话隔离。目标 Vitest 4/4、前端类型检查与 diff 检查通过。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ce4a40057` | (see git log) |
+| `627ce2131` | (see git log) |
+
+### Status
+
+[OK] **Completed**
