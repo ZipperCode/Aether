@@ -97,11 +97,12 @@
                   <div
                     v-for="model in filteredGlobalModels"
                     :key="model.id"
-                    class="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-muted cursor-pointer"
+                    class="flex items-start gap-2 px-2 py-1.5 rounded hover:bg-muted cursor-pointer"
+                    :data-global-model-id="model.id"
                     @click="toggleGlobalModelSelection(model.id)"
                   >
                     <div
-                      class="w-4 h-4 border rounded flex items-center justify-center shrink-0"
+                      class="w-4 h-4 mt-0.5 border rounded flex items-center justify-center shrink-0"
                       :class="isGlobalModelSelected(model.id) ? 'bg-primary border-primary' : ''"
                     >
                       <Check
@@ -116,6 +117,37 @@
                       <p class="text-xs text-muted-foreground truncate font-mono">
                         {{ model.name }}
                       </p>
+                      <div
+                        v-if="globalModelsToAdd.includes(model.id) && upstreamModels.length > 0"
+                        class="mt-2 space-y-1"
+                        @click.stop
+                      >
+                        <label
+                          :for="`upstream-model-${model.id}`"
+                          class="block text-xs text-muted-foreground"
+                        >
+                          真实上游模型（可选）
+                        </label>
+                        <select
+                          :id="`upstream-model-${model.id}`"
+                          :value="selectedUpstreamModelIds.get(model.id) || ''"
+                          :aria-label="`为 ${model.display_name} 选择上游模型`"
+                          class="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
+                          @click.stop
+                          @change="setUpstreamModelSelection(model.id, $event)"
+                        >
+                          <option value="">
+                            未指定（使用全局模型名自动推断）
+                          </option>
+                          <option
+                            v-for="upstreamModel in upstreamModels"
+                            :key="upstreamModel.id"
+                            :value="upstreamModel.id"
+                          >
+                            {{ upstreamModel.id }}
+                          </option>
+                        </select>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -191,9 +223,11 @@ import {
   getProviderModels,
   getProviderKeys,
   batchAssignModelsToProvider,
+  createModel,
   deleteModel,
   type Model,
-  type EndpointAPIKey
+  type EndpointAPIKey,
+  type UpstreamModel,
 } from '@/api/endpoints'
 
 type AutoMatchKey = Pick<EndpointAPIKey, 'id' | 'name' | 'api_key_masked'>
@@ -226,14 +260,20 @@ const loadingGlobalModels = ref(false)
 const loadingProviderKeys = ref(false)
 const saving = ref(false)
 const fetchingAutoMatchedModels = ref(false)
+// 弹窗每次打开、关闭或切换 Provider 都递增，用于丢弃上一会话的异步结果。
+let dialogSession = 0
 
 // 数据
 const allGlobalModels = ref<GlobalModelResponse[]>([])
 const existingModels = ref<Model[]>([])
 const providerKeys = ref<AutoMatchKey[]>([])
+// 当前所选 Key 返回的真实上游模型，保留其模型名和 Endpoint 链路供新关联使用。
+const upstreamModels = ref<UpstreamModel[]>([])
 
 // 选择状态（本地状态，保存时才提交）
 const selectedGlobalModelIds = ref<Set<string>>(new Set())
+// 本轮新增关联中，Global Model ID 到真实上游模型 ID 的显式对应关系。
+const selectedUpstreamModelIds = ref<Map<string, string>>(new Map())
 
 // 初始状态（用于计算变更）
 const initialGlobalModelIds = ref<Set<string>>(new Set())
@@ -244,7 +284,26 @@ const searchQuery = ref('')
 const autoMatchButtonTitle = computed(() => {
   if (loadingProviderKeys.value) return '正在加载密钥'
   if (providerKeys.value.length === 0) return '暂无可用于匹配的密钥'
-  return '选择密钥，并按该密钥的上游模型自动勾选同名模型'
+  return '选择密钥，获取真实上游模型并自动勾选同名模型'
+})
+
+/**
+ * 按忽略大小写的完整名称建立唯一上游模型索引；同名冲突不自动选择，避免错误关联。
+ */
+const uniqueUpstreamModelsByName = computed(() => {
+  const uniqueModels = new Map<string, UpstreamModel>()
+  const duplicateNames = new Set<string>()
+  for (const model of upstreamModels.value) {
+    const normalizedName = normalizeModelName(model.id)
+    if (!normalizedName || duplicateNames.has(normalizedName)) continue
+    if (uniqueModels.has(normalizedName)) {
+      uniqueModels.delete(normalizedName)
+      duplicateNames.add(normalizedName)
+    } else {
+      uniqueModels.set(normalizedName, model)
+    }
+  }
+  return uniqueModels
 })
 
 // 已关联的全局模型 ID 集合（从已有数据计算）
@@ -272,7 +331,7 @@ const isAllGlobalModelsSelected = computed(() => {
   return filteredGlobalModels.value.every(m => isGlobalModelSelected(m.id))
 })
 
-// 检查全局模型是否已选中
+/** 检查 Global Model 是否已在本轮关联选择中。 */
 function isGlobalModelSelected(globalModelId: string): boolean {
   return selectedGlobalModelIds.value.has(globalModelId)
 }
@@ -311,20 +370,25 @@ const pendingChangesCount = computed(() => {
     globalModelsToRemove.value.length
 })
 
-// 切换全局模型选择
+/**
+ * 切换 Global Model 选择，并同步清理或补入唯一同名的真实上游模型。
+ */
 function toggleGlobalModelSelection(id: string) {
-  if (selectedGlobalModelIds.value.has(id)) {
+  const wasSelected = selectedGlobalModelIds.value.has(id)
+  if (wasSelected) {
     selectedGlobalModelIds.value.delete(id)
   } else {
     selectedGlobalModelIds.value.add(id)
   }
   selectedGlobalModelIds.value = new Set(selectedGlobalModelIds.value)
+  syncUpstreamModelSelections(wasSelected ? [] : [id])
 }
 
-// 全选/取消全选全局模型
+/** 全选或取消当前筛选结果，并同步本轮真实上游模型选择。 */
 function toggleAllGlobalModels() {
   const allIds = filteredGlobalModels.value.map(m => m.id)
-  if (isAllGlobalModelsSelected.value) {
+  const wasAllSelected = isAllGlobalModelsSelected.value
+  if (wasAllSelected) {
     for (const id of allIds) {
       selectedGlobalModelIds.value.delete(id)
     }
@@ -334,32 +398,98 @@ function toggleAllGlobalModels() {
     }
   }
   selectedGlobalModelIds.value = new Set(selectedGlobalModelIds.value)
+  syncUpstreamModelSelections(wasAllSelected ? [] : allIds)
 }
 
+/** 将模型名规范为仅忽略首尾空白和大小写的精确匹配键，不做前缀或模糊匹配。 */
 function normalizeModelName(name: string | null | undefined): string {
-  return (name || '').trim()
+  return (name || '').trim().toLowerCase()
 }
 
+/** 返回密钥的首选展示名称，缺少名称时依次使用掩码和短 ID。 */
 function getAutoMatchKeyLabel(key: AutoMatchKeyLike): string {
   return key.name || key.api_key_masked || key.id.slice(0, 8)
 }
 
+/** 返回密钥列表中的辅助信息，避免重复主展示内容。 */
 function getAutoMatchKeyDetail(key: AutoMatchKeyLike): string {
   if (key.name && key.api_key_masked) return key.api_key_masked
   return key.name ? key.id.slice(0, 8) : ''
 }
 
+/**
+ * 仅保留仍有效的新关联选择，并按调用方指定范围自动填入唯一同名上游模型。
+ * 不在后续无关选择变化时恢复用户主动清空的上游模型。
+ */
+function syncUpstreamModelSelections(autoSelectGlobalModelIds: Iterable<string> = []) {
+  const availableUpstreamIds = new Set(upstreamModels.value.map(model => model.id))
+  const nextSelections = new Map<string, string>()
+
+  for (const [globalModelId, upstreamModelId] of selectedUpstreamModelIds.value) {
+    if (
+      selectedGlobalModelIds.value.has(globalModelId)
+      && !initialGlobalModelIds.value.has(globalModelId)
+      && availableUpstreamIds.has(upstreamModelId)
+    ) {
+      nextSelections.set(globalModelId, upstreamModelId)
+    }
+  }
+
+  for (const globalModelId of autoSelectGlobalModelIds) {
+    const globalModel = allGlobalModels.value.find(model => model.id === globalModelId)
+    if (!globalModel) continue
+    if (
+      !selectedGlobalModelIds.value.has(globalModel.id)
+      || initialGlobalModelIds.value.has(globalModel.id)
+      || nextSelections.has(globalModel.id)
+    ) continue
+
+    const sameNameUpstreamModel = uniqueUpstreamModelsByName.value.get(
+      normalizeModelName(globalModel.name),
+    )
+    if (sameNameUpstreamModel) {
+      nextSelections.set(globalModel.id, sameNameUpstreamModel.id)
+    }
+  }
+
+  selectedUpstreamModelIds.value = nextSelections
+}
+
+/** 记录用户为某个新 Global Model 显式选择的真实上游模型。 */
+function setUpstreamModelSelection(globalModelId: string, event: Event) {
+  const upstreamModelId = (event.target as HTMLSelectElement).value
+  const nextSelections = new Map(selectedUpstreamModelIds.value)
+  if (upstreamModelId) {
+    nextSelections.set(globalModelId, upstreamModelId)
+  } else {
+    nextSelections.delete(globalModelId)
+  }
+  selectedUpstreamModelIds.value = nextSelections
+}
+
+/**
+ * 获取所选 Key 的上游模型；同名项自动关联，不同名项保留给用户自由选择。
+ */
 async function applyAutoMatchFromKey(key: AutoMatchKey) {
   if (!props.providerId || !key || fetchingAutoMatchedModels.value) return
 
+  const requestedProviderId = props.providerId
+  const requestedSession = dialogSession
   fetchingAutoMatchedModels.value = true
   try {
-    const result = await fetchCachedModels(props.providerId, key.id, true)
-    if (!props.open) return
+    const result = await fetchCachedModels(requestedProviderId, key.id, true)
+    if (
+      requestedSession !== dialogSession
+      || !props.open
+      || props.providerId !== requestedProviderId
+    ) return
 
     if (result.warning) {
       showWarning(`部分格式获取失败: ${result.warning}`)
     }
+
+    upstreamModels.value = result.models
+    syncUpstreamModelSelections(selectedGlobalModelIds.value)
 
     if (result.models.length === 0) {
       if (result.error) {
@@ -370,19 +500,9 @@ async function applyAutoMatchFromKey(key: AutoMatchKey) {
       return
     }
 
-    const upstreamModelIds = new Set(
-      result.models
-        .map(model => normalizeModelName(model.id))
-        .filter(Boolean)
-    )
     const matchedGlobalModelIds = allGlobalModels.value
-      .filter(model => upstreamModelIds.has(normalizeModelName(model.name)))
+      .filter(model => uniqueUpstreamModelsByName.value.has(normalizeModelName(model.name)))
       .map(model => model.id)
-
-    if (matchedGlobalModelIds.length === 0) {
-      showWarning('未找到与此 Key 上游模型 ID 同名的全局模型')
-      return
-    }
 
     const nextSelected = new Set(selectedGlobalModelIds.value)
     let newlySelectedCount = 0
@@ -393,21 +513,36 @@ async function applyAutoMatchFromKey(key: AutoMatchKey) {
       nextSelected.add(id)
     }
     selectedGlobalModelIds.value = nextSelected
+    syncUpstreamModelSelections(matchedGlobalModelIds)
     searchQuery.value = ''
 
-    if (newlySelectedCount > 0) {
+    if (matchedGlobalModelIds.length === 0) {
+      showWarning(`已获取 ${result.models.length} 个上游模型，请为新关联的全局模型选择对应模型`)
+    } else if (newlySelectedCount > 0) {
       success(`已按 ${getAutoMatchKeyLabel(key)} 勾选 ${matchedGlobalModelIds.length} 个同名模型`)
     } else {
       success(`${matchedGlobalModelIds.length} 个同名模型已在选中列表中`)
     }
   } catch (err: unknown) {
-    showError(parseApiError(err, '自动匹配模型失败'), '错误')
+    if (
+      requestedSession === dialogSession
+      && props.open
+      && props.providerId === requestedProviderId
+    ) {
+      showError(parseApiError(err, '自动匹配模型失败'), '错误')
+    }
   } finally {
-    fetchingAutoMatchedModels.value = false
+    if (
+      requestedSession === dialogSession
+      && props.open
+      && props.providerId === requestedProviderId
+    ) {
+      fetchingAutoMatchedModels.value = false
+    }
   }
 }
 
-// 处理关闭
+/** 关闭弹窗；存在未保存变更时先请求用户确认。 */
 async function handleClose() {
   if (hasChanges.value) {
     const confirmed = await confirmWarning('有未保存的更改，确定要关闭吗？', '放弃更改')
@@ -416,7 +551,7 @@ async function handleClose() {
   emit('update:open', false)
 }
 
-// 处理对话框状态变更
+/** 处理遮罩等外部关闭动作，并保持未保存变更确认语义。 */
 async function handleDialogUpdate(value: boolean) {
   if (!value && hasChanges.value) {
     const confirmed = await confirmWarning('有未保存的更改，确定要关闭吗？', '放弃更改')
@@ -425,7 +560,9 @@ async function handleDialogUpdate(value: boolean) {
   emit('update:open', value)
 }
 
-// 保存变更
+/**
+ * 保存关联变更：显式上游选择逐项精确创建，其余新增项继续使用原批量推断接口。
+ */
 async function handleSave() {
   if (!hasChanges.value || saving.value) return
 
@@ -449,11 +586,37 @@ async function handleSave() {
       }
     }
 
-    // 添加全局模型
-    if (globalModelsToAdd.value.length > 0) {
+    // 显式选择真实上游模型的新增项逐项创建，确保名称和 Endpoint 链路不丢失。
+    const explicitlyHandledGlobalModelIds = new Set<string>()
+    for (const globalModelId of globalModelsToAdd.value) {
+      const upstreamModelId = selectedUpstreamModelIds.value.get(globalModelId)
+      const upstreamModel = upstreamModels.value.find(model => model.id === upstreamModelId)
+      if (!upstreamModel) continue
+
       hasAnyOperation = true
       try {
-        const result = await batchAssignModelsToProvider(props.providerId, globalModelsToAdd.value)
+        const endpointIds = [...new Set((upstreamModel.endpoint_ids || []).filter(Boolean))]
+        await createModel(props.providerId, {
+          global_model_id: globalModelId,
+          provider_model_name: upstreamModel.id,
+          ...(endpointIds.length > 0 ? { endpoint_ids: endpointIds } : {}),
+        })
+        explicitlyHandledGlobalModelIds.add(globalModelId)
+        totalSuccess++
+      } catch (err: unknown) {
+        explicitlyHandledGlobalModelIds.add(globalModelId)
+        allErrors.push(parseApiError(err, `模型 ${upstreamModel.id} 关联失败`))
+      }
+    }
+
+    // 未选择上游模型的新增项保持历史自动推断行为。
+    const inferredGlobalModelIds = globalModelsToAdd.value.filter(
+      id => !explicitlyHandledGlobalModelIds.has(id),
+    )
+    if (inferredGlobalModelIds.length > 0) {
+      hasAnyOperation = true
+      try {
+        const result = await batchAssignModelsToProvider(props.providerId, inferredGlobalModelIds)
         totalSuccess += result.success.length
         if (result.errors.length > 0) {
           allErrors.push(...result.errors.map(e => e.error))
@@ -483,68 +646,98 @@ async function handleSave() {
   }
 }
 
-// 从已有数据同步选择状态
+/** 从已有关联模型同步初始选择，并清空仅属于本轮新增的上游对应关系。 */
 function syncGlobalModelSelection() {
   const globalIds = [...existingGlobalModelIds.value].filter((id): id is string => id !== undefined)
   selectedGlobalModelIds.value = new Set(globalIds)
   initialGlobalModelIds.value = new Set(globalIds)
+  selectedUpstreamModelIds.value = new Map()
 }
 
 // 监听打开状态
 watch(
-  () => props.open,
-  async (isOpen) => {
-    if (isOpen && props.providerId) {
-      await loadData()
+  () => [props.open, props.providerId] as const,
+  async ([isOpen, providerId]) => {
+    const session = ++dialogSession
+    upstreamModels.value = []
+    selectedUpstreamModelIds.value = new Map()
+    fetchingAutoMatchedModels.value = false
+    if (isOpen && providerId) {
+      await loadData(providerId, session)
     } else {
       searchQuery.value = ''
       selectedGlobalModelIds.value = new Set()
       initialGlobalModelIds.value = new Set()
       providerKeys.value = []
-      fetchingAutoMatchedModels.value = false
+      loadingGlobalModels.value = false
+      loadingProviderKeys.value = false
     }
   },
   { immediate: true },
 )
 
-// 加载数据
-async function loadData() {
-  await Promise.all([loadGlobalModels(), loadExistingModels(), loadProviderKeys()])
-  syncGlobalModelSelection()
+/** 并行加载 Global Model、已有关联和密钥，再建立本地初始选择。 */
+async function loadData(providerId: string, session: number) {
+  await Promise.all([
+    loadGlobalModels(providerId, session),
+    loadExistingModels(providerId, session),
+    loadProviderKeys(providerId, session),
+  ])
+  if (session === dialogSession && props.open && props.providerId === providerId) {
+    syncGlobalModelSelection()
+  }
 }
 
-// 加载全局模型列表
-async function loadGlobalModels() {
+/** 加载可供关联的完整 Global Model 列表。 */
+async function loadGlobalModels(providerId: string, session: number) {
   try {
     loadingGlobalModels.value = true
     const response = await getGlobalModels({ limit: 1000 })
-    allGlobalModels.value = response.models
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      allGlobalModels.value = response.models
+    }
   } catch (err: unknown) {
-    showError(parseApiError(err, '加载全局模型失败'), '错误')
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      showError(parseApiError(err, '加载全局模型失败'), '错误')
+    }
   } finally {
-    loadingGlobalModels.value = false
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      loadingGlobalModels.value = false
+    }
   }
 }
 
-// 加载已关联的模型
-async function loadExistingModels() {
+/** 加载当前 Provider 已有关联，用于计算新增与移除差异。 */
+async function loadExistingModels(providerId: string, session: number) {
   try {
-    existingModels.value = await getProviderModels(props.providerId)
+    const models = await getProviderModels(providerId)
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      existingModels.value = models
+    }
   } catch (err: unknown) {
-    showError(parseApiError(err, '加载已关联模型失败'), '错误')
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      showError(parseApiError(err, '加载已关联模型失败'), '错误')
+    }
   }
 }
 
-// 加载密钥列表
-async function loadProviderKeys() {
+/** 加载可用于获取真实上游模型的 Provider 密钥。 */
+async function loadProviderKeys(providerId: string, session: number) {
   try {
     loadingProviderKeys.value = true
-    providerKeys.value = await getProviderKeys(props.providerId)
+    const keys = await getProviderKeys(providerId)
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      providerKeys.value = keys
+    }
   } catch (err: unknown) {
-    providerKeys.value = []
-    showError(parseApiError(err, '加载密钥失败'), '错误')
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      providerKeys.value = []
+      showError(parseApiError(err, '加载密钥失败'), '错误')
+    }
   } finally {
-    loadingProviderKeys.value = false
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      loadingProviderKeys.value = false
+    }
   }
 }
 </script>
