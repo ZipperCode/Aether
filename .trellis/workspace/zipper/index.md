@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 13
+- **Total Sessions**: 14
 - **Last Active**: 2026-09-04
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~328 | Active |
+| `journal-1.md` | ~363 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 14 | 2026-09-04 | 审查并发布 v0.7.28 | `83c3058b76fc785d91526b4474a1d040bda48de1`, `e89bf81a1601f9222ab5d1b5441390aab0aee3fa`, `47deb22b122214fda1fea7ef7c87ab260ce1d0bb` | `master` |
 | 13 | 2026-09-04 | 修复上游模型自由关联 Global Model | `ce4a40057`, `627ce2131` | `master` |
 | 12 | 2026-09-03 | 发布 v0.7.27 并修复同步后 CI | `d0ef009cc`, `debf52535`, `d24695454`, `fa4d32da2`, `94ddca675` | `master` |
 | 11 | 2026-09-03 | 同步上游路由、Provider Pool 与协议兼容功能 | `f485ae016`, `09c4aab9e`, `02ac8aac0`, `72994512b`, `9a3f17acd`, `192782763` | `master` |

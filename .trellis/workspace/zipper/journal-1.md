@@ -326,3 +326,38 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 14: 审查并发布 v0.7.28
+
+**Date**: 2026-09-04
+**Task**: 审查并发布 v0.7.28
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+完成上游模型自由关联修复的独立审查、精确 SHA CI 门禁、v0.7.28 Tag 与 GitHub Release 发布验收。
+
+### Main Changes
+
+- 审查候选差异无阻塞发现，并将 master 推送到认证候选 SHA。
+- 创建并推送 annotated tag v0.7.28，完成 GHCR 多架构镜像和 GitHub Release 发布。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `83c3058b76fc785d91526b4474a1d040bda48de1` | (see git log) |
+| `e89bf81a1601f9222ab5d1b5441390aab0aee3fa` | (see git log) |
+| `47deb22b122214fda1fea7ef7c87ab260ce1d0bb` | (see git log) |
+
+### Testing
+
+- [OK] Rust CI run 33825487633：23/23 Job 成功。
+- [OK] Release Aether run 33826435698：7/7 Job 成功。
+- [OK] 4 个 Release 资产 digest 通过；两个 tarball 与 SHA256SUMS 一致且结构完整。
+
+### Status
+
+[OK] **Completed**
