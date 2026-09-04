@@ -27,6 +27,11 @@ pub struct RoutingModelPolicy {
 pub const DEFAULT_STICKY_KEY_ATTEMPTS: u32 = 2;
 pub const STICKY_KEY_ATTEMPTS_REPORT_FIELD: &str = "sticky_key_attempts";
 
+pub(crate) struct CandidateSchedulingContext {
+    pub(crate) now_unix_secs: u64,
+    pub(crate) load_balance_seed: u64,
+}
+
 pub(crate) fn next_same_key_retry_index(
     identity: ExecutionAttemptIdentity,
     sticky_key_attempts: Option<u32>,
@@ -70,6 +75,16 @@ No database migration is involved; routing configuration remains opaque JSON.
 - Provider and Endpoint `max_retries` fields remain readable/writable for
   compatibility but no longer expand local execution attempts. Do not add the
   removed Provider form control back as a second retry authority.
+- Candidate runtime state and ranking must receive a named
+  `CandidateSchedulingContext`. Circuit, RPM, concurrency, OAuth, quota, and
+  adaptive-time decisions consume only `now_unix_secs`; ranking consumes only
+  `load_balance_seed`.
+- Ordinary and paged preselection use `current_unix_secs()` for runtime time.
+  A paged cursor freezes one `request_distribution_seed()` across its pages;
+  an admission wait refreshes only `now_unix_secs`.
+- Final resolved-candidate ranking creates one `request_distribution_seed()`
+  per ranking batch. Do not use a wall-clock millisecond value directly as the
+  load-balance seed because same-millisecond requests then share an order.
 
 ## 4. Validation & Error Matrix
 
@@ -85,6 +100,8 @@ No database migration is involved; routing configuration remains opaque JSON.
 | Later candidate or later Pool Key fails | Advance; never derive a same-Key retry. |
 | Derived attempt is quota/admission blocked | Skip it through the existing guard; do not bypass the guard. |
 | Routing storage is read-only during bootstrap | Log and continue with legacy fallback. |
+| `now_unix_secs=100`, seed is `u64::MAX`, circuit probe is at `200` | Skip with `key_circuit_open`; the seed must not affect time. |
+| Admission wait polls again | Refresh `now_unix_secs`; retain the original `load_balance_seed`. |
 
 ## 5. Good / Base / Bad Cases
 
@@ -95,9 +112,15 @@ No database migration is involved; routing configuration remains opaque JSON.
   the existing global Key priorities.
 - Good: the first candidate fails once, a fresh same-Key retry succeeds, and no
   fallback candidate was pre-persisted as a retry slot.
+- Good: a large distribution seed changes load-balance ordering while a recent
+  RPM observation and future circuit deadline still use the real Unix time.
+- Base: fixed ordering receives a seed but does not use it to change priority.
 - Bad: applying the legacy conversion-priority switch after policy resolution,
   pre-expanding N retries per candidate, or using the last failure instead of
   the deferred response's plan to build exhaustion.
+- Bad: passing `request_distribution_seed()` into a positional
+  `now_unix_secs: u64` parameter; rotated millisecond bits make future runtime
+  deadlines appear expired.
 
 ## 6. Tests Required
 
@@ -108,6 +131,9 @@ No database migration is involved; routing configuration remains opaque JSON.
 - Gateway: system-default bootstrap/fallback, attempt index/Pool stride,
   dynamic-loop cleanup, sync/stream failover, Pool balance/runtime quota, and
   `openai_image_sync_heartbeat_retries_sticky_key_lazily_before_failover`.
+- Gateway scheduler: use different explicit time/seed values and assert both a
+  future open circuit and a recent RPM observation remain blocked; assert a
+  paged cursor retains its seed and final ranking preserves the supplied seed.
 - Frontend: routing config normalization, independent per-format Key maps,
   hidden Provider override preservation, sticky-attempt clamping, and type-check.
 
@@ -120,6 +146,9 @@ let keep_priority = policy.keep_priority_on_conversion || legacy_global_flag;
 for retry_index in 0..policy.sticky_key_attempts {
     attempts.push(build_attempt(candidate, retry_index));
 }
+
+// A distribution seed is not a Unix timestamp.
+let candidates = list_candidates(request_distribution_seed()).await?;
 ```
 
 ### Correct
@@ -129,4 +158,9 @@ let ordering = SchedulerOrderingConfig::from_routing_policy(policy);
 let attempts = vec![build_attempt(candidate, 0)];
 // After a candidate-scoped failure only:
 let retry = next_same_key_retry_attempt(&attempt);
+
+let context = CandidateSchedulingContext {
+    now_unix_secs: current_unix_secs(),
+    load_balance_seed: request_distribution_seed(),
+};
 ```
