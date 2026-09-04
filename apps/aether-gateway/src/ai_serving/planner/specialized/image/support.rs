@@ -26,7 +26,8 @@ use crate::ai_serving::{
     ExecutionRuntimeAuthContext, GatewayControlDecision, PlannerAppState,
 };
 use crate::client_session_affinity::client_session_affinity_from_parts;
-use crate::clock::current_unix_secs;
+use crate::clock::{current_unix_secs, request_distribution_seed};
+use crate::scheduler::candidate::CandidateSchedulingContext;
 use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::{AppState, GatewayError};
 use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
@@ -113,7 +114,7 @@ fn resolve_local_openai_image_auth_context(
     resolve_local_decision_execution_runtime_auth_context(decision)
 }
 
-/// 按请求路由策略列出 OpenAI 图片初始候选尝试。
+/// 按请求路由策略列出图片候选；同一格式批次共享种子并以真实时间过滤。
 pub(super) async fn list_local_openai_image_candidate_attempts(
     state: &AppState,
     trace_id: &str,
@@ -123,6 +124,10 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
     decision_kind: &str,
 ) -> Option<Vec<LocalOpenAiImageCandidateAttempt>> {
     let candidate_api_formats = image_candidate_api_formats(api_format);
+    let scheduling_context = CandidateSchedulingContext {
+        now_unix_secs: current_unix_secs(),
+        load_balance_seed: request_distribution_seed(),
+    };
     let mut attempts = Vec::new();
     for candidate_api_format in candidate_api_formats {
         let matches_client_format = candidate_api_format == api_format;
@@ -135,7 +140,7 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
                 input.required_capabilities.as_ref(),
                 matches_client_format.then_some(&input.auth_snapshot),
                 input.client_session_affinity.as_ref(),
-                current_unix_secs(),
+                scheduling_context,
                 false,
                 input
                     .routing_policy
@@ -192,7 +197,7 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
     Some(attempts)
 }
 
-/// 构造 OpenAI 图片动态候选来源，供失败后继续按策略取下一候选。
+/// 构造图片动态候选来源；跨格式预选共享种子，失败后继续按策略取下一候选。
 pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
     state: &'a AppState,
     trace_id: &str,
@@ -202,6 +207,10 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
     decision_kind: &str,
 ) -> Result<Option<(LocalOpenAiImageCandidateAttemptSource<'a>, usize)>, GatewayError> {
     let planner_state = PlannerAppState::new(state);
+    let scheduling_context = CandidateSchedulingContext {
+        now_unix_secs: current_unix_secs(),
+        load_balance_seed: request_distribution_seed(),
+    };
     let mut candidates = Vec::new();
     let mut preselection_skipped = Vec::new();
     for candidate_api_format in image_candidate_api_formats(api_format) {
@@ -214,7 +223,7 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
                 input.required_capabilities.as_ref(),
                 matches_client_format.then_some(&input.auth_snapshot),
                 input.client_session_affinity.as_ref(),
-                current_unix_secs(),
+                scheduling_context,
                 false,
                 input
                     .routing_policy

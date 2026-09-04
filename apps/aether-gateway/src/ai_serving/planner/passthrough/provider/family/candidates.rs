@@ -25,7 +25,8 @@ use crate::ai_serving::{
     resolve_local_decision_execution_runtime_auth_context, GatewayControlDecision, PlannerAppState,
 };
 use crate::client_session_affinity::client_session_affinity_from_api_request;
-use crate::clock::current_unix_secs;
+use crate::clock::{current_unix_secs, request_distribution_seed};
+use crate::scheduler::candidate::CandidateSchedulingContext;
 use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::{AppState, GatewayError};
 
@@ -114,7 +115,7 @@ pub(crate) async fn resolve_local_same_format_provider_decision_input(
     Ok(Some(input))
 }
 
-/// 为同格式 Provider 请求选择并物化候选，同时传递请求级排序和粘性重试策略。
+/// 为同格式 Provider 请求以独立时间/种子选择候选，并传递请求级排序与粘性策略。
 pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
     state: &AppState,
     trace_id: &str,
@@ -144,7 +145,10 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
             input.required_capabilities.as_ref(),
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
-            current_unix_secs(),
+            CandidateSchedulingContext {
+                now_unix_secs: current_unix_secs(),
+                load_balance_seed: request_distribution_seed(),
+            },
             false,
             spec.operation.map(|operation| operation.as_str()),
             input
@@ -227,7 +231,7 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
     Ok((outcome.attempts, outcome.candidate_count))
 }
 
-/// 构造同格式 Provider 的动态候选来源，保留 Endpoint 能力过滤与请求排序配置。
+/// 构造同格式 Provider 动态来源，保留 Endpoint 过滤及独立时间/种子排序语义。
 pub(crate) async fn build_local_same_format_provider_candidate_attempt_source<'a>(
     state: &'a AppState,
     trace_id: &str,
@@ -257,7 +261,10 @@ pub(crate) async fn build_local_same_format_provider_candidate_attempt_source<'a
             input.required_capabilities.as_ref(),
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
-            current_unix_secs(),
+            CandidateSchedulingContext {
+                now_unix_secs: current_unix_secs(),
+                load_balance_seed: request_distribution_seed(),
+            },
             false,
             spec.operation.map(|operation| operation.as_str()),
             input

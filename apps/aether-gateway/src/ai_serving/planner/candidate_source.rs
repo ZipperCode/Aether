@@ -27,14 +27,14 @@ use crate::cache::{
     record_candidate_row_page_cache_miss, record_candidate_row_page_cache_none, CacheLoadObserver,
     CandidatePageCacheKey, CandidatePageSnapshot, CandidateRowPageCacheKey,
 };
-use crate::clock::request_distribution_seed;
+use crate::clock::{current_unix_secs, request_distribution_seed};
 use crate::data::candidate_selection::{
     read_api_format_rows_fallback_page, read_requested_model_rows_fast_path_page,
     requested_model_candidate_names, MinimalCandidateSelectionRowSource,
     RequestedModelCandidateRowsPage, REQUESTED_MODEL_CANDIDATE_PAGE_SIZE,
     REQUESTED_MODEL_MAX_SCANNED_ROWS,
 };
-use crate::scheduler::candidate::SchedulerSkippedCandidate;
+use crate::scheduler::candidate::{CandidateSchedulingContext, SchedulerSkippedCandidate};
 use crate::scheduler::config::{SchedulerOrderingConfig, SchedulerSchedulingMode};
 use crate::stage_metrics::observe_gateway_stage_ms;
 use crate::GatewayError;
@@ -54,6 +54,7 @@ impl LocalCandidatePreselectionKeyMode {
     }
 }
 
+/// 普通预选端口在整个格式批次内固定排序种子，同时以创建时的真实秒数判断运行态。
 struct GatewayLocalCandidatePreselectionPort<'a> {
     state: PlannerAppState<'a>,
     client_api_format: &'a str,
@@ -68,7 +69,8 @@ struct GatewayLocalCandidatePreselectionPort<'a> {
     key_mode: LocalCandidatePreselectionKeyMode,
     candidate_api_formats: Vec<String>,
     model_directive_routing_models: BTreeMap<String, String>,
-    ranking_seed: u64,
+    /// 当前预选批次固定使用的真实时间与负载均衡种子。
+    scheduling_context: CandidateSchedulingContext,
 }
 
 impl GatewayLocalCandidatePreselectionPort<'_> {
@@ -170,7 +172,7 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
                     .is_none()
                     .then_some(self.client_session_affinity)
                     .flatten(),
-                self.ranking_seed,
+                self.scheduling_context,
                 false,
                 self.request_operation,
                 self.routing_policy
@@ -337,12 +339,16 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
         key_mode,
         candidate_api_formats,
         model_directive_routing_models,
-        ranking_seed: request_distribution_seed(),
+        scheduling_context: CandidateSchedulingContext {
+            now_unix_secs: current_unix_secs(),
+            load_balance_seed: request_distribution_seed(),
+        },
     };
 
     run_ai_candidate_preselection(&port).await
 }
 
+/// 分页预选游标跨页保留排序种子；每次加载页面时单独采集最新真实时间。
 pub(crate) struct LocalCandidatePreselectionPageCursor<'a> {
     state: PlannerAppState<'a>,
     trace_id: String,
@@ -362,7 +368,8 @@ pub(crate) struct LocalCandidatePreselectionPageCursor<'a> {
     model_directive_routing_models: BTreeMap<String, String>,
     model_directive_policy_cache_key: String,
     ordering_config: SchedulerOrderingConfig,
-    ranking_seed: u64,
+    /// 游标生命周期内固定的负载均衡种子，等待或翻页不得更新。
+    load_balance_seed: u64,
     priority_page_emitted: bool,
     deferred_pages_by_format: BTreeMap<
         String,
@@ -399,7 +406,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// 创建分页候选游标，并冻结本次请求的操作感知格式集合与模型指令映射。
+    /// 创建分页候选游标，并冻结格式集合、模型指令映射及本次请求的排序种子。
     pub(crate) async fn new(
         state: PlannerAppState<'a>,
         model_directive_policy: &crate::system_features::ModelDirectivePolicySnapshot,
@@ -454,7 +461,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             model_directive_routing_models,
             model_directive_policy_cache_key: model_directive_policy.cache_key().to_string(),
             ordering_config,
-            ranking_seed: request_distribution_seed(),
+            load_balance_seed: request_distribution_seed(),
             priority_page_emitted: false,
             deferred_pages_by_format: BTreeMap::new(),
             format_index: 0,
@@ -1195,7 +1202,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             || self.exhausted_api_formats.contains(&normalized_api_format)
     }
 
-    /// 将存储行解析为分页候选结果，并在最终全局排序前保留分页边界状态。
+    /// 将存储行解析为分页候选，以最新真实时间过滤并沿用游标固定种子排序。
     async fn build_page_outcome_from_rows(
         &mut self,
         candidate_api_format: &str,
@@ -1320,7 +1327,10 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                     .is_none()
                     .then_some(self.client_session_affinity.as_ref())
                     .flatten(),
-                self.ranking_seed,
+                CandidateSchedulingContext {
+                    now_unix_secs: current_unix_secs(),
+                    load_balance_seed: self.load_balance_seed,
+                },
                 self.routing_policy
                     .as_ref()
                     .map(SchedulerOrderingConfig::from_routing_policy),
@@ -2537,6 +2547,7 @@ mod tests {
         );
     }
 
+    /// 验证跨格式分页保持首屏语义，并且翻页期间不更换游标的负载均衡种子。
     #[tokio::test]
     async fn first_page_includes_cross_format_candidates_that_keep_conversion_priority() {
         let same_format = standard_candidate_row("provider-claude", "claude:messages", 10);
@@ -2599,12 +2610,14 @@ mod tests {
             None,
         )
         .await;
+        let load_balance_seed = cursor.load_balance_seed;
 
         let first_page = cursor
             .next_page()
             .await
             .expect("preselection should succeed")
             .expect("same-format and keep-priority conversion candidates should share first page");
+        assert_eq!(cursor.load_balance_seed, load_balance_seed);
 
         assert_eq!(
             first_page
@@ -2645,6 +2658,7 @@ mod tests {
             .await
             .expect("preselection should continue")
             .expect("regular conversion candidate should remain in a later page");
+        assert_eq!(cursor.load_balance_seed, load_balance_seed);
         assert_eq!(
             second_page
                 .candidates

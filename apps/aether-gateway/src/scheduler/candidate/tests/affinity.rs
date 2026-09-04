@@ -27,8 +27,10 @@ use crate::{AppState, GatewayError};
 
 use super::super::affinity::build_scheduler_affinity_cache_key;
 use super::super::selection::select_minimal_candidate as select_candidate_impl;
+use super::super::CandidateSchedulingContext;
 use super::support::{sample_auth_snapshot, sample_key, sample_provider, sample_row};
 
+/// 测试辅助入口让真实时间与排序种子取同一确定值，保持既有亲和断言稳定。
 async fn select_candidate(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
     runtime_state: &AppState,
@@ -48,7 +50,10 @@ async fn select_candidate(
         None,
         auth_snapshot,
         client_session_affinity,
-        now_unix_secs,
+        CandidateSchedulingContext {
+            now_unix_secs,
+            load_balance_seed: now_unix_secs,
+        },
         false,
     )
     .await

@@ -25,7 +25,8 @@ use crate::ai_serving::{
     ExecutionRuntimeAuthContext, GatewayControlDecision, PlannerAppState,
 };
 use crate::client_session_affinity::client_session_affinity_from_parts;
-use crate::clock::current_unix_secs;
+use crate::clock::{current_unix_secs, request_distribution_seed};
+use crate::scheduler::candidate::CandidateSchedulingContext;
 use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::{AppState, GatewayError};
 
@@ -98,7 +99,7 @@ pub(super) async fn resolve_local_gemini_files_decision_input(
     Ok(Some(input))
 }
 
-/// 按请求级排序配置选择并物化 Gemini Files 初始候选尝试。
+/// 以独立真实时间和批次种子选择并物化 Gemini Files 初始候选尝试。
 pub(super) async fn materialize_local_gemini_files_candidate_attempts(
     state: &AppState,
     trace_id: &str,
@@ -117,7 +118,10 @@ pub(super) async fn materialize_local_gemini_files_candidate_attempts(
             input.endpoint_capability_require_streaming,
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
-            current_unix_secs(),
+            CandidateSchedulingContext {
+                now_unix_secs: current_unix_secs(),
+                load_balance_seed: request_distribution_seed(),
+            },
             input
                 .routing_policy
                 .as_ref()
@@ -178,7 +182,7 @@ pub(super) async fn materialize_local_gemini_files_candidate_attempts(
     Ok(outcome.attempts)
 }
 
-/// 构造 Gemini Files 动态候选来源，并保留 Endpoint streaming/operation 能力条件。
+/// 构造 Gemini Files 动态候选来源，并以具名上下文保留运行态与排序语义。
 pub(super) async fn build_local_gemini_files_candidate_attempt_source<'a>(
     state: &'a AppState,
     trace_id: &str,
@@ -197,7 +201,10 @@ pub(super) async fn build_local_gemini_files_candidate_attempt_source<'a>(
             input.endpoint_capability_require_streaming,
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
-            current_unix_secs(),
+            CandidateSchedulingContext {
+                now_unix_secs: current_unix_secs(),
+                load_balance_seed: request_distribution_seed(),
+            },
             input
                 .routing_policy
                 .as_ref()

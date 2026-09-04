@@ -13,6 +13,7 @@ use super::affinity::{
 use super::runtime::CandidateRuntimeSelectionSnapshot;
 use super::SchedulerMinimalCandidateSelectionCandidate;
 
+/// 仅以当前批次的分布种子排序候选；运行态时间已在进入本函数前完成消费。
 pub(super) fn rank_scheduler_candidates(
     candidates: &mut [SchedulerMinimalCandidateSelectionCandidate],
     runtime_snapshot: &CandidateRuntimeSelectionSnapshot,
@@ -20,7 +21,7 @@ pub(super) fn rank_scheduler_candidates(
     required_capabilities: Option<&serde_json::Value>,
     priority_affinity_key: Option<&str>,
     cached_affinity_target: Option<&SchedulerAffinityTarget>,
-    now_unix_secs: u64,
+    load_balance_seed: u64,
 ) {
     let rankables = candidates
         .iter()
@@ -71,7 +72,7 @@ pub(super) fn rank_scheduler_candidates(
             priority_mode: ordering_config.priority_mode,
             ranking_mode: scheduler_ranking_mode(ordering_config.scheduling_mode),
             include_health: true,
-            load_balance_seed: now_unix_secs,
+            load_balance_seed,
         },
     );
 }

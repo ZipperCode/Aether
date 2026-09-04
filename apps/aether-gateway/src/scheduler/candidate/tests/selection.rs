@@ -29,8 +29,10 @@ use super::super::selection::{
     collect_selectable_candidates_with_skip_reasons as collect_selectable_candidates_with_skip_reasons_impl,
     is_exact_all_skipped_by_auth_limit, select_minimal_candidate as select_candidate_impl,
 };
+use super::super::CandidateSchedulingContext;
 use super::support::{sample_auth_snapshot, sample_key, sample_provider, sample_row};
 
+/// 测试辅助入口使用同一确定值构造具名时间和种子，保持既有选择断言不变。
 async fn select_candidate(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
     runtime_state: &AppState,
@@ -49,7 +51,10 @@ async fn select_candidate(
         None,
         auth_snapshot,
         None,
-        now_unix_secs,
+        CandidateSchedulingContext {
+            now_unix_secs,
+            load_balance_seed: now_unix_secs,
+        },
         false,
     )
     .await
@@ -65,6 +70,31 @@ async fn collect_selectable_candidates(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     now_unix_secs: u64,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
+    collect_selectable_candidates_with_context(
+        selection_row_source,
+        runtime_state,
+        api_format,
+        global_model_name,
+        require_streaming,
+        auth_snapshot,
+        CandidateSchedulingContext {
+            now_unix_secs,
+            load_balance_seed: now_unix_secs,
+        },
+    )
+    .await
+}
+
+/// 使用显式具名上下文收集候选，供时间与排序种子分离的回归断言复用。
+async fn collect_selectable_candidates_with_context(
+    selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
+    runtime_state: &AppState,
+    api_format: &str,
+    global_model_name: &str,
+    require_streaming: bool,
+    auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+    scheduling_context: CandidateSchedulingContext,
+) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
     collect_selectable_candidates_impl(
         selection_row_source,
         runtime_state,
@@ -74,13 +104,14 @@ async fn collect_selectable_candidates(
         None,
         auth_snapshot,
         None,
-        now_unix_secs,
+        scheduling_context,
         false,
         None,
     )
     .await
 }
 
+/// 使用确定的具名调度上下文收集候选及跳过原因。
 async fn collect_selectable_candidates_with_skip_reasons(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
     runtime_state: &AppState,
@@ -89,6 +120,37 @@ async fn collect_selectable_candidates_with_skip_reasons(
     require_streaming: bool,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     now_unix_secs: u64,
+) -> Result<
+    (
+        Vec<SchedulerMinimalCandidateSelectionCandidate>,
+        Vec<super::super::SchedulerSkippedCandidate>,
+    ),
+    GatewayError,
+> {
+    collect_selectable_candidates_with_skip_reasons_and_context(
+        selection_row_source,
+        runtime_state,
+        api_format,
+        global_model_name,
+        require_streaming,
+        auth_snapshot,
+        CandidateSchedulingContext {
+            now_unix_secs,
+            load_balance_seed: now_unix_secs,
+        },
+    )
+    .await
+}
+
+/// 使用显式时间与种子收集候选及跳过原因，直接覆盖跨层参数错位回归。
+async fn collect_selectable_candidates_with_skip_reasons_and_context(
+    selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
+    runtime_state: &AppState,
+    api_format: &str,
+    global_model_name: &str,
+    require_streaming: bool,
+    auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+    scheduling_context: CandidateSchedulingContext,
 ) -> Result<
     (
         Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -105,7 +167,7 @@ async fn collect_selectable_candidates_with_skip_reasons(
         None,
         auth_snapshot,
         None,
-        now_unix_secs,
+        scheduling_context,
         false,
         None,
     )
@@ -414,7 +476,10 @@ async fn scheduler_selection_prefers_required_capability_matches_before_priority
         Some(&required_capabilities),
         None,
         None,
-        100,
+        CandidateSchedulingContext {
+            now_unix_secs: 100,
+            load_balance_seed: 100,
+        },
         false,
     )
     .await
@@ -609,7 +674,10 @@ async fn cache_affinity_promotes_cached_scheduler_affinity_candidate_when_enable
         None,
         Some(&auth_snapshot),
         Some(&client_session_affinity),
-        100,
+        CandidateSchedulingContext {
+            now_unix_secs: 100,
+            load_balance_seed: 100,
+        },
         false,
     )
     .await
@@ -720,7 +788,10 @@ async fn load_balance_selection_does_not_remember_scheduler_affinity() {
         None,
         Some(&auth_snapshot),
         Some(&client_session_affinity),
-        100,
+        CandidateSchedulingContext {
+            now_unix_secs: 100,
+            load_balance_seed: 100,
+        },
         false,
     )
     .await
@@ -733,6 +804,7 @@ async fn load_balance_selection_does_not_remember_scheduler_affinity() {
         .is_none());
 }
 
+/// 验证负载均衡只消费显式种子：真实时间固定时，不同种子仍可改变同层候选顺序。
 #[tokio::test]
 async fn load_balance_ignores_provider_priority_and_cached_affinity() {
     let mut first = sample_row();
@@ -781,27 +853,33 @@ async fn load_balance_ignores_provider_priority_and_cached_affinity() {
         100,
     );
 
-    let first_pass = collect_selectable_candidates(
+    let first_pass = collect_selectable_candidates_with_context(
         state.data.as_ref(),
         &state,
         "openai:chat",
         "gpt-4.1",
         false,
         Some(&auth_snapshot),
-        100,
+        CandidateSchedulingContext {
+            now_unix_secs: 100,
+            load_balance_seed: 100,
+        },
     )
     .await
     .expect("first pass should succeed");
     let mut provider_b_first_seed = None;
     for seed in 101..600 {
-        let pass = collect_selectable_candidates(
+        let pass = collect_selectable_candidates_with_context(
             state.data.as_ref(),
             &state,
             "openai:chat",
             "gpt-4.1",
             false,
             Some(&auth_snapshot),
-            seed,
+            CandidateSchedulingContext {
+                now_unix_secs: 100,
+                load_balance_seed: seed,
+            },
         )
         .await
         .expect("seeded pass should succeed");
@@ -815,14 +893,17 @@ async fn load_balance_ignores_provider_priority_and_cached_affinity() {
     }
     let provider_b_first_seed = provider_b_first_seed
         .expect("test seed should allow provider-b to win despite lower priority");
-    let second_pass = collect_selectable_candidates(
+    let second_pass = collect_selectable_candidates_with_context(
         state.data.as_ref(),
         &state,
         "openai:chat",
         "gpt-4.1",
         false,
         Some(&auth_snapshot),
-        provider_b_first_seed,
+        CandidateSchedulingContext {
+            now_unix_secs: 100,
+            load_balance_seed: provider_b_first_seed,
+        },
     )
     .await
     .expect("second pass should succeed");
@@ -1775,6 +1856,98 @@ async fn exposes_runtime_skipped_candidates_with_skip_reasons() {
     assert_eq!(skipped[0].candidate.provider_id, "provider-a");
     assert_eq!(skipped[0].skip_reason, "key_circuit_open");
     assert!(!is_exact_all_skipped_by_auth_limit(&selected, &skipped));
+}
+
+/// 验证极大排序种子不会冒充 Unix 秒，熔断探测和 RPM 活动窗口仍按真实时间阻断。
+#[tokio::test]
+async fn scheduling_context_keeps_runtime_windows_on_real_time() {
+    let rows = vec![
+        provider_key_concurrency_row(
+            "provider-circuit",
+            "endpoint-circuit",
+            "key-circuit",
+            "circuit",
+            0,
+            0,
+        ),
+        provider_key_concurrency_row("provider-rpm", "endpoint-rpm", "key-rpm", "rpm", 1, 0),
+        provider_key_concurrency_row(
+            "provider-healthy",
+            "endpoint-healthy",
+            "key-healthy",
+            "healthy",
+            2,
+            0,
+        ),
+    ];
+    let circuit_key = sample_key("key-circuit", "provider-circuit", Some(10)).with_health_fields(
+        None,
+        Some(json!({
+            "openai:chat": {
+                "open": true,
+                "next_probe_at_unix_secs": 200
+            }
+        })),
+    );
+    let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows));
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![
+            sample_provider("provider-circuit", None),
+            sample_provider("provider-rpm", None),
+            sample_provider("provider-healthy", None),
+        ],
+        Vec::new(),
+        vec![
+            circuit_key,
+            sample_key("key-rpm", "provider-rpm", Some(1)),
+            sample_key("key-healthy", "provider-healthy", Some(10)),
+        ],
+    ));
+    let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+        active_provider_key_candidate(
+            "active-rpm",
+            "request-rpm",
+            "provider-rpm",
+            "endpoint-rpm",
+            "key-rpm",
+            RequestCandidateStatus::Pending,
+        ),
+    ]));
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_candidate_selection_provider_catalog_quota_and_request_candidates_for_tests(
+                candidates,
+                provider_catalog,
+                quotas,
+                request_candidates,
+            ),
+        );
+
+    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons_and_context(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        CandidateSchedulingContext {
+            now_unix_secs: 100,
+            load_balance_seed: u64::MAX,
+        },
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].key_id, "key-healthy");
+    assert!(skipped.iter().any(|item| {
+        item.candidate.key_id == "key-circuit" && item.skip_reason == "key_circuit_open"
+    }));
+    assert!(skipped.iter().any(|item| {
+        item.candidate.key_id == "key-rpm" && item.skip_reason == "key_rpm_exhausted"
+    }));
 }
 
 #[tokio::test]

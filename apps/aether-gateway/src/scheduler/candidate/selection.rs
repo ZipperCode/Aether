@@ -14,7 +14,9 @@ use super::resolution::resolve_scheduler_candidate_selectability;
 use super::runtime::{
     auth_snapshot_concurrency_limit_reached, read_candidate_runtime_selection_snapshot,
 };
-use super::{SchedulerMinimalCandidateSelectionCandidate, SchedulerRuntimeState};
+use super::{
+    CandidateSchedulingContext, SchedulerMinimalCandidateSelectionCandidate, SchedulerRuntimeState,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SchedulerSkippedCandidate {
@@ -48,6 +50,7 @@ pub(super) fn is_exact_all_skipped_by_auth_limit(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// 使用同一具名上下文过滤运行态并排序一个模型的候选，避免时间与分布种子错位。
 pub(super) async fn select_minimal_candidate(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
     runtime_state: &impl SchedulerRuntimeState,
@@ -57,7 +60,7 @@ pub(super) async fn select_minimal_candidate(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     enable_model_directives: bool,
 ) -> Result<Option<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
     let affinity_epoch = runtime_state.scheduler_affinity_epoch();
@@ -92,7 +95,7 @@ pub(super) async fn select_minimal_candidate(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
-        now_unix_secs,
+        scheduling_context,
         ordering_config,
         priority_affinity_key,
     )
@@ -115,7 +118,7 @@ pub(super) async fn select_minimal_candidate(
     Ok(selected)
 }
 
-/// 收集并排序指定模型的可用候选，不返回跳过明细。
+/// 使用具名时间/种子上下文收集并排序指定模型的可用候选，不返回跳过明细。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect_selectable_candidates(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -126,7 +129,7 @@ pub(super) async fn collect_selectable_candidates(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     enable_model_directives: bool,
     ordering_config: Option<SchedulerOrderingConfig>,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
@@ -140,7 +143,7 @@ pub(super) async fn collect_selectable_candidates(
             required_capabilities,
             auth_snapshot,
             client_session_affinity,
-            now_unix_secs,
+            scheduling_context,
             enable_model_directives,
             None,
             ordering_config,
@@ -150,7 +153,7 @@ pub(super) async fn collect_selectable_candidates(
     )
 }
 
-/// 兼容旧调用形状：未显式提供请求策略时，从运行态解析系统默认排序配置。
+/// 使用具名调度上下文收集跳过原因；未显式提供请求策略时读取运行态默认配置。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect_selectable_candidates_with_skip_reasons(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -161,7 +164,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     enable_model_directives: bool,
     request_operation: Option<&str>,
 ) -> Result<
@@ -180,7 +183,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
-        now_unix_secs,
+        scheduling_context,
         enable_model_directives,
         request_operation,
         None,
@@ -199,7 +202,7 @@ pub(super) async fn resolve_preselection_ordering_config(
     }
 }
 
-/// 按显式或运行态排序配置选择候选，并同时返回每个被跳过候选的原因。
+/// 按显式或运行态排序配置及具名调度上下文选择候选，并返回每个跳过原因。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ordering(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -210,7 +213,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ordering
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     enable_model_directives: bool,
     request_operation: Option<&str>,
     ordering_config: Option<SchedulerOrderingConfig>,
@@ -247,14 +250,14 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ordering
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
-        now_unix_secs,
+        scheduling_context,
         ordering_config,
         priority_affinity_key,
     )
     .await
 }
 
-/// 对已枚举候选执行运行态资格过滤、请求排序和亲和记录，并返回跳过明细。
+/// 对已枚举候选以真实时间过滤、以独立种子排序并记录亲和，最后返回跳过明细。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
     runtime_state: &impl SchedulerRuntimeState,
@@ -264,7 +267,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     ordering_config: SchedulerOrderingConfig,
     priority_affinity_key: Option<&str>,
 ) -> Result<
@@ -278,7 +281,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
         runtime_state,
         &candidates,
         auth_snapshot,
-        now_unix_secs,
+        scheduling_context.now_unix_secs,
     )
     .await?;
     let affinity_cache_key = build_scheduler_affinity_cache_key(
@@ -298,7 +301,11 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
         None
     };
 
-    if auth_snapshot_concurrency_limit_reached(auth_snapshot, &runtime_snapshot, now_unix_secs) {
+    if auth_snapshot_concurrency_limit_reached(
+        auth_snapshot,
+        &runtime_snapshot,
+        scheduling_context.now_unix_secs,
+    ) {
         rank_scheduler_candidates(
             &mut candidates,
             &runtime_snapshot,
@@ -306,7 +313,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
             required_capabilities,
             priority_affinity_key,
             cached_affinity_target.as_ref(),
-            now_unix_secs,
+            scheduling_context.load_balance_seed,
         );
         return Ok((
             Vec::new(),
@@ -320,8 +327,11 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
         ));
     }
 
-    let (mut selected, skipped) =
-        resolve_scheduler_candidate_selectability(candidates, &runtime_snapshot, now_unix_secs);
+    let (mut selected, skipped) = resolve_scheduler_candidate_selectability(
+        candidates,
+        &runtime_snapshot,
+        scheduling_context.now_unix_secs,
+    );
     rank_scheduler_candidates(
         &mut selected,
         &runtime_snapshot,
@@ -329,7 +339,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
         required_capabilities,
         priority_affinity_key,
         cached_affinity_target.as_ref(),
-        now_unix_secs,
+        scheduling_context.load_balance_seed,
     );
 
     Ok((selected, skipped))

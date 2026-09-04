@@ -3,16 +3,16 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{GatewayAuthApiKeySnapshot, PlannerAppState};
-use crate::clock::current_unix_secs;
+use crate::clock::{current_unix_secs, request_distribution_seed};
 use crate::constants::{
     API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS, API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS,
 };
-use crate::scheduler::candidate::SchedulerSkippedCandidate;
+use crate::scheduler::candidate::{CandidateSchedulingContext, SchedulerSkippedCandidate};
 use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::GatewayError;
 
 impl<'a> PlannerAppState<'a> {
-    /// 列出可选候选；显式排序配置来自请求路由策略，空值回退运行态默认策略。
+    /// 为模型目录兼容入口补充分布种子后列出候选；传入值仅作为真实 Unix 秒使用。
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates(
         self,
@@ -26,6 +26,10 @@ impl<'a> PlannerAppState<'a> {
         enable_model_directives: bool,
         ordering_config: Option<SchedulerOrderingConfig>,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
+        let scheduling_context = CandidateSchedulingContext {
+            now_unix_secs,
+            load_balance_seed: request_distribution_seed(),
+        };
         crate::scheduler::candidate::list_selectable_candidates(
             self.app().data.as_ref(),
             self.app(),
@@ -35,14 +39,14 @@ impl<'a> PlannerAppState<'a> {
             required_capabilities,
             auth_snapshot,
             client_session_affinity,
-            now_unix_secs,
+            scheduling_context,
             enable_model_directives,
             ordering_config,
         )
         .await
     }
 
-    /// 列出可选候选及跳过原因，并把请求排序配置传递到统一预选器。
+    /// 以具名时间/种子上下文列出候选及跳过原因，并传递请求排序配置。
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates_with_skip_reasons(
         self,
@@ -52,7 +56,7 @@ impl<'a> PlannerAppState<'a> {
         required_capabilities: Option<&serde_json::Value>,
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
-        now_unix_secs: u64,
+        scheduling_context: CandidateSchedulingContext,
         enable_model_directives: bool,
         ordering_config: Option<SchedulerOrderingConfig>,
     ) -> Result<
@@ -69,7 +73,7 @@ impl<'a> PlannerAppState<'a> {
             required_capabilities,
             auth_snapshot,
             client_session_affinity,
-            now_unix_secs,
+            scheduling_context,
             enable_model_directives,
             None,
             ordering_config,
@@ -77,7 +81,7 @@ impl<'a> PlannerAppState<'a> {
         .await
     }
 
-    /// 按请求操作列出候选及跳过原因；并发额度短暂占满时在限定窗口内重读。
+    /// 按请求操作列出候选；并发等待只刷新真实时间，整个排序批次沿用原分布种子。
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates_with_skip_reasons_for_request_operation(
         self,
@@ -87,7 +91,7 @@ impl<'a> PlannerAppState<'a> {
         required_capabilities: Option<&serde_json::Value>,
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
-        now_unix_secs: u64,
+        scheduling_context: CandidateSchedulingContext,
         enable_model_directives: bool,
         request_operation: Option<&str>,
         ordering_config: Option<SchedulerOrderingConfig>,
@@ -101,7 +105,7 @@ impl<'a> PlannerAppState<'a> {
         let wait_timeout = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS);
         let wait_interval = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS.max(1));
         let wait_deadline = Instant::now() + wait_timeout;
-        let mut attempt_now_unix_secs = now_unix_secs;
+        let mut attempt_context = scheduling_context;
         loop {
             let result = crate::scheduler::candidate::list_selectable_candidates_with_skip_reasons_for_request_operation(
                 self.app().data.as_ref(),
@@ -112,7 +116,7 @@ impl<'a> PlannerAppState<'a> {
                 required_capabilities,
                 auth_snapshot,
                 client_session_affinity,
-                attempt_now_unix_secs,
+                attempt_context,
                 enable_model_directives,
                 request_operation,
                 ordering_config,
@@ -132,11 +136,11 @@ impl<'a> PlannerAppState<'a> {
 
             let remaining = wait_deadline.duration_since(now);
             tokio::time::sleep(wait_interval.min(remaining)).await;
-            attempt_now_unix_secs = current_unix_secs();
+            attempt_context.now_unix_secs = current_unix_secs();
         }
     }
 
-    /// 对调用方枚举出的候选应用权限、亲和和请求级排序配置。
+    /// 对调用方枚举出的候选应用权限、亲和及具名时间/种子上下文。
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
         self,
@@ -146,7 +150,7 @@ impl<'a> PlannerAppState<'a> {
         required_capabilities: Option<&serde_json::Value>,
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
-        now_unix_secs: u64,
+        scheduling_context: CandidateSchedulingContext,
         ordering_config: Option<SchedulerOrderingConfig>,
     ) -> Result<
         (
@@ -163,13 +167,13 @@ impl<'a> PlannerAppState<'a> {
             required_capabilities,
             auth_snapshot,
             client_session_affinity,
-            now_unix_secs,
+            scheduling_context,
             ordering_config,
         )
         .await
     }
 
-    /// 在没有请求模型名时按独占能力选择候选，并沿用请求级或系统默认排序。
+    /// 在没有请求模型名时按独占能力选择候选；等待仅刷新时间并保持排序种子稳定。
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates_for_required_capability_without_requested_model(
         self,
@@ -178,13 +182,13 @@ impl<'a> PlannerAppState<'a> {
         require_streaming: bool,
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
-        now_unix_secs: u64,
+        scheduling_context: CandidateSchedulingContext,
         ordering_config: Option<SchedulerOrderingConfig>,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
         let wait_timeout = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS);
         let wait_interval = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS.max(1));
         let wait_deadline = Instant::now() + wait_timeout;
-        let mut attempt_now_unix_secs = now_unix_secs;
+        let mut attempt_context = scheduling_context;
 
         loop {
             let (result, auth_limit_blocked) = crate::scheduler::candidate::list_selectable_candidates_for_required_capability_without_requested_model_with_auth_limit_signal(
@@ -195,7 +199,7 @@ impl<'a> PlannerAppState<'a> {
                 require_streaming,
                 auth_snapshot,
                 client_session_affinity,
-                attempt_now_unix_secs,
+                attempt_context,
                 ordering_config,
             )
             .await?;
@@ -211,7 +215,7 @@ impl<'a> PlannerAppState<'a> {
 
             let remaining = wait_deadline.duration_since(now);
             tokio::time::sleep(wait_interval.min(remaining)).await;
-            attempt_now_unix_secs = current_unix_secs();
+            attempt_context.now_unix_secs = current_unix_secs();
         }
     }
 }

@@ -49,13 +49,22 @@ use crate::GatewayError;
 #[cfg_attr(not(test), allow(dead_code))]
 const SCHEDULER_AFFINITY_MAX_ENTRIES: usize = 10_000;
 
+/// 候选调度一次排序批次的时间与分布上下文，避免两个同型整数在跨层调用时互换语义。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CandidateSchedulingContext {
+    /// 运行态资格判断使用的真实 Unix 秒；熔断、RPM、并发和凭据时效只读取该值。
+    pub(crate) now_unix_secs: u64,
+    /// 当前排序批次固定使用的分布种子；不得作为任何运行态时间来源。
+    pub(crate) load_balance_seed: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequiredCapabilityMatchMode {
     Compatible,
     Exclusive,
 }
 
-/// 列出匹配模型和格式的可用候选；请求排序配置为空时读取运行态默认策略。
+/// 使用具名时间/种子上下文列出可用候选；请求排序配置为空时读取运行态默认策略。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_selectable_candidates(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -66,7 +75,7 @@ pub(crate) async fn list_selectable_candidates(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     enable_model_directives: bool,
     ordering_config: Option<SchedulerOrderingConfig>,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
@@ -79,7 +88,7 @@ pub(crate) async fn list_selectable_candidates(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
-        now_unix_secs,
+        scheduling_context,
         enable_model_directives,
         ordering_config,
     )
@@ -93,7 +102,7 @@ pub(crate) fn is_exact_all_skipped_by_auth_limit(
     selection::is_exact_all_skipped_by_auth_limit(selected, skipped)
 }
 
-/// 列出可用候选及跳过原因，并沿用请求级或系统默认排序配置。
+/// 使用具名时间/种子上下文列出候选及跳过原因，并沿用请求级或系统默认排序配置。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_selectable_candidates_with_skip_reasons(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -104,7 +113,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     enable_model_directives: bool,
     ordering_config: Option<SchedulerOrderingConfig>,
 ) -> Result<
@@ -123,7 +132,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
-        now_unix_secs,
+        scheduling_context,
         enable_model_directives,
         None,
         ordering_config,
@@ -131,7 +140,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons(
     .await
 }
 
-/// 按具体请求操作列出候选及跳过原因，保留 Endpoint 能力隔离。
+/// 按具体请求操作和具名调度上下文列出候选及跳过原因，保留 Endpoint 能力隔离。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_selectable_candidates_with_skip_reasons_for_request_operation(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -142,7 +151,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons_for_request_ope
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     enable_model_directives: bool,
     request_operation: Option<&str>,
     ordering_config: Option<SchedulerOrderingConfig>,
@@ -162,7 +171,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons_for_request_ope
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
-        now_unix_secs,
+        scheduling_context,
         enable_model_directives,
         request_operation,
         ordering_config,
@@ -170,7 +179,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons_for_request_ope
     .await
 }
 
-/// 对已枚举候选统一应用权限、亲和和排序配置。
+/// 对已枚举候选统一应用权限、亲和和具名时间/种子上下文。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
     runtime_state: &impl SchedulerRuntimeState,
@@ -180,7 +189,7 @@ pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     ordering_config: Option<SchedulerOrderingConfig>,
 ) -> Result<
     (
@@ -204,14 +213,14 @@ pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
-        now_unix_secs,
+        scheduling_context,
         ordering_config,
         priority_affinity_key,
     )
     .await
 }
 
-/// 在无请求模型名时按必需能力选择候选，并返回可用列表。
+/// 在无请求模型名时按必需能力和具名调度上下文选择候选，并返回可用列表。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_selectable_candidates_for_required_capability_without_requested_model(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -221,7 +230,7 @@ pub(crate) async fn list_selectable_candidates_for_required_capability_without_r
     require_streaming: bool,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     ordering_config: Option<SchedulerOrderingConfig>,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
     Ok(
@@ -233,7 +242,7 @@ pub(crate) async fn list_selectable_candidates_for_required_capability_without_r
             require_streaming,
             auth_snapshot,
             client_session_affinity,
-            now_unix_secs,
+            scheduling_context,
             ordering_config,
         )
         .await?
@@ -241,7 +250,7 @@ pub(crate) async fn list_selectable_candidates_for_required_capability_without_r
     )
 }
 
-/// 按必需能力选择候选，并额外报告是否全部受 API Key 并发额度阻断。
+/// 按必需能力和具名调度上下文选择候选，并额外报告是否全部受 API Key 并发额度阻断。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_selectable_candidates_for_required_capability_without_requested_model_with_auth_limit_signal(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -251,7 +260,7 @@ pub(crate) async fn list_selectable_candidates_for_required_capability_without_r
     require_streaming: bool,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
-    now_unix_secs: u64,
+    scheduling_context: CandidateSchedulingContext,
     ordering_config: Option<SchedulerOrderingConfig>,
 ) -> Result<(Vec<SchedulerMinimalCandidateSelectionCandidate>, bool), GatewayError> {
     let normalized_api_format = normalize_api_format(candidate_api_format);
@@ -296,7 +305,7 @@ pub(crate) async fn list_selectable_candidates_for_required_capability_without_r
                 required_capabilities.as_ref(),
                 auth_snapshot,
                 client_session_affinity,
-                now_unix_secs,
+                scheduling_context,
                 false,
                 None,
                 ordering_config,

@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
-use crate::clock::current_unix_ms;
+use crate::clock::request_distribution_seed;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::scheduler::config::{
     read_scheduler_ordering_config, SchedulerOrderingConfig, SchedulerSchedulingMode,
@@ -26,6 +26,7 @@ use super::candidate_transport_ranking_facts::{
     resolve_cached_transport_ranking_facts, CandidateTransportRankingFactsCache,
 };
 
+/// 解析后候选排序端口为一次排序执行冻结独立分布种子，避免同毫秒请求形成热点。
 struct GatewayLocalCandidateRankingPort<'a> {
     state: PlannerAppState<'a>,
     requested_model: Option<&'a str>,
@@ -33,6 +34,8 @@ struct GatewayLocalCandidateRankingPort<'a> {
     client_session_affinity: Option<&'a ClientSessionAffinity>,
     required_capabilities: Option<&'a serde_json::Value>,
     ordering_config: SchedulerOrderingConfig,
+    /// 本排序批次唯一且稳定的负载均衡种子。
+    load_balance_seed: u64,
     routing_policy: Option<&'a ResolvedRoutingPolicy>,
     transport_ranking_facts_cache: Mutex<CandidateTransportRankingFactsCache>,
 }
@@ -110,8 +113,12 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
         }))
     }
 
+    /// 构造只消费冻结分布种子的最终排序上下文。
     fn ranking_context(&self) -> SchedulerRankingContext {
-        ai_ranking_context(ai_ranking_context_config(self.ordering_config))
+        ai_ranking_context(ai_ranking_context_config(
+            self.ordering_config,
+            self.load_balance_seed,
+        ))
     }
 
     fn apply_ranking_outcome(
@@ -123,6 +130,7 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
     }
 }
 
+/// 对已解析候选执行最终排序；每次调用生成一个批次级分布种子并由端口全程复用。
 pub(crate) async fn rank_eligible_local_execution_candidates(
     state: PlannerAppState<'_>,
     candidates: Vec<EligibleLocalExecutionCandidate>,
@@ -141,6 +149,7 @@ pub(crate) async fn rank_eligible_local_execution_candidates(
         client_session_affinity,
         required_capabilities,
         ordering_config,
+        load_balance_seed: request_distribution_seed(),
         routing_policy,
         transport_ranking_facts_cache: Mutex::new(CandidateTransportRankingFactsCache::default()),
     };
@@ -168,11 +177,15 @@ fn local_execution_candidate_uses_pool(eligible: &EligibleLocalExecutionCandidat
         .is_some()
 }
 
-fn ai_ranking_context_config(ordering_config: SchedulerOrderingConfig) -> AiRankingContextConfig {
+/// 将网关排序配置映射为 AI 排序上下文，并原样传递调用方生成的批次种子。
+fn ai_ranking_context_config(
+    ordering_config: SchedulerOrderingConfig,
+    load_balance_seed: u64,
+) -> AiRankingContextConfig {
     AiRankingContextConfig {
         priority_mode: ordering_config.priority_mode,
         scheduling_mode: ai_ranking_scheduling_mode(ordering_config.scheduling_mode),
-        load_balance_seed: current_unix_ms(),
+        load_balance_seed,
     }
 }
 
@@ -288,6 +301,7 @@ mod tests {
     use crate::{scheduler::affinity::SCHEDULER_AFFINITY_TTL, AppState};
     use aether_data::repository::auth::StoredAuthApiKeySnapshot;
 
+    /// 测试辅助排序使用固定种子，避免用墙上时钟制造不稳定断言。
     async fn rank_local_execution_candidates(
         state: PlannerAppState<'_>,
         candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -324,9 +338,18 @@ mod tests {
         apply_scheduler_candidate_ranking(
             &mut candidates,
             &rankables,
-            ai_ranking_context(super::ai_ranking_context_config(ordering_config)),
+            ai_ranking_context(super::ai_ranking_context_config(ordering_config, 0)),
         );
         candidates
+    }
+
+    /// 验证最终排序配置完整保留批次种子，不再自行读取毫秒时钟。
+    #[test]
+    fn ai_ranking_context_config_preserves_batch_seed() {
+        let config =
+            super::ai_ranking_context_config(super::SchedulerOrderingConfig::default(), 42);
+
+        assert_eq!(config.load_balance_seed, 42);
     }
 
     fn sample_candidate(
