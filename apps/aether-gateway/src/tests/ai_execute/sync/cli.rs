@@ -3,7 +3,9 @@ use super::{
     to_bytes, wait_until, Arc, Body, Json, Mutex, Request, Router, StatusCode,
     EXECUTION_PATH_EXECUTION_RUNTIME_SYNC, EXECUTION_PATH_HEADER, TRACE_ID_HEADER,
 };
-use crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER;
+use crate::constants::{
+    EXECUTION_PATH_LOCAL_API_KEY_CONCURRENCY_LIMITED, LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER,
+};
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::auth::{
     InMemoryAuthApiKeySnapshotRepository, StoredAuthApiKeySnapshot,
@@ -969,16 +971,18 @@ async fn gateway_waits_for_api_key_concurrency_slot_then_executes_openai_respons
     upstream_handle.abort();
 }
 
+/// 验证真实请求持续占用 API Key 时，等待预算耗尽必须拒绝新请求，不能绕过并发门禁。
 #[test]
-fn gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_budget_elapses() {
+fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync() {
     run_cli_sync_test(
-        "gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_budget_elapses",
-        gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_budget_elapses_impl,
+        "gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync",
+        gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync_impl,
     );
 }
 
-async fn gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_budget_elapses_impl()
-{
+/// 构造一个仍在执行的首请求，并核对第二个请求的状态码、诊断及候选落库结果。
+async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync_impl(
+) {
     fn hash_api_key(value: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(value.as_bytes());
@@ -1301,36 +1305,42 @@ async fn gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_b
 
     assert!(
         started_at.elapsed() >= std::time::Duration::from_millis(100),
-        "request should wait for the bounded concurrency window before retrying"
+        "request should wait for the bounded concurrency window before failing"
     );
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         response
             .headers()
             .get(EXECUTION_PATH_HEADER)
             .and_then(|value| value.to_str().ok()),
-        Some(EXECUTION_PATH_EXECUTION_RUNTIME_SYNC)
+        Some(EXECUTION_PATH_LOCAL_API_KEY_CONCURRENCY_LIMITED)
     );
     assert_eq!(
         response
             .headers()
             .get(LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
             .and_then(|value| value.to_str().ok()),
-        None
+        Some("auth_api_key_concurrency_limit_reached")
     );
     let payload: serde_json::Value = response.json().await.expect("body should parse");
-    assert_eq!(payload["model"], "gpt-5-upstream");
+    assert_eq!(
+        payload["error"]["message"],
+        serde_json::Value::String("当前调用方 API Key 并发请求数已达上限，请稍后重试".to_string())
+    );
 
     let stored_candidates = request_candidate_repository
         .list_by_request_id("trace-openai-cli-local-timeout-123")
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
-    assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Success);
-    assert_eq!(stored_candidates[0].skip_reason.as_deref(), None);
+    assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Skipped);
+    assert_eq!(
+        stored_candidates[0].skip_reason.as_deref(),
+        Some("auth_api_key_concurrency_limit_reached")
+    );
     assert_eq!(
         *execution_runtime_hits.lock().expect("mutex should lock"),
-        2
+        1
     );
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
     let first_response = first_request.await.expect("inflight request should join");
