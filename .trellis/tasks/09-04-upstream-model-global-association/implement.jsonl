@@ -1,0 +1,4 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/tasks/09-04-upstream-model-global-association/research/association-flow.md", "reason": "当前关联链路、可复用 API 与最小写集"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "保证上游模型、Global Model 与 Endpoint 字段完整流转"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "复用现有模型创建接口与组件模式"}
