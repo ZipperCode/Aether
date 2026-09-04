@@ -36,7 +36,8 @@
 - 两个 tarball 均可读取，各含 247 个条目，网关二进制、前端、安装/更新脚本、Compose、环境示例、README 和 LICENSE 均存在。
 - 未创建或发布任何 `tunnel-v*` Tag。
 
-## 待收口
+## 收口
 
-- 归档任务、记录 journal，并推送 bookkeeping 提交。
+- 任务已归档到 `archive/2026-09/09-04-release-v0-7-28`，journal Session 14 已记录。
+- Bookkeeping 已推送，并复核 `master` 与 `origin/master` 一致、工作区干净；Tag 仍指向认证候选 SHA。
 - 本次资产验收目录位于系统临时目录；递归和逐文件清理均被当前执行策略拒绝，未执行删除。

@@ -32,7 +32,7 @@
 - [x] AC4：精确 Tag/SHA 的 `Release Aether` 成功。
 - [x] AC5：GitHub Release 存在；`aether-v0.7.28-linux-amd64.tar.gz`、`aether-v0.7.28-linux-arm64.tar.gz`、`install.sh`、`SHA256SUMS` 均存在且非空。
 - [x] AC6：两个 tarball 的 GitHub digest 与 `SHA256SUMS` 声明一致。
-- [ ] AC7：发布任务归档、journal 完成，最终 `master` 与 `origin/master` 一致且工作区干净。
+- [x] AC7：发布任务归档、journal 完成，最终 `master` 与 `origin/master` 一致且工作区干净。
 
 ## Out of Scope
 
