@@ -1,0 +1,28 @@
+{
+  "id": "scheduler-clock-seed",
+  "name": "scheduler-clock-seed",
+  "title": "修复调度时间与排序种子混用",
+  "description": "",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": "apps/aether-gateway/src/ai_serving/planner; apps/aether-gateway/src/scheduler/candidate; task/spec artifacts; remote app-only deployment",
+  "package": "aether-gateway",
+  "priority": "P0",
+  "creator": "zipper",
+  "assignee": "zipper",
+  "createdAt": "2026-09-04",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "deployment_target": "192.168.2.212:8084"
+  }
+}

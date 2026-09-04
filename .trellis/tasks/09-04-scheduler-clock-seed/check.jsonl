@@ -1,0 +1,5 @@
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"Verify gateway package boundaries and required contracts."}
+{"file":".trellis/spec/aether-scheduler-core/backend/index.md","reason":"Verify runtime time semantics and scheduler-core ownership."}
+{"file":".trellis/spec/aether-routing-core/backend/routing-ordering-sticky-retry-contract.md","reason":"Ensure sticky_key_attempts remains the sole retry authority."}
+{"file":".trellis/spec/aether-provider-pool/backend/key-admission-affinity-model-quota-contract.md","reason":"Ensure admission, affinity, and model quota behavior is preserved."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Check time and seed data flow across every layer and caller."}

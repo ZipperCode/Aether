@@ -1,0 +1,6 @@
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"Gateway backend package index and current cross-package contracts."}
+{"file":".trellis/spec/aether-scheduler-core/backend/index.md","reason":"Scheduler-core ownership and runtime selectability contracts."}
+{"file":".trellis/spec/aether-routing-core/backend/routing-ordering-sticky-retry-contract.md","reason":"Confirmed routing ordering, seed-sensitive ranking, and sticky retry authority."}
+{"file":".trellis/spec/aether-provider-pool/backend/key-admission-affinity-model-quota-contract.md","reason":"Existing Key admission, cache affinity, and model quota boundaries to preserve."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Time and ranking context crosses planner, gateway scheduler, and scheduler-core boundaries."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse existing clock and ranking primitives without a second implementation."}
