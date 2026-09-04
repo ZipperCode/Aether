@@ -361,3 +361,28 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 15: 修复调度时间种子并发布 v0.7.29
+
+**Date**: 2026-09-04
+**Task**: 修复调度时间种子并发布 v0.7.29
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+分离候选调度真实时间与负载均衡种子，校正并发超时测试契约；GitHub CI 和 Release 成功，NAS 清理 5.294GB 构建缓存后仅拉取并部署 GHCR v0.7.29。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ca29b728a` | (see git log) |
+| `20faefe13` | (see git log) |
+| `3475f21b9` | (see git log) |
+| `9e3d61234` | (see git log) |
+
+### Status
+
+[OK] **Completed**
