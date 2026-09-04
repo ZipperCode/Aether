@@ -386,3 +386,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 16: 补充调度标量跨层防复发规则
+
+**Date**: 2026-09-04
+**Task**: 补充调度标量跨层防复发规则
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+将时间、ID、计数器与排序种子等同类型标量的具名字段、单位核对和差异化测试要求写入跨层思考指南；项目无规范模板目录可同步。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `80ea7c094` | (see git log) |
+
+### Status
+
+[OK] **Completed**
