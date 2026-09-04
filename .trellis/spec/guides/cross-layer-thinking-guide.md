@@ -100,6 +100,18 @@ create one owner for:
 
 Rendering code may format fields, but it must not redefine the payload contract.
 
+### Mistake 5: Semantically Different Scalars Share One Parameter
+
+**Bad**: Passing a random or distribution seed through a positional integer
+parameter that downstream code interprets as Unix time.
+
+**Good**: Use a named context with separate fields for each semantic unit, and
+refresh only the field whose value is allowed to change during retries or paging.
+
+**Rule**: When the same primitive type crosses layers, verify units and meaning
+at every caller. Tests must use deliberately different values for time, IDs,
+counters, and seeds so accidental interchange cannot still pass.
+
 ---
 
 ## Checklist for Cross-Layer Features
@@ -120,6 +132,8 @@ After implementation:
       casting payload fields locally
 - [ ] Checked that derived state points back to the source event identifier
       (`seq`, `id`, `version`) instead of inventing a second cursor
+- [ ] Checked that same-typed scalar fields keep distinct names, units, and
+      deliberately different test values across every layer
 
 ---
 
