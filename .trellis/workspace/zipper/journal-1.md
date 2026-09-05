@@ -432,3 +432,29 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 18: 同步上游选定功能并完成真实 Compose 验证
+
+**Date**: 2026-09-05
+**Task**: 同步上游选定功能并完成真实 Compose 验证
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+按依赖语义同步上游编号 1、3、4、5，保留本地 Endpoint 与 Responses 契约；完成目标测试、workspace check、真实 Docker Compose 构建、健康检查、管理员登录和前端资源验证。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `74e3c665a` | (see git log) |
+| `a4db10370` | (see git log) |
+| `fc620ecbb` | (see git log) |
+| `42fb99ea6` | (see git log) |
+| `12975e34b` | (see git log) |
+
+### Status
+
+[OK] **Completed**
