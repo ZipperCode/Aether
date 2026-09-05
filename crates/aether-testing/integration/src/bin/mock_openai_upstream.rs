@@ -37,6 +37,8 @@ const MAX_MOCK_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const BASIS_POINTS: u16 = 10_000;
 const DEFAULT_TIMEOUT_HOLD_MS: u64 = 60_000;
 const REQUEST_SEQUENCE_HEADER: &str = "x-mock-request-sequence";
+/// 为 h2c 留出确定性的 DATA flush 窗口，再用 RST_STREAM 模拟截断。
+const TRUNCATED_STREAM_FLUSH_DELAY: Duration = Duration::from_millis(10);
 
 const RANDOM_DOMAIN_FAULT: u64 = 0x5c32_22f7_27d4_7a6f;
 const RANDOM_DOMAIN_FIRST_BYTE: u64 = 0x087d_89d9_3bc3_15db;
@@ -604,6 +606,7 @@ async fn responses(State(app): State<App>, request: axum::extract::Request) -> R
     with_sequence(axum::Json(payload).into_response(), profile)
 }
 
+/// 构造 Chat SSE；截断故障会先稳定写出成功 DATA 帧，再返回 body error。
 fn build_chat_sse_response(
     app: App,
     profile: RequestProfile,
@@ -646,8 +649,7 @@ fn build_chat_sse_response(
             if profile.truncate_after_chunks == Some(0)
                 || profile.truncate_after_chunks == Some(index + 1)
             {
-                // Force Hyper to flush the successful frame before observing the body error.
-                tokio::task::yield_now().await;
+                tokio::time::sleep(TRUNCATED_STREAM_FLUSH_DELAY).await;
                 record_fault(&app, Fault::TruncateStream);
                 yield Err::<Bytes, std::io::Error>(truncated_stream_error());
                 return;
@@ -664,6 +666,7 @@ fn build_chat_sse_response(
     with_sequence(sse_response(Body::from_stream(stream)), profile)
 }
 
+/// 构造 Responses SSE；截断故障保持响应头与首个 DATA 帧先于 HTTP/2 reset。
 fn build_responses_sse_response(
     app: App,
     profile: RequestProfile,
@@ -701,8 +704,7 @@ fn build_responses_sse_response(
             if profile.truncate_after_chunks == Some(0)
                 || profile.truncate_after_chunks == Some(index + 1)
             {
-                // Force Hyper to flush the successful frame before observing the body error.
-                tokio::task::yield_now().await;
+                tokio::time::sleep(TRUNCATED_STREAM_FLUSH_DELAY).await;
                 record_fault(&app, Fault::TruncateStream);
                 yield Err::<Bytes, std::io::Error>(truncated_stream_error());
                 return;

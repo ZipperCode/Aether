@@ -112,12 +112,10 @@ pub fn openai_responses_synthetic_reasoning_item_id(
     )
 }
 
-/// Removes reasoning history items that cannot be replayed against an OpenAI Responses backend.
+/// 删除不能回放到 OpenAI Responses 上游的 reasoning 历史项。
 ///
-/// Reasoning IDs are opaque provider references and must never be repaired by changing their
-/// prefix. Foreign IDs (for example `item_...`) are therefore removed. Aether-synthesized
-/// reasoning summaries are also removed unless they carry encrypted reasoning state that can be
-/// replayed statelessly.
+/// Provider reasoning ID 是不透明引用，不能通过改前缀伪造；Aether 借 `encrypted_content`
+/// 携带的 Gemini 签名也不是真实 OpenAI 密文，必须一并删除。
 pub fn strip_incompatible_openai_responses_reasoning_items(
     body: &mut Value,
     provider_api_format: &str,
@@ -129,6 +127,7 @@ pub fn strip_incompatible_openai_responses_reasoning_items(
     )
 }
 
+/// 按指定 Provider 回放策略过滤 reasoning；非 Responses 目标保持原请求不变。
 pub fn strip_incompatible_openai_responses_reasoning_items_with_policy(
     body: &mut Value,
     provider_api_format: &str,
@@ -159,6 +158,7 @@ pub fn strip_incompatible_openai_responses_reasoning_items_with_policy(
     original_len.saturating_sub(items.len())
 }
 
+/// 判断单个 reasoning item 是否属于目标 Responses Provider 可接受的回放状态。
 fn openai_responses_reasoning_item_is_replayable(
     item: &Value,
     policy: OpenAiResponsesReasoningReplayPolicy,
@@ -168,6 +168,13 @@ fn openai_responses_reasoning_item_is_replayable(
     };
     if object.get("type").and_then(Value::as_str) != Some("reasoning") {
         return true;
+    }
+    if object
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.starts_with(GEMINI_TOOL_SIGNATURE_CARRIER_PREFIX))
+    {
+        return false;
     }
     if policy == OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque
         && deepseek_opaque_reasoning_item_is_replayable(object)
@@ -444,6 +451,44 @@ mod tests {
         assert_eq!(input[0]["id"], "rs_provider_123");
         assert_eq!(input[1]["encrypted_content"], "opaque");
         assert_eq!(input[2]["id"], "item_message_123");
+    }
+
+    /// 验证只删除 Aether Gemini 签名 carrier，并保留真实 Provider 密文和合法 rs 引用。
+    #[test]
+    fn strips_gemini_signature_carriers_before_openai_replay() {
+        let gemini_item_id = openai_responses_synthetic_reasoning_item_id("resp_gemini", 0);
+        let openai_item_id = openai_responses_synthetic_reasoning_item_id("resp_openai", 0);
+        let carrier = encode_gemini_tool_signature_carrier_with_direction(
+            "opaque-gemini-thought-signature",
+            GeminiToolSignatureCarrierDirection::Next,
+        )
+        .expect("Gemini signature carrier");
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": gemini_item_id,
+                    "summary": [],
+                    "encrypted_content": carrier
+                },
+                {
+                    "type": "reasoning",
+                    "id": openai_item_id,
+                    "summary": [],
+                    "encrypted_content": "provider-encrypted-state"
+                },
+                {"type": "reasoning", "id": "rs_provider_123", "summary": []}
+            ]
+        });
+
+        assert_eq!(
+            strip_incompatible_openai_responses_reasoning_items(&mut body, "openai:responses"),
+            1
+        );
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["encrypted_content"], "provider-encrypted-state");
+        assert_eq!(input[1]["id"], "rs_provider_123");
     }
 
     #[test]

@@ -72,6 +72,19 @@ struct RuntimeRequestCaptureSeed {
     provider_request: Option<Value>,
     provider_request_body_ref: Option<String>,
     body_states: UsageBodyStatesSeed,
+    /// 原始请求是否存在内联正文；Describe 模式不保留值但仍据此生成 capture 状态。
+    request_has_inline_body: bool,
+    /// Provider 请求是否存在内联正文；用于在不复制正文时保持 metadata 与类型推断一致。
+    provider_request_has_inline_body: bool,
+}
+
+/// 指定 usage seed 保留请求正文，还是只保留正文的状态、引用与派生事实。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestBodyCapture {
+    /// 普通即时写入保留实际正文。
+    Keep,
+    /// 长生命周期 Guard 只描述正文，避免每个在途请求复制数 MB 数据。
+    Describe,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -799,12 +812,14 @@ fn build_terminal_usage_event_from_seed_impl(
     Ok(UsageEvent::new(event_type, request_id, data))
 }
 
+/// 构建终态 usage 上下文；该即时消费路径保留请求正文供既有终态生成器使用。
 pub fn build_terminal_usage_context_seed(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
 ) -> TerminalUsageContextSeed {
     let context = report_context.and_then(Value::as_object);
-    let request_capture = build_runtime_request_capture_seed(plan, context);
+    let request_capture =
+        build_runtime_request_capture_seed(plan, context, RequestBodyCapture::Keep);
     let client_contract = context_string(context, "client_contract")
         .or_else(|| context_string(context, "client_api_format"))
         .or_else(|| non_empty_str(Some(plan.client_api_format.as_str())))
@@ -1687,20 +1702,31 @@ fn build_lifecycle_usage_record_impl(
     })
 }
 
+/// 构建包含请求正文的完整 usage 数据种子，供不跨请求生命周期持有的写入路径使用。
 pub fn build_usage_event_data_seed(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
 ) -> UsageEventData {
-    build_usage_event_data_seed_with_detail(plan, report_context)
+    build_usage_event_data_seed_with_detail(plan, report_context, RequestBodyCapture::Keep)
 }
 
-fn build_usage_event_data_seed_with_detail(
+/// 构建不复制请求正文的 usage 数据种子，同时保留 capture 状态、引用和派生 metadata。
+pub fn build_usage_event_data_seed_describing_request_bodies(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
 ) -> UsageEventData {
+    build_usage_event_data_seed_with_detail(plan, report_context, RequestBodyCapture::Describe)
+}
+
+/// 根据正文保留策略构造统一 usage seed，确保 Keep 与 Describe 仅在实际正文值上不同。
+fn build_usage_event_data_seed_with_detail(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    capture: RequestBodyCapture,
+) -> UsageEventData {
     let context = report_context.and_then(Value::as_object);
     let routing = build_runtime_routing_seed(plan, context);
-    let request_capture = build_runtime_request_capture_seed(plan, context);
+    let request_capture = build_runtime_request_capture_seed(plan, context, capture);
     let api_format = context_string(context, "client_api_format")
         .or_else(|| non_empty_str(Some(plan.client_api_format.as_str())));
     let endpoint_api_format = context_string(context, "provider_api_format")
@@ -1714,7 +1740,10 @@ fn build_usage_event_data_seed_with_detail(
     let request_type = Some(infer_request_type_from_contracts(
         api_format.as_deref(),
         endpoint_api_format.as_deref(),
-        request_capture.provider_request.as_ref(),
+        request_capture
+            .provider_request
+            .as_ref()
+            .or_else(|| provider_request_body_ref_for_inference(plan, context)),
     ));
     let api_family = api_format
         .as_deref()
@@ -1737,9 +1766,9 @@ fn build_usage_event_data_seed_with_detail(
         build_runtime_request_metadata_seed_from_parts(
             plan,
             context,
-            request_capture.request_body.is_some(),
+            request_capture.request_has_inline_body,
             request_capture.request_body_ref.as_deref(),
-            request_capture.provider_request.is_some(),
+            request_capture.provider_request_has_inline_body,
             request_capture.provider_request_body_ref.as_deref(),
             plan.body.body_bytes_b64.as_deref(),
         ),
@@ -1996,20 +2025,31 @@ fn plan_has_inline_json_body_for_usage(plan: &ExecutionPlan) -> bool {
         && plan.body.json_body.is_some()
 }
 
+/// 从真实计划生成正文 capture 描述；Describe 模式省略值但不改变任何状态或派生事实。
 fn build_runtime_request_capture_seed(
     plan: &ExecutionPlan,
     context: Option<&Map<String, Value>>,
+    capture: RequestBodyCapture,
 ) -> RuntimeRequestCaptureSeed {
-    let request_body = context_body_value(context, "original_request_body");
+    let request_has_inline_body = context_has_inline_body(context, "original_request_body");
+    let provider_request_has_inline_body =
+        context_has_inline_body(context, "provider_request_body")
+            || plan_has_inline_json_body_for_usage(plan);
+    let (request_body, provider_request) = match capture {
+        RequestBodyCapture::Keep => (
+            context_body_value(context, "original_request_body"),
+            context_body_value(context, "provider_request_body")
+                .or_else(|| plan_json_body_capture_for_usage(plan)),
+        ),
+        RequestBodyCapture::Describe => (None, None),
+    };
     let request_body_ref = context_string(context, "request_body_ref");
-    let provider_request = context_body_value(context, "provider_request_body")
-        .or_else(|| plan_json_body_capture_for_usage(plan));
     let provider_request_body_ref = context_string(context, "provider_request_body_ref")
         .or_else(|| non_empty_str(plan.body.body_ref.as_deref()));
     let body_states = build_runtime_body_states_seed_from_parts(
-        request_body.is_some(),
+        request_has_inline_body,
         request_body_ref.as_deref(),
-        provider_request.is_some(),
+        provider_request_has_inline_body,
         provider_request_body_ref.as_deref(),
         plan.body.body_bytes_b64.is_some(),
     );
@@ -2020,7 +2060,23 @@ fn build_runtime_request_capture_seed(
         provider_request,
         provider_request_body_ref,
         body_states,
+        request_has_inline_body,
+        provider_request_has_inline_body,
     }
+}
+
+/// 借用用于 request-type 推断的 Provider 正文，不为 Describe seed 额外克隆 JSON。
+fn provider_request_body_ref_for_inference<'a>(
+    plan: &'a ExecutionPlan,
+    context: Option<&'a Map<String, Value>>,
+) -> Option<&'a Value> {
+    context_value_ref(context, "provider_request_body")
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            plan_has_inline_json_body_for_usage(plan)
+                .then_some(plan.body.json_body.as_ref())
+                .flatten()
+        })
 }
 
 fn build_runtime_request_metadata_seed(
@@ -3502,7 +3558,8 @@ mod tests {
         build_streaming_usage_event_from_owned_seed, build_streaming_usage_record,
         build_sync_terminal_usage_event, build_sync_terminal_usage_payload_seed,
         build_sync_terminal_usage_seed, build_terminal_usage_context_seed,
-        build_terminal_usage_event_from_seed, build_usage_event_data_seed, decode_body_for_storage,
+        build_terminal_usage_event_from_seed, build_usage_event_data_seed,
+        build_usage_event_data_seed_describing_request_bodies, decode_body_for_storage,
         extract_token_counts_from_json, extract_token_counts_from_value, headers_to_json,
         mask_header_value, mask_sensitive_body_fields, mask_sensitive_headers_in_json_value,
         parse_sse_body_for_storage, resolve_error_message, trim_owned_non_empty_string,
@@ -6892,6 +6949,111 @@ mod tests {
             .expect("runtime body size metadata should remain");
         assert!(body_size.get("client_request_body").is_some());
         assert!(body_size.get("provider_request_body").is_some());
+    }
+
+    /// 验证 Describe seed 仅省略两个大正文值，其 capture 状态、引用与派生 metadata 全部一致。
+    #[test]
+    fn describing_request_bodies_matches_the_capturing_seed_apart_from_the_bodies() {
+        let plan = ExecutionPlan {
+            request_id: "req-seed-describe-1".to_string(),
+            candidate_id: Some("cand-seed-describe-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/chat/completions".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5",
+                "service_tier": "priority",
+                "reasoning": {"effort": "high"}
+            })),
+            stream: false,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:chat".to_string(),
+            model_name: Some("gpt-5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let report_context = json!({
+            "client_api_format": "openai:chat",
+            "provider_api_format": "openai:chat",
+            "original_request_body": {"model": "gpt-5", "messages": []},
+            "original_headers": {"accept": "application/json"}
+        });
+
+        let captured = build_usage_event_data_seed(&plan, Some(&report_context));
+        let described =
+            build_usage_event_data_seed_describing_request_bodies(&plan, Some(&report_context));
+
+        assert!(captured.request_body.is_some());
+        assert!(captured.provider_request_body.is_some());
+        assert_eq!(described.request_body, None);
+        assert_eq!(described.provider_request_body, None);
+        assert_eq!(
+            described.request_body_state,
+            Some(UsageBodyCaptureState::Inline)
+        );
+        assert_eq!(
+            described.provider_request_body_state,
+            Some(UsageBodyCaptureState::Inline)
+        );
+        assert_eq!(described.request_body_state, captured.request_body_state);
+        assert_eq!(
+            described.provider_request_body_state,
+            captured.provider_request_body_state
+        );
+        assert_eq!(described.request_body_ref, captured.request_body_ref);
+        assert_eq!(
+            described.provider_request_body_ref,
+            captured.provider_request_body_ref
+        );
+        assert_eq!(described.request_type, captured.request_type);
+        assert_eq!(described.request_metadata, captured.request_metadata);
+        assert_eq!(
+            described.provider_request_headers,
+            captured.provider_request_headers
+        );
+        assert_eq!(described.request_headers, captured.request_headers);
+    }
+
+    /// 验证 raw body 在 Describe 模式仍标记为 unavailable，而不是误写成 none 清除旧 capture。
+    #[test]
+    fn describing_request_bodies_keeps_the_unavailable_marker_for_raw_bodies() {
+        let mut plan = ExecutionPlan {
+            request_id: "req-seed-describe-2".to_string(),
+            candidate_id: None,
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/chat/completions".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "gpt-5"})),
+            stream: false,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:chat".to_string(),
+            model_name: Some("gpt-5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        plan.body.json_body = None;
+        plan.body.body_bytes_b64 = Some("eyJtb2RlbCI6ICJncHQtNSJ9".to_string());
+
+        let described = build_usage_event_data_seed_describing_request_bodies(&plan, None);
+
+        assert_eq!(
+            described.provider_request_body_state,
+            Some(UsageBodyCaptureState::Unavailable)
+        );
     }
 
     #[test]

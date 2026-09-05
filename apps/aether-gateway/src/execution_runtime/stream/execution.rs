@@ -2738,10 +2738,14 @@ async fn record_stream_pending_lifecycle(
     );
 }
 
+/// 在响应交给客户端前唯一拥有候选与 usage 终态的 Guard；Drop 时把中断记为 499。
 struct StreamAttemptTerminalGuard {
     state: AppState,
-    plan: ExecutionPlan,
-    report_context: Option<Value>,
+    request_id: String,
+    candidate_id: Option<String>,
+    candidate: Option<LocalRequestCandidateStatusSnapshot>,
+    /// 只描述请求正文的紧凑 seed，避免每个在途请求长期复制完整 JSON。
+    usage_seed: Option<Box<UsageEventData>>,
     request_diagnostics: Option<Arc<RequestDiagnostics>>,
     candidate_started_unix_ms: u64,
     candidate_started_at: Instant,
@@ -2750,17 +2754,28 @@ struct StreamAttemptTerminalGuard {
 }
 
 impl StreamAttemptTerminalGuard {
+    /// 在 Pending 已落库后建立终态所有权，并只保存结算所需的紧凑快照。
     fn new(
         state: &AppState,
         plan: &ExecutionPlan,
-        report_context: Option<Value>,
+        report_context: Option<&Value>,
+        candidate: Option<&LocalRequestCandidateStatusSnapshot>,
         candidate_started_unix_ms: u64,
         candidate_started_at: Instant,
     ) -> Self {
         Self {
             state: state.clone(),
-            plan: plan.clone(),
-            report_context,
+            request_id: plan.request_id.clone(),
+            candidate_id: plan.candidate_id.clone(),
+            candidate: candidate.cloned(),
+            usage_seed: state.usage_runtime.is_enabled().then(|| {
+                Box::new(
+                    aether_usage_runtime::build_usage_event_data_seed_describing_request_bodies(
+                        plan,
+                        report_context,
+                    ),
+                )
+            }),
             request_diagnostics: current_request_diagnostics(),
             candidate_started_unix_ms,
             candidate_started_at,
@@ -2769,10 +2784,12 @@ impl StreamAttemptTerminalGuard {
         }
     }
 
+    /// 已有终态路径接管后解除 Drop 结算，防止重复写入不可回退的候选终态。
     fn disarm(&mut self) {
         self.armed = false;
     }
 
+    /// 把尚未移交给响应体的执行错误按真实状态落库，并原子解除 Guard 所有权。
     async fn fail_and_disarm(&mut self, error: &GatewayError) {
         if !self.armed {
             return;
@@ -2796,8 +2813,10 @@ impl StreamAttemptTerminalGuard {
         };
         record_stream_attempt_forced_terminal_state(
             self.state.clone(),
-            self.plan.clone(),
-            self.report_context.clone(),
+            self.request_id.clone(),
+            self.candidate_id.clone(),
+            self.candidate.clone(),
+            self.usage_seed.clone(),
             self.request_diagnostics.clone(),
             self.candidate_started_unix_ms,
             self.candidate_started_at,
@@ -2825,8 +2844,10 @@ impl Drop for StreamAttemptTerminalGuard {
             return;
         }
         let state = self.state.clone();
-        let plan = self.plan.clone();
-        let report_context = self.report_context.clone();
+        let request_id = self.request_id.clone();
+        let candidate_id = self.candidate_id.clone();
+        let candidate = self.candidate.clone();
+        let usage_seed = self.usage_seed.clone();
         let request_diagnostics = self.request_diagnostics.clone();
         let candidate_started_unix_ms = self.candidate_started_unix_ms;
         let candidate_started_at = self.candidate_started_at;
@@ -2834,8 +2855,10 @@ impl Drop for StreamAttemptTerminalGuard {
             handle.spawn(async move {
                 record_stream_attempt_forced_terminal_state(
                     state,
-                    plan,
-                    report_context,
+                    request_id,
+                    candidate_id,
+                    candidate,
+                    usage_seed,
                     request_diagnostics,
                     candidate_started_unix_ms,
                     candidate_started_at,
@@ -2851,8 +2874,8 @@ impl Drop for StreamAttemptTerminalGuard {
             warn!(
                 event_name = "local_stream_attempt_terminal_guard_no_runtime",
                 log_type = "ops",
-                request_id = %short_request_id(self.plan.request_id.as_str()),
-                candidate_id = ?self.plan.candidate_id,
+                request_id = %short_request_id(self.request_id.as_str()),
+                candidate_id = ?self.candidate_id,
                 "gateway could not finalize dropped local stream attempt because no Tokio runtime is available"
             );
         }
@@ -2860,10 +2883,13 @@ impl Drop for StreamAttemptTerminalGuard {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 使用候选身份快照与 bodyless usage seed 写入强制终态，不重新持有或推断完整请求计划。
 async fn record_stream_attempt_forced_terminal_state(
     state: AppState,
-    plan: ExecutionPlan,
-    report_context: Option<Value>,
+    request_id: String,
+    candidate_id: Option<String>,
+    candidate: Option<LocalRequestCandidateStatusSnapshot>,
+    usage_seed: Option<Box<UsageEventData>>,
     request_diagnostics: Option<Arc<RequestDiagnostics>>,
     candidate_started_unix_ms: u64,
     candidate_started_at: Instant,
@@ -2874,31 +2900,32 @@ async fn record_stream_attempt_forced_terminal_state(
     error_message: impl Into<String>,
 ) {
     let error_message = error_message.into();
-    let report_context =
-        attach_request_diagnostics_to_report_context(report_context, request_diagnostics.as_ref());
     let latency_ms = stream_elapsed_ms_since(candidate_started_at);
-    record_local_request_candidate_status(
-        &state,
-        &plan,
-        report_context.as_ref(),
-        SchedulerRequestCandidateStatusUpdate {
-            status: candidate_status,
-            status_code: Some(status_code),
-            error_type: Some(error_type.to_string()),
-            error_message: Some(error_message.clone()),
-            latency_ms: Some(latency_ms),
-            started_at_unix_ms: Some(candidate_started_unix_ms),
-            finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
-        },
-    )
-    .await;
-
-    if !state.usage_runtime.is_enabled() {
-        return;
+    if let Some(candidate) = candidate.as_ref() {
+        record_local_request_candidate_status_snapshot(
+            &state,
+            candidate,
+            SchedulerRequestCandidateStatusUpdate {
+                status: candidate_status,
+                status_code: Some(status_code),
+                error_type: Some(error_type.to_string()),
+                error_message: Some(error_message.clone()),
+                latency_ms: Some(latency_ms),
+                started_at_unix_ms: Some(candidate_started_unix_ms),
+                finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+            },
+        )
+        .await;
     }
 
-    let mut usage_data =
-        aether_usage_runtime::build_usage_event_data_seed(&plan, report_context.as_ref());
+    let Some(usage_data) = usage_seed else {
+        return;
+    };
+    let mut usage_data = *usage_data;
+    usage_data.request_metadata = attach_request_diagnostics_to_report_context(
+        usage_data.request_metadata.take(),
+        request_diagnostics.as_ref(),
+    );
     usage_data.status_code = Some(status_code);
     usage_data.error_message = Some(error_message.clone());
     usage_data.error_category = Some(
@@ -2926,7 +2953,7 @@ async fn record_stream_attempt_forced_terminal_state(
 
     let usage_runtime = Arc::clone(&state.usage_runtime);
     let usage_data_state = Arc::clone(state.usage_lifecycle_data_state());
-    let event = UsageEvent::new(usage_event_type, plan.request_id.clone(), usage_data);
+    let event = UsageEvent::new(usage_event_type, request_id.clone(), usage_data);
     let terminal_write = tokio::spawn(async move {
         usage_runtime
             .record_terminal_event_direct(usage_data_state.as_ref(), event)
@@ -2936,8 +2963,8 @@ async fn record_stream_attempt_forced_terminal_state(
         warn!(
             event_name = "local_stream_attempt_terminal_write_join_failed",
             log_type = "ops",
-            request_id = %short_request_id(plan.request_id.as_str()),
-            candidate_id = ?plan.candidate_id,
+            request_id = %short_request_id(request_id.as_str()),
+            candidate_id = ?candidate_id,
             error = %err,
             "gateway failed to join the isolated stream terminal usage write"
         );
@@ -4039,7 +4066,8 @@ async fn execute_execution_runtime_stream_inner(
     let mut terminal_guard = StreamAttemptTerminalGuard::new(
         state,
         &plan,
-        report_context.clone(),
+        report_context.as_ref(),
+        request_candidate_status_snapshot.as_ref(),
         candidate_started_unix_secs,
         stream_started_at,
     );
@@ -9204,6 +9232,7 @@ mod tests {
         }
     }
 
+    /// 验证唯一终态 Guard 对 admission timeout 只结算一次，并保持 429/void 语义。
     #[tokio::test]
     async fn stream_attempt_guard_records_admission_timeout_once_as_429() {
         let request_id = "req-stream-admission-timeout";
@@ -9225,10 +9254,14 @@ mod tests {
             request_id,
             "https://provider.example/v1/responses".to_string(),
         );
+        let report_context = json!({"candidate_index": 0, "retry_index": 0});
+        let candidate =
+            super::snapshot_local_request_candidate_status(&plan, Some(&report_context));
         let mut guard = StreamAttemptTerminalGuard::new(
             &state,
             &plan,
-            Some(json!({"candidate_index": 0, "retry_index": 0})),
+            Some(&report_context),
+            candidate.as_ref(),
             100,
             Instant::now(),
         );
@@ -11646,9 +11679,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// 验证畸形 Gemini 函数调用在提交前触发候选级重试，而不是向客户端返回伪成功。
+    /// 验证非空 thought 已提交后，畸形 Gemini 工具终态在同一流内失败且不切换 Candidate。
     #[tokio::test]
-    async fn malformed_antigravity_function_call_retries_before_stream_commit() {
+    async fn malformed_antigravity_function_call_streams_thought_then_fails_in_band() {
         let request_id = "req-antigravity-malformed-function-call";
         let plan = antigravity_gemini_stream_plan(request_id);
         let provider_catalog = provider_catalog_for_plan(
@@ -11727,10 +11760,35 @@ mod tests {
             None,
         )
         .await
-        .expect("malformed Antigravity stream should resolve through failover");
+        .expect("malformed Antigravity stream should return a client stream")
+        .expect("the first reasoning delta should commit the selected candidate");
 
-        assert!(response.is_none());
-        assert_eq!(retry_scope, AiAttemptRetryScope::Candidate);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let body = String::from_utf8(body.to_vec()).expect("response body should be utf8");
+        assert!(
+            body.contains("event: response.reasoning_summary_text.delta\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"delta\":\"Validating the document.\""),
+            "{body}"
+        );
+        assert!(body.contains("event: response.failed\n"), "{body}");
+        assert!(
+            body.contains("\"code\":\"MALFORMED_FUNCTION_CALL\""),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "\"message\":\"Malformed function call: Function call is empty - no input to parse.\""
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("unsupported_finish_reason"), "{body}");
+        assert_eq!(retry_scope, AiAttemptRetryScope::Provider);
     }
 
     fn tunnel_proxy_snapshot(base_url: String) -> aether_contracts::ProxySnapshot {
