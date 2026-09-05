@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 16
-- **Last Active**: 2026-09-04
+- **Total Sessions**: 17
+- **Last Active**: 2026-09-05
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~410 | Active |
+| `journal-1.md` | ~434 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 17 | 2026-09-05 | 修复关联模型 Endpoint 推断复发 | `c465e50a9`, `f2b37a8bd`, `1b6bc7d3c` | `master` |
 | 16 | 2026-09-04 | 补充调度标量跨层防复发规则 | `80ea7c094` | `master` |
 | 15 | 2026-09-04 | 修复调度时间种子并发布 v0.7.29 | `ca29b728a`, `20faefe13`, `3475f21b9`, `9e3d61234` | `master` |
 | 14 | 2026-09-04 | 审查并发布 v0.7.28 | `83c3058b76fc785d91526b4474a1d040bda48de1`, `e89bf81a1601f9222ab5d1b5441390aab0aee3fa`, `47deb22b122214fda1fea7ef7c87ab260ce1d0bb` | `master` |

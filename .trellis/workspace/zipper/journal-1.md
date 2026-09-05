@@ -408,3 +408,27 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 17: 修复关联模型 Endpoint 推断复发
+
+**Date**: 2026-09-05
+**Task**: 修复关联模型 Endpoint 推断复发
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+默认关联路径自动加载聚合上游模型并透传 Endpoint 证据，补齐竞态守卫、目标测试、跨层规范及真实 Docker Compose 验证。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c465e50a9` | (see git log) |
+| `f2b37a8bd` | (see git log) |
+| `1b6bc7d3c` | (see git log) |
+
+### Status
+
+[OK] **Completed**
