@@ -1,0 +1,6 @@
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"Review package ownership and linked contracts"}
+{"file":".trellis/spec/aether-gateway/backend/quality-guidelines.md","reason":"Review bounded memory and validation coverage"}
+{"file":".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md","reason":"Verify account self-check behavior is preserved"}
+{"file":".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md","reason":"Verify background strong-read and quota block semantics"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Check all repository adapters and gateway wrappers stay aligned"}
+{"file":".trellis/tasks/09-05-bound-oauth-candidate-memory/research/remote-and-source-evidence.md","reason":"Validate implementation against observed failure and avoid disproven body claim"}

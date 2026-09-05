@@ -1,0 +1,8 @@
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"Gateway package conventions and linked runtime contracts"}
+{"file":".trellis/spec/aether-gateway/backend/quality-guidelines.md","reason":"Gateway bounded buffering and validation expectations"}
+{"file":".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md","reason":"Account self-check cadence, concurrency, and cache semantics"}
+{"file":".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md","reason":"Background probe and strong-read scheduling invariants"}
+{"file":".trellis/spec/aether-data-contracts/backend/index.md","reason":"Provider catalog contract package boundary"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse existing paging, limiter, and configuration patterns"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Keep repository projection and gateway consumers aligned"}
+{"file":".trellis/tasks/09-05-bound-oauth-candidate-memory/research/remote-and-source-evidence.md","reason":"Remote memory timeline, deployed identity, source causality, and candidate correction"}
