@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 18
+- **Total Sessions**: 19
 - **Last Active**: 2026-09-05
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~460 | Active |
+| `journal-1.md` | ~483 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 19 | 2026-09-05 | 限制认证维护与候选内存放大 | `72f3e1dfa`, `857542bf2` | `master` |
 | 18 | 2026-09-05 | 同步上游选定功能并完成真实 Compose 验证 | `74e3c665a`, `a4db10370`, `fc620ecbb`, `42fb99ea6`, `12975e34b` | `master` |
 | 17 | 2026-09-05 | 修复关联模型 Endpoint 推断复发 | `c465e50a9`, `f2b37a8bd`, `1b6bc7d3c` | `master` |
 | 16 | 2026-09-04 | 补充调度标量跨层防复发规则 | `80ea7c094` | `master` |

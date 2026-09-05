@@ -458,3 +458,26 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 19: 限制认证维护与候选内存放大
+
+**Date**: 2026-09-05
+**Task**: 限制认证维护与候选内存放大
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+实现共享认证维护并发闸门、轻量候选投影和惰性请求体物化；通过定向 Rust 检查与当前源码 Docker Compose 构建，远端尚未部署。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `72f3e1dfa` | (see git log) |
+| `857542bf2` | (see git log) |
+
+### Status
+
+[OK] **Completed**
