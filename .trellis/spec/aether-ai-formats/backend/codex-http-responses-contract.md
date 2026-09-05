@@ -70,6 +70,17 @@ Native same-format SSE preserves event names, event order, JSON fields, and unkn
 
 For native `openai:responses` SSE, classify the first complete body/event before committing downstream HTTP 2xx. If that first body is an embedded error and no output is client-visible, preserve the real error status or use the existing candidate-failover path. Do not expose a bare `{ "error": ... }` object as a successful Response: successful Responses require an `id`, while a post-commit `response.failed` event requires a complete Response object.
 
+For cross-format Gemini streams, the first non-empty `thought` is visible
+reasoning output and commits the candidate. Signature-only control parts remain
+non-visible. If a tool-call terminal error arrives after visible reasoning or a
+tool call, emit one complete `response.failed` event with the accumulated
+Response and usage in the same stream; never splice in another candidate.
+
+Before replaying a Responses conversation to an OpenAI provider, remove only a
+valid Aether Gemini tool-signature carrier. Preserve real provider
+`encrypted_content`, opaque ciphertext, and valid `rs_` reasoning references;
+their prefixes are provider-owned data, not cleanup markers.
+
 Aether stores normal usage/audit records only. It does not store Response bodies or create `response_id` affinity for this Codex HTTP surface.
 
 ## 4. Validation & Error Matrix
@@ -87,6 +98,11 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 | Upstream HTTP 2xx + first native Responses body is an embedded error | Detect before committing downstream 2xx; preserve the error or retry an eligible next candidate. |
 | Terminal SSE error after client-visible output | Return the same stream; do not splice a second provider stream. |
 | Retryable terminal policy error before additional client-visible output | Follow the existing configured failover policy. |
+| First non-empty Gemini thought | Commit it as client-visible reasoning output. |
+| Gemini signature-only part | Keep waiting for visible output or a terminal event. |
+| Gemini tool terminal error after visible output | Emit one complete in-band `response.failed` with usage; do not retry another candidate. |
+| Responses replay contains an Aether Gemini carrier | Remove only the decoded, validated carrier. |
+| Responses replay contains provider ciphertext or an `rs_` reference | Preserve it byte-for-byte as provider-owned data. |
 | `store=false` | Forward unchanged; create no Aether Response persistence. |
 
 ## 5. Good / Base / Bad Cases
@@ -114,6 +130,11 @@ Keep focused regressions on the shared paths:
 - `prefetched_codex_cyber_policy_violation_stops_failover_by_default`: opaque SSE and terminal error bytes remain ordered and unchanged.
 - `prefetched_codex_cyber_policy_violation_retries_when_system_setting_is_enabled`: the no-extra-output retry boundary remains intact.
 - `same_format_responses_prefetch_retries_bare_error_before_committing_success`: a first bare Responses error is classified before HTTP commit and returns the existing candidate-retry signal.
+- Gemini-to-Responses regressions must cover immediate thought emission,
+  signature-only non-commit, every supported tool-call terminal reason, complete
+  in-band failure shape, usage retention, and no post-visibility failover.
+- Replay regressions must distinguish a valid Aether carrier from real provider
+  ciphertext and `rs_` reasoning references.
 
 Run the API coverage generator in check mode and `cargo fmt --all --check`. Broaden crate tests only when a focused regression exposes a shared-contract risk.
 

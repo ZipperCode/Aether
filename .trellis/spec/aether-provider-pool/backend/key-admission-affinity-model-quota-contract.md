@@ -4,9 +4,9 @@
 
 Use this contract when changing Provider Key `concurrent_limit`, runtime
 semaphores, sync/stream/WebSocket admission, Pool cache affinity, model quota
-windows, or Antigravity quota projection. It keeps every transport on the same
-atomic Key capacity and prevents one model's exhausted window from blocking a
-different model.
+windows, Antigravity quota projection, Codex reset-credit state, or quota-driven
+model discovery. It keeps every transport on the same atomic Key capacity and
+prevents one model's exhausted window from blocking a different model.
 
 ## 2. Signatures
 
@@ -39,8 +39,10 @@ Relevant persisted/admin JSON shapes are:
 {"status_snapshot":{"quota":{"windows":[{"model":"gemini-2.5-pro","exhausted":true,"reset_at":1710000000}]}}}
 ```
 
-Antigravity metadata flows through
-`upstream_metadata.antigravity.quota_by_model` into normalized quota windows.
+The current Antigravity admin snapshot stores model entries under
+`upstream_metadata.antigravity.models`. Readers may accept the older
+`quota_by_model` key as a compatibility input, but new local writes and tests
+must use `models`.
 
 ## 3. Contracts
 
@@ -70,6 +72,22 @@ Antigravity metadata flows through
 - Antigravity refresh must preserve refresh credentials and project each model
   window with reset aliases (`reset_at`, `next_reset_at`, `reset_time`,
   `next_reset_time`), accepting Unix and RFC3339 sources.
+- A successful Antigravity admin quota refresh extracts routable model IDs from
+  `antigravity.models` (or the legacy `quota_by_model` fallback), applies the
+  shared case-insensitive internal-model exclusion predicate, and imports them
+  through the normal admin model catalog path. Every imported Provider Model
+  carries the exact source `endpoint.id`; never re-infer an Endpoint from the
+  Provider after discovery.
+- Catalog synchronization is a best-effort side effect of a successful quota
+  refresh. Item or repository failures are warnings and must not turn valid
+  quota data into a failed refresh.
+- Antigravity OAuth exchange resolves Google userinfo through the same selected
+  network context as token exchange and persists the returned email in both the
+  normalized auth configuration and raw payload.
+- A successful Codex reset-credit consumption decrements the locally projected
+  available count exactly once under the existing credential-generation,
+  reservation, and compare-and-set fences. A failed detail refresh preserves
+  the last known count and item list while recording the detail failure.
 - Pool Management, Provider Detail, and the Antigravity quota dialog use the
   shared quota summary. Gemini is one group; Claude and `gpt-*` share another.
   The group displays minimum remaining percent, a range when values differ,
@@ -90,6 +108,11 @@ Antigravity metadata flows through
 | Matching model quota exhausted | Skip only that requested provider model. |
 | Different model window exhausted | Keep the requested model eligible. |
 | Reset timestamp malformed | Keep the quota fact, omit the countdown; do not invent a timestamp. |
+| Antigravity quota refresh discovers a routable model | Import it with the exact refresh Endpoint ID. |
+| Discovered model is internal or differs only by case from an excluded ID | Do not add it to the catalog. |
+| Catalog synchronization fails after valid quota data arrives | Return quota success and emit a warning. |
+| Codex reset consumption wins its reservation/generation fence | Decrement the projected count once. |
+| Codex detail refresh fails | Preserve the previous count/items and mark detail failure. |
 
 ## 5. Good / Base / Bad Cases
 
@@ -116,7 +139,12 @@ Antigravity metadata flows through
 - Provider Pool: model A exhaustion does not block model B for Antigravity and
   Codex model-scoped windows.
 - OAuth/transport/admin: Antigravity legacy refresh token, refreshed credential
-  persistence, model window projection, and RFC3339 reset parsing.
+  persistence, Google userinfo email, local `models` projection, legacy
+  `quota_by_model` reading, exact-Endpoint catalog import, and RFC3339 reset
+  parsing.
+- Admin/Gateway: Codex reset-credit activation and completion-order races,
+  credential-generation replacement rejection, one-time local decrement, and
+  failed-detail preservation.
 - Frontend: concurrent-limit input/save, scheduling-mode metadata, shared quota
   summary, percentage/range, and countdown rendering.
 

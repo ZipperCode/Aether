@@ -2,7 +2,7 @@
 
 ## 1. Scope / Trigger
 
-This contract applies whenever an admin UI creates a Provider Model for a Provider that may own multiple Endpoints. The normal user path must carry authoritative upstream model and Endpoint evidence before it relies on backend inference.
+This contract applies whenever an admin UI or a trusted admin refresh creates a Provider Model for a Provider that may own multiple Endpoints. Every automatic path must carry authoritative upstream model and Endpoint evidence before it relies on backend inference.
 
 ## 2. Signatures
 
@@ -17,6 +17,8 @@ This contract applies whenever an admin UI creates a Provider Model for a Provid
 - The Provider detail association dialog loads aggregate upstream models without requiring an extra Key-selection action.
 - Exact, case-insensitive Global Model name matches may be selected automatically. Different names require an explicit user selection; prefixes and fuzzy guesses are forbidden.
 - Exact creation uses the upstream `id` as `provider_model_name` and forwards its de-duplicated `endpoint_ids`.
+- A quota-driven discovery path constructs the complete admin import source and binds each discovered model to the exact Endpoint that produced the quota snapshot. It must not call Provider-level Endpoint inference.
+- Internal/non-routable model IDs are filtered through one shared, case-insensitive predicate before any catalog write. Quota success remains successful if the best-effort catalog synchronization fails.
 - Saving is unavailable while the initial aggregate query is pending. Async results may update state only when Provider ID, open state, and dialog session still match.
 - If discovery returns no usable model, the existing batch inference path remains available for single-Endpoint Providers, explicit metadata, and Providers that do not publish a model list.
 
@@ -30,6 +32,9 @@ This contract applies whenever an admin UI creates a Provider Model for a Provid
 | Aggregate query empty or failed | Keep the compatibility fallback |
 | Response belongs to an old dialog session | Discard it without changing current state |
 | Endpoint ID is empty, duplicated, or foreign | Normalize duplicates in the UI; backend validation rejects empty or foreign IDs |
+| Quota refresh discovers a routable model | Import with the refresh Endpoint ID as authoritative evidence |
+| Quota refresh discovers an internal model | Exclude it before catalog import, case-insensitively |
+| Quota succeeds but catalog import fails | Keep quota success and report only a warning |
 
 ## 5. Good / Base / Bad Cases
 
@@ -44,6 +49,7 @@ This contract applies whenever an admin UI creates a Provider Model for a Provid
 - Race path: keep discovery pending and assert save is disabled and guarded.
 - Session path: resolve an older request after reopening and assert that only current-session models are rendered.
 - Contract path: frontend type-checking must include `endpoint_ids` on the provider-query response type.
+- Admin quota path: assert the complete import source, exact Endpoint ID, internal-model exclusion, and non-fatal repository failure behavior.
 
 ## 7. Wrong vs Correct
 
@@ -54,4 +60,3 @@ Test only a hidden or optional Key-selection path, then assume the normal “sel
 ### Correct
 
 Load aggregate upstream evidence on the default path, guard saving until it settles, and keep manual Key selection only as an explicit refresh or disambiguation tool.
-
