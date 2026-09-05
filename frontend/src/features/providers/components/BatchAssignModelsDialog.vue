@@ -178,7 +178,7 @@
         </p>
         <div class="flex items-center gap-2">
           <Button
-            :disabled="!hasChanges || saving"
+            :disabled="!hasChanges || saving || fetchingAutoMatchedModels"
             @click="handleSave"
           >
             <Loader2
@@ -564,7 +564,7 @@ async function handleDialogUpdate(value: boolean) {
  * 保存关联变更：显式上游选择逐项精确创建，其余新增项继续使用原批量推断接口。
  */
 async function handleSave() {
-  if (!hasChanges.value || saving.value) return
+  if (!hasChanges.value || saving.value || fetchingAutoMatchedModels.value) return
 
   saving.value = true
   let hasAnyOperation = false
@@ -676,15 +676,32 @@ watch(
   { immediate: true },
 )
 
-/** 并行加载 Global Model、已有关联和密钥，再建立本地初始选择。 */
+/**
+ * 并行加载基础关联数据，再查询 Provider 全部 Key 聚合的真实上游模型。
+ * 整个初始加载链路禁止保存；仅当前弹窗会话可写入结果，失败或空结果继续使用批量推断兜底。
+ */
 async function loadData(providerId: string, session: number) {
-  await Promise.all([
-    loadGlobalModels(providerId, session),
-    loadExistingModels(providerId, session),
-    loadProviderKeys(providerId, session),
-  ])
-  if (session === dialogSession && props.open && props.providerId === providerId) {
+  if (session !== dialogSession || !props.open || props.providerId !== providerId) return
+
+  fetchingAutoMatchedModels.value = true
+  try {
+    await Promise.all([
+      loadGlobalModels(providerId, session),
+      loadExistingModels(providerId, session),
+      loadProviderKeys(providerId, session),
+    ])
+    if (session !== dialogSession || !props.open || props.providerId !== providerId) return
+
     syncGlobalModelSelection()
+    const result = await fetchCachedModels(providerId)
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      upstreamModels.value = result.models
+      syncUpstreamModelSelections(selectedGlobalModelIds.value)
+    }
+  } finally {
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      fetchingAutoMatchedModels.value = false
+    }
   }
 }
 

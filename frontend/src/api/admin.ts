@@ -585,6 +585,7 @@ export interface ProviderModelsQueryResponse {
       display_name?: string
       api_format?: string
       api_formats?: string[]
+      endpoint_ids?: string[]  // 实际返回该模型的 Provider Endpoint，供前端精确创建关联
       model_test_capabilities?: ModelTestCapabilities | null
     }>
     error?: string

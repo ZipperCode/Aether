@@ -130,9 +130,45 @@ describe('BatchAssignModelsDialog loading', () => {
     expect(globalModelMocks.getGlobalModels).toHaveBeenCalledWith({ limit: 1000 })
     expect(endpointMocks.getProviderModels).toHaveBeenCalledWith('provider-1')
     expect(endpointMocks.getProviderKeys).toHaveBeenCalledWith('provider-1')
+    expect(upstreamModelMocks.fetchModels).toHaveBeenCalledWith('provider-1')
   })
 
-  it('creates a selected Global Model with the real upstream name and Endpoint', async () => {
+  it('creates an exact same-name Global Model from aggregate upstream evidence without choosing a Key', async () => {
+    globalModelMocks.getGlobalModels.mockResolvedValue({
+      models: [{
+        id: 'global-gemini',
+        name: 'GEMINI-3.7-FLASH',
+        display_name: 'Gemini 3.7 Flash',
+      }],
+      total: 1,
+    })
+    upstreamModelMocks.fetchModels.mockResolvedValue({
+      models: [{
+        id: 'gemini-3.7-flash',
+        api_formats: ['gemini'],
+        endpoint_ids: ['endpoint-gemini', 'endpoint-gemini'],
+      }],
+    })
+
+    const { root } = await mountDialog()
+    root.querySelector<HTMLElement>('[data-global-model-id="global-gemini"]')?.click()
+    await settle()
+
+    const saveButton = Array.from(root.querySelectorAll('button'))
+      .find(button => button.textContent?.trim() === '保存')
+    saveButton?.click()
+    await settle()
+
+    expect(upstreamModelMocks.fetchModels).toHaveBeenCalledWith('provider-1')
+    expect(endpointMocks.createModel).toHaveBeenCalledWith('provider-1', {
+      global_model_id: 'global-gemini',
+      provider_model_name: 'gemini-3.7-flash',
+      endpoint_ids: ['endpoint-gemini'],
+    })
+    expect(endpointMocks.batchAssignModelsToProvider).not.toHaveBeenCalled()
+  })
+
+  it('keeps explicit different-name selection after refreshing models from a Key', async () => {
     globalModelMocks.getGlobalModels.mockResolvedValue({
       models: [{ id: 'global-gemini', name: 'gemini-3.8', display_name: 'Gemini 3.8' }],
       total: 1,
@@ -167,6 +203,7 @@ describe('BatchAssignModelsDialog loading', () => {
     )
     expect(upstreamSelect).not.toBeNull()
     if (!upstreamSelect) return
+    expect(upstreamSelect.value).toBe('')
     upstreamSelect.value = 'gemini-3.8-flash-high'
     upstreamSelect.dispatchEvent(new Event('change', { bubbles: true }))
     await settle()
@@ -207,16 +244,68 @@ describe('BatchAssignModelsDialog loading', () => {
     expect(endpointMocks.createModel).not.toHaveBeenCalled()
   })
 
-  it('ignores an upstream response from a previous open session', async () => {
+  it('does not save while the initial aggregate upstream query is pending', async () => {
     globalModelMocks.getGlobalModels.mockResolvedValue({
       models: [{ id: 'global-custom', name: 'custom-model', display_name: 'Custom Model' }],
       total: 1,
     })
-    endpointMocks.getProviderKeys.mockResolvedValue([{
-      id: 'key-1',
-      name: 'Gemini Key',
-      api_key_masked: 'gm-***',
-    }])
+    let resolveModels!: (value: { models: [] }) => void
+    upstreamModelMocks.fetchModels.mockImplementationOnce(
+      () => new Promise(resolve => { resolveModels = resolve }),
+    )
+
+    const { root } = await mountDialog()
+    root.querySelector<HTMLElement>('[data-global-model-id="global-custom"]')?.click()
+    await settle()
+
+    const saveButton = Array.from(root.querySelectorAll('button'))
+      .find(button => button.textContent?.trim() === '保存') as HTMLButtonElement | undefined
+    expect(saveButton?.disabled).toBe(true)
+    // 主动绕过 DOM 禁用态，单独证明 handleSave 仍有函数级竞态守卫。
+    saveButton?.removeAttribute('disabled')
+    saveButton?.click()
+    await settle()
+    expect(endpointMocks.batchAssignModelsToProvider).not.toHaveBeenCalled()
+    expect(endpointMocks.createModel).not.toHaveBeenCalled()
+
+    resolveModels({ models: [] })
+    await settle()
+    expect(saveButton?.disabled).toBe(false)
+  })
+
+  it('guards save before aggregate discovery starts while base data is still loading', async () => {
+    globalModelMocks.getGlobalModels.mockResolvedValue({
+      models: [{ id: 'global-custom', name: 'custom-model', display_name: 'Custom Model' }],
+      total: 1,
+    })
+    let resolveProviderKeys!: (value: []) => void
+    endpointMocks.getProviderKeys.mockImplementationOnce(
+      () => new Promise(resolve => { resolveProviderKeys = resolve }),
+    )
+
+    const { root } = await mountDialog()
+    root.querySelector<HTMLElement>('[data-global-model-id="global-custom"]')?.click()
+    await settle()
+
+    const saveButton = Array.from(root.querySelectorAll('button'))
+      .find(button => button.textContent?.trim() === '保存') as HTMLButtonElement | undefined
+    expect(upstreamModelMocks.fetchModels).not.toHaveBeenCalled()
+    expect(saveButton?.disabled).toBe(true)
+    saveButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await settle()
+    expect(endpointMocks.batchAssignModelsToProvider).not.toHaveBeenCalled()
+    expect(endpointMocks.createModel).not.toHaveBeenCalled()
+
+    resolveProviderKeys([])
+    await settle()
+    expect(upstreamModelMocks.fetchModels).toHaveBeenCalledWith('provider-1')
+  })
+
+  it('ignores an initial aggregate upstream response from a previous open session', async () => {
+    globalModelMocks.getGlobalModels.mockResolvedValue({
+      models: [{ id: 'global-custom', name: 'custom-model', display_name: 'Custom Model' }],
+      total: 1,
+    })
     let resolveOldRequest!: (value: {
       models: Array<{ id: string; api_formats: string[]; endpoint_ids: string[] }>
     }) => void
@@ -227,16 +316,9 @@ describe('BatchAssignModelsDialog loading', () => {
       })
 
     const { root, open } = await mountDialog()
-    const findKeyButton = () => Array.from(root.querySelectorAll('button'))
-      .find(button => button.textContent?.includes('Gemini Key'))
-    findKeyButton()?.click()
-    await settle()
-
     open.value = false
     await settle()
     open.value = true
-    await settle()
-    findKeyButton()?.click()
     await settle()
     root.querySelector<HTMLElement>('[data-global-model-id="global-custom"]')?.click()
     await settle()
@@ -248,6 +330,7 @@ describe('BatchAssignModelsDialog loading', () => {
 
     const optionValues = Array.from(root.querySelectorAll<HTMLOptionElement>('select option'))
       .map(option => option.value)
+    expect(upstreamModelMocks.fetchModels).toHaveBeenCalledTimes(2)
     expect(optionValues).toContain('current-upstream')
     expect(optionValues).not.toContain('stale-upstream')
   })
