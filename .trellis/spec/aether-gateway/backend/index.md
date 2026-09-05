@@ -23,6 +23,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Runtime Key Quota Block](../../aether-provider-pool/backend/runtime-quota-block-contract.md) | Failure classification, effects, admin recovery, and cache integration | Current |
 | [Codex HTTP Responses Relay](../../aether-ai-formats/backend/codex-http-responses-contract.md) | Cross-layer create, compact, SSE, auth, and state boundary | Current |
 | [Model Capability Test](./model-capability-test-contract.md) | Pinned target/reference execution, random suite, scoring, API, and UI boundary | Current |
+| [Provider Model Association Endpoint Evidence](./model-association-endpoint-contract.md) | Default-path discovery, exact association, Endpoint propagation, fallback, and race contract | Current |
 
 ---
 

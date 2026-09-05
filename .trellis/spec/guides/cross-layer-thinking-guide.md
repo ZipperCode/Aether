@@ -112,6 +112,19 @@ refresh only the field whose value is allowed to change during retries or paging
 at every caller. Tests must use deliberately different values for time, IDs,
 counters, and seeds so accidental interchange cannot still pass.
 
+### Mistake 6: Optional Enrichment Is Missing From The Default Action Path
+
+**Bad**: A secondary button loads the API evidence required by Save, while the
+normal “select then save” path can run before that evidence exists.
+
+**Good**: Load required evidence on the default path, guard the action while it
+is pending, and keep the secondary control only for refresh or disambiguation.
+
+**Rule**: When an async lookup supplies IDs used by a later write, test the
+default user path without invoking optional controls. Also test pending and
+stale-session states. For Provider Model association, follow
+`../aether-gateway/backend/model-association-endpoint-contract.md`.
+
 ---
 
 ## Checklist for Cross-Layer Features
@@ -134,6 +147,8 @@ After implementation:
       (`seq`, `id`, `version`) instead of inventing a second cursor
 - [ ] Checked that same-typed scalar fields keep distinct names, units, and
       deliberately different test values across every layer
+- [ ] Checked that evidence required by a write is loaded on the default user
+      path, with action guards and stale-session coverage
 
 ---
 
