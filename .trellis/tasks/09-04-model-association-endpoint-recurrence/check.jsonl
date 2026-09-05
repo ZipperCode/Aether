@@ -1,0 +1,4 @@
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"检查 endpoint_ids 跨层字段、空值和竞态语义"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"检查是否复用现有路径并避免重复状态机制"}
+{"file":".trellis/tasks/09-04-model-association-endpoint-recurrence/research/recurrence.md","reason":"按复发现象与旧覆盖缺口验证实现是否命中根因"}
+{"file":".trellis/spec/aether-gateway/backend/model-association-endpoint-contract.md","reason":"检查默认路径、精确 Endpoint 传递、兜底和竞态行为"}

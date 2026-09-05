@@ -1,0 +1,4 @@
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"核对上游模型 endpoint_ids 从后端响应到保存请求的完整跨层链路"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"复用现有聚合查询、会话守卫和创建接口，避免新增推断实现"}
+{"file":".trellis/tasks/09-04-model-association-endpoint-recurrence/research/recurrence.md","reason":"包含复发调用链、旧测试缺口和最小根因修复边界"}
+{"file":".trellis/spec/aether-gateway/backend/model-association-endpoint-contract.md","reason":"定义默认聚合查询、精确关联、兜底和异步竞态的执行合同"}
