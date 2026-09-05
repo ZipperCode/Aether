@@ -1,0 +1,12 @@
+{"file":".trellis/tasks/09-05-upstream-selected-sync/research/routing-model-filter.md","reason":"编号 1 的本地重叠、最小适配和目标验证"}
+{"file":".trellis/tasks/09-05-upstream-selected-sync/research/provider-antigravity.md","reason":"编号 3 的提交分类、Endpoint 绑定适配和验证"}
+{"file":".trellis/tasks/09-05-upstream-selected-sync/research/gateway-streaming.md","reason":"编号 4 的唯一 Guard 融合、期限和收尾契约"}
+{"file":".trellis/tasks/09-05-upstream-selected-sync/research/gemini-responses.md","reason":"编号 5 的终态、回放与同格式保留契约"}
+{"file":".trellis/tasks/09-05-upstream-selected-sync/research/integration-map.md","reason":"13 个上游补丁的整体分类、顺序和冲突边界"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"跨前端、控制面、执行与格式层保持 ID 和终态语义"}
+{"file":".trellis/spec/aether-gateway/backend/model-association-endpoint-contract.md","reason":"发现模型目录同步必须携带精确 Endpoint 证据"}
+{"file":".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md","reason":"保持 Responses 同格式透传、裸错误和提交后终态边界"}
+{"file":".trellis/spec/aether-gateway-execution/backend/codex-logical-identity-contract.md","reason":"重试与候选切换不得改变 Codex 逻辑身份"}
+{"file":".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md","reason":"保留余额调度和缓存失效契约"}
+{"file":".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md","reason":"保留运行时 quota 证据和手工恢复语义"}
+{"file":".trellis/spec/aether-provider-pool/backend/key-admission-affinity-model-quota-contract.md","reason":"保留强 Key 准入、并发许可和模型 quota 契约"}

@@ -1,0 +1,10 @@
+{"file":".trellis/tasks/09-05-upstream-selected-sync/research/integration-map.md","reason":"核对全部上游补丁的纳入、适配、测试依赖和排除映射"}
+{"file":".trellis/tasks/09-05-upstream-selected-sync/research/routing-model-filter.md","reason":"核对路由查询、竞态和本地更严格过滤"}
+{"file":".trellis/tasks/09-05-upstream-selected-sync/research/provider-antigravity.md","reason":"核对 OAuth、reset-credit、目录与 Endpoint 证据"}
+{"file":".trellis/tasks/09-05-upstream-selected-sync/research/gateway-streaming.md","reason":"核对单一终态所有者、结算和共享期限"}
+{"file":".trellis/tasks/09-05-upstream-selected-sync/research/gemini-responses.md","reason":"核对 Gemini 终态与 Responses 回放行为"}
+{"file":".trellis/spec/aether-gateway/backend/model-association-endpoint-contract.md","reason":"防止目录同步回退到 Endpoint 猜测"}
+{"file":".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md","reason":"验证 same-format、裸错误和 response.failed 边界"}
+{"file":".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md","reason":"验证余额调度未回归"}
+{"file":".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md","reason":"验证 quota 状态机未回归"}
+{"file":".trellis/spec/aether-provider-pool/backend/key-admission-affinity-model-quota-contract.md","reason":"验证准入、affinity 和模型 quota 未回归"}
