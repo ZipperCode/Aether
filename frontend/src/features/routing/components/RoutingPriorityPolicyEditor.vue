@@ -402,6 +402,8 @@ const draggedKeyId = ref<string | null>(null)
 const dragOverKeyId = ref<string | null>(null)
 const providerMultiSelectEnabled = ref(false)
 const selectedProviderIds = ref<Set<string>>(new Set())
+/** Provider 列表请求代次；仅最新代次可回写列表、错误和加载状态。 */
+let providerLoadRequestId = 0
 
 const config = computed(() => normalizeRoutingGroupConfig(props.config))
 const targetModel = computed(() => props.model?.trim() || DEFAULT_ROUTING_POLICY_MODEL)
@@ -523,6 +525,12 @@ watch(effectivePriorityMode, mode => {
     providerMultiSelectEnabled.value = false
     selectedProviderIds.value = new Set()
   }
+  void loadProviders()
+})
+
+// 模型名或父级异步解析的 GlobalModel ID 变化后，重新获取当前作用域的 Provider。
+watch([targetModel, resolvedGlobalModelId], () => {
+  void loadProviders()
 })
 
 watch(providerRows, rows => {
@@ -578,17 +586,37 @@ function updateSchedulingMode(mode: RoutingSchedulingMode): void {
   updateDefaultPolicy({ scheduling_mode: mode })
 }
 
+/**
+ * 按当前排序作用域加载 Provider：按模型 Provider 排序使用 GlobalModel ID，统一或 Key
+ * 排序加载全量；ID 未就绪时清空列表，并以请求代次阻止旧成功或失败覆盖新选择。
+ */
 async function loadProviders(): Promise<void> {
+  const requestId = ++providerLoadRequestId
   loadingProviders.value = true
   loadError.value = null
   try {
-    const response = await getProvidersSummary({ page: 1, page_size: 9999 })
+    const filtersByModel = isPerModelProviderOrdering.value
+      && effectivePriorityMode.value === 'provider'
+    if (filtersByModel && !resolvedGlobalModelId.value) {
+      providers.value = []
+      return
+    }
+
+    const response = await getProvidersSummary({
+      page: 1,
+      page_size: 9999,
+      ...(filtersByModel ? { model_id: resolvedGlobalModelId.value } : {}),
+    })
+    if (requestId !== providerLoadRequestId) return
     providers.value = response.items
   } catch (err) {
+    if (requestId !== providerLoadRequestId) return
     loadError.value = parseApiError(err, '加载 Provider 失败')
     providers.value = []
   } finally {
-    loadingProviders.value = false
+    if (requestId === providerLoadRequestId) {
+      loadingProviders.value = false
+    }
   }
 }
 
