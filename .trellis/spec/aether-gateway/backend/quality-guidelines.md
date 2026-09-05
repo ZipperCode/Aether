@@ -90,6 +90,38 @@ public_limit.map_or(scoped_limit, |limit| limit.min(scoped_limit))
 
 ## Forbidden Patterns
 
+### Bounded authentication maintenance and candidate materialization
+
+- OAuth token refresh and account self-check share the process-wide
+  `AETHER_AUTH_MAINTENANCE_CONCURRENCY` semaphore. The normalized value defaults
+  to `4` and is bounded to `1..=64`.
+- A maintenance permit must be acquired before a strong Key/transport read and
+  must remain owned through the single upstream authentication or quota call.
+  RAII permit ownership is required so cancellation and error paths release the
+  slot without manual bookkeeping.
+- Maintenance scans first use the lightweight auth-maintenance projection. It
+  must not return encrypted credentials, `upstream_metadata`,
+  `status_snapshot`, or request bodies. A complete Key is loaded by ID only
+  after a permit is acquired and is released before the next candidate starts.
+- Ordinary Chat, Responses, family, and same-format text requests use the
+  paged dynamic attempt source. Do not restore eager `Vec` plan/report builders
+  that construct a request body for every candidate. Static materialization is
+  limited to specialized image/file/video bridges whose persistence contract
+  requires it.
+- If a routing policy requires global ranking, preserve that ordering contract
+  explicitly; do not remove the policy-wide collection as an incidental memory
+  optimization. Any replacement must provide an equivalent bounded ranking
+  algorithm and regression coverage.
+
+### Required checks for this contract
+
+- Unit tests cover default/invalid/upper-bound concurrency, 6,000 candidates,
+  combined OAuth/self-check occupancy, and cancelled waiters.
+- PostgreSQL, MySQL, SQLite, and memory repositories expose the same lightweight
+  projection and tests assert that secret/heavy result columns are absent.
+- Source/architecture tests keep ordinary text planners on the dynamic source
+  and keep OAuth away from the full provider-key-by-provider listing method.
+
 <!-- Patterns that should never be used and why -->
 
 (To be filled by the team)

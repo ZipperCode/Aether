@@ -24,6 +24,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Codex HTTP Responses Relay](../../aether-ai-formats/backend/codex-http-responses-contract.md) | Cross-layer create, compact, SSE, auth, and state boundary | Current |
 | [Model Capability Test](./model-capability-test-contract.md) | Pinned target/reference execution, random suite, scoring, API, and UI boundary | Current |
 | [Provider Model Association Endpoint Evidence](./model-association-endpoint-contract.md) | Default-path discovery, exact association, Endpoint propagation, fallback, and race contract | Current |
+| [Authentication Maintenance Memory](./auth-maintenance-memory-contract.md) | Shared auth gate, lightweight Key projection, and lazy candidate body materialization | Current |
 
 ---
 
