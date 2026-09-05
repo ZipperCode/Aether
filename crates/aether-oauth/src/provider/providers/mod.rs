@@ -6,7 +6,7 @@ mod kiro;
 mod nous;
 mod windsurf;
 
-pub use antigravity::AntigravityProviderOAuthAdapter;
+pub use antigravity::{AntigravityProviderOAuthAdapter, ANTIGRAVITY_USER_INFO_URL};
 pub use claude_code::{
     ClaudeCodeProviderOAuthAdapter, CLAUDE_CODE_AUTHORIZE_URL, CLAUDE_CODE_CLIENT_ID,
     CLAUDE_CODE_COOKIE_SCOPE, CLAUDE_CODE_OAUTH_SCOPES, CLAUDE_CODE_PROVIDER_TYPE,

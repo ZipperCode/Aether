@@ -1212,6 +1212,7 @@ import {
   getCodexResetCreditAvailableCount,
   getCodexResetCreditReservationIdempotencyKey,
   getVisibleCodexResetCreditItems,
+  mergeCodexQuotaDisplays,
   readPendingCodexResetCreditIdempotencyKey,
   rememberPendingCodexResetCreditIdempotencyKey,
 } from '@/features/providers/components/codex-reset-credit-display'
@@ -2418,11 +2419,19 @@ function applyQuotaRefreshResultToCurrentPage(result: Awaited<ReturnType<typeof 
   keyPage.value.keys = mergePoolKeyQuotaSnapshots(keyPage.value.keys, result.results)
 }
 
-/** 仅从 Codex 额度快照读取重置机会，避免把其他 Provider 的同名字段误用。 */
+/** 合并 Codex 快照与较新的 metadata 重置机会；其他 Provider 的同名字段不参与。 */
 function getCodexResetCredits(key: PoolKeyDetail) {
-  return getQuotaSnapshotProviderType(key) === 'codex'
-    ? key.status_snapshot?.quota?.reset_credits ?? null
+  if (getQuotaSnapshotProviderType(key) !== 'codex') return null
+
+  const snapshot = key.status_snapshot?.quota?.reset_credits
+  const snapshotUpdatedAt = key.status_snapshot?.quota?.updated_at
+  const snapshotDisplay = snapshot
+    ? {
+        ...(typeof snapshotUpdatedAt === 'number' ? { updated_at: snapshotUpdatedAt } : {}),
+        reset_credits: snapshot,
+      }
     : null
+  return mergeCodexQuotaDisplays(snapshotDisplay, key.upstream_metadata?.codex)?.reset_credits ?? null
 }
 
 /** 读取 Codex 凭据代际；`undefined` 表示服务端尚未提供并发安全的代际信息。 */

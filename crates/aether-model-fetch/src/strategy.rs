@@ -1135,6 +1135,7 @@ fn execution_result_error_message(result: &ExecutionResult) -> String {
     }
 }
 
+/// 解析 Antigravity 模型与额度，并通过共享谓词排除空 ID 和内部不可路由模型。
 fn parse_antigravity_models_response(body: &Value) -> Result<(Vec<Value>, Option<Value>), String> {
     let models_object = body
         .get("models")
@@ -1145,7 +1146,7 @@ fn parse_antigravity_models_response(body: &Value) -> Result<(Vec<Value>, Option
     let mut quota_by_model = serde_json::Map::new();
     for (model_id, model_data) in models_object {
         let model_id = model_id.trim();
-        if model_id.is_empty() || ANTIGRAVITY_BLOCKED_MODELS.contains(&model_id) {
+        if !antigravity_model_id_is_routable(model_id) {
             continue;
         }
         let model_object = model_data.as_object().cloned().unwrap_or_default();
@@ -1177,6 +1178,15 @@ fn parse_antigravity_models_response(body: &Value) -> Result<(Vec<Value>, Option
     });
 
     Ok((models, upstream_metadata))
+}
+
+/// 判断 Antigravity 模型 ID 是否可进入路由目录；内部黑名单按大小写不敏感匹配。
+pub fn antigravity_model_id_is_routable(model_id: &str) -> bool {
+    let model_id = model_id.trim();
+    !model_id.is_empty()
+        && !ANTIGRAVITY_BLOCKED_MODELS
+            .iter()
+            .any(|blocked| blocked.eq_ignore_ascii_case(model_id))
 }
 
 fn parse_kiro_available_models_response(

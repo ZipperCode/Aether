@@ -572,6 +572,52 @@ pub(crate) async fn reserve_codex_account_reset(
     Ok(None)
 }
 
+/// 记录一次已确认的本地重置消费：计数饱和减一、移除首项并等待下一次只读刷新校准。
+fn record_locally_consumed_codex_reset_credit(
+    codex: &mut serde_json::Map<String, serde_json::Value>,
+    observed_at_unix_secs: u64,
+) {
+    let Some(reset_credits) = codex
+        .get_mut("reset_credits")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(available_count) = reset_credits
+        .get("available_count")
+        .and_then(admin_provider_quota_pure::coerce_json_u64)
+    else {
+        return;
+    };
+
+    reset_credits.insert(
+        "available_count".to_string(),
+        serde_json::json!(available_count.saturating_sub(1)),
+    );
+    reset_credits.insert(
+        "updated_at".to_string(),
+        serde_json::json!(observed_at_unix_secs),
+    );
+    reset_credits.insert(
+        "detail_source".to_string(),
+        serde_json::json!("local_consume"),
+    );
+    reset_credits.insert(
+        "detail_status".to_string(),
+        serde_json::json!("pending_refresh"),
+    );
+    reset_credits.remove("detail_error");
+    if let Some(credits) = reset_credits
+        .get_mut("credits")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        if !credits.is_empty() {
+            credits.remove(0);
+        }
+    }
+}
+
+/// 在凭据与 CAS 门禁内完成一次 Codex 重置，并仅对首次确认的 `reset` 本地扣减机会。
 pub(crate) async fn complete_codex_account_reset(
     state: &AdminAppState<'_>,
     key_id: &str,
@@ -637,6 +683,9 @@ pub(crate) async fn complete_codex_account_reset(
             generation: reservation.generation,
             outcome: outcome.to_string(),
         };
+        if outcome == "reset" {
+            record_locally_consumed_codex_reset_credit(&mut codex, fence_unix_ms / 1_000);
+        }
         codex_reset_write_bounded_history(&mut codex, &terminal);
         if codex_reset_reservation_from_object(&codex).as_ref() == Some(reservation) {
             codex.remove(admin_provider_quota_pure::CODEX_QUOTA_ACCOUNT_RESET_RESERVATION_KEY);
@@ -1747,6 +1796,7 @@ mod tests {
         (app, repository)
     }
 
+    /// 构造同时含凭据代际与两次重置机会的状态机夹具，覆盖代际拒绝和本地消费语义。
     fn codex_reset_state_machine_test_state(
         key_id: &str,
     ) -> (
@@ -1772,7 +1822,19 @@ mod tests {
         .expect("key should build");
         key.encrypted_auth_config = Some("auth-v1".to_string());
         key.upstream_metadata = Some(json!({
-            "codex": {"credential_generation": "credential-v1"}
+            "codex": {
+                "credential_generation": "credential-v1",
+                "reset_credits": {
+                    "available_count": 2,
+                    "updated_at": 100u64,
+                    "detail_source": "wham_readonly",
+                    "detail_status": "available",
+                    "credits": [
+                        {"id": "credit-1", "expires_at": 20_000u64},
+                        {"id": "credit-2", "expires_at": 30_000u64}
+                    ]
+                }
+            }
         }));
         let credential = ProviderCatalogKeyOAuthCredentialFence {
             encrypted_api_key: None,
@@ -1861,11 +1923,19 @@ mod tests {
         assert!(codex.get("account_quota_reset_generation").is_none());
     }
 
+    /// 验证凭据代际不匹配时不写入预留，也不丢失已有重置机会 metadata。
     #[tokio::test]
     async fn codex_reset_reservation_rejects_replaced_credential_generation() {
         let key_id = "key-codex-reset-credential-generation";
         let (app, repository, credential) = codex_reset_state_machine_test_state(key_id);
         let admin_state = AdminAppState::new(&app);
+        let original_metadata = repository
+            .list_keys_by_ids(&[key_id.to_string()])
+            .await
+            .expect("key should load before reservation")
+            .pop()
+            .expect("key should exist before reservation")
+            .upstream_metadata;
 
         let result = reserve_codex_account_reset(
             &admin_state,
@@ -1889,10 +1959,7 @@ mod tests {
             .expect("key should reload")
             .pop()
             .expect("key should exist");
-        assert_eq!(
-            stored.upstream_metadata.unwrap()["codex"],
-            json!({"credential_generation":"credential-v1"})
-        );
+        assert_eq!(stored.upstream_metadata, original_metadata);
     }
 
     #[tokio::test]
@@ -2014,6 +2081,7 @@ mod tests {
             .clone()
     }
 
+    /// 验证 noop 与 reset 到达顺序不同仍只激活一次，并只消费一次本地重置机会。
     #[tokio::test]
     async fn codex_reset_activation_wins_over_noop_in_both_completion_orders() {
         for codex in [
@@ -2026,6 +2094,11 @@ mod tests {
             assert_eq!(
                 codex["account_quota_reset_history"][0]["outcome"],
                 json!("reset")
+            );
+            assert_eq!(codex["reset_credits"]["available_count"], json!(1u64));
+            assert_eq!(
+                codex["reset_credits"]["credits"],
+                json!([{"id": "credit-2", "expires_at": 30_000u64}])
             );
         }
     }

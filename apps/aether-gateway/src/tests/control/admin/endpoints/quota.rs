@@ -5,8 +5,12 @@ use std::time::Duration;
 use aether_crypto::{
     decrypt_python_fernet_ciphertext, encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY,
 };
+use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data::repository::proxy_nodes::InMemoryProxyNodeRepository;
+use aether_data_contracts::repository::global_models::{
+    AdminProviderModelListQuery, GlobalModelReadRepository,
+};
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
@@ -2392,6 +2396,7 @@ async fn gateway_reports_codex_quota_runtime_failures_locally_without_falling_ba
     upstream_handle.abort();
 }
 
+/// 验证 Antigravity 额度刷新走本地执行并把可路由模型同步到当前 Endpoint。
 #[test]
 fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_admin_principal() {
     run_provider_quota_test(
@@ -2400,6 +2405,7 @@ fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_a
     );
 }
 
+/// 执行完整额度刷新，检查 quota 持久化、模型过滤与精确 Endpoint binding。
 async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_admin_principal_inner(
 ) {
     #[derive(Debug, Clone)]
@@ -2466,6 +2472,12 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
                                 },
                                 "gemini-2.5-pro": {
                                     "displayName": "Gemini 2.5 Pro"
+                                },
+                                "gemini-3.7-flash-tiered": {
+                                    "displayName": "Gemini 3.7 Flash"
+                                },
+                                "chat_23310": {
+                                    "displayName": "Internal Chat"
                                 }
                             }
                         })),
@@ -2527,6 +2539,11 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         )],
         vec![key],
     ));
+    // Provider 目录与模型目录是独立内存仓储；模型写入也必须持有同一 Endpoint 归属证据。
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::default()
+            .with_endpoint_provider_ids([("endpoint-antigravity-chat", "provider-antigravity")]),
+    );
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
@@ -2536,6 +2553,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
                 GatewayDataState::with_provider_catalog_repository_for_tests(
                     provider_catalog_repository.clone(),
                 )
+                .with_global_model_repository_for_tests(global_model_repository.clone())
                 .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
             ),
     );
@@ -2649,6 +2667,39 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             .map(Vec::len),
         Some(1usize)
     );
+
+    let imported_provider_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-antigravity".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("imported Antigravity provider models should read");
+    let imported_model_names = imported_provider_models
+        .iter()
+        .map(|model| model.provider_model_name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(imported_model_names.contains("claude-sonnet-4"));
+    assert!(imported_model_names.contains("gemini-2.5-pro"));
+    assert!(imported_model_names.contains("gemini-3.7-flash-tiered"));
+    assert!(!imported_model_names.contains("chat_23310"));
+
+    let imported_model_ids = imported_provider_models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&imported_model_ids)
+        .await
+        .expect("imported model endpoint bindings should read");
+    assert_eq!(bindings.len(), imported_provider_models.len());
+    assert!(bindings.iter().all(|binding| {
+        binding.endpoint_id == "endpoint-antigravity-chat"
+            && binding.source == "discovered"
+            && binding.is_active
+    }));
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
