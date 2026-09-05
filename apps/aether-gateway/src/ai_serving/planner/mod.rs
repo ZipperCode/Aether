@@ -36,8 +36,7 @@ pub(crate) use self::candidate_resolution::{
 };
 pub(crate) use self::common::resolve_upstream_is_stream_for_provider;
 pub(crate) use self::passthrough::{
-    build_local_same_format_stream_attempt_source, build_local_same_format_stream_plan_and_reports,
-    build_local_same_format_sync_attempt_source, build_local_same_format_sync_plan_and_reports,
+    build_local_same_format_stream_attempt_source, build_local_same_format_sync_attempt_source,
     maybe_build_pinned_stream_local_same_format_provider_decision_payload,
 };
 pub(crate) use self::plan_builders::{
@@ -71,17 +70,11 @@ pub(crate) use self::specialized::{
 };
 pub(crate) use self::standard::{
     build_local_openai_chat_stream_attempt_source_for_kind,
-    build_local_openai_chat_stream_plan_and_reports_for_kind,
     build_local_openai_chat_sync_attempt_source_for_kind,
-    build_local_openai_chat_sync_plan_and_reports_for_kind,
     build_local_openai_responses_stream_attempt_source_for_kind,
-    build_local_openai_responses_stream_plan_and_reports_for_kind,
     build_local_openai_responses_sync_attempt_source_for_kind,
-    build_local_openai_responses_sync_plan_and_reports_for_kind,
     build_local_stream_attempt_source as build_standard_family_stream_attempt_source,
-    build_local_stream_plan_and_reports as build_standard_family_stream_plan_and_reports,
     build_local_sync_attempt_source as build_standard_family_sync_attempt_source,
-    build_local_sync_plan_and_reports as build_standard_family_sync_plan_and_reports,
     codex_model_capabilities_for_transport, maybe_build_responses_websocket_decision,
     openai_responses_reasoning_replay_policy, set_local_openai_chat_execution_exhausted_diagnostic,
     validate_final_openai_provider_request, ResponsesWebSocketBodyNormalization,

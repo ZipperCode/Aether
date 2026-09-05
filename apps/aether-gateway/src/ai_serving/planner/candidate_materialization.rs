@@ -2338,7 +2338,10 @@ pub(crate) async fn persist_skipped_local_execution_candidates_with_context(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use aether_data::repository::auth::InMemoryAuthApiKeySnapshotRepository;
     use aether_data::repository::auth::StoredAuthApiKeySnapshot;
@@ -3032,6 +3035,71 @@ mod tests {
             .await
             .expect("remaining attempt read should succeed")
             .is_none());
+    }
+
+    /// 验证普通文本的大请求体只在当前候选被取出后构造，停止时不会为其余候选复制请求体。
+    #[tokio::test]
+    async fn dynamic_attempt_source_materializes_only_current_large_request_body() {
+        const CANDIDATE_COUNT: usize = 6_000;
+        const LARGE_INPUT_BYTES: usize = 512 * 1024;
+
+        let items = (0..CANDIDATE_COUNT)
+            .map(|index| {
+                let candidate = sample_eligible(&format!("key-{index}"), None);
+                LocalExecutionCandidateAttemptSourceItem::Static {
+                    attempts: dispatch_sequence_from_attempts(
+                        build_unpersisted_local_execution_candidate_attempts(
+                            candidate,
+                            u32::try_from(index).expect("candidate index should fit u32"),
+                        )
+                        .into(),
+                    ),
+                }
+            })
+            .collect::<VecDeque<_>>();
+        let mut source = LocalExecutionCandidateAttemptSource {
+            items,
+            retired_persisted_static_attempts: Vec::new(),
+            static_attempts_are_persisted: false,
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+            state: None,
+            client_api_format: None,
+            require_streaming: false,
+            request_operation: None,
+        };
+        let request_body = json!({
+            "model": "gpt-large-candidate-regression",
+            "input": "x".repeat(LARGE_INPUT_BYTES),
+        });
+        let body_build_count = AtomicUsize::new(0);
+        let materialize_body = |attempt: LocalExecutionCandidateAttempt| {
+            body_build_count.fetch_add(1, Ordering::SeqCst);
+            let mut body = request_body.clone();
+            body["selected_key"] = json!(attempt.eligible.candidate.key_id);
+            body
+        };
+
+        let first = source
+            .next_attempt()
+            .await
+            .expect("first attempt read should succeed")
+            .expect("first attempt should be available");
+        let first_body = materialize_body(first);
+
+        assert_eq!(
+            first_body["input"].as_str().map(str::len),
+            Some(LARGE_INPUT_BYTES)
+        );
+        assert_eq!(first_body["selected_key"], json!("key-0"));
+        assert!(source.drain_static_attempts().is_empty());
+        assert!(source
+            .next_attempt()
+            .await
+            .expect("stopped source should remain readable")
+            .is_none());
+        assert_eq!(body_build_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

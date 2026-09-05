@@ -14,9 +14,9 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeySchedulingStateCasUpdate,
     ProviderCatalogKeyStatusSnapshotUpdate, ProviderCatalogReadRepository,
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::DataLayerError;
 use aether_data_query::{
@@ -143,6 +143,22 @@ FROM provider_api_keys
 
 const KEY_MAINTENANCE_SUMMARY_SELECT_SQL: &str = r#"
 SELECT id, provider_id, is_active, upstream_metadata
+FROM provider_api_keys
+"#;
+
+const AUTH_MAINTENANCE_CANDIDATE_SELECT_SQL: &str = r#"
+SELECT
+  id,
+  provider_id,
+  is_active,
+  auth_type,
+  CASE
+    WHEN NULLIF(TRIM(auth_config), '') IS NULL THEN FALSE
+    ELSE TRUE
+  END AS has_auth_config,
+  expires_at AS expires_at_unix_secs,
+  oauth_invalid_at AS oauth_invalid_at_unix_secs,
+  oauth_invalid_reason
 FROM provider_api_keys
 "#;
 
@@ -313,6 +329,30 @@ impl MysqlProviderCatalogReadRepository {
         .await
         .map_sql_err()?;
         rows.iter().map(map_key_maintenance_summary_row).collect()
+    }
+
+    /// 只读取认证维护资格字段，密文和大型运行态 JSON 不进入查询结果。
+    pub async fn list_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogAuthMaintenanceCandidate>, DataLayerError> {
+        if provider_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = build_in_query(
+            AUTH_MAINTENANCE_CANDIDATE_SELECT_SQL,
+            "provider_id",
+            provider_ids,
+            " ORDER BY provider_id ASC, id ASC",
+        )
+        .build()
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        rows.iter()
+            .map(map_auth_maintenance_candidate_row)
+            .collect()
     }
 
     pub async fn list_keys_page(
@@ -2117,6 +2157,14 @@ impl ProviderCatalogReadRepository for MysqlProviderCatalogReadRepository {
         Self::list_key_maintenance_summaries_by_provider_ids(self, provider_ids).await
     }
 
+    /// 将统一仓储契约委托给 MySQL 的轻量认证维护投影。
+    async fn list_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogAuthMaintenanceCandidate>, DataLayerError> {
+        Self::list_auth_maintenance_candidates_by_provider_ids(self, provider_ids).await
+    }
+
     async fn list_keys_page(
         &self,
         query: &ProviderCatalogKeyListQuery,
@@ -3161,6 +3209,28 @@ fn map_key_maintenance_summary_row(
     })
 }
 
+/// 将 MySQL 轻量结果行映射为认证维护候选，不解析任何密文或大型 JSON。
+fn map_auth_maintenance_candidate_row(
+    row: &MySqlRow,
+) -> Result<StoredProviderCatalogAuthMaintenanceCandidate, DataLayerError> {
+    Ok(StoredProviderCatalogAuthMaintenanceCandidate {
+        id: row.try_get("id").map_sql_err()?,
+        provider_id: row.try_get("provider_id").map_sql_err()?,
+        is_active: row.try_get("is_active").map_sql_err()?,
+        auth_type: row.try_get("auth_type").map_sql_err()?,
+        has_auth_config: row.try_get("has_auth_config").map_sql_err()?,
+        expires_at_unix_secs: optional_u64(
+            row.try_get("expires_at_unix_secs").map_sql_err()?,
+            "provider_api_keys.expires_at",
+        )?,
+        oauth_invalid_at_unix_secs: optional_u64(
+            row.try_get("oauth_invalid_at_unix_secs").map_sql_err()?,
+            "provider_api_keys.oauth_invalid_at",
+        )?,
+        oauth_invalid_reason: row.try_get("oauth_invalid_reason").map_sql_err()?,
+    })
+}
+
 fn map_key_row(row: &MySqlRow) -> Result<StoredProviderCatalogKey, DataLayerError> {
     let total_cost_usd = row
         .try_get::<Option<f64>, _>("total_cost_usd")
@@ -3385,6 +3455,32 @@ mod tests {
         assert!(sql.contains("binary auth_config <=> binary ?"));
     }
 
+    /// 验证认证维护 SELECT 只输出轻量资格字段，不返回密文或大型 JSON。
+    #[test]
+    fn auth_maintenance_candidate_query_excludes_secret_and_heavy_columns() {
+        let projection = super::AUTH_MAINTENANCE_CANDIDATE_SELECT_SQL
+            .split("FROM provider_api_keys")
+            .next()
+            .expect("auth maintenance query should contain a FROM clause")
+            .to_ascii_lowercase();
+
+        assert!(projection.contains("as has_auth_config"));
+        for forbidden in [
+            "api_key",
+            "encrypted_key",
+            "upstream_metadata",
+            "status_snapshot",
+        ] {
+            assert!(
+                !projection.contains(forbidden),
+                "unexpected column: {forbidden}"
+            );
+        }
+        assert!(!projection
+            .lines()
+            .any(|line| line.trim().trim_end_matches(',') == "auth_config"));
+    }
+
     #[test]
     fn admin_credential_cas_has_atomic_rotation_guards() {
         let source = include_str!("provider_catalog.rs");
@@ -3410,6 +3506,7 @@ mod tests {
             source.contains("JSON_TYPE(COALESCE(NULLIF(upstream_metadata, ''), '{}')) = 'OBJECT'")
         );
     }
+    /// 验证所有空 ID 批量读取都在连接数据库前直接返回空结果。
     #[tokio::test]
     async fn empty_id_lists_do_not_connect_to_lazy_pool() {
         let pool = sqlx::mysql::MySqlPoolOptions::new().connect_lazy_with(
@@ -3453,6 +3550,11 @@ mod tests {
             .list_key_maintenance_summaries_by_provider_ids(&[])
             .await
             .expect("empty maintenance provider ids should not connect")
+            .is_empty());
+        assert!(repository
+            .list_auth_maintenance_candidates_by_provider_ids(&[])
+            .await
+            .expect("empty auth maintenance provider ids should not connect")
             .is_empty());
         assert!(repository
             .list_key_stats_by_provider_ids(&[])
@@ -3535,6 +3637,7 @@ mod tests {
         }
     }
 
+    /// 在配置测试数据库时验证 MySQL Provider Catalog 的完整读写与轻量投影。
     #[tokio::test]
     async fn mysql_provider_catalog_repository_round_trips_when_url_is_set() {
         let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
@@ -3666,6 +3769,17 @@ mod tests {
             .await
             .expect("key should create");
         assert_eq!(created_key.concurrent_limit, Some(3));
+
+        let auth_maintenance_candidates = repository
+            .list_auth_maintenance_candidates_by_provider_ids(std::slice::from_ref(&provider_id))
+            .await
+            .expect("auth maintenance candidates should list");
+        assert_eq!(auth_maintenance_candidates.len(), 1);
+        assert!(auth_maintenance_candidates[0].has_auth_config);
+        assert_eq!(
+            auth_maintenance_candidates[0].expires_at_unix_secs,
+            Some(1_730_000_000)
+        );
 
         sqlx::query("UPDATE provider_api_keys SET status_snapshot = '' WHERE id = ?")
             .bind(&key_id)

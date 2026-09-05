@@ -7,7 +7,8 @@ use std::time::Duration;
 use aether_cache::ExpiringMap;
 use aether_data::DataLayerError;
 use aether_data_contracts::repository::provider_catalog::{
-    ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, StoredProviderCatalogEndpoint,
+    ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
+    StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
     StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
     StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
@@ -400,6 +401,16 @@ impl ProviderCatalogReadRepository for CachedProviderCatalogReadRepository {
         }
     }
 
+    /// 认证维护扫描必须绕过目录缓存，避免逐 Key 写入失效时反复保留整批结果。
+    async fn list_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogAuthMaintenanceCandidate>, DataLayerError> {
+        self.inner
+            .list_auth_maintenance_candidates_by_provider_ids(provider_ids)
+            .await
+    }
+
     async fn list_keys_page(
         &self,
         query: &ProviderCatalogKeyListQuery,
@@ -610,6 +621,50 @@ mod tests {
             .await
             .expect("strong key read should succeed");
         assert_eq!(strong[0].upstream_metadata.as_ref(), Some(&new_metadata));
+    }
+
+    /// 验证认证维护投影不会被目录缓存保存，底层凭据状态变化可立即被下一次扫描看到。
+    #[tokio::test]
+    async fn auth_maintenance_candidates_bypass_catalog_cache() {
+        let key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "key-1".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should be valid");
+        let inner = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider("provider-1")],
+            Vec::new(),
+            vec![key],
+        ));
+        let cache = CachedProviderCatalogReadRepository::new(inner.clone());
+        let provider_ids = vec!["provider-1".to_string()];
+
+        let first = cache
+            .list_auth_maintenance_candidates_by_provider_ids(&provider_ids)
+            .await
+            .expect("initial maintenance candidates should read");
+        assert!(!first[0].has_auth_config);
+
+        assert!(inner
+            .update_key_oauth_credentials(
+                "key-1",
+                "encrypted-api-key",
+                Some("encrypted-auth-config"),
+                Some(120),
+            )
+            .await
+            .expect("inner OAuth credential update should succeed"));
+
+        let refreshed = cache
+            .list_auth_maintenance_candidates_by_provider_ids(&provider_ids)
+            .await
+            .expect("refreshed maintenance candidates should read");
+        assert!(refreshed[0].has_auth_config);
+        assert_eq!(refreshed[0].expires_at_unix_secs, Some(120));
     }
 
     #[tokio::test]

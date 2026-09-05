@@ -6,7 +6,8 @@ use super::{
     ProviderCatalogKeyOAuthRuntimeStateCasUpdate, ProviderCatalogKeyRuntimeMetadataUpdate,
     ProviderCatalogKeySchedulingStateCasUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
     PublicHealthStatusCount, PublicHealthTimelineBucket, StoredGeminiFileMapping,
-    StoredGeminiFileMappingListPage, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredGeminiFileMappingListPage, StoredProviderCatalogAuthMaintenanceCandidate,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider, StoredRequestCandidate,
     UpsertGeminiFileMappingRecord, UpsertRequestCandidateRecord,
@@ -325,6 +326,21 @@ impl GatewayDataState {
             Some(repository) => {
                 repository
                     .list_key_maintenance_summaries_by_provider_ids(provider_ids)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 读取认证维护轻量候选；缓存包装层会直接委托底层仓储而不缓存结果。
+    pub(crate) async fn list_provider_catalog_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogAuthMaintenanceCandidate>, DataLayerError> {
+        match &self.provider_catalog_reader {
+            Some(repository) => {
+                repository
+                    .list_auth_maintenance_candidates_by_provider_ids(provider_ids)
                     .await
             }
             None => Ok(Vec::new()),

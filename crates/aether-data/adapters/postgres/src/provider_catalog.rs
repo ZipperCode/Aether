@@ -15,9 +15,9 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeySchedulingStateCasUpdate,
     ProviderCatalogKeyStatusSnapshotUpdate, ProviderCatalogReadRepository,
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -340,6 +340,23 @@ SELECT
   provider_id,
   is_active,
   upstream_metadata
+FROM provider_api_keys
+WHERE provider_id IN (
+"#;
+
+const LIST_AUTH_MAINTENANCE_CANDIDATES_BY_PROVIDER_IDS_PREFIX: &str = r#"
+SELECT
+  id,
+  provider_id,
+  is_active,
+  auth_type,
+  CASE
+    WHEN NULLIF(BTRIM(auth_config), '') IS NULL THEN FALSE
+    ELSE TRUE
+  END AS has_auth_config,
+  EXTRACT(EPOCH FROM expires_at)::bigint AS expires_at_unix_secs,
+  EXTRACT(EPOCH FROM oauth_invalid_at)::bigint AS oauth_invalid_at_unix_secs,
+  oauth_invalid_reason
 FROM provider_api_keys
 WHERE provider_id IN (
 "#;
@@ -819,6 +836,28 @@ impl SqlxProviderCatalogReadRepository {
             .build()
             .fetch(&self.pool),
             map_key_maintenance_summary_row,
+        )
+        .await
+    }
+
+    /// 只读取认证维护资格字段，密文和大型运行态 JSON 不进入查询结果。
+    pub async fn list_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogAuthMaintenanceCandidate>, DataLayerError> {
+        if provider_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        collect_query_rows(
+            build_list_query(
+                LIST_AUTH_MAINTENANCE_CANDIDATES_BY_PROVIDER_IDS_PREFIX,
+                provider_ids,
+                " ORDER BY provider_id ASC, id ASC",
+            )
+            .build()
+            .fetch(&self.pool),
+            map_auth_maintenance_candidate_row,
         )
         .await
     }
@@ -2918,6 +2957,14 @@ impl ProviderCatalogReadRepository for SqlxProviderCatalogReadRepository {
         Self::list_key_maintenance_summaries_by_provider_ids(self, provider_ids).await
     }
 
+    /// 将统一仓储契约委托给 PostgreSQL 的轻量认证维护投影。
+    async fn list_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogAuthMaintenanceCandidate>, DataLayerError> {
+        Self::list_auth_maintenance_candidates_by_provider_ids(self, provider_ids).await
+    }
+
     async fn list_keys_page(
         &self,
         query: &ProviderCatalogKeyListQuery,
@@ -3449,6 +3496,24 @@ fn map_key_maintenance_summary_row(
     })
 }
 
+/// 将 PostgreSQL 轻量结果行映射为认证维护候选，不接触完整凭据列。
+fn map_auth_maintenance_candidate_row(
+    row: &PgRow,
+) -> Result<StoredProviderCatalogAuthMaintenanceCandidate, DataLayerError> {
+    Ok(StoredProviderCatalogAuthMaintenanceCandidate {
+        id: row_get(row, "id")?,
+        provider_id: row_get(row, "provider_id")?,
+        is_active: row_get(row, "is_active")?,
+        auth_type: row_get(row, "auth_type")?,
+        has_auth_config: row_get(row, "has_auth_config")?,
+        expires_at_unix_secs: row_get::<Option<i64>>(row, "expires_at_unix_secs")?
+            .and_then(|value| u64::try_from(value).ok()),
+        oauth_invalid_at_unix_secs: row_get::<Option<i64>>(row, "oauth_invalid_at_unix_secs")?
+            .and_then(|value| u64::try_from(value).ok()),
+        oauth_invalid_reason: row_get(row, "oauth_invalid_reason")?,
+    })
+}
+
 fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> {
     let rpm_limit = row_get::<Option<i32>>(row, "rpm_limit")?
         .map(|value| {
@@ -3710,6 +3775,32 @@ mod tests {
         }
     }
 
+    /// 验证认证维护 SELECT 只输出轻量资格字段，不返回密文或大型 JSON。
+    #[test]
+    fn auth_maintenance_candidate_query_excludes_secret_and_heavy_columns() {
+        let projection = super::LIST_AUTH_MAINTENANCE_CANDIDATES_BY_PROVIDER_IDS_PREFIX
+            .split("FROM provider_api_keys")
+            .next()
+            .expect("auth maintenance query should contain a FROM clause")
+            .to_ascii_lowercase();
+
+        assert!(projection.contains("as has_auth_config"));
+        for forbidden in [
+            "api_key",
+            "encrypted_key",
+            "upstream_metadata",
+            "status_snapshot",
+        ] {
+            assert!(
+                !projection.contains(forbidden),
+                "unexpected column: {forbidden}"
+            );
+        }
+        assert!(!projection
+            .lines()
+            .any(|line| line.trim().trim_end_matches(',') == "auth_config"));
+    }
+
     #[test]
     fn provider_api_keys_concurrent_limit_queries_include_field() {
         for sql in [
@@ -3785,6 +3876,7 @@ mod tests {
         ));
     }
 
+    /// 在配置测试数据库时验证 PostgreSQL 状态兼容及轻量认证维护投影。
     #[tokio::test]
     async fn postgres_quota_snapshot_normalizes_scalar_status_when_url_is_set() {
         let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
@@ -3840,6 +3932,13 @@ mod tests {
             .create_key(&key)
             .await
             .expect("key should create");
+
+        let auth_maintenance_candidates = repository
+            .list_auth_maintenance_candidates_by_provider_ids(std::slice::from_ref(&provider_id))
+            .await
+            .expect("auth maintenance candidates should list");
+        assert_eq!(auth_maintenance_candidates.len(), 1);
+        assert!(!auth_maintenance_candidates[0].has_auth_config);
 
         repository
             .mutate_key_quota_snapshot(

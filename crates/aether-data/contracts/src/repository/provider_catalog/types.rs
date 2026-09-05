@@ -493,6 +493,47 @@ pub struct StoredProviderCatalogKeyMaintenanceSummary {
     pub upstream_metadata: Option<serde_json::Value>,
 }
 
+/// 认证维护扫描使用的轻量 Key 投影，避免把密文和大型运行态 JSON 拉入内存。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredProviderCatalogAuthMaintenanceCandidate {
+    /// Provider Key 的稳定标识，用于取得许可后执行单 Key 强读取。
+    pub id: String,
+    /// Key 所属 Provider 的稳定标识，用于匹配 Provider 类型和 Endpoint。
+    pub provider_id: String,
+    /// 管理员是否启用了该 Key；禁用项不得进入认证维护执行阶段。
+    pub is_active: bool,
+    /// Key 的认证类型，仅用于轻量候选资格判断，不包含认证材料。
+    pub auth_type: String,
+    /// 数据库中是否存在非空认证配置；该布尔值不会暴露配置密文。
+    pub has_auth_config: bool,
+    /// OAuth 凭证过期时间，Unix 秒；缺失时由具体 Provider 的恢复规则决定。
+    pub expires_at_unix_secs: Option<u64>,
+    /// 最近一次 OAuth 失效时间，Unix 秒；存在时普通自动刷新候选会被排除。
+    pub oauth_invalid_at_unix_secs: Option<u64>,
+    /// OAuth 失效原因，仅用于识别允许后台恢复的受控状态。
+    pub oauth_invalid_reason: Option<String>,
+}
+
+impl From<&StoredProviderCatalogKey> for StoredProviderCatalogAuthMaintenanceCandidate {
+    /// 从完整 Key 生成不携带任何密文或大型 JSON 的维护候选。
+    fn from(key: &StoredProviderCatalogKey) -> Self {
+        Self {
+            id: key.id.clone(),
+            provider_id: key.provider_id.clone(),
+            is_active: key.is_active,
+            auth_type: key.auth_type.clone(),
+            has_auth_config: key
+                .encrypted_auth_config
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty()),
+            expires_at_unix_secs: key.expires_at_unix_secs,
+            oauth_invalid_at_unix_secs: key.oauth_invalid_at_unix_secs,
+            oauth_invalid_reason: key.oauth_invalid_reason.clone(),
+        }
+    }
+}
+
 impl StoredProviderCatalogKey {
     pub fn new(
         id: String,
@@ -838,6 +879,17 @@ pub trait ProviderCatalogReadRepository: Send + Sync {
         &self,
         provider_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogKeyMaintenanceSummary>, crate::DataLayerError>;
+
+    /// 按 Provider 批量读取认证维护轻量候选；生产仓储必须覆盖实现并只投影资格字段。
+    async fn list_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        _provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogAuthMaintenanceCandidate>, crate::DataLayerError> {
+        Err(crate::DataLayerError::InvalidConfiguration(
+            "provider catalog auth maintenance candidate projection is not supported by this repository"
+                .to_string(),
+        ))
+    }
 
     async fn list_keys_page(
         &self,

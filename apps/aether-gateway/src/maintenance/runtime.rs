@@ -10,6 +10,8 @@ use crate::{AppState, GatewayError};
 mod account_self_check;
 #[path = "runtime/audit_cleanup.rs"]
 mod audit_cleanup;
+#[path = "runtime/auth_maintenance.rs"]
+mod auth_maintenance;
 #[path = "runtime/cleanup_runs.rs"]
 mod cleanup_runs;
 #[path = "runtime/config.rs"]
@@ -66,6 +68,7 @@ pub(crate) use aether_data_contracts::repository::usage::{
     UsageCleanupSummary, UsageCleanupWindow,
 };
 use audit_cleanup::*;
+use auth_maintenance::{shared_auth_maintenance_gate, AuthMaintenanceGate};
 pub(crate) use cleanup_runs::{
     list_admin_cleanup_run_records, record_admin_cleanup_run, record_completed_cleanup_run,
     record_failed_cleanup_run, start_admin_request_body_cleanup_task,

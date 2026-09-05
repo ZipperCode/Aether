@@ -11,7 +11,7 @@ pub use types::{
     ProviderCatalogKeySchedulingStateCasUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
     ProviderCatalogReadRepository, ProviderCatalogUpstreamMetadataNamespaceExpectation,
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };

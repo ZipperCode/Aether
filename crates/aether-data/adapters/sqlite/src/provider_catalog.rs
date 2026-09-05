@@ -14,9 +14,9 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeySchedulingStateCasUpdate,
     ProviderCatalogKeyStatusSnapshotUpdate, ProviderCatalogReadRepository,
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -301,6 +301,23 @@ FROM provider_api_keys
 WHERE provider_id IN (
 "#;
 
+const LIST_AUTH_MAINTENANCE_CANDIDATES_BY_PROVIDER_IDS_PREFIX: &str = r#"
+SELECT
+  id,
+  provider_id,
+  is_active,
+  auth_type,
+  CASE
+    WHEN NULLIF(TRIM(auth_config), '') IS NULL THEN FALSE
+    ELSE TRUE
+  END AS has_auth_config,
+  expires_at AS expires_at_unix_secs,
+  oauth_invalid_at AS oauth_invalid_at_unix_secs,
+  oauth_invalid_reason
+FROM provider_api_keys
+WHERE provider_id IN (
+"#;
+
 #[derive(Debug, Clone)]
 pub struct SqliteProviderCatalogReadRepository {
     pool: SqlitePool,
@@ -464,6 +481,29 @@ impl SqliteProviderCatalogReadRepository {
         .await
         .map_sql_err()?;
         rows.iter().map(map_key_maintenance_summary_row).collect()
+    }
+
+    /// 只读取认证维护资格字段，密文和大型运行态 JSON 不进入查询结果。
+    pub async fn list_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogAuthMaintenanceCandidate>, DataLayerError> {
+        if provider_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = build_list_query(
+            LIST_AUTH_MAINTENANCE_CANDIDATES_BY_PROVIDER_IDS_PREFIX,
+            provider_ids,
+            " ORDER BY provider_id ASC, id ASC",
+        )
+        .build()
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        rows.iter()
+            .map(map_auth_maintenance_candidate_row)
+            .collect()
     }
 
     pub async fn list_keys_page(
@@ -2323,6 +2363,14 @@ impl ProviderCatalogReadRepository for SqliteProviderCatalogReadRepository {
         Self::list_key_maintenance_summaries_by_provider_ids(self, provider_ids).await
     }
 
+    /// 将统一仓储契约委托给 SQLite 的轻量认证维护投影。
+    async fn list_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogAuthMaintenanceCandidate>, DataLayerError> {
+        Self::list_auth_maintenance_candidates_by_provider_ids(self, provider_ids).await
+    }
+
     async fn list_keys_page(
         &self,
         query: &ProviderCatalogKeyListQuery,
@@ -3335,6 +3383,28 @@ fn map_key_maintenance_summary_row(
     })
 }
 
+/// 将 SQLite 轻量结果行映射为认证维护候选，不解析任何密文或大型 JSON。
+fn map_auth_maintenance_candidate_row(
+    row: &SqliteRow,
+) -> Result<StoredProviderCatalogAuthMaintenanceCandidate, DataLayerError> {
+    Ok(StoredProviderCatalogAuthMaintenanceCandidate {
+        id: row.try_get("id").map_sql_err()?,
+        provider_id: row.try_get("provider_id").map_sql_err()?,
+        is_active: row.try_get("is_active").map_sql_err()?,
+        auth_type: row.try_get("auth_type").map_sql_err()?,
+        has_auth_config: row.try_get("has_auth_config").map_sql_err()?,
+        expires_at_unix_secs: optional_u64(
+            row.try_get("expires_at_unix_secs").map_sql_err()?,
+            "provider_api_keys.expires_at",
+        )?,
+        oauth_invalid_at_unix_secs: optional_u64(
+            row.try_get("oauth_invalid_at_unix_secs").map_sql_err()?,
+            "provider_api_keys.oauth_invalid_at",
+        )?,
+        oauth_invalid_reason: row.try_get("oauth_invalid_reason").map_sql_err()?,
+    })
+}
+
 fn map_key_row(row: &SqliteRow) -> Result<StoredProviderCatalogKey, DataLayerError> {
     let total_cost_usd = sqlite_optional_real(row, "total_cost_usd")?.unwrap_or(0.0);
     if !total_cost_usd.is_finite() {
@@ -3541,6 +3611,32 @@ mod tests {
         StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
     use serde_json::json;
+
+    /// 验证认证维护 SELECT 只输出轻量资格字段，不返回密文或大型 JSON。
+    #[test]
+    fn auth_maintenance_candidate_query_excludes_secret_and_heavy_columns() {
+        let projection = super::LIST_AUTH_MAINTENANCE_CANDIDATES_BY_PROVIDER_IDS_PREFIX
+            .split("FROM provider_api_keys")
+            .next()
+            .expect("auth maintenance query should contain a FROM clause")
+            .to_ascii_lowercase();
+
+        assert!(projection.contains("as has_auth_config"));
+        for forbidden in [
+            "api_key",
+            "encrypted_key",
+            "upstream_metadata",
+            "status_snapshot",
+        ] {
+            assert!(
+                !projection.contains(forbidden),
+                "unexpected column: {forbidden}"
+            );
+        }
+        assert!(!projection
+            .lines()
+            .any(|line| line.trim().trim_end_matches(',') == "auth_config"));
+    }
 
     #[tokio::test]
     async fn sqlite_admin_credential_cas_rotates_codex_namespace_atomically() {
@@ -3791,6 +3887,7 @@ mod tests {
         assert_eq!(stored.encrypted_auth_config.as_deref(), Some("auth-v1"));
     }
 
+    /// 验证 SQLite 实际连接可以解码 Provider Catalog 的各类只读投影。
     #[tokio::test]
     async fn sqlite_repository_reads_provider_catalog_contract_views() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -3828,6 +3925,15 @@ mod tests {
         assert_eq!(keys[0].total_tokens, 1234);
         assert_eq!(keys[0].total_response_time_ms, Some(u32::MAX as u64 + 1));
         assert_eq!(keys[0].concurrent_limit, Some(3));
+
+        let auth_maintenance_candidates = repository
+            .list_auth_maintenance_candidates_by_provider_ids(&["provider-1".to_string()])
+            .await
+            .expect("auth maintenance candidates should list");
+        assert_eq!(auth_maintenance_candidates.len(), 1);
+        assert_eq!(auth_maintenance_candidates[0].id, "key-1");
+        assert_eq!(auth_maintenance_candidates[0].auth_type, "api_key");
+        assert!(!auth_maintenance_candidates[0].has_auth_config);
 
         let page = repository
             .list_keys_page(&ProviderCatalogKeyListQuery {

@@ -11,9 +11,9 @@ pub(crate) use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, ProviderCatalogSnapshot,
     ProviderCatalogUpstreamMetadataNamespaceExpectation,
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 #[cfg(feature = "mysql")]
 pub use aether_data_mysql::MysqlProviderCatalogReadRepository;

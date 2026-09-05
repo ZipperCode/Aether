@@ -568,6 +568,18 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    /// 向认证维护 worker 暴露不含密文和大型运行态 JSON 的轻量候选。
+    pub(crate) async fn list_provider_catalog_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<provider_catalog::StoredProviderCatalogAuthMaintenanceCandidate>, GatewayError>
+    {
+        self.data
+            .list_provider_catalog_auth_maintenance_candidates_by_provider_ids(provider_ids)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn list_provider_catalog_keys_by_ids(
         &self,
         key_ids: &[String],

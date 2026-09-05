@@ -1,5 +1,49 @@
 use super::*;
 
+/// 确认普通文本规划器只暴露按需 attempt source，避免重新引入全候选请求体构造入口。
+#[test]
+fn ordinary_text_candidate_planners_do_not_expose_eager_plan_vectors() {
+    for root in [
+        "apps/aether-gateway/src/ai_serving/planner/standard/openai/chat",
+        "apps/aether-gateway/src/ai_serving/planner/standard/openai/responses",
+        "apps/aether-gateway/src/ai_serving/planner/standard/family",
+        "apps/aether-gateway/src/ai_serving/planner/passthrough/provider",
+    ] {
+        for file in collect_workspace_rust_files(root) {
+            let source = std::fs::read_to_string(&file).expect("source file should be readable");
+            assert!(
+                !source.contains("plan_and_reports"),
+                "{} must keep ordinary text candidates lazy; eager plan vector API remains",
+                file.display()
+            );
+        }
+    }
+
+    for path in [
+        "apps/aether-gateway/src/ai_serving/api.rs",
+        "apps/aether-gateway/src/ai_serving/mod.rs",
+        "apps/aether-gateway/src/ai_serving/planner/mod.rs",
+        "apps/aether-gateway/src/executor/orchestration.rs",
+    ] {
+        let source = read_workspace_file(path);
+        for symbol in [
+            "build_local_openai_chat_sync_plan_and_reports_for_kind",
+            "build_local_openai_chat_stream_plan_and_reports_for_kind",
+            "build_local_openai_responses_sync_plan_and_reports_for_kind",
+            "build_local_openai_responses_stream_plan_and_reports_for_kind",
+            "build_standard_family_sync_plan_and_reports",
+            "build_standard_family_stream_plan_and_reports",
+            "build_local_same_format_sync_plan_and_reports",
+            "build_local_same_format_stream_plan_and_reports",
+        ] {
+            assert!(
+                !source.contains(symbol),
+                "{path} must not expose eager ordinary-text candidate API {symbol}"
+            );
+        }
+    }
+}
+
 #[test]
 fn specialized_decisions_embed_provider_failover_policy_in_report_context() {
     for path in [

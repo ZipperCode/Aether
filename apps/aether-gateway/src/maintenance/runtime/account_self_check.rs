@@ -24,6 +24,8 @@ use crate::handlers::shared::provider_pool::{
 };
 use crate::{AppState, GatewayError};
 
+use super::{shared_auth_maintenance_gate, AuthMaintenanceGate};
+
 const ACCOUNT_SELF_CHECK_REDIS_PREFIX: &str = "ap:account_self_check:last";
 const ACCOUNT_SELF_CHECK_LOCK_TTL_MS: u64 = 30_000;
 const ACCOUNT_SELF_CHECK_DEFAULT_SCAN_INTERVAL_SECONDS: u64 = 60;
@@ -304,35 +306,36 @@ pub(crate) fn select_account_self_check_key_ids(
         .collect()
 }
 
-async fn select_keys_for_provider(
+/// 在 Provider 分布式锁内选出到期的轻量 Key ID，不提前读取或保留完整凭据。
+async fn select_key_ids_for_provider(
     state: &AppState,
     runtime: &RuntimeState,
     provider: &StoredProviderCatalogProvider,
     interval_seconds: u64,
     max_keys_per_provider: usize,
     now_ts: u64,
-) -> Result<Vec<StoredProviderCatalogKey>, GatewayError> {
+) -> Result<Vec<String>, GatewayError> {
     let lease = acquire_provider_self_check_lock(runtime, &provider.id).await;
     if lease.is_none() {
         return Ok(Vec::new());
     }
 
     let result = async {
-        let summaries = state
-            .list_provider_catalog_key_maintenance_summaries_by_provider_ids(std::slice::from_ref(
-                &provider.id,
-            ))
+        let candidates = state
+            .list_provider_catalog_auth_maintenance_candidates_by_provider_ids(
+                std::slice::from_ref(&provider.id),
+            )
             .await?
             .into_iter()
-            .filter(|summary| summary.is_active)
+            .filter(|candidate| candidate.is_active && candidate.provider_id == provider.id)
             .collect::<Vec<_>>();
-        if summaries.is_empty() {
+        if candidates.is_empty() {
             return Ok(Vec::new());
         }
 
-        let key_ids = summaries
+        let key_ids = candidates
             .iter()
-            .map(|summary| summary.id.clone())
+            .map(|candidate| candidate.id.clone())
             .collect::<Vec<_>>();
         let check_stamps = load_check_timestamps(runtime, &provider.id, &key_ids).await;
         let selected_ids = select_account_self_check_key_ids(
@@ -354,18 +357,7 @@ async fn select_keys_for_provider(
             interval_seconds,
         )
         .await;
-
-        let mut keys_by_id = state
-            .list_provider_catalog_keys_by_ids_strong(&selected_ids)
-            .await?
-            .into_iter()
-            .map(|key| (key.id.clone(), key))
-            .collect::<BTreeMap<_, _>>();
-        Ok(selected_ids
-            .into_iter()
-            .filter_map(|key_id| keys_by_id.remove(&key_id))
-            .filter(|key| !provider_pool_key_runtime_quota_blocked(key))
-            .collect::<Vec<_>>())
+        Ok(selected_ids)
     }
     .await;
 
@@ -483,6 +475,63 @@ async fn perform_quota_refresh_check(
     )
     .await?;
     Ok(quota_payload_result_for_key(&key_id, payload))
+}
+
+/// 在共享许可内强读取并复核单个 Key，执行额度/OAuth 自检并完成对应状态持久化。
+async fn perform_account_self_check_candidate_under_gate(
+    state: &AppState,
+    admin_state: &AdminAppState<'_>,
+    provider: &StoredProviderCatalogProvider,
+    endpoint: &StoredProviderCatalogEndpoint,
+    provider_type: &str,
+    key_id: String,
+    attempted_at: u64,
+    serving_policy: ProviderQuotaServingPolicy,
+    gate: AuthMaintenanceGate,
+) -> Result<Option<AccountSelfCheckOutcome>, GatewayError> {
+    let _permit = gate.acquire().await?;
+    let Some(key) = state
+        .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(&key_id))
+        .await?
+        .into_iter()
+        .find(|key| key.id == key_id && key.provider_id == provider.id)
+    else {
+        // 与旧版批量强读保持一致：已删除 Key 不进入 selected/scanned 汇总。
+        return Ok(None);
+    };
+    if !key.is_active || provider_pool_key_runtime_quota_blocked(&key) {
+        // 资格在轻量选中后发生变化时只跳过本 Key，不把它伪计为一次检查。
+        return Ok(None);
+    }
+
+    if matches!(serving_policy, ProviderQuotaServingPolicy::ServingProbe) {
+        record_score_probe_in_progress_for_key(state, &provider.id, &key.id, attempted_at).await;
+    }
+    let outcome = match perform_quota_refresh_check(
+        admin_state,
+        provider,
+        endpoint,
+        provider_type,
+        key,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => AccountSelfCheckOutcome::Failed {
+            status_code: None,
+            message: gateway_error_message(err),
+        },
+    };
+    record_score_probe_result_for_key(
+        state,
+        &provider.id,
+        &key_id,
+        attempted_at,
+        &outcome,
+        serving_policy,
+    )
+    .await;
+    Ok(Some(outcome))
 }
 
 async fn record_score_probe_in_progress_for_key(
@@ -776,6 +825,20 @@ fn update_summary_from_outcome(
     }
 }
 
+/// 合并一个强读复核后的候选结果；返回该候选是否应计入本轮 selected/scanned。
+fn update_summary_from_revalidated_candidate(
+    summary: &mut AccountSelfCheckRunSummary,
+    outcome: Option<&AccountSelfCheckOutcome>,
+) -> bool {
+    let Some(outcome) = outcome else {
+        return false;
+    };
+    summary.scanned_keys = summary.scanned_keys.saturating_add(1);
+    summary.selected_keys = summary.selected_keys.saturating_add(1);
+    update_summary_from_outcome(summary, outcome);
+    true
+}
+
 /// 解析账户自检配置；ObservationOnly 余额提供商默认启用，其他策略仍遵循显式开关。
 fn account_self_check_config_for_provider(
     provider: &StoredProviderCatalogProvider,
@@ -797,6 +860,20 @@ fn account_self_check_config_for_provider(
 pub(crate) async fn perform_account_self_check_once_with_config(
     state: &AppState,
     config: AccountSelfCheckWorkerConfig,
+) -> Result<AccountSelfCheckRunSummary, GatewayError> {
+    perform_account_self_check_once_with_config_and_gate(
+        state,
+        config,
+        shared_auth_maintenance_gate(),
+    )
+    .await
+}
+
+/// 以指定共享闸门执行一轮账号自检，供测试隔离验证跨 worker 的并发边界。
+async fn perform_account_self_check_once_with_config_and_gate(
+    state: &AppState,
+    config: AccountSelfCheckWorkerConfig,
+    gate: AuthMaintenanceGate,
 ) -> Result<AccountSelfCheckRunSummary, GatewayError> {
     if !state.has_provider_catalog_data_reader() || !state.has_provider_catalog_data_writer() {
         return Ok(AccountSelfCheckRunSummary::empty());
@@ -861,7 +938,7 @@ pub(crate) async fn perform_account_self_check_once_with_config(
             .clamp(1, 1440)
             .saturating_mul(60);
         let provider_limit = config.max_keys_per_provider;
-        let keys = select_keys_for_provider(
+        let key_ids = select_key_ids_for_provider(
             state,
             state.runtime_state.as_ref(),
             &provider,
@@ -870,66 +947,55 @@ pub(crate) async fn perform_account_self_check_once_with_config(
             now_ts,
         )
         .await?;
-        if keys.is_empty() {
+        if key_ids.is_empty() {
             continue;
-        }
-
-        let selected_count = keys.len();
-        summary.scanned_keys = summary.scanned_keys.saturating_add(selected_count);
-        summary.selected_keys = summary.selected_keys.saturating_add(selected_count);
-        summary.providers_checked_with_keys = summary.providers_checked_with_keys.saturating_add(1);
-        if matches!(serving_policy, ProviderQuotaServingPolicy::ServingProbe) {
-            for key in &keys {
-                record_score_probe_in_progress_for_key(state, &provider.id, &key.id, now_ts).await;
-            }
         }
 
         let provider_short_id = provider.id.chars().take(8).collect::<String>();
         let concurrency = (pool_config.account_self_check_concurrency as usize)
             .clamp(1, 64)
             .min(config.global_concurrency)
+            .min(gate.concurrency())
             .max(1);
-        let check_results = stream::iter(keys.into_iter().map(|key| {
-            let admin_state = &admin_state;
-            let provider = &provider;
-            let endpoint = &endpoint;
-            let provider_type = provider_type.as_str();
+        let admin_state_ref = &admin_state;
+        let provider_ref = &provider;
+        let endpoint_ref = &endpoint;
+        let provider_type_ref = provider_type.as_str();
+        let check_results = stream::iter(key_ids.into_iter().map(|key_id| {
+            let gate = gate.clone();
             async move {
-                let key_for_check = key.clone();
-                let result = perform_quota_refresh_check(
-                    admin_state,
-                    provider,
-                    endpoint,
-                    provider_type,
-                    key_for_check,
+                perform_account_self_check_candidate_under_gate(
+                    state,
+                    admin_state_ref,
+                    provider_ref,
+                    endpoint_ref,
+                    provider_type_ref,
+                    key_id,
+                    now_ts,
+                    serving_policy,
+                    gate,
                 )
-                .await;
-                (key, result)
+                .await
             }
         }))
         .buffer_unordered(concurrency)
         .collect::<Vec<_>>()
         .await;
 
-        for (key, result) in check_results {
-            let outcome = match result {
-                Ok(outcome) => outcome,
-                Err(err) => AccountSelfCheckOutcome::Failed {
-                    status_code: None,
-                    message: gateway_error_message(err),
-                },
-            };
-            record_score_probe_result_for_key(
-                state,
-                &provider.id,
-                &key.id,
-                now_ts,
-                &outcome,
-                serving_policy,
-            )
-            .await;
-            update_summary_from_outcome(&mut summary, &outcome);
+        let mut selected_count = 0usize;
+        for result in check_results {
+            // 强读仓储错误沿用旧版边界：终止本轮，而不是伪装为上游检查失败。
+            let outcome = result?;
+            if update_summary_from_revalidated_candidate(&mut summary, outcome.as_ref()) {
+                selected_count = selected_count.saturating_add(1);
+            }
         }
+
+        // 只有强读后仍具备资格的 Key 才沿用旧版 selected/scanned 统计口径。
+        if selected_count == 0 {
+            continue;
+        }
+        summary.providers_checked_with_keys = summary.providers_checked_with_keys.saturating_add(1);
 
         info!(
             provider_id = %provider_short_id,
@@ -943,6 +1009,7 @@ pub(crate) async fn perform_account_self_check_once_with_config(
     Ok(summary)
 }
 
+/// 使用环境配置与进程级共享闸门执行一轮账号自检。
 pub(crate) async fn perform_account_self_check_once(
     state: &AppState,
 ) -> Result<AccountSelfCheckRunSummary, GatewayError> {
@@ -997,7 +1064,8 @@ mod tests {
     use super::{
         account_self_check_config_for_provider, quota_payload_result_for_key,
         record_score_probe_result_for_key, select_account_self_check_key_ids,
-        update_summary_from_outcome, AccountSelfCheckOutcome, AccountSelfCheckRunSummary,
+        update_summary_from_outcome, update_summary_from_revalidated_candidate,
+        AccountSelfCheckOutcome, AccountSelfCheckRunSummary,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1128,6 +1196,20 @@ mod tests {
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.blocked, 0);
+    }
+
+    #[test]
+    fn revalidation_skip_is_not_counted_as_selected_or_scanned() {
+        // 轻量选中后已删除、停用或额度封禁的 Key 不属于旧版强读后的最终候选集。
+        let mut summary = AccountSelfCheckRunSummary::empty();
+
+        let counted = update_summary_from_revalidated_candidate(&mut summary, None);
+
+        assert!(!counted);
+        assert_eq!(summary.scanned_keys, 0);
+        assert_eq!(summary.selected_keys, 0);
+        assert_eq!(summary.succeeded, 0);
+        assert_eq!(summary.failed, 0);
     }
 
     #[tokio::test]

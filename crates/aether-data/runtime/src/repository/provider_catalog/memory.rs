@@ -13,9 +13,9 @@ use super::{
     ProviderCatalogKeySchedulingStateCasUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
     ProviderCatalogReadRepository, ProviderCatalogSnapshot,
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use crate::repository::usage::{ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta};
 use crate::DataLayerError;
@@ -396,6 +396,29 @@ impl ProviderCatalogReadRepository for InMemoryProviderCatalogReadRepository {
         Ok(self
             .snapshot()
             .list_key_maintenance_summaries_by_provider_ids(provider_ids))
+    }
+
+    /// 在共享索引读锁内直接投影认证维护字段，避免克隆整个完整 Key 目录。
+    async fn list_auth_maintenance_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogAuthMaintenanceCandidate>, DataLayerError> {
+        let index = self
+            .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut candidates = index
+            .keys
+            .values()
+            .filter(|key| provider_ids.contains(&key.provider_id))
+            .map(StoredProviderCatalogAuthMaintenanceCandidate::from)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.provider_id
+                .cmp(&right.provider_id)
+                .then(left.id.cmp(&right.id))
+        });
+        Ok(candidates)
     }
 
     async fn list_keys_page(
@@ -1639,6 +1662,45 @@ mod tests {
                 .expect("keys should read")
                 .len(),
             1
+        );
+    }
+
+    /// 验证内存仓储只返回认证维护资格字段，并正确区分空白认证配置。
+    #[tokio::test]
+    async fn auth_maintenance_candidates_are_lightweight_and_ordered() {
+        let mut first = sample_key("key-b", "provider-1");
+        first.auth_type = "oauth".to_string();
+        first.encrypted_auth_config = Some("encrypted-secret".repeat(1_024));
+        first.expires_at_unix_secs = Some(120);
+        first.oauth_invalid_at_unix_secs = Some(90);
+        first.oauth_invalid_reason = Some("refresh_failed".to_string());
+        first.upstream_metadata = Some(json!({"large": "metadata".repeat(1_024)}));
+        first.status_snapshot = Some(json!({"large": "status".repeat(1_024)}));
+
+        let mut second = sample_key("key-a", "provider-1");
+        second.auth_type = "oauth".to_string();
+        second.encrypted_auth_config = Some("   ".to_string());
+
+        let repository = InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider("provider-1")],
+            Vec::new(),
+            vec![first, second],
+        );
+        let candidates = repository
+            .list_auth_maintenance_candidates_by_provider_ids(&["provider-1".to_string()])
+            .await
+            .expect("auth maintenance candidates should read");
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].id, "key-a");
+        assert!(!candidates[0].has_auth_config);
+        assert_eq!(candidates[1].id, "key-b");
+        assert!(candidates[1].has_auth_config);
+        assert_eq!(candidates[1].expires_at_unix_secs, Some(120));
+        assert_eq!(candidates[1].oauth_invalid_at_unix_secs, Some(90));
+        assert_eq!(
+            candidates[1].oauth_invalid_reason.as_deref(),
+            Some("refresh_failed")
         );
     }
 
