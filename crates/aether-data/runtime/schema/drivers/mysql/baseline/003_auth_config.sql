@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS system_configs (
     `key` VARCHAR(255) NOT NULL,
     value TEXT NOT NULL,
     description TEXT,
+    revision BIGINT NOT NULL DEFAULT 0,
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL,
     UNIQUE KEY system_configs_key_key (`key`)

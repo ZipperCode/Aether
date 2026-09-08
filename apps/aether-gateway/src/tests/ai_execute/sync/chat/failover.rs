@@ -80,6 +80,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:chat": 1})),
+            routing_facts: Default::default(),
             model_id: "model-openai-skip-local-1".to_string(),
             global_model_id: "global-model-openai-skip-local-1".to_string(),
             global_model_name: "gpt-5".to_string(),
@@ -490,6 +491,7 @@ async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_ch
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:chat": 1})),
+            routing_facts: Default::default(),
             model_id: "model-openai-local-miss-1".to_string(),
             global_model_id: "global-model-openai-local-miss-1".to_string(),
             global_model_name: "gpt-5".to_string(),
@@ -771,6 +773,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
             key_global_priority_by_format: Some(
                 serde_json::json!({"openai:chat": global_priority}),
             ),
+            routing_facts: Default::default(),
             model_id: format!("model-{provider_id}"),
             global_model_id: "global-model-openai-sync-failover".to_string(),
             global_model_name: "gpt-5".to_string(),

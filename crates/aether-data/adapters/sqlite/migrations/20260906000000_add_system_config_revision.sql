@@ -1,0 +1,1 @@
+ALTER TABLE system_configs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;

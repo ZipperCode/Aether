@@ -3,12 +3,27 @@ use sqlx::Row;
 use crate::error::SqlResultExt;
 use crate::repository::system::{
     AdminSystemStats, AdminSystemStatsDailyAggregate, AdminSystemStatsDailyApiKeyAggregate,
-    AdminSystemStatsUserDailyAggregate,
+    AdminSystemStatsUserDailyAggregate, StoredSystemConfigValue,
 };
 use crate::DataLayerError;
 
 use super::u64_from_i64;
 use super::*;
+
+/// revision-only 强读 SQL；投影保持单列，避免未变化配置复制完整 JSON。
+const FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL: &str =
+    "SELECT revision FROM system_configs WHERE key = ? LIMIT 1";
+
+/// 删除以 JSON null 墓碑表达，保留同一行并推进 revision。
+const DELETE_SYSTEM_CONFIG_VALUE_SQL: &str = r#"
+UPDATE system_configs
+SET value = 'null',
+    description = NULL,
+    revision = revision + 1,
+    updated_at = ?
+WHERE key = ?
+  AND TRIM(value) <> 'null'
+"#;
 
 const READ_ADMIN_SYSTEM_STATS_SQL: &str = r#"
 SELECT
@@ -1049,6 +1064,7 @@ impl SqliteBackend {
         Ok(summary)
     }
 
+    /// 普通读取隐藏 JSON null 删除墓碑；revision 强读仍可观察墓碑版本。
     pub async fn find_system_config_value(
         &self,
         key: &str,
@@ -1066,12 +1082,46 @@ LIMIT 1
         .await
         .map_sql_err()?;
 
+        let value = row
+            .map(|row| {
+                row.try_get("value")
+                    .map_sql_err()
+                    .and_then(parse_json_value)
+            })
+            .transpose()?;
+        Ok(value.filter(|value| !value.is_null()))
+    }
+
+    /// 强读系统配置 revision 与 JSON 值，revision 在写入时单调递增。
+    pub async fn find_system_config_value_strong(
+        &self,
+        key: &str,
+    ) -> Result<Option<StoredSystemConfigValue>, DataLayerError> {
+        let row = sqlx::query("SELECT revision, value FROM system_configs WHERE key = ? LIMIT 1")
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await
+            .map_sql_err()?;
         row.map(|row| {
-            row.try_get("value")
-                .map_sql_err()
-                .and_then(parse_json_value)
+            Ok(StoredSystemConfigValue {
+                revision: row.try_get::<i64, _>("revision").map_sql_err()?.max(0) as u64,
+                value: parse_json_value(row.try_get("value").map_sql_err()?)?,
+            })
         })
         .transpose()
+    }
+
+    /// 仅强读系统配置 revision；查询不读取 JSON value，供认证快照快速命中。
+    pub async fn find_system_config_revision_strong(
+        &self,
+        key: &str,
+    ) -> Result<Option<u64>, DataLayerError> {
+        sqlx::query_scalar::<_, i64>(FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL)
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await
+            .map_sql_err()
+            .map(|revision| revision.map(|value| value.max(0) as u64))
     }
 
     pub async fn upsert_system_config_value(
@@ -1086,6 +1136,7 @@ LIMIT 1
             .value)
     }
 
+    /// 管理列表隐藏 JSON null 墓碑，但底层行继续保留单调 revision。
     pub async fn list_system_config_entries(
         &self,
     ) -> Result<Vec<StoredSystemConfigEntry>, DataLayerError> {
@@ -1100,19 +1151,23 @@ ORDER BY key ASC
         .await
         .map_sql_err()?;
 
-        rows.into_iter()
-            .map(|row| {
-                Ok(StoredSystemConfigEntry {
-                    key: row.try_get("key").map_sql_err()?,
-                    value: parse_json_value(row.try_get("value").map_sql_err()?)?,
-                    description: row.try_get("description").map_sql_err()?,
-                    updated_at_unix_secs: row
-                        .try_get::<Option<i64>, _>("updated_at")
-                        .map_sql_err()?
-                        .map(|value| value.max(0) as u64),
-                })
-            })
-            .collect()
+        let mut entries = Vec::new();
+        for row in rows {
+            let value = parse_json_value(row.try_get("value").map_sql_err()?)?;
+            if value.is_null() {
+                continue;
+            }
+            entries.push(StoredSystemConfigEntry {
+                key: row.try_get("key").map_sql_err()?,
+                value,
+                description: row.try_get("description").map_sql_err()?,
+                updated_at_unix_secs: row
+                    .try_get::<Option<i64>, _>("updated_at")
+                    .map_sql_err()?
+                    .map(|value| value.max(0) as u64),
+            });
+        }
+        Ok(entries)
     }
 
     pub async fn upsert_system_config_entry(
@@ -1125,12 +1180,13 @@ ORDER BY key ASC
         let serialized = serialize_json_value(value)?;
         sqlx::query(
             r#"
-INSERT INTO system_configs (id, key, value, description, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO system_configs (id, key, value, description, revision, created_at, updated_at)
+VALUES (?, ?, ?, ?, 1, ?, ?)
 ON CONFLICT (key) DO UPDATE
 SET value = excluded.value,
     description = COALESCE(excluded.description, system_configs.description),
-    updated_at = excluded.updated_at
+    updated_at = excluded.updated_at,
+    revision = system_configs.revision + 1
 "#,
         )
         .bind(uuid::Uuid::new_v4().to_string())
@@ -1154,17 +1210,15 @@ SET value = excluded.value,
             })
     }
 
+    /// 首次删除写入 JSON null 墓碑并递增 revision；重复删除保持 false。
     pub async fn delete_system_config_value(&self, key: &str) -> Result<bool, DataLayerError> {
-        let result = sqlx::query(
-            r#"
-DELETE FROM system_configs
-WHERE key = ?
-"#,
-        )
-        .bind(key)
-        .execute(self.pool())
-        .await
-        .map_sql_err()?;
+        let now = current_unix_secs();
+        let result = sqlx::query(DELETE_SYSTEM_CONFIG_VALUE_SQL)
+            .bind(now as i64)
+            .bind(key)
+            .execute(self.pool())
+            .await
+            .map_sql_err()?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -1277,7 +1331,33 @@ pub(super) fn map_admin_system_stats(
 
 #[cfg(test)]
 mod tests {
-    use super::{purge_sqlite_admin_system_data, AdminSystemPurgeSummary, AdminSystemPurgeTarget};
+    use super::{
+        purge_sqlite_admin_system_data, AdminSystemPurgeSummary, AdminSystemPurgeTarget,
+        DELETE_SYSTEM_CONFIG_VALUE_SQL, FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL,
+    };
+
+    /// 验证 SQLite revision-only 强读不会把大 JSON value 带入结果集。
+    #[test]
+    fn system_config_revision_query_excludes_value_projection() {
+        let projection = FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL
+            .split_once("FROM")
+            .expect("revision query should contain FROM")
+            .0
+            .to_ascii_lowercase();
+        assert!(projection.contains("revision"));
+        assert!(!projection.contains("value"));
+    }
+
+    /// 验证 SQLite 删除只写墓碑并推进 revision，不物理移除配置行。
+    #[test]
+    fn system_config_delete_query_preserves_revision_tombstone() {
+        let sql = DELETE_SYSTEM_CONFIG_VALUE_SQL.to_ascii_lowercase();
+        assert!(sql.contains("update system_configs"));
+        assert!(sql.contains("value = 'null'"));
+        assert!(sql.contains("description = null"));
+        assert!(sql.contains("revision = revision + 1"));
+        assert!(!sql.contains("delete from"));
+    }
 
     #[tokio::test]
     async fn usage_purge_removes_pending_counters_and_resets_model_usage() {

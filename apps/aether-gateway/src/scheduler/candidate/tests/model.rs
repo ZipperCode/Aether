@@ -136,6 +136,7 @@ fn scheduler_candidate_is_serializable() {
         key_internal_priority: 50,
         key_global_priority_for_format: Some(2),
         key_capabilities: Some(serde_json::json!({"cache_1h": true})),
+        routing_facts: Default::default(),
         model_id: "model-1".to_string(),
         global_model_id: "global-model-1".to_string(),
         global_model_name: "gpt-4.1".to_string(),

@@ -236,6 +236,7 @@ fn openai_chat_pressure_candidates(
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:chat": 1})),
+            routing_facts: Default::default(),
             model_id: pressure_model_id(index),
             global_model_id: "global-model-openai-chat-pressure".to_string(),
             global_model_name: config.requested_model.clone(),

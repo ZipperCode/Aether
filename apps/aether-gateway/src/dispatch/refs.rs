@@ -143,6 +143,7 @@ mod tests {
                 key_internal_priority: 7,
                 key_global_priority_for_format: None,
                 key_capabilities: None,
+                routing_facts: Default::default(),
                 model_id: "model-1".to_string(),
                 global_model_id: "global-model-1".to_string(),
                 global_model_name: "gpt-5".to_string(),

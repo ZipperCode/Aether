@@ -27,8 +27,10 @@ use uuid::Uuid;
 use crate::ai_serving::planner::candidate_affinity_cache::remember_scheduler_affinity_for_candidate_with_routing_policy_at_epoch;
 use crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy;
 use crate::ai_serving::planner::candidate_resolution::{
+    hydrate_ranked_local_execution_candidate, resolve_and_rank_logical_local_candidate_snapshots,
     resolve_and_rank_logical_local_execution_candidates, EligibleLocalExecutionCandidate,
-    LocalExecutionCandidateKind, SkippedLocalExecutionCandidate,
+    LocalExecutionCandidateKind, RankedLocalExecutionCandidate, SkippedLocalExecutionCandidate,
+    UnmaterializedSkippedLocalExecutionCandidate,
 };
 use crate::ai_serving::planner::candidate_source::{
     LocalCandidatePreselectionKeyMode, LocalCandidatePreselectionPageCursor,
@@ -933,6 +935,7 @@ fn build_logical_candidate_items<'a>(
     (items, next_candidate_index)
 }
 
+/// 构造请求模型的分页尝试源；同格式模式仅扫描客户端格式，其他文本模式保留跨格式后备链。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_lazy_requested_model_execution_candidate_attempt_source_with_serving<
     'a,
@@ -955,6 +958,7 @@ pub(crate) async fn build_lazy_requested_model_execution_candidate_attempt_sourc
     persistence_policy: LocalCandidatePersistencePolicy<'_>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
+    same_format_only: bool,
     resolution_mode: LocalCandidateResolutionMode,
     build_available_extra_data: F,
     decorate_skipped_candidate: G,
@@ -968,7 +972,7 @@ where
     let _ = build_available_extra_data;
     let decorate_skipped_candidate = Arc::new(decorate_skipped_candidate);
     let record_runtime_miss_diagnostic = persistence_policy.skipped.record_runtime_miss_diagnostic;
-    let page_cursor = LocalCandidatePreselectionPageCursor::new(
+    let mut page_cursor = LocalCandidatePreselectionPageCursor::new(
         state,
         model_directive_policy,
         client_api_format,
@@ -986,6 +990,9 @@ where
         Some(trace_id),
     )
     .await;
+    if same_format_only {
+        page_cursor.restrict_to_client_api_format();
+    }
     let mut cursor = RequestedModelAttemptPageCursor {
         state,
         trace_id: trace_id.to_string(),
@@ -1005,6 +1012,7 @@ where
         resolution_mode,
         decorate_skipped_candidate,
         page_cursor,
+        pending_ranked_candidates: VecDeque::new(),
         pending_items: VecDeque::new(),
         skipped_provider_ids: BTreeSet::new(),
         skipped_endpoint_ids: BTreeSet::new(),
@@ -1022,7 +1030,10 @@ where
     }
     let candidate_count = cursor.candidate_count;
     let mut items = VecDeque::new();
-    if !cursor.pending_items.is_empty() || cursor.deferred_error.is_some() {
+    if !cursor.pending_ranked_candidates.is_empty()
+        || !cursor.pending_items.is_empty()
+        || cursor.deferred_error.is_some()
+    {
         items.push_back(
             LocalExecutionCandidateAttemptSourceItem::RequestedModelPage {
                 cursor: Box::new(cursor),
@@ -1046,6 +1057,15 @@ where
     )
 }
 
+#[derive(Debug, Clone)]
+/// 已分配全局候选序号但尚未读取 transport 的待尝试项。
+struct PendingRankedLocalExecutionCandidate {
+    /// transport-free 的全局排序候选。
+    candidate: RankedLocalExecutionCandidate,
+    /// 持久化与执行诊断使用的稳定候选序号。
+    candidate_index: u32,
+}
+
 struct RequestedModelAttemptPageCursor<'a> {
     state: PlannerAppState<'a>,
     trace_id: String,
@@ -1065,6 +1085,8 @@ struct RequestedModelAttemptPageCursor<'a> {
     resolution_mode: LocalCandidateResolutionMode,
     decorate_skipped_candidate: DecorateSkippedCandidateFn<'a>,
     page_cursor: LocalCandidatePreselectionPageCursor<'a>,
+    /// 全局排序后的轻量候选；仅弹出当前项后才允许 hydration。
+    pending_ranked_candidates: VecDeque<PendingRankedLocalExecutionCandidate>,
     pending_items: VecDeque<LocalExecutionCandidateAttemptSourceItem<'a>>,
     skipped_provider_ids: BTreeSet<String>,
     skipped_endpoint_ids: BTreeSet<String>,
@@ -1112,10 +1134,132 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
             {
                 return Ok(Some(attempt));
             }
+            if let Some(pending) = self.pop_next_ranked_candidate() {
+                match hydrate_ranked_local_execution_candidate(
+                    self.state,
+                    pending.candidate,
+                    &self.client_api_format,
+                    Some(&self.requested_model),
+                    self.routing_policy.as_ref(),
+                    self.request_auth_channel.as_deref(),
+                    self.resolution_mode,
+                )
+                .await
+                {
+                    Ok(candidate) => {
+                        self.push_hydrated_candidate(candidate, pending.candidate_index);
+                    }
+                    Err(skipped) => {
+                        self.persist_hydration_skip(pending.candidate_index, skipped)
+                            .await;
+                    }
+                }
+                continue;
+            }
             if !self.load_next_page().await? {
                 return Ok(None);
             }
         }
+    }
+
+    /// 弹出下一个未被请求级跳过或能力隔离命中的轻量候选，不触发 transport 读取。
+    fn pop_next_ranked_candidate(&mut self) -> Option<PendingRankedLocalExecutionCandidate> {
+        while let Some(pending) = self.pending_ranked_candidates.pop_front() {
+            let candidate = &pending.candidate.candidate;
+            if self.skipped_provider_ids.contains(&candidate.provider_id)
+                || self.skipped_endpoint_ids.contains(&candidate.endpoint_id)
+                || self.skipped_credential_ids.contains(&candidate.key_id)
+                || self.state.app().endpoint_capability_is_quarantined(
+                    &candidate.model_id,
+                    &candidate.endpoint_id,
+                    &candidate.key_id,
+                    &self.client_api_format,
+                    self.require_streaming,
+                    self.page_cursor.resolved_page_cache_request_operation(),
+                )
+            {
+                continue;
+            }
+            return Some(pending);
+        }
+        None
+    }
+
+    /// 将唯一已 hydration 的候选接入原有 SingleKey/Pool 尝试序列。
+    fn push_hydrated_candidate(
+        &mut self,
+        candidate: EligibleLocalExecutionCandidate,
+        candidate_index: u32,
+    ) {
+        if self.scheduler_cache_affinity_enabled && !self.remembered_affinity {
+            remember_first_local_candidate_affinity(
+                self.state,
+                Some(&self.auth_snapshot),
+                self.client_session_affinity.as_ref(),
+                &self.client_api_format,
+                Some(&self.requested_model),
+                self.routing_policy.as_ref(),
+                std::slice::from_ref(&candidate),
+            );
+            self.remembered_affinity = true;
+        }
+        let (items, _) = build_logical_candidate_items(
+            self.state,
+            vec![candidate],
+            candidate_index,
+            Some(&self.trace_id),
+            self.record_runtime_miss_diagnostic,
+            self.sticky_session_token.as_deref(),
+            Some(&self.requested_model),
+            self.request_auth_channel.as_deref(),
+            self.routing_policy.as_ref(),
+            Some(PoolGroupExhaustionPersistenceContext {
+                app: self.state.app().clone(),
+                trace_id: self.trace_id.clone(),
+                user_id: self.skipped_user_id.clone(),
+                api_key_id: self.skipped_api_key_id.clone(),
+                required_capabilities: self.skipped_required_capabilities.clone(),
+                error_context: self.skipped_error_context,
+                client_api_format: self.client_api_format.clone(),
+                routing_policy: self.routing_policy.clone(),
+            }),
+        );
+        self.pending_items.extend(items);
+    }
+
+    /// 持久化选中候选在完整 transport 门禁中的失败，并继续既有全局后备顺序。
+    async fn persist_hydration_skip(
+        &self,
+        candidate_index: u32,
+        skipped: SkippedLocalExecutionCandidate,
+    ) {
+        quarantine_static_endpoint_capability_skips(
+            self.state.app(),
+            &self.client_api_format,
+            self.require_streaming,
+            self.page_cursor.resolved_page_cache_request_operation(),
+            std::slice::from_ref(&skipped),
+        );
+        let skipped = (self.decorate_skipped_candidate)(skipped);
+        persist_skipped_local_execution_candidates_with_context(
+            self.state.app(),
+            &self.trace_id,
+            LocalSkippedCandidatePersistenceContext {
+                user_id: self.skipped_user_id.as_str(),
+                api_key_id: self.skipped_api_key_id.as_str(),
+                required_capabilities: self.skipped_required_capabilities.as_ref(),
+                error_context: self.skipped_error_context,
+                record_runtime_miss_diagnostic: self.record_runtime_miss_diagnostic,
+            },
+            candidate_index,
+            attach_routing_trace_to_skipped_candidates(
+                self.routing_policy.as_ref(),
+                &self.client_api_format,
+                candidate_index,
+                vec![skipped],
+            ),
+        )
+        .await;
     }
 
     async fn load_next_page(&mut self) -> Result<bool, GatewayError> {
@@ -1155,13 +1299,6 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
             let resolve_started_at = std::time::Instant::now();
             let (candidates, resolved_skipped) =
                 resolve_priority_candidate_page_with_cache(self, page.candidates).await;
-            quarantine_static_endpoint_capability_skips(
-                self.state.app(),
-                &self.client_api_format,
-                self.require_streaming,
-                self.page_cursor.resolved_page_cache_request_operation(),
-                &resolved_skipped,
-            );
             observe_gateway_stage_ms(
                 "candidate_page_resolve",
                 resolve_started_at.elapsed().as_millis() as u64,
@@ -1169,56 +1306,38 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
             let skipped_candidates = page
                 .skipped_candidates
                 .into_iter()
-                .chain(resolved_skipped)
+                .chain(
+                    resolved_skipped
+                        .into_iter()
+                        .map(UnmaterializedSkippedLocalExecutionCandidate::into_skipped),
+                )
                 .map(|skipped| (self.decorate_skipped_candidate)(skipped))
                 .collect::<Vec<_>>();
             let skipped_candidate_count = skipped_candidates.len();
             self.candidate_count = self
                 .candidate_count
                 .saturating_add(candidates.len() + skipped_candidate_count);
-            if self.scheduler_cache_affinity_enabled
-                && !self.remembered_affinity
-                && !candidates.is_empty()
-            {
-                remember_first_local_candidate_affinity(
-                    self.state,
-                    Some(&self.auth_snapshot),
-                    self.client_session_affinity.as_ref(),
-                    &self.client_api_format,
-                    Some(&self.requested_model),
-                    self.routing_policy.as_ref(),
-                    &candidates,
-                );
-                self.remembered_affinity = true;
-            }
-            let (items, next_candidate_index) = build_logical_candidate_items(
-                self.state,
-                candidates,
-                self.next_candidate_index,
-                Some(&self.trace_id),
-                self.record_runtime_miss_diagnostic,
-                self.sticky_session_token.as_deref(),
-                Some(&self.requested_model),
-                self.request_auth_channel.as_deref(),
-                self.routing_policy.as_ref(),
-                Some(PoolGroupExhaustionPersistenceContext {
-                    app: self.state.app().clone(),
-                    trace_id: self.trace_id.clone(),
-                    user_id: self.skipped_user_id.clone(),
-                    api_key_id: self.skipped_api_key_id.clone(),
-                    required_capabilities: self.skipped_required_capabilities.clone(),
-                    error_context: self.skipped_error_context,
-                    client_api_format: self.client_api_format.clone(),
-                    routing_policy: self.routing_policy.clone(),
-                }),
-            );
-            self.next_candidate_index = next_candidate_index
+            let starting_candidate_index = self.next_candidate_index;
+            let ranked_candidate_count = candidates.len();
+            self.next_candidate_index = self
+                .next_candidate_index
+                .saturating_add(u32::try_from(ranked_candidate_count).unwrap_or(u32::MAX))
                 .saturating_add(u32::try_from(skipped_candidate_count).unwrap_or(u32::MAX));
-            if !items.is_empty() {
-                self.pending_items = items;
+            self.pending_ranked_candidates
+                .extend(
+                    candidates
+                        .into_iter()
+                        .enumerate()
+                        .map(|(offset, candidate)| PendingRankedLocalExecutionCandidate {
+                            candidate,
+                            candidate_index: starting_candidate_index
+                                .saturating_add(u32::try_from(offset).unwrap_or(u32::MAX)),
+                        }),
+                );
+            if !self.pending_ranked_candidates.is_empty() {
                 return Ok(true);
             }
-            let skipped_starting_candidate_index = next_candidate_index;
+            let skipped_starting_candidate_index = starting_candidate_index;
             let skipped_persistence = LocalSkippedCandidatePersistenceContext {
                 user_id: self.skipped_user_id.as_str(),
                 api_key_id: self.skipped_api_key_id.as_str(),
@@ -1459,11 +1578,11 @@ async fn resolve_priority_candidate_page_with_cache(
     cursor: &RequestedModelAttemptPageCursor<'_>,
     page_candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
 ) -> (
-    Vec<EligibleLocalExecutionCandidate>,
-    Vec<SkippedLocalExecutionCandidate>,
+    Vec<RankedLocalExecutionCandidate>,
+    Vec<UnmaterializedSkippedLocalExecutionCandidate>,
 ) {
     if !should_cache_resolved_candidate_page(cursor) {
-        return resolve_and_rank_logical_local_execution_candidates(
+        return resolve_and_rank_logical_local_candidate_snapshots(
             cursor.state,
             page_candidates,
             &cursor.client_api_format,
@@ -1472,9 +1591,7 @@ async fn resolve_priority_candidate_page_with_cache(
             cursor.client_session_affinity.as_ref(),
             cursor.required_capabilities.as_ref(),
             cursor.routing_policy.as_ref(),
-            cursor.sticky_session_token.as_deref(),
             cursor.request_auth_channel.as_deref(),
-            cursor.resolution_mode,
         )
         .await;
     }
@@ -1566,7 +1683,7 @@ async fn resolve_priority_candidate_page_with_cache(
             if page_candidates_for_fallback.is_empty() {
                 return (Vec::new(), Vec::new());
             }
-            resolve_and_rank_logical_local_execution_candidates(
+            resolve_and_rank_logical_local_candidate_snapshots(
                 cursor.state,
                 page_candidates_for_fallback,
                 &cursor.client_api_format,
@@ -1575,9 +1692,7 @@ async fn resolve_priority_candidate_page_with_cache(
                 cursor.client_session_affinity.as_ref(),
                 cursor.required_capabilities.as_ref(),
                 cursor.routing_policy.as_ref(),
-                cursor.sticky_session_token.as_deref(),
                 cursor.request_auth_channel.as_deref(),
-                cursor.resolution_mode,
             )
             .await
         }
@@ -1594,10 +1709,10 @@ async fn resolve_candidate_page_snapshot(
     required_capabilities: Option<Value>,
     routing_policy: Option<ResolvedRoutingPolicy>,
     request_auth_channel: Option<String>,
-    resolution_mode: LocalCandidateResolutionMode,
+    _resolution_mode: LocalCandidateResolutionMode,
 ) -> Result<Option<Arc<CandidateResolvedPageSnapshot>>, GatewayError> {
     let state = PlannerAppState::new(&app);
-    let (candidates, resolved_skipped) = resolve_and_rank_logical_local_execution_candidates(
+    let (candidates, resolved_skipped) = resolve_and_rank_logical_local_candidate_snapshots(
         state,
         page_candidates,
         &client_api_format,
@@ -1606,9 +1721,7 @@ async fn resolve_candidate_page_snapshot(
         client_session_affinity.as_ref(),
         required_capabilities.as_ref(),
         routing_policy.as_ref(),
-        None,
         request_auth_channel.as_deref(),
-        resolution_mode,
     )
     .await;
     Ok(Some(Arc::new(CandidateResolvedPageSnapshot {
@@ -1618,7 +1731,10 @@ async fn resolve_candidate_page_snapshot(
 }
 
 fn should_cache_resolved_candidate_page(cursor: &RequestedModelAttemptPageCursor<'_>) -> bool {
-    cursor.sticky_session_token.is_none()
+    // 路由聚合页包含按请求动态计算的全局排序与后备链，继续按合同绕过 resolved-page 缓存；
+    // 无路由策略时缓存值也只包含未 hydration 的轻量候选。
+    cursor.routing_policy.is_none()
+        && cursor.sticky_session_token.is_none()
         && cursor
             .page_cursor
             .should_cache_current_priority_resolved_page()
@@ -1629,9 +1745,14 @@ fn should_persist_available_local_candidate(eligible: &EligibleLocalExecutionCan
 }
 
 fn should_persist_skipped_local_candidate(candidate: &SkippedLocalExecutionCandidate) -> bool {
-    let is_pool_candidate = candidate.transport.as_ref().is_some_and(|transport| {
-        admin_provider_pool_config_from_config_value(transport.provider.config.as_ref()).is_some()
-    });
+    let is_pool_candidate = candidate
+        .transport
+        .as_ref()
+        .map(|transport| {
+            admin_provider_pool_config_from_config_value(transport.provider.config.as_ref())
+                .is_some()
+        })
+        .unwrap_or(candidate.candidate.routing_facts.provider_pool_enabled);
     ai_should_persist_skipped_candidate_for_pool_membership(is_pool_candidate)
 }
 
@@ -1897,13 +2018,20 @@ fn attach_routing_trace_to_skipped_candidate(
     selected_order: u32,
     mut skipped_candidate: SkippedLocalExecutionCandidate,
 ) -> SkippedLocalExecutionCandidate {
-    let kind = if skipped_candidate
+    let is_pool_candidate = skipped_candidate
         .transport
         .as_ref()
-        .is_some_and(|transport| {
+        .map(|transport| {
             admin_provider_pool_config_from_config_value(transport.provider.config.as_ref())
                 .is_some()
-        }) {
+        })
+        .unwrap_or(
+            skipped_candidate
+                .candidate
+                .routing_facts
+                .provider_pool_enabled,
+        );
+    let kind = if is_pool_candidate {
         LocalExecutionCandidateKind::PoolGroup
     } else {
         LocalExecutionCandidateKind::SingleKey
@@ -2343,15 +2471,27 @@ mod tests {
         Arc,
     };
 
+    use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
     use aether_data::repository::auth::InMemoryAuthApiKeySnapshotRepository;
     use aether_data::repository::auth::StoredAuthApiKeySnapshot;
     use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
     use aether_data_contracts::repository::candidates::RequestCandidateStatus;
+    use aether_data_contracts::repository::provider_catalog::{
+        ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, StoredProviderCatalogEndpoint,
+        StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+        StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    };
+    use aether_data_contracts::DataLayerError;
     use aether_provider_transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
         GatewayProviderTransportProvider,
+    };
+    use aether_routing_core::{
+        MutationPlan, RankingOverlay, ResolvedRoutingPolicy, RoutingSchedulingMode,
+        RoutingSetPriorityMode,
     };
     use aether_scheduler_core::{
         build_scheduler_affinity_cache_key_for_api_key_id,
@@ -2364,6 +2504,122 @@ mod tests {
     use crate::data::GatewayDataState;
     use crate::orchestration::LocalExecutionCandidateMetadata;
     use crate::scheduler::affinity::SCHEDULER_AFFINITY_TTL;
+
+    /// 统计 transport hydration 的普通 Key 读取，同时让预选强读保持独立计数。
+    struct CountingProviderCatalogReadRepository {
+        inner: InMemoryProviderCatalogReadRepository,
+        transport_key_reads: Arc<AtomicUsize>,
+        missing_transport_key_ids: BTreeSet<String>,
+    }
+
+    #[async_trait]
+    impl ProviderCatalogReadRepository for CountingProviderCatalogReadRepository {
+        async fn list_providers(
+            &self,
+            active_only: bool,
+        ) -> Result<Vec<StoredProviderCatalogProvider>, DataLayerError> {
+            self.inner.list_providers(active_only).await
+        }
+
+        async fn list_providers_by_ids(
+            &self,
+            provider_ids: &[String],
+        ) -> Result<Vec<StoredProviderCatalogProvider>, DataLayerError> {
+            self.inner.list_providers_by_ids(provider_ids).await
+        }
+
+        async fn list_endpoints_by_ids(
+            &self,
+            endpoint_ids: &[String],
+        ) -> Result<Vec<StoredProviderCatalogEndpoint>, DataLayerError> {
+            self.inner.list_endpoints_by_ids(endpoint_ids).await
+        }
+
+        async fn list_endpoints_by_provider_ids(
+            &self,
+            provider_ids: &[String],
+        ) -> Result<Vec<StoredProviderCatalogEndpoint>, DataLayerError> {
+            self.inner
+                .list_endpoints_by_provider_ids(provider_ids)
+                .await
+        }
+
+        async fn list_keys_by_ids(
+            &self,
+            key_ids: &[String],
+        ) -> Result<Vec<StoredProviderCatalogKey>, DataLayerError> {
+            self.transport_key_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .inner
+                .list_keys_by_ids(key_ids)
+                .await?
+                .into_iter()
+                .filter(|key| !self.missing_transport_key_ids.contains(&key.id))
+                .collect())
+        }
+
+        async fn list_keys_by_ids_strong(
+            &self,
+            key_ids: &[String],
+        ) -> Result<Vec<StoredProviderCatalogKey>, DataLayerError> {
+            self.inner.list_keys_by_ids(key_ids).await
+        }
+
+        async fn list_keys_by_provider_ids(
+            &self,
+            provider_ids: &[String],
+        ) -> Result<Vec<StoredProviderCatalogKey>, DataLayerError> {
+            self.inner.list_keys_by_provider_ids(provider_ids).await
+        }
+
+        async fn list_key_summaries_by_provider_ids(
+            &self,
+            provider_ids: &[String],
+        ) -> Result<Vec<StoredProviderCatalogKey>, DataLayerError> {
+            self.inner
+                .list_key_summaries_by_provider_ids(provider_ids)
+                .await
+        }
+
+        async fn list_key_maintenance_summaries_by_provider_ids(
+            &self,
+            provider_ids: &[String],
+        ) -> Result<Vec<StoredProviderCatalogKeyMaintenanceSummary>, DataLayerError> {
+            self.inner
+                .list_key_maintenance_summaries_by_provider_ids(provider_ids)
+                .await
+        }
+
+        async fn list_auth_maintenance_candidates_by_provider_ids(
+            &self,
+            provider_ids: &[String],
+        ) -> Result<
+            Vec<
+                aether_data_contracts::repository::provider_catalog::StoredProviderCatalogAuthMaintenanceCandidate,
+            >,
+            DataLayerError,
+        >{
+            self.inner
+                .list_auth_maintenance_candidates_by_provider_ids(provider_ids)
+                .await
+        }
+
+        async fn list_keys_page(
+            &self,
+            query: &ProviderCatalogKeyListQuery,
+        ) -> Result<StoredProviderCatalogKeyPage, DataLayerError> {
+            self.inner.list_keys_page(query).await
+        }
+
+        async fn list_key_stats_by_provider_ids(
+            &self,
+            provider_ids: &[String],
+        ) -> Result<Vec<StoredProviderCatalogKeyStats>, DataLayerError> {
+            self.inner
+                .list_key_stats_by_provider_ids(provider_ids)
+                .await
+        }
+    }
 
     fn sample_candidate(key_id: &str) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
@@ -2379,12 +2635,51 @@ mod tests {
             key_internal_priority: 10,
             key_global_priority_for_format: Some(10),
             key_capabilities: None,
+            routing_facts: Default::default(),
             model_id: "model-1".to_string(),
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-5".to_string(),
             selected_provider_model_name: "gpt-5".to_string(),
             supports_streaming: true,
             mapping_matched_model: None,
+        }
+    }
+
+    /// 构造分页仓储使用的轻量候选行，确保真实 attempt source 测试不预装 transport。
+    fn sample_candidate_row(key_id: &str, priority: i32) -> StoredMinimalCandidateSelectionRow {
+        let mut routing_facts = aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateRoutingFacts::default();
+        routing_facts.key_auth_type_for_endpoint_format = "api_key".to_string();
+        StoredMinimalCandidateSelectionRow {
+            provider_id: "provider-1".to_string(),
+            provider_name: "provider-1".to_string(),
+            provider_type: "custom".to_string(),
+            provider_priority: 0,
+            provider_is_active: true,
+            endpoint_id: "endpoint-1".to_string(),
+            endpoint_api_format: "openai:chat".to_string(),
+            endpoint_api_family: Some("openai".to_string()),
+            endpoint_kind: Some("chat".to_string()),
+            endpoint_is_active: true,
+            key_id: key_id.to_string(),
+            key_name: key_id.to_string(),
+            key_auth_type: "api_key".to_string(),
+            key_is_active: true,
+            key_api_formats: Some(vec!["openai:chat".to_string()]),
+            key_allowed_models: None,
+            key_capabilities: None,
+            key_internal_priority: priority,
+            key_global_priority_by_format: Some(json!({"openai:chat": priority})),
+            routing_facts,
+            model_id: "model-1".to_string(),
+            global_model_id: "global-model-1".to_string(),
+            global_model_name: "gpt-5".to_string(),
+            global_model_mappings: None,
+            global_model_supports_streaming: Some(true),
+            model_provider_model_name: "gpt-5".to_string(),
+            model_provider_model_mappings: None,
+            model_supports_streaming: Some(true),
+            model_is_active: true,
+            model_is_available: true,
         }
     }
 
@@ -2511,6 +2806,169 @@ mod tests {
         candidate: SkippedLocalExecutionCandidate,
     ) -> SkippedLocalExecutionCandidate {
         candidate
+    }
+
+    /// 验证 2,048 条候选的全局排序不读取 transport，且失效首项只在尝试时逐个 hydration 后回退。
+    #[tokio::test]
+    async fn routed_ranking_hydrates_only_selected_candidates_in_fallback_order() {
+        const CANDIDATE_COUNT: usize = 2_048;
+        let provider = StoredProviderCatalogProvider::new(
+            "provider-1".to_string(),
+            "provider-1".to_string(),
+            Some("https://provider.example".to_string()),
+            "custom".to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(true, false, false, None, None, None, None, None, None);
+        let endpoint = StoredProviderCatalogEndpoint::new(
+            "endpoint-1".to_string(),
+            "provider-1".to_string(),
+            "openai:chat".to_string(),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            true,
+        )
+        .expect("endpoint should build")
+        .with_transport_fields(
+            "https://provider.example/v1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("endpoint transport should build");
+        let encrypted_key = encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "secret")
+            .expect("test key should encrypt");
+        let mut catalog_keys = Vec::with_capacity(CANDIDATE_COUNT);
+        let mut rows = Vec::with_capacity(CANDIDATE_COUNT);
+        for index in 0..CANDIDATE_COUNT {
+            let key_id = format!("key-{index:04}");
+            let mut key = StoredProviderCatalogKey::new(
+                key_id.clone(),
+                "provider-1".to_string(),
+                key_id.clone(),
+                "api_key".to_string(),
+                None,
+                true,
+            )
+            .expect("key should build")
+            .with_transport_fields(
+                Some(json!(["openai:chat"])),
+                encrypted_key.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("key transport should build");
+            key.internal_priority = i32::try_from(index).expect("test index should fit i32");
+            catalog_keys.push(key);
+
+            rows.push(sample_candidate_row(
+                &key_id,
+                i32::try_from(index).expect("test index should fit i32"),
+            ));
+        }
+
+        let transport_key_reads = Arc::new(AtomicUsize::new(0));
+        let repository: Arc<dyn ProviderCatalogReadRepository> =
+            Arc::new(CountingProviderCatalogReadRepository {
+                inner: InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    catalog_keys,
+                ),
+                transport_key_reads: Arc::clone(&transport_key_reads),
+                missing_transport_key_ids: BTreeSet::from(["key-0000".to_string()]),
+            });
+        let candidate_repository: Arc<
+            dyn aether_data_contracts::repository::candidate_selection::MinimalCandidateSelectionReadRepository,
+        > = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows));
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    repository,
+                    candidate_repository,
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let state = PlannerAppState::new(&app);
+        let routing_policy = ResolvedRoutingPolicy {
+            group_id: Some("routing-group-memory".to_string()),
+            group_version: Some(1),
+            selection_source: "test".to_string(),
+            requested_model: "gpt-5".to_string(),
+            resolved_model: "gpt-5".to_string(),
+            priority_mode: RoutingSetPriorityMode::Provider,
+            scheduling_mode: RoutingSchedulingMode::FixedOrder,
+            keep_priority_on_conversion: false,
+            sticky_key_attempts: 1,
+            ranking_overlay: RankingOverlay::default(),
+            mutation_plan: MutationPlan::default(),
+            pool_policy_overrides: Default::default(),
+            matched_rules: Vec::new(),
+        };
+
+        let auth_snapshot = sample_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let (mut source, candidate_count) =
+            build_lazy_requested_model_execution_candidate_attempt_source_with_serving(
+                state,
+                &model_directive_policy,
+                "trace-routed-lazy-hydration",
+                "openai:chat",
+                "gpt-5",
+                None,
+                false,
+                &auth_snapshot,
+                None,
+                None,
+                Some(&routing_policy),
+                None,
+                None,
+                LocalCandidatePersistencePolicy {
+                    available: LocalAvailableCandidatePersistenceContext {
+                        user_id: "user-1",
+                        api_key_id: "api-key-1",
+                        required_capabilities: None,
+                        error_context: "test available candidate persistence",
+                    },
+                    skipped: LocalSkippedCandidatePersistenceContext {
+                        user_id: "user-1",
+                        api_key_id: "api-key-1",
+                        required_capabilities: None,
+                        error_context: "test skipped candidate persistence",
+                        record_runtime_miss_diagnostic: false,
+                    },
+                },
+                false,
+                LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
+                false,
+                LocalCandidateResolutionMode::Standard,
+                no_extra_data,
+                identity_skipped_candidate,
+            )
+            .await;
+        assert_eq!(candidate_count, CANDIDATE_COUNT);
+        assert_eq!(transport_key_reads.load(Ordering::SeqCst), 0);
+
+        let attempt = source
+            .next_attempt()
+            .await
+            .expect("real attempt source should remain usable")
+            .expect("fallback candidate should hydrate");
+        assert_eq!(attempt.eligible.candidate.key_id, "key-0001");
+        assert_eq!(transport_key_reads.load(Ordering::SeqCst), 2);
+        assert!(source.drain_static_attempts().is_empty());
+        assert_eq!(transport_key_reads.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -2691,7 +3149,7 @@ mod tests {
         )
         .await;
         page_cursor.mark_priority_page_emitted_for_tests();
-        let cursor = RequestedModelAttemptPageCursor {
+        let mut cursor = RequestedModelAttemptPageCursor {
             state: PlannerAppState::new(&app),
             trace_id: "trace-no-session-affinity".to_string(),
             client_api_format: "openai:chat".to_string(),
@@ -2710,6 +3168,7 @@ mod tests {
             resolution_mode: LocalCandidateResolutionMode::Standard,
             decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
             page_cursor,
+            pending_ranked_candidates: VecDeque::new(),
             pending_items: VecDeque::new(),
             skipped_provider_ids: BTreeSet::new(),
             skipped_endpoint_ids: BTreeSet::new(),
@@ -2724,6 +3183,27 @@ mod tests {
         };
 
         assert!(!should_cache_resolved_candidate_page(&cursor));
+
+        // 路由聚合页即使满足固定排序，也不得缓存包含完整 transport 的解析结果。
+        cursor.client_session_affinity =
+            Some(ClientSessionAffinity::from_session_key("routed-session"));
+        cursor.routing_policy = Some(ResolvedRoutingPolicy {
+            group_id: Some("group-1".to_string()),
+            group_version: Some(1),
+            selection_source: "test".to_string(),
+            requested_model: "gpt-5".to_string(),
+            resolved_model: "gpt-5".to_string(),
+            priority_mode: RoutingSetPriorityMode::Provider,
+            scheduling_mode: RoutingSchedulingMode::FixedOrder,
+            keep_priority_on_conversion: false,
+            sticky_key_attempts: 1,
+            ranking_overlay: RankingOverlay::default(),
+            mutation_plan: MutationPlan::default(),
+            pool_policy_overrides: Default::default(),
+            matched_rules: Vec::new(),
+        });
+        assert!(!should_cache_resolved_candidate_page(&cursor));
+        cursor.routing_policy = None;
 
         let sticky_cursor = RequestedModelAttemptPageCursor {
             sticky_session_token: Some("sticky-token".to_string()),
@@ -2808,6 +3288,7 @@ mod tests {
             resolution_mode: LocalCandidateResolutionMode::Standard,
             decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
             page_cursor,
+            pending_ranked_candidates: VecDeque::new(),
             pending_items: VecDeque::new(),
             skipped_provider_ids: BTreeSet::new(),
             skipped_endpoint_ids: BTreeSet::new(),

@@ -226,6 +226,7 @@ mod tests {
             key_internal_priority: 1,
             key_global_priority_for_format: Some(1),
             key_capabilities: None,
+            routing_facts: Default::default(),
             model_id: format!("model-{id}"),
             global_model_id: format!("global-model-{id}"),
             global_model_name: "gpt-5".to_string(),

@@ -1149,6 +1149,7 @@ mod tests {
             key_internal_priority: 0,
             key_global_priority_for_format: Some(0),
             key_capabilities: Some(json!({"provider_only_capability": true})),
+            routing_facts: Default::default(),
             model_id: "model-1".to_string(),
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-5".to_string(),

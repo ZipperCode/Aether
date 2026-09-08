@@ -6,6 +6,7 @@ use aether_data_contracts::repository::pool_scores::PoolMemberScoreRepository;
 use aether_data_contracts::repository::quota::ProviderQuotaRepository;
 use aether_data_contracts::repository::usage::UsageRepository;
 
+use super::core::next_memory_system_config_revision;
 use super::{
     AnnouncementReadRepository, AnnouncementWriteRepository, AuthApiKeyReadRepository,
     AuthApiKeyWriteRepository, AuthModuleReadRepository, AuthModuleWriteRepository,
@@ -261,10 +262,6 @@ impl GatewayDataState {
     where
         I: IntoIterator<Item = (String, serde_json::Value)>,
     {
-        let now_unix_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let values = entries
             .into_iter()
             .map(|(key, value)| {
@@ -272,7 +269,7 @@ impl GatewayDataState {
                     key: key.clone(),
                     value,
                     description: None,
-                    updated_at_unix_secs: Some(now_unix_secs),
+                    updated_at_unix_secs: Some(next_memory_system_config_revision()),
                 };
                 (key, entry)
             })

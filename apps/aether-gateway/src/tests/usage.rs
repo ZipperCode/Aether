@@ -90,6 +90,7 @@ pub(super) fn sample_local_openai_candidate_row() -> StoredMinimalCandidateSelec
         key_capabilities: None,
         key_internal_priority: 5,
         key_global_priority_by_format: Some(serde_json::json!({"openai:chat": 1})),
+        routing_facts: Default::default(),
         model_id: "model-openai-usage-local-1".to_string(),
         global_model_id: "global-model-openai-usage-local-1".to_string(),
         global_model_name: "gpt-5".to_string(),

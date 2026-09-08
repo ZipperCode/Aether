@@ -13,5 +13,6 @@ pub use types::{
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
     StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
     StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats,
+    StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };

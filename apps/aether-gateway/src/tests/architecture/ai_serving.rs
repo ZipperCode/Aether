@@ -42,6 +42,14 @@ fn ordinary_text_candidate_planners_do_not_expose_eager_plan_vectors() {
             );
         }
     }
+
+    let same_format_candidates = read_workspace_file(
+        "apps/aether-gateway/src/ai_serving/planner/passthrough/provider/family/candidates.rs",
+    );
+    assert!(same_format_candidates
+        .contains("build_lazy_requested_model_execution_candidate_attempt_source_with_serving("));
+    assert!(!same_format_candidates
+        .contains("build_local_execution_candidate_attempt_source_with_serving("));
 }
 
 #[test]

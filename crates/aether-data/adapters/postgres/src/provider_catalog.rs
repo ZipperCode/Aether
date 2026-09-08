@@ -17,7 +17,8 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
     StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
     StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats,
+    StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -340,6 +341,25 @@ SELECT
   provider_id,
   is_active,
   upstream_metadata
+FROM provider_api_keys
+WHERE provider_id IN (
+"#;
+
+const LIST_MODEL_FETCH_CANDIDATES_BY_PROVIDER_IDS_PREFIX: &str = r#"
+SELECT
+  id,
+  provider_id,
+  is_active,
+  auto_fetch_models,
+  api_formats,
+  allowed_models,
+  locked_models,
+  model_include_patterns,
+  model_exclude_patterns,
+  CASE
+    WHEN is_active AND auto_fetch_models THEN upstream_metadata
+    ELSE NULL::jsonb
+  END AS upstream_metadata
 FROM provider_api_keys
 WHERE provider_id IN (
 "#;
@@ -836,6 +856,28 @@ impl SqlxProviderCatalogReadRepository {
             .build()
             .fetch(&self.pool),
             map_key_maintenance_summary_row,
+        )
+        .await
+    }
+
+    /// 只读取模型抓取决策和过滤字段；仅符合执行资格的 Key 返回上游元数据。
+    pub async fn list_model_fetch_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, DataLayerError> {
+        if provider_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        collect_query_rows(
+            build_list_query(
+                LIST_MODEL_FETCH_CANDIDATES_BY_PROVIDER_IDS_PREFIX,
+                provider_ids,
+                " ORDER BY provider_id ASC, id ASC",
+            )
+            .build()
+            .fetch(&self.pool),
+            map_model_fetch_candidate_row,
         )
         .await
     }
@@ -2957,6 +2999,14 @@ impl ProviderCatalogReadRepository for SqlxProviderCatalogReadRepository {
         Self::list_key_maintenance_summaries_by_provider_ids(self, provider_ids).await
     }
 
+    /// 将统一仓储契约委托给 PostgreSQL 的模型抓取轻量投影。
+    async fn list_model_fetch_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, DataLayerError> {
+        Self::list_model_fetch_candidates_by_provider_ids(self, provider_ids).await
+    }
+
     /// 将统一仓储契约委托给 PostgreSQL 的轻量认证维护投影。
     async fn list_auth_maintenance_candidates_by_provider_ids(
         &self,
@@ -3496,6 +3546,24 @@ fn map_key_maintenance_summary_row(
     })
 }
 
+/// 将 PostgreSQL 的模型抓取轻量结果映射为候选，避免解码认证或调度运行态字段。
+fn map_model_fetch_candidate_row(
+    row: &PgRow,
+) -> Result<StoredProviderCatalogModelFetchCandidate, DataLayerError> {
+    Ok(StoredProviderCatalogModelFetchCandidate {
+        id: row_get(row, "id")?,
+        provider_id: row_get(row, "provider_id")?,
+        is_active: row_get(row, "is_active")?,
+        auto_fetch_models: row_get(row, "auto_fetch_models")?,
+        api_formats: row_get(row, "api_formats")?,
+        allowed_models: row_get(row, "allowed_models")?,
+        locked_models: row_get(row, "locked_models")?,
+        model_include_patterns: row_get(row, "model_include_patterns")?,
+        model_exclude_patterns: row_get(row, "model_exclude_patterns")?,
+        upstream_metadata: row_get(row, "upstream_metadata")?,
+    })
+}
+
 /// 将 PostgreSQL 轻量结果行映射为认证维护候选，不接触完整凭据列。
 fn map_auth_maintenance_candidate_row(
     row: &PgRow,
@@ -3799,6 +3867,46 @@ mod tests {
         assert!(!projection
             .lines()
             .any(|line| line.trim().trim_end_matches(',') == "auth_config"));
+    }
+
+    /// 验证模型抓取候选查询只投影抓取所需字段，且旧元数据不会泄漏给无资格 Key。
+    #[test]
+    fn model_fetch_candidate_query_projects_only_required_columns() {
+        let projection = super::LIST_MODEL_FETCH_CANDIDATES_BY_PROVIDER_IDS_PREFIX
+            .split("FROM provider_api_keys")
+            .next()
+            .expect("model fetch query should contain a FROM clause")
+            .to_ascii_lowercase();
+
+        for required in [
+            "id",
+            "provider_id",
+            "is_active",
+            "auto_fetch_models",
+            "api_formats",
+            "allowed_models",
+            "locked_models",
+            "model_include_patterns",
+            "model_exclude_patterns",
+            "when is_active and auto_fetch_models then upstream_metadata",
+            "else null::jsonb",
+        ] {
+            assert!(projection.contains(required), "missing column: {required}");
+        }
+        for forbidden in [
+            "api_key",
+            "encrypted_key",
+            "auth_config",
+            "status_snapshot",
+            "capabilities",
+            "health_by_format",
+            "circuit_breaker_by_format",
+        ] {
+            assert!(
+                !projection.contains(forbidden),
+                "unexpected column: {forbidden}"
+            );
+        }
     }
 
     #[test]

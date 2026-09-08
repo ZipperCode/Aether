@@ -579,6 +579,7 @@ fn sample_minimal_candidate_selection_row(
         key_capabilities: Some(serde_json::json!({"cache_1h": true})),
         key_internal_priority,
         key_global_priority_by_format: Some(serde_json::json!({"openai:chat": 3})),
+        routing_facts: Default::default(),
         model_id: format!("model-{provider_id}"),
         global_model_id: "global-model-1".to_string(),
         global_model_name: "gpt-4.1".to_string(),

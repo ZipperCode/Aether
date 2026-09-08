@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS system_configs (
     `key` VARCHAR(255) NOT NULL,
     `value` LONGTEXT NOT NULL,
     `description` LONGTEXT,
+    `revision` BIGINT NOT NULL DEFAULT 0,
     `created_at` BIGINT NOT NULL,
     `updated_at` BIGINT NOT NULL,
     PRIMARY KEY (`id`),

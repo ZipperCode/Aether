@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use super::{
     ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, StoredProviderCatalogEndpoint,
     StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats,
+    StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };
 use crate::DataLayerError;
 
@@ -139,6 +140,25 @@ impl ProviderCatalogSnapshot {
                 .then(left.id.cmp(&right.id))
         });
         keys
+    }
+
+    /// 从内存快照按 Provider 生成模型抓取轻量候选，并保持稳定的 Provider/Key 顺序。
+    pub fn list_model_fetch_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Vec<StoredProviderCatalogModelFetchCandidate> {
+        let mut candidates = self
+            .keys
+            .values()
+            .filter(|key| provider_ids.contains(&key.provider_id))
+            .map(StoredProviderCatalogModelFetchCandidate::from)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.provider_id
+                .cmp(&right.provider_id)
+                .then(left.id.cmp(&right.id))
+        });
+        candidates
     }
 
     pub fn list_keys_page(

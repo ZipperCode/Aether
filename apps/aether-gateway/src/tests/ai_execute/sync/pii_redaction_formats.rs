@@ -597,6 +597,7 @@ fn candidate_row(case: &RedactionFormatCase) -> StoredMinimalCandidateSelectionR
         key_capabilities: None,
         key_internal_priority: 5,
         key_global_priority_by_format: Some(json!({case.provider_format.api_format(): 1})),
+        routing_facts: Default::default(),
         model_id: format!("model-{}", case.test_id),
         global_model_id: format!("global-model-{}", case.test_id),
         global_model_name: case.client_format.client_model().to_string(),

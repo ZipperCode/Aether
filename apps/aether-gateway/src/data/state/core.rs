@@ -3,17 +3,20 @@ use aether_data_contracts::repository::candidate_selection::MinimalCandidateSele
 use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
 use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
 use aether_runtime_state::RuntimeQueueStore;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    GatewayDataConfig, GatewayDataState, StoredSystemConfigEntry, SystemConfigValueCacheState,
-    SystemConfigValueInflightCompletion, SystemConfigValueInflightState,
+    GatewayDataConfig, GatewayDataState, StoredSystemConfigEntry, StoredSystemConfigValue,
+    SystemConfigValueCacheState, SystemConfigValueInflightCompletion,
+    SystemConfigValueInflightState,
 };
 
 const SYSTEM_CONFIG_VALUE_CACHE_TTL: Duration = Duration::from_secs(30);
 const SYSTEM_CONFIG_VALUE_CACHE_MAX_ENTRIES: usize = 512;
 const SYSTEM_CONFIG_VALUE_CACHE_MAX_INFLIGHT: usize = 512;
+static MEMORY_SYSTEM_CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
 
 enum SystemConfigValueLoadRegistration<'a> {
     Leader(SystemConfigValueLoadGuard<'a>),
@@ -255,6 +258,24 @@ fn current_system_config_updated_at_unix_secs() -> u64 {
         .as_secs()
 }
 
+/// 为内存系统配置分配严格递增的 revision，避免同一秒内连续写入复用秒级更新时间。
+pub(super) fn next_memory_system_config_revision() -> u64 {
+    let now_unix_secs = current_system_config_updated_at_unix_secs();
+    let mut previous = MEMORY_SYSTEM_CONFIG_REVISION.load(Ordering::Relaxed);
+    loop {
+        let revision = now_unix_secs.max(previous.saturating_add(1));
+        match MEMORY_SYSTEM_CONFIG_REVISION.compare_exchange_weak(
+            previous,
+            revision,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return revision,
+            Err(current) => previous = current,
+        }
+    }
+}
+
 #[cfg(test)]
 mod system_config_value_cache_tests {
     use super::*;
@@ -385,6 +406,104 @@ mod system_config_value_cache_tests {
         replacement.finish(SystemConfigValueInflightCompletion::Cancelled);
         assert_eq!(cache.admission.available_permits(), 1);
         drop(active);
+    }
+
+    /// 验证内存后端连续写入即使发生在同一秒内，也会生成不同且递增的 revision。
+    #[tokio::test]
+    async fn memory_system_config_revisions_advance_for_consecutive_upserts() {
+        let state = GatewayDataState::disabled().with_system_config_values_for_tests([(
+            "config".to_string(),
+            serde_json::json!({"version": "initial"}),
+        )]);
+        let initial = state
+            .find_system_config_revision_strong("config")
+            .await
+            .expect("initial revision read should succeed")
+            .expect("initial config should exist");
+
+        state
+            .upsert_system_config_value("config", &serde_json::json!({"version": "first"}), None)
+            .await
+            .expect("first config upsert should succeed");
+        let first = state
+            .find_system_config_revision_strong("config")
+            .await
+            .expect("first revision read should succeed")
+            .expect("first config should exist");
+
+        state
+            .upsert_system_config_value("config", &serde_json::json!({"version": "second"}), None)
+            .await
+            .expect("second config upsert should succeed");
+        let second = state
+            .find_system_config_revision_strong("config")
+            .await
+            .expect("second revision read should succeed")
+            .expect("second config should exist");
+
+        assert!(first > initial);
+        assert!(second > first);
+    }
+
+    /// 验证内存删除保留 null 墓碑版本，普通读取隐藏墓碑，重建后 revision 继续递增。
+    #[tokio::test]
+    async fn memory_system_config_delete_and_reinsert_preserve_revision_order() {
+        let state =
+            GatewayDataState::disabled()
+                .with_system_config_values_for_tests(Vec::<(String, serde_json::Value)>::new());
+        state
+            .upsert_system_config_entry(
+                "config",
+                &serde_json::json!({"version": "initial"}),
+                Some("initial description"),
+            )
+            .await
+            .expect("initial config should upsert");
+        let initial_revision = state
+            .find_system_config_revision_strong("config")
+            .await
+            .expect("initial revision read should succeed")
+            .expect("initial config should exist");
+
+        assert!(state
+            .delete_system_config_value("config")
+            .await
+            .expect("config delete should succeed"));
+        assert!(!state
+            .delete_system_config_value("config")
+            .await
+            .expect("repeated config delete should succeed"));
+        assert_eq!(
+            state
+                .find_system_config_value("config")
+                .await
+                .expect("ordinary config read should succeed"),
+            None
+        );
+        assert!(state
+            .list_system_config_entries()
+            .await
+            .expect("config list should succeed")
+            .is_empty());
+        let tombstone = state
+            .find_system_config_value_with_revision_strong("config")
+            .await
+            .expect("tombstone read should succeed")
+            .expect("tombstone should retain its row");
+        assert!(tombstone.value.is_null());
+        assert!(tombstone.revision > initial_revision);
+
+        let restored = state
+            .upsert_system_config_entry("config", &serde_json::json!({"version": "restored"}), None)
+            .await
+            .expect("restored config should upsert");
+        let restored_revision = state
+            .find_system_config_revision_strong("config")
+            .await
+            .expect("restored revision read should succeed")
+            .expect("restored config should exist");
+        assert!(restored_revision > tombstone.revision);
+        assert_eq!(restored.description, None);
     }
 }
 
@@ -806,6 +925,7 @@ impl GatewayDataState {
         self.config.encryption_key()
     }
 
+    /// 读取普通系统配置；JSON null 是保留 revision 的删除墓碑，对调用方表现为不存在。
     pub(crate) async fn find_system_config_value(
         &self,
         key: &str,
@@ -815,7 +935,8 @@ impl GatewayDataState {
                 .read()
                 .expect("system config values lock")
                 .get(key)
-                .map(|entry| entry.value.clone()));
+                .map(|entry| entry.value.clone())
+                .filter(|value| !value.is_null()));
         }
         if let Some(value) = self.system_config_value_cache.get(key) {
             return Ok(value);
@@ -876,6 +997,7 @@ impl GatewayDataState {
         .await
     }
 
+    /// 强读普通系统配置值，同时隐藏内部 JSON null 删除墓碑。
     pub(crate) async fn find_system_config_value_strong(
         &self,
         key: &str,
@@ -885,7 +1007,8 @@ impl GatewayDataState {
                 .read()
                 .expect("system config values lock")
                 .get(key)
-                .map(|entry| entry.value.clone()));
+                .map(|entry| entry.value.clone())
+                .filter(|value| !value.is_null()));
         }
         let Some(backends) = self.backends.as_ref() else {
             return Ok(None);
@@ -894,6 +1017,65 @@ impl GatewayDataState {
             "system_config_value_strong",
             self.database_pool_summary(),
             backends.find_system_config_value(key),
+        )
+        .await
+    }
+
+    /// 仅强读系统配置 revision；内存路径不克隆 JSON，数据库路径只投影 revision 列。
+    pub(crate) async fn find_system_config_revision_strong(
+        &self,
+        key: &str,
+    ) -> Result<Option<u64>, DataLayerError> {
+        if let Some(values) = &self.system_config_values {
+            return Ok(values
+                .read()
+                .expect("system config values lock")
+                .get(key)
+                .map(|entry| {
+                    let revision = entry.updated_at_unix_secs.unwrap_or_default();
+                    // 同步既有 revision，保证后续同秒写入也能分配更大的编号。
+                    MEMORY_SYSTEM_CONFIG_REVISION.fetch_max(revision, Ordering::Relaxed);
+                    revision
+                }));
+        }
+        let Some(backends) = self.backends.as_ref() else {
+            return Ok(None);
+        };
+        crate::request_diagnostics::observe_db_operation(
+            "system_config_revision_strong",
+            self.database_pool_summary(),
+            backends.find_system_config_revision_strong(key),
+        )
+        .await
+    }
+
+    /// 强读系统配置 revision 与值；内存后端使用单调 revision 识别连续更新。
+    pub(crate) async fn find_system_config_value_with_revision_strong(
+        &self,
+        key: &str,
+    ) -> Result<Option<StoredSystemConfigValue>, DataLayerError> {
+        if let Some(values) = &self.system_config_values {
+            return Ok(values
+                .read()
+                .expect("system config values lock")
+                .get(key)
+                .map(|entry| {
+                    let revision = entry.updated_at_unix_secs.unwrap_or_default();
+                    // 同步既有 revision，保证后续同秒写入也能分配更大的编号。
+                    MEMORY_SYSTEM_CONFIG_REVISION.fetch_max(revision, Ordering::Relaxed);
+                    StoredSystemConfigValue {
+                        revision,
+                        value: entry.value.clone(),
+                    }
+                }));
+        }
+        let Some(backends) = self.backends.as_ref() else {
+            return Ok(None);
+        };
+        crate::request_diagnostics::observe_db_operation(
+            "system_config_value_revision_strong",
+            self.database_pool_summary(),
+            backends.find_system_config_value_strong(key),
         )
         .await
     }
@@ -910,6 +1092,7 @@ impl GatewayDataState {
             .value)
     }
 
+    /// 列出对外可见的系统配置；内部墓碑只保留 revision，不进入管理与导出列表。
     pub(crate) async fn list_system_config_entries(
         &self,
     ) -> Result<Vec<StoredSystemConfigEntry>, DataLayerError> {
@@ -918,6 +1101,7 @@ impl GatewayDataState {
                 .read()
                 .expect("system config values lock")
                 .values()
+                .filter(|entry| !entry.value.is_null())
                 .cloned()
                 .collect());
         }
@@ -942,7 +1126,7 @@ impl GatewayDataState {
                 key: key.to_string(),
                 value: value.clone(),
                 description,
-                updated_at_unix_secs: Some(current_system_config_updated_at_unix_secs()),
+                updated_at_unix_secs: Some(next_memory_system_config_revision()),
             };
             values.insert(key.to_string(), entry.clone());
             self.clear_cached_system_config_value(key);
@@ -966,16 +1150,23 @@ impl GatewayDataState {
         })
     }
 
+    /// 将系统配置转为保留 revision 的 JSON null 墓碑；已是墓碑时返回未删除。
     pub(crate) async fn delete_system_config_value(
         &self,
         key: &str,
     ) -> Result<bool, DataLayerError> {
         if let Some(values) = &self.system_config_values {
-            let deleted = values
-                .write()
-                .expect("system config values lock")
-                .remove(key)
-                .is_some();
+            let mut values = values.write().expect("system config values lock");
+            let deleted =
+                if let Some(entry) = values.get_mut(key).filter(|entry| !entry.value.is_null()) {
+                    entry.value = serde_json::Value::Null;
+                    entry.description = None;
+                    entry.updated_at_unix_secs = Some(next_memory_system_config_revision());
+                    true
+                } else {
+                    false
+                };
+            drop(values);
             self.clear_cached_system_config_value(key);
             return Ok(deleted);
         }

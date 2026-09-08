@@ -15,7 +15,8 @@ use super::{
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
     StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
     StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats,
+    StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };
 use crate::repository::usage::{ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta};
 use crate::DataLayerError;
@@ -396,6 +397,29 @@ impl ProviderCatalogReadRepository for InMemoryProviderCatalogReadRepository {
         Ok(self
             .snapshot()
             .list_key_maintenance_summaries_by_provider_ids(provider_ids))
+    }
+
+    /// 在内存索引快照中仅克隆模型抓取所需字段，非 eligible Key 不保留上游元数据。
+    async fn list_model_fetch_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, DataLayerError> {
+        let index = self
+            .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut candidates = index
+            .keys
+            .values()
+            .filter(|key| provider_ids.contains(&key.provider_id))
+            .map(StoredProviderCatalogModelFetchCandidate::from)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.provider_id
+                .cmp(&right.provider_id)
+                .then(left.id.cmp(&right.id))
+        });
+        Ok(candidates)
     }
 
     /// 在共享索引读锁内直接投影认证维护字段，避免克隆整个完整 Key 目录。
@@ -1701,6 +1725,47 @@ mod tests {
         assert_eq!(
             candidates[1].oauth_invalid_reason.as_deref(),
             Some("refresh_failed")
+        );
+    }
+
+    /// 验证模型抓取投影保留决策字段，并仅为 active 自动抓取 Key 携带旧元数据。
+    #[tokio::test]
+    async fn model_fetch_candidates_are_lightweight_and_gate_metadata() {
+        let mut eligible = sample_key("key-b", "provider-1");
+        eligible.auto_fetch_models = true;
+        eligible.api_formats = Some(json!(["openai:chat"]));
+        eligible.allowed_models = Some(json!(["gpt-5"]));
+        eligible.locked_models = Some(json!(["gpt-locked"]));
+        eligible.model_include_patterns = Some(json!(["gpt-*"]));
+        eligible.model_exclude_patterns = Some(json!(["gpt-old"]));
+        eligible.upstream_metadata = Some(json!({"codex": {"reset_time": 123}}));
+        eligible.encrypted_api_key = Some("secret-not-projected".to_string());
+        eligible.status_snapshot = Some(json!({"large": "status".repeat(256)}));
+
+        let mut disabled = sample_key("key-a", "provider-1");
+        disabled.auto_fetch_models = true;
+        disabled.is_active = false;
+        disabled.upstream_metadata = Some(json!({"must": "not be cloned"}));
+
+        let repository = InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider("provider-1")],
+            Vec::new(),
+            vec![eligible, disabled],
+        );
+        let candidates = repository
+            .list_model_fetch_candidates_by_provider_ids(&["provider-1".to_string()])
+            .await
+            .expect("model fetch candidates should read");
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].id, "key-a");
+        assert!(candidates[0].upstream_metadata.is_none());
+        assert_eq!(candidates[1].id, "key-b");
+        assert_eq!(candidates[1].api_formats, Some(json!(["openai:chat"])));
+        assert_eq!(candidates[1].allowed_models, Some(json!(["gpt-5"])));
+        assert_eq!(
+            candidates[1].upstream_metadata,
+            Some(json!({"codex": {"reset_time": 123}}))
         );
     }
 

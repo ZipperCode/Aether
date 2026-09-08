@@ -119,6 +119,7 @@ fn rerank_candidate_row() -> StoredMinimalCandidateSelectionRow {
         key_capabilities: None,
         key_internal_priority: 50,
         key_global_priority_by_format: None,
+        routing_facts: Default::default(),
         model_id: "model-rerank-base".to_string(),
         global_model_id: "global-rerank-base".to_string(),
         global_model_name: "bge-reranker-base".to_string(),

@@ -90,6 +90,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_s
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"gemini:generate_content": 1})),
+            routing_facts: Default::default(),
             model_id: "model-gemini-cli-local-1".to_string(),
             global_model_id: "global-model-gemini-cli-local-1".to_string(),
             global_model_name: "gemini-cli".to_string(),
@@ -543,6 +544,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"gemini:generate_content": 1})),
+            routing_facts: Default::default(),
             model_id: "model-gemini-cli-oauth-stream-local-1".to_string(),
             global_model_id: "global-model-gemini-cli-oauth-stream-local-1".to_string(),
             global_model_name: "gemini-cli".to_string(),
@@ -1099,6 +1101,7 @@ async fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_wi
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"gemini:generate_content": 1})),
+            routing_facts: Default::default(),
             model_id: "model-vertex-cli-stream-local-1".to_string(),
             global_model_id: "global-model-vertex-cli-stream-local-1".to_string(),
             global_model_name: "gemini-cli".to_string(),
@@ -1563,6 +1566,7 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"gemini:generate_content": 1})),
+            routing_facts: Default::default(),
             model_id: format!("model-antigravity-cli-oauth-stream-local-{row_suffix}"),
             global_model_id: format!(
                 "global-model-antigravity-cli-oauth-stream-local-{row_suffix}"

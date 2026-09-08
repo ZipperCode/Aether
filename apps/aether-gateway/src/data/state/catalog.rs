@@ -9,8 +9,9 @@ use super::{
     StoredGeminiFileMappingListPage, StoredProviderCatalogAuthMaintenanceCandidate,
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider, StoredRequestCandidate,
-    UpsertGeminiFileMappingRecord, UpsertRequestCandidateRecord,
+    StoredProviderCatalogKeyStats, StoredProviderCatalogModelFetchCandidate,
+    StoredProviderCatalogProvider, StoredRequestCandidate, UpsertGeminiFileMappingRecord,
+    UpsertRequestCandidateRecord,
 };
 
 impl GatewayDataState {
@@ -326,6 +327,21 @@ impl GatewayDataState {
             Some(repository) => {
                 repository
                     .list_key_maintenance_summaries_by_provider_ids(provider_ids)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 读取模型抓取轻量候选；缓存包装层会绕过目录缓存以保留批末实时可见性。
+    pub(crate) async fn list_provider_catalog_model_fetch_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, DataLayerError> {
+        match &self.provider_catalog_reader {
+            Some(repository) => {
+                repository
+                    .list_model_fetch_candidates_by_provider_ids(provider_ids)
                     .await
             }
             None => Ok(Vec::new()),

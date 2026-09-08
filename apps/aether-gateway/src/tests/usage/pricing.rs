@@ -257,6 +257,7 @@ fn sample_candidate_row(spec: ProviderSpec) -> StoredMinimalCandidateSelectionRo
         key_capabilities: None,
         key_internal_priority: 5,
         key_global_priority_by_format: Some(single_format_priority_map(spec.api_format)),
+        routing_facts: Default::default(),
         model_id: spec.model_id.to_string(),
         global_model_id: spec.global_model_id.to_string(),
         global_model_name: spec.global_model_name.to_string(),

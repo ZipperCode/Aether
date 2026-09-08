@@ -5,7 +5,8 @@ use sqlx::{mysql::MySqlRow, MySql, QueryBuilder, Row};
 
 use aether_data_contracts::repository::candidate_selection::{
     provider_model_mapping_api_format_covers, MinimalCandidateSelectionReadRepository,
-    StoredApiFormatCandidateRowsQuery, StoredMinimalCandidateSelectionRow,
+    StoredApiFormatCandidateRowsQuery, StoredCandidateProxyAffinitySource,
+    StoredMinimalCandidateRoutingFacts, StoredMinimalCandidateSelectionRow,
     StoredPoolKeyCandidateOrder, StoredPoolKeyCandidateRowsByKeyIdsQuery,
     StoredPoolKeyCandidateRowsQuery, StoredProviderModelMapping,
     StoredRequestedModelCandidateRowsQuery,
@@ -22,22 +23,134 @@ SELECT
   p.provider_type AS provider_type,
   p.provider_priority AS provider_priority,
   p.is_active AS provider_is_active,
-  p.config AS provider_config,
+  p.keep_priority_on_conversion AS provider_keep_priority_on_conversion,
+  CASE
+    WHEN JSON_TYPE(IF(JSON_VALID(p.config), JSON_EXTRACT(p.config, '$.pool_advanced'), NULL)) IS NOT NULL
+      AND JSON_TYPE(IF(JSON_VALID(p.config), JSON_EXTRACT(p.config, '$.pool_advanced'), NULL)) <> 'NULL'
+    THEN 1 ELSE 0
+  END AS provider_pool_enabled,
+  CASE
+    WHEN JSON_TYPE(IF(JSON_VALID(p.proxy), JSON_EXTRACT(p.proxy, '$'), NULL)) = 'OBJECT'
+      AND CASE
+        WHEN JSON_TYPE(IF(JSON_VALID(p.proxy), JSON_EXTRACT(p.proxy, '$.enabled'), NULL)) = 'BOOLEAN'
+        THEN JSON_UNQUOTE(JSON_EXTRACT(p.proxy, '$.enabled')) = 'true'
+        ELSE TRUE
+      END
+      AND JSON_TYPE(JSON_EXTRACT(p.proxy, '$.node_id')) = 'STRING'
+    THEN NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(p.proxy, '$.node_id'))), '')
+    ELSE NULL
+  END AS provider_proxy_node_id,
+  CASE
+    WHEN JSON_TYPE(IF(JSON_VALID(p.proxy), JSON_EXTRACT(p.proxy, '$'), NULL)) = 'OBJECT'
+      AND CASE
+        WHEN JSON_TYPE(IF(JSON_VALID(p.proxy), JSON_EXTRACT(p.proxy, '$.enabled'), NULL)) = 'BOOLEAN'
+        THEN JSON_UNQUOTE(JSON_EXTRACT(p.proxy, '$.enabled')) = 'true'
+        ELSE TRUE
+      END
+      AND (
+        (JSON_TYPE(JSON_EXTRACT(p.proxy, '$.url')) = 'STRING' AND NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(p.proxy, '$.url'))), '') IS NOT NULL)
+        OR (JSON_TYPE(JSON_EXTRACT(p.proxy, '$.proxy_url')) = 'STRING' AND NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(p.proxy, '$.proxy_url'))), '') IS NOT NULL)
+      )
+    THEN 1 ELSE 0
+  END AS provider_proxy_has_inline_url,
+  CASE
+    WHEN JSON_TYPE(IF(JSON_VALID(p.proxy), JSON_EXTRACT(p.proxy, '$'), NULL)) = 'OBJECT'
+      AND CASE
+        WHEN JSON_TYPE(IF(JSON_VALID(p.proxy), JSON_EXTRACT(p.proxy, '$.enabled'), NULL)) = 'BOOLEAN'
+        THEN JSON_UNQUOTE(JSON_EXTRACT(p.proxy, '$.enabled')) = 'true'
+        ELSE TRUE
+      END
+      AND JSON_TYPE(JSON_EXTRACT(p.proxy, '$.tunnel_owner_instance_id')) = 'STRING'
+    THEN NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(p.proxy, '$.tunnel_owner_instance_id'))), '')
+    ELSE NULL
+  END AS provider_proxy_tunnel_owner_instance_id,
   pe.id AS endpoint_id,
   COALESCE(pe.api_format, '') AS endpoint_api_format,
   pe.api_family AS endpoint_api_family,
   pe.endpoint_kind AS endpoint_kind,
   pe.is_active AS endpoint_is_active,
+  CASE
+    WHEN JSON_TYPE(IF(JSON_VALID(pe.proxy), JSON_EXTRACT(pe.proxy, '$'), NULL)) = 'OBJECT'
+      AND CASE
+        WHEN JSON_TYPE(IF(JSON_VALID(pe.proxy), JSON_EXTRACT(pe.proxy, '$.enabled'), NULL)) = 'BOOLEAN'
+        THEN JSON_UNQUOTE(JSON_EXTRACT(pe.proxy, '$.enabled')) = 'true'
+        ELSE TRUE
+      END
+      AND JSON_TYPE(JSON_EXTRACT(pe.proxy, '$.node_id')) = 'STRING'
+    THEN NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(pe.proxy, '$.node_id'))), '')
+    ELSE NULL
+  END AS endpoint_proxy_node_id,
+  CASE
+    WHEN JSON_TYPE(IF(JSON_VALID(pe.proxy), JSON_EXTRACT(pe.proxy, '$'), NULL)) = 'OBJECT'
+      AND CASE
+        WHEN JSON_TYPE(IF(JSON_VALID(pe.proxy), JSON_EXTRACT(pe.proxy, '$.enabled'), NULL)) = 'BOOLEAN'
+        THEN JSON_UNQUOTE(JSON_EXTRACT(pe.proxy, '$.enabled')) = 'true'
+        ELSE TRUE
+      END
+      AND (
+        (JSON_TYPE(JSON_EXTRACT(pe.proxy, '$.url')) = 'STRING' AND NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(pe.proxy, '$.url'))), '') IS NOT NULL)
+        OR (JSON_TYPE(JSON_EXTRACT(pe.proxy, '$.proxy_url')) = 'STRING' AND NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(pe.proxy, '$.proxy_url'))), '') IS NOT NULL)
+      )
+    THEN 1 ELSE 0
+  END AS endpoint_proxy_has_inline_url,
+  CASE
+    WHEN JSON_TYPE(IF(JSON_VALID(pe.proxy), JSON_EXTRACT(pe.proxy, '$'), NULL)) = 'OBJECT'
+      AND CASE
+        WHEN JSON_TYPE(IF(JSON_VALID(pe.proxy), JSON_EXTRACT(pe.proxy, '$.enabled'), NULL)) = 'BOOLEAN'
+        THEN JSON_UNQUOTE(JSON_EXTRACT(pe.proxy, '$.enabled')) = 'true'
+        ELSE TRUE
+      END
+      AND JSON_TYPE(JSON_EXTRACT(pe.proxy, '$.tunnel_owner_instance_id')) = 'STRING'
+    THEN NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(pe.proxy, '$.tunnel_owner_instance_id'))), '')
+    ELSE NULL
+  END AS endpoint_proxy_tunnel_owner_instance_id,
   pak.id AS key_id,
   pak.name AS key_name,
   pak.auth_type AS key_auth_type,
-  pak.auth_config AS key_auth_config,
+  CASE WHEN NULLIF(TRIM(pak.auth_config), '') IS NOT NULL THEN 1 ELSE 0 END AS key_has_auth_config,
   pak.is_active AS key_is_active,
   pak.api_formats AS key_api_formats,
+  pak.auth_type_by_format AS key_auth_type_by_format,
+  pak.allow_auth_channel_mismatch_formats AS key_allow_auth_channel_mismatch_formats,
   pak.allowed_models AS key_allowed_models,
   pak.capabilities AS key_capabilities,
   pak.internal_priority AS key_internal_priority,
   pak.global_priority_by_format AS key_global_priority_by_format,
+  CASE
+    WHEN JSON_TYPE(IF(JSON_VALID(pak.proxy), JSON_EXTRACT(pak.proxy, '$'), NULL)) = 'OBJECT'
+      AND CASE
+        WHEN JSON_TYPE(IF(JSON_VALID(pak.proxy), JSON_EXTRACT(pak.proxy, '$.enabled'), NULL)) = 'BOOLEAN'
+        THEN JSON_UNQUOTE(JSON_EXTRACT(pak.proxy, '$.enabled')) = 'true'
+        ELSE TRUE
+      END
+      AND JSON_TYPE(JSON_EXTRACT(pak.proxy, '$.node_id')) = 'STRING'
+    THEN NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(pak.proxy, '$.node_id'))), '')
+    ELSE NULL
+  END AS key_proxy_node_id,
+  CASE
+    WHEN JSON_TYPE(IF(JSON_VALID(pak.proxy), JSON_EXTRACT(pak.proxy, '$'), NULL)) = 'OBJECT'
+      AND CASE
+        WHEN JSON_TYPE(IF(JSON_VALID(pak.proxy), JSON_EXTRACT(pak.proxy, '$.enabled'), NULL)) = 'BOOLEAN'
+        THEN JSON_UNQUOTE(JSON_EXTRACT(pak.proxy, '$.enabled')) = 'true'
+        ELSE TRUE
+      END
+      AND (
+        (JSON_TYPE(JSON_EXTRACT(pak.proxy, '$.url')) = 'STRING' AND NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(pak.proxy, '$.url'))), '') IS NOT NULL)
+        OR (JSON_TYPE(JSON_EXTRACT(pak.proxy, '$.proxy_url')) = 'STRING' AND NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(pak.proxy, '$.proxy_url'))), '') IS NOT NULL)
+      )
+    THEN 1 ELSE 0
+  END AS key_proxy_has_inline_url,
+  CASE
+    WHEN JSON_TYPE(IF(JSON_VALID(pak.proxy), JSON_EXTRACT(pak.proxy, '$'), NULL)) = 'OBJECT'
+      AND CASE
+        WHEN JSON_TYPE(IF(JSON_VALID(pak.proxy), JSON_EXTRACT(pak.proxy, '$.enabled'), NULL)) = 'BOOLEAN'
+        THEN JSON_UNQUOTE(JSON_EXTRACT(pak.proxy, '$.enabled')) = 'true'
+        ELSE TRUE
+      END
+      AND JSON_TYPE(JSON_EXTRACT(pak.proxy, '$.tunnel_owner_instance_id')) = 'STRING'
+    THEN NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(pak.proxy, '$.tunnel_owner_instance_id'))), '')
+    ELSE NULL
+  END AS key_proxy_tunnel_owner_instance_id,
   m.id AS model_id,
   m.global_model_id AS global_model_id,
   gm.name AS global_model_name,
@@ -76,7 +189,8 @@ pub struct MysqlMinimalCandidateSelectionReadRepository {
 struct CandidateSelectionRow {
     row: StoredMinimalCandidateSelectionRow,
     provider_pool_enabled: bool,
-    key_auth_config: Option<String>,
+    /// Kiro bearer 候选只保留认证配置存在性，禁止候选页持有原始认证 JSON。
+    key_has_auth_config: bool,
 }
 
 #[derive(Debug)]
@@ -363,11 +477,6 @@ fn push_selected_pool_rows(builder: &mut QueryBuilder<'_, MySql>) {
 ranked_rows AS (
   SELECT
     candidate_rows.*,
-    CASE
-      WHEN JSON_EXTRACT(provider_config, '$.pool_advanced') IS NOT NULL
-        AND JSON_TYPE(JSON_EXTRACT(provider_config, '$.pool_advanced')) <> 'NULL'
-      THEN 1 ELSE 0
-    END AS provider_pool_enabled,
     ROW_NUMBER() OVER (
       PARTITION BY provider_id, endpoint_id, model_id
       ORDER BY key_internal_priority ASC, key_id ASC
@@ -763,12 +872,7 @@ fn key_auth_channel_matches(row: &CandidateSelectionRow, api_format: &str) -> bo
         "claude_code" => auth_type == "oauth" && api_format == "claude:messages",
         "kiro" => {
             api_format == "claude:messages"
-                && (auth_type == "oauth"
-                    || (auth_type == "bearer"
-                        && row
-                            .key_auth_config
-                            .as_deref()
-                            .is_some_and(|value| !value.trim().is_empty())))
+                && (auth_type == "oauth" || (auth_type == "bearer" && row.key_has_auth_config))
         }
         "gemini_cli" | "antigravity" => {
             auth_type == "oauth" && api_format == "gemini:generate_content"
@@ -810,9 +914,8 @@ fn dedupe_candidate_selection_rows(
 }
 
 fn map_candidate_selection_row(row: &MySqlRow) -> Result<CandidateSelectionRow, DataLayerError> {
-    let provider_config = parse_json(row.try_get("provider_config").ok().flatten())?;
     let global_model_config = parse_json(row.try_get("global_model_config").ok().flatten())?;
-    let provider_pool_enabled = json_object_field_present(&provider_config, "pool_advanced");
+    let provider_pool_enabled = row.try_get("provider_pool_enabled").map_sql_err()?;
     let global_model_mappings = global_model_config
         .as_ref()
         .and_then(|value| value.get("model_mappings").cloned());
@@ -820,6 +923,27 @@ fn map_candidate_selection_row(row: &MySqlRow) -> Result<CandidateSelectionRow, 
         .as_ref()
         .and_then(|value| value.get("streaming"))
         .and_then(json_bool);
+    let endpoint_api_format: String = row.try_get("endpoint_api_format").map_sql_err()?;
+    let key_auth_type: String = row.try_get("key_auth_type").map_sql_err()?;
+    let key_auth_type_by_format =
+        parse_json(row.try_get("key_auth_type_by_format").ok().flatten())?;
+    let key_allow_auth_channel_mismatch_formats = parse_json(
+        row.try_get("key_allow_auth_channel_mismatch_formats")
+            .ok()
+            .flatten(),
+    )?;
+    let routing_facts = StoredMinimalCandidateRoutingFacts::from_safe_projection(
+        row.try_get("provider_keep_priority_on_conversion")
+            .map_sql_err()?,
+        provider_pool_enabled,
+        &key_auth_type,
+        &endpoint_api_format,
+        key_auth_type_by_format.as_ref(),
+        key_allow_auth_channel_mismatch_formats.as_ref(),
+        map_proxy_affinity_source(row, "key")?,
+        map_proxy_affinity_source(row, "endpoint")?,
+        map_proxy_affinity_source(row, "provider")?,
+    );
     Ok(CandidateSelectionRow {
         row: StoredMinimalCandidateSelectionRow {
             provider_id: row.try_get("provider_id").map_sql_err()?,
@@ -828,13 +952,13 @@ fn map_candidate_selection_row(row: &MySqlRow) -> Result<CandidateSelectionRow, 
             provider_priority: row.try_get("provider_priority").map_sql_err()?,
             provider_is_active: row.try_get("provider_is_active").map_sql_err()?,
             endpoint_id: row.try_get("endpoint_id").map_sql_err()?,
-            endpoint_api_format: row.try_get("endpoint_api_format").map_sql_err()?,
+            endpoint_api_format,
             endpoint_api_family: row.try_get("endpoint_api_family").map_sql_err()?,
             endpoint_kind: row.try_get("endpoint_kind").map_sql_err()?,
             endpoint_is_active: row.try_get("endpoint_is_active").map_sql_err()?,
             key_id: row.try_get("key_id").map_sql_err()?,
             key_name: row.try_get("key_name").map_sql_err()?,
-            key_auth_type: row.try_get("key_auth_type").map_sql_err()?,
+            key_auth_type,
             key_is_active: row.try_get("key_is_active").map_sql_err()?,
             key_api_formats: parse_string_list(
                 parse_json(row.try_get("key_api_formats").ok().flatten())?,
@@ -849,6 +973,7 @@ fn map_candidate_selection_row(row: &MySqlRow) -> Result<CandidateSelectionRow, 
             key_global_priority_by_format: parse_json(
                 row.try_get("key_global_priority_by_format").ok().flatten(),
             )?,
+            routing_facts,
             model_id: row.try_get("model_id").map_sql_err()?,
             global_model_id: row.try_get("global_model_id").map_sql_err()?,
             global_model_name: row.try_get("global_model_name").map_sql_err()?,
@@ -866,8 +991,23 @@ fn map_candidate_selection_row(row: &MySqlRow) -> Result<CandidateSelectionRow, 
             model_is_available: row.try_get("model_is_available").map_sql_err()?,
         },
         provider_pool_enabled,
-        key_auth_config: row.try_get("key_auth_config").map_sql_err()?,
+        key_has_auth_config: row.try_get("key_has_auth_config").map_sql_err()?,
     })
+}
+
+/// 将 MySQL 的无凭据代理标量组合成候选亲和事实，避免把 URL 或认证信息带出查询边界。
+fn map_proxy_affinity_source(
+    row: &MySqlRow,
+    source: &str,
+) -> Result<Option<StoredCandidateProxyAffinitySource>, DataLayerError> {
+    let node_id_column = format!("{source}_proxy_node_id");
+    let inline_url_column = format!("{source}_proxy_has_inline_url");
+    let owner_column = format!("{source}_proxy_tunnel_owner_instance_id");
+    Ok(StoredCandidateProxyAffinitySource::new(
+        row.try_get(node_id_column.as_str()).map_sql_err()?,
+        row.try_get(inline_url_column.as_str()).map_sql_err()?,
+        row.try_get(owner_column.as_str()).map_sql_err()?,
+    ))
 }
 
 fn parse_json(value: Option<String>) -> Result<Option<serde_json::Value>, DataLayerError> {
@@ -881,13 +1021,6 @@ fn parse_json(value: Option<String>) -> Result<Option<serde_json::Value>, DataLa
             })
         })
         .transpose()
-}
-
-fn json_object_field_present(value: &Option<serde_json::Value>, field: &str) -> bool {
-    value
-        .as_ref()
-        .and_then(|value| value.get(field))
-        .is_some_and(|value| !value.is_null())
 }
 
 fn json_bool(value: &serde_json::Value) -> Option<bool> {
@@ -1115,7 +1248,8 @@ mod tests {
         api_format_page_query, pool_key_group_by_key_ids_query, pool_key_group_query,
         provider_model_mapping_api_format_covers, push_key_auth_channel_filter,
         requested_model_page_query, vertex_key_auth_channel_matches, ExactPageAccumulator,
-        MysqlMinimalCandidateSelectionReadRepository, REQUESTED_MODEL_RAW_SCAN_LIMIT,
+        MysqlMinimalCandidateSelectionReadRepository, CANDIDATE_SELECTION_COLUMNS,
+        REQUESTED_MODEL_RAW_SCAN_LIMIT,
     };
     use aether_data_contracts::repository::candidate_selection::{
         StoredPoolKeyCandidateOrder, StoredPoolKeyCandidateRowsByKeyIdsQuery,
@@ -1127,6 +1261,26 @@ mod tests {
         let source = include_str!("candidate_selection.rs");
         assert!(source.contains("INNER JOIN model_endpoint_bindings meb"));
         assert!(source.contains("AND meb.is_active = 1"));
+    }
+
+    /// 验证 MySQL 候选基础投影只输出代理标量和认证策略，不输出完整配置、URL 或 auth JSON。
+    #[test]
+    fn mysql_candidate_query_projects_compact_routing_facts() {
+        let sql = CANDIDATE_SELECTION_COLUMNS;
+        for alias in [
+            "provider_proxy_node_id",
+            "endpoint_proxy_node_id",
+            "key_proxy_node_id",
+            "provider_proxy_has_inline_url",
+            "key_has_auth_config",
+        ] {
+            assert!(sql.contains(alias));
+        }
+        assert!(!sql.contains("p.config AS provider_config"));
+        assert!(!sql.contains("pak.auth_config AS key_auth_config"));
+        assert!(!sql.contains("p.proxy AS provider_proxy"));
+        assert!(!sql.contains("pe.proxy AS endpoint_proxy"));
+        assert!(!sql.contains("pak.proxy AS key_proxy"));
     }
 
     #[test]

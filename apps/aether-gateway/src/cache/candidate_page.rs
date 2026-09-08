@@ -15,7 +15,8 @@ use serde_json::Value;
 use sha2::Digest as _;
 
 use crate::ai_serving::{
-    EligibleLocalExecutionCandidate, GatewayAuthApiKeySnapshot, SkippedLocalExecutionCandidate,
+    GatewayAuthApiKeySnapshot, RankedLocalExecutionCandidate, SkippedLocalExecutionCandidate,
+    UnmaterializedSkippedLocalExecutionCandidate,
 };
 use crate::data::candidate_selection::RequestedModelCandidateRowsPage;
 
@@ -41,8 +42,10 @@ pub(crate) type CandidateRowPageCache =
 
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateResolvedPageSnapshot {
-    pub(crate) candidates: Vec<EligibleLocalExecutionCandidate>,
-    pub(crate) resolved_skipped: Vec<SkippedLocalExecutionCandidate>,
+    /// 已完成全局排序但尚未读取 transport 的候选。
+    pub(crate) candidates: Vec<RankedLocalExecutionCandidate>,
+    /// 轻量策略产生的跳过结果；类型层面不允许携带 transport。
+    pub(crate) resolved_skipped: Vec<UnmaterializedSkippedLocalExecutionCandidate>,
 }
 
 pub(crate) type CandidateResolvedPageCache =

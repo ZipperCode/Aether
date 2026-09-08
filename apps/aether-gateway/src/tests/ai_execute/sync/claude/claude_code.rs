@@ -120,6 +120,7 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"claude:messages": 1})),
+            routing_facts: Default::default(),
             model_id: "model-claude-code-cli-local-1".to_string(),
             global_model_id: "global-model-claude-code-cli-local-1".to_string(),
             global_model_name: "claude-code".to_string(),

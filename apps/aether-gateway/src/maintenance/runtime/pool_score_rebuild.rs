@@ -271,6 +271,7 @@ pub(crate) async fn ensure_provider_key_pool_scores_for_keys(
     Ok(upserted)
 }
 
+/// 先用轻量摘要选出本轮 Key ID，再逐个强读当前 Key 并更新分数，避免整批完整凭据驻留。
 pub(crate) async fn perform_pool_score_rebuild_once_with_config(
     state: &AppState,
     config: PoolScoreRebuildWorkerConfig,
@@ -350,52 +351,17 @@ pub(crate) async fn perform_pool_score_rebuild_once_with_config(
                 key_ids[key_index].clone()
             })
             .collect::<Vec<_>>();
-        let mut selected_keys_by_id = state
-            .list_provider_catalog_keys_by_ids(&selected_ids)
-            .await?
-            .into_iter()
-            .filter(|key| key.is_active && key.provider_id == provider.id)
-            .map(|key| (key.id.clone(), key))
-            .collect::<BTreeMap<_, _>>();
-        let selected_keys = selected_ids
-            .iter()
-            .filter_map(|key_id| selected_keys_by_id.remove(key_id))
-            .collect::<Vec<_>>();
-        let mut build_items = Vec::with_capacity(selected_keys.len());
-        for offset in 0..provider_budget {
-            let Some(key) = selected_keys.get(offset) else {
-                break;
-            };
-            let draft = build_provider_key_pool_score_upsert(
-                key,
-                provider.provider_type.as_str(),
-                None,
-                now,
-                pool_config.score_rules,
-            );
-            build_items.push((offset, draft.id));
-        }
-        if build_items.is_empty() {
-            store_runtime_usize(
-                state,
-                &provider_cursor_key,
-                (provider_cursor + provider_budget) % total_keys,
-            )
-            .await;
-            continue;
-        }
         let mut provider_upserts = 0usize;
         summary.keys_seen = summary.keys_seen.saturating_add(total_keys);
-        for (key_index, _) in &build_items {
+        for key_id in &selected_ids {
             if summary.scores_upserted >= config.max_upserts_per_tick {
                 break;
             }
-            let key = &selected_keys[*key_index];
             if upsert_current_provider_key_pool_score(
                 state,
                 &provider,
                 &pool_config,
-                &key.id,
+                key_id,
                 false,
                 now,
             )
@@ -434,6 +400,7 @@ pub(crate) async fn perform_pool_score_rebuild_once(
         .await
 }
 
+/// 启动后立即执行一次 Pool 分数重建，并消费 interval 的即时 tick 后再进入周期循环。
 pub(crate) fn spawn_pool_score_rebuild_worker(
     state: AppState,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -457,6 +424,7 @@ pub(crate) fn spawn_pool_score_rebuild_worker(
             }
             let mut interval = tokio::time::interval(config.interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
             let mut deferred_since = None;
             loop {
                 interval.tick().await;
@@ -499,11 +467,15 @@ pub(crate) fn spawn_pool_score_rebuild_worker(
 mod tests {
     use super::*;
 
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
-    use aether_data_contracts::repository::pool_scores::PoolMemberIdentity;
+    use aether_data_contracts::repository::pool_scores::{
+        PoolMemberIdentity, PoolScoreReadRepository,
+    };
     use aether_data_contracts::repository::provider_catalog::{
         ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
         StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
@@ -516,9 +488,12 @@ mod tests {
 
     struct NoWideKeyProviderCatalogReadRepository {
         inner: InMemoryProviderCatalogReadRepository,
+        /// 记录轻量摘要扫描轮数，用于验证 worker 启动时只执行一轮重建。
+        maintenance_summary_calls: AtomicUsize,
     }
 
     impl NoWideKeyProviderCatalogReadRepository {
+        /// 构造拒绝宽 Key 批量读取并可观测摘要扫描次数的测试仓储。
         fn seed(
             providers: Vec<StoredProviderCatalogProvider>,
             endpoints: Vec<StoredProviderCatalogEndpoint>,
@@ -526,7 +501,13 @@ mod tests {
         ) -> Self {
             Self {
                 inner: InMemoryProviderCatalogReadRepository::seed(providers, endpoints, keys),
+                maintenance_summary_calls: AtomicUsize::new(0),
             }
+        }
+
+        /// 返回已经开始的轻量摘要扫描轮数。
+        fn maintenance_summary_calls(&self) -> usize {
+            self.maintenance_summary_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -562,10 +543,16 @@ mod tests {
                 .await
         }
 
+        /// 测试仓储拒绝批量完整 Key 读取，只允许当前 Key 的单项强读。
         async fn list_keys_by_ids(
             &self,
             key_ids: &[String],
         ) -> Result<Vec<StoredProviderCatalogKey>, DataLayerError> {
+            assert_eq!(
+                key_ids.len(),
+                1,
+                "pool score rebuild must hydrate only the current key"
+            );
             self.inner.list_keys_by_ids(key_ids).await
         }
 
@@ -585,10 +572,13 @@ mod tests {
                 .await
         }
 
+        /// 委托轻量摘要读取，并记录每轮重建必经的扫描入口。
         async fn list_key_maintenance_summaries_by_provider_ids(
             &self,
             provider_ids: &[String],
         ) -> Result<Vec<StoredProviderCatalogKeyMaintenanceSummary>, DataLayerError> {
+            self.maintenance_summary_calls
+                .fetch_add(1, Ordering::SeqCst);
             self.inner
                 .list_key_maintenance_summaries_by_provider_ids(provider_ids)
                 .await
@@ -644,6 +634,7 @@ mod tests {
         )
     }
 
+    /// 验证两个 active Key 均能更新分数，且重建过程不会批量加载完整 Key。
     #[tokio::test]
     async fn pool_score_rebuild_uses_maintenance_summaries_before_full_key_load() {
         let provider = provider("provider-1");
@@ -668,7 +659,7 @@ mod tests {
             &state,
             PoolScoreRebuildWorkerConfig {
                 interval: Duration::from_secs(60),
-                max_upserts_per_tick: 1,
+                max_upserts_per_tick: 2,
             },
         )
         .await
@@ -680,7 +671,7 @@ mod tests {
                 providers_checked: 1,
                 providers_scored: 1,
                 keys_seen: 2,
-                scores_upserted: 1,
+                scores_upserted: 2,
             }
         );
 
@@ -694,7 +685,56 @@ mod tests {
             })
             .await
             .expect("scores should load");
-        assert_eq!(scores.len(), 1);
-        assert_eq!(scores[0].member_id, "key-a");
+        assert_eq!(scores.len(), 2);
+        assert_eq!(
+            scores
+                .iter()
+                .map(|score| score.member_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["key-a", "key-b"])
+        );
+    }
+
+    /// 验证 worker 启动后完成一轮重建，但不会被 interval 的即时首 tick 重复执行第二轮。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_score_rebuild_worker_runs_only_once_at_startup() {
+        let provider_catalog_repository = Arc::new(NoWideKeyProviderCatalogReadRepository::seed(
+            vec![provider("provider-1")],
+            Vec::new(),
+            vec![key("key-a", true)],
+        ));
+        let pool_score_repository = Arc::new(InMemoryPoolMemberScoreRepository::default());
+        let provider_catalog_reader: Arc<dyn ProviderCatalogReadRepository> =
+            provider_catalog_repository.clone();
+        let data =
+            GatewayDataState::with_provider_catalog_reader_for_tests(provider_catalog_reader)
+                .with_pool_score_repository_for_tests(Arc::clone(&pool_score_repository));
+        let state = AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(data);
+
+        let handle = spawn_pool_score_rebuild_worker(state).expect("worker should spawn");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let scores = pool_score_repository
+                    .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+                        ids: vec![score_id("provider-1", "key-a")],
+                    })
+                    .await
+                    .expect("scores should load");
+                if !scores.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup rebuild should finish");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(provider_catalog_repository.maintenance_summary_calls(), 1);
+
+        handle.abort();
+        let _ = handle.await;
     }
 }

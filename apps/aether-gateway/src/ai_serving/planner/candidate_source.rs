@@ -476,6 +476,11 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         }
     }
 
+    /// 将尚未开始的游标收窄为客户端同格式，供原生 passthrough 路径复用分页加载。
+    pub(crate) fn restrict_to_client_api_format(&mut self) {
+        self.candidate_api_formats = vec![self.client_api_format.clone()];
+    }
+
     pub(crate) async fn next_page(
         &mut self,
     ) -> Result<
@@ -2120,6 +2125,7 @@ mod tests {
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:responses": 1})),
+            routing_facts: Default::default(),
             model_id: "model-openai-responses-mapped-1".to_string(),
             global_model_id: "global-model-openai-responses-mapped-1".to_string(),
             global_model_name: "gpt-5".to_string(),
@@ -2158,6 +2164,7 @@ mod tests {
             key_capabilities: None,
             key_internal_priority: 0,
             key_global_priority_by_format: None,
+            routing_facts: Default::default(),
             model_id: format!("model-{provider_id}"),
             global_model_id: "global-model-gpt-5".to_string(),
             global_model_name: "gpt-5".to_string(),
@@ -2275,6 +2282,7 @@ mod tests {
             key_capabilities: None,
             key_internal_priority,
             key_global_priority_by_format: None,
+            routing_facts: Default::default(),
             model_id: "model-opg-deepseek-v4-pro".to_string(),
             global_model_id: "global-model-deepseek-v4-pro".to_string(),
             global_model_name: "deepseek-v4-pro".to_string(),
@@ -2551,8 +2559,11 @@ mod tests {
     #[tokio::test]
     async fn first_page_includes_cross_format_candidates_that_keep_conversion_priority() {
         let same_format = standard_candidate_row("provider-claude", "claude:messages", 10);
-        let keep_priority_cross =
+        let mut keep_priority_cross =
             standard_candidate_row("provider-openai-responses-keep", "openai:responses", 0);
+        keep_priority_cross
+            .routing_facts
+            .provider_keep_priority_on_conversion = true;
         let regular_cross =
             standard_candidate_row("provider-openai-responses-regular", "openai:responses", 1);
         let candidate_repository: Arc<dyn MinimalCandidateSelectionReadRepository> =

@@ -4,7 +4,7 @@ use sqlx::Row;
 use crate::error::SqlxResultExt;
 use crate::repository::system::{
     AdminSystemStats, AdminSystemStatsDailyAggregate, AdminSystemStatsDailyApiKeyAggregate,
-    AdminSystemStatsUserDailyAggregate,
+    AdminSystemStatsUserDailyAggregate, StoredSystemConfigValue,
 };
 use crate::DataLayerError;
 
@@ -18,13 +18,23 @@ WHERE key = $1
 LIMIT 1
 "#;
 
+const FIND_SYSTEM_CONFIG_VALUE_STRONG_SQL: &str = r#"
+SELECT revision, value FROM system_configs WHERE key = $1 LIMIT 1
+"#;
+
+/// revision-only 强读 SQL；投影保持单列，避免未变化配置复制完整 JSON。
+const FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL: &str = r#"
+SELECT revision FROM system_configs WHERE key = $1 LIMIT 1
+"#;
+
 const UPSERT_SYSTEM_CONFIG_VALUE_SQL: &str = r#"
-INSERT INTO system_configs (id, key, value, description, created_at, updated_at)
-VALUES ($1, $2, $3, $4, NOW(), NOW())
+INSERT INTO system_configs (id, key, value, description, revision, created_at, updated_at)
+VALUES ($1, $2, $3, $4, 1, NOW(), NOW())
 ON CONFLICT (key) DO UPDATE
 SET value = EXCLUDED.value,
     description = COALESCE(EXCLUDED.description, system_configs.description),
-    updated_at = NOW()
+    updated_at = NOW(),
+    revision = system_configs.revision + 1
 RETURNING value
 "#;
 
@@ -39,22 +49,29 @@ ORDER BY key ASC
 "#;
 
 const UPSERT_SYSTEM_CONFIG_ENTRY_SQL: &str = r#"
-INSERT INTO system_configs (id, key, value, description, created_at, updated_at)
-VALUES ($1, $2, $3, $4, NOW(), NOW())
+INSERT INTO system_configs (id, key, value, description, revision, created_at, updated_at)
+VALUES ($1, $2, $3, $4, 1, NOW(), NOW())
 ON CONFLICT (key) DO UPDATE
 SET value = EXCLUDED.value,
     description = COALESCE(EXCLUDED.description, system_configs.description),
-    updated_at = NOW()
+    updated_at = NOW(),
+    revision = system_configs.revision + 1
 RETURNING
     key,
     value,
     description,
+    revision,
     EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at_unix_secs
 "#;
 
 const DELETE_SYSTEM_CONFIG_VALUE_SQL: &str = r#"
-DELETE FROM system_configs
+UPDATE system_configs
+SET value = 'null'::json,
+    description = NULL,
+    revision = revision + 1,
+    updated_at = NOW()
 WHERE key = $1
+  AND json_typeof(value) IS DISTINCT FROM 'null'
 "#;
 
 const READ_ADMIN_SYSTEM_STATS_SQL: &str = r#"
@@ -1143,6 +1160,7 @@ impl PostgresBackend {
         Ok(summary)
     }
 
+    /// 普通读取隐藏 JSON null 删除墓碑；revision 强读仍可观察墓碑版本。
     pub async fn find_system_config_value(
         &self,
         key: &str,
@@ -1152,9 +1170,43 @@ impl PostgresBackend {
             .fetch_optional(self.pool())
             .await
             .map_postgres_err()?;
-        row.map(|row| row.try_get("value"))
+        let value = row
+            .map(|row| row.try_get("value"))
             .transpose()
+            .map_postgres_err()?;
+        Ok(value.filter(|value: &serde_json::Value| !value.is_null()))
+    }
+
+    /// 强读系统配置 revision 与 JSON 值，确保跨节点吊销在下一次刷新可见。
+    pub async fn find_system_config_value_strong(
+        &self,
+        key: &str,
+    ) -> Result<Option<StoredSystemConfigValue>, DataLayerError> {
+        let row = sqlx::query(FIND_SYSTEM_CONFIG_VALUE_STRONG_SQL)
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await
+            .map_postgres_err()?;
+        row.map(|row| {
+            Ok(StoredSystemConfigValue {
+                revision: row.try_get::<i64, _>("revision").map_postgres_err()?.max(0) as u64,
+                value: row.try_get("value").map_postgres_err()?,
+            })
+        })
+        .transpose()
+    }
+
+    /// 仅强读系统配置 revision；查询不读取 JSON value，供认证快照快速命中。
+    pub async fn find_system_config_revision_strong(
+        &self,
+        key: &str,
+    ) -> Result<Option<u64>, DataLayerError> {
+        sqlx::query_scalar::<_, i64>(FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL)
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await
             .map_postgres_err()
+            .map(|revision| revision.map(|value| value.max(0) as u64))
     }
 
     pub async fn upsert_system_config_value(
@@ -1174,15 +1226,20 @@ impl PostgresBackend {
         row.try_get("value").map_postgres_err()
     }
 
+    /// 管理列表隐藏 JSON null 墓碑，但底层行继续保留单调 revision。
     pub async fn list_system_config_entries(
         &self,
     ) -> Result<Vec<StoredSystemConfigEntry>, DataLayerError> {
         let mut rows = sqlx::query(LIST_SYSTEM_CONFIG_ENTRIES_SQL).fetch(self.pool());
         let mut entries = Vec::new();
         while let Some(row) = rows.try_next().await.map_postgres_err()? {
+            let value: serde_json::Value = row.try_get("value").map_postgres_err()?;
+            if value.is_null() {
+                continue;
+            }
             entries.push(StoredSystemConfigEntry {
                 key: row.try_get("key").map_postgres_err()?,
-                value: row.try_get("value").map_postgres_err()?,
+                value,
                 description: row.try_get("description").map_postgres_err()?,
                 updated_at_unix_secs: row
                     .try_get::<Option<i64>, _>("updated_at_unix_secs")
@@ -1218,6 +1275,7 @@ impl PostgresBackend {
         })
     }
 
+    /// 首次删除写入 JSON null 墓碑并递增 revision；重复删除保持 false。
     pub async fn delete_system_config_value(&self, key: &str) -> Result<bool, DataLayerError> {
         let result = sqlx::query(DELETE_SYSTEM_CONFIG_VALUE_SQL)
             .bind(key)
@@ -1344,4 +1402,32 @@ pub(super) fn map_admin_system_stats(
             .map_postgres_err()?
             .max(0) as u64,
     })
+}
+
+#[cfg(test)]
+mod revision_query_tests {
+    use super::{DELETE_SYSTEM_CONFIG_VALUE_SQL, FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL};
+
+    /// 验证 PostgreSQL revision-only 强读不会把大 JSON value 带入结果集。
+    #[test]
+    fn system_config_revision_query_excludes_value_projection() {
+        let projection = FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL
+            .split_once("FROM")
+            .expect("revision query should contain FROM")
+            .0
+            .to_ascii_lowercase();
+        assert!(projection.contains("revision"));
+        assert!(!projection.contains("value"));
+    }
+
+    /// 验证 PostgreSQL 删除只写墓碑并推进 revision，不物理移除配置行。
+    #[test]
+    fn system_config_delete_query_preserves_revision_tombstone() {
+        let sql = DELETE_SYSTEM_CONFIG_VALUE_SQL.to_ascii_lowercase();
+        assert!(sql.contains("update system_configs"));
+        assert!(sql.contains("value = 'null'::json"));
+        assert!(sql.contains("description = null"));
+        assert!(sql.contains("revision = revision + 1"));
+        assert!(!sql.contains("delete from"));
+    }
 }

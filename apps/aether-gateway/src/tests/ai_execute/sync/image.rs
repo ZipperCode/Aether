@@ -118,6 +118,7 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
             key_global_priority_by_format: Some(serde_json::json!({
                 "gemini:generate_content": 1
             })),
+            routing_facts: Default::default(),
             model_id: "model-gemini-image-bridge-1".to_string(),
             global_model_id: "global-model-gemini-image-bridge-1".to_string(),
             global_model_name: "gpt-image-2".to_string(),
@@ -472,6 +473,7 @@ async fn gateway_converts_gemini_image_sync_to_openai_image_provider_impl() {
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:image": 1})),
+            routing_facts: Default::default(),
             model_id: "model-openai-image-bridge-1".to_string(),
             global_model_id: "global-model-openai-image-bridge-1".to_string(),
             global_model_name: "gemini-image".to_string(),
@@ -822,6 +824,7 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:image": 1})),
+            routing_facts: Default::default(),
             model_id: "model-codex-image-local-1".to_string(),
             global_model_id: "global-model-codex-image-local-1".to_string(),
             global_model_name: "gpt-image-2".to_string(),
@@ -1232,6 +1235,7 @@ async fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url_imp
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:image": 1})),
+            routing_facts: Default::default(),
             model_id: "model-chatgpt-web-image-plan-1".to_string(),
             global_model_id: "global-model-chatgpt-web-image-plan-1".to_string(),
             global_model_name: "gpt-image-2".to_string(),

@@ -16,7 +16,8 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
     StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
     StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats,
+    StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -301,6 +302,25 @@ FROM provider_api_keys
 WHERE provider_id IN (
 "#;
 
+const LIST_MODEL_FETCH_CANDIDATES_BY_PROVIDER_IDS_PREFIX: &str = r#"
+SELECT
+  id,
+  provider_id,
+  is_active,
+  auto_fetch_models,
+  api_formats,
+  allowed_models,
+  locked_models,
+  model_include_patterns,
+  model_exclude_patterns,
+  CASE
+    WHEN is_active AND auto_fetch_models THEN upstream_metadata
+    ELSE NULL
+  END AS upstream_metadata
+FROM provider_api_keys
+WHERE provider_id IN (
+"#;
+
 const LIST_AUTH_MAINTENANCE_CANDIDATES_BY_PROVIDER_IDS_PREFIX: &str = r#"
 SELECT
   id,
@@ -481,6 +501,27 @@ impl SqliteProviderCatalogReadRepository {
         .await
         .map_sql_err()?;
         rows.iter().map(map_key_maintenance_summary_row).collect()
+    }
+
+    /// 只读取模型抓取决策、过滤和命名空间合并字段，避免批量加载认证密文与运行态 JSON。
+    pub async fn list_model_fetch_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, DataLayerError> {
+        if provider_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = build_list_query(
+            LIST_MODEL_FETCH_CANDIDATES_BY_PROVIDER_IDS_PREFIX,
+            provider_ids,
+            " ORDER BY provider_id ASC, id ASC",
+        )
+        .build()
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        rows.iter().map(map_model_fetch_candidate_row).collect()
     }
 
     /// 只读取认证维护资格字段，密文和大型运行态 JSON 不进入查询结果。
@@ -2363,6 +2404,14 @@ impl ProviderCatalogReadRepository for SqliteProviderCatalogReadRepository {
         Self::list_key_maintenance_summaries_by_provider_ids(self, provider_ids).await
     }
 
+    /// 将统一仓储契约委托给 SQLite 的模型抓取轻量投影。
+    async fn list_model_fetch_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, DataLayerError> {
+        Self::list_model_fetch_candidates_by_provider_ids(self, provider_ids).await
+    }
+
     /// 将统一仓储契约委托给 SQLite 的轻量认证维护投影。
     async fn list_auth_maintenance_candidates_by_provider_ids(
         &self,
@@ -3383,6 +3432,42 @@ fn map_key_maintenance_summary_row(
     })
 }
 
+/// 将 SQLite 轻量结果行映射为模型抓取候选，只解析抓取策略必需的 JSON 字段。
+fn map_model_fetch_candidate_row(
+    row: &SqliteRow,
+) -> Result<StoredProviderCatalogModelFetchCandidate, DataLayerError> {
+    Ok(StoredProviderCatalogModelFetchCandidate {
+        id: row.try_get("id").map_sql_err()?,
+        provider_id: row.try_get("provider_id").map_sql_err()?,
+        is_active: row.try_get("is_active").map_sql_err()?,
+        auto_fetch_models: row.try_get("auto_fetch_models").map_sql_err()?,
+        api_formats: optional_json_from_string(
+            row.try_get("api_formats").map_sql_err()?,
+            "provider_api_keys.api_formats",
+        )?,
+        allowed_models: optional_json_from_string(
+            row.try_get("allowed_models").map_sql_err()?,
+            "provider_api_keys.allowed_models",
+        )?,
+        locked_models: optional_json_from_string(
+            row.try_get("locked_models").map_sql_err()?,
+            "provider_api_keys.locked_models",
+        )?,
+        model_include_patterns: optional_json_from_string(
+            row.try_get("model_include_patterns").map_sql_err()?,
+            "provider_api_keys.model_include_patterns",
+        )?,
+        model_exclude_patterns: optional_json_from_string(
+            row.try_get("model_exclude_patterns").map_sql_err()?,
+            "provider_api_keys.model_exclude_patterns",
+        )?,
+        upstream_metadata: optional_json_from_string(
+            row.try_get("upstream_metadata").map_sql_err()?,
+            "provider_api_keys.upstream_metadata",
+        )?,
+    })
+}
+
 /// 将 SQLite 轻量结果行映射为认证维护候选，不解析任何密文或大型 JSON。
 fn map_auth_maintenance_candidate_row(
     row: &SqliteRow,
@@ -3636,6 +3721,141 @@ mod tests {
         assert!(!projection
             .lines()
             .any(|line| line.trim().trim_end_matches(',') == "auth_config"));
+    }
+
+    /// 验证模型抓取候选查询仅投影决策字段，并把非 eligible Key 的旧元数据留在数据库。
+    #[test]
+    fn model_fetch_candidate_query_excludes_secret_and_heavy_columns() {
+        let projection = super::LIST_MODEL_FETCH_CANDIDATES_BY_PROVIDER_IDS_PREFIX
+            .split("FROM provider_api_keys")
+            .next()
+            .expect("model fetch query should contain a FROM clause")
+            .to_ascii_lowercase();
+
+        for required in [
+            "id",
+            "provider_id",
+            "is_active",
+            "auto_fetch_models",
+            "api_formats",
+            "allowed_models",
+            "locked_models",
+            "model_include_patterns",
+            "model_exclude_patterns",
+            "as upstream_metadata",
+        ] {
+            assert!(projection.contains(required), "missing column: {required}");
+        }
+        for forbidden in ["api_key", "encrypted_key", "auth_config", "status_snapshot"] {
+            assert!(
+                !projection.contains(forbidden),
+                "unexpected column: {forbidden}"
+            );
+        }
+    }
+
+    /// 验证 SQLite 实际投影保留 eligible Key 元数据，并清空不可抓取 Key 的元数据。
+    #[tokio::test]
+    async fn sqlite_model_fetch_candidates_keep_only_eligible_metadata() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let repository = SqliteProviderCatalogReadRepository::new(pool);
+        repository
+            .create_provider(
+                &StoredProviderCatalogProvider::new(
+                    "model-fetch-provider".to_string(),
+                    "Model Fetch Provider".to_string(),
+                    None,
+                    "openai".to_string(),
+                )
+                .expect("provider should build"),
+                None,
+            )
+            .await
+            .expect("provider should create");
+
+        let mut eligible = StoredProviderCatalogKey::new(
+            "model-fetch-eligible".to_string(),
+            "model-fetch-provider".to_string(),
+            "Eligible".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        eligible.auto_fetch_models = true;
+        eligible.api_formats = Some(json!(["openai-chat"]));
+        eligible.allowed_models = Some(json!(["gpt-5.2"]));
+        eligible.locked_models = Some(json!(["gpt-5.2-locked"]));
+        eligible.model_include_patterns = Some(json!(["gpt-5.*"]));
+        eligible.model_exclude_patterns = Some(json!(["gpt-5.2-preview"]));
+        eligible.upstream_metadata = Some(json!({"models":{"etag":"eligible"}}));
+
+        let mut disabled = eligible.clone();
+        disabled.id = "model-fetch-disabled".to_string();
+        disabled.is_active = false;
+        disabled.upstream_metadata = Some(json!({"models":{"etag":"disabled"}}));
+
+        let mut auto_fetch_disabled = eligible.clone();
+        auto_fetch_disabled.id = "model-fetch-auto-disabled".to_string();
+        auto_fetch_disabled.auto_fetch_models = false;
+        auto_fetch_disabled.upstream_metadata = Some(json!({"models":{"etag":"auto-disabled"}}));
+
+        for key in [&eligible, &disabled, &auto_fetch_disabled] {
+            repository.create_key(key).await.expect("key should create");
+        }
+
+        let candidates = repository
+            .list_model_fetch_candidates_by_provider_ids(&["model-fetch-provider".to_string()])
+            .await
+            .expect("model fetch candidates should list");
+        assert_eq!(candidates.len(), 3);
+
+        let eligible_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == "model-fetch-eligible")
+            .expect("eligible candidate should exist");
+        assert_eq!(eligible_candidate.provider_id, "model-fetch-provider");
+        assert!(eligible_candidate.is_active);
+        assert!(eligible_candidate.auto_fetch_models);
+        assert_eq!(eligible_candidate.api_formats, eligible.api_formats);
+        assert_eq!(eligible_candidate.allowed_models, eligible.allowed_models);
+        assert_eq!(eligible_candidate.locked_models, eligible.locked_models);
+        assert_eq!(
+            eligible_candidate.model_include_patterns,
+            eligible.model_include_patterns
+        );
+        assert_eq!(
+            eligible_candidate.model_exclude_patterns,
+            eligible.model_exclude_patterns
+        );
+        assert_eq!(
+            eligible_candidate.upstream_metadata,
+            eligible.upstream_metadata
+        );
+
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|candidate| candidate.id == "model-fetch-disabled")
+                .expect("disabled candidate should exist")
+                .upstream_metadata,
+            None
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|candidate| candidate.id == "model-fetch-auto-disabled")
+                .expect("auto-fetch-disabled candidate should exist")
+                .upstream_metadata,
+            None
+        );
     }
 
     #[tokio::test]

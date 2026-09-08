@@ -1145,6 +1145,7 @@ CREATE TABLE IF NOT EXISTS public.system_configs (
     key character varying(100) NOT NULL,
     value json NOT NULL,
     description text,
+    revision bigint DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );

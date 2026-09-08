@@ -5,12 +5,12 @@ use aether_ai_serving::{
 };
 use aether_routing_core::ResolvedRoutingPolicy;
 use async_trait::async_trait;
+use std::marker::PhantomData;
 use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
 use crate::clock::request_distribution_seed;
-use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::scheduler::config::{
     read_scheduler_ordering_config, SchedulerOrderingConfig, SchedulerSchedulingMode,
 };
@@ -21,13 +21,15 @@ use aether_scheduler_core::{
 };
 
 use super::candidate_affinity_cache::read_cached_scheduler_affinity_target;
-use super::candidate_resolution::{EligibleLocalExecutionCandidate, LocalExecutionCandidateKind};
+use super::candidate_resolution::{
+    EligibleLocalExecutionCandidate, LocalExecutionCandidateKind, RankedLocalExecutionCandidate,
+};
 use super::candidate_transport_ranking_facts::{
     resolve_cached_transport_ranking_facts, CandidateTransportRankingFactsCache,
 };
 
 /// 解析后候选排序端口为一次排序执行冻结独立分布种子，避免同毫秒请求形成热点。
-struct GatewayLocalCandidateRankingPort<'a> {
+struct GatewayLocalCandidateRankingPort<'a, Candidate> {
     state: PlannerAppState<'a>,
     requested_model: Option<&'a str>,
     auth_snapshot: Option<&'a GatewayAuthApiKeySnapshot>,
@@ -38,11 +40,67 @@ struct GatewayLocalCandidateRankingPort<'a> {
     load_balance_seed: u64,
     routing_policy: Option<&'a ResolvedRoutingPolicy>,
     transport_ranking_facts_cache: Mutex<CandidateTransportRankingFactsCache>,
+    /// 仅绑定排序候选类型，不持有候选或 transport。
+    candidate_type: PhantomData<Candidate>,
+}
+
+/// 统一已 hydration 与未 hydration 候选的排序视图，确保两条路径共享完全相同的排序算法。
+trait LocalCandidateRankingTarget: Send + Sync {
+    /// 返回调度核心候选标量。
+    fn scheduler_candidate(&self) -> &SchedulerMinimalCandidateSelectionCandidate;
+
+    /// 返回候选逻辑类型；Pool 组使用独立的覆盖优先级与亲和范围。
+    fn candidate_kind(&self) -> LocalExecutionCandidateKind;
+
+    /// 返回 Provider Endpoint 的标准化格式。
+    fn provider_api_format(&self) -> &str;
+
+    /// 写入本批次最终排序结果，供持久化诊断复用。
+    fn set_ranking(&mut self, outcome: SchedulerRankingOutcome);
+}
+
+impl LocalCandidateRankingTarget for EligibleLocalExecutionCandidate {
+    fn scheduler_candidate(&self) -> &SchedulerMinimalCandidateSelectionCandidate {
+        &self.candidate
+    }
+
+    fn candidate_kind(&self) -> LocalExecutionCandidateKind {
+        self.kind
+    }
+
+    fn provider_api_format(&self) -> &str {
+        &self.provider_api_format
+    }
+
+    fn set_ranking(&mut self, outcome: SchedulerRankingOutcome) {
+        self.ranking = Some(outcome);
+    }
+}
+
+impl LocalCandidateRankingTarget for RankedLocalExecutionCandidate {
+    fn scheduler_candidate(&self) -> &SchedulerMinimalCandidateSelectionCandidate {
+        &self.candidate
+    }
+
+    fn candidate_kind(&self) -> LocalExecutionCandidateKind {
+        self.kind
+    }
+
+    fn provider_api_format(&self) -> &str {
+        &self.provider_api_format
+    }
+
+    fn set_ranking(&mut self, outcome: SchedulerRankingOutcome) {
+        self.ranking = Some(outcome);
+    }
 }
 
 #[async_trait]
-impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
-    type Candidate = EligibleLocalExecutionCandidate;
+impl<Candidate> AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_, Candidate>
+where
+    Candidate: LocalCandidateRankingTarget,
+{
+    type Candidate = Candidate;
     type AffinityTarget = SchedulerAffinityTarget;
     type Error = std::convert::Infallible;
 
@@ -54,7 +112,7 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
             .or_else(|| {
                 candidates
                     .first()
-                    .map(|candidate| candidate.candidate.global_model_name.clone())
+                    .map(|candidate| candidate.scheduler_candidate().global_model_name.clone())
             })
     }
 
@@ -93,19 +151,21 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
             resolve_cached_transport_ranking_facts(
                 self.state,
                 &mut cache,
-                &candidate.candidate,
-                candidate.transport.as_ref(),
+                candidate.scheduler_candidate(),
                 self.ordering_config,
             )
             .await
         };
-        let routing_overlaid_candidate =
-            routing_overlaid_candidate(self.routing_policy, candidate.kind, &candidate.candidate);
+        let routing_overlaid_candidate = routing_overlaid_candidate(
+            self.routing_policy,
+            candidate.candidate_kind(),
+            candidate.scheduler_candidate(),
+        );
         Ok(build_ai_rankable_candidate(AiRankableCandidateParts {
             candidate: &routing_overlaid_candidate,
             original_index,
             normalized_client_api_format,
-            provider_api_format: candidate.provider_api_format.as_str(),
+            provider_api_format: candidate.provider_api_format(),
             required_capabilities: self.required_capabilities,
             cached_affinity_match,
             tunnel_bucket: ranking_facts.tunnel_bucket,
@@ -126,7 +186,7 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
         candidate: &mut Self::Candidate,
         outcome: SchedulerRankingOutcome,
     ) {
-        candidate.ranking = Some(outcome);
+        candidate.set_ranking(outcome);
     }
 }
 
@@ -141,8 +201,61 @@ pub(crate) async fn rank_eligible_local_execution_candidates(
     required_capabilities: Option<&serde_json::Value>,
     routing_policy: Option<&ResolvedRoutingPolicy>,
 ) -> Vec<EligibleLocalExecutionCandidate> {
+    rank_local_execution_candidates(
+        state,
+        candidates,
+        normalized_client_api_format,
+        requested_model,
+        auth_snapshot,
+        client_session_affinity,
+        required_capabilities,
+        routing_policy,
+    )
+    .await
+}
+
+/// 对 transport-free 候选执行与已解析候选相同的全局排序。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rank_local_candidate_snapshots(
+    state: PlannerAppState<'_>,
+    candidates: Vec<RankedLocalExecutionCandidate>,
+    normalized_client_api_format: &str,
+    requested_model: Option<&str>,
+    auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+    client_session_affinity: Option<&ClientSessionAffinity>,
+    required_capabilities: Option<&serde_json::Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+) -> Vec<RankedLocalExecutionCandidate> {
+    rank_local_execution_candidates(
+        state,
+        candidates,
+        normalized_client_api_format,
+        requested_model,
+        auth_snapshot,
+        client_session_affinity,
+        required_capabilities,
+        routing_policy,
+    )
+    .await
+}
+
+/// 为任一轻量排序视图冻结配置与分布种子，并运行共享 AI 排序核心。
+#[allow(clippy::too_many_arguments)]
+async fn rank_local_execution_candidates<Candidate>(
+    state: PlannerAppState<'_>,
+    candidates: Vec<Candidate>,
+    normalized_client_api_format: &str,
+    requested_model: Option<&str>,
+    auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+    client_session_affinity: Option<&ClientSessionAffinity>,
+    required_capabilities: Option<&serde_json::Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+) -> Vec<Candidate>
+where
+    Candidate: LocalCandidateRankingTarget,
+{
     let ordering_config = scheduler_ordering_config_for_routing_policy(state, routing_policy).await;
-    let port = GatewayLocalCandidateRankingPort {
+    let port = GatewayLocalCandidateRankingPort::<Candidate> {
         state,
         requested_model,
         auth_snapshot,
@@ -152,6 +265,7 @@ pub(crate) async fn rank_eligible_local_execution_candidates(
         load_balance_seed: request_distribution_seed(),
         routing_policy,
         transport_ranking_facts_cache: Mutex::new(CandidateTransportRankingFactsCache::default()),
+        candidate_type: PhantomData,
     };
 
     match run_ai_candidate_ranking(&port, candidates, normalized_client_api_format).await {
@@ -161,20 +275,16 @@ pub(crate) async fn rank_eligible_local_execution_candidates(
 }
 
 fn cached_affinity_matches_local_execution_scope(
-    eligible: &EligibleLocalExecutionCandidate,
+    eligible: &impl LocalCandidateRankingTarget,
     target: &SchedulerAffinityTarget,
 ) -> bool {
-    if local_execution_candidate_uses_pool(eligible) {
-        return eligible.candidate.provider_id == target.provider_id
-            && eligible.candidate.endpoint_id == target.endpoint_id;
+    let candidate = eligible.scheduler_candidate();
+    if eligible.candidate_kind() == LocalExecutionCandidateKind::PoolGroup {
+        return candidate.provider_id == target.provider_id
+            && candidate.endpoint_id == target.endpoint_id;
     }
 
-    matches_affinity_target(&eligible.candidate, target)
-}
-
-fn local_execution_candidate_uses_pool(eligible: &EligibleLocalExecutionCandidate) -> bool {
-    admin_provider_pool_config_from_config_value(eligible.transport.provider.config.as_ref())
-        .is_some()
+    matches_affinity_target(candidate, target)
 }
 
 /// 将网关排序配置映射为 AI 排序上下文，并原样传递调用方生成的批次种子。
@@ -369,6 +479,7 @@ mod tests {
             key_internal_priority: 0,
             key_global_priority_for_format: Some(0),
             key_capabilities: None,
+            routing_facts: Default::default(),
             model_id: "model-1".to_string(),
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-4.1".to_string(),
@@ -683,6 +794,7 @@ mod tests {
             key_internal_priority: 0,
             key_global_priority_for_format,
             key_capabilities: None,
+            routing_facts: Default::default(),
             model_id: format!("model-{provider_id}"),
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-4.1".to_string(),
@@ -912,17 +1024,21 @@ mod tests {
             .expect("state should build")
             .with_data_state_for_tests(data_state);
 
+        let mut cross_format = sample_priority_candidate(
+            "provider-cross",
+            "endpoint-cross",
+            "key-cross",
+            "claude:messages",
+            Some(0),
+            0,
+        );
+        cross_format
+            .routing_facts
+            .provider_keep_priority_on_conversion = true;
         let ranked = rank_local_execution_candidates(
             PlannerAppState::new(&state),
             vec![
-                sample_priority_candidate(
-                    "provider-cross",
-                    "endpoint-cross",
-                    "key-cross",
-                    "claude:messages",
-                    Some(0),
-                    0,
-                ),
+                cross_format,
                 sample_priority_candidate(
                     "provider-same",
                     "endpoint-same",

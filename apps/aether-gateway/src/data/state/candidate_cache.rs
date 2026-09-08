@@ -1273,6 +1273,7 @@ mod tests {
             key_capabilities: None,
             key_internal_priority,
             key_global_priority_by_format: None,
+            routing_facts: Default::default(),
             model_id: "model-1".to_string(),
             global_model_id: "global-model-1".to_string(),
             global_model_name: "mock-model".to_string(),

@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS public.system_configs (
     key character varying(255) NOT NULL,
     value text NOT NULL,
     description text,
+    revision bigint DEFAULT 0 NOT NULL,
     created_at bigint NOT NULL,
     updated_at bigint NOT NULL
 );

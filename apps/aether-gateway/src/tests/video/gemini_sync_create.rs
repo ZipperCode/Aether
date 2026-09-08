@@ -99,6 +99,7 @@ async fn gateway_executes_gemini_video_create_via_local_decision_gate_with_local
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(json!({"gemini:video": 1})),
+            routing_facts: Default::default(),
             model_id: "model-gemini-video-local-1".to_string(),
             global_model_id: "global-model-gemini-video-local-1".to_string(),
             global_model_name: "veo-3".to_string(),

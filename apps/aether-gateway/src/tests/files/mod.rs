@@ -104,6 +104,7 @@ fn sample_files_candidate_row() -> StoredMinimalCandidateSelectionRow {
         key_capabilities: Some(serde_json::json!({"gemini_files": true})),
         key_internal_priority: 5,
         key_global_priority_by_format: Some(serde_json::json!({"gemini:files": 1})),
+        routing_facts: Default::default(),
         model_id: "model-gemini-files-local-1".to_string(),
         global_model_id: "global-model-gemini-files-local-1".to_string(),
         global_model_name: "gemini-2.5-pro".to_string(),

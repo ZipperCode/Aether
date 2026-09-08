@@ -6,6 +6,15 @@ pub struct StoredSystemConfigEntry {
     pub updated_at_unix_secs: Option<u64>,
 }
 
+/// 系统配置强读结果；revision 与 value 在同一次数据库读取中返回，供跨节点配置失效判断。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredSystemConfigValue {
+    /// 数据库内单调递增的配置版本，用于判断进程内解析快照是否仍有效。
+    pub revision: u64,
+    /// 与 revision 同一次强读取得的完整 JSON，仅在版本变化时加载。
+    pub value: serde_json::Value,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AdminSecurityBlacklistEntry {
     pub ip_address: String,

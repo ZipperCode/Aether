@@ -108,6 +108,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(json!({"openai:search": 1})),
+            routing_facts: Default::default(),
             model_id: "model-codex-search-1".to_string(),
             global_model_id: "global-model-codex-search-1".to_string(),
             global_model_name: "gpt-5.6-sol".to_string(),

@@ -4,15 +4,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
-    StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };
 use aether_model_fetch::{
     aggregate_models_for_cache, apply_model_filters,
     fetch_models_from_transports_for_client_version, global_model_matches_allowed_models,
     json_string_list, model_catalog_upstream_metadata, model_fetch_interval_minutes,
     model_fetch_startup_delay_seconds, model_fetch_startup_enabled, preset_models_for_provider,
-    selected_models_fetch_endpoints, sync_provider_model_whitelist_associations,
-    upstream_metadata_namespace_updates, ModelFetchAssociationStore, ModelFetchRunSummary,
+    reconcile_provider_model_whitelist_availability,
+    selected_models_fetch_endpoints_for_api_formats, sync_provider_model_discovery_associations,
+    sync_provider_model_whitelist_associations, upstream_metadata_namespace_updates,
+    ModelFetchAssociationStore, ModelFetchRunSummary,
 };
 use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
@@ -27,7 +29,7 @@ use self::state::ModelFetchRuntimeState;
 #[derive(Debug, Clone)]
 struct SelectedFetchTarget {
     provider: StoredProviderCatalogProvider,
-    key: StoredProviderCatalogKey,
+    key: StoredProviderCatalogModelFetchCandidate,
     endpoints: Vec<StoredProviderCatalogEndpoint>,
 }
 
@@ -132,8 +134,9 @@ pub(crate) async fn sync_global_model_provider_associations(
 
     let mut allowed_models_by_provider = BTreeMap::<String, BTreeSet<String>>::new();
     for key in state
-        .list_provider_catalog_keys_by_provider_ids(&provider_ids)
-        .await?
+        .list_model_fetch_candidates_by_provider_ids(&provider_ids)
+        .await
+        .map_err(GatewayError::Internal)?
         .into_iter()
         .filter(|key| key.is_active && active_provider_ids.contains(&key.provider_id))
     {
@@ -243,8 +246,9 @@ where
             .or_default()
             .push(endpoint);
     }
-    let mut keys_by_provider = HashMap::<String, Vec<StoredProviderCatalogKey>>::new();
-    for key in <S as ModelFetchAssociationStore>::list_provider_catalog_keys_by_provider_ids(
+    let mut keys_by_provider =
+        HashMap::<String, Vec<StoredProviderCatalogModelFetchCandidate>>::new();
+    for key in <S as ModelFetchAssociationStore>::list_model_fetch_candidates_by_provider_ids(
         state,
         &provider_ids,
     )
@@ -270,7 +274,10 @@ where
             if !key.is_active || !key.auto_fetch_models {
                 continue;
             }
-            let selected_endpoints = selected_models_fetch_endpoints(&endpoints, &key);
+            let selected_endpoints = selected_models_fetch_endpoints_for_api_formats(
+                &endpoints,
+                key.api_formats.as_ref(),
+            );
             targets.push(SelectedFetchTarget {
                 provider: provider.clone(),
                 key,
@@ -281,6 +288,7 @@ where
     Ok(targets)
 }
 
+/// 顺序执行本轮抓取目标，并将 Provider 全量白名单可用性核对合并为每个成功 Provider 一次。
 async fn execute_fetch_targets<S>(
     state: &S,
     targets: Vec<SelectedFetchTarget>,
@@ -298,6 +306,7 @@ where
     let mut discovered_models_by_provider = BTreeMap::<String, Vec<Value>>::new();
     let mut provider_fetch_authority = BTreeMap::<String, (bool, BTreeSet<String>)>::new();
     let mut provider_failed_endpoint_ids = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut successful_provider_ids = BTreeSet::new();
     for target in targets {
         let target_endpoint_ids = target
             .endpoints
@@ -306,7 +315,10 @@ where
             .collect::<BTreeSet<_>>();
         let outcome = fetch_and_persist_key_models(state, &target).await?;
         match outcome.disposition {
-            KeyFetchDisposition::Succeeded => summary.succeeded += 1,
+            KeyFetchDisposition::Succeeded => {
+                summary.succeeded += 1;
+                successful_provider_ids.insert(target.provider.id.clone());
+            }
             KeyFetchDisposition::Failed => summary.failed += 1,
             KeyFetchDisposition::Skipped => summary.skipped += 1,
         }
@@ -342,6 +354,11 @@ where
                 .extend(target_endpoint_ids);
         }
     }
+    for provider_id in &successful_provider_ids {
+        reconcile_provider_model_whitelist_availability(state, provider_id)
+            .await
+            .map_err(GatewayError::Internal)?;
+    }
     if reconcile_automatic_bindings {
         for (provider_id, models) in discovered_models_by_provider {
             let models = aggregate_models_for_cache(&models);
@@ -359,7 +376,7 @@ where
                 .collect::<Vec<_>>();
             let replace_automatic_bindings =
                 !authoritative_endpoint_ids.is_empty() && !has_preset_results;
-            sync_provider_model_whitelist_associations(
+            sync_provider_model_discovery_associations(
                 state,
                 &provider_id,
                 &[],
@@ -422,6 +439,7 @@ impl KeyFetchOutcome {
     }
 }
 
+/// 抓取并持久化单个 Key 的模型，同时仅同步该次发现直接产生的模型关联与 Endpoint 绑定。
 async fn fetch_and_persist_key_models(
     state: &(impl ModelFetchRuntimeState + ?Sized),
     target: &SelectedFetchTarget,
@@ -460,7 +478,7 @@ async fn fetch_and_persist_key_models(
             state
                 .write_upstream_models_cache(&target.provider.id, &target.key.id, &models)
                 .await;
-            sync_provider_model_whitelist_associations(
+            sync_provider_model_discovery_associations(
                 state,
                 &target.provider.id,
                 &filtered_models,
@@ -599,7 +617,7 @@ async fn fetch_and_persist_key_models(
     state
         .write_upstream_models_cache(&target.provider.id, &target.key.id, &association_models)
         .await;
-    sync_provider_model_whitelist_associations(
+    sync_provider_model_discovery_associations(
         state,
         &target.provider.id,
         &filtered_models,
@@ -651,7 +669,7 @@ fn attach_model_endpoint_ids(models: &mut [Value], endpoints: &[StoredProviderCa
 
 async fn persist_key_fetch_failure(
     state: &(impl ModelFetchRuntimeState + ?Sized),
-    key: &StoredProviderCatalogKey,
+    key: &StoredProviderCatalogModelFetchCandidate,
     now_unix_secs: u64,
     error: String,
 ) -> Result<(), GatewayError> {
@@ -669,7 +687,7 @@ async fn persist_key_fetch_failure(
 
 async fn persist_key_fetch_success(
     state: &(impl ModelFetchRuntimeState + ?Sized),
-    key: &StoredProviderCatalogKey,
+    key: &StoredProviderCatalogModelFetchCandidate,
     now_unix_secs: u64,
     allowed_models: &[String],
     upstream_metadata: Option<&Value>,
@@ -718,7 +736,8 @@ mod tests {
     };
     use aether_data_contracts::repository::provider_catalog::{
         ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
-        StoredProviderCatalogKey, StoredProviderCatalogProvider,
+        StoredProviderCatalogKey, StoredProviderCatalogModelFetchCandidate,
+        StoredProviderCatalogProvider,
     };
     use aether_model_fetch::{
         build_models_fetch_execution_plan, ModelFetchAssociationStore, ModelFetchTransportRuntime,
@@ -747,9 +766,12 @@ mod tests {
         provider_models: Arc<Mutex<Vec<StoredAdminProviderModel>>>,
         binding_syncs: Arc<Mutex<Vec<(String, Vec<String>, bool, Vec<String>)>>>,
         upstream_metadata_updates: Arc<Mutex<Vec<(String, String, Value, Option<u64>)>>>,
+        /// 记录测试仓储按 Provider 读取模型抓取轻量投影的参数，用于约束收集与批末重读次数。
+        model_fetch_candidate_queries: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     impl TestState {
+        /// 构造可记录目录读取次数与执行结果的模型抓取测试状态。
         fn new(
             providers: Vec<StoredProviderCatalogProvider>,
             endpoints: Vec<StoredProviderCatalogEndpoint>,
@@ -768,6 +790,7 @@ mod tests {
                 provider_models: Arc::new(Mutex::new(Vec::new())),
                 binding_syncs: Arc::new(Mutex::new(Vec::new())),
                 upstream_metadata_updates: Arc::new(Mutex::new(Vec::new())),
+                model_fetch_candidate_queries: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -914,10 +937,15 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn list_provider_catalog_keys_by_provider_ids(
+        /// 返回指定 Provider 的轻量候选，并记录实时读取以验证批次去重与重读语义。
+        async fn list_model_fetch_candidates_by_provider_ids(
             &self,
             provider_ids: &[String],
-        ) -> Result<Vec<StoredProviderCatalogKey>, Self::Error> {
+        ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, Self::Error> {
+            self.model_fetch_candidate_queries
+                .lock()
+                .expect("model fetch candidate query mutex")
+                .push(provider_ids.to_vec());
             Ok(self
                 .keys
                 .lock()
@@ -928,7 +956,7 @@ mod tests {
                         .iter()
                         .any(|provider_id| provider_id == &key.provider_id)
                 })
-                .cloned()
+                .map(StoredProviderCatalogModelFetchCandidate::from)
                 .collect())
         }
     }
@@ -1261,6 +1289,155 @@ mod tests {
         let mut model = sample_provider_model(id, provider_id, provider_model_name);
         model.provider_model_mappings = Some(json!([{ "name": alias }]));
         model
+    }
+
+    #[tokio::test]
+    /// 验证同 Provider 的 50 个成功 Key 只做一次全量 reconcile，其他成功 Provider 各一次，失败 Provider 不执行。
+    async fn model_fetch_reconciles_whitelist_availability_once_per_successful_provider() {
+        let provider_many = sample_provider("provider-many", "openai");
+        let provider_other = sample_provider("provider-other", "openai");
+        let provider_failed = sample_provider("provider-failed", "openai");
+        let endpoint_many = sample_endpoint("endpoint-many", "provider-many", "openai:chat");
+        let endpoint_other = sample_endpoint("endpoint-other", "provider-other", "openai:chat");
+        let endpoint_failed = sample_endpoint("endpoint-failed", "provider-failed", "openai:chat");
+
+        let mut keys = Vec::new();
+        let mut transports = HashMap::new();
+        let mut execution_results = Vec::new();
+        for index in 0..50 {
+            let key_id = format!("key-many-{index}");
+            keys.push(sample_key(
+                &key_id,
+                "provider-many",
+                "api_key",
+                &["openai:chat"],
+            ));
+            transports.insert(
+                (
+                    "provider-many".to_string(),
+                    "endpoint-many".to_string(),
+                    key_id.clone(),
+                ),
+                sample_transport(
+                    "openai",
+                    "provider-many",
+                    "endpoint-many",
+                    &key_id,
+                    "openai:chat",
+                    "api_key",
+                    None,
+                ),
+            );
+            execution_results.push(execution_result(json!({
+                "data": [{"id": "gpt-many"}]
+            })));
+        }
+        keys.push(sample_key(
+            "key-other",
+            "provider-other",
+            "api_key",
+            &["openai:chat"],
+        ));
+        transports.insert(
+            (
+                "provider-other".to_string(),
+                "endpoint-other".to_string(),
+                "key-other".to_string(),
+            ),
+            sample_transport(
+                "openai",
+                "provider-other",
+                "endpoint-other",
+                "key-other",
+                "openai:chat",
+                "api_key",
+                None,
+            ),
+        );
+        execution_results.push(execution_result(json!({
+            "data": [{"id": "gpt-other"}]
+        })));
+        keys.push(sample_key(
+            "key-failed",
+            "provider-failed",
+            "api_key",
+            &["openai:chat"],
+        ));
+        transports.insert(
+            (
+                "provider-failed".to_string(),
+                "endpoint-failed".to_string(),
+                "key-failed".to_string(),
+            ),
+            sample_transport(
+                "openai",
+                "provider-failed",
+                "endpoint-failed",
+                "key-failed",
+                "openai:chat",
+                "api_key",
+                None,
+            ),
+        );
+        execution_results.push(execution_error_result(
+            503,
+            json!({"error": {"message": "catalog unavailable"}}),
+        ));
+
+        let state = TestState::new(
+            vec![provider_many, provider_other, provider_failed],
+            vec![endpoint_many, endpoint_other, endpoint_failed],
+            keys,
+            transports,
+            execution_results,
+        )
+        .with_provider_models(vec![
+            sample_provider_model("model-many", "provider-many", "gpt-many"),
+            sample_provider_model("model-other", "provider-other", "gpt-other"),
+            sample_provider_model("model-failed", "provider-failed", "gpt-failed"),
+        ]);
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("model fetch batch should finish");
+
+        assert_eq!(summary.attempted, 52);
+        assert_eq!(summary.succeeded, 51);
+        assert_eq!(summary.failed, 1);
+        let queries = state
+            .model_fetch_candidate_queries
+            .lock()
+            .expect("model fetch candidate query mutex");
+        assert_eq!(queries.len(), 3);
+        assert_eq!(
+            queries[0],
+            vec![
+                "provider-many".to_string(),
+                "provider-other".to_string(),
+                "provider-failed".to_string(),
+            ]
+        );
+        assert_eq!(
+            queries
+                .iter()
+                .filter(|provider_ids| {
+                    provider_ids.len() == 1 && provider_ids[0] == "provider-many"
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            queries
+                .iter()
+                .filter(|provider_ids| {
+                    provider_ids.len() == 1 && provider_ids[0] == "provider-other"
+                })
+                .count(),
+            1
+        );
+        assert!(!queries
+            .iter()
+            .any(|provider_ids| provider_ids.len() == 1 && provider_ids[0] == "provider-failed"));
     }
 
     #[tokio::test]

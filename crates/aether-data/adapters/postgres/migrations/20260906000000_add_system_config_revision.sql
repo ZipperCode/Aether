@@ -1,0 +1,1 @@
+ALTER TABLE public.system_configs ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;

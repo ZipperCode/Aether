@@ -114,6 +114,7 @@ fn enumerate_minimal_candidate_selection_inner(
                 normalized_api_format,
             )?,
             key_capabilities: row.key_capabilities,
+            routing_facts: row.routing_facts,
             model_id: row.model_id,
             global_model_id: row.global_model_id,
             global_model_name: row.global_model_name,

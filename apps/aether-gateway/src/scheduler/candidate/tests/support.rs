@@ -28,6 +28,7 @@ pub(super) fn sample_row() -> StoredMinimalCandidateSelectionRow {
         key_capabilities: Some(serde_json::json!({"cache_1h": true})),
         key_internal_priority: 50,
         key_global_priority_by_format: Some(serde_json::json!({"openai:chat": 2})),
+        routing_facts: Default::default(),
         model_id: "model-1".to_string(),
         global_model_id: "global-model-1".to_string(),
         global_model_name: "gpt-4.1".to_string(),

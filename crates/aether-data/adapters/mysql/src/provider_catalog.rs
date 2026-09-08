@@ -16,7 +16,8 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
     StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
     StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats,
+    StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::DataLayerError;
 use aether_data_query::{
@@ -143,6 +144,22 @@ FROM provider_api_keys
 
 const KEY_MAINTENANCE_SUMMARY_SELECT_SQL: &str = r#"
 SELECT id, provider_id, is_active, upstream_metadata
+FROM provider_api_keys
+"#;
+
+/// 模型目录抓取只需决策、过滤和命名空间合并字段，避免批量读取认证密文及运行态大字段。
+const MODEL_FETCH_CANDIDATE_SELECT_SQL: &str = r#"
+SELECT
+  id,
+  provider_id,
+  is_active,
+  auto_fetch_models,
+  api_formats,
+  allowed_models,
+  locked_models,
+  model_include_patterns,
+  model_exclude_patterns,
+  CASE WHEN is_active AND auto_fetch_models THEN upstream_metadata ELSE NULL END AS upstream_metadata
 FROM provider_api_keys
 "#;
 
@@ -329,6 +346,28 @@ impl MysqlProviderCatalogReadRepository {
         .await
         .map_sql_err()?;
         rows.iter().map(map_key_maintenance_summary_row).collect()
+    }
+
+    /// 按 Provider 读取模型抓取候选，未启用自动抓取的 Key 不携带上游元数据。
+    pub async fn list_model_fetch_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, DataLayerError> {
+        if provider_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = build_in_query(
+            MODEL_FETCH_CANDIDATE_SELECT_SQL,
+            "provider_id",
+            provider_ids,
+            " ORDER BY provider_id ASC, id ASC",
+        )
+        .build()
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        rows.iter().map(map_model_fetch_candidate_row).collect()
     }
 
     /// 只读取认证维护资格字段，密文和大型运行态 JSON 不进入查询结果。
@@ -2157,6 +2196,14 @@ impl ProviderCatalogReadRepository for MysqlProviderCatalogReadRepository {
         Self::list_key_maintenance_summaries_by_provider_ids(self, provider_ids).await
     }
 
+    /// 将统一仓储契约委托给 MySQL 的模型抓取轻量候选投影。
+    async fn list_model_fetch_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, DataLayerError> {
+        Self::list_model_fetch_candidates_by_provider_ids(self, provider_ids).await
+    }
+
     /// 将统一仓储契约委托给 MySQL 的轻量认证维护投影。
     async fn list_auth_maintenance_candidates_by_provider_ids(
         &self,
@@ -3209,6 +3256,42 @@ fn map_key_maintenance_summary_row(
     })
 }
 
+/// 将模型抓取轻量行转为候选，JSON 仅覆盖模型决策与过滤字段。
+fn map_model_fetch_candidate_row(
+    row: &MySqlRow,
+) -> Result<StoredProviderCatalogModelFetchCandidate, DataLayerError> {
+    Ok(StoredProviderCatalogModelFetchCandidate {
+        id: row.try_get("id").map_sql_err()?,
+        provider_id: row.try_get("provider_id").map_sql_err()?,
+        is_active: row.try_get("is_active").map_sql_err()?,
+        auto_fetch_models: row.try_get("auto_fetch_models").map_sql_err()?,
+        api_formats: optional_json_from_string(
+            row.try_get("api_formats").map_sql_err()?,
+            "provider_api_keys.api_formats",
+        )?,
+        allowed_models: optional_json_from_string(
+            row.try_get("allowed_models").map_sql_err()?,
+            "provider_api_keys.allowed_models",
+        )?,
+        locked_models: optional_json_from_string(
+            row.try_get("locked_models").map_sql_err()?,
+            "provider_api_keys.locked_models",
+        )?,
+        model_include_patterns: optional_json_from_string(
+            row.try_get("model_include_patterns").map_sql_err()?,
+            "provider_api_keys.model_include_patterns",
+        )?,
+        model_exclude_patterns: optional_json_from_string(
+            row.try_get("model_exclude_patterns").map_sql_err()?,
+            "provider_api_keys.model_exclude_patterns",
+        )?,
+        upstream_metadata: optional_json_from_string(
+            row.try_get("upstream_metadata").map_sql_err()?,
+            "provider_api_keys.upstream_metadata",
+        )?,
+    })
+}
+
 /// 将 MySQL 轻量结果行映射为认证维护候选，不解析任何密文或大型 JSON。
 fn map_auth_maintenance_candidate_row(
     row: &MySqlRow,
@@ -3481,6 +3564,48 @@ mod tests {
             .any(|line| line.trim().trim_end_matches(',') == "auth_config"));
     }
 
+    /// 验证模型抓取投影不读取认证字段和无关运行态，仅保留候选决策所需列。
+    #[test]
+    fn model_fetch_candidate_query_excludes_secret_and_heavy_columns() {
+        let projection = super::MODEL_FETCH_CANDIDATE_SELECT_SQL
+            .split("FROM provider_api_keys")
+            .next()
+            .expect("model fetch query should contain a FROM clause")
+            .to_ascii_lowercase();
+
+        for required in [
+            "id",
+            "provider_id",
+            "is_active",
+            "auto_fetch_models",
+            "api_formats",
+            "allowed_models",
+            "locked_models",
+            "model_include_patterns",
+            "model_exclude_patterns",
+            "case when is_active and auto_fetch_models then upstream_metadata else null end as upstream_metadata",
+        ] {
+            assert!(projection.contains(required), "missing column: {required}");
+        }
+        for forbidden in [
+            "api_key",
+            "encrypted_key",
+            "auth_config",
+            "status_snapshot",
+            "capabilities",
+            "health_by_format",
+            "circuit_breaker_by_format",
+            "adjustment_history",
+            "utilization_samples",
+            "total_tokens",
+        ] {
+            assert!(
+                !projection.contains(forbidden),
+                "unexpected column: {forbidden}"
+            );
+        }
+    }
+
     #[test]
     fn admin_credential_cas_has_atomic_rotation_guards() {
         let source = include_str!("provider_catalog.rs");
@@ -3550,6 +3675,11 @@ mod tests {
             .list_key_maintenance_summaries_by_provider_ids(&[])
             .await
             .expect("empty maintenance provider ids should not connect")
+            .is_empty());
+        assert!(repository
+            .list_model_fetch_candidates_by_provider_ids(&[])
+            .await
+            .expect("empty model fetch provider ids should not connect")
             .is_empty());
         assert!(repository
             .list_auth_maintenance_candidates_by_provider_ids(&[])

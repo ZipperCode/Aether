@@ -141,7 +141,11 @@ pub(super) fn build_auth_context_cache_key(
 
     Some(format!(
         "{signature}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        bundle.authorization_bearer.unwrap_or_default(),
+        bundle
+            .authorization_bearer
+            .as_deref()
+            .map(hash_api_key)
+            .unwrap_or_default(),
         bundle.x_api_key.unwrap_or_default(),
         bundle.api_key.unwrap_or_default(),
         bundle.x_goog_api_key.unwrap_or_default(),

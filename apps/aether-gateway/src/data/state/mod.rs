@@ -52,7 +52,9 @@ use aether_data::repository::proxy_nodes::{
     StoredProxyFleetMetricsBucket, StoredProxyNode, StoredProxyNodeEvent,
     StoredProxyNodeMetricsBucket,
 };
-pub(crate) use aether_data::repository::system::{AdminSystemStats, StoredSystemConfigEntry};
+pub(crate) use aether_data::repository::system::{
+    AdminSystemStats, StoredSystemConfigEntry, StoredSystemConfigValue,
+};
 use aether_data::repository::users::{
     StoredUserAuthRecord, StoredUserExportRow, StoredUserOAuthLinkSummary, StoredUserSummary,
     UserReadRepository,
@@ -135,7 +137,8 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogWriteRepository, StoredProviderCatalogAuthMaintenanceCandidate,
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogKeyStats, StoredProviderCatalogModelFetchCandidate,
+    StoredProviderCatalogProvider,
 };
 use aether_data_contracts::repository::quota::{
     ProviderQuotaReadRepository, ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,

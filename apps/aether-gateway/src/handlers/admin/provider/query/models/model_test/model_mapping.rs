@@ -173,6 +173,7 @@ fn provider_query_admin_model_selection_row(
         key_capabilities: None,
         key_internal_priority: 0,
         key_global_priority_by_format: None,
+        routing_facts: Default::default(),
         model_id: model.id.clone(),
         global_model_id: model.global_model_id.clone(),
         global_model_name: model.global_model_name.clone().unwrap_or_default(),

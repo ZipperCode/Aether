@@ -1,4 +1,10 @@
-use std::{sync::OnceLock, time::Duration};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::{
+    collections::HashSet,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogProvider,
@@ -49,7 +55,7 @@ struct AntigravityBearerBridgeConfig {
     #[serde(default)]
     auth_api_key_id: String,
     #[serde(default)]
-    bearer_sha256_allowlist: Vec<String>,
+    bearer_sha256_allowlist: HashSet<String>,
     #[serde(default)]
     allow_unverified_google_bearer: bool,
 }
@@ -60,8 +66,7 @@ impl AntigravityBearerBridgeConfig {
             let bearer_hash = hash_api_key(raw_bearer);
             return self
                 .bearer_sha256_allowlist
-                .iter()
-                .any(|allowed| allowed.trim().eq_ignore_ascii_case(&bearer_hash))
+                .contains(&bearer_hash)
                 .then_some("sha256_allowlist");
         }
 
@@ -69,6 +74,35 @@ impl AntigravityBearerBridgeConfig {
             .then_some("explicit_unverified")
     }
 }
+
+/// 进程级 AntiGravity 配置单航班快照；异步互斥保证一次 revision 变化只加载并解析一次完整 JSON。
+static ANTIGRAVITY_CONFIG_SNAPSHOT: OnceLock<
+    tokio::sync::Mutex<Option<(u64, AntigravityBearerBridgeSnapshot)>>,
+> = OnceLock::new();
+
+/// 一个 revision 的不可变解析结果；墓碑和错误也会缓存，避免重复加载同一完整 JSON。
+#[derive(Debug, Clone)]
+enum AntigravityBearerBridgeSnapshot {
+    /// 已解析且可继续验证 bearer 的配置。
+    Parsed(Arc<AntigravityBearerBridgeConfig>),
+    /// JSON null 删除墓碑，对认证调用方表现为未配置。
+    Null,
+    /// 同 revision 的确定性解析错误；后续请求复用同一错误而不重新解析。
+    Invalid(String),
+}
+
+/// 测试当前关注的 revision；只统计该版本，避免并行测试的其他配置读取污染断言。
+#[cfg(test)]
+static ANTIGRAVITY_CONFIG_TRACKED_REVISION: AtomicU64 = AtomicU64::new(0);
+/// 测试关注 revision 的完整 JSON 强读次数。
+#[cfg(test)]
+static ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// 测试关注 revision 的完整 JSON 解析次数。
+#[cfg(test)]
+static ANTIGRAVITY_CONFIG_PARSE_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// 串行隔离共享进程快照的单元测试，避免不同测试配置互相覆盖。
+#[cfg(test)]
+static ANTIGRAVITY_CONFIG_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct GatewayControlAuthContext {
@@ -1014,6 +1048,7 @@ pub(super) async fn resolve_data_backed_auth_context(
     }
 }
 
+/// 解析 AntiGravity bearer 桥接身份；每次刷新只强读 revision，版本变化时才单航班加载完整配置。
 async fn resolve_antigravity_bearer_bridge_auth_context(
     state: &AppState,
     auth_endpoint_signature: &str,
@@ -1029,27 +1064,104 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
         return Ok(None);
     }
 
-    let config_value = {
+    let observed_revision = {
         let _permit = state.acquire_auth_snapshot_load_gate().await?;
         state
             .data
-            .find_system_config_value_strong(crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY)
+            .find_system_config_revision_strong(
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+            )
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?
     };
-    let Some(config_value) = config_value else {
-        return Ok(None);
+    let cache = ANTIGRAVITY_CONFIG_SNAPSHOT.get_or_init(|| tokio::sync::Mutex::new(None));
+    let snapshot = {
+        let mut guard = cache.lock().await;
+        let cached_for_observed_revision = observed_revision.and_then(|revision| {
+            guard.as_ref().and_then(|(cached_revision, snapshot)| {
+                (*cached_revision == revision).then(|| snapshot.clone())
+            })
+        });
+        if let Some(snapshot) = cached_for_observed_revision {
+            snapshot
+        } else {
+            // 等待单航班锁期间配置可能再次更新，因此失配后在锁内重新确认最新 revision。
+            let latest_revision = {
+                let _permit = state.acquire_auth_snapshot_load_gate().await?;
+                state
+                    .data
+                    .find_system_config_revision_strong(
+                        crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+                    )
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))?
+            };
+            let Some(latest_revision) = latest_revision else {
+                *guard = None;
+                return Ok(None);
+            };
+            if let Some(snapshot) = guard.as_ref().and_then(|(cached_revision, snapshot)| {
+                (*cached_revision == latest_revision).then(|| snapshot.clone())
+            }) {
+                snapshot
+            } else {
+                let config_read = {
+                    let _permit = state.acquire_auth_snapshot_load_gate().await?;
+                    state
+                        .data
+                        .find_system_config_value_with_revision_strong(
+                            crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+                        )
+                        .await
+                        .map_err(|err| GatewayError::Internal(err.to_string()))?
+                };
+                let Some(config_read) = config_read else {
+                    *guard = None;
+                    return Ok(None);
+                };
+                #[cfg(test)]
+                if ANTIGRAVITY_CONFIG_TRACKED_REVISION.load(Ordering::Relaxed)
+                    == config_read.revision
+                {
+                    ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                let snapshot = if config_read.value.is_null() {
+                    AntigravityBearerBridgeSnapshot::Null
+                } else {
+                    #[cfg(test)]
+                    if ANTIGRAVITY_CONFIG_TRACKED_REVISION.load(Ordering::Relaxed)
+                        == config_read.revision
+                    {
+                        ANTIGRAVITY_CONFIG_PARSE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    match serde_json::from_value::<AntigravityBearerBridgeConfig>(config_read.value)
+                    {
+                        Ok(mut parsed) => {
+                            parsed.bearer_sha256_allowlist = parsed
+                                .bearer_sha256_allowlist
+                                .into_iter()
+                                .map(|value| value.trim().to_ascii_lowercase())
+                                .collect();
+                            AntigravityBearerBridgeSnapshot::Parsed(Arc::new(parsed))
+                        }
+                        Err(err) => AntigravityBearerBridgeSnapshot::Invalid(format!(
+                            "{} invalid: {err}",
+                            crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY
+                        )),
+                    }
+                };
+                *guard = Some((config_read.revision, snapshot.clone()));
+                snapshot
+            }
+        }
     };
-    if config_value.is_null() {
-        return Ok(None);
-    }
-    let config: AntigravityBearerBridgeConfig =
-        serde_json::from_value(config_value).map_err(|err| {
-            GatewayError::Internal(format!(
-                "{} invalid: {err}",
-                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY
-            ))
-        })?;
+    let config = match snapshot {
+        AntigravityBearerBridgeSnapshot::Parsed(config) => config,
+        AntigravityBearerBridgeSnapshot::Null => return Ok(None),
+        AntigravityBearerBridgeSnapshot::Invalid(message) => {
+            return Err(GatewayError::Internal(message));
+        }
+    };
     if !config.enabled {
         return Ok(None);
     }
@@ -1442,6 +1554,7 @@ fn get_cached_auth_context_with_age(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1461,9 +1574,13 @@ mod tests {
     use futures_util::future::join_all;
 
     use super::{
-        get_cached_auth_context, resolve_control_decision_auth, resolve_data_backed_auth_context,
+        get_cached_auth_context, resolve_antigravity_bearer_bridge_auth_context,
+        resolve_control_decision_auth, resolve_data_backed_auth_context,
         resolve_execution_runtime_auth_context, ControlDecisionAuthResolution,
-        GatewayLocalAuthRejection,
+        GatewayCredentialCarrier, GatewayLocalAuthRejection,
+        ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT, ANTIGRAVITY_CONFIG_PARSE_COUNT,
+        ANTIGRAVITY_CONFIG_SNAPSHOT, ANTIGRAVITY_CONFIG_TEST_LOCK,
+        ANTIGRAVITY_CONFIG_TRACKED_REVISION,
     };
     use crate::control::auth::credentials::{build_auth_context_cache_key, hash_api_key};
     use crate::control::GatewayControlDecision;
@@ -1495,6 +1612,16 @@ mod tests {
             Some(serde_json::json!(["gpt-4.1"])),
         )
         .expect("snapshot should build")
+    }
+
+    /// 构造允许 AntiGravity v1internal 的认证快照，供 bearer 桥接并发与吊销测试复用。
+    fn sample_antigravity_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
+        let mut snapshot = sample_snapshot(api_key_id, user_id);
+        snapshot.user_allowed_providers = Some(vec!["antigravity".to_string()]);
+        snapshot.api_key_allowed_providers = Some(vec!["antigravity".to_string()]);
+        snapshot.user_allowed_api_formats = Some(vec!["gemini:generate_content".to_string()]);
+        snapshot.api_key_allowed_api_formats = Some(vec!["gemini:generate_content".to_string()]);
+        snapshot
     }
 
     fn uri(path: &str) -> Uri {
@@ -2416,17 +2543,302 @@ mod tests {
         assert_eq!(auth_context.local_rejection, None);
     }
 
+    /// 验证一万条 allowlist 在 128 个并发刷新下只加载并解析一次完整配置。
+    #[tokio::test]
+    async fn antigravity_allowlist_same_revision_singleflights_full_value_load() {
+        let _isolation = ANTIGRAVITY_CONFIG_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        *ANTIGRAVITY_CONFIG_SNAPSHOT
+            .get_or_init(|| tokio::sync::Mutex::new(None))
+            .lock()
+            .await = None;
+
+        let raw_bearer = "google-oauth-access-token-large-allowlist";
+        let api_key_id = "key-antigravity-large-allowlist";
+        let user_id = "user-antigravity-large-allowlist";
+        let mut allowlist = (0..9_999)
+            .map(|index| hash_api_key(&format!("unrelated-bearer-{index}")))
+            .collect::<Vec<_>>();
+        allowlist.push(hash_api_key(raw_bearer));
+        assert_eq!(allowlist.len(), 10_000);
+        let config = serde_json::json!({
+            "enabled": true,
+            "auth_user_id": user_id,
+            "auth_api_key_id": api_key_id,
+            "bearer_sha256_allowlist": allowlist,
+        });
+        let repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed([(
+            None,
+            sample_antigravity_snapshot(api_key_id, user_id),
+        )]));
+        let data = GatewayDataState::with_auth_api_key_reader_for_tests(repository)
+            .with_system_config_values_for_tests([(
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY.to_string(),
+                config,
+            )]);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+        let revision = state
+            .data
+            .find_system_config_revision_strong(
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+            )
+            .await
+            .expect("revision read should succeed")
+            .expect("bridge config should exist");
+        ANTIGRAVITY_CONFIG_TRACKED_REVISION.store(revision, Ordering::Relaxed);
+        ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.store(0, Ordering::Relaxed);
+        ANTIGRAVITY_CONFIG_PARSE_COUNT.store(0, Ordering::Relaxed);
+
+        let results = join_all((0..128).map(|_| {
+            resolve_antigravity_bearer_bridge_auth_context(
+                &state,
+                "antigravity:v1internal",
+                raw_bearer,
+                GatewayCredentialCarrier::AuthorizationBearer,
+                1_700_000_000,
+            )
+        }))
+        .await;
+        for result in results {
+            let context = result
+                .expect("concurrent bearer auth should resolve")
+                .expect("allowed bearer should produce auth context");
+            assert!(context.access_allowed);
+        }
+        assert_eq!(
+            ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(ANTIGRAVITY_CONFIG_PARSE_COUNT.load(Ordering::Relaxed), 1);
+        ANTIGRAVITY_CONFIG_TRACKED_REVISION.store(0, Ordering::Relaxed);
+    }
+
+    /// 验证 revision 变化只重新加载一次配置，并让旧 bearer 在下一次刷新立即失效。
+    #[tokio::test]
+    async fn antigravity_allowlist_revision_change_reloads_once_and_revokes_bearer() {
+        let _isolation = ANTIGRAVITY_CONFIG_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        *ANTIGRAVITY_CONFIG_SNAPSHOT
+            .get_or_init(|| tokio::sync::Mutex::new(None))
+            .lock()
+            .await = None;
+
+        let raw_bearer = "google-oauth-access-token-revision-change";
+        let api_key_id = "key-antigravity-revision-change";
+        let user_id = "user-antigravity-revision-change";
+        let allowed_config = serde_json::json!({
+            "enabled": true,
+            "auth_user_id": user_id,
+            "auth_api_key_id": api_key_id,
+            "bearer_sha256_allowlist": [hash_api_key(raw_bearer)],
+        });
+        let repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed([(
+            None,
+            sample_antigravity_snapshot(api_key_id, user_id),
+        )]));
+        let data = GatewayDataState::with_auth_api_key_reader_for_tests(repository)
+            .with_system_config_values_for_tests([(
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY.to_string(),
+                allowed_config,
+            )]);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+        let initial_revision = state
+            .data
+            .find_system_config_revision_strong(
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+            )
+            .await
+            .expect("initial revision read should succeed")
+            .expect("initial bridge config should exist");
+        ANTIGRAVITY_CONFIG_TRACKED_REVISION.store(initial_revision, Ordering::Relaxed);
+        ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.store(0, Ordering::Relaxed);
+        ANTIGRAVITY_CONFIG_PARSE_COUNT.store(0, Ordering::Relaxed);
+        let initial = resolve_antigravity_bearer_bridge_auth_context(
+            &state,
+            "antigravity:v1internal",
+            raw_bearer,
+            GatewayCredentialCarrier::AuthorizationBearer,
+            1_700_000_000,
+        )
+        .await
+        .expect("initial bearer auth should resolve")
+        .expect("initial bearer should be allowed");
+        assert!(initial.access_allowed);
+        assert_eq!(
+            ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(ANTIGRAVITY_CONFIG_PARSE_COUNT.load(Ordering::Relaxed), 1);
+
+        let revoked_config = serde_json::json!({
+            "enabled": true,
+            "auth_user_id": user_id,
+            "auth_api_key_id": api_key_id,
+            "bearer_sha256_allowlist": [hash_api_key("different-revision-bearer")],
+        });
+        state
+            .data
+            .upsert_system_config_value(
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+                &revoked_config,
+                None,
+            )
+            .await
+            .expect("revoked bridge config should write");
+        let changed_revision = state
+            .data
+            .find_system_config_revision_strong(
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+            )
+            .await
+            .expect("changed revision read should succeed")
+            .expect("changed bridge config should exist");
+        assert!(changed_revision > initial_revision);
+        ANTIGRAVITY_CONFIG_TRACKED_REVISION.store(changed_revision, Ordering::Relaxed);
+        ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.store(0, Ordering::Relaxed);
+        ANTIGRAVITY_CONFIG_PARSE_COUNT.store(0, Ordering::Relaxed);
+
+        for _ in 0..2 {
+            assert!(resolve_antigravity_bearer_bridge_auth_context(
+                &state,
+                "antigravity:v1internal",
+                raw_bearer,
+                GatewayCredentialCarrier::AuthorizationBearer,
+                1_700_000_000,
+            )
+            .await
+            .expect("revoked bearer auth should resolve without internal error")
+            .is_none());
+        }
+        assert_eq!(
+            ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(ANTIGRAVITY_CONFIG_PARSE_COUNT.load(Ordering::Relaxed), 1);
+        ANTIGRAVITY_CONFIG_TRACKED_REVISION.store(0, Ordering::Relaxed);
+    }
+
+    /// 验证同 revision 的 null 墓碑与无效配置均只完整加载一次，无效配置也只解析一次。
+    #[tokio::test]
+    async fn antigravity_null_and_invalid_snapshots_are_singleflight_cached() {
+        let _isolation = ANTIGRAVITY_CONFIG_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        *ANTIGRAVITY_CONFIG_SNAPSHOT
+            .get_or_init(|| tokio::sync::Mutex::new(None))
+            .lock()
+            .await = None;
+
+        let data = GatewayDataState::disabled().with_system_config_values_for_tests([(
+            crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY.to_string(),
+            serde_json::Value::Null,
+        )]);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+        let null_revision = state
+            .data
+            .find_system_config_revision_strong(
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+            )
+            .await
+            .expect("null revision should read")
+            .expect("null tombstone should retain revision");
+        ANTIGRAVITY_CONFIG_TRACKED_REVISION.store(null_revision, Ordering::Relaxed);
+        ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.store(0, Ordering::Relaxed);
+        ANTIGRAVITY_CONFIG_PARSE_COUNT.store(0, Ordering::Relaxed);
+
+        for _ in 0..2 {
+            assert!(resolve_antigravity_bearer_bridge_auth_context(
+                &state,
+                "antigravity:v1internal",
+                "null-bearer",
+                GatewayCredentialCarrier::AuthorizationBearer,
+                1_700_000_000,
+            )
+            .await
+            .expect("null tombstone should resolve as absent")
+            .is_none());
+        }
+        assert_eq!(
+            ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(ANTIGRAVITY_CONFIG_PARSE_COUNT.load(Ordering::Relaxed), 0);
+
+        state
+            .data
+            .upsert_system_config_value(
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+                &serde_json::json!("invalid"),
+                None,
+            )
+            .await
+            .expect("invalid config should write");
+        let invalid_revision = state
+            .data
+            .find_system_config_revision_strong(
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+            )
+            .await
+            .expect("invalid revision should read")
+            .expect("invalid config should retain revision");
+        assert!(invalid_revision > null_revision);
+        ANTIGRAVITY_CONFIG_TRACKED_REVISION.store(invalid_revision, Ordering::Relaxed);
+        ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.store(0, Ordering::Relaxed);
+        ANTIGRAVITY_CONFIG_PARSE_COUNT.store(0, Ordering::Relaxed);
+
+        let mut messages = Vec::new();
+        for _ in 0..2 {
+            let error = resolve_antigravity_bearer_bridge_auth_context(
+                &state,
+                "antigravity:v1internal",
+                "invalid-bearer",
+                GatewayCredentialCarrier::AuthorizationBearer,
+                1_700_000_000,
+            )
+            .await
+            .expect_err("invalid config should fail closed");
+            messages.push(error.into_message());
+        }
+        assert_eq!(messages[0], messages[1]);
+        assert_eq!(
+            ANTIGRAVITY_CONFIG_FULL_VALUE_LOAD_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(ANTIGRAVITY_CONFIG_PARSE_COUNT.load(Ordering::Relaxed), 1);
+        ANTIGRAVITY_CONFIG_TRACKED_REVISION.store(0, Ordering::Relaxed);
+        *ANTIGRAVITY_CONFIG_SNAPSHOT
+            .get_or_init(|| tokio::sync::Mutex::new(None))
+            .lock()
+            .await = None;
+    }
+
+    /// 验证节点本地缓存仍旧时，下一次到期刷新会通过强 revision 读观察跨节点吊销。
     #[tokio::test]
     async fn due_antigravity_bearer_refresh_observes_cross_node_allowlist_revocation() {
+        let _isolation = ANTIGRAVITY_CONFIG_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        *ANTIGRAVITY_CONFIG_SNAPSHOT
+            .get_or_init(|| tokio::sync::Mutex::new(None))
+            .lock()
+            .await = None;
         let raw_bearer = "google-oauth-access-token-revoked-cross-node";
-        let mut snapshot = sample_snapshot(
+        let snapshot = sample_antigravity_snapshot(
             "key-antigravity-bearer-revocation",
             "user-antigravity-bearer-revocation",
         );
-        snapshot.user_allowed_providers = Some(vec!["antigravity".to_string()]);
-        snapshot.api_key_allowed_providers = Some(vec!["antigravity".to_string()]);
-        snapshot.user_allowed_api_formats = Some(vec!["gemini:generate_content".to_string()]);
-        snapshot.api_key_allowed_api_formats = Some(vec!["gemini:generate_content".to_string()]);
         let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
             None, snapshot,
         )]));

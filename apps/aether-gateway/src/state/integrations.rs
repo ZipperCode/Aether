@@ -11,7 +11,8 @@ use aether_data_contracts::repository::global_models::{
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
-    StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    StoredProviderCatalogKey, StoredProviderCatalogModelFetchCandidate,
+    StoredProviderCatalogProvider,
 };
 use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
 use aether_model_fetch::{
@@ -580,11 +581,12 @@ impl ModelFetchAssociationStore for AppState {
         .map_err(|err| format!("{err:?}"))
     }
 
-    async fn list_provider_catalog_keys_by_provider_ids(
+    /// 为模型抓取和批末 reconcile 提供实时轻量 Key 投影。
+    async fn list_model_fetch_candidates_by_provider_ids(
         &self,
         provider_ids: &[String],
-    ) -> Result<Vec<StoredProviderCatalogKey>, Self::Error> {
-        AppState::list_provider_catalog_keys_by_provider_ids(self, provider_ids)
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, Self::Error> {
+        AppState::list_provider_catalog_model_fetch_candidates_by_provider_ids(self, provider_ids)
             .await
             .map_err(|err| format!("{err:?}"))
     }

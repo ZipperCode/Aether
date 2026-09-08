@@ -6,7 +6,7 @@ use aether_data_contracts::repository::global_models::{
     CreateAdminProviderModelWithBindingsRecord, StoredAdminGlobalModelPage,
     StoredAdminProviderModel, StoredModelEndpointBinding, UpsertAdminProviderModelRecord,
 };
-use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
+use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogModelFetchCandidate;
 use aether_scheduler_core::{compiled_model_mappings, CompiledModelMappings};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -56,13 +56,15 @@ pub trait ModelFetchAssociationStore {
         replacement_scope_endpoint_ids: &[String],
     ) -> Result<Vec<StoredModelEndpointBinding>, Self::Error>;
 
-    async fn list_provider_catalog_keys_by_provider_ids(
+    /// 按 Provider 读取模型抓取轻量 Key 投影，不得返回认证材料或完整运行态。
+    async fn list_model_fetch_candidates_by_provider_ids(
         &self,
         provider_ids: &[String],
-    ) -> Result<Vec<StoredProviderCatalogKey>, Self::Error>;
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, Self::Error>;
 }
 
-pub async fn sync_provider_model_whitelist_associations<S>(
+/// 同步单次模型发现直接产生的模型关联与 Endpoint 绑定，并把 Provider 全量可用性核对留给批次边界。
+pub async fn sync_provider_model_discovery_associations<S>(
     state: &S,
     provider_id: &str,
     current_allowed_models: &[String],
@@ -94,8 +96,33 @@ where
         authoritative_endpoint_ids,
     )
     .await?;
-    reconcile_provider_model_availability_by_key_whitelist(state, provider_id).await?;
     Ok(())
+}
+
+/// 完整同步一次 Provider 模型关联；独立调用场景仍在末尾立即核对所有 Key 的白名单可用性。
+pub async fn sync_provider_model_whitelist_associations<S>(
+    state: &S,
+    provider_id: &str,
+    current_allowed_models: &[String],
+    discovered_models: &[Value],
+    allow_unbound_models: bool,
+    replace_automatic_bindings: bool,
+    authoritative_endpoint_ids: &[String],
+) -> Result<(), S::Error>
+where
+    S: ModelFetchAssociationStore + Sync + ?Sized,
+{
+    sync_provider_model_discovery_associations(
+        state,
+        provider_id,
+        current_allowed_models,
+        discovered_models,
+        allow_unbound_models,
+        replace_automatic_bindings,
+        authoritative_endpoint_ids,
+    )
+    .await?;
+    reconcile_provider_model_whitelist_availability(state, provider_id).await
 }
 
 async fn sync_provider_model_endpoint_bindings<S>(
@@ -261,15 +288,19 @@ where
     Ok(())
 }
 
-async fn reconcile_provider_model_availability_by_key_whitelist<S>(
+/// 基于一个 Provider 的全部 active Key 白名单统一核对模型可用性；批量抓取每个 Provider 只调用一次。
+pub async fn reconcile_provider_model_whitelist_availability<S>(
     state: &S,
     provider_id: &str,
 ) -> Result<(), S::Error>
 where
     S: ModelFetchAssociationStore + Sync + ?Sized,
 {
+    if !state.has_global_model_reader() || !state.has_global_model_writer() {
+        return Ok(());
+    }
     let active_keys = state
-        .list_provider_catalog_keys_by_provider_ids(&[provider_id.to_string()])
+        .list_model_fetch_candidates_by_provider_ids(&[provider_id.to_string()])
         .await?
         .into_iter()
         .filter(|key| key.is_active)
@@ -479,7 +510,7 @@ mod tests {
         StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredModelEndpointBinding,
         UpsertAdminProviderModelRecord,
     };
-    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogModelFetchCandidate;
 
     #[derive(Default)]
     struct AssociationTestStore {
@@ -561,10 +592,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn list_provider_catalog_keys_by_provider_ids(
+        /// 测试仓储返回空的模型抓取候选集合。
+        async fn list_model_fetch_candidates_by_provider_ids(
             &self,
             _provider_ids: &[String],
-        ) -> Result<Vec<StoredProviderCatalogKey>, Self::Error> {
+        ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, Self::Error> {
             Ok(Vec::new())
         }
     }

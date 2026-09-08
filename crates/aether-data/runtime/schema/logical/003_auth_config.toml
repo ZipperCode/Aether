@@ -23,6 +23,11 @@ type = "long_text"
 nullable = true
 
 [[table.system_configs.columns]]
+name = "revision"
+type = "int64"
+default = 0
+
+[[table.system_configs.columns]]
 name = "created_at"
 type = "unix_seconds"
 

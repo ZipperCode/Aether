@@ -1477,6 +1477,7 @@ fn pool_candidate_from_row(
         .ok()
         .flatten();
     candidate.key_capabilities = row.key_capabilities;
+    candidate.routing_facts = row.routing_facts;
     candidate
 }
 
@@ -5151,6 +5152,7 @@ mod tests {
                 key_capabilities: None,
                 key_internal_priority: 10,
                 key_global_priority_by_format: None,
+                routing_facts: Default::default(),
                 model_id: "model-1".to_string(),
                 global_model_id: "global-model-1".to_string(),
                 global_model_name: "gpt-5".to_string(),
@@ -5305,6 +5307,7 @@ mod tests {
             key_capabilities: None,
             key_internal_priority: 10,
             key_global_priority_by_format: Some(json!({"openai:responses": 1})),
+            routing_facts: Default::default(),
             model_id: "model-1".to_string(),
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-5".to_string(),
@@ -5339,6 +5342,7 @@ mod tests {
                 key_internal_priority: 10,
                 key_global_priority_for_format: Some(1),
                 key_capabilities: None,
+                routing_facts: Default::default(),
                 model_id: "model-1".to_string(),
                 global_model_id: "global-model-1".to_string(),
                 global_model_name: "gpt-5".to_string(),
@@ -5455,6 +5459,7 @@ mod tests {
                 key_internal_priority: internal_priority,
                 key_global_priority_for_format: Some(1),
                 key_capabilities: None,
+                routing_facts: Default::default(),
                 model_id: "model-1".to_string(),
                 global_model_id: "global-model-1".to_string(),
                 global_model_name: "gpt-5".to_string(),

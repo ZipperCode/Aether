@@ -315,6 +315,11 @@ mod tests {
             .await
             .expect("system config should upsert");
         assert_eq!(stored.value, value);
+        let initial_revision = backend
+            .find_system_config_revision_strong("feature.local")
+            .await
+            .expect("initial revision should read")
+            .expect("initial revision should exist");
         assert_eq!(
             backend
                 .find_system_config_value("feature.local")
@@ -334,6 +339,48 @@ mod tests {
             .delete_system_config_value("feature.local")
             .await
             .expect("system config should delete"));
+        assert!(!backend
+            .delete_system_config_value("feature.local")
+            .await
+            .expect("repeated system config delete should succeed"));
+        assert_eq!(
+            backend
+                .find_system_config_value("feature.local")
+                .await
+                .expect("deleted config should read"),
+            None
+        );
+        assert_eq!(
+            backend
+                .list_system_config_entries()
+                .await
+                .expect("deleted config should be hidden")
+                .len(),
+            1
+        );
+        let tombstone = backend
+            .find_system_config_value_strong("feature.local")
+            .await
+            .expect("tombstone should read")
+            .expect("tombstone row should remain");
+        assert!(tombstone.value.is_null());
+        assert!(tombstone.revision > initial_revision);
+
+        let restored = backend
+            .upsert_system_config_entry(
+                "feature.local",
+                &serde_json::json!({"enabled": false}),
+                None,
+            )
+            .await
+            .expect("deleted config should restore");
+        let restored_revision = backend
+            .find_system_config_revision_strong("feature.local")
+            .await
+            .expect("restored revision should read")
+            .expect("restored revision should exist");
+        assert!(restored_revision > tombstone.revision);
+        assert_eq!(restored.description, None);
     }
 
     #[tokio::test]

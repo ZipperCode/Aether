@@ -126,6 +126,7 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:responses": 1})),
+            routing_facts: Default::default(),
             model_id: "model-codex-cli-stream-local-1".to_string(),
             global_model_id: "global-model-codex-cli-stream-local-1".to_string(),
             global_model_name: "gpt-5.6-sol".to_string(),

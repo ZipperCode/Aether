@@ -15,7 +15,7 @@ use crate::maintenance::{
 use crate::repository::system::{
     AdminSystemPurgeSummary, AdminSystemPurgeTarget, AdminSystemStats,
     AdminSystemUsageAggregateImportMode, AdminSystemUsageAggregateImportSummary,
-    AdminSystemUsageAggregateSnapshot, StoredSystemConfigEntry,
+    AdminSystemUsageAggregateSnapshot, StoredSystemConfigEntry, StoredSystemConfigValue,
 };
 use crate::DataLayerError;
 use sqlx::migrate::MigrateError;
@@ -198,6 +198,28 @@ impl DataBackends {
     ) -> Result<Option<serde_json::Value>, DataLayerError> {
         match self.sql_backend() {
             Some(backend) => backend.find_system_config_value(key).await,
+            None => Ok(None),
+        }
+    }
+
+    /// 仅强读系统配置 revision，供调用方在不加载大 JSON 的情况下判断快照是否失效。
+    pub async fn find_system_config_revision_strong(
+        &self,
+        key: &str,
+    ) -> Result<Option<u64>, DataLayerError> {
+        match self.sql_backend() {
+            Some(backend) => backend.find_system_config_revision_strong(key).await,
+            None => Ok(None),
+        }
+    }
+
+    /// 以单行强读同时取得系统配置 revision 与值，避免跨节点更新在同秒内被折叠。
+    pub async fn find_system_config_value_strong(
+        &self,
+        key: &str,
+    ) -> Result<Option<StoredSystemConfigValue>, DataLayerError> {
+        match self.sql_backend() {
+            Some(backend) => backend.find_system_config_value_strong(key).await,
             None => Ok(None),
         }
     }
@@ -501,6 +523,36 @@ impl<'a> SqlBackendRef<'a> {
             Self::Mysql(mysql) => mysql.find_system_config_value(key).await,
             #[cfg(feature = "sqlite")]
             Self::Sqlite(sqlite) => sqlite.find_system_config_value(key).await,
+        }
+    }
+
+    /// 将 revision 与 value 的原子强读路由到当前启用的 SQL 驱动。
+    async fn find_system_config_value_strong(
+        self,
+        key: &str,
+    ) -> Result<Option<StoredSystemConfigValue>, DataLayerError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(postgres) => postgres.find_system_config_value_strong(key).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(mysql) => mysql.find_system_config_value_strong(key).await,
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(sqlite) => sqlite.find_system_config_value_strong(key).await,
+        }
+    }
+
+    /// 将 revision-only 强读路由到当前启用的 SQL 驱动，禁止退化为完整 value 查询。
+    async fn find_system_config_revision_strong(
+        self,
+        key: &str,
+    ) -> Result<Option<u64>, DataLayerError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(postgres) => postgres.find_system_config_revision_strong(key).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(mysql) => mysql.find_system_config_revision_strong(key).await,
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(sqlite) => sqlite.find_system_config_revision_strong(key).await,
         }
     }
 

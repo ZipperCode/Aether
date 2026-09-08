@@ -90,6 +90,7 @@ async fn gateway_executes_gemini_chat_stream_via_local_decision_gate_with_local_
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"gemini:generate_content": 1})),
+            routing_facts: Default::default(),
             model_id: "model-gemini-chat-local-stream-1".to_string(),
             global_model_id: "global-model-gemini-chat-local-stream-1".to_string(),
             global_model_name: "gemini-2.5-pro".to_string(),

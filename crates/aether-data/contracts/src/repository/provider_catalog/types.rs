@@ -493,6 +493,54 @@ pub struct StoredProviderCatalogKeyMaintenanceSummary {
     pub upstream_metadata: Option<serde_json::Value>,
 }
 
+/// 模型目录抓取与批末白名单核对共享的轻量 Key 投影。
+///
+/// 该类型只携带模型抓取决策、过滤和命名空间合并所需字段；认证密文、状态快照及
+/// 其他调度运行态不得进入这条批量读取路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredProviderCatalogModelFetchCandidate {
+    /// Provider Key 的稳定标识，用于选中后读取 transport 并持久化抓取结果。
+    pub id: String,
+    /// Key 所属 Provider 的稳定标识，用于按 Provider 分组与批末去重核对。
+    pub provider_id: String,
+    /// 管理员是否启用该 Key；禁用项不得进入抓取目标。
+    pub is_active: bool,
+    /// 是否为该 Key 开启自动模型目录抓取。
+    pub auto_fetch_models: bool,
+    /// Key 允许使用的 API 格式，用于选择可执行的模型目录 Endpoint。
+    pub api_formats: Option<serde_json::Value>,
+    /// 当前模型白名单；失败写回及 Provider 可用性核对需要保留其精确空值语义。
+    pub allowed_models: Option<serde_json::Value>,
+    /// 无论上游是否返回都必须保留的模型标识列表。
+    pub locked_models: Option<serde_json::Value>,
+    /// 上游模型目录的包含模式列表。
+    pub model_include_patterns: Option<serde_json::Value>,
+    /// 上游模型目录的排除模式列表。
+    pub model_exclude_patterns: Option<serde_json::Value>,
+    /// 仅 active 且开启自动抓取的 Key 返回旧元数据，用于命名空间级合并。
+    pub upstream_metadata: Option<serde_json::Value>,
+}
+
+impl From<&StoredProviderCatalogKey> for StoredProviderCatalogModelFetchCandidate {
+    /// 从完整 Key 创建模型抓取投影，并在非 eligible Key 上主动丢弃上游元数据。
+    fn from(key: &StoredProviderCatalogKey) -> Self {
+        Self {
+            id: key.id.clone(),
+            provider_id: key.provider_id.clone(),
+            is_active: key.is_active,
+            auto_fetch_models: key.auto_fetch_models,
+            api_formats: key.api_formats.clone(),
+            allowed_models: key.allowed_models.clone(),
+            locked_models: key.locked_models.clone(),
+            model_include_patterns: key.model_include_patterns.clone(),
+            model_exclude_patterns: key.model_exclude_patterns.clone(),
+            upstream_metadata: (key.is_active && key.auto_fetch_models)
+                .then(|| key.upstream_metadata.clone())
+                .flatten(),
+        }
+    }
+}
+
 /// 认证维护扫描使用的轻量 Key 投影，避免把密文和大型运行态 JSON 拉入内存。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredProviderCatalogAuthMaintenanceCandidate {
@@ -879,6 +927,17 @@ pub trait ProviderCatalogReadRepository: Send + Sync {
         &self,
         provider_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogKeyMaintenanceSummary>, crate::DataLayerError>;
+
+    /// 按 Provider 读取模型抓取轻量候选；实现必须避免投影认证和大型运行态字段。
+    async fn list_model_fetch_candidates_by_provider_ids(
+        &self,
+        _provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, crate::DataLayerError> {
+        Err(crate::DataLayerError::InvalidConfiguration(
+            "provider catalog model fetch candidate projection is not supported by this repository"
+                .to_string(),
+        ))
+    }
 
     /// 按 Provider 批量读取认证维护轻量候选；生产仓储必须覆盖实现并只投影资格字段。
     async fn list_auth_maintenance_candidates_by_provider_ids(

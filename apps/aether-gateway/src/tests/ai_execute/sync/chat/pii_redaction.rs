@@ -102,6 +102,7 @@ fn candidate_row(test_id: &str) -> StoredMinimalCandidateSelectionRow {
         key_capabilities: None,
         key_internal_priority: 5,
         key_global_priority_by_format: Some(serde_json::json!({"openai:chat": 1})),
+        routing_facts: Default::default(),
         model_id: format!("model-{test_id}"),
         global_model_id: format!("global-model-{test_id}"),
         global_model_name: "gpt-5".to_string(),

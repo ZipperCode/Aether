@@ -5,7 +5,8 @@ use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite};
 
 use aether_data_contracts::repository::candidate_selection::{
     provider_model_mapping_api_format_covers, MinimalCandidateSelectionReadRepository,
-    StoredApiFormatCandidateRowsQuery, StoredMinimalCandidateSelectionRow,
+    StoredApiFormatCandidateRowsQuery, StoredCandidateProxyAffinitySource,
+    StoredMinimalCandidateRoutingFacts, StoredMinimalCandidateSelectionRow,
     StoredPoolKeyCandidateOrder, StoredPoolKeyCandidateRowsByKeyIdsQuery,
     StoredPoolKeyCandidateRowsQuery, StoredProviderModelMapping,
     StoredRequestedModelCandidateRowsQuery,
@@ -22,22 +23,102 @@ SELECT
   p.provider_type AS provider_type,
   p.provider_priority AS provider_priority,
   p.is_active AS provider_is_active,
-  p.config AS provider_config,
+  p.keep_priority_on_conversion AS provider_keep_priority_on_conversion,
+  CASE
+    WHEN json_type(CASE WHEN json_valid(p.proxy) THEN p.proxy END) = 'object'
+      AND CASE json_type(CASE WHEN json_valid(p.proxy) THEN p.proxy END, '$.enabled')
+        WHEN 'false' THEN 0 ELSE 1 END = 1
+      AND json_type(CASE WHEN json_valid(p.proxy) THEN p.proxy END, '$.node_id') = 'text'
+    THEN NULLIF(TRIM(json_extract(p.proxy, '$.node_id')), '')
+    ELSE NULL
+  END AS provider_proxy_node_id,
+  CASE
+    WHEN json_type(CASE WHEN json_valid(p.proxy) THEN p.proxy END) = 'object'
+      AND CASE json_type(CASE WHEN json_valid(p.proxy) THEN p.proxy END, '$.enabled')
+        WHEN 'false' THEN 0 ELSE 1 END = 1
+      AND (
+        (json_type(p.proxy, '$.url') = 'text' AND NULLIF(TRIM(json_extract(p.proxy, '$.url')), '') IS NOT NULL)
+        OR (json_type(p.proxy, '$.proxy_url') = 'text' AND NULLIF(TRIM(json_extract(p.proxy, '$.proxy_url')), '') IS NOT NULL)
+      )
+    THEN 1 ELSE 0
+  END AS provider_proxy_has_inline_url,
+  CASE
+    WHEN json_type(CASE WHEN json_valid(p.proxy) THEN p.proxy END) = 'object'
+      AND CASE json_type(CASE WHEN json_valid(p.proxy) THEN p.proxy END, '$.enabled')
+        WHEN 'false' THEN 0 ELSE 1 END = 1
+      AND json_type(p.proxy, '$.tunnel_owner_instance_id') = 'text'
+    THEN NULLIF(TRIM(json_extract(p.proxy, '$.tunnel_owner_instance_id')), '')
+    ELSE NULL
+  END AS provider_proxy_tunnel_owner_instance_id,
   pe.id AS endpoint_id,
   COALESCE(pe.api_format, '') AS endpoint_api_format,
   pe.api_family AS endpoint_api_family,
   pe.endpoint_kind AS endpoint_kind,
   pe.is_active AS endpoint_is_active,
+  CASE
+    WHEN json_type(CASE WHEN json_valid(pe.proxy) THEN pe.proxy END) = 'object'
+      AND CASE json_type(CASE WHEN json_valid(pe.proxy) THEN pe.proxy END, '$.enabled')
+        WHEN 'false' THEN 0 ELSE 1 END = 1
+      AND json_type(pe.proxy, '$.node_id') = 'text'
+    THEN NULLIF(TRIM(json_extract(pe.proxy, '$.node_id')), '')
+    ELSE NULL
+  END AS endpoint_proxy_node_id,
+  CASE
+    WHEN json_type(CASE WHEN json_valid(pe.proxy) THEN pe.proxy END) = 'object'
+      AND CASE json_type(CASE WHEN json_valid(pe.proxy) THEN pe.proxy END, '$.enabled')
+        WHEN 'false' THEN 0 ELSE 1 END = 1
+      AND (
+        (json_type(pe.proxy, '$.url') = 'text' AND NULLIF(TRIM(json_extract(pe.proxy, '$.url')), '') IS NOT NULL)
+        OR (json_type(pe.proxy, '$.proxy_url') = 'text' AND NULLIF(TRIM(json_extract(pe.proxy, '$.proxy_url')), '') IS NOT NULL)
+      )
+    THEN 1 ELSE 0
+  END AS endpoint_proxy_has_inline_url,
+  CASE
+    WHEN json_type(CASE WHEN json_valid(pe.proxy) THEN pe.proxy END) = 'object'
+      AND CASE json_type(CASE WHEN json_valid(pe.proxy) THEN pe.proxy END, '$.enabled')
+        WHEN 'false' THEN 0 ELSE 1 END = 1
+      AND json_type(pe.proxy, '$.tunnel_owner_instance_id') = 'text'
+    THEN NULLIF(TRIM(json_extract(pe.proxy, '$.tunnel_owner_instance_id')), '')
+    ELSE NULL
+  END AS endpoint_proxy_tunnel_owner_instance_id,
   pak.id AS key_id,
   pak.name AS key_name,
   pak.auth_type AS key_auth_type,
-  pak.auth_config AS key_auth_config,
+  CASE WHEN NULLIF(TRIM(pak.auth_config), '') IS NOT NULL THEN 1 ELSE 0 END AS key_has_auth_config,
   pak.is_active AS key_is_active,
   pak.api_formats AS key_api_formats,
+  pak.auth_type_by_format AS key_auth_type_by_format,
+  pak.allow_auth_channel_mismatch_formats AS key_allow_auth_channel_mismatch_formats,
   pak.allowed_models AS key_allowed_models,
   pak.capabilities AS key_capabilities,
   pak.internal_priority AS key_internal_priority,
   pak.global_priority_by_format AS key_global_priority_by_format,
+  CASE
+    WHEN json_type(CASE WHEN json_valid(pak.proxy) THEN pak.proxy END) = 'object'
+      AND CASE json_type(CASE WHEN json_valid(pak.proxy) THEN pak.proxy END, '$.enabled')
+        WHEN 'false' THEN 0 ELSE 1 END = 1
+      AND json_type(pak.proxy, '$.node_id') = 'text'
+    THEN NULLIF(TRIM(json_extract(pak.proxy, '$.node_id')), '')
+    ELSE NULL
+  END AS key_proxy_node_id,
+  CASE
+    WHEN json_type(CASE WHEN json_valid(pak.proxy) THEN pak.proxy END) = 'object'
+      AND CASE json_type(CASE WHEN json_valid(pak.proxy) THEN pak.proxy END, '$.enabled')
+        WHEN 'false' THEN 0 ELSE 1 END = 1
+      AND (
+        (json_type(pak.proxy, '$.url') = 'text' AND NULLIF(TRIM(json_extract(pak.proxy, '$.url')), '') IS NOT NULL)
+        OR (json_type(pak.proxy, '$.proxy_url') = 'text' AND NULLIF(TRIM(json_extract(pak.proxy, '$.proxy_url')), '') IS NOT NULL)
+      )
+    THEN 1 ELSE 0
+  END AS key_proxy_has_inline_url,
+  CASE
+    WHEN json_type(CASE WHEN json_valid(pak.proxy) THEN pak.proxy END) = 'object'
+      AND CASE json_type(CASE WHEN json_valid(pak.proxy) THEN pak.proxy END, '$.enabled')
+        WHEN 'false' THEN 0 ELSE 1 END = 1
+      AND json_type(pak.proxy, '$.tunnel_owner_instance_id') = 'text'
+    THEN NULLIF(TRIM(json_extract(pak.proxy, '$.tunnel_owner_instance_id')), '')
+    ELSE NULL
+  END AS key_proxy_tunnel_owner_instance_id,
   pak.last_used_at AS key_last_used_at_unix_secs,
   m.id AS model_id,
   m.global_model_id AS global_model_id,
@@ -84,7 +165,8 @@ pub struct SqliteMinimalCandidateSelectionReadRepository {
 #[derive(Debug, Clone)]
 struct CandidateSelectionRow {
     row: StoredMinimalCandidateSelectionRow,
-    key_auth_config: Option<String>,
+    /// Kiro bearer 候选只需要知道认证配置是否存在，不读取或保留原始认证 JSON。
+    key_has_auth_config: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -982,12 +1064,7 @@ fn key_auth_channel_matches(row: &CandidateSelectionRow, api_format: &str) -> bo
         "claude_code" => auth_type == "oauth" && api_format == "claude:messages",
         "kiro" => {
             api_format == "claude:messages"
-                && (auth_type == "oauth"
-                    || (auth_type == "bearer"
-                        && row
-                            .key_auth_config
-                            .as_deref()
-                            .is_some_and(|value| !value.trim().is_empty())))
+                && (auth_type == "oauth" || (auth_type == "bearer" && row.key_has_auth_config))
         }
         "gemini_cli" | "antigravity" => {
             auth_type == "oauth" && api_format == "gemini:generate_content"
@@ -1049,7 +1126,6 @@ fn sort_candidate_selection_rows(
 }
 
 fn map_candidate_selection_row(row: &SqliteRow) -> Result<CandidateSelectionRow, DataLayerError> {
-    let _provider_config = parse_json(row.try_get("provider_config").ok().flatten())?;
     let global_model_config = parse_json(row.try_get("global_model_config").ok().flatten())?;
     let global_model_mappings = global_model_config
         .as_ref()
@@ -1058,6 +1134,27 @@ fn map_candidate_selection_row(row: &SqliteRow) -> Result<CandidateSelectionRow,
         .as_ref()
         .and_then(|value| value.get("streaming"))
         .and_then(json_bool);
+    let endpoint_api_format: String = row.try_get("endpoint_api_format").map_sql_err()?;
+    let key_auth_type: String = row.try_get("key_auth_type").map_sql_err()?;
+    let key_auth_type_by_format =
+        parse_json(row.try_get("key_auth_type_by_format").ok().flatten())?;
+    let key_allow_auth_channel_mismatch_formats = parse_json(
+        row.try_get("key_allow_auth_channel_mismatch_formats")
+            .ok()
+            .flatten(),
+    )?;
+    let routing_facts = StoredMinimalCandidateRoutingFacts::from_safe_projection(
+        row.try_get("provider_keep_priority_on_conversion")
+            .map_sql_err()?,
+        row.try_get("provider_pool_enabled").map_sql_err()?,
+        &key_auth_type,
+        &endpoint_api_format,
+        key_auth_type_by_format.as_ref(),
+        key_allow_auth_channel_mismatch_formats.as_ref(),
+        map_proxy_affinity_source(row, "key")?,
+        map_proxy_affinity_source(row, "endpoint")?,
+        map_proxy_affinity_source(row, "provider")?,
+    );
     Ok(CandidateSelectionRow {
         row: StoredMinimalCandidateSelectionRow {
             provider_id: row.try_get("provider_id").map_sql_err()?,
@@ -1066,13 +1163,13 @@ fn map_candidate_selection_row(row: &SqliteRow) -> Result<CandidateSelectionRow,
             provider_priority: row.try_get("provider_priority").map_sql_err()?,
             provider_is_active: row.try_get("provider_is_active").map_sql_err()?,
             endpoint_id: row.try_get("endpoint_id").map_sql_err()?,
-            endpoint_api_format: row.try_get("endpoint_api_format").map_sql_err()?,
+            endpoint_api_format,
             endpoint_api_family: row.try_get("endpoint_api_family").map_sql_err()?,
             endpoint_kind: row.try_get("endpoint_kind").map_sql_err()?,
             endpoint_is_active: row.try_get("endpoint_is_active").map_sql_err()?,
             key_id: row.try_get("key_id").map_sql_err()?,
             key_name: row.try_get("key_name").map_sql_err()?,
-            key_auth_type: row.try_get("key_auth_type").map_sql_err()?,
+            key_auth_type,
             key_is_active: row.try_get("key_is_active").map_sql_err()?,
             key_api_formats: parse_string_list(
                 parse_json(row.try_get("key_api_formats").ok().flatten())?,
@@ -1087,6 +1184,7 @@ fn map_candidate_selection_row(row: &SqliteRow) -> Result<CandidateSelectionRow,
             key_global_priority_by_format: parse_json(
                 row.try_get("key_global_priority_by_format").ok().flatten(),
             )?,
+            routing_facts,
             model_id: row.try_get("model_id").map_sql_err()?,
             global_model_id: row.try_get("global_model_id").map_sql_err()?,
             global_model_name: row.try_get("global_model_name").map_sql_err()?,
@@ -1103,8 +1201,23 @@ fn map_candidate_selection_row(row: &SqliteRow) -> Result<CandidateSelectionRow,
             model_is_active: row.try_get("model_is_active").map_sql_err()?,
             model_is_available: row.try_get("model_is_available").map_sql_err()?,
         },
-        key_auth_config: row.try_get("key_auth_config").map_sql_err()?,
+        key_has_auth_config: row.try_get("key_has_auth_config").map_sql_err()?,
     })
+}
+
+/// 将 SQLite 的三个无凭据代理标量压缩为候选亲和事实；URL 内容从未离开数据库。
+fn map_proxy_affinity_source(
+    row: &SqliteRow,
+    source: &str,
+) -> Result<Option<StoredCandidateProxyAffinitySource>, DataLayerError> {
+    let node_id_column = format!("{source}_proxy_node_id");
+    let inline_url_column = format!("{source}_proxy_has_inline_url");
+    let owner_column = format!("{source}_proxy_tunnel_owner_instance_id");
+    Ok(StoredCandidateProxyAffinitySource::new(
+        row.try_get(node_id_column.as_str()).map_sql_err()?,
+        row.try_get(inline_url_column.as_str()).map_sql_err()?,
+        row.try_get(owner_column.as_str()).map_sql_err()?,
+    ))
 }
 
 fn parse_json(value: Option<String>) -> Result<Option<serde_json::Value>, DataLayerError> {
@@ -1481,6 +1594,7 @@ mod tests {
         assert_eq!(first_seed_sql.matches('?').count(), 18);
     }
 
+    /// 验证真实 SQLite 查询可读取候选及无 URL、无凭据的紧凑路由事实。
     #[tokio::test]
     async fn sqlite_repository_reads_candidate_selection_rows() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1509,6 +1623,40 @@ mod tests {
             Some(vec!["alias-global".to_string()])
         );
         assert_eq!(rows[1].global_model_supports_streaming, Some(true));
+        let routing_facts = &rows[1].routing_facts;
+        assert!(routing_facts.provider_keep_priority_on_conversion);
+        assert!(routing_facts.provider_pool_enabled);
+        assert_eq!(routing_facts.key_auth_type_for_endpoint_format, "bearer");
+        assert!(routing_facts.key_allows_auth_channel_mismatch_for_endpoint_format);
+        assert_eq!(
+            routing_facts
+                .key_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.node_id.as_deref()),
+            Some("key-node")
+        );
+        assert!(routing_facts
+            .key_proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.has_inline_url));
+        assert_eq!(
+            routing_facts
+                .endpoint_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.tunnel_owner_instance_id.as_deref()),
+            Some("endpoint-owner")
+        );
+        assert_eq!(
+            routing_facts
+                .provider_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.node_id.as_deref()),
+            Some("provider-node")
+        );
+        let compact_json =
+            serde_json::to_string(routing_facts).expect("compact routing facts should serialize");
+        assert!(!compact_json.contains("secret"));
+        assert!(!compact_json.contains("proxy.example"));
         assert_eq!(
             rows[1]
                 .model_provider_model_mappings
@@ -1736,6 +1884,7 @@ mod tests {
         assert_eq!(seed_b, vec!["key-2", "key-1"]);
     }
 
+    /// 写入覆盖 Pool、格式认证和三层代理的候选夹具，敏感值只用于证明查询不会投影它们。
     async fn seed_candidate_selection(pool: &sqlx::SqlitePool) {
         sqlx::query(
             r#"
@@ -1755,6 +1904,21 @@ INSERT INTO provider_api_keys (
 VALUES
   ('key-1', 'provider-1', 'Key One', 'api_key', '["openai:chat"]', 10, 1, 1, 1),
   ('key-2', 'provider-1', 'Key Two', 'api_key', '["openai:chat"]', 20, 1, 1, 1);
+
+UPDATE providers
+SET keep_priority_on_conversion = 1,
+    proxy = '{"enabled":true,"node_id":"provider-node","url":"http://user:secret@provider.proxy.example","tunnel_owner_instance_id":"provider-owner"}'
+WHERE id = 'provider-1';
+
+UPDATE provider_endpoints
+SET proxy = '{"enabled":true,"node_id":"endpoint-node","tunnel_owner_instance_id":"endpoint-owner"}'
+WHERE id = 'endpoint-1';
+
+UPDATE provider_api_keys
+SET auth_type_by_format = '{"openai:chat":"bearer"}',
+    allow_auth_channel_mismatch_formats = '["/v1/chat/completions"]',
+    proxy = '{"enabled":true,"node_id":"key-node","url":"http://user:secret@key.proxy.example","tunnel_owner_instance_id":"key-owner","password":"never-project"}'
+WHERE id = 'key-1';
 
 INSERT INTO providers (
   id, name, provider_type, provider_priority, is_active, created_at, updated_at

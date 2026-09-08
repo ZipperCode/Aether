@@ -32,7 +32,8 @@ mod state;
 pub(crate) use self::candidate_materialization::LocalExecutionAttemptSource;
 pub(crate) use self::candidate_resolution::{
     candidate_auth_channel_skip_reason, read_candidate_transport_snapshot,
-    EligibleLocalExecutionCandidate, LocalExecutionCandidateKind, SkippedLocalExecutionCandidate,
+    EligibleLocalExecutionCandidate, LocalExecutionCandidateKind, RankedLocalExecutionCandidate,
+    SkippedLocalExecutionCandidate, UnmaterializedSkippedLocalExecutionCandidate,
 };
 pub(crate) use self::common::resolve_upstream_is_stream_for_provider;
 pub(crate) use self::passthrough::{

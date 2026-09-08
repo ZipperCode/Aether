@@ -10,7 +10,8 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
     StoredProviderCatalogAuthMaintenanceCandidate, StoredProviderCatalogEndpoint,
     StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats,
+    StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };
 use async_trait::async_trait;
 use tokio::sync::Notify;
@@ -401,6 +402,16 @@ impl ProviderCatalogReadRepository for CachedProviderCatalogReadRepository {
         }
     }
 
+    /// 模型抓取候选每次直接读取底层仓储，确保批末 reconcile 看见本轮及并发管理写入。
+    async fn list_model_fetch_candidates_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, DataLayerError> {
+        self.inner
+            .list_model_fetch_candidates_by_provider_ids(provider_ids)
+            .await
+    }
+
     /// 认证维护扫描必须绕过目录缓存，避免逐 Key 写入失效时反复保留整批结果。
     async fn list_auth_maintenance_candidates_by_provider_ids(
         &self,
@@ -665,6 +676,51 @@ mod tests {
             .expect("refreshed maintenance candidates should read");
         assert!(refreshed[0].has_auth_config);
         assert_eq!(refreshed[0].expires_at_unix_secs, Some(120));
+    }
+
+    /// 验证模型抓取投影不会复用首次结果，批末读取可观察最新白名单与元数据。
+    #[tokio::test]
+    async fn model_fetch_candidates_bypass_catalog_cache() {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "key-1".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("key should be valid");
+        key.auto_fetch_models = true;
+        key.allowed_models = Some(serde_json::json!(["old-model"]));
+        key.upstream_metadata = Some(serde_json::json!({"catalog": {"etag": "old"}}));
+        let inner = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider("provider-1")],
+            Vec::new(),
+            vec![key],
+        ));
+        let cache = CachedProviderCatalogReadRepository::new(inner.clone());
+        let provider_ids = vec!["provider-1".to_string()];
+
+        let first = cache
+            .list_model_fetch_candidates_by_provider_ids(&provider_ids)
+            .await
+            .expect("initial model fetch candidates should read");
+        assert_eq!(
+            first[0].allowed_models,
+            Some(serde_json::json!(["old-model"]))
+        );
+
+        let new_models = serde_json::json!(["new-model"]);
+        assert!(inner
+            .update_key_model_fetch_success("key-1", Some(&new_models), 120, &[], Some(120))
+            .await
+            .expect("inner model fetch state should update"));
+
+        let refreshed = cache
+            .list_model_fetch_candidates_by_provider_ids(&provider_ids)
+            .await
+            .expect("refreshed model fetch candidates should read");
+        assert_eq!(refreshed[0].allowed_models, Some(new_models));
     }
 
     #[tokio::test]

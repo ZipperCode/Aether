@@ -339,6 +339,7 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
             persistence_policy,
             true,
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            false,
             LocalCandidateResolutionMode::Standard,
             move |eligible| {
                 let provider_api_format = eligible.provider_api_format.clone();

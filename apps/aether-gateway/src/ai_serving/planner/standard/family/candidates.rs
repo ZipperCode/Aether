@@ -274,6 +274,7 @@ pub(super) async fn build_local_standard_candidate_attempt_source<'a>(
             persistence_policy,
             false,
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            false,
             LocalCandidateResolutionMode::Standard,
             move |eligible| {
                 let provider_api_format = eligible.provider_api_format.clone();

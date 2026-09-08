@@ -483,11 +483,20 @@ pub fn parse_windsurf_model_configs_response(
     ))
 }
 
+/// 按完整 Key 的 API 格式选择每种模型抓取格式的首选 Endpoint。
 pub fn selected_models_fetch_endpoints(
     endpoints: &[StoredProviderCatalogEndpoint],
     key: &StoredProviderCatalogKey,
 ) -> Vec<StoredProviderCatalogEndpoint> {
-    let key_formats = json_string_list(key.api_formats.as_ref())
+    selected_models_fetch_endpoints_for_api_formats(endpoints, key.api_formats.as_ref())
+}
+
+/// 按轻量候选携带的 API 格式选择模型抓取 Endpoint，避免为目标收集读取完整 Key。
+pub fn selected_models_fetch_endpoints_for_api_formats(
+    endpoints: &[StoredProviderCatalogEndpoint],
+    api_formats: Option<&Value>,
+) -> Vec<StoredProviderCatalogEndpoint> {
+    let key_formats = json_string_list(api_formats)
         .into_iter()
         .map(|value| normalize_api_format(&value))
         .collect::<BTreeSet<_>>();

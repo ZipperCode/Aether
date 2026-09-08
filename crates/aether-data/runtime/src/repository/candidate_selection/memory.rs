@@ -399,6 +399,7 @@ mod tests {
             key_capabilities: None,
             key_internal_priority: 50,
             key_global_priority_by_format: None,
+            routing_facts: Default::default(),
             model_id: format!("model-{provider_id}"),
             global_model_id: "global-model-1".to_string(),
             global_model_name: global_model_name.to_string(),

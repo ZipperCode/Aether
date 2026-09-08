@@ -6,6 +6,7 @@ mod transport;
 
 pub use association_sync::{
     global_model_matches_allowed_models, provider_model_matches_discovered_model,
+    reconcile_provider_model_whitelist_availability, sync_provider_model_discovery_associations,
     sync_provider_model_whitelist_associations, ModelFetchAssociationStore,
 };
 pub use config::{
@@ -19,7 +20,8 @@ pub use logic::{
     parse_models_response_page, parse_windsurf_model_configs_response, preset_models_for_provider,
     project_codex_models_for_legacy_cache, provider_type_uses_preset_models,
     select_models_fetch_endpoint, selected_models_fetch_endpoints,
-    upstream_metadata_namespace_updates, ModelFetchRunSummary, ModelsFetchPage, ModelsFetchSuccess,
+    selected_models_fetch_endpoints_for_api_formats, upstream_metadata_namespace_updates,
+    ModelFetchRunSummary, ModelsFetchPage, ModelsFetchSuccess,
 };
 pub use strategy::{
     antigravity_model_id_is_routable, fetch_models_from_transports,

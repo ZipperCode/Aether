@@ -102,6 +102,7 @@ async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:responses:compact": 1})),
+            routing_facts: Default::default(),
             model_id: "model-openai-compact-finalize-local-1".to_string(),
             global_model_id: "global-model-openai-compact-finalize-local-1".to_string(),
             global_model_name: "gpt-5".to_string(),

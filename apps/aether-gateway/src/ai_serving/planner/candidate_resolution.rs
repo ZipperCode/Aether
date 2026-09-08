@@ -4,6 +4,9 @@ use aether_ai_serving::{
     run_ai_candidate_resolution, AiCandidateResolutionMode, AiCandidateResolutionPort,
     AiCandidateResolutionRequest,
 };
+use aether_data_contracts::repository::candidate_selection::{
+    StoredCandidateProxyAffinitySource, StoredMinimalCandidateRoutingFacts,
+};
 use aether_routing_core::ResolvedRoutingPolicy;
 use async_trait::async_trait;
 use std::convert::Infallible;
@@ -24,7 +27,8 @@ use crate::orchestration::LocalExecutionCandidateMetadata;
 use crate::stage_metrics::observe_gateway_stage_ms;
 
 use super::candidate_ranking::{
-    rank_eligible_local_execution_candidates, scheduler_ordering_config_for_routing_policy,
+    rank_eligible_local_execution_candidates, rank_local_candidate_snapshots,
+    scheduler_ordering_config_for_routing_policy,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +39,47 @@ pub(crate) struct EligibleLocalExecutionCandidate {
     pub(crate) provider_api_format: String,
     pub(crate) orchestration: LocalExecutionCandidateMetadata,
     pub(crate) ranking: Option<SchedulerRankingOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// 尚未读取 transport 的全局排序候选；分页缓存与路由聚合只能保存此类型。
+pub(crate) struct RankedLocalExecutionCandidate {
+    /// 由轻量 Provider Pool 标志确定的逻辑候选类型。
+    pub(crate) kind: LocalExecutionCandidateKind,
+    /// 数据层输出的最小候选及无凭据排序事实。
+    pub(crate) candidate: SchedulerMinimalCandidateSelectionCandidate,
+    /// 标准化后的 Endpoint 格式，供跨格式排序使用。
+    pub(crate) provider_api_format: String,
+    /// 排序后附加的编排元数据；不包含请求体或 transport。
+    pub(crate) orchestration: LocalExecutionCandidateMetadata,
+    /// 调度核心生成的全局排名诊断。
+    pub(crate) ranking: Option<SchedulerRankingOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// transport-free 的解析跳过结果，允许 resolved-page 缓存安全保存诊断。
+pub(crate) struct UnmaterializedSkippedLocalExecutionCandidate {
+    /// 被轻量策略拒绝的候选。
+    pub(crate) candidate: SchedulerMinimalCandidateSelectionCandidate,
+    /// 与完整解析路径一致的稳定跳过原因。
+    pub(crate) skip_reason: &'static str,
+    /// 可选全局排序结果；预排序拒绝通常为空。
+    pub(crate) ranking: Option<SchedulerRankingOutcome>,
+    /// 不含 transport 的附加诊断。
+    pub(crate) extra_data: Option<serde_json::Value>,
+}
+
+impl UnmaterializedSkippedLocalExecutionCandidate {
+    /// 在离开缓存边界后转换为通用跳过类型，transport 固定为空。
+    pub(crate) fn into_skipped(self) -> SkippedLocalExecutionCandidate {
+        SkippedLocalExecutionCandidate {
+            candidate: self.candidate,
+            skip_reason: self.skip_reason,
+            transport: None,
+            ranking: self.ranking,
+            extra_data: self.extra_data,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -156,9 +201,12 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
 
     fn build_eligible_candidate(
         &self,
-        candidate: Self::Candidate,
+        mut candidate: Self::Candidate,
         transport: Self::Transport,
     ) -> Self::Eligible {
+        if candidate.routing_facts == StoredMinimalCandidateRoutingFacts::default() {
+            candidate.routing_facts = routing_facts_from_hydrated_transport(&transport);
+        }
         let provider_api_format = transport.endpoint.api_format.trim().to_ascii_lowercase();
         let kind = if provider_transport_uses_pool(&transport) {
             LocalExecutionCandidateKind::PoolGroup
@@ -304,6 +352,174 @@ pub(crate) async fn resolve_and_rank_logical_local_execution_candidates(
     .await
 }
 
+/// 为旧静态调用方从已存在的 transport 补紧凑事实；不会触发额外读取或延长 transport 生命周期。
+pub(super) fn routing_facts_from_hydrated_transport(
+    transport: &GatewayProviderTransportSnapshot,
+) -> StoredMinimalCandidateRoutingFacts {
+    StoredMinimalCandidateRoutingFacts::from_safe_projection(
+        transport.provider.keep_priority_on_conversion,
+        provider_transport_uses_pool(transport),
+        &transport.key.auth_type,
+        &transport.endpoint.api_format,
+        transport.key.auth_type_by_format.as_ref(),
+        transport.key.allow_auth_channel_mismatch_formats.as_ref(),
+        compact_proxy_affinity_source(transport.key.proxy.as_ref()),
+        compact_proxy_affinity_source(transport.endpoint.proxy.as_ref()),
+        compact_proxy_affinity_source(transport.provider.proxy.as_ref()),
+    )
+}
+
+/// 从当前已 hydration 的代理配置提取安全标量，丢弃 URL 内容和任意 extra。
+fn compact_proxy_affinity_source(
+    raw: Option<&serde_json::Value>,
+) -> Option<StoredCandidateProxyAffinitySource> {
+    let object = raw?.as_object()?;
+    if object.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+        return None;
+    }
+    let compact_string = |key: &str| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    StoredCandidateProxyAffinitySource::new(
+        compact_string("node_id"),
+        compact_string("url")
+            .or_else(|| compact_string("proxy_url"))
+            .is_some(),
+        compact_string("tunnel_owner_instance_id"),
+    )
+}
+
+/// 对分页候选执行 transport-free 资格预判与全局排序；完整校验推迟到选中 attempt。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_and_rank_logical_local_candidate_snapshots(
+    state: PlannerAppState<'_>,
+    candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
+    client_api_format: &str,
+    requested_model: Option<&str>,
+    auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+    client_session_affinity: Option<&ClientSessionAffinity>,
+    required_capabilities: Option<&serde_json::Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    request_auth_channel: Option<&str>,
+) -> (
+    Vec<RankedLocalExecutionCandidate>,
+    Vec<UnmaterializedSkippedLocalExecutionCandidate>,
+) {
+    let scheduler_affinity_epoch = state.app().scheduler_affinity_epoch();
+    let mut rankable = Vec::with_capacity(candidates.len());
+    let mut skipped = Vec::new();
+    for candidate in candidates {
+        let kind = projected_candidate_kind(&candidate);
+        let skip_reason =
+            routing_policy_candidate_skip_reason_for_kind(routing_policy, &candidate, kind)
+                .or_else(|| {
+                    projected_candidate_auth_channel_skip_reason(&candidate, request_auth_channel)
+                });
+        if let Some(skip_reason) = skip_reason {
+            skipped.push(UnmaterializedSkippedLocalExecutionCandidate {
+                candidate,
+                skip_reason,
+                ranking: None,
+                extra_data: None,
+            });
+            continue;
+        }
+        let provider_api_format = candidate.endpoint_api_format.trim().to_ascii_lowercase();
+        rankable.push(RankedLocalExecutionCandidate {
+            kind,
+            candidate,
+            provider_api_format,
+            orchestration: LocalExecutionCandidateMetadata::default(),
+            ranking: None,
+        });
+    }
+
+    let mut ranked = rank_local_candidate_snapshots(
+        state,
+        rankable,
+        client_api_format,
+        requested_model,
+        auth_snapshot,
+        client_session_affinity,
+        required_capabilities,
+        routing_policy,
+    )
+    .await;
+    let sticky_key_attempts = if ranked.is_empty() {
+        None
+    } else {
+        Some(
+            scheduler_ordering_config_for_routing_policy(state, routing_policy)
+                .await
+                .sticky_key_attempts,
+        )
+    };
+    for candidate in &mut ranked {
+        candidate.orchestration.scheduler_affinity_epoch = Some(scheduler_affinity_epoch);
+        candidate.orchestration.sticky_key_attempts = sticky_key_attempts;
+    }
+    (ranked, skipped)
+}
+
+/// 为一个已排好序的候选读取唯一完整 transport，并重跑现有最终资格门禁。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn hydrate_ranked_local_execution_candidate(
+    state: PlannerAppState<'_>,
+    ranked: RankedLocalExecutionCandidate,
+    client_api_format: &str,
+    requested_model: Option<&str>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    request_auth_channel: Option<&str>,
+    mode: AiCandidateResolutionMode,
+) -> Result<EligibleLocalExecutionCandidate, SkippedLocalExecutionCandidate> {
+    let port = GatewayLocalCandidateResolutionPort {
+        state,
+        requested_model,
+        auth_snapshot: None,
+        client_session_affinity: None,
+        required_capabilities: None,
+        routing_policy,
+        request_auth_channel,
+    };
+    let candidate = ranked.candidate;
+    let transport = match port.read_candidate_transport(&candidate).await {
+        Ok(Some(transport)) => transport,
+        Ok(None) => {
+            let mut skipped = port.build_missing_transport_skipped_candidate(candidate);
+            skipped.ranking = ranked.ranking;
+            return Err(skipped);
+        }
+        Err(error) => match error {},
+    };
+    let normalized_client_api_format = client_api_format.trim().to_ascii_lowercase();
+    let skip_reason = port
+        .candidate_common_skip_reason(&candidate, &transport, requested_model)
+        .or_else(|| match mode {
+            AiCandidateResolutionMode::Standard => port.candidate_transport_pair_skip_reason(
+                &candidate,
+                &transport,
+                &normalized_client_api_format,
+                requested_model.unwrap_or_default(),
+            ),
+            AiCandidateResolutionMode::WithoutTransportPairGate => None,
+        });
+    if let Some(skip_reason) = skip_reason {
+        let mut skipped = port.build_skipped_candidate(candidate, transport, skip_reason);
+        skipped.ranking = ranked.ranking;
+        return Err(skipped);
+    }
+
+    let mut eligible = port.build_eligible_candidate(candidate, transport);
+    eligible.orchestration = ranked.orchestration;
+    eligible.ranking = ranked.ranking;
+    Ok(eligible)
+}
+
 async fn resolve_and_rank_local_execution_candidates_with_mode(
     state: PlannerAppState<'_>,
     candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -418,10 +634,35 @@ fn provider_transport_uses_pool(transport: &GatewayProviderTransportSnapshot) ->
     .is_some()
 }
 
+/// 从最小投影判定候选逻辑类型，避免仅为识别 Pool 组读取 Provider 完整配置。
+fn projected_candidate_kind(
+    candidate: &SchedulerMinimalCandidateSelectionCandidate,
+) -> LocalExecutionCandidateKind {
+    if candidate.routing_facts.provider_pool_enabled {
+        LocalExecutionCandidateKind::PoolGroup
+    } else {
+        LocalExecutionCandidateKind::SingleKey
+    }
+}
+
 fn routing_policy_candidate_skip_reason(
     routing_policy: Option<&ResolvedRoutingPolicy>,
     candidate: &SchedulerMinimalCandidateSelectionCandidate,
     transport: &GatewayProviderTransportSnapshot,
+) -> Option<&'static str> {
+    let kind = if provider_transport_uses_pool(transport) {
+        LocalExecutionCandidateKind::PoolGroup
+    } else {
+        LocalExecutionCandidateKind::SingleKey
+    };
+    routing_policy_candidate_skip_reason_for_kind(routing_policy, candidate, kind)
+}
+
+/// 使用已知候选类型应用路由 allowlist；Pool 组不把代表 Key 当作真实成员过滤。
+fn routing_policy_candidate_skip_reason_for_kind(
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    candidate: &SchedulerMinimalCandidateSelectionCandidate,
+    kind: LocalExecutionCandidateKind,
 ) -> Option<&'static str> {
     let policy = routing_policy?;
     if !policy
@@ -430,7 +671,7 @@ fn routing_policy_candidate_skip_reason(
     {
         return Some("routing_profile_disallowed_provider");
     }
-    if !provider_transport_uses_pool(transport)
+    if kind == LocalExecutionCandidateKind::SingleKey
         && !policy
             .ranking_overlay
             .key_allowed(candidate.key_id.as_str())
@@ -438,6 +679,40 @@ fn routing_policy_candidate_skip_reason(
         return Some("routing_profile_disallowed_key");
     }
     None
+}
+
+/// 用紧凑认证策略预判请求与上游通道是否兼容，最终 hydration 仍会重跑完整门禁。
+fn projected_candidate_auth_channel_skip_reason(
+    candidate: &SchedulerMinimalCandidateSelectionCandidate,
+    request_auth_channel: Option<&str>,
+) -> Option<&'static str> {
+    let request_auth_channel = normalize_request_auth_channel(request_auth_channel?)?;
+    let projected_auth_type = candidate
+        .routing_facts
+        .key_auth_type_for_endpoint_format
+        .trim();
+    let auth_type = if projected_auth_type.is_empty() {
+        candidate.key_auth_type.trim()
+    } else {
+        projected_auth_type
+    }
+    .to_ascii_lowercase();
+    let provider_policy = provider_runtime_policy(&candidate.provider_type);
+    let upstream_auth_channel = match auth_type.as_str() {
+        "api_key" => Some("api_key"),
+        "bearer" => Some("bearer_like"),
+        "oauth" if provider_policy.oauth_is_bearer_like => Some("bearer_like"),
+        _ => None,
+    }?;
+    if request_auth_channel == upstream_auth_channel
+        || candidate
+            .routing_facts
+            .key_allows_auth_channel_mismatch_for_endpoint_format
+    {
+        None
+    } else {
+        Some("auth_channel_mismatch")
+    }
 }
 
 fn pool_group_common_transport_skip_reason(
@@ -573,7 +848,10 @@ pub(crate) async fn read_candidate_transport_snapshot_arc(
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_auth_channel_skip_reason, pool_group_common_transport_skip_reason};
+    use super::{
+        candidate_auth_channel_skip_reason, pool_group_common_transport_skip_reason,
+        projected_candidate_auth_channel_skip_reason,
+    };
     use crate::ai_serving::GatewayProviderTransportSnapshot;
     use aether_provider_transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -652,6 +930,7 @@ mod tests {
             key_internal_priority: 10,
             key_global_priority_for_format: None,
             key_capabilities: None,
+            routing_facts: Default::default(),
             model_id: "model-1".to_string(),
             global_model_id: "global-model-1".to_string(),
             global_model_name: "claude-sonnet".to_string(),
@@ -659,6 +938,25 @@ mod tests {
             supports_streaming: true,
             mapping_matched_model: None,
         }
+    }
+
+    /// 验证轻量预判与完整门禁一致：缺失 allowlist 默认放行，显式排除才阻断。
+    #[test]
+    fn projected_auth_channel_gate_preserves_default_allow_semantics() {
+        let mut candidate = sample_candidate();
+        candidate.routing_facts.key_auth_type_for_endpoint_format = "bearer".to_string();
+        assert_eq!(
+            projected_candidate_auth_channel_skip_reason(&candidate, Some("api_key")),
+            None
+        );
+
+        candidate
+            .routing_facts
+            .key_allows_auth_channel_mismatch_for_endpoint_format = false;
+        assert_eq!(
+            projected_candidate_auth_channel_skip_reason(&candidate, Some("api_key")),
+            Some("auth_channel_mismatch")
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS system_configs (
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     description TEXT,
+    revision INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE (key)
