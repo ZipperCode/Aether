@@ -481,3 +481,26 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 20: 修复 AntiGravity 大量认证内存放大
+
+**Date**: 2026-09-08
+**Task**: 修复 AntiGravity 大量认证内存放大
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+完成 revision-only allowlist singleflight、候选 transport 延迟物化、model-fetch 轻量投影与 Pool 启动去重；Docker 8356-Key 对比峰值 RSS 降低 82.23%，并恢复健康本地服务。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b917064af` | (see git log) |
+| `1350a54bb` | (see git log) |
+
+### Status
+
+[OK] **Completed**
