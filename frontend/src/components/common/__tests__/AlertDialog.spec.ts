@@ -31,7 +31,7 @@ describe('AlertDialog accessibility', () => {
     expect(dialog.getAttribute('aria-label')).toBe('转换提供商类型')
     expect(document.activeElement).toBe(buttons[0])
 
-    buttons.at(-1)?.focus()
+    buttons[buttons.length - 1]?.focus()
     dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }))
     expect(document.activeElement).toBe(buttons[0])
 
@@ -71,7 +71,7 @@ describe('AlertDialog accessibility', () => {
       const buttons = [...dialog.querySelectorAll('button')] as HTMLButtonElement[]
       expect(document.activeElement).toBe(buttons[0])
       dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true }))
-      expect(document.activeElement).toBe(buttons.at(-1))
+      expect(document.activeElement).toBe(buttons[buttons.length - 1])
       buttons[0].click()
       await nextTick()
       await nextTick()

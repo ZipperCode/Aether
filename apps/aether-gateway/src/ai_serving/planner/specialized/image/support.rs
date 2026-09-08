@@ -142,10 +142,9 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
                 input.client_session_affinity.as_ref(),
                 scheduling_context,
                 false,
-                input
-                    .routing_policy
-                    .as_ref()
-                    .map(SchedulerOrderingConfig::from_routing_policy),
+                crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                    input.routing_policy.as_ref(),
+                ),
             )
             .await
         {
@@ -225,10 +224,9 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
                 input.client_session_affinity.as_ref(),
                 scheduling_context,
                 false,
-                input
-                    .routing_policy
-                    .as_ref()
-                    .map(SchedulerOrderingConfig::from_routing_policy),
+                crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                    input.routing_policy.as_ref(),
+                ),
             )
             .await
         {

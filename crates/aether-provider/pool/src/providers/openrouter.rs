@@ -45,6 +45,7 @@ impl ProviderPoolAdapter for OpenRouterProviderPoolAdapter {
     }
 }
 
+/// 仅为官方 OpenRouter 端点构造 Key 余额请求，复用统一 TLS 校验策略。
 pub fn build_openrouter_credits_request<F>(
     key_id: &str,
     endpoint: &StoredProviderCatalogEndpoint,
@@ -73,7 +74,6 @@ where
         client_api_format: "openai:chat".into(),
         provider_api_format: "openai:chat".into(),
         model_name: None,
-        accept_invalid_certs: false,
     })
 }
 

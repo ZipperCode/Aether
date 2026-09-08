@@ -21,7 +21,8 @@ use crate::client_session_affinity::{
 };
 use crate::orchestration::{
     insert_pool_key_lease_report_context_fields, ExecutionAttemptIdentity,
-    ROUTING_POOL_POLICY_OVERRIDE_REPORT_FIELD, SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
+    ROUTING_EXECUTION_POLICY_REPORT_FIELD, ROUTING_POOL_POLICY_OVERRIDE_REPORT_FIELD,
+    SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
 };
 use crate::scheduler::affinity::insert_scheduler_affinity_policy_report_context_field;
 
@@ -76,10 +77,12 @@ pub(crate) fn build_local_execution_report_context(
     let RequestOrigin {
         client_ip,
         user_agent,
+        forwarded_headers_trusted,
     } = parts
         .request_origin
         .unwrap_or_else(|| request_origin_from_headers(parts.original_headers));
-    let original_headers = crate::ai_serving::collect_control_headers(parts.original_headers);
+    let original_headers =
+        collect_report_context_original_headers(parts.original_headers, forwarded_headers_trusted);
     let original_request_body = crate::ai_serving::build_report_context_original_request_echo(
         parts.original_request_body_json,
         parts.original_request_body_base64,
@@ -106,13 +109,20 @@ pub(crate) fn build_local_execution_report_context(
             value,
         );
     }
-    if let Some(incoming_tls) =
-        crate::ai_serving::tls_fingerprint_from_headers(parts.original_headers)
-    {
-        merge_incoming_tls_fingerprint(&mut extra_fields, incoming_tls);
+    if forwarded_headers_trusted {
+        if let Some(incoming_tls) =
+            crate::ai_serving::tls_fingerprint_from_headers(parts.original_headers)
+        {
+            merge_incoming_tls_fingerprint(&mut extra_fields, incoming_tls);
+        }
     }
     insert_pool_key_lease_report_context_fields(&mut extra_fields, parts.pool_key_lease);
     insert_scheduler_affinity_policy_report_context_field(&mut extra_fields, parts.routing_policy);
+    if let Some(policy) = parts.routing_policy {
+        if let Ok(value) = serde_json::to_value(policy.execution_policy) {
+            extra_fields.insert(ROUTING_EXECUTION_POLICY_REPORT_FIELD.to_string(), value);
+        }
+    }
     if let Some(override_policy) = parts
         .routing_policy
         .and_then(|policy| policy.pool_policy_overrides.get(parts.provider_id))
@@ -184,6 +194,17 @@ pub(crate) fn build_local_execution_report_context(
     })
 }
 
+fn collect_report_context_original_headers(
+    headers: &http::HeaderMap,
+    forwarded_headers_trusted: bool,
+) -> BTreeMap<String, String> {
+    let mut collected = crate::ai_serving::collect_control_headers(headers);
+    if !forwarded_headers_trusted {
+        collected.retain(|name, _| !name.starts_with("x-aether-tls-"));
+    }
+    collected
+}
+
 fn insert_request_path_fields(
     extra_fields: &mut Map<String, Value>,
     request_path: Option<&str>,
@@ -253,8 +274,8 @@ mod tests {
     use serde_json::{json, Map, Value};
 
     use super::{
-        build_local_execution_report_context, provider_stream_event_api_format_for_provider_type,
-        LocalExecutionReportContextParts,
+        build_local_execution_report_context, collect_report_context_original_headers,
+        provider_stream_event_api_format_for_provider_type, LocalExecutionReportContextParts,
     };
     use crate::ai_serving::ExecutionRuntimeAuthContext;
     use crate::ai_serving::RequestOrigin;
@@ -285,6 +306,26 @@ mod tests {
     }
 
     /// 验证报告上下文保留请求来源、会话亲和与路由尝试预算。
+    #[test]
+    fn untrusted_tls_forwarding_headers_are_excluded_from_report_context() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-aether-tls-ja3", "spoofed-ja3".parse().unwrap());
+        headers.insert(http::header::USER_AGENT, "test-client".parse().unwrap());
+
+        let untrusted = collect_report_context_original_headers(&headers, false);
+        assert!(!untrusted.contains_key("x-aether-tls-ja3"));
+        assert_eq!(
+            untrusted.get("user-agent").map(String::as_str),
+            Some("test-client")
+        );
+
+        let trusted = collect_report_context_original_headers(&headers, true);
+        assert_eq!(
+            trusted.get("x-aether-tls-ja3").map(String::as_str),
+            Some("spoofed-ja3")
+        );
+    }
+
     #[test]
     fn local_execution_report_context_records_request_origin_and_session_affinity() {
         let auth_context = ExecutionRuntimeAuthContext {
@@ -335,6 +376,7 @@ mod tests {
                 request_origin: Some(RequestOrigin {
                     client_ip: Some("203.0.113.8".to_string()),
                     user_agent: Some("Claude-Code/1.0".to_string()),
+                    forwarded_headers_trusted: false,
                 }),
                 original_request_body_json: Some(&json!({"model": "gpt-5"})),
                 original_request_body_base64: None,
@@ -489,7 +531,11 @@ mod tests {
                 original_headers: &original_headers,
                 request_path: None,
                 request_query_string: None,
-                request_origin: None,
+                request_origin: Some(RequestOrigin {
+                    client_ip: None,
+                    user_agent: None,
+                    forwarded_headers_trusted: true,
+                }),
                 original_request_body_json: Some(&json!({"model": "gpt-5"})),
                 original_request_body_base64: None,
                 client_session_affinity: None,

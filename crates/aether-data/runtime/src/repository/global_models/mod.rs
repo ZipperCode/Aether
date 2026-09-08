@@ -12,10 +12,6 @@ pub(crate) use aether_data_contracts::repository::global_models::{
     UpdateAdminGlobalModelRecord, UpdateAdminProviderModelWithBindingsRecord,
     UpsertAdminProviderModelRecord, UpsertModelEndpointBindingRecord,
 };
-#[cfg(feature = "mysql")]
-pub use aether_data_mysql::MysqlGlobalModelReadRepository;
 #[cfg(feature = "postgres")]
 pub use aether_data_postgres::SqlxGlobalModelReadRepository;
-#[cfg(feature = "sqlite")]
-pub use aether_data_sqlite::SqliteGlobalModelReadRepository;
 pub use memory::InMemoryGlobalModelReadRepository;

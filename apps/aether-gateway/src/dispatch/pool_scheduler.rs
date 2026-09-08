@@ -331,7 +331,7 @@ fn active_probe_member_is_unschedulable_for_request(
             || context.account_blocked
             || context.runtime_quota_hard_blocked
             || context.quota_hard_blocked
-            || (pool_config.skip_exhausted_accounts && context.quota_exhausted)
+            || context.quota_exhausted
             || context.balance_below_minimum
     })
 }
@@ -1837,7 +1837,21 @@ fn run_local_execution_pool_scheduler_with_runtime_map(
         let key_context = key_context_by_id
             .get(&candidate.candidate.key_id)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                // An explicitly non-empty metadata snapshot should contain
+                // every catalog key in this page. If one disappeared between
+                // reads, fail closed for that key instead of sending traffic
+                // with an unknown quota state. Empty maps are retained for
+                // callers/tests that intentionally provide no runtime context.
+                if key_context_by_id.is_empty() {
+                    PoolCatalogKeyContext::default()
+                } else {
+                    PoolCatalogKeyContext {
+                        quota_hard_blocked: true,
+                        ..PoolCatalogKeyContext::default()
+                    }
+                }
+            });
         let admin_pool_config = effective_pool_config_by_provider
             .get(&candidate.candidate.provider_id)
             .cloned()
@@ -2119,7 +2133,8 @@ mod tests {
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
     use aether_pool_core::{
-        PoolMemberSignals, PoolSchedulingPreset, POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON,
+        PoolMemberSignals, PoolSchedulingPreset, POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
+        POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON,
     };
     use aether_provider_pool::ProviderPoolService;
     use aether_provider_transport::snapshot::{
@@ -2233,6 +2248,55 @@ mod tests {
     }
 
     /// 验证 Pool 排序结果携带组索引、Key 索引、租约及粘性尝试预算。
+    #[test]
+    fn pool_scheduler_skips_quota_exhausted_key_when_flag_is_false() {
+        let ready = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-ready",
+            10,
+            Some(json!({ "pool_advanced": {} })),
+        );
+        let exhausted = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-exhausted",
+            10,
+            Some(json!({ "pool_advanced": { "skip_exhausted_accounts": false } })),
+        );
+        let key_context_by_id = BTreeMap::from([
+            ("key-ready".to_string(), PoolCatalogKeyContext::default()),
+            (
+                "key-exhausted".to_string(),
+                PoolCatalogKeyContext {
+                    quota_exhausted: true,
+                    ..PoolCatalogKeyContext::default()
+                },
+            ),
+        ]);
+
+        let (scheduled, skipped) = apply_local_execution_pool_scheduler_with_runtime_map(
+            vec![ready, exhausted],
+            &BTreeMap::new(),
+            &key_context_by_id,
+        );
+
+        assert_eq!(
+            scheduled
+                .iter()
+                .map(|item| item.candidate.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-ready"]
+        );
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|item| (item.candidate.key_id.as_str(), item.skip_reason))
+                .collect::<Vec<_>>(),
+            vec![("key-exhausted", POOL_ACCOUNT_EXHAUSTED_SKIP_REASON)]
+        );
+    }
+
     #[test]
     fn pool_scheduler_attaches_group_and_pool_metadata_to_ranked_candidates() {
         let pool_first = sample_eligible_candidate(
@@ -4996,6 +5060,7 @@ mod tests {
     }
 
     /// 验证已知封禁元数据仍是与请求模型无关的账号级阻断。
+
     #[test]
     fn pool_catalog_context_marks_known_banned_account_from_metadata() {
         let mut key = sample_catalog_oauth_key("key-account-banned");
@@ -5054,6 +5119,15 @@ mod tests {
             ))
     }
 
+    fn provider_catalog_credential_state() -> AppState {
+        AppState::new()
+            .expect("credential state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            )
+    }
+
     fn large_pool_fixture(
         key_count: usize,
         provider_config: Option<serde_json::Value>,
@@ -5104,10 +5178,18 @@ mod tests {
         )
         .expect("endpoint transport should build");
 
+        let credential_state = provider_catalog_credential_state();
         let mut keys = Vec::with_capacity(key_count);
         let mut rows = Vec::with_capacity(key_count);
         for index in 0..key_count {
             let key_id = format!("key-{index:05}");
+            let encrypted_api_key = credential_state
+                .seal_provider_catalog_key_api_key(
+                    "provider-pool",
+                    &key_id,
+                    &format!("secret-{index}"),
+                )
+                .expect("api key should encrypt");
             let mut key = StoredProviderCatalogKey::new(
                 key_id.clone(),
                 "provider-pool".to_string(),
@@ -5119,7 +5201,7 @@ mod tests {
             .expect("key should build")
             .with_transport_fields(
                 Some(json!(["openai:chat"])),
-                Some(format!("secret-{index}")),
+                encrypted_api_key,
                 None,
                 None,
                 None,
@@ -5256,6 +5338,9 @@ mod tests {
     }
 
     fn sample_codex_pool_key(provider_id: &str, key_id: &str) -> StoredProviderCatalogKey {
+        let encrypted_api_key = provider_catalog_credential_state()
+            .seal_provider_catalog_key_api_key(provider_id, key_id, &format!("secret-{key_id}"))
+            .expect("api key should encrypt");
         let mut key = StoredProviderCatalogKey::new(
             key_id.to_string(),
             provider_id.to_string(),
@@ -5267,7 +5352,7 @@ mod tests {
         .expect("key should build")
         .with_transport_fields(
             Some(json!(["openai:responses"])),
-            Some(format!("secret-{key_id}")),
+            encrypted_api_key,
             None,
             None,
             Some(json!({"openai:responses": 1})),
@@ -5423,6 +5508,7 @@ mod tests {
             scheduling_mode: RoutingSchedulingMode::CacheAffinity,
             keep_priority_on_conversion: false,
             sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            execution_policy: Default::default(),
             ranking_overlay: RankingOverlay {
                 allowed_keys: key_ids.into_iter().map(str::to_string).collect(),
                 ..RankingOverlay::default()

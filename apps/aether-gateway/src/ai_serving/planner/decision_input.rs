@@ -13,7 +13,7 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
 
 use crate::ai_serving::planner::common::extract_standard_requested_model;
-use crate::ai_serving::transport::CodexFingerprintConvergenceContext;
+use crate::ai_serving::transport::ProviderOutboundRequestContext;
 use crate::ai_serving::{
     ClientSurface, ExecutionRuntimeAuthContext, GatewayAuthApiKeySnapshot,
     GatewayCredentialCarrier, GatewayProviderTransportSnapshot, PlannerAppState,
@@ -37,6 +37,10 @@ const ROUTING_GROUP_SELECTION_CACHE_TTL: Duration = Duration::from_secs(30);
 const ROUTING_GROUP_SELECTION_CACHE_STALE_TTL: Duration = Duration::from_secs(120);
 const CODEX_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 const CODEX_FEDRAMP_HEADER: &str = "x-openai-fedramp";
+const INVALID_ROUTING_PROVIDER_CONTRACT_MESSAGE: &str =
+    "routing provider request violates provider contract";
+const INVALID_ROUTING_PROVIDER_HEADERS_MESSAGE: &str =
+    "invalid provider request headers in routing mutation";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedLocalDecisionAuthInput {
@@ -57,8 +61,8 @@ pub(crate) struct LocalRequestedModelDecisionInput {
     pub(crate) client_surface: Option<ClientSurface>,
     pub(crate) gateway_credential_carrier: Option<GatewayCredentialCarrier>,
     pub(crate) client_session_affinity: Option<ClientSessionAffinity>,
-    /// 当前逻辑 turn 的不可变 Codex 指纹上下文，所有候选与重规划必须复用。
-    pub(crate) codex_fingerprint_context: Option<CodexFingerprintConvergenceContext>,
+    /// 当前逻辑 turn 冻结的出站上下文，供所有候选及重规划复用身份与指纹。
+    pub(crate) provider_outbound_context: Option<ProviderOutboundRequestContext>,
     pub(crate) routing_policy: Option<ResolvedRoutingPolicy>,
     pub(crate) routing_trace_seed: Option<RoutingDecisionTrace>,
     pub(crate) routing_context: Option<LocalRoutingRequestContext>,
@@ -221,7 +225,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
                 provider_api_format.as_str(),
             );
         }
-        apply_codex_fingerprint_convergence_to_decision(
+        apply_provider_outbound_request_policies_to_decision(
             input,
             decision,
             transport,
@@ -284,7 +288,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
                 provider_api_format.as_str(),
             );
         }
-        apply_codex_fingerprint_convergence_to_decision(
+        apply_provider_outbound_request_policies_to_decision(
             input,
             decision,
             transport,
@@ -365,10 +369,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
                 )
             }
         }
-        .map_err(|violation| GatewayError::Client {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("routing provider_request violates provider contract: {violation:?}"),
-        })?;
+        .map_err(|_| invalid_routing_provider_contract())?;
     }
     let provider_model = provider_request_body
         .get("model")
@@ -410,7 +411,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
     if original_provider_request_body.is_some() {
         decision.provider_request_body = Some(provider_request_body);
     }
-    apply_codex_fingerprint_convergence_to_decision(
+    apply_provider_outbound_request_policies_to_decision(
         input,
         decision,
         transport,
@@ -420,8 +421,8 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
     Ok(())
 }
 
-/// 在终态 Provider 请求上应用已冻结的 Codex 上下文，并同步决策中的最终缓存键。
-fn apply_codex_fingerprint_convergence_to_decision(
+/// 在终态 Provider 请求上应用冻结的出站策略，并同步最终缓存键和策略诊断。
+fn apply_provider_outbound_request_policies_to_decision(
     input: &LocalRequestedModelDecisionInput,
     decision: &mut AiExecutionDecision,
     transport: Option<&GatewayProviderTransportSnapshot>,
@@ -432,17 +433,17 @@ fn apply_codex_fingerprint_convergence_to_decision(
     else {
         return;
     };
-    let Some(context) = input.codex_fingerprint_context.as_ref() else {
+    let Some(context) = input.provider_outbound_context.as_ref() else {
         return;
     };
-    let applied = crate::ai_serving::transport::apply_codex_fingerprint_convergence_with_context(
+    let results = crate::ai_serving::transport::apply_provider_outbound_request_policies(
         transport,
         provider_api_format,
         context,
         &mut decision.provider_request_headers,
         provider_request_body,
     );
-    if applied {
+    if results.iter().any(|result| result.was_applied()) {
         decision.prompt_cache_key = provider_request_body
             .get("prompt_cache_key")
             .and_then(Value::as_str)
@@ -450,6 +451,31 @@ fn apply_codex_fingerprint_convergence_to_decision(
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
     }
+    if results.is_empty() {
+        return;
+    }
+    for result in &results {
+        tracing::debug!(
+            event_name = "provider_outbound_policy_evaluated",
+            log_type = "event",
+            policy = ?result.policy,
+            outcome = ?result.outcome,
+            reason = ?result.reason,
+            mutation_scope = ?result.mutation_scope,
+            identity_scope = ?result.identity_scope,
+            "provider outbound request policy evaluated"
+        );
+    }
+    let Some(serde_json::Value::Object(report_context)) = decision.report_context.as_mut() else {
+        return;
+    };
+    report_context.insert(
+        "provider_outbound_policies".to_string(),
+        serde_json::json!({
+            "schema_version": 1,
+            "results": results,
+        }),
+    );
 }
 
 struct GatewayAuthenticatedDecisionInputPort<'a> {
@@ -540,7 +566,7 @@ pub(crate) fn build_local_requested_model_decision_input(
         client_surface: None,
         gateway_credential_carrier: None,
         client_session_affinity: None,
-        codex_fingerprint_context: None,
+        provider_outbound_context: None,
         routing_policy: None,
         routing_trace_seed: None,
         routing_context: None,
@@ -559,7 +585,7 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
     body_json: &Value,
     client_api_format: &str,
 ) -> Result<(), GatewayError> {
-    input.codex_fingerprint_context =
+    input.provider_outbound_context =
         Some(crate::ai_serving::codex_context::resolve_codex_fingerprint_context(parts, body_json));
     let explicit_group = routing_header_value_str(&parts.headers, ROUTING_GROUP_HEADER);
     let selected_group = match state.routing_group_read_repository() {
@@ -685,21 +711,17 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
                     GatewayRoutingSelectionError::NotFound(explicit_group.unwrap_or_default()),
                 ));
             }
-            None
+            return Err(routing_selection_error(
+                GatewayRoutingSelectionError::NoDefault,
+            ));
         }
     };
 
     let Some((group_id, group_version, group_config_json, selection_source)) = selected_group
     else {
-        input.client_session_affinity = client_session_affinity_from_api_request(
-            client_api_format,
-            &parts.headers,
-            Some(body_json),
-        );
-        input.routing_policy = None;
-        input.routing_trace_seed = None;
-        input.routing_context = None;
-        return Ok(());
+        return Err(routing_selection_error(
+            GatewayRoutingSelectionError::NoDefault,
+        ));
     };
 
     if try_attach_static_default_routing_policy_to_input(
@@ -923,10 +945,36 @@ fn routing_selection_error(error: GatewayRoutingSelectionError) -> GatewayError 
         GatewayRoutingSelectionError::Repository(message) => {
             GatewayError::Internal(format!("routing group repository lookup failed: {message}"))
         }
-        error => GatewayError::Client {
-            status: StatusCode::FORBIDDEN,
-            message: error.to_string(),
+        GatewayRoutingSelectionError::NoDefault => GatewayError::Client {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "no enabled routing strategy is configured for this request".to_string(),
         },
+        GatewayRoutingSelectionError::NotFound(_) => GatewayError::Client {
+            status: StatusCode::FORBIDDEN,
+            message: "requested routing group was not found".to_string(),
+        },
+        GatewayRoutingSelectionError::Disabled(_) => GatewayError::Client {
+            status: StatusCode::FORBIDDEN,
+            message: "requested routing group is not enabled".to_string(),
+        },
+        GatewayRoutingSelectionError::Forbidden(_) => GatewayError::Client {
+            status: StatusCode::FORBIDDEN,
+            message: "requested routing group is not allowed for this principal".to_string(),
+        },
+    }
+}
+
+fn invalid_routing_provider_contract() -> GatewayError {
+    GatewayError::Client {
+        status: StatusCode::BAD_REQUEST,
+        message: INVALID_ROUTING_PROVIDER_CONTRACT_MESSAGE.to_string(),
+    }
+}
+
+fn invalid_routing_provider_headers() -> GatewayError {
+    GatewayError::Client {
+        status: StatusCode::BAD_REQUEST,
+        message: INVALID_ROUTING_PROVIDER_HEADERS_MESSAGE.to_string(),
     }
 }
 
@@ -981,14 +1029,9 @@ fn btree_headers_to_header_map(
 ) -> Result<HeaderMap, GatewayError> {
     let mut output = HeaderMap::new();
     for (name, value) in headers {
-        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| GatewayError::Client {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("invalid provider request header name in routing mutation: {err}"),
-        })?;
-        let value = HeaderValue::from_str(value).map_err(|err| GatewayError::Client {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("invalid provider request header value in routing mutation: {err}"),
-        })?;
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| invalid_routing_provider_headers())?;
+        let value = HeaderValue::from_str(value).map_err(|_| invalid_routing_provider_headers())?;
         output.insert(name, value);
     }
     Ok(output)
@@ -1213,6 +1256,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn routing_selection_errors_do_not_echo_explicit_group() {
+        let secret = "private-group?token=Bearer-secret";
+
+        for error in [
+            GatewayRoutingSelectionError::NotFound(secret.to_string()),
+            GatewayRoutingSelectionError::Disabled(secret.to_string()),
+            GatewayRoutingSelectionError::Forbidden(secret.to_string()),
+        ] {
+            let error = routing_selection_error(error);
+            assert!(matches!(
+                error,
+                GatewayError::Client {
+                    status: StatusCode::FORBIDDEN,
+                    ref message,
+                } if !message.contains(secret)
+            ));
+        }
+    }
+
+    #[test]
+    fn routing_provider_errors_do_not_echo_dynamic_details() {
+        let secret = "https://internal.example/?token=Bearer-secret";
+        let contract_error = invalid_routing_provider_contract();
+        let header_error = btree_headers_to_header_map(&BTreeMap::from([(
+            format!("Authorization: {secret}"),
+            secret.to_string(),
+        )]))
+        .expect_err("invalid header should fail");
+
+        for (error, expected_message) in [
+            (contract_error, INVALID_ROUTING_PROVIDER_CONTRACT_MESSAGE),
+            (header_error, INVALID_ROUTING_PROVIDER_HEADERS_MESSAGE),
+        ] {
+            assert!(matches!(
+                error,
+                GatewayError::Client {
+                    status: StatusCode::BAD_REQUEST,
+                    ref message,
+                } if message == expected_message && !message.contains(secret)
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn explicit_auth_snapshot_override_does_not_fall_back_to_the_planner_cache() {
         // AppState::new has no auth snapshot repository. Without the explicit
@@ -1269,6 +1356,7 @@ mod tests {
                 description: None,
                 enabled: true,
                 is_system_default: false,
+                sort_order: 0,
                 config_json: json!({}),
                 version: 1,
                 created_at: 1,
@@ -1836,6 +1924,35 @@ mod tests {
 
     /// 验证无路由上下文、静态路由与动态路由的所有成功出口均执行同一指纹收敛。
     #[test]
+    fn non_codex_provider_outbound_policies_are_terminal_noop() {
+        let mut input = sample_decision_input();
+        input.routing_context = None;
+        input.provider_outbound_context = Some(ProviderOutboundRequestContext::new(
+            "logical-turn",
+            1_700_000_000_123,
+        ));
+        let mut decision = sample_codex_fingerprint_decision();
+        decision.provider_type = Some("openai".to_string());
+        decision.provider_api_format = Some("openai:responses".to_string());
+        decision.client_api_format = Some("openai:responses".to_string());
+        let mut transport = sample_codex_fingerprint_transport();
+        transport.provider.provider_type = "openai".to_string();
+
+        let original_headers = decision.provider_request_headers.clone();
+        let original_body = decision.provider_request_body.clone();
+        apply_provider_request_routing_policy_to_decision(&input, &mut decision, Some(&transport))
+            .expect("non-Codex terminal finalization should succeed");
+
+        assert_eq!(decision.provider_request_headers, original_headers);
+        assert_eq!(decision.provider_request_body, original_body);
+        assert!(decision
+            .report_context
+            .as_ref()
+            .and_then(|context| context.get("provider_outbound_policies"))
+            .is_none());
+    }
+
+    #[test]
     fn codex_fingerprint_convergence_runs_at_every_provider_routing_success_exit() {
         let transport = sample_codex_fingerprint_transport();
         let mut no_context = sample_decision_input();
@@ -1851,8 +1968,8 @@ mod tests {
         });
         let mut with_mutation = sample_decision_input();
         for input in [&mut no_context, &mut empty_mutation, &mut with_mutation] {
-            input.codex_fingerprint_context = Some(
-                CodexFingerprintConvergenceContext::new(
+            input.provider_outbound_context = Some(
+                ProviderOutboundRequestContext::new(
                     uuid::Uuid::new_v4().to_string(),
                     1_756_668_000_000,
                 )
@@ -1920,6 +2037,25 @@ mod tests {
                 installation_id
             );
             assert_eq!(body["client_metadata"]["x-codex-window-id"], window_id);
+
+            let policy_results = decision
+                .report_context
+                .as_ref()
+                .and_then(|context| context.get("provider_outbound_policies"))
+                .and_then(|policies| policies.get("results"))
+                .and_then(Value::as_array)
+                .expect("provider policy results");
+            assert_eq!(
+                policy_results.len(),
+                1,
+                "policy result count at {exit_name}"
+            );
+            assert_eq!(
+                policy_results[0]["policy"],
+                json!("codex_fingerprint_convergence")
+            );
+            assert_eq!(policy_results[0]["outcome"], json!("applied"));
+            assert_eq!(policy_results[0]["reason"], json!("applied"));
 
             let header_metadata: Value =
                 serde_json::from_str(&decision.provider_request_headers["x-codex-turn-metadata"])

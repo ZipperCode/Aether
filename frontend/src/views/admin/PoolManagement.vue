@@ -628,8 +628,8 @@
                   <button
                     v-if="item.key === 'priority'"
                     type="button"
-                    class="inline-flex max-w-full items-center rounded-full border px-2 py-0.5 text-[10px] font-medium leading-4"
-                    :class="`${getMobileTagClass(item)} hover:border-primary/40 hover:text-foreground`"
+                    class="inline-flex max-w-full items-center rounded-full border px-2 py-0.5 text-[10px] font-medium leading-4 hover:border-primary/40 hover:text-foreground"
+                    :class="getMobileTagClass(item)"
                     :title="`${item.label}，点击编辑优先级`"
                     @click="quickEditInternalPriority(key)"
                   >
@@ -1032,7 +1032,7 @@
       v-model="showAccountBatchDialog"
       :provider-id="selectedProviderId"
       :provider-name="selectedProviderData?.name || ''"
-      :provider-type="selectedProviderData?.provider_type || selectedProviderType"
+      :provider-type="selectedProviderData?.provider_type ?? selectedProviderOverview?.provider_type ?? undefined"
       :batch-concurrency="selectedProviderConfig?.batch_concurrency"
       :selected-keys="selectedPoolKeys"
       :select-all-filtered="selectAllFilteredPoolKeys"
@@ -1056,7 +1056,7 @@
       v-if="selectedProviderId"
       :open="keyFormDialogOpen"
       :endpoint="null"
-      :provider-type="selectedProviderData?.provider_type || selectedProviderType"
+      :provider-type="selectedProviderData?.provider_type ?? selectedProviderOverview?.provider_type ?? null"
       :editing-key="editingKey"
       :provider-id="selectedProviderId"
       :available-api-formats="selectedProviderData?.api_formats || []"
@@ -1191,6 +1191,7 @@ import {
 } from '@/features/pool/utils/poolManagementState'
 import type { PoolBatchActionValue } from '@/features/pool/utils/poolBatchActions'
 import {
+  buildAccountTotalStatsDisplay,
   buildPoolStatsDisplay,
   type PoolCodexCycleStatsGroup,
   type PoolStatsDisplay,
@@ -1198,11 +1199,7 @@ import {
 } from '@/features/pool/utils/poolStatsDisplay'
 import { resetCodexCycleUsageWindows } from '@/features/pool/utils/poolCycleStats'
 import { mergePoolKeyQuotaSnapshots } from '@/features/pool/utils/poolQuotaRefresh'
-import {
-  dedupeAntigravityQuotaItemsByLabel,
-  resolveAntigravityQuotaLabel,
-  summarizeAntigravityQuotaItems,
-} from '@/features/providers/utils/antigravityQuota'
+import { resolveAntigravityQuotaGroupLabel } from '@/features/providers/utils/antigravityQuota'
 import {
   clearPendingCodexResetCreditIdempotencyKey,
   clearPendingCodexResetCreditIdempotencyKeyForOutcome,
@@ -1253,7 +1250,7 @@ function prefetchProviderDetailDrawer(): void {
 type PoolKeyScore = NonNullable<PoolKeyDetail['pool_score']>
 
 const { success, error: showError, warning: showWarning } = useToast()
-const { legacyT } = useI18n()
+const { legacyT, t } = useI18n()
 const { confirm } = useConfirm()
 const { copyToClipboard } = useClipboard()
 const { tick: countdownTick, start: startCountdownTimer } = useCountdownTimer()
@@ -1563,7 +1560,7 @@ function appendDemandMetricSample(overview: PoolOverviewItem | null): void {
   const existing = providerDemandMetricSamples.value.filter(
     sample => sample.providerId === overview.provider_id,
   )
-  const lastSample = existing.at(-1)
+  const lastSample = existing[existing.length - 1]
   if (
     lastSample
     && nextSample.sampledAt - lastSample.sampledAt < 1000
@@ -2311,7 +2308,7 @@ function getPoolKeyAccountStatsMetrics(key: PoolKeyDetail): PoolStatsMetric[] {
   const display = getPoolKeyStatsDisplay(key)
   return display.kind === 'account_total'
     ? display.metrics
-    : buildPoolStatsDisplay(key, selectedProviderType.value, 'account_total').metrics
+    : buildAccountTotalStatsDisplay(key).metrics
 }
 
 const quotaRefreshSupported = computed(() => {
@@ -4217,17 +4214,17 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
   }
 
   if (providerType === 'antigravity') {
-    const windows = getQuotaSnapshotWindowsByScope(quota, 'model')
+    const windows = getQuotaSnapshotWindowsByScope(quota, 'quota_group')
     if (windows.length === 0) return []
-    const opaqueDisplayIndex = { value: 1 }
-    return summarizeAntigravityQuotaItems(dedupeAntigravityQuotaItemsByLabel(windows
-      .map((window): (QuotaProgressItem & { model: string, resetSeconds: number | null }) | null => {
+    return windows
+      .map((window, index): QuotaProgressItem | null => {
         const remainingPercent = getQuotaWindowRemainingPercent(window)
         if (remainingPercent == null) return null
-        const model = String(window.model || window.code || '').trim().replace(/^model:/i, '')
+        const label = resolveAntigravityQuotaGroupLabel(window, t)
+        if (!label) return null
         return {
-          model,
-          label: resolveAntigravityQuotaLabel(model, window.label, opaqueDisplayIndex),
+          label,
+          sortOrder: index,
           remainingPercent,
           resetAtSeconds: normalizeUnixSeconds(window.reset_at ?? quota.reset_at ?? null),
           resetSeconds: normalizeRemainingSeconds(window.reset_seconds ?? quota.reset_seconds ?? null),
@@ -4235,7 +4232,7 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
           allowDynamicReset: true,
         }
       })
-        .filter((item): item is QuotaProgressItem & { model: string, resetSeconds: number | null } => item != null)))
+      .filter((item): item is QuotaProgressItem => item != null)
   }
 
   if (providerType === 'gemini_cli') {

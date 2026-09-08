@@ -43,6 +43,7 @@ impl ProviderPoolAdapter for DeepSeekProviderPoolAdapter {
     }
 }
 
+/// 仅为官方 DeepSeek 端点构造余额观察请求；证书校验由统一传输层负责。
 pub fn build_deepseek_balance_request<F>(
     key_id: &str,
     endpoint: &StoredProviderCatalogEndpoint,
@@ -70,7 +71,6 @@ where
         client_api_format: "openai:chat".into(),
         provider_api_format: "openai:chat".into(),
         model_name: None,
-        accept_invalid_certs: false,
     })
 }
 

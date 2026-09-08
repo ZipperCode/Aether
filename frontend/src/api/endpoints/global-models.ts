@@ -13,6 +13,7 @@ import type {
 
 // 重新导出路由相关类型供外部使用
 export type {
+  GlobalModelResponse,
   RoutingKeyInfo,
   RoutingEndpointInfo,
   RoutingModelMapping,
@@ -39,7 +40,7 @@ export async function getGlobalModels(params?: {
   return cachedRequest(
     key,
     async () => {
-      const response = await client.get('/api/admin/models/global', { params })
+      const response = await client.get<GlobalModelListResponse>('/api/admin/models/global', { params })
       return response.data
     },
     cacheTtlMs,
@@ -51,7 +52,7 @@ export async function getGlobalModels(params?: {
  */
 export async function getGlobalModel(id: string): Promise<GlobalModelWithStats> {
   return dedupedRequest(`global-models:detail:${id}`, async () => {
-    const response = await client.get(`/api/admin/models/global/${id}`)
+    const response = await client.get<GlobalModelWithStats>(`/api/admin/models/global/${id}`)
     return response.data
   })
 }
@@ -60,7 +61,7 @@ export async function getGlobalModel(id: string): Promise<GlobalModelWithStats> 
  * 创建 GlobalModel
  */
 export async function createGlobalModel(data: GlobalModelCreate): Promise<GlobalModelResponse> {
-  const response = await client.post('/api/admin/models/global', data)
+  const response = await client.post<GlobalModelResponse>('/api/admin/models/global', data)
   return response.data
 }
 
@@ -71,7 +72,7 @@ export async function updateGlobalModel(
   id: string,
   data: GlobalModelUpdate
 ): Promise<GlobalModelResponse> {
-  const response = await client.patch(`/api/admin/models/global/${id}`, data)
+  const response = await client.patch<GlobalModelResponse>(`/api/admin/models/global/${id}`, data)
   return response.data
 }
 
@@ -91,7 +92,7 @@ export async function deleteGlobalModel(
 export async function batchDeleteGlobalModels(
   ids: string[]
 ): Promise<{ success_count: number; failed: Array<{ id: string; error: string }> }> {
-  const response = await client.post('/api/admin/models/global/batch-delete', { ids })
+  const response = await client.post<{ success_count: number; failed: Array<{ id: string; error: string }> }>('/api/admin/models/global/batch-delete', { ids })
   return response.data
 }
 
@@ -115,7 +116,17 @@ export async function batchAssignToProviders(
     error: string
   }>
 }> {
-  const response = await client.post(
+  const response = await client.post<{
+  success: Array<{
+    provider_id: string
+    provider_name: string
+    model_id?: string
+  }>
+  errors: Array<{
+    provider_id: string
+    error: string
+  }>
+}>(
     `/api/admin/models/global/${globalModelId}/assign-to-providers`,
     data
   )
@@ -130,7 +141,7 @@ export async function getGlobalModelProviders(globalModelId: string): Promise<{
   total: number
 }> {
   return dedupedRequest(`global-models:providers:${globalModelId}`, async () => {
-    const response = await client.get(
+    const response = await client.get<{ providers: ModelCatalogProviderDetail[]; total: number }>(
       `/api/admin/models/global/${globalModelId}/providers`
     )
     return response.data
@@ -138,13 +149,13 @@ export async function getGlobalModelProviders(globalModelId: string): Promise<{
 }
 
 /**
- * 获取 GlobalModel 的请求链路预览
+ * 获取 GlobalModel 轻量请求链路，不加载 Key 白名单；映射详情由分页预览接口单独读取。
  */
 export async function getGlobalModelRoutingPreview(
   globalModelId: string
 ): Promise<ModelRoutingPreviewResponse> {
   return dedupedRequest(`global-models:routing:${globalModelId}:light`, async () => {
-    const response = await client.get(
+    const response = await client.get<ModelRoutingPreviewResponse>(
       `/api/admin/models/global/${globalModelId}/routing`,
       { params: { include_whitelist: false } },
     )
@@ -172,7 +183,7 @@ export async function getGlobalModelMappingPreview(
   return dedupedRequest(
     `global-models:mapping-preview:${globalModelId}:${JSON.stringify(normalized)}`,
     async () => {
-      const response = await client.post(
+      const response = await client.post<ModelMappingPreviewResponse>(
         `/api/admin/models/global/${globalModelId}/mapping-preview`,
         normalized,
       )

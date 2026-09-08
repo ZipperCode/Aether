@@ -181,10 +181,6 @@ packages:
     path: crates/aether-data/contracts
   aether-data-postgres:
     path: crates/aether-data/adapters/postgres
-  aether-data-mysql:
-    path: crates/aether-data/adapters/mysql
-  aether-data-sqlite:
-    path: crates/aether-data/adapters/sqlite
   aether-data-query:
     path: crates/aether-data/query
   aether-data-schema:

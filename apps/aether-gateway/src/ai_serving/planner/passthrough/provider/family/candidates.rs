@@ -152,10 +152,9 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
             },
             false,
             spec.operation.map(|operation| operation.as_str()),
-            input
-                .routing_policy
-                .as_ref()
-                .map(SchedulerOrderingConfig::from_routing_policy),
+            crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                input.routing_policy.as_ref(),
+            ),
         )
         .await?;
     let outcome = materialize_local_execution_candidates_with_serving(

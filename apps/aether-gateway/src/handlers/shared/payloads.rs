@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Deserialize)]
 pub(crate) struct InternalTunnelHeartbeatRequest {
     pub(crate) node_id: String,
-    #[serde(default)]
-    pub(crate) heartbeat_session_id: Option<String>,
+    /// 同一 tunnel 心跳会话的非空标识，供认证后的去重游标使用。
+    pub(crate) heartbeat_session_id: String,
     pub(crate) heartbeat_id: u64,
     #[serde(default)]
     pub(crate) heartbeat_interval: Option<i32>,

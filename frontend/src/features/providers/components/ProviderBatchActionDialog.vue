@@ -228,6 +228,7 @@ import {
   type ProviderBasicBatchState,
   validateProviderBasicState,
 } from '@/features/providers/utils/batchEdit'
+import { log } from '@/utils/logger'
 
 type BatchMode = 'status' | 'basic' | 'endpoint'
 type ProviderStatusAction = 'enable' | 'disable' | 'delete'
@@ -769,8 +770,7 @@ async function executeStatusBatch(): Promise<void> {
         successCount += 1
       } catch (err) {
         failedCount += 1
-        // eslint-disable-next-line no-console
-        console.error(`[ProviderBatchActionDialog] ${statusAction.value} failed (${provider.id}):`, err)
+        log.error('Provider batch action failed', err)
       } finally {
         progressDone.value += 1
       }

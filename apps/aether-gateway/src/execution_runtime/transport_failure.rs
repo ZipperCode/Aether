@@ -20,9 +20,12 @@ const TRANSPORT_ERROR_CLIENT_MESSAGE: &str =
     "Upstream transport failed before an HTTP response was received";
 
 #[derive(Debug, Default)]
+/// 共享同一候选的终态所有权，watchdog 与取消 Guard 只保留一套接管标志。
 pub(crate) struct StreamCandidateWatchdogProgress {
+    /// 正常终态持久化已开始，watchdog 必须等待它完成。
     terminal_started: AtomicBool,
-    timeout_terminal_claimed: AtomicBool,
+    /// watchdog 已接管超时结算，取消 Guard 不得再写 Cancelled。
+    abandoned: AtomicBool,
 }
 
 tokio::task_local! {
@@ -38,16 +41,23 @@ impl StreamCandidateWatchdogProgress {
         self.terminal_started.load(Ordering::Acquire)
     }
 
+    /// watchdog 在丢弃执行 Future 前声明超时结算所有权。
+    ///
+    /// The attempt future is dropped once the watchdog returns, so its own
+    /// cancellation guard must stay out of the way instead of racing the
+    /// watchdog's terminal rows with a cancellation.
+    pub(crate) fn mark_abandoned(&self) {
+        self.abandoned.store(true, Ordering::Release);
+    }
+
+    /// 取消路径读取接管事实，避免覆盖 watchdog 已经开始写入的超时终态。
+    pub(crate) fn abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+    }
+
+    /// The watchdog watching the attempt on this task, if it runs under one.
     pub(crate) fn current() -> Option<Arc<Self>> {
         STREAM_CANDIDATE_WATCHDOG_PROGRESS.try_with(Arc::clone).ok()
-    }
-
-    pub(crate) fn claim_timeout_terminal(&self) {
-        self.timeout_terminal_claimed.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn timeout_terminal_claimed(&self) -> bool {
-        self.timeout_terminal_claimed.load(Ordering::Acquire)
     }
 
     pub(crate) async fn scope<F>(self: Arc<Self>, future: F) -> F::Output

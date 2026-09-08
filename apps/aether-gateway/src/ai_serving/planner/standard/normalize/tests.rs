@@ -292,7 +292,10 @@ fn local_codex_responses_wrapper_strips_invalid_typed_item_ids() {
     let input = provider_request_body["input"]
         .as_array()
         .expect("input array");
-    assert!(input[0].get("id").is_none());
+    assert_eq!(
+        input[0]["id"],
+        crate::ai_serving::openai_responses_message_item_id("item_e19637e60faa53da843e731c", 0)
+    );
     assert_eq!(input[0]["content"][0]["text"], "done");
     assert!(input[1].get("id").is_none());
     assert_eq!(input[1]["call_id"], "call_123");

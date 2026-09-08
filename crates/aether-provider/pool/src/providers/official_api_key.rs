@@ -106,6 +106,7 @@ impl ProviderPoolAdapter for OfficialApiKeyQuotaProviderPoolAdapter {
     }
 }
 
+/// 校验官方端点后构造对应余额或套餐请求，不携带可绕过统一 TLS 的局部配置。
 pub fn build_official_api_key_quota_request<F>(
     provider_type: &str,
     key_id: &str,
@@ -155,7 +156,6 @@ where
         client_api_format: "openai:chat".into(),
         provider_api_format: "openai:chat".into(),
         model_name: None,
-        accept_invalid_certs: false,
     })
 }
 
@@ -173,6 +173,7 @@ where
     Ok(request)
 }
 
+/// 为官方智谱端点构造账户余额补充查询，认证与 TLS 分别由现有边界负责。
 pub fn build_zhipu_account_balance_request<F>(
     key_id: &str,
     endpoint: &StoredProviderCatalogEndpoint,
@@ -200,7 +201,6 @@ where
         client_api_format: "openai:chat".into(),
         provider_api_format: "openai:chat".into(),
         model_name: None,
-        accept_invalid_certs: false,
     })
 }
 

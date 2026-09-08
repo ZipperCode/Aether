@@ -322,6 +322,7 @@ import ProxyNodeSelect from '@/features/providers/components/ProxyNodeSelect.vue
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
+import { log } from '@/utils/logger'
 import {
   batchActionPoolKeys,
   getPoolBatchDeleteTask,
@@ -650,7 +651,7 @@ async function executeAction(actionOverride?: PoolBatchActionValue): Promise<voi
       const payload = selectedAction.value === 'set_proxy'
         ? { node_id: proxyNodeIdForAction.value, enabled: true }
         : selectedAction.value === 'update_settings'
-          ? buildPoolKeySettingsPatch(settingsSelection, settingsDraft)
+          ? { ...buildPoolKeySettingsPatch(settingsSelection, settingsDraft) }
           : undefined
       const result = await batchActionPoolKeys(props.providerId, {
         selection: {
@@ -727,8 +728,7 @@ async function executeAction(actionOverride?: PoolBatchActionValue): Promise<voi
             successCount += 1
           } catch (err) {
             failedCount += 1
-            // eslint-disable-next-line no-console
-            console.error(`[PoolAccountBatchDialog] export failed (${key.key_id}):`, err)
+            log.error('Pool account credential export failed', err)
           } finally {
             progressDone.value += 1
           }
@@ -774,8 +774,7 @@ async function executeAction(actionOverride?: PoolBatchActionValue): Promise<voi
             successCount += result.affected
           }
         } catch (err) {
-          // eslint-disable-next-line no-console
-          console.error(`batch delete failed (batch ${batchIndex}/${totalBatches}):`, err)
+          log.error('Pool account batch delete failed', err)
           failedCount += batch.length
         }
 
@@ -803,12 +802,11 @@ async function executeAction(actionOverride?: PoolBatchActionValue): Promise<voi
           const result = await batchActionPoolKeys(props.providerId, {
             key_ids: batch,
             action: selectedAction.value as 'enable' | 'disable' | 'clear_proxy' | 'set_proxy' | 'update_settings',
-            ...(payload ? { payload } : {}),
+            ...(payload ? { payload: { ...payload } } : {}),
           })
           successCount += result.affected
         } catch (err) {
-          // eslint-disable-next-line no-console
-          console.error(`batch ${selectedAction.value} failed (batch ${batchIndex}/${totalBatches}):`, err)
+          log.error('Pool account batch action failed', err)
           failedCount += batch.length
         }
 
@@ -855,8 +853,7 @@ async function executeAction(actionOverride?: PoolBatchActionValue): Promise<voi
   } catch (err) {
     showError(parseApiError(err, '批量操作失败'))
   } finally {
-    // eslint-disable-next-line no-console
-    console.info('[PoolAccountBatchDialog] executeAction timing', {
+    log.info('Pool account batch action timing', {
       providerId: props.providerId,
       action: selectedAction.value,
       requestedCount,

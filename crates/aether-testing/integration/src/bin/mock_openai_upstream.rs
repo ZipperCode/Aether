@@ -649,6 +649,9 @@ fn build_chat_sse_response(
             if profile.truncate_after_chunks == Some(0)
                 || profile.truncate_after_chunks == Some(index + 1)
             {
+                // Hyper translates body errors into RST_STREAM for HTTP/2. Keep the body
+                // pending briefly so the response headers and successful DATA frame are
+                // written before Hyper observes the error.
                 tokio::time::sleep(TRUNCATED_STREAM_FLUSH_DELAY).await;
                 record_fault(&app, Fault::TruncateStream);
                 yield Err::<Bytes, std::io::Error>(truncated_stream_error());
@@ -704,6 +707,9 @@ fn build_responses_sse_response(
             if profile.truncate_after_chunks == Some(0)
                 || profile.truncate_after_chunks == Some(index + 1)
             {
+                // Hyper translates body errors into RST_STREAM for HTTP/2. Keep the body
+                // pending briefly so the response headers and successful DATA frame are
+                // written before Hyper observes the error.
                 tokio::time::sleep(TRUNCATED_STREAM_FLUSH_DELAY).await;
                 record_fault(&app, Fault::TruncateStream);
                 yield Err::<Bytes, std::io::Error>(truncated_stream_error());

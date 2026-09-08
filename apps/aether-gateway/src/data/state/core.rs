@@ -445,6 +445,42 @@ mod system_config_value_cache_tests {
         assert!(second > first);
     }
 
+    /// 验证字符串 CAS 推进配置版本，且失败的旧值比较不会再次修改版本。
+    #[tokio::test]
+    async fn memory_system_config_string_cas_advances_revision() {
+        let state = GatewayDataState::disabled().with_system_config_values_for_tests([(
+            "config".to_string(),
+            serde_json::json!("before"),
+        )]);
+        let before = state
+            .find_system_config_revision_strong("config")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state
+            .compare_and_set_system_config_string_value("config", "before", "after")
+            .await
+            .unwrap());
+        let after = state
+            .find_system_config_value_with_revision_strong("config")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.revision > before);
+        assert_eq!(after.value, serde_json::json!("after"));
+        assert!(!state
+            .compare_and_set_system_config_string_value("config", "before", "stale")
+            .await
+            .unwrap());
+        assert_eq!(
+            state
+                .find_system_config_revision_strong("config")
+                .await
+                .unwrap(),
+            Some(after.revision)
+        );
+    }
+
     /// 验证内存删除保留 null 墓碑版本，普通读取隐藏墓碑，重建后 revision 继续递增。
     #[tokio::test]
     async fn memory_system_config_delete_and_reinsert_preserve_revision_order() {
@@ -1080,6 +1116,44 @@ impl GatewayDataState {
         .await
     }
 
+    /// 仅在配置字符串仍匹配预期值时替换，并推进 revision 使跨请求缓存失效。
+    pub(crate) async fn compare_and_set_system_config_string_value(
+        &self,
+        key: &str,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<bool, DataLayerError> {
+        if let Some(values) = &self.system_config_values {
+            let updated = {
+                let mut values = values.write().expect("system config values lock");
+                match values.get_mut(key) {
+                    Some(entry) if entry.value.as_str() == Some(expected) => {
+                        entry.value = serde_json::Value::String(replacement.to_string());
+                        entry.updated_at_unix_secs = Some(next_memory_system_config_revision());
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            self.clear_cached_system_config_value(key);
+            return Ok(updated);
+        }
+
+        let result = match self.backends.as_ref() {
+            Some(backends) => {
+                crate::request_diagnostics::observe_db_operation(
+                    "system_config_compare_and_set",
+                    self.database_pool_summary(),
+                    backends.compare_and_set_system_config_string_value(key, expected, replacement),
+                )
+                .await
+            }
+            None => Ok(false),
+        };
+        self.clear_cached_system_config_value(key);
+        result
+    }
+
     pub(crate) async fn upsert_system_config_value(
         &self,
         key: &str,
@@ -1272,10 +1346,7 @@ impl GatewayDataState {
 }
 
 fn database_driver_supports_usage_counter_flush(driver: Option<DatabaseDriver>) -> bool {
-    matches!(
-        driver,
-        Some(DatabaseDriver::Postgres | DatabaseDriver::Mysql | DatabaseDriver::Sqlite)
-    )
+    matches!(driver, Some(DatabaseDriver::Postgres))
 }
 
 #[cfg(test)]
@@ -1287,12 +1358,6 @@ mod usage_counter_flush_backend_tests {
     fn every_sql_driver_supports_usage_counter_flush() {
         assert!(database_driver_supports_usage_counter_flush(Some(
             DatabaseDriver::Postgres
-        )));
-        assert!(database_driver_supports_usage_counter_flush(Some(
-            DatabaseDriver::Mysql
-        )));
-        assert!(database_driver_supports_usage_counter_flush(Some(
-            DatabaseDriver::Sqlite
         )));
         assert!(!database_driver_supports_usage_counter_flush(None));
     }

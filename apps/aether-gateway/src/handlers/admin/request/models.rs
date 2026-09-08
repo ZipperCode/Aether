@@ -58,6 +58,18 @@ pub(crate) fn stored_admin_provider_model_from_upsert(
     }
 }
 
+const ADMIN_MODEL_DATA_UNAVAILABLE_DETAIL: &str = "Model data temporarily unavailable";
+
+fn admin_model_repository_error(operation: &'static str) -> String {
+    tracing::error!(
+        event_name = "admin_model_repository_error",
+        operation,
+        error_category = "repository_unavailable",
+        "admin model repository operation failed"
+    );
+    ADMIN_MODEL_DATA_UNAVAILABLE_DETAIL.to_string()
+}
+
 fn normalize_provider_model_mapping_scopes(
     value: Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
@@ -470,7 +482,7 @@ impl<'a> AdminAppState<'a> {
     {
         self.get_admin_global_model_by_id(global_model_id)
             .await
-            .map_err(|err| format!("{err:?}"))?
+            .map_err(|_| admin_model_repository_error("resolve_global_model_by_id"))?
             .ok_or_else(|| format!("GlobalModel {global_model_id} 不存在"))
     }
 
@@ -511,7 +523,7 @@ impl<'a> AdminAppState<'a> {
         if self
             .admin_provider_model_name_exists(provider_id, &provider_model_name, None)
             .await
-            .map_err(|err| format!("{err:?}"))?
+            .map_err(|_| admin_model_repository_error("check_provider_model_name"))?
         {
             return Err(format!("模型 '{provider_model_name}' 已存在"));
         }
@@ -569,7 +581,7 @@ impl<'a> AdminAppState<'a> {
             if self
                 .admin_provider_model_name_exists(&existing.provider_id, &name, Some(&existing.id))
                 .await
-                .map_err(|err| format!("{err:?}"))?
+                .map_err(|_| admin_model_repository_error("check_provider_model_name"))?
             {
                 return Err(format!("模型 '{name}' 已存在"));
             }
@@ -703,7 +715,7 @@ impl<'a> AdminAppState<'a> {
                 limit: 10_000,
             })
             .await
-            .map_err(|err| format!("{err:?}"))?;
+            .map_err(|_| admin_model_repository_error("list_provider_models_for_import"))?;
         let mut existing_by_name = existing_models
             .iter()
             .map(|model| (model.provider_model_name.clone(), model.clone()))
@@ -845,7 +857,7 @@ impl<'a> AdminAppState<'a> {
             let global_model = if let Some(existing) = self
                 .get_admin_global_model_by_name(&trimmed)
                 .await
-                .map_err(|err| format!("{err:?}"))?
+                .map_err(|_| admin_model_repository_error("lookup_global_model_for_import"))?
             {
                 existing
             } else {
@@ -860,7 +872,7 @@ impl<'a> AdminAppState<'a> {
                         .map_err(|err| err.to_string())?,
                     )
                     .await
-                    .map_err(|err| format!("{err:?}"))?;
+                    .map_err(|_| admin_model_repository_error("create_global_model_for_import"))?;
                 let Some(created) = created else {
                     errors.push(json!({"model_id": trimmed, "error": "Create GlobalModel failed"}));
                     continue;
@@ -928,26 +940,26 @@ impl<'a> AdminAppState<'a> {
                     if created_global_model {
                         self.delete_unreferenced_admin_global_model(&global_model.id)
                             .await
-                            .map_err(|err| format!("清理未完成的 GlobalModel 失败: {err:?}"))?;
+                            .map_err(|_| {
+                                admin_model_repository_error("cleanup_unreferenced_global_model")
+                            })?;
                     }
                     errors.push(json!({
                         "model_id": trimmed,
                         "error": "Create provider model failed",
                     }));
                 }
-                Err(err) => {
+                Err(_) => {
                     if created_global_model {
                         self.delete_unreferenced_admin_global_model(&global_model.id)
                             .await
-                            .map_err(|cleanup_err| {
-                                format!(
-                                    "创建 Provider Model 失败: {err:?}; 清理未完成的 GlobalModel 失败: {cleanup_err:?}"
-                                )
+                            .map_err(|_| {
+                                admin_model_repository_error("cleanup_unreferenced_global_model")
                             })?;
                     }
                     errors.push(json!({
                         "model_id": trimmed,
-                        "error": format!("{err:?}"),
+                        "error": admin_model_repository_error("create_provider_model_for_import"),
                     }));
                 }
             }
@@ -972,7 +984,7 @@ impl<'a> AdminAppState<'a> {
                 limit: 10_000,
             })
             .await
-            .map_err(|err| format!("{err:?}"))?;
+            .map_err(|_| admin_model_repository_error("list_provider_models_for_assignment"))?;
         let existing_global_model_ids = existing_models
             .into_iter()
             .map(|model| model.global_model_id)
@@ -1041,9 +1053,11 @@ impl<'a> AdminAppState<'a> {
                     "global_model_id": global_model.id,
                     "error": "Create provider model failed",
                 })),
-                Err(err) => errors.push(json!({
+                Err(_) => errors.push(json!({
                     "global_model_id": global_model.id,
-                    "error": format!("{err:?}"),
+                    "error": admin_model_repository_error(
+                        "create_provider_model_for_assignment"
+                    ),
                 })),
             }
         }

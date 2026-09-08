@@ -42,8 +42,9 @@ The corresponding internal skip reasons are
   currencies. Any valid balance `> 1.0` keeps the Key eligible.
 - Missing, stale, null, unknown, malformed, non-finite, empty, or ambiguously
   unlimited data is fail-open.
-- Balance eligibility is independent of `skip_exhausted_accounts`.
-  Subscription exhaustion remains controlled by that switch.
+- Balance eligibility is independent of `skip_exhausted_accounts`. Known
+  subscription exhaustion is also excluded unconditionally; the historical
+  switch is not a bypass for either fact after the full upstream merge.
 - Ordinary candidates and real Pool Keys consume the same shared balance
   fact. A PoolGroup representative must not project its balance onto the
   whole Pool.
@@ -69,7 +70,7 @@ No database, HTTP, frontend, or user-configuration contract is introduced.
 | empty balances or missing/empty unit | false | fail-open |
 | missing/invalid/non-finite amount | false | fail-open |
 | `unlimited = true`, null, or invalid | false | fail-open |
-| subscription quota | not a balance fact | use existing exhaustion switch |
+| known exhausted subscription quota | not a balance fact | exclude regardless of the historical switch |
 
 ## 5. Good / Base / Bad Cases
 
@@ -86,8 +87,8 @@ No database, HTTP, frontend, or user-configuration contract is introduced.
 - Provider-pool unit tests must assert `0`, `1`, `1.0001`, multi-currency,
   stale, empty, missing unit/amount, malformed/non-finite values, unlimited,
   and subscription behavior.
-- Pool-core tests must assert balance is unconditional while subscription
-  exhaustion still follows `skip_exhausted_accounts`.
+- Pool-core tests must assert balance and known subscription exhaustion are
+  both excluded for either value of the historical `skip_exhausted_accounts`.
 - Scheduler tests must assert ordinary Key filtering and that PoolGroup
   representatives do not inherit Key balance state.
 - Gateway tests must assert sticky fallback/seen/skip evidence/scan budget,

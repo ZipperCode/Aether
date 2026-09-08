@@ -1,5 +1,12 @@
 import type { ProviderModelMapping } from './provider'
 
+export interface ModelProviderReference {
+  id: string
+  model_id?: string | null
+  name: string
+  is_active: boolean
+}
+
 // ========== 阶梯计费类型 ==========
 
 /** 缓存时长定价配置 */
@@ -67,6 +74,19 @@ export interface ProviderTieredPricingConfig {
   [key: string]: unknown
 }
 
+export interface ModelConfig extends Record<string, unknown> {
+  description?: string
+  model_mappings?: string[]
+  api_formats?: string[]
+  billing?: {
+    video?: {
+      price_per_second_by_resolution?: Record<string, number>
+      [key: string]: unknown
+    }
+    [key: string]: unknown
+  }
+}
+
 /** 模型能力检测保存的可信参考四元组；只保存内部 ID，不包含密钥明文。 */
 export interface CapabilityTestReferenceConfig {
   /** 可信参考提供商 ID。 */
@@ -80,7 +100,7 @@ export interface CapabilityTestReferenceConfig {
 }
 
 /** ProviderModel 的开放配置，并为能力检测参考提供 typed 读取入口。 */
-export interface ProviderModelConfig extends Record<string, unknown> {
+export interface ProviderModelConfig extends ModelConfig {
   /** 首次选择后保存的可信官方参考；失效时不得自动替换。 */
   capability_test_reference?: CapabilityTestReferenceConfig
 }
@@ -266,7 +286,7 @@ export interface GlobalModelCreate {
   // Key 能力配置 - 模型支持的能力列表
   supported_capabilities?: string[]
   // 模型配置（JSON格式）- 包含能力、规格、元信息等
-  config?: Record<string, unknown>
+  config?: ModelConfig
   is_active?: boolean
 }
 
@@ -280,7 +300,7 @@ export interface GlobalModelUpdate {
   // Key 能力配置 - 模型支持的能力列表
   supported_capabilities?: string[] | null
   // 模型配置（JSON格式）- 包含能力、规格、元信息等
-  config?: Record<string, unknown> | null
+  config?: ModelConfig | null
 }
 
 export interface GlobalModelResponse {
@@ -296,7 +316,7 @@ export interface GlobalModelResponse {
   supported_capabilities?: string[] | null
   supports_embedding?: boolean | null
   // 模型配置（JSON格式）
-  config?: Record<string, unknown> | null
+  config?: ModelConfig | null
   // 统计数据
   provider_count?: number
   active_provider_count?: number

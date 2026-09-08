@@ -93,7 +93,7 @@ async function mountEditor(
   const state = reactive({
     config,
     model,
-    globalModelId,
+    globalModelId: globalModelId as string | undefined,
     priorityMode,
     showPriorityMode: false,
     showSchedulingMode: false,

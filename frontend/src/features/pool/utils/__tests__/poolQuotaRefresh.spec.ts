@@ -28,6 +28,30 @@ function createKey(keyId: string): PoolKeyDetail {
 }
 
 describe('mergePoolKeyQuotaSnapshots', () => {
+  /** 刷新成功只更新额度；管理员恢复前，调度阻断和已有模型探测证据必须保留。 */
+  it('preserves runtime scheduling and model-probe state during quota refresh', () => {
+    const key = createKey('blocked')
+    key.status_snapshot = {
+      oauth: { code: 'valid' },
+      account: { code: 'ok', blocked: false },
+      quota: { code: 'exhausted', exhausted: true },
+      scheduling: { code: 'quota_exhausted', blocked: true, requires_manual_recovery: true },
+      model_probe: { status: 'ok', model: 'model-a' },
+    }
+
+    const [updated] = mergePoolKeyQuotaSnapshots([key], [{
+      key_id: key.key_id,
+      key_name: key.key_name,
+      status: 'success',
+      quota_snapshot: { code: 'ok', exhausted: false },
+    }])
+
+    expect(updated.status_snapshot?.quota.exhausted).toBe(false)
+    expect(updated.status_snapshot?.scheduling).toEqual(key.status_snapshot.scheduling)
+    expect(updated.status_snapshot?.model_probe).toEqual(key.status_snapshot.model_probe)
+    expect(updated.status_snapshot?.oauth).toEqual(key.status_snapshot.oauth)
+  })
+
   it('merges snapshots from non-success quota results', () => {
     const keys = [createKey('exhausted'), createKey('invalid'), createKey('unchanged')]
     const results: RefreshQuotaResult['results'] = [

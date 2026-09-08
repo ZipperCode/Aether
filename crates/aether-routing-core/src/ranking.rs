@@ -249,6 +249,7 @@ mod tests {
     }
 
     /// 验证无路由覆盖时排序向量回退候选原始优先级。
+
     #[test]
     fn rank_vector_falls_back_to_existing_priorities() {
         let facts = RoutingCandidateFacts {

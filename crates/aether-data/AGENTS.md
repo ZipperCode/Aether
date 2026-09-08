@@ -2,7 +2,7 @@
 
 ## OVERVIEW
 
-Runtime persistence implementation for memory, PostgreSQL, MySQL, and SQLite, plus migration, backfill, export, bootstrap, and schema-maintenance workflows.
+Runtime persistence implementation for memory and PostgreSQL, plus migration, backfill, export, bootstrap, and schema-maintenance workflows. MySQL and SQLite are intentionally unsupported after the full upstream synchronization.
 
 ## STRUCTURE
 
@@ -24,7 +24,7 @@ backfills/         # Versioned operational data changes
 |---|---|---|
 | Public implementation surface | `src/lib.rs` | Shared contracts usually belong in `aether-data-contracts` |
 | Driver/config selection | `src/database.rs`, `src/backend/` | Composition owner |
-| Domain persistence | `src/repository/<domain>/` | Explicit memory/postgres/mysql/sqlite modules |
+| Domain persistence | `runtime/src/repository/<domain>/`, `adapters/postgres/src/` | Explicit memory and PostgreSQL implementations |
 | Migration/bootstrap | `src/lifecycle/migrate*`, `schema/bootstrap/postgres/` | PostgreSQL snapshot is build output |
 | Schema source and generation | `schema/README.md`, `schema/logical/` | Start portable shape changes here |
 | Cross-database lifecycle | `src/lifecycle/{backfill,export}.rs` | Backfills are not migrations |
@@ -32,7 +32,7 @@ backfills/         # Versioned operational data changes
 ## CONVENTIONS
 
 - Cross-crate DTOs, repository traits, and `DataLayerError` belong in `aether-data-contracts`; implementation-only types may stay here.
-- Repository modules use explicit `postgres.rs`, `mysql.rs`, `sqlite.rs`, and `memory.rs`. Do not hide dialect SQL in a generic `sql.rs`.
+- Repository modules use explicit PostgreSQL adapters and `memory.rs` implementations. Do not restore MySQL/SQLite modules or hide domain SQL in a generic `sql.rs`.
 - Driver modules own connection primitives, not domain queries. Backend chooses drivers; repositories do not.
 - Portable table changes begin in `schema/logical/*.toml`; physical SQL remains dialect-specific where required.
 - Append timestamped migrations/backfills. Applied versions and paths are compatibility surfaces.
@@ -44,7 +44,7 @@ backfills/         # Versioned operational data changes
 - Never check in the PostgreSQL empty-database snapshot; `build.rs` emits it into `OUT_DIR`.
 - Do not use `schema/overrides/` for ordinary tables, columns, or indexes.
 - Do not put domain SQL in pool modules or driver-selection branches in repositories.
-- Do not use PostgreSQL-only `jsonb` in MySQL/SQLite migrations.
+- Do not introduce MySQL/SQLite migrations or compatibility branches.
 - Do not renumber/remove applied migration or backfill versions casually.
 
 ## COMMANDS

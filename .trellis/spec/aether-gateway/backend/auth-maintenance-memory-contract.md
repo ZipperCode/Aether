@@ -63,6 +63,9 @@ Endpoint configuration.
   description, and increments revision. Normal find/list/admin APIs hide the
   tombstone; revision-only and atomic revision/value reads retain visibility
   so delete/recreate cannot reuse an old bearer snapshot.
+- A successful string compare-and-set also increments revision in the same
+  memory/PostgreSQL mutation. A rejected comparison leaves both value and
+  revision unchanged, so the immutable auth snapshot cannot miss a CAS write.
 - Bearer-derived auth-context cache keys use a one-way bearer hash and must not
   retain the raw authorization bearer.
 - OAuth refresh and account self-check share one process-wide
@@ -126,13 +129,13 @@ Endpoint configuration.
   cross-node revocation is observed, and null/invalid outcomes are cached.
 - System-config tests assert revision-only SQL excludes `value`, delete creates
   an incrementing tombstone, repeated delete returns false, and recreate
-  advances revision for memory and all SQL contracts, with a live SQLite round
-  trip.
+  advances revision for memory and PostgreSQL. String CAS must advance revision
+  only on success; live PostgreSQL round trips require a dedicated test database.
 - Candidate tests use 2,048 candidates and assert zero full transport reads
   before ranking, one read for the first attempt, and a second read only after
   the first candidate becomes invalid.
 - Model-fetch tests assert the compact projection excludes secret/heavy
-  columns in memory and all SQL adapters, and Provider reconciliation occurs
+  columns in memory and PostgreSQL, and Provider reconciliation occurs
   once per successful Provider.
 - Pool-score tests reject multi-Key full reads, assert one startup round, and
   preserve score results.

@@ -122,10 +122,9 @@ pub(super) async fn materialize_local_gemini_files_candidate_attempts(
                 now_unix_secs: current_unix_secs(),
                 load_balance_seed: request_distribution_seed(),
             },
-            input
-                .routing_policy
-                .as_ref()
-                .map(SchedulerOrderingConfig::from_routing_policy),
+            crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                input.routing_policy.as_ref(),
+            ),
         )
         .await?;
     let outcome = materialize_local_execution_candidates_with_serving(
@@ -205,10 +204,9 @@ pub(super) async fn build_local_gemini_files_candidate_attempt_source<'a>(
                 now_unix_secs: current_unix_secs(),
                 load_balance_seed: request_distribution_seed(),
             },
-            input
-                .routing_policy
-                .as_ref()
-                .map(SchedulerOrderingConfig::from_routing_policy),
+            crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                input.routing_policy.as_ref(),
+            ),
         )
         .await?;
     Ok(build_local_execution_candidate_attempt_source_with_serving(

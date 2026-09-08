@@ -61,7 +61,7 @@ quota_exhaustion_patterns?: FailoverRuleItem[]
   clears it.
 - The scheduling CAS must compare the encrypted API key, encrypted auth config,
   auth type, and previously observed scheduling object. Implement it for
-  memory, SQLite, MySQL, and PostgreSQL.
+  memory and PostgreSQL; retired MySQL/SQLite adapters must not be resurrected.
 - Serialize quota-evidence scheduling CAS, runtime-quota Pool projection, score rebuild,
   active-probe membership, and administrator recovery with the same
   provider/Key runtime lock. Every writer that could derive `Available`,
@@ -143,7 +143,7 @@ quota_exhaustion_patterns?: FailoverRuleItem[]
 - Classifier assertions: New API, One API, and Sub2API exact codes; HTTP 402;
   weak two-hit confirmation; intervening non-quota response; reset headers and
   body fields; transient rate-limit codes; configured HTTP 200 error envelopes.
-- Repository assertions: CAS success/conflict on all four backends, including
+- Repository assertions: CAS success/conflict on memory and PostgreSQL, including
   credential replacement and concurrent suspicion increments.
 - Scheduling assertions: ordinary, Pool, sticky, cached, active-probe, restart,
   score rebuild, and credential-scope current-request filtering.

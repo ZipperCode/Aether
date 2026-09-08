@@ -574,7 +574,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         .filter(|plan| plan["request_id"] == "trace-search-failover-1")
         .map(|plan| plan["provider_id"].clone())
         .collect::<Vec<_>>();
-    // 默认总尝试数为 2：首 Provider 同 Key 重试一次后才转移到下一 Provider。
+    // 默认首 Key 尝试数为 2：首 Provider 同 Key 重试一次后才转移到下一 Provider。
     assert_eq!(
         failover_plans,
         vec![

@@ -272,7 +272,7 @@ describe('pool key display panels', () => {
     const app = createApp(PoolKeyQuotaPanel, {
       items: [
         {
-          label: 'Gemini额度',
+          label: 'Gemini Models · 周',
           remainingPercent: 90.6,
           resetText: '1h 后重置',
           meterText: '90.6%–100%',
@@ -280,7 +280,7 @@ describe('pool key display panels', () => {
           meterClass: 'text-emerald-600',
         },
         {
-          label: 'Claude & ChatGPT',
+          label: 'Claude and GPT models · 周',
           remainingPercent: 100,
           resetText: '1h 后重置',
           meterText: '100%',
@@ -294,8 +294,8 @@ describe('pool key display panels', () => {
 
     expect(root.querySelector('[data-testid="pool-quota-rows"]')?.className).toContain('space-y-2')
     expect(Array.from(root.querySelectorAll('[data-testid="pool-quota-period-label"]')).map(node => node.textContent)).toEqual([
-      'Gemini额度',
-      'Claude & ChatGPT',
+      'Gemini Models · 周',
+      'Claude and GPT models · 周',
     ])
     expect(Array.from(root.querySelectorAll('[data-testid="pool-quota-meter-text"]')).map(node => node.textContent)).toEqual(['90.6%–100%', '100%'])
     expect(root.querySelectorAll('[data-testid="pool-quota-progress-track"]')).toHaveLength(2)

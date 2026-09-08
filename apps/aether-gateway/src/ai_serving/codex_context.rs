@@ -1,18 +1,18 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aether_provider_transport::CodexFingerprintConvergenceContext;
 use http::{request::Parts, HeaderMap};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::ai_serving::transport::ProviderOutboundRequestContext;
 use crate::client_session_affinity::codex_request_signals_from_request;
 
 #[derive(Debug, Clone)]
 /// 在克隆的 HTTP `Parts` 之间共享一次性 Codex 指纹上下文，避免重规划生成新身份。
 pub(crate) struct CodexFingerprintContextSlot(
     /// 首个实际读取请求信号的调用负责初始化，后续克隆只复用同一值。
-    Arc<OnceLock<CodexFingerprintConvergenceContext>>,
+    Arc<OnceLock<ProviderOutboundRequestContext>>,
 );
 
 impl Default for CodexFingerprintContextSlot {
@@ -24,11 +24,7 @@ impl Default for CodexFingerprintContextSlot {
 
 impl CodexFingerprintContextSlot {
     /// 首次从原始头和正文构建上下文，之后无论传入何种重试正文都返回首值。
-    fn resolve(
-        &self,
-        headers: &HeaderMap,
-        body_json: &Value,
-    ) -> CodexFingerprintConvergenceContext {
+    fn resolve(&self, headers: &HeaderMap, body_json: &Value) -> ProviderOutboundRequestContext {
         self.0
             .get_or_init(|| {
                 build_codex_fingerprint_context(headers, body_json, Uuid::now_v7().to_string())
@@ -41,10 +37,10 @@ impl CodexFingerprintContextSlot {
 pub(crate) fn resolve_codex_fingerprint_context(
     parts: &Parts,
     body_json: &Value,
-) -> CodexFingerprintConvergenceContext {
+) -> ProviderOutboundRequestContext {
     if let Some(context) = parts
         .extensions
-        .get::<CodexFingerprintConvergenceContext>()
+        .get::<ProviderOutboundRequestContext>()
         .cloned()
     {
         return context;
@@ -59,7 +55,7 @@ pub(crate) fn resolve_codex_fingerprint_context(
 pub(crate) fn install_codex_fingerprint_context_slot(parts: &mut Parts) {
     if parts
         .extensions
-        .get::<CodexFingerprintConvergenceContext>()
+        .get::<ProviderOutboundRequestContext>()
         .is_none()
         && parts
             .extensions
@@ -76,11 +72,11 @@ pub(crate) fn install_codex_fingerprint_context_slot(parts: &mut Parts) {
 pub(crate) fn ensure_codex_fingerprint_context(
     parts: &mut Parts,
     body_json: &Value,
-) -> CodexFingerprintConvergenceContext {
+) -> ProviderOutboundRequestContext {
     let context = resolve_codex_fingerprint_context(parts, body_json);
     if parts
         .extensions
-        .get::<CodexFingerprintConvergenceContext>()
+        .get::<ProviderOutboundRequestContext>()
         .is_none()
     {
         parts.extensions.remove::<CodexFingerprintContextSlot>();
@@ -94,7 +90,7 @@ pub(crate) fn attach_codex_logical_turn_context(
     parts: &mut Parts,
     body_json: &Value,
     logical_turn_id: &str,
-) -> CodexFingerprintConvergenceContext {
+) -> ProviderOutboundRequestContext {
     let context =
         build_codex_fingerprint_context(&parts.headers, body_json, logical_turn_id.to_string());
     parts.extensions.remove::<CodexFingerprintContextSlot>();
@@ -105,7 +101,7 @@ pub(crate) fn attach_codex_logical_turn_context(
 /// 在重试、重绑或重新规划前恢复原逻辑 turn 上下文，禁止重新读取变化后的信号。
 pub(crate) fn restore_codex_logical_turn_context(
     parts: &mut Parts,
-    context: &CodexFingerprintConvergenceContext,
+    context: &ProviderOutboundRequestContext,
 ) {
     parts.extensions.remove::<CodexFingerprintContextSlot>();
     parts.extensions.insert(context.clone());
@@ -116,10 +112,9 @@ fn build_codex_fingerprint_context(
     headers: &HeaderMap,
     body_json: &Value,
     logical_turn_id: String,
-) -> CodexFingerprintConvergenceContext {
+) -> ProviderOutboundRequestContext {
     let signals = codex_request_signals_from_request(headers, Some(body_json));
-    let mut context =
-        CodexFingerprintConvergenceContext::new(logical_turn_id, current_unix_millis());
+    let mut context = ProviderOutboundRequestContext::new(logical_turn_id, current_unix_millis());
 
     if let Some(turn_id) = signals.turn_id {
         context = context.with_original_turn_id(turn_id);
@@ -174,7 +169,7 @@ mod tests {
         assert_eq!(context.original_client_session_id(), Some("header-thread"));
         assert_eq!(context.original_prompt_cache_key(), Some("client-cache"));
         assert_eq!(
-            parts.extensions.get::<CodexFingerprintConvergenceContext>(),
+            parts.extensions.get::<ProviderOutboundRequestContext>(),
             Some(&context)
         );
     }
@@ -182,7 +177,7 @@ mod tests {
     /// 验证恢复的上下文优先于重试请求中新出现的会话、turn 与缓存字段。
     #[test]
     fn restored_context_wins_over_retry_request_signals() {
-        let original = CodexFingerprintConvergenceContext::new("logical-turn", 1234)
+        let original = ProviderOutboundRequestContext::new("logical-turn", 1234)
             .with_original_turn_id("original-turn")
             .with_original_client_session_id("original-thread")
             .with_original_prompt_cache_key("original-cache");

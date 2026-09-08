@@ -10,6 +10,8 @@ pub mod stream;
 
 const TOOL_ERROR_PREFIX: &str = "[tool error]";
 const AETHER_REASONING_ITEM_ID_PREFIX: &str = "rs_aether_";
+/// Aether 合成消息项使用稳定的 Responses message ID 前缀。
+const AETHER_MESSAGE_ITEM_ID_PREFIX: &str = "msg_aether_";
 /// Aether 合成的 Gemini 工具签名 carrier 前缀，用于与 provider reasoning 区分。
 const GEMINI_TOOL_SIGNATURE_CARRIER_PREFIX: &str = "cpa-gemini-responses-carrier-v1:";
 /// 单个原始签名上限；解码前后都校验，避免 carrier 放大无界内存。
@@ -112,6 +114,67 @@ pub fn openai_responses_synthetic_reasoning_item_id(
     )
 }
 
+/// 根据响应身份与输出索引生成稳定的 msg_aether 消息 ID，供跨格式响应回放使用。
+///
+/// Responses clients replay assistant message items verbatim on the next turn and
+/// OpenAI requires those IDs to begin with `msg`. Upstream response IDs are not
+/// guaranteed to have that prefix (Chat completion IDs and UUIDs are common), so
+/// appending a suffix to the response ID is not sufficient. A deterministic UUID
+/// keeps the ID stable across sync/stream projections while avoiding assumptions
+/// about the upstream ID's shape or length.
+pub fn openai_responses_message_item_id(response_id: &str, output_index: usize) -> String {
+    let seed = format!("{response_id}:{output_index}");
+    format!(
+        "{AETHER_MESSAGE_ITEM_ID_PREFIX}{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, seed.as_bytes()).simple()
+    )
+}
+
+/// 规范化已确认需要官方消息 ID 的 Responses 历史；返回被改写的消息数。
+///
+/// Aether versions before the `msg_` contract emitted IDs such as
+/// `<response-id>_msg`. Clients legitimately replay those assistant items on
+/// the next turn, so merely fixing newly generated responses leaves existing
+/// conversations broken. Preserve already-valid provider IDs and deterministically
+/// remap only message items that do not begin with `msg`.
+pub fn normalize_openai_responses_message_item_ids(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut repaired = 0usize;
+    for (index, item) in items.iter_mut().enumerate() {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(raw_id) = object.get("id") else {
+            // IDs are optional for newly-authored input messages. Only repair
+            // an ID that a previous response actually supplied.
+            continue;
+        };
+        let valid = object
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("msg"));
+        if valid {
+            continue;
+        }
+        let source_id = raw_id
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or("missing")
+            .to_string();
+        object.insert(
+            "id".to_string(),
+            Value::String(openai_responses_message_item_id(source_id.as_str(), index)),
+        );
+        repaired += 1;
+    }
+    repaired
+}
+
 /// 删除不能回放到 OpenAI Responses 上游的 reasoning 历史项。
 ///
 /// Provider reasoning ID 是不透明引用，不能通过改前缀伪造；Aether 借 `encrypted_content`
@@ -172,7 +235,7 @@ fn openai_responses_reasoning_item_is_replayable(
     if object
         .get("encrypted_content")
         .and_then(Value::as_str)
-        .is_some_and(|value| value.starts_with(GEMINI_TOOL_SIGNATURE_CARRIER_PREFIX))
+        .is_some_and(|value| decode_gemini_tool_signature_carrier(value).is_some())
     {
         return false;
     }
@@ -198,10 +261,10 @@ fn openai_responses_reasoning_item_is_replayable(
         .is_some_and(|encrypted_content| !encrypted_content.trim().is_empty())
 }
 
-/// 删除官方 OpenAI/Codex Responses 上游会拒绝的类型化输入 Item ID。
+/// 修正官方 OpenAI/Codex Responses 的类型化输入 Item ID，返回变更项数。
 ///
-/// Item ID 是不透明的上游引用，前缀不兼容时只能删除，不能伪造新前缀。`call_id` 不属于
-/// Item ID，因此保持原样以维持工具调用与结果的配对。
+/// 普通 Responses 消息沿用上游稳定 msg_aether 规范化；Compact 与函数调用的无效引用
+/// 仍删除。非官方 Provider 不改写；call_id 保持原样，维持工具调用与结果的配对。
 pub fn strip_incompatible_openai_responses_input_item_ids(
     body: &mut Value,
     provider_type: &str,
@@ -214,11 +277,17 @@ pub fn strip_incompatible_openai_responses_input_item_ids(
     {
         return 0;
     }
+    let mut changed = if aether_ai_formats::is_openai_responses_format(provider_api_format)
+        && openai_responses_request_operation(provider_api_format, body).is_none()
+    {
+        normalize_openai_responses_message_item_ids(body)
+    } else {
+        0
+    };
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return 0;
     };
 
-    let mut stripped = 0;
     for item in items {
         let Some(object) = item.as_object_mut() else {
             continue;
@@ -236,12 +305,13 @@ pub fn strip_incompatible_openai_responses_input_item_ids(
             .is_some_and(|id| !id.starts_with(expected_prefix));
         if incompatible {
             object.remove("id");
-            stripped += 1;
+            changed += 1;
         }
     }
-    stripped
+    changed
 }
 
+/// 官方类型化引用的有效前缀；工具结果与其他原生项不属于本地清理范围。
 fn openai_responses_input_item_id_prefix(item_type: &str) -> Option<&'static str> {
     match item_type {
         "message" => Some("msg"),
@@ -325,6 +395,7 @@ mod tests {
 
     use super::{
         decode_gemini_tool_signature_carrier, encode_gemini_tool_signature_carrier_with_direction,
+        normalize_openai_responses_message_item_ids, openai_responses_message_item_id,
         openai_responses_request_operation, openai_responses_synthetic_reasoning_item_id,
         strip_incompatible_openai_responses_input_item_ids,
         strip_incompatible_openai_responses_reasoning_items,
@@ -422,6 +493,38 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_message_item_ids_are_stable_and_start_with_msg() {
+        let first = openai_responses_message_item_id("1c938e58-32a8-4d28-9c34-538d78076895", 0);
+        let second = openai_responses_message_item_id("1c938e58-32a8-4d28-9c34-538d78076895", 0);
+        let other = openai_responses_message_item_id("chatcmpl-123", 1);
+
+        assert!(first.starts_with("msg_"));
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn normalizes_legacy_message_ids_but_preserves_valid_ids() {
+        let mut body = json!({
+            "input": [
+                {"type": "message", "id": "1c938e58-32a8-4d28-9c34-538d78076895_msg", "role": "assistant"},
+                {"type": "message", "id": "msg_provider_123", "role": "assistant"},
+                {"type": "function_call", "id": "legacy_call"},
+                {"type": "message", "role": "user"}
+            ]
+        });
+
+        assert_eq!(normalize_openai_responses_message_item_ids(&mut body), 1);
+        let input = body["input"].as_array().expect("input array");
+        assert!(input[0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_")));
+        assert_eq!(input[1]["id"], "msg_provider_123");
+        assert_eq!(input[2].get("id"), Some(&json!("legacy_call")));
+        assert!(input[3].get("id").is_none());
+    }
+
+    #[test]
     fn strips_foreign_and_non_replayable_synthetic_reasoning_items() {
         let portable_synthetic = openai_responses_synthetic_reasoning_item_id("resp_123", 1);
         let local_synthetic = openai_responses_synthetic_reasoning_item_id("resp_123", 2);
@@ -491,6 +594,41 @@ mod tests {
         assert_eq!(input[1]["id"], "rs_provider_123");
     }
 
+    /// 验证只删除有效 carrier，形似 Aether 前缀的真实密文与合法 rs 引用保持原值。
+    #[test]
+    fn reasoning_replay_removes_only_valid_aether_carriers() {
+        let preserved = json!([
+            {"type": "reasoning", "id": "rs_provider_ref", "summary": []},
+            {"type": "reasoning", "id": "rs_provider_cipher", "encrypted_content": "opaque-provider-state"},
+            {"type": "reasoning", "id": "rs_provider_prefix", "encrypted_content": "cpa-gemini-responses-carrier-v1:provider-ciphertext"},
+            {"type": "reasoning", "id": "rs_provider_direction", "encrypted_content": "cpa-gemini-responses-carrier-v1:unknown:function:c2ln"},
+            {"type": "reasoning", "id": "rs_aether_opaque", "encrypted_content": "cpa-gemini-responses-carrier-v1:next:function:not-base64!"}
+        ]);
+        let mut body = json!({"input": preserved.clone()});
+        for direction in [
+            GeminiToolSignatureCarrierDirection::Next,
+            GeminiToolSignatureCarrierDirection::Previous,
+        ] {
+            let carrier =
+                encode_gemini_tool_signature_carrier_with_direction("signature", direction)
+                    .expect("valid carrier");
+            body["input"]
+                .as_array_mut()
+                .expect("input array")
+                .push(json!({
+                    "type": "reasoning",
+                    "id": "rs_aether_carrier",
+                    "encrypted_content": carrier,
+                }));
+        }
+
+        assert_eq!(
+            strip_incompatible_openai_responses_reasoning_items(&mut body, "openai:responses"),
+            2
+        );
+        assert_eq!(body["input"], preserved);
+    }
+
     #[test]
     fn reasoning_item_sanitizer_is_scoped_to_responses_targets() {
         let mut body = json!({
@@ -504,6 +642,7 @@ mod tests {
         assert_eq!(body["input"].as_array().map(Vec::len), Some(1));
     }
 
+    /// 验证消息 ID 规范化与函数引用清理并存，且工具调用和结果保持配对。
     #[test]
     fn strips_invalid_typed_input_item_ids_without_breaking_tool_pairing() {
         let mut body = json!({
@@ -551,7 +690,10 @@ mod tests {
             2
         );
         let input = body["input"].as_array().expect("input array");
-        assert!(input[0].get("id").is_none());
+        assert_eq!(
+            input[0]["id"],
+            openai_responses_message_item_id("item_message", 0)
+        );
         assert_eq!(input[1]["id"], "msg_valid");
         assert!(input[2].get("id").is_none());
         assert_eq!(input[2]["call_id"], "call_123");
@@ -592,6 +734,7 @@ mod tests {
         assert_eq!(compatible_body, original);
     }
 
+    /// 验证 Codex 消息历史取得稳定消息 ID，但无效函数引用仍被移除。
     #[test]
     fn codex_responses_targets_strip_foreign_typed_item_ids() {
         let mut body = json!({
@@ -622,10 +765,60 @@ mod tests {
             2
         );
         let input = body["input"].as_array().expect("input array");
-        assert!(input[0].get("id").is_none());
+        assert_eq!(
+            input[0]["id"],
+            openai_responses_message_item_id("item_message", 0)
+        );
         assert!(input[1].get("id").is_none());
         assert_eq!(input[1]["call_id"], "call_123");
         assert_eq!(input[2]["id"], "fco_123");
+    }
+
+    /// 验证官方普通消息规范化可重复调用，而 Compact 继续删除非官方消息引用。
+    #[test]
+    fn official_message_normalization_is_idempotent_and_compact_stays_strict() {
+        let original = json!({
+            "input": [{"type": "message", "id": "legacy_msg", "role": "assistant", "content": []}]
+        });
+        let mut ordinary = original.clone();
+        assert_eq!(
+            strip_incompatible_openai_responses_input_item_ids(
+                &mut ordinary,
+                "codex",
+                "openai:responses"
+            ),
+            1
+        );
+        assert_eq!(
+            ordinary["input"][0]["id"],
+            openai_responses_message_item_id("legacy_msg", 0)
+        );
+        assert_eq!(
+            strip_incompatible_openai_responses_input_item_ids(
+                &mut ordinary,
+                "codex",
+                "openai:responses"
+            ),
+            0
+        );
+        for api_format in ["openai:responses", "openai:responses:compact"] {
+            let mut compact = original.clone();
+            if api_format == "openai:responses" {
+                compact["input"]
+                    .as_array_mut()
+                    .expect("input array")
+                    .push(json!({"type": "compaction_trigger"}));
+            }
+            assert_eq!(
+                strip_incompatible_openai_responses_input_item_ids(
+                    &mut compact,
+                    "codex",
+                    api_format
+                ),
+                1
+            );
+            assert!(compact["input"][0].get("id").is_none());
+        }
     }
 
     #[test]

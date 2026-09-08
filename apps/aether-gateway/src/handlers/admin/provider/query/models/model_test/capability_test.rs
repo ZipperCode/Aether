@@ -1393,6 +1393,11 @@ fn classify_capability_gateway_error(error: &GatewayError) -> CapabilityItemStat
         GatewayError::Client { status, .. } if *status == http::StatusCode::TOO_MANY_REQUESTS => {
             return CapabilityItemStatus::RateLimited;
         }
+        // 订阅额度拒绝属于限流；管理员保护拒绝属于业务执行失败，不应伪报网络故障。
+        GatewayError::PlanUsageLimited(_) => return CapabilityItemStatus::RateLimited,
+        GatewayError::LastActiveAdminUpdateDenied | GatewayError::LastActiveAdminDeleteDenied => {
+            return CapabilityItemStatus::UpstreamError;
+        }
         GatewayError::UpstreamUnavailable { message, .. }
         | GatewayError::ControlUnavailable { message, .. }
         | GatewayError::Client { message, .. }

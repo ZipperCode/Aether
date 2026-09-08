@@ -49,7 +49,7 @@ pub(super) fn is_exact_all_skipped_by_auth_limit(
             .all(|candidate| is_auth_api_key_concurrency_limit_skip_reason(candidate.skip_reason))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 /// 使用同一具名上下文过滤运行态并排序一个模型的候选，避免时间与分布种子错位。
 pub(super) async fn select_minimal_candidate(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -62,20 +62,8 @@ pub(super) async fn select_minimal_candidate(
     client_session_affinity: Option<&ClientSessionAffinity>,
     scheduling_context: CandidateSchedulingContext,
     enable_model_directives: bool,
+    ordering_config: SchedulerOrderingConfig,
 ) -> Result<Option<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
-    let affinity_epoch = runtime_state.scheduler_affinity_epoch();
-    let ordering_config = runtime_state.read_scheduler_ordering_config().await?;
-    let affinity_cache_key = build_scheduler_affinity_cache_key(
-        auth_snapshot,
-        api_format,
-        global_model_name,
-        client_session_affinity,
-    );
-    let priority_affinity_key = scheduling_priority_affinity_key(
-        auth_snapshot,
-        client_session_affinity,
-        ordering_config.scheduling_mode,
-    );
     let candidates = enumerate_scheduler_candidates(
         selection_row_source,
         api_format,
@@ -87,7 +75,7 @@ pub(super) async fn select_minimal_candidate(
         None,
     )
     .await?;
-    let selected = collect_selectable_enumerated_candidates_with_skip_reasons(
+    Ok(collect_selectable_enumerated_candidates_with_skip_reasons(
         runtime_state,
         api_format,
         global_model_name,
@@ -97,25 +85,16 @@ pub(super) async fn select_minimal_candidate(
         client_session_affinity,
         scheduling_context,
         ordering_config,
-        priority_affinity_key,
+        scheduling_priority_affinity_key(
+            auth_snapshot,
+            client_session_affinity,
+            ordering_config.scheduling_mode,
+        ),
     )
     .await?
     .0
     .into_iter()
-    .next();
-    if ordering_config.scheduling_mode == SchedulerSchedulingMode::CacheAffinity
-        && has_explicit_session_affinity(client_session_affinity)
-    {
-        if let Some(candidate) = selected.as_ref() {
-            remember_scheduler_affinity(
-                affinity_cache_key.as_deref(),
-                runtime_state,
-                candidate,
-                Some(affinity_epoch),
-            );
-        }
-    }
-    Ok(selected)
+    .next())
 }
 
 /// 使用具名时间/种子上下文收集并排序指定模型的可用候选，不返回跳过明细。
@@ -131,7 +110,7 @@ pub(super) async fn collect_selectable_candidates(
     client_session_affinity: Option<&ClientSessionAffinity>,
     scheduling_context: CandidateSchedulingContext,
     enable_model_directives: bool,
-    ordering_config: Option<SchedulerOrderingConfig>,
+    ordering_config: SchedulerOrderingConfig,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
     Ok(
         collect_selectable_candidates_with_skip_reasons_and_ordering(
@@ -153,8 +132,9 @@ pub(super) async fn collect_selectable_candidates(
     )
 }
 
-/// 使用具名调度上下文收集跳过原因；未显式提供请求策略时读取运行态默认配置。
+/// 测试入口使用默认排序策略与具名调度上下文收集跳过原因。
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) async fn collect_selectable_candidates_with_skip_reasons(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
     runtime_state: &impl SchedulerRuntimeState,
@@ -186,23 +166,12 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
         scheduling_context,
         enable_model_directives,
         request_operation,
-        None,
+        SchedulerOrderingConfig::default(),
     )
     .await
 }
 
-/// 解析预选排序配置：请求级路由策略优先，否则依次使用系统默认组和旧系统配置。
-pub(super) async fn resolve_preselection_ordering_config(
-    runtime_state: &impl SchedulerRuntimeState,
-    ordering_config: Option<SchedulerOrderingConfig>,
-) -> Result<SchedulerOrderingConfig, GatewayError> {
-    match ordering_config {
-        Some(config) => Ok(config),
-        None => runtime_state.read_scheduler_ordering_config().await,
-    }
-}
-
-/// 按显式或运行态排序配置及具名调度上下文选择候选，并返回每个跳过原因。
+/// 按请求冻结的排序配置和具名调度上下文选择候选，并返回跳过原因。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ordering(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -216,7 +185,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ordering
     scheduling_context: CandidateSchedulingContext,
     enable_model_directives: bool,
     request_operation: Option<&str>,
-    ordering_config: Option<SchedulerOrderingConfig>,
+    ordering_config: SchedulerOrderingConfig,
 ) -> Result<
     (
         Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -224,8 +193,6 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ordering
     ),
     GatewayError,
 > {
-    let ordering_config =
-        resolve_preselection_ordering_config(runtime_state, ordering_config).await?;
     let priority_affinity_key = scheduling_priority_affinity_key(
         auth_snapshot,
         client_session_affinity,

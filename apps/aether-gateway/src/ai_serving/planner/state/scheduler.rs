@@ -24,7 +24,7 @@ impl<'a> PlannerAppState<'a> {
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
         enable_model_directives: bool,
-        ordering_config: Option<SchedulerOrderingConfig>,
+        ordering_config: SchedulerOrderingConfig,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
         let scheduling_context = CandidateSchedulingContext {
             now_unix_secs,
@@ -58,7 +58,7 @@ impl<'a> PlannerAppState<'a> {
         client_session_affinity: Option<&ClientSessionAffinity>,
         scheduling_context: CandidateSchedulingContext,
         enable_model_directives: bool,
-        ordering_config: Option<SchedulerOrderingConfig>,
+        ordering_config: SchedulerOrderingConfig,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -94,7 +94,7 @@ impl<'a> PlannerAppState<'a> {
         scheduling_context: CandidateSchedulingContext,
         enable_model_directives: bool,
         request_operation: Option<&str>,
-        ordering_config: Option<SchedulerOrderingConfig>,
+        ordering_config: SchedulerOrderingConfig,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -151,7 +151,7 @@ impl<'a> PlannerAppState<'a> {
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         scheduling_context: CandidateSchedulingContext,
-        ordering_config: Option<SchedulerOrderingConfig>,
+        ordering_config: SchedulerOrderingConfig,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -183,7 +183,7 @@ impl<'a> PlannerAppState<'a> {
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         scheduling_context: CandidateSchedulingContext,
-        ordering_config: Option<SchedulerOrderingConfig>,
+        ordering_config: SchedulerOrderingConfig,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
         let wait_timeout = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS);
         let wait_interval = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS.max(1));

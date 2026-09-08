@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import type { QuotaStatusSnapshot } from '@/api/endpoints/types'
 
 import {
   getGenericQuotaSections,
@@ -17,7 +18,7 @@ describe('providerKeyQuota', () => {
       windows: [{ code: 'monthly', label: '月度', remaining_value: '800', limit_value: '1000' }],
       rate_limits: { rpm: 60, tpm: 100000, kind: 'configured_limits' },
       refresh_state: { error: '上游暂时不可用' },
-    } as const
+    } satisfies QuotaStatusSnapshot
 
     expect(getGenericQuotaSections(quota)).toEqual({
       balances: ['可用 $12.50 / 总额 $20'],
@@ -42,7 +43,7 @@ describe('providerKeyQuota', () => {
         last_success_at: 1_700_000_000,
         error: 'http_server_error: quota upstream returned an error',
       },
-    } as const
+    } satisfies QuotaStatusSnapshot
 
     expect(getGenericQuotaSections(quota)).toEqual({
       balances: [],
@@ -66,7 +67,7 @@ describe('providerKeyQuota', () => {
         refresh_state: {
           error: 'http_unauthorized: quota upstream rejected authentication',
         },
-      } as const
+      } satisfies QuotaStatusSnapshot
 
       expect(getGenericQuotaSections(quota, providerType)).toEqual({
         balances: [],
@@ -88,7 +89,7 @@ describe('providerKeyQuota', () => {
         available: '9007199254740993.123456789012345678',
         total: '9007199254740994.000000000000000001',
       }],
-    } as const
+    } satisfies QuotaStatusSnapshot
 
     expect(getGenericQuotaSections(quota).balances).toEqual([
       '可用 9,007,199,254,740,993.123456789012345678 CNY / 总额 9,007,199,254,740,994.000000000000000001 CNY',
@@ -106,7 +107,7 @@ describe('providerKeyQuota', () => {
       token_plan_scheduling_blocked: false,
       token_plan_error: 'upstream business code 500: quota upstream returned a business error',
       balances: [{ unit: 'CNY', available: '0' }],
-    } as const
+    } satisfies QuotaStatusSnapshot
 
     expect(getGenericQuotaSections(quota)).toEqual({
       balances: [],
@@ -124,7 +125,7 @@ describe('providerKeyQuota', () => {
       balance_insufficient: true, balance_status: 'insufficient',
       token_plan_status: 'query_failed', token_plan_scheduling_blocked: false,
       balances: [{ unit: 'CNY', available: '0' }],
-    } as const
+    } satisfies QuotaStatusSnapshot
 
     expect(getQuotaDisplayText({
       status_snapshot: {
@@ -143,7 +144,7 @@ describe('providerKeyQuota', () => {
       balance_insufficient: true, balance_status: 'insufficient',
       token_plan_status: 'query_failed', token_plan_scheduling_blocked: false,
       balances: [{ unit: 'CNY', available: '0' }],
-    } as const
+    } satisfies QuotaStatusSnapshot
 
     expect(getQuotaDisplayText({
       status_snapshot: {
@@ -165,7 +166,7 @@ describe('providerKeyQuota', () => {
       refresh_state: {
         error: 'http_client_error: upstream business code 1113: account balance is insufficient',
       },
-    } as const
+    } satisfies QuotaStatusSnapshot
 
     expect(getGenericQuotaSections(quota).status).toEqual(['数据已过期', '余额不足'])
   })
@@ -235,6 +236,37 @@ describe('providerKeyQuota', () => {
     }, 'codex')).toBe('月剩余 86.0%')
   })
 
+  it('keeps account and model Codex weekly quotas distinct in display text', () => {
+    expect(getQuotaDisplayText({
+      status_snapshot: {
+        oauth: { code: 'valid' },
+        account: { code: 'ok', blocked: false },
+        quota: {
+          provider_type: 'codex',
+          code: 'ok',
+          exhausted: false,
+          windows: [
+            {
+              code: 'weekly',
+              label: '周',
+              scope: 'account',
+              window_minutes: 10_080,
+              remaining_ratio: 0.9,
+            },
+            {
+              code: 'additional_0_primary',
+              label: 'gpt-reserve',
+              scope: 'model',
+              model: 'gpt-reserve',
+              window_minutes: 10_080,
+              remaining_ratio: 0.4,
+            },
+          ],
+        },
+      },
+    }, 'codex')).toBe('周剩余 90.0% | gpt-reserve 周剩余 40.0%')
+  })
+
   it('formats Grok account quota from structured quota windows', () => {
     expect(getQuotaDisplayText({
       status_snapshot: {
@@ -251,6 +283,7 @@ describe('providerKeyQuota', () => {
           exhausted: false,
           windows: [
             {
+              code: 'account',
               scope: 'account',
               used_value: 2,
               limit_value: 10,
@@ -303,6 +336,8 @@ describe('providerKeyQuota', () => {
   it('formats Gemini CLI AI credits from status snapshot and upstream metadata', () => {
     expect(getQuotaDisplayText({
       status_snapshot: {
+        oauth: { code: 'none' },
+        account: { code: 'ok', blocked: false },
         quota: {
           provider_type: 'gemini_cli',
           code: 'ok',
@@ -317,6 +352,8 @@ describe('providerKeyQuota', () => {
 
     expect(getGeminiCliAccountCreditsText({
       status_snapshot: {
+        oauth: { code: 'none' },
+        account: { code: 'ok', blocked: false },
         quota: {
           provider_type: 'gemini_cli',
           code: 'ok',
@@ -337,6 +374,8 @@ describe('providerKeyQuota', () => {
   it('formats ChatGPT Web image quota as remaining count', () => {
     expect(getQuotaDisplayText({
       status_snapshot: {
+        oauth: { code: 'none' },
+        account: { code: 'ok', blocked: false },
         quota: {
           provider_type: 'chatgpt_web',
           code: 'ok',
@@ -359,6 +398,8 @@ describe('providerKeyQuota', () => {
   it('surfaces Windsurf hard account states', () => {
     expect(getQuotaDisplayText({
       status_snapshot: {
+        oauth: { code: 'none' },
+        account: { code: 'ok', blocked: false },
         quota: {
           provider_type: 'windsurf',
           code: 'quarantined',
@@ -370,6 +411,8 @@ describe('providerKeyQuota', () => {
 
     expect(getQuotaDisplayText({
       status_snapshot: {
+        oauth: { code: 'none' },
+        account: { code: 'ok', blocked: false },
         quota: {
           provider_type: 'windsurf',
           code: 'cooldown',
@@ -381,6 +424,8 @@ describe('providerKeyQuota', () => {
 
     expect(getQuotaDisplayText({
       status_snapshot: {
+        oauth: { code: 'none' },
+        account: { code: 'ok', blocked: false },
         quota: {
           provider_type: 'windsurf',
           code: 'cooldown',
@@ -393,6 +438,8 @@ describe('providerKeyQuota', () => {
   it('includes Windsurf quota windows and model availability in display text', () => {
     expect(getQuotaDisplayText({
       status_snapshot: {
+        oauth: { code: 'none' },
+        account: { code: 'ok', blocked: false },
         quota: {
           provider_type: 'windsurf',
           code: 'ok',
@@ -424,6 +471,8 @@ describe('providerKeyQuota', () => {
 
     expect(getQuotaDisplayText({
       status_snapshot: {
+        oauth: { code: 'none' },
+        account: { code: 'ok', blocked: false },
         quota: {
           provider_type: 'windsurf',
           code: 'cooldown',
@@ -464,6 +513,8 @@ describe('providerKeyQuota', () => {
   it('uses Windsurf model availability when no quota window is present', () => {
     expect(getQuotaDisplayText({
       status_snapshot: {
+        oauth: { code: 'none' },
+        account: { code: 'ok', blocked: false },
         quota: {
           provider_type: 'windsurf',
           code: 'ok',

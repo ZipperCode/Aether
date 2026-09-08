@@ -181,7 +181,7 @@
               <div class="flex items-center gap-2">
                 <span class="truncate text-sm font-medium">{{ row.name }}</span>
                 <span
-                  v-if="row.kind === 'pool'"
+                  v-if="poolProviderIds.has(row.id)"
                   class="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary"
                 >
                   Pool
@@ -326,6 +326,7 @@ import {
   type RoutingPriorityMode,
   type RoutingSchedulingMode,
 } from '../utils/routingPolicy'
+import { buildRoutingProviderSummaryQuery } from '../utils/providerQuery'
 
 interface ProviderPriorityRow {
   id: string
@@ -595,18 +596,17 @@ async function loadProviders(): Promise<void> {
   loadingProviders.value = true
   loadError.value = null
   try {
-    const filtersByModel = isPerModelProviderOrdering.value
-      && effectivePriorityMode.value === 'provider'
-    if (filtersByModel && !resolvedGlobalModelId.value) {
+    const query = buildRoutingProviderSummaryQuery(
+      targetModel.value,
+      resolvedGlobalModelId.value,
+      effectivePriorityMode.value,
+    )
+    if (!query) {
       providers.value = []
       return
     }
 
-    const response = await getProvidersSummary({
-      page: 1,
-      page_size: 9999,
-      ...(filtersByModel ? { model_id: resolvedGlobalModelId.value } : {}),
-    })
+    const response = await getProvidersSummary(query)
     if (requestId !== providerLoadRequestId) return
     providers.value = response.items
   } catch (err) {

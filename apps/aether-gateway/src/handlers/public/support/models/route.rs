@@ -539,6 +539,12 @@ async fn retain_routable_model_rows(
     now_unix_secs: u64,
 ) -> Option<Vec<StoredModelCatalogEntry>> {
     let rows = filter_catalog_for_models(rows, auth_snapshot, Some(api_format));
+    // 模型目录没有执行请求正文，统一读取系统默认路由组，禁止逐行回读旧系统调度键。
+    let ordering_config =
+        crate::scheduler::config::read_system_default_routing_ordering_config(state)
+            .await
+            .ok()?
+            .unwrap_or_default();
     let visibility = async {
         stream::iter(rows.into_iter().map(|row| async move {
             crate::ai_serving::PlannerAppState::new(state)
@@ -551,7 +557,7 @@ async fn retain_routable_model_rows(
                     None,
                     now_unix_secs,
                     false,
-                    None,
+                    ordering_config,
                 )
                 .await
                 .map(|candidates| (!candidates.is_empty()).then_some(row))

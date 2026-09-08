@@ -32,7 +32,7 @@ Generated/tool state such as `target/`, `node_modules/`, `frontend/dist/`, `.ser
 | Provider execution and transport | `apps/aether-gateway/src/execution_runtime/`, `crates/aether-provider-transport/` | Keep routing, execution, and wire policy separated |
 | Admin/control behavior | `apps/aether-gateway/src/handlers/admin/`, `crates/aether-admin/` | Check matching frontend API contracts |
 | Format conversion | `crates/aether-ai-formats/`, `docs/api/` | Strict passthrough and fail-closed rules apply |
-| Persistence | `crates/aether-data-contracts/`, `crates/aether-data/` | Three SQL engines plus memory implementations |
+| Persistence | `crates/aether-data/contracts/`, `crates/aether-data/runtime/` | PostgreSQL persistence plus memory implementations; MySQL/SQLite are retired |
 | Provider selection and health | `crates/aether-provider-pool/`, `crates/aether-model-fetch/`, `crates/aether-scheduler-core/` | Policy belongs in focused crates, not handlers |
 | Frontend feature work | `frontend/src/features/`, `frontend/src/views/` | Features own reusable domain UI; views orchestrate routes |
 | Tunnel agent | `apps/aether-tunnel/` | Separate CLI/service with security-sensitive egress |
@@ -62,7 +62,7 @@ Generated/tool state such as `target/`, `node_modules/`, `frontend/dist/`, `.ser
 
 - Do not edit `target/`, any `node_modules/`, `frontend/dist/`, or generated data-schema SQL directly.
 - Do not bypass gateway architecture tests with compatibility shims, cross-domain re-export hubs, or handler-owned `sqlx` calls.
-- Do not log tokens, provider keys, raw credentials, sensitive request bodies, or unredacted proxy URLs.
+- Do not print credentials or sensitive payloads in operational logs or development reports. Enabled usage HTTP capture intentionally preserves original headers and configured bodies; follow its capture settings and existing administrator access contract, not an extra masking layer.
 - Do not treat the API field-coverage matrix as a runtime allowlist; same-format traffic must preserve unknown JSON fields.
 - Do not run `npm run lint` as a read-only check: it invokes ESLint with `--fix` and mutates files.
 - Do not assume `npm run build` includes `vue-tsc`; use `build:with-typecheck` or run `type-check` separately.
@@ -90,7 +90,7 @@ cd frontend && npm run build
 
 - `make dev` may start Postgres/Redis through Docker when selected dependencies are unavailable; the default local runtime is in-memory.
 - Prebuilt Compose and local-source deployment are different paths. Use `./deploy.sh` for a current-source image; standard Compose pulls its configured registry image.
-- PostgreSQL/MySQL smoke tests require explicit test URLs; skipped tests are not proof of database compatibility.
+- PostgreSQL smoke tests require explicit test URLs; skipped tests are not proof of database compatibility. MySQL and SQLite are no longer supported backends.
 - Current compose image defaults and release/example namespaces have historically diverged. Verify `APP_IMAGE` before deployment.
 <!-- TRELLIS:START -->
 # Trellis Instructions

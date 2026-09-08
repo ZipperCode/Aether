@@ -453,11 +453,7 @@ pub(crate) async fn resolve_and_rank_logical_local_candidate_snapshots(
     let sticky_key_attempts = if ranked.is_empty() {
         None
     } else {
-        Some(
-            scheduler_ordering_config_for_routing_policy(state, routing_policy)
-                .await
-                .sticky_key_attempts,
-        )
+        Some(scheduler_ordering_config_for_routing_policy(routing_policy).sticky_key_attempts)
     };
     for candidate in &mut ranked {
         candidate.orchestration.scheduler_affinity_epoch = Some(scheduler_affinity_epoch);
@@ -601,8 +597,7 @@ async fn resolve_and_rank_local_execution_candidates_with_pool_expansion(
                 None
             } else {
                 Some(
-                    scheduler_ordering_config_for_routing_policy(state, routing_policy)
-                        .await
+                    scheduler_ordering_config_for_routing_policy(routing_policy)
                         .sticky_key_attempts,
                 )
             };

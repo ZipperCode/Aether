@@ -33,6 +33,11 @@ export interface QuotaWindowSnapshot {
   scope?: 'account' | 'workspace' | 'model' | string
   unit?: 'percent' | 'count' | 'usd' | 'tokens' | string
   model?: string | null
+  quota_group?: string | null
+  quota_group_label?: string | null
+  bucket_id?: string | null
+  window?: string | null
+  description?: string | null
   used_ratio?: DecimalJsonValue
   remaining_ratio?: DecimalJsonValue
   used_value?: DecimalJsonValue
@@ -110,6 +115,8 @@ export interface QuotaStatusSnapshot {
   source?: string | null
   observed_at?: number | null
   exhausted: boolean
+  /** Nous 等额度查询返回的耗尽原因；仅作为展示证据，不替代调度阻断状态。 */
+  exhausted_reason?: string | null
   unlimited?: boolean | null
   is_free_tier?: boolean | null
   is_management_key?: boolean | null

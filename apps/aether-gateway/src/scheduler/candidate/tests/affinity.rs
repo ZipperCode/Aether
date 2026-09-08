@@ -23,6 +23,7 @@ use crate::data::candidate_selection::{
     read_requested_model_rows, MinimalCandidateSelectionRowSource,
 };
 use crate::data::GatewayDataState;
+use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::{AppState, GatewayError};
 
 use super::super::affinity::build_scheduler_affinity_cache_key;
@@ -55,6 +56,7 @@ async fn select_candidate(
             load_balance_seed: now_unix_secs,
         },
         false,
+        SchedulerOrderingConfig::default(),
     )
     .await
 }

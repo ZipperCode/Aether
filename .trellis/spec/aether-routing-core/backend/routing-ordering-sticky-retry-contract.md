@@ -52,11 +52,12 @@ No database migration is involved; routing configuration remains opaque JSON.
 - A resolved `ResolvedRoutingPolicy` is the only request-level source for
   `priority_mode`, `scheduling_mode`, `keep_priority_on_conversion`, and
   `sticky_key_attempts`. Do not OR or merge legacy global values into it.
-- Without a resolved policy, read the enabled system-default routing group's
-  `default_policy`; only then fall back to legacy system-config keys.
-- Startup best-effort creates and publishes a system-default group from legacy
-  values when routing storage is writable and no default exists. Missing or
-  read-only storage must not prevent gateway startup.
+- Request candidate ordering requires its resolved policy. The optional
+  system-default-group reader returns no value for a missing, disabled or
+  invalid group; it never falls back to legacy system-config keys.
+- Startup creates the system-default group from `RoutingDefaultPolicy`
+  defaults when routing storage is writable and no default exists. It does
+  not migrate or merge legacy scheduler keys into the new strategy.
 - Key priority precedence is format-scoped override, format-agnostic override,
   then catalog priority. Format keys are trimmed and compared case-insensitively;
   planner matching may also recognize existing API-format aliases.
@@ -91,7 +92,7 @@ No database migration is involved; routing configuration remains opaque JSON.
 | Condition | Required result |
 | --- | --- |
 | Enabled system-default group has valid `default_policy` | Use it; ignore conflicting legacy values. |
-| Default group missing/disabled/invalid | Fall back to legacy values, then stable defaults. |
+| Default group missing/disabled/invalid | Optional reader returns no value; do not restore legacy fallback. |
 | Format-specific Key override exists | Use it before the global Key override. |
 | Blank `api_format` in action | Treat as format-agnostic Key override. |
 | `sticky_key_attempts` missing | Deserialize as `2`. |
@@ -99,7 +100,7 @@ No database migration is involved; routing configuration remains opaque JSON.
 | First candidate fails with candidate scope | Derive the next same-Key attempt if budget remains. |
 | Later candidate or later Pool Key fails | Advance; never derive a same-Key retry. |
 | Derived attempt is quota/admission blocked | Skip it through the existing guard; do not bypass the guard. |
-| Routing storage is read-only during bootstrap | Log and continue with legacy fallback. |
+| Bootstrap creates a missing system-default group | Use routing defaults, not legacy scheduler values. |
 | `now_unix_secs=100`, seed is `u64::MAX`, circuit probe is at `200` | Skip with `key_circuit_open`; the seed must not affect time. |
 | Admission wait polls again | Refresh `now_unix_secs`; retain the original `load_balance_seed`. |
 
@@ -128,7 +129,7 @@ No database migration is involved; routing configuration remains opaque JSON.
   format-scoped priority precedence.
 - `aether-ai-serving`: one attempt per candidate and preservation of deferred
   exhaustion context.
-- Gateway: system-default bootstrap/fallback, attempt index/Pool stride,
+- Gateway: system-default bootstrap and `bootstrap_does_not_migrate_legacy_scheduler_keys`, attempt index/Pool stride,
   dynamic-loop cleanup, sync/stream failover, Pool balance/runtime quota, and
   `openai_image_sync_heartbeat_retries_sticky_key_lazily_before_failover`.
 - Gateway scheduler: use different explicit time/seed values and assert both a

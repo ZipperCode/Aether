@@ -18,6 +18,7 @@ WHERE key = $1
 LIMIT 1
 "#;
 
+/// 同一条查询读取 revision 和配置值，避免快照版本与内容错配。
 const FIND_SYSTEM_CONFIG_VALUE_STRONG_SQL: &str = r#"
 SELECT revision, value FROM system_configs WHERE key = $1 LIMIT 1
 "#;
@@ -25,6 +26,17 @@ SELECT revision, value FROM system_configs WHERE key = $1 LIMIT 1
 /// revision-only 强读 SQL；投影保持单列，避免未变化配置复制完整 JSON。
 const FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL: &str = r#"
 SELECT revision FROM system_configs WHERE key = $1 LIMIT 1
+"#;
+
+/// 字符串配置 CAS 同时推进 revision，使认证快照观察到加密等后台更新。
+const COMPARE_AND_SET_SYSTEM_CONFIG_STRING_VALUE_SQL: &str = r#"
+UPDATE system_configs
+SET value = TO_JSON($3::text),
+    revision = revision + 1,
+    updated_at = NOW()
+WHERE key = $1
+  AND JSON_TYPEOF(value) = 'string'
+  AND value #>> '{}' = $2
 "#;
 
 const UPSERT_SYSTEM_CONFIG_VALUE_SQL: &str = r#"
@@ -454,7 +466,11 @@ SET api_key_name = EXCLUDED.api_key_name,
         add_aggregate_import_count(&mut summary.stats_daily_api_key, existing.is_some());
     }
 
-    tx.commit().await.map_postgres_err()?;
+    if mode == AdminSystemUsageAggregateImportMode::ValidateError {
+        tx.rollback().await.map_postgres_err()?;
+    } else {
+        tx.commit().await.map_postgres_err()?;
+    }
     Ok(summary)
 }
 
@@ -1209,6 +1225,23 @@ impl PostgresBackend {
             .map(|revision| revision.map(|value| value.max(0) as u64))
     }
 
+    /// 仅在当前值仍等于预期字符串时替换，并原子推进配置 revision。
+    pub async fn compare_and_set_system_config_string_value(
+        &self,
+        key: &str,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<bool, DataLayerError> {
+        let result = sqlx::query(COMPARE_AND_SET_SYSTEM_CONFIG_STRING_VALUE_SQL)
+            .bind(key)
+            .bind(expected)
+            .bind(replacement)
+            .execute(self.pool())
+            .await
+            .map_postgres_err()?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn upsert_system_config_value(
         &self,
         key: &str,
@@ -1406,7 +1439,20 @@ pub(super) fn map_admin_system_stats(
 
 #[cfg(test)]
 mod revision_query_tests {
-    use super::{DELETE_SYSTEM_CONFIG_VALUE_SQL, FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL};
+    use super::{
+        COMPARE_AND_SET_SYSTEM_CONFIG_STRING_VALUE_SQL, DELETE_SYSTEM_CONFIG_VALUE_SQL,
+        FIND_SYSTEM_CONFIG_REVISION_STRONG_SQL,
+    };
+
+    /// 字符串 CAS 不能绕过 revision；比较失败时 WHERE 条件同时阻止值和版本更新。
+    #[test]
+    fn system_config_string_cas_advances_revision_atomically() {
+        let sql = COMPARE_AND_SET_SYSTEM_CONFIG_STRING_VALUE_SQL.to_ascii_lowercase();
+        assert!(sql.contains("revision = revision + 1"));
+        assert!(sql.contains("value = to_json($3::text)"));
+        assert!(sql.contains("json_typeof(value) = 'string'"));
+        assert!(sql.contains("value #>> '{}' = $2"));
+    }
 
     /// 验证 PostgreSQL revision-only 强读不会把大 JSON value 带入结果集。
     #[test]

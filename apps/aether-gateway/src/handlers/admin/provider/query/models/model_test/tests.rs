@@ -1,5 +1,6 @@
 use super::*;
 use crate::handlers::admin::request::AdminGatewayProviderTransportSnapshot;
+use base64::Engine as _;
 use serde_json::json;
 
 fn sample_model_probe_execution(

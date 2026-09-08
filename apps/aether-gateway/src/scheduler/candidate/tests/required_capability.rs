@@ -70,7 +70,7 @@ async fn compatible_required_capability_prefers_matching_keys_without_hard_filte
             now_unix_secs: 100,
             load_balance_seed: 100,
         },
-        None,
+        crate::scheduler::config::SchedulerOrderingConfig::default(),
     )
     .await
     .expect("selection should succeed");
@@ -130,7 +130,7 @@ async fn exclusive_required_capability_keeps_hard_filtering_only_matching_keys()
             now_unix_secs: 100,
             load_balance_seed: 100,
         },
-        None,
+        crate::scheduler::config::SchedulerOrderingConfig::default(),
     )
     .await
     .expect("selection should succeed");
@@ -211,7 +211,7 @@ async fn required_capability_without_model_uses_session_scoped_affinity() {
             now_unix_secs: 100,
             load_balance_seed: 100,
         },
-        None,
+        crate::scheduler::config::SchedulerOrderingConfig::default(),
     )
     .await
     .expect("selection should succeed");
@@ -293,7 +293,7 @@ async fn required_capability_reports_auth_limit_signal_when_every_model_is_block
                 now_unix_secs: 100,
                 load_balance_seed: 100,
             },
-            None,
+            crate::scheduler::config::SchedulerOrderingConfig::default(),
         )
         .await
         .expect("selection should succeed");

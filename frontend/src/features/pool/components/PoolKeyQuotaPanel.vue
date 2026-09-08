@@ -186,6 +186,7 @@ const emit = defineEmits<{
   'consume-reset-credit': []
 }>()
 
+
 const { legacyT } = useI18n()
 const supportsStructuredQuota = computed(() => [
   'deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai',

@@ -568,6 +568,9 @@ mod tests {
     use super::*;
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
     use aether_data_contracts::repository::provider_catalog::ProviderCatalogWriteRepository;
+    use aether_data_contracts::repository::provider_catalog::{
+        ProviderCatalogKeyAdminCasUpdate, ProviderCatalogKeyOAuthCredentialFence,
+    };
 
     fn cache() -> CachedProviderCatalogReadRepository {
         CachedProviderCatalogReadRepository::new(Arc::new(
@@ -637,7 +640,7 @@ mod tests {
     /// 验证认证维护投影不会被目录缓存保存，底层凭据状态变化可立即被下一次扫描看到。
     #[tokio::test]
     async fn auth_maintenance_candidates_bypass_catalog_cache() {
-        let key = StoredProviderCatalogKey::new(
+        let mut key = StoredProviderCatalogKey::new(
             "key-1".to_string(),
             "provider-1".to_string(),
             "key-1".to_string(),
@@ -649,7 +652,7 @@ mod tests {
         let inner = Arc::new(InMemoryProviderCatalogReadRepository::seed(
             vec![provider("provider-1")],
             Vec::new(),
-            vec![key],
+            vec![key.clone()],
         ));
         let cache = CachedProviderCatalogReadRepository::new(inner.clone());
         let provider_ids = vec!["provider-1".to_string()];
@@ -660,13 +663,23 @@ mod tests {
             .expect("initial maintenance candidates should read");
         assert!(!first[0].has_auth_config);
 
+        // 在底层仓储按原凭据执行管理员 CAS，模拟另一节点同时更新认证资格与过期时间。
+        key.encrypted_api_key = Some("encrypted-api-key".to_string());
+        key.encrypted_auth_config = Some("encrypted-auth-config".to_string());
+        key.expires_at_unix_secs = Some(120);
         assert!(inner
-            .update_key_oauth_credentials(
-                "key-1",
-                "encrypted-api-key",
-                Some("encrypted-auth-config"),
-                Some(120),
-            )
+            .compare_and_update_key_admin_state(&ProviderCatalogKeyAdminCasUpdate {
+                expected_encrypted_auth_config: None,
+                expected_credential: ProviderCatalogKeyOAuthCredentialFence {
+                    encrypted_api_key: None,
+                    auth_type: "oauth".to_string(),
+                    provider_id: "provider-1".to_string(),
+                    provider_type: provider("provider-1").provider_type,
+                },
+                key,
+                codex_rotation: None,
+                reset_oauth_runtime: false,
+            })
             .await
             .expect("inner OAuth credential update should succeed"));
 

@@ -32,6 +32,7 @@ impl ProviderPoolAdapter for NousProviderPoolAdapter {
         "找不到有效的 Nous 端点".to_string()
     }
 }
+/// 构造 Nous 账户或账单查询并保留对应额度类型，统一传输层负责证书校验。
 fn request(
     key_id: &str,
     authorization: (String, String),
@@ -54,7 +55,6 @@ fn request(
         client_api_format: "openai:chat".into(),
         provider_api_format: "openai:chat".into(),
         model_name: None,
-        accept_invalid_certs: false,
     }
 }
 pub fn build_nous_account_quota_request(

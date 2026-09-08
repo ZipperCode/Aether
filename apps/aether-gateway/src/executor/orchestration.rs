@@ -52,13 +52,10 @@ use crate::executor::{
     record_failed_usage_for_deferred_upstream_response, record_failed_usage_for_exhausted_request,
     take_deferred_upstream_exhaustion, LocalExecutionExhaustion, LocalExecutionRequestOutcome,
 };
-use crate::handlers::shared::system_config_bool;
 use crate::request_diagnostics::{current_request_diagnostics, scope_request_diagnostics_with};
 use crate::stage_metrics::observe_gateway_stage_ms;
 use crate::{AiExecutionDecision, AppState, GatewayError};
 
-const ENABLE_OPENAI_IMAGE_SYNC_HEARTBEAT_CONFIG_KEY: &str = "enable_openai_image_sync_heartbeat";
-const ENABLE_STANDARD_TEXT_SYNC_HEARTBEAT_CONFIG_KEY: &str = "enable_standard_text_sync_heartbeat";
 const OPENAI_IMAGE_SYNC_HEARTBEAT_INTERNAL_ERROR_STATUS: u16 = 502;
 const OPENAI_IMAGE_SYNC_HEARTBEAT_EXHAUSTED_STATUS: u16 = 503;
 const OPENAI_IMAGE_SYNC_HEARTBEAT_ERROR_MESSAGE_LIMIT: usize = 4096;
@@ -105,7 +102,10 @@ pub(crate) async fn maybe_execute_sync_via_local_decision(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
 
-    if standard_text_sync_heartbeat_should_wrap(state, plan_kind).await {
+    if standard_text_sync_heartbeat_should_wrap(
+        plan_kind,
+        attempt_source.routing_execution_policy(),
+    ) {
         let parts_for_task = parts.clone();
         let body_json_for_task = body_json.clone();
         let transfer_tracker_for_task = transfer_tracker.clone();
@@ -262,7 +262,10 @@ pub(crate) async fn maybe_execute_sync_via_local_openai_responses_decision(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
 
-    if standard_text_sync_heartbeat_should_wrap(state, plan_kind).await {
+    if standard_text_sync_heartbeat_should_wrap(
+        plan_kind,
+        attempt_source.routing_execution_policy(),
+    ) {
         let parts_for_task = parts.clone();
         let body_json_for_task = body_json.clone();
         let transfer_tracker_for_task = transfer_tracker.clone();
@@ -379,7 +382,10 @@ pub(crate) async fn maybe_execute_sync_via_standard_family_decision(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
 
-    if standard_text_sync_heartbeat_should_wrap(state, plan_kind).await {
+    if standard_text_sync_heartbeat_should_wrap(
+        plan_kind,
+        attempt_source.routing_execution_policy(),
+    ) {
         let parts_for_task = parts.clone();
         let body_json_for_task = body_json.clone();
         let transfer_tracker_for_task = transfer_tracker.clone();
@@ -607,7 +613,10 @@ pub(crate) async fn maybe_execute_sync_via_local_same_format_provider_decision(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
 
-    if standard_text_sync_heartbeat_should_wrap(state, plan_kind).await {
+    if standard_text_sync_heartbeat_should_wrap(
+        plan_kind,
+        attempt_source.routing_execution_policy(),
+    ) {
         let parts_for_task = parts.clone();
         let body_json_for_task = body_json.clone();
         let transfer_tracker_for_task = transfer_tracker.clone();
@@ -744,42 +753,6 @@ pub(crate) async fn maybe_execute_sync_via_local_gemini_files_decision(
     .await
 }
 
-async fn openai_image_sync_heartbeat_enabled(state: &AppState) -> bool {
-    match state
-        .read_system_config_json_value(ENABLE_OPENAI_IMAGE_SYNC_HEARTBEAT_CONFIG_KEY)
-        .await
-    {
-        Ok(value) => system_config_bool(value.as_ref(), false),
-        Err(err) => {
-            tracing::warn!(
-                event_name = "openai_image_sync_heartbeat_config_read_failed",
-                log_type = "ops",
-                error = ?err,
-                "gateway failed to read sync image heartbeat config; defaulting disabled"
-            );
-            false
-        }
-    }
-}
-
-async fn standard_text_sync_heartbeat_enabled(state: &AppState) -> bool {
-    match state
-        .read_system_config_json_value(ENABLE_STANDARD_TEXT_SYNC_HEARTBEAT_CONFIG_KEY)
-        .await
-    {
-        Ok(value) => system_config_bool(value.as_ref(), false),
-        Err(err) => {
-            tracing::warn!(
-                event_name = "standard_text_sync_heartbeat_config_read_failed",
-                log_type = "ops",
-                error = ?err,
-                "gateway failed to read standard text sync heartbeat config; defaulting disabled"
-            );
-            false
-        }
-    }
-}
-
 fn standard_text_sync_heartbeat_applies_to_plan_kind(plan_kind: &str) -> bool {
     matches!(
         plan_kind,
@@ -793,9 +766,12 @@ fn standard_text_sync_heartbeat_applies_to_plan_kind(plan_kind: &str) -> bool {
     )
 }
 
-async fn standard_text_sync_heartbeat_should_wrap(state: &AppState, plan_kind: &str) -> bool {
+fn standard_text_sync_heartbeat_should_wrap(
+    plan_kind: &str,
+    execution_policy: Option<aether_routing_core::RoutingExecutionPolicy>,
+) -> bool {
     standard_text_sync_heartbeat_applies_to_plan_kind(plan_kind)
-        && standard_text_sync_heartbeat_enabled(state).await
+        && execution_policy.is_some_and(|policy| policy.enable_cf_heartbeat)
 }
 
 fn standard_text_sync_heartbeat_client_api_format_for_plan_kind(plan_kind: &str) -> &'static str {
@@ -940,10 +916,10 @@ async fn standard_text_sync_heartbeat_final_bytes(
             STANDARD_TEXT_SYNC_HEARTBEAT_EXHAUSTED_STATUS,
             "standard text sync exhausted all local candidates",
         ),
-        Err(err) => standard_text_sync_heartbeat_error_body(
+        Err(_err) => standard_text_sync_heartbeat_error_body(
             client_api_format,
             STANDARD_TEXT_SYNC_HEARTBEAT_INTERNAL_ERROR_STATUS,
-            &format!("{err:?}"),
+            "internal gateway error while executing request",
         ),
     }
 }
@@ -963,11 +939,11 @@ async fn standard_text_sync_heartbeat_response_body_bytes(
                 bytes.as_ref(),
             ) {
                 Ok(body) => body,
-                Err(err) => {
+                Err(_err) => {
                     return standard_text_sync_heartbeat_error_body(
                         client_api_format,
                         STANDARD_TEXT_SYNC_HEARTBEAT_INTERNAL_ERROR_STATUS,
-                        &format!("{err:?}"),
+                        "internal gateway error while restoring response",
                     );
                 }
             };
@@ -987,10 +963,10 @@ async fn standard_text_sync_heartbeat_response_body_bytes(
                 "empty standard text sync response",
             )
         }
-        Err(err) => standard_text_sync_heartbeat_error_body(
+        Err(_err) => standard_text_sync_heartbeat_error_body(
             client_api_format,
             STANDARD_TEXT_SYNC_HEARTBEAT_INTERNAL_ERROR_STATUS,
-            &err.to_string(),
+            "internal gateway error while reading response",
         ),
     }
 }
@@ -1296,9 +1272,9 @@ async fn openai_image_sync_heartbeat_final_bytes(
             OPENAI_IMAGE_SYNC_HEARTBEAT_EXHAUSTED_STATUS,
             "OpenAI image sync exhausted all local candidates",
         ),
-        Err(err) => openai_image_sync_heartbeat_error_body(
+        Err(_err) => openai_image_sync_heartbeat_error_body(
             OPENAI_IMAGE_SYNC_HEARTBEAT_INTERNAL_ERROR_STATUS,
-            &format!("{err:?}"),
+            "internal gateway error while executing image request",
         ),
     }
 }
@@ -1319,9 +1295,9 @@ async fn openai_image_sync_heartbeat_response_body_bytes(response: Response<Body
             OPENAI_IMAGE_SYNC_HEARTBEAT_INTERNAL_ERROR_STATUS,
             "empty sync image response",
         ),
-        Err(err) => openai_image_sync_heartbeat_error_body(
+        Err(_err) => openai_image_sync_heartbeat_error_body(
             OPENAI_IMAGE_SYNC_HEARTBEAT_INTERNAL_ERROR_STATUS,
-            &err.to_string(),
+            "internal gateway error while reading image response",
         ),
     }
 }
@@ -1401,7 +1377,10 @@ pub(crate) async fn maybe_execute_sync_via_local_image_decision(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
 
-    if openai_image_sync_heartbeat_enabled(state).await {
+    if attempt_source
+        .routing_execution_policy()
+        .is_some_and(|policy| policy.enable_cf_heartbeat)
+    {
         let mut attempts = Vec::new();
         while let Some(attempt) = attempt_source.next_execution_attempt().await? {
             attempts.push(attempt);
@@ -1980,11 +1959,10 @@ mod tests {
         assert_eq!(body, json!({"data": [{"b64_json": "x"}]}));
     }
 
-    #[tokio::test]
-    async fn openai_image_sync_heartbeat_missing_config_defaults_disabled() {
-        let state = AppState::new().expect("state should build");
-
-        assert!(!openai_image_sync_heartbeat_enabled(&state).await);
+    #[test]
+    fn openai_image_sync_heartbeat_missing_routing_policy_defaults_disabled() {
+        assert!(!Option::<aether_routing_core::RoutingExecutionPolicy>::None
+            .is_some_and(|policy| policy.enable_cf_heartbeat));
     }
 
     #[tokio::test]
@@ -2306,6 +2284,7 @@ mod tests {
     }
 
     /// 验证图片心跳即使存在粘性预算，也服从 Provider 转移次数上限。
+
     #[tokio::test]
     async fn openai_image_sync_heartbeat_honors_provider_transfer_limit() {
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -2353,6 +2332,26 @@ mod tests {
                     ))
                 }
             });
+        let mut attempts = vec![
+            test_openai_image_heartbeat_attempt(0, "endpoint-key-1", "candidate-key-1"),
+            test_openai_image_heartbeat_attempt(1, "endpoint-key-2", "candidate-key-2"),
+            test_openai_image_heartbeat_attempt(2, "endpoint-key-3", "candidate-key-3"),
+            test_openai_image_heartbeat_attempt(3, "endpoint-fallback", "candidate-fallback"),
+        ];
+        for (index, attempt) in attempts.iter_mut().take(3).enumerate() {
+            attempt.plan.key_id = format!("key-{}", index + 1);
+            attempt.report_context = Some(json!({
+                "candidate_index": index,
+                "retry_index": 0,
+                "sticky_key_attempts": 1,
+                "local_failover_policy": {
+                    "max_transfer_count": 1,
+                    "max_transfer_timeout_seconds": 0
+                }
+            }));
+        }
+        attempts[3].plan.provider_id = "provider-fallback".to_string();
+        attempts[3].plan.key_id = "key-fallback".to_string();
 
         let outcome = execute_openai_image_sync_heartbeat_attempts(
             state,
@@ -2377,22 +2376,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_text_sync_heartbeat_missing_config_defaults_disabled() {
-        let state = AppState::new().expect("state should build");
-
-        assert!(!standard_text_sync_heartbeat_enabled(&state).await);
-    }
-
-    #[tokio::test]
     async fn standard_text_sync_heartbeat_no_local_candidates_preserves_no_path() {
-        let state = AppState::new()
-            .expect("state should build")
-            .with_data_state_for_tests(
-                crate::data::GatewayDataState::disabled().with_system_config_values_for_tests([(
-                    ENABLE_STANDARD_TEXT_SYNC_HEARTBEAT_CONFIG_KEY.to_string(),
-                    json!(true),
-                )]),
-            );
+        let state = AppState::new().expect("state should build");
         let (parts, _) = http::Request::builder()
             .method(http::Method::POST)
             .uri("/v1/responses")
@@ -2528,6 +2513,70 @@ mod tests {
             .expect("heartbeat chunk should be ok");
         assert_eq!(first.as_ref(), b"\n");
         let _ = release_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn standard_text_sync_heartbeat_background_holds_request_admission_after_disconnect() {
+        let state = AppState::new().expect("state should build");
+        let gate = aether_runtime::ConcurrencyGate::new("heartbeat_request", 1);
+        let admission = aether_runtime::AdmissionPermit::from(
+            gate.try_acquire().expect("request admission permit"),
+        );
+        let (mut parts, _) = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/v1/responses")
+            .body(())
+            .expect("request should build")
+            .into_parts();
+        parts.extensions.insert(
+            crate::executor::candidate_loop::BackgroundAdmissionPermit::new(admission.clone()),
+        );
+        drop(admission);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let response = build_standard_text_sync_heartbeat_shell_response(
+            state,
+            parts,
+            "trace-standard-text-heartbeat-admission".to_string(),
+            test_standard_text_heartbeat_decision(),
+            TEST_STANDARD_TEXT_SYNC_PLAN_KIND.to_string(),
+            move |_state, parts, _trace_id, _decision, _plan_kind, _started_at| async move {
+                assert!(
+                    parts
+                        .extensions
+                        .get::<crate::executor::candidate_loop::BackgroundAdmissionPermit>()
+                        .is_some(),
+                    "background request parts should carry admission"
+                );
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok(LocalExecutionRequestOutcome::responded(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(r#"{"id":"resp_done","output":[]}"#))
+                        .expect("response should build"),
+                ))
+            },
+        )
+        .expect("heartbeat shell should build");
+
+        started_rx.await.expect("background execution should start");
+        drop(response);
+        assert_eq!(gate.snapshot().in_flight, 1);
+        assert!(
+            gate.try_acquire().is_err(),
+            "disconnect must not release background admission"
+        );
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.snapshot().in_flight != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background completion should release admission");
     }
 
     #[tokio::test]

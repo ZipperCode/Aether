@@ -2,14 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aether_crypto::{
-    decrypt_python_fernet_ciphertext, encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY,
-};
+use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data::repository::proxy_nodes::InMemoryProxyNodeRepository;
 use aether_data_contracts::repository::global_models::{
-    AdminProviderModelListQuery, GlobalModelReadRepository,
+    AdminGlobalModelListQuery, AdminProviderModelListQuery, GlobalModelReadRepository,
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -22,8 +20,9 @@ use serde_json::json;
 use tokio::sync::oneshot;
 
 use super::super::super::{
-    build_router_with_state, build_state_with_execution_runtime_override, sample_endpoint,
-    sample_key, sample_proxy_node, start_server,
+    build_router_with_state, build_state_with_execution_runtime_override,
+    sample_admin_global_model, sample_bound_auth_config, sample_bound_key, sample_endpoint,
+    sample_key, sample_proxy_node, start_server, AppState,
 };
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
@@ -33,6 +32,28 @@ use crate::data::GatewayDataState;
 
 const PROVIDER_QUOTA_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
 const WAVE2_ZERO_RESPONSE_QA_PORT: u16 = 19086;
+
+fn open_provider_catalog_credential_for_test(
+    key: &StoredProviderCatalogKey,
+    field: &str,
+) -> String {
+    let state = AppState::new()
+        .expect("gateway state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::disabled().with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    match field {
+        "api_key" => state
+            .decrypt_provider_catalog_key_api_key(key)
+            .expect("provider catalog API key should decrypt")
+            .expect("provider catalog API key should be present"),
+        "auth_config" => state
+            .decrypt_provider_catalog_key_auth_config(key)
+            .expect("provider catalog auth config should decrypt")
+            .expect("provider catalog auth config should be present"),
+        _ => panic!("unsupported provider catalog credential field: {field}"),
+    }
+}
 
 fn run_provider_quota_test<F, Fut>(test_name: &'static str, make_future: F)
 where
@@ -493,23 +514,9 @@ async fn gateway_codex_quota_refresh_persists_after_automatic_oauth_token_refres
         .await
         .expect("key should reload");
     let persisted = reloaded.first().expect("key should remain installed");
-    let decrypted_api_key = decrypt_python_fernet_ciphertext(
-        DEVELOPMENT_ENCRYPTION_KEY,
-        persisted
-            .encrypted_api_key
-            .as_deref()
-            .expect("api key should persist"),
-    )
-    .expect("api key should decrypt");
+    let decrypted_api_key = open_provider_catalog_credential_for_test(persisted, "api_key");
     assert_eq!(decrypted_api_key, "refreshed-codex-access-token");
-    let decrypted_auth_config = decrypt_python_fernet_ciphertext(
-        DEVELOPMENT_ENCRYPTION_KEY,
-        persisted
-            .encrypted_auth_config
-            .as_deref()
-            .expect("auth config should persist"),
-    )
-    .expect("auth config should decrypt");
+    let decrypted_auth_config = open_provider_catalog_credential_for_test(persisted, "auth_config");
     let auth_config: serde_json::Value =
         serde_json::from_str(&decrypted_auth_config).expect("auth config should parse");
     assert_eq!(auth_config["refresh_token"], "rotated-codex-refresh-token");
@@ -1536,40 +1543,23 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_kiro_with_trusted_ad
         }),
     );
 
-    let encrypted_auth_config = encrypt_python_fernet_plaintext(
-        DEVELOPMENT_ENCRYPTION_KEY,
+    let mut key = sample_bound_key(
+        "key-kiro-a",
+        "provider-kiro",
+        "claude:messages",
+        "__placeholder__",
+    );
+    key.auth_type = "bearer".to_string();
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-kiro",
+        "key-kiro-a",
         r#"{
             "access_token":"kiro-access-token",
             "api_region":"us-west-2",
             "machine_id":"123e4567-e89b-12d3-a456-426614174000",
             "kiro_version":"1.2.3"
         }"#,
-    )
-    .expect("auth config ciphertext should build");
-    let encrypted_api_key =
-        encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "__placeholder__")
-            .expect("api key ciphertext should build");
-    let key = StoredProviderCatalogKey::new(
-        "key-kiro-a".to_string(),
-        "provider-kiro".to_string(),
-        "default".to_string(),
-        "bearer".to_string(),
-        None,
-        true,
-    )
-    .expect("key should build")
-    .with_transport_fields(
-        Some(json!(["claude:messages"])),
-        encrypted_api_key,
-        Some(encrypted_auth_config),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .expect("key transport should build");
+    ));
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![StoredProviderCatalogProvider::new(
@@ -1625,6 +1615,11 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_kiro_with_trusted_ad
     );
     assert_eq!(
         payload["results"][0]["quota_snapshot"]["plan_type"],
+        serde_json::Value::Null,
+        "quota snapshot token projection must reject unsafely formatted plan labels"
+    );
+    assert_eq!(
+        payload["results"][0]["metadata"]["subscription_title"],
         "KIRO PRO+"
     );
     assert_eq!(
@@ -1702,7 +1697,8 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_kiro_with_trusted_ad
             .as_ref()
             .and_then(|value| value.get("quota"))
             .and_then(|value| value.get("plan_type")),
-        Some(&json!("KIRO PRO+"))
+        None,
+        "persisted admin-safe status must omit unsafely formatted plan labels"
     );
     assert_eq!(
         reloaded[0]
@@ -1917,35 +1913,18 @@ async fn gateway_refresh_kiro_quota_reconciles_missing_fixed_endpoint_before_ref
         }),
     );
 
-    let encrypted_auth_config = encrypt_python_fernet_plaintext(
-        DEVELOPMENT_ENCRYPTION_KEY,
+    let mut key = sample_bound_key(
+        "key-kiro-reconcile",
+        "provider-kiro-reconcile",
+        "claude:messages",
+        "__placeholder__",
+    );
+    key.auth_type = "bearer".to_string();
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-kiro-reconcile",
+        "key-kiro-reconcile",
         r#"{"access_token":"kiro-access-token","api_region":"us-west-2"}"#,
-    )
-    .expect("auth config ciphertext should build");
-    let encrypted_api_key =
-        encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "__placeholder__")
-            .expect("api key ciphertext should build");
-    let key = StoredProviderCatalogKey::new(
-        "key-kiro-reconcile".to_string(),
-        "provider-kiro-reconcile".to_string(),
-        "default".to_string(),
-        "bearer".to_string(),
-        None,
-        true,
-    )
-    .expect("key should build")
-    .with_transport_fields(
-        Some(json!(["claude:messages"])),
-        encrypted_api_key,
-        Some(encrypted_auth_config),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .expect("key transport should build");
+    ));
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![StoredProviderCatalogProvider::new(
@@ -2380,7 +2359,7 @@ async fn gateway_reports_codex_quota_runtime_failures_locally_without_falling_ba
     assert!(payload["results"][0]["message"]
         .as_str()
         .expect("message should be string")
-        .contains("wham/usage 请求执行失败: execution runtime returned HTTP 500"));
+        .contains("wham/usage 请求执行失败"));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     let reloaded = provider_catalog_repository
@@ -2412,6 +2391,8 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
     struct SeenExecutionRuntimeRequest {
         url: String,
         authorization: String,
+        user_agent: String,
+        x_client_version: String,
         provider_api_format: String,
         request_body: Option<serde_json::Value>,
     }
@@ -2429,7 +2410,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         }),
     );
 
-    let seen_execution_runtime = Arc::new(Mutex::new(None::<SeenExecutionRuntimeRequest>));
+    let seen_execution_runtime = Arc::new(Mutex::new(Vec::<SeenExecutionRuntimeRequest>::new()));
     let seen_execution_runtime_clone = Arc::clone(&seen_execution_runtime);
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
@@ -2442,26 +2423,30 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
                         .expect("body should read"),
                 )
                 .expect("plan should parse");
-                *seen_execution_runtime_inner
+                let request_body = plan.body.json_body.clone();
+                seen_execution_runtime_inner
                     .lock()
-                    .expect("mutex should lock") = Some(SeenExecutionRuntimeRequest {
-                    url: plan.url.clone(),
-                    authorization: plan
-                        .headers
-                        .get("authorization")
-                        .cloned()
-                        .unwrap_or_default(),
-                    provider_api_format: plan.provider_api_format.clone(),
-                    request_body: plan.body.json_body.clone(),
-                });
-                let result = aether_contracts::ExecutionResult {
-                    request_id: plan.request_id,
-                    candidate_id: None,
-                    status_code: 200,
-                    headers: BTreeMap::new(),
-                    response_observation: None,
-                    body: Some(aether_contracts::ResponseBody {
-                        json_body: Some(json!({
+                    .expect("mutex should lock")
+                    .push(SeenExecutionRuntimeRequest {
+                        url: plan.url.clone(),
+                        authorization: plan
+                            .headers
+                            .get("authorization")
+                            .cloned()
+                            .unwrap_or_default(),
+                        user_agent: plan.headers.get("user-agent").cloned().unwrap_or_default(),
+                        x_client_version: plan
+                            .headers
+                            .get("x-client-version")
+                            .cloned()
+                            .unwrap_or_default(),
+                        provider_api_format: plan.provider_api_format.clone(),
+                        request_body: request_body.clone(),
+                    });
+                let (status_code, json_body) = match plan.provider_api_format.as_str() {
+                    "antigravity:fetch_available_models" => (
+                        200,
+                        json!({
                             "models": {
                                 "claude-sonnet-4": {
                                     "displayName": "Claude Sonnet 4",
@@ -2480,7 +2465,47 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
                                     "displayName": "Internal Chat"
                                 }
                             }
-                        })),
+                        }),
+                    ),
+                    "antigravity:retrieve_user_quota_summary"
+                        if request_body
+                            .as_ref()
+                            .and_then(|body| body.get("project"))
+                            .is_some() =>
+                    {
+                        (403, json!({"error": {"message": "project not accepted"}}))
+                    }
+                    "antigravity:retrieve_user_quota_summary" => (
+                        200,
+                        json!({
+                            "groups": [{
+                                "displayName": "Claude and GPT models",
+                                "description": "Shared quota",
+                                "buckets": [{
+                                    "bucketId": "3p-5h",
+                                    "window": "5h",
+                                    "remainingFraction": 0.25,
+                                    "resetTime": "2026-05-05T05:00:00Z",
+                                    "displayName": "5 hour"
+                                }, {
+                                    "bucketId": "3p-weekly",
+                                    "window": "weekly",
+                                    "remainingFraction": 0.8,
+                                    "resetTime": "2026-05-11T00:00:00Z"
+                                }]
+                            }]
+                        }),
+                    ),
+                    unexpected => panic!("unexpected quota request format: {unexpected}"),
+                };
+                let result = aether_contracts::ExecutionResult {
+                    request_id: plan.request_id,
+                    candidate_id: None,
+                    status_code,
+                    headers: BTreeMap::new(),
+                    response_observation: None,
+                    body: Some(aether_contracts::ResponseBody {
+                        json_body: Some(json_body),
                         body_bytes_b64: None,
                     }),
                     telemetry: None,
@@ -2539,9 +2564,15 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         )],
         vec![key],
     ));
-    // Provider 目录与模型目录是独立内存仓储；模型写入也必须持有同一 Endpoint 归属证据。
+    let existing_global_model = sample_admin_global_model(
+        "global-claude-sonnet-4",
+        "claude-sonnet-4",
+        "Claude Sonnet 4",
+    );
     let global_model_repository = Arc::new(
         InMemoryGlobalModelReadRepository::default()
+            .with_admin_global_models(vec![existing_global_model.clone()])
+            // 模型存储同时持有准确的 Endpoint 归属，避免额度发现退回推断。
             .with_endpoint_provider_ids([("endpoint-antigravity-chat", "provider-antigravity")]),
     );
 
@@ -2589,31 +2620,55 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         payload["results"][0]["quota_snapshot"]["windows"]
             .as_array()
             .map(Vec::len),
-        Some(1usize)
+        Some(3usize)
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
-    let seen_execution_runtime_request = seen_execution_runtime
+    let seen_execution_runtime_requests = seen_execution_runtime
         .lock()
         .expect("mutex should lock")
-        .clone()
-        .expect("execution runtime request should be captured");
+        .clone();
+    assert_eq!(seen_execution_runtime_requests.len(), 3);
+    let fetch_models_request = &seen_execution_runtime_requests[0];
     assert_eq!(
-        seen_execution_runtime_request.url,
+        fetch_models_request.url,
         "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
     );
+    assert_eq!(fetch_models_request.authorization, "Bearer ya29.ant-token");
     assert_eq!(
-        seen_execution_runtime_request.authorization,
-        "Bearer ya29.ant-token"
+        fetch_models_request.user_agent,
+        "vscode/1.X.X (Antigravity/4.3.0)"
     );
+    assert_eq!(fetch_models_request.x_client_version, "4.3.0");
     assert_eq!(
-        seen_execution_runtime_request.provider_api_format,
+        fetch_models_request.provider_api_format,
         "antigravity:fetch_available_models"
     );
     assert_eq!(
-        seen_execution_runtime_request.request_body,
+        fetch_models_request.request_body,
         Some(json!({ "project": "project-ant-123" }))
     );
+    let grouped_with_project = &seen_execution_runtime_requests[1];
+    let grouped_without_project = &seen_execution_runtime_requests[2];
+    assert_eq!(
+        grouped_with_project.url,
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+    );
+    assert_eq!(
+        grouped_with_project.provider_api_format,
+        "antigravity:retrieve_user_quota_summary"
+    );
+    assert_eq!(
+        grouped_with_project.request_body,
+        Some(json!({"project": "project-ant-123"}))
+    );
+    assert_eq!(grouped_without_project.url, grouped_with_project.url);
+    assert_eq!(grouped_without_project.request_body, Some(json!({})));
+    assert!(seen_execution_runtime_requests.iter().all(|request| {
+        request.authorization == "Bearer ya29.ant-token"
+            && request.user_agent == "vscode/1.X.X (Antigravity/4.3.0)"
+            && request.x_client_version == "4.3.0"
+    }));
 
     let reloaded = provider_catalog_repository
         .list_keys_by_ids(&["key-antigravity-a".to_string()])
@@ -2626,21 +2681,60 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             .upstream_metadata
             .as_ref()
             .and_then(|value| value.get("antigravity"))
-            .and_then(|value| value.get("models"))
+            .and_then(|value| value.get("quota_by_model"))
             .and_then(|value| value.get("claude-sonnet-4"))
             .and_then(|value| value.get("remaining_fraction")),
         Some(&json!(0.25))
     );
+    let global_models = global_model_repository
+        .list_admin_global_models(&AdminGlobalModelListQuery {
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .expect("global models should read after quota refresh");
+    assert_eq!(global_models.total, 1);
+    assert_eq!(global_models.items, vec![existing_global_model]);
+    let provider_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-antigravity".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("Antigravity provider models should read after quota refresh");
+    assert!(provider_models.is_empty());
     assert_eq!(
         reloaded[0]
             .upstream_metadata
             .as_ref()
             .and_then(|value| value.get("antigravity"))
-            .and_then(|value| value.get("models"))
+            .and_then(|value| value.get("quota_by_model"))
             .and_then(|value| value.get("claude-sonnet-4"))
             .and_then(|value| value.get("used_percent")),
         Some(&json!(75.0))
     );
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.pointer("/antigravity/quota_groups/0/buckets/0/bucket_id")),
+        Some(&json!("3p-5h"))
+    );
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.pointer("/antigravity/project_id")),
+        Some(&json!("project-ant-123"))
+    );
+    assert!(reloaded[0]
+        .upstream_metadata
+        .as_ref()
+        .and_then(|value| value.pointer("/antigravity/quota_groups_updated_at"))
+        .and_then(serde_json::Value::as_u64)
+        .is_some());
     assert_eq!(
         reloaded[0]
             .status_snapshot
@@ -2665,7 +2759,19 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             .and_then(|value| value.get("windows"))
             .and_then(|value| value.as_array())
             .map(Vec::len),
-        Some(1usize)
+        Some(3usize)
+    );
+    assert_eq!(
+        reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.pointer("/quota/windows"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|windows| windows
+                .iter()
+                .find(|window| window["code"] == "group:0:3p-5h"))
+            .and_then(|window| window.get("remaining_ratio")),
+        Some(&json!(0.25))
     );
 
     let imported_provider_models = global_model_repository

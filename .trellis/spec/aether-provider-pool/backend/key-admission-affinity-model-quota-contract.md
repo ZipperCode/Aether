@@ -89,9 +89,10 @@ must use `models`.
   reservation, and compare-and-set fences. A failed detail refresh preserves
   the last known count and item list while recording the detail failure.
 - Pool Management, Provider Detail, and the Antigravity quota dialog use the
-  shared quota summary. Gemini is one group; Claude and `gpt-*` share another.
-  The group displays minimum remaining percent, a range when values differ,
-  and the reset countdown belonging to the minimum window.
+  shared account-window projection keyed by upstream `quota_group`, including
+  weekly and five-hour periods. Keep each window's label, remaining percentage
+  and reset countdown; do not rebuild the retired Gemini/Claude+GPT family
+  minimum/range summary from individual model windows.
 
 ## 4. Validation & Error Matrix
 
@@ -121,10 +122,10 @@ must use `models`.
 - Base: a Key without a positive limit follows the existing Pool scheduling and
   Provider in-flight behavior.
 - Good: Antigravity reports Gemini exhausted and Claude available; a Claude
-  request remains schedulable and all three UIs show the same grouped summary.
+  request remains schedulable while the UIs share the same account-window data.
 - Bad: reading `concurrent_limit` from a stale local snapshot, using separate
   semaphores per protocol, treating every quota window as Provider-wide, or
-  implementing three independent Antigravity family summaries.
+  implementing three independent Antigravity account-window projections.
 
 ## 6. Tests Required
 
@@ -145,8 +146,8 @@ must use `models`.
 - Admin/Gateway: Codex reset-credit activation and completion-order races,
   credential-generation replacement rejection, one-time local decrement, and
   failed-detail preservation.
-- Frontend: concurrent-limit input/save, scheduling-mode metadata, shared quota
-  summary, percentage/range, and countdown rendering.
+- Frontend: concurrent-limit input/save, scheduling-mode metadata, shared
+  `quota_group` windows, weekly/five-hour labels, percentage and countdown.
 
 ## 7. Wrong vs Correct
 

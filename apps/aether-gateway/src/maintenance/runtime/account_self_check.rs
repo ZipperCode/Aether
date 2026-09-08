@@ -99,23 +99,20 @@ impl AccountSelfCheckWorkerConfig {
 enum AccountSelfCheckOutcome {
     Success {
         status_code: Option<u16>,
-        message: Option<String>,
         exhausted: bool,
     },
     Blocked {
         status_code: Option<u16>,
-        message: String,
     },
     AutoRemoved {
         status_code: Option<u16>,
-        message: String,
     },
     Failed {
         status_code: Option<u16>,
-        message: String,
+        category: &'static str,
     },
     Skipped {
-        message: String,
+        category: &'static str,
     },
 }
 
@@ -140,13 +137,12 @@ impl AccountSelfCheckOutcome {
         }
     }
 
-    fn message(&self) -> Option<&str> {
+    fn category(&self) -> &'static str {
         match self {
-            Self::Success { message, .. } => message.as_deref(),
-            Self::Blocked { message, .. }
-            | Self::AutoRemoved { message, .. }
-            | Self::Failed { message, .. }
-            | Self::Skipped { message, .. } => Some(message.as_str()),
+            Self::Success { .. } => "quota_refresh_succeeded",
+            Self::Blocked { .. } => "account_blocked",
+            Self::AutoRemoved { .. } => "account_auto_removed",
+            Self::Failed { category, .. } | Self::Skipped { category } => category,
         }
     }
 }
@@ -369,13 +365,13 @@ fn quota_payload_result_for_key(key_id: &str, payload: Option<Value>) -> Account
     let Some(payload) = payload else {
         return AccountSelfCheckOutcome::Failed {
             status_code: None,
-            message: "quota refresh returned no payload".to_string(),
+            category: "missing_payload",
         };
     };
     let Some(results) = payload.get("results").and_then(Value::as_array) else {
         return AccountSelfCheckOutcome::Failed {
             status_code: None,
-            message: "quota refresh returned no result list".to_string(),
+            category: "invalid_payload",
         };
     };
     let Some(item) = results.iter().find(|item| {
@@ -385,7 +381,7 @@ fn quota_payload_result_for_key(key_id: &str, payload: Option<Value>) -> Account
     }) else {
         return AccountSelfCheckOutcome::Failed {
             status_code: None,
-            message: "quota refresh result missing key".to_string(),
+            category: "missing_key_result",
         };
     };
 
@@ -403,8 +399,7 @@ fn quota_payload_result_for_key(key_id: &str, payload: Option<Value>) -> Account
         .get("message")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+        .filter(|value| !value.is_empty());
     let auto_removed = item
         .get("auto_removed")
         .and_then(Value::as_bool)
@@ -412,13 +407,12 @@ fn quota_payload_result_for_key(key_id: &str, payload: Option<Value>) -> Account
 
     if status == "backoff" {
         return AccountSelfCheckOutcome::Skipped {
-            message: "quota refresh deferred by backoff".to_string(),
+            category: "quota_refresh_backoff",
         };
     }
     if status == "success" {
         return AccountSelfCheckOutcome::Success {
             status_code,
-            message,
             exhausted: item
                 .get("quota_snapshot")
                 .and_then(|snapshot| snapshot.get("exhausted"))
@@ -427,20 +421,24 @@ fn quota_payload_result_for_key(key_id: &str, payload: Option<Value>) -> Account
         };
     }
     if auto_removed {
-        return AccountSelfCheckOutcome::AutoRemoved {
-            status_code,
-            message: message.unwrap_or_else(|| "已自动删除".to_string()),
-        };
+        return AccountSelfCheckOutcome::AutoRemoved { status_code };
     }
-    if quota_result_status_is_blocked(&status, status_code, message.as_deref()) {
-        return AccountSelfCheckOutcome::Blocked {
-            status_code,
-            message: message.unwrap_or_else(|| status.clone()),
-        };
+    if quota_result_status_is_blocked(&status, status_code, message) {
+        return AccountSelfCheckOutcome::Blocked { status_code };
     }
     AccountSelfCheckOutcome::Failed {
         status_code,
-        message: message.unwrap_or_else(|| status.clone()),
+        category: quota_refresh_failure_category(&status, status_code),
+    }
+}
+
+fn quota_refresh_failure_category(status: &str, status_code: Option<u16>) -> &'static str {
+    match status_code {
+        Some(408 | 504) => "upstream_timed_out",
+        Some(429) => "rate_limited",
+        Some(500..=599) => "upstream_error",
+        _ if matches!(status, "unsupported" | "not_supported") => "unsupported",
+        _ => "quota_refresh_failed",
     }
 }
 
@@ -519,7 +517,7 @@ async fn perform_account_self_check_candidate_under_gate(
         Ok(outcome) => outcome,
         Err(err) => AccountSelfCheckOutcome::Failed {
             status_code: None,
-            message: gateway_error_message(err),
+            category: gateway_error_category(&err),
         },
     };
     record_score_probe_result_for_key(
@@ -743,21 +741,7 @@ async fn record_score_probe_result_for_key_locked(
             PoolMemberProbeStatus::Never,
         ),
     };
-    let mut score_reason_patch = json!({
-        "last_probe": {
-            "source": "account_self_check",
-            "status": outcome.score_status(),
-            "status_code": outcome.status_code(),
-            "message": outcome.message()
-        },
-        "last_self_check": {
-            "source": "account_self_check",
-            "status": outcome.score_status(),
-            "status_code": outcome.status_code(),
-            "message": outcome.message(),
-            "attempted_at": attempted_at
-        }
-    });
+    let mut score_reason_patch = score_reason_patch_for_outcome(outcome, attempted_at);
     if let Some(state_name) = match subscription_hard_state {
         Some(PoolMemberHardState::QuotaExhausted) => Some("quota_exhausted"),
         Some(PoolMemberHardState::Available) => Some("available"),
@@ -791,6 +775,24 @@ async fn record_score_probe_result_for_key_locked(
     }
 }
 
+fn score_reason_patch_for_outcome(outcome: &AccountSelfCheckOutcome, attempted_at: u64) -> Value {
+    json!({
+        "last_probe": {
+            "source": "account_self_check",
+            "status": outcome.score_status(),
+            "status_code": outcome.status_code(),
+            "category": outcome.category()
+        },
+        "last_self_check": {
+            "source": "account_self_check",
+            "status": outcome.score_status(),
+            "status_code": outcome.status_code(),
+            "category": outcome.category(),
+            "attempted_at": attempted_at
+        }
+    })
+}
+
 fn endpoint_for_self_check(
     provider_type: &str,
     endpoints: &[StoredProviderCatalogEndpoint],
@@ -798,8 +800,21 @@ fn endpoint_for_self_check(
     provider_quota_refresh_endpoint_for_provider(provider_type, endpoints, true)
 }
 
-fn gateway_error_message(err: GatewayError) -> String {
-    err.into_message()
+fn gateway_error_category(err: &GatewayError) -> &'static str {
+    match err {
+        GatewayError::UpstreamUnavailable { .. } => "upstream_unavailable",
+        GatewayError::ControlUnavailable { .. } => "control_unavailable",
+        GatewayError::LocalExecutionPlanningTimeout { .. } => "planning_timed_out",
+        GatewayError::AdmissionTimeout { .. } => "admission_timed_out",
+        GatewayError::Client { status, .. } if status.as_u16() == 429 => "rate_limited",
+        GatewayError::Client { status, .. } if status.is_server_error() => "upstream_error",
+        GatewayError::Client { .. } => "request_rejected",
+        GatewayError::PlanUsageLimited(_) => "plan_usage_limited",
+        GatewayError::LastActiveAdminUpdateDenied | GatewayError::LastActiveAdminDeleteDenied => {
+            "operation_rejected"
+        }
+        GatewayError::Internal(_) => "internal_error",
+    }
 }
 
 fn update_summary_from_outcome(
@@ -1062,11 +1077,13 @@ pub(crate) fn spawn_account_self_check_worker(
 #[cfg(test)]
 mod tests {
     use super::{
-        account_self_check_config_for_provider, quota_payload_result_for_key,
-        record_score_probe_result_for_key, select_account_self_check_key_ids,
+        account_self_check_config_for_provider, gateway_error_category,
+        quota_payload_result_for_key, record_score_probe_result_for_key,
+        score_reason_patch_for_outcome, select_account_self_check_key_ids,
         update_summary_from_outcome, update_summary_from_revalidated_candidate,
         AccountSelfCheckOutcome, AccountSelfCheckRunSummary,
     };
+    use crate::GatewayError;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -1159,7 +1176,7 @@ mod tests {
             100,
             &AccountSelfCheckOutcome::Failed {
                 status_code: Some(503),
-                message: "upstream unavailable".to_string(),
+                category: "upstream_unavailable",
             },
             ProviderQuotaServingPolicy::ObservationOnly,
         )
@@ -1256,7 +1273,6 @@ mod tests {
             100,
             &AccountSelfCheckOutcome::Success {
                 status_code: Some(200),
-                message: None,
                 exhausted: false,
             },
             ProviderQuotaServingPolicy::SubscriptionExhaustionOnly,
@@ -1288,5 +1304,39 @@ mod tests {
         let selected = select_account_self_check_key_ids(&key_ids, 2_000, 600, &stamps, 2);
 
         assert_eq!(selected, vec!["never".to_string(), "stale".to_string()]);
+    }
+
+    #[test]
+    fn account_self_check_patch_does_not_persist_upstream_message() {
+        let secret = "Authorization: Bearer quota-secret from /srv/aether/credentials.json";
+        let outcome = quota_payload_result_for_key(
+            "key-secret-regression",
+            Some(json!({
+                "results": [{
+                    "key_id": "key-secret-regression",
+                    "status": "error",
+                    "status_code": 502,
+                    "message": secret
+                }]
+            })),
+        );
+
+        let patch = score_reason_patch_for_outcome(&outcome, 1_777_000_000);
+        let serialized = patch.to_string();
+
+        assert_eq!(patch["last_self_check"]["category"], "upstream_error");
+        assert!(patch["last_self_check"].get("message").is_none());
+        assert!(!serialized.contains("quota-secret"));
+        assert!(!serialized.contains("/srv/aether/credentials.json"));
+    }
+
+    #[test]
+    fn account_self_check_gateway_error_category_drops_internal_details() {
+        let error = GatewayError::Internal(
+            "postgresql://admin:database-secret@db.internal/aether".to_string(),
+        );
+
+        assert_eq!(gateway_error_category(&error), "internal_error");
+        assert!(!gateway_error_category(&error).contains("database-secret"));
     }
 }

@@ -132,11 +132,17 @@ describe('ModelMappingDialog', () => {
       error: null,
       warning: null,
     })
-    const model = {
+    const model: Model = {
+      provider_id: 'provider-1',
+      global_model_id: 'global-model-1',
+      is_active: true,
+      is_available: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
       id: 'model-1',
       provider_model_name: 'provider-model-1',
       provider_model_mappings: [],
-    } as Model
+    }
     const root = document.createElement('div')
     document.body.appendChild(root)
     const app = createApp(defineComponent({
@@ -153,7 +159,24 @@ describe('ModelMappingDialog', () => {
     mountedApps.push({ app, root })
 
     await vi.waitFor(() => expect(upstreamModelMocks.fetchModels).toHaveBeenCalledTimes(1))
-    expect(upstreamModelMocks.fetchModels).toHaveBeenCalledWith('provider-1')
+    expect(upstreamModelMocks.fetchModels).toHaveBeenCalledWith('provider-1', undefined, false)
+
+    // Both manual fetch and refresh must bypass the backend cache.
+    upstreamModelMocks.fetchModels.mockResolvedValue({ models: [{ id: 'gpt-old' }] })
+    await nextTick()
+    const fetchButton = root.querySelector<HTMLButtonElement>('[title="从提供商获取模型"]')
+    expect(fetchButton).not.toBeNull()
+    fetchButton!.click()
+    await vi.waitFor(() => expect(root.textContent).toContain('gpt-old'))
+    expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith('provider-1', undefined, true)
+
+    upstreamModelMocks.fetchModels.mockResolvedValue({ models: [{ id: 'gpt-6-astra' }] })
+    const refreshButton = root.querySelector<HTMLButtonElement>('[title="刷新上游模型"]')
+    expect(refreshButton).not.toBeNull()
+    refreshButton!.click()
+    await vi.waitFor(() => expect(root.textContent).toContain('gpt-6-astra'))
+    expect(root.textContent).not.toContain('gpt-old')
+    expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith('provider-1', undefined, true)
   })
 
   it('bypasses the backend cache when the refresh button is clicked', async () => {
@@ -170,9 +193,15 @@ describe('ModelMappingDialog', () => {
       })
     const model = {
       id: 'model-1',
+      provider_id: 'provider-1',
+      global_model_id: 'global-1',
       provider_model_name: 'provider-model-1',
       provider_model_mappings: [],
-    } as Model
+      is_active: true,
+      is_available: true,
+      created_at: '',
+      updated_at: '',
+    } satisfies Model
     const root = document.createElement('div')
     document.body.appendChild(root)
     const app = createApp(defineComponent({
@@ -216,12 +245,18 @@ describe('ModelMappingDialog', () => {
       base_url: 'https://api.example.com/v1',
       is_active: true,
     } as ProviderEndpoint
-    const model = {
+    const model: Model = {
+      provider_id: 'provider-1',
+      global_model_id: 'global-model-1',
+      is_active: true,
+      is_available: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
       id: 'model-sol',
       provider_model_name: 'gpt-5.6-sol',
       global_model_display_name: 'GPT-5.6 Sol',
       provider_model_mappings: [],
-    } as Model
+    }
     const open = ref(false)
     const root = document.createElement('div')
     document.body.appendChild(root)
@@ -269,7 +304,13 @@ describe('ModelMappingDialog', () => {
       base_url: 'https://api.example.com/v1',
       is_active: true,
     } as ProviderEndpoint
-    const model = {
+    const model: Model = {
+      provider_id: 'provider-1',
+      global_model_id: 'global-model-1',
+      is_active: true,
+      is_available: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
       id: 'model-sol',
       provider_model_name: 'gpt-5.6-sol',
       global_model_display_name: 'GPT-5.6 Sol',
@@ -279,7 +320,7 @@ describe('ModelMappingDialog', () => {
         endpoint_ids: [responsesEndpoint.id],
         operations: ['compact'],
       }],
-    } as Model
+    }
     const editingGroup: AliasGroup = {
       model,
       apiFormatsKey: '',
@@ -334,7 +375,13 @@ describe('ModelMappingDialog', () => {
   })
 
   it('preserves an edited compact scope when endpoint capabilities are unavailable', async () => {
-    const model = {
+    const model: Model = {
+      provider_id: 'provider-1',
+      global_model_id: 'global-model-1',
+      is_active: true,
+      is_available: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
       id: 'model-sol',
       provider_model_name: 'gpt-5.6-sol',
       global_model_display_name: 'GPT-5.6 Sol',
@@ -344,7 +391,7 @@ describe('ModelMappingDialog', () => {
         endpoint_ids: ['endpoint-responses'],
         operations: ['compact'],
       }],
-    } as Model
+    }
     const editingGroup: AliasGroup = {
       model,
       apiFormatsKey: '',
@@ -399,7 +446,13 @@ describe('ModelMappingDialog', () => {
       base_url: 'https://api.example.com/v1',
       is_active: true,
     } as ProviderEndpoint
-    const model = {
+    const model: Model = {
+      provider_id: 'provider-1',
+      global_model_id: 'global-model-1',
+      is_active: true,
+      is_available: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
       id: 'model-sol',
       provider_model_name: 'gpt-5.6-sol',
       global_model_display_name: 'GPT-5.6 Sol',
@@ -409,7 +462,7 @@ describe('ModelMappingDialog', () => {
         endpoint_ids: [endpoint.id],
         operations: ['Compact'],
       }],
-    } as Model
+    }
     const editingGroup: AliasGroup = {
       model,
       apiFormatsKey: '',

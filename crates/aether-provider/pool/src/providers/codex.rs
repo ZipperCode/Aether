@@ -218,7 +218,6 @@ pub fn build_codex_pool_quota_request(
         client_api_format: "openai:responses".to_string(),
         provider_api_format: "openai:responses".to_string(),
         model_name: Some("codex-wham-usage".to_string()),
-        accept_invalid_certs: false,
     })
 }
 
@@ -242,7 +241,6 @@ pub fn build_codex_pool_reset_credits_request(
         client_api_format: "openai:responses".to_string(),
         provider_api_format: "openai:responses".to_string(),
         model_name: Some("codex-wham-reset-credits".to_string()),
-        accept_invalid_certs: false,
     })
 }
 
@@ -276,7 +274,6 @@ pub fn build_codex_pool_reset_credit_consume_request(
         client_api_format: "openai:responses".to_string(),
         provider_api_format: "openai:responses".to_string(),
         model_name: Some("codex-wham-reset-credit-consume".to_string()),
-        accept_invalid_certs: false,
     })
 }
 

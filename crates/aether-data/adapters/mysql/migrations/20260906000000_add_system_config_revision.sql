@@ -1,1 +1,0 @@
-ALTER TABLE system_configs ADD COLUMN revision BIGINT NOT NULL DEFAULT 0;

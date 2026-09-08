@@ -1,0 +1,9 @@
+{"file": ".trellis/spec/aether-gateway/backend/index.md", "reason": "Verify retained contracts and approved replacements"}
+{"file": ".trellis/spec/aether-gateway/backend/auth-maintenance-memory-contract.md", "reason": "Verify retained contracts and approved replacements"}
+{"file": ".trellis/spec/aether-gateway/backend/model-association-endpoint-contract.md", "reason": "Verify retained contracts and approved replacements"}
+{"file": ".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md", "reason": "Verify retained contracts and approved replacements"}
+{"file": ".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md", "reason": "Verify retained contracts and approved replacements"}
+{"file": ".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md", "reason": "Verify retained contracts and approved replacements"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Verify retained contracts and approved replacements"}
+{"file": ".trellis/tasks/09-08-full-upstream-sync/research/integration.md", "reason": "Reuse verified full-workspace results and run only outstanding gateway behavior"}
+{"file": ".trellis/spec/aether-gateway-execution/backend/stream-attempt-lifecycle-contract.md", "reason": "Verify single terminal owner and per-candidate budget"}

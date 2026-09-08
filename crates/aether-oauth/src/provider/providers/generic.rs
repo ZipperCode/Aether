@@ -1,4 +1,7 @@
-use crate::core::{current_unix_secs, OAuthAuthorizeResponse, OAuthError, OAuthTokenSet};
+use crate::core::{
+    current_unix_secs, redacted_oauth_error_body_excerpt, OAuthAuthorizeResponse, OAuthError,
+    OAuthTokenSet,
+};
 use crate::network::{OAuthHttpExecutor, OAuthHttpRequest};
 use crate::provider::ProviderOAuthAdapter;
 use crate::provider::{
@@ -17,6 +20,10 @@ use super::claude_code::{
     CLAUDE_CODE_PROVIDER_TYPE, CLAUDE_CODE_REDIRECT_URI, CLAUDE_CODE_TOKEN_URL,
 };
 
+pub const GEMINI_CLI_OAUTH_CLIENT_ID_ENV: &str = "AETHER_GEMINI_CLI_OAUTH_CLIENT_ID";
+pub const GEMINI_CLI_OAUTH_CLIENT_SECRET_ENV: &str = "AETHER_GEMINI_CLI_OAUTH_CLIENT_SECRET";
+pub const ANTIGRAVITY_OAUTH_CLIENT_ID_ENV: &str = "AETHER_ANTIGRAVITY_OAUTH_CLIENT_ID";
+pub const ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV: &str = "AETHER_ANTIGRAVITY_OAUTH_CLIENT_SECRET";
 /// Codex OAuth 元数据中保存稳定账号成员指纹的字段名。
 const CODEX_IDENTITY_FINGERPRINT_FIELD: &str = "codex_identity_fingerprint";
 /// 指纹域分隔版本；升级算法时必须更换版本，避免新旧种子混用。
@@ -57,7 +64,10 @@ pub struct GenericProviderOAuthTemplate {
     pub authorize_url: &'static str,
     pub token_url: &'static str,
     pub client_id: &'static str,
-    pub client_secret: &'static str,
+    /// 可选客户端 ID 环境变量名；只影响该 OAuth 提供商的授权及 token 请求。
+    pub client_id_env: Option<&'static str>,
+    /// 可选敏感客户端凭据环境变量名；自定义客户端必须配置匹配值。
+    pub client_secret_env: Option<&'static str>,
     pub scopes: &'static [&'static str],
     pub redirect_uri: &'static str,
     pub use_pkce: bool,
@@ -72,7 +82,8 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
         authorize_url: CLAUDE_CODE_AUTHORIZE_URL,
         token_url: CLAUDE_CODE_TOKEN_URL,
         client_id: CLAUDE_CODE_CLIENT_ID,
-        client_secret: "",
+        client_id_env: None,
+        client_secret_env: None,
         scopes: CLAUDE_CODE_OAUTH_SCOPES,
         redirect_uri: CLAUDE_CODE_REDIRECT_URI,
         use_pkce: true,
@@ -85,7 +96,8 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
         authorize_url: "https://auth.openai.com/oauth/authorize",
         token_url: "https://auth.openai.com/oauth/token",
         client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
-        client_secret: "",
+        client_id_env: None,
+        client_secret_env: None,
         scopes: &["openid", "email", "profile", "offline_access"],
         redirect_uri: "http://localhost:1455/auth/callback",
         use_pkce: true,
@@ -98,7 +110,8 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
         authorize_url: "https://auth.openai.com/oauth/authorize",
         token_url: "https://auth.openai.com/oauth/token",
         client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
-        client_secret: "",
+        client_id_env: None,
+        client_secret_env: None,
         scopes: &["openid", "email", "profile", "offline_access"],
         redirect_uri: "http://localhost:1455/auth/callback",
         use_pkce: true,
@@ -111,7 +124,8 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
         authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
         token_url: "https://oauth2.googleapis.com/token",
         client_id: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
-        client_secret: "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",
+        client_id_env: Some(GEMINI_CLI_OAUTH_CLIENT_ID_ENV),
+        client_secret_env: Some(GEMINI_CLI_OAUTH_CLIENT_SECRET_ENV),
         scopes: &[
             "https://www.googleapis.com/auth/cloud-platform",
             "https://www.googleapis.com/auth/userinfo.email",
@@ -128,7 +142,8 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
         authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
         token_url: "https://oauth2.googleapis.com/token",
         client_id: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
-        client_secret: "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",
+        client_id_env: Some(ANTIGRAVITY_OAUTH_CLIENT_ID_ENV),
+        client_secret_env: Some(ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV),
         scopes: &[
             "https://www.googleapis.com/auth/cloud-platform",
             "https://www.googleapis.com/auth/userinfo.email",
@@ -143,10 +158,24 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
     },
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GenericProviderOAuthAdapter {
     template: GenericProviderOAuthTemplate,
     token_url_override: Option<String>,
+    client_id_override: Option<String>,
+    client_secret_override: Option<String>,
+}
+
+impl std::fmt::Debug for GenericProviderOAuthAdapter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenericProviderOAuthAdapter")
+            .field("provider_type", &self.template.provider_type)
+            .field("has_token_url_override", &self.token_url_override.is_some())
+            .field("client_id_env", &self.template.client_id_env)
+            .field("client_secret_env", &self.template.client_secret_env)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GenericProviderOAuthAdapter {
@@ -154,6 +183,8 @@ impl GenericProviderOAuthAdapter {
         Self {
             template,
             token_url_override: None,
+            client_id_override: None,
+            client_secret_override: None,
         }
     }
 
@@ -170,10 +201,74 @@ impl GenericProviderOAuthAdapter {
         self.with_token_url_override(token_url)
     }
 
+    #[doc(hidden)]
+    pub fn with_oauth_credentials_for_tests(
+        mut self,
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+    ) -> Self {
+        self.client_id_override = Some(client_id.into());
+        self.client_secret_override = Some(client_secret.into());
+        self
+    }
+
+    #[cfg(test)]
+    fn without_oauth_client_secret_for_tests(mut self) -> Self {
+        self.client_secret_override = Some(String::new());
+        self
+    }
+
     fn token_url(&self) -> String {
         self.token_url_override
             .clone()
             .unwrap_or_else(|| self.template.token_url.to_string())
+    }
+
+    /// 优先使用测试或环境指定的客户端 ID；缺失时使用提供商原生应用默认值。
+    fn client_id(&self) -> String {
+        if let Some(value) = self.client_id_override.clone().and_then(non_empty_owned) {
+            return value;
+        }
+
+        self.template
+            .client_id_env
+            .and_then(non_empty_environment_value)
+            .unwrap_or_else(|| self.template.client_id.to_string())
+    }
+
+    /// 解析当前客户端对应的凭据；测试覆盖值为空时显式失败，避免误用生产默认值。
+    fn client_secret(&self) -> Result<Option<String>, OAuthError> {
+        let Some(env_name) = self.template.client_secret_env else {
+            return Ok(None);
+        };
+
+        if let Some(value) = self.client_secret_override.clone() {
+            return required_client_secret(env_name, non_empty_owned(value)).map(Some);
+        }
+
+        let configured = non_empty_environment_value(env_name);
+        self.resolve_client_secret(configured).map(Some)
+    }
+
+    /// 自定义客户端必须提供匹配凭据；仅原生默认客户端允许使用内置应用凭据。
+    fn resolve_client_secret(&self, configured: Option<String>) -> Result<String, OAuthError> {
+        let configured = configured.or_else(|| {
+            let default_template = template_for_provider_type(self.template.provider_type)?;
+            if self.client_id() != default_template.client_id {
+                return None;
+            }
+            match self.template.provider_type {
+                "gemini_cli" => Some("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".to_string()),
+                "antigravity" => Some("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".to_string()),
+                _ => None,
+            }
+        });
+        required_client_secret(
+            self.template
+                .client_secret_env
+                .unwrap_or(ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV),
+            configured,
+        )
     }
 
     /// 按提供商模板交换授权码或刷新令牌，并把返回凭据规范化为统一令牌集。
@@ -186,6 +281,8 @@ impl GenericProviderOAuthAdapter {
         state: Option<&str>,
         pkce_verifier: Option<&str>,
     ) -> Result<ProviderOAuthTokenSet, OAuthError> {
+        let client_id = self.client_id();
+        let client_secret = self.client_secret()?;
         let scope = (!self.template.scopes.is_empty()).then(|| self.template.scopes.join(" "));
         let request_id = match grant_type {
             "authorization_code" => "provider-oauth:exchange-code".to_string(),
@@ -201,11 +298,14 @@ impl GenericProviderOAuthAdapter {
                     "grant_type".to_string(),
                     Value::String(grant_type.to_string()),
                 ),
-                (
-                    "client_id".to_string(),
-                    Value::String(self.template.client_id.to_string()),
-                ),
+                ("client_id".to_string(), Value::String(client_id.clone())),
             ]);
+            if let Some(client_secret) = client_secret.as_ref() {
+                body.insert(
+                    "client_secret".to_string(),
+                    Value::String(client_secret.clone()),
+                );
+            }
             if grant_type == "authorization_code" {
                 body.insert(
                     "code".to_string(),
@@ -252,7 +352,7 @@ impl GenericProviderOAuthAdapter {
             let form_body = {
                 let mut form = form_urlencoded::Serializer::new(String::new());
                 form.append_pair("grant_type", grant_type);
-                form.append_pair("client_id", self.template.client_id);
+                form.append_pair("client_id", &client_id);
                 if grant_type == "authorization_code" {
                     form.append_pair("redirect_uri", self.template.redirect_uri);
                     form.append_pair("code", code_or_refresh_token);
@@ -267,8 +367,8 @@ impl GenericProviderOAuthAdapter {
                         form.append_pair("scope", scope);
                     }
                 }
-                if !self.template.client_secret.trim().is_empty() {
-                    form.append_pair("client_secret", self.template.client_secret);
+                if let Some(client_secret) = client_secret.as_deref() {
+                    form.append_pair("client_secret", client_secret);
                 }
                 form.finish().into_bytes()
             };
@@ -346,12 +446,14 @@ impl ProviderOAuthAdapter for GenericProviderOAuthAdapter {
         state: &str,
         code_challenge: Option<&str>,
     ) -> Result<OAuthAuthorizeResponse, OAuthError> {
+        self.client_secret()?;
+        let client_id = self.client_id();
         let mut url = url::Url::parse(self.template.authorize_url)
             .map_err(|_| OAuthError::invalid_request("authorize_url must be absolute"))?;
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("response_type", "code");
-            query.append_pair("client_id", self.template.client_id);
+            query.append_pair("client_id", &client_id);
             query.append_pair("redirect_uri", self.template.redirect_uri);
             query.append_pair("state", state);
             if !self.template.scopes.is_empty() {
@@ -483,6 +585,26 @@ impl ProviderOAuthAdapter for GenericProviderOAuthAdapter {
     }
 }
 
+fn non_empty_environment_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(non_empty_owned)
+}
+
+fn non_empty_owned(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn required_client_secret(
+    env_name: &'static str,
+    configured: Option<String>,
+) -> Result<String, OAuthError> {
+    configured.ok_or_else(|| {
+        OAuthError::invalid_request(format!(
+            "{env_name} must be configured for this OAuth provider"
+        ))
+    })
+}
+
 pub fn template_for_provider_type(provider_type: &str) -> Option<GenericProviderOAuthTemplate> {
     let normalized = provider_type.trim();
     GENERIC_PROVIDER_OAUTH_TEMPLATES
@@ -517,12 +639,7 @@ fn json_headers(provider_type: &str) -> BTreeMap<String, String> {
 }
 
 fn truncate_body(body: &str) -> String {
-    let body = body.trim();
-    if body.is_empty() {
-        "-".to_string()
-    } else {
-        body.chars().take(500).collect()
-    }
+    redacted_oauth_error_body_excerpt(body)
 }
 
 /// 对敏感值生成不可逆短指纹，仅用于稳定去重，不返回原始凭据。
@@ -810,8 +927,21 @@ fn value_to_string(value: &Value) -> Option<String> {
 /// 无验签解析本地已获取 token 的声明，仅用于元数据投影；失败时返回缺失而不影响授权。
 fn decode_jwt_claims(token: &str) -> Option<serde_json::Map<String, Value>> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    const MAX_UNVERIFIED_JWT_CLAIMS_BYTES: usize = 64 * 1024;
+
     let payload = token.split('.').nth(1)?;
+    let max_encoded_len = MAX_UNVERIFIED_JWT_CLAIMS_BYTES
+        .saturating_add(2)
+        .checked_div(3)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4);
+    if payload.len() > max_encoded_len {
+        return None;
+    }
     let bytes = URL_SAFE_NO_PAD.decode(payload.as_bytes()).ok()?;
+    if bytes.len() > MAX_UNVERIFIED_JWT_CLAIMS_BYTES {
+        return None;
+    }
     serde_json::from_slice::<Value>(&bytes)
         .ok()?
         .as_object()
@@ -821,9 +951,12 @@ fn decode_jwt_claims(token: &str) -> Option<serde_json::Map<String, Value>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_codex_identity_fingerprint, enrich_generic_identity, template_for_provider_type,
-        GenericProviderOAuthAdapter, CODEX_IDENTITY_FINGERPRINT_FIELD,
+        decode_jwt_claims, derive_codex_identity_fingerprint, enrich_generic_identity,
+        template_for_provider_type, GenericProviderOAuthAdapter,
+        ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV, CODEX_IDENTITY_FINGERPRINT_FIELD,
+        GEMINI_CLI_OAUTH_CLIENT_SECRET_ENV,
     };
+    use crate::core::OAuthError;
     use crate::network::{OAuthHttpExecutor, OAuthHttpRequest, OAuthHttpResponse};
     use crate::provider::ProviderOAuthAdapter;
     use crate::provider::{ProviderOAuthAccount, ProviderOAuthTransportContext};
@@ -857,6 +990,111 @@ mod tests {
         )
     }
 
+    #[test]
+    fn google_oauth_templates_reference_external_client_secrets() {
+        let gemini = template_for_provider_type("gemini_cli").expect("gemini template");
+        let antigravity = template_for_provider_type("antigravity").expect("antigravity template");
+
+        assert_eq!(
+            gemini.client_secret_env,
+            Some(GEMINI_CLI_OAUTH_CLIENT_SECRET_ENV)
+        );
+        assert_eq!(
+            antigravity.client_secret_env,
+            Some(ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV)
+        );
+    }
+
+    #[tokio::test]
+    async fn google_default_credentials_support_authorization_and_refresh() {
+        for provider_type in ["gemini_cli", "antigravity"] {
+            let mut template = template_for_provider_type(provider_type).expect("template");
+            template.client_id_env = None;
+            template.client_secret_env = Some("AETHER_TEST_UNUSED_ANTIGRAVITY_SECRET");
+            let adapter = GenericProviderOAuthAdapter::new(template);
+            let ctx = transport_context(provider_type);
+            adapter
+                .build_authorize_url(&ctx, "state", None)
+                .expect("authorize");
+            let seen_request = Arc::new(Mutex::new(None));
+            let executor = StaticExecutor {
+                seen_request: Arc::clone(&seen_request),
+                response_payload: json!({"access_token": "new-token", "expires_in": 3600}),
+            };
+            adapter
+                .refresh(&executor, &ctx, &oauth_account(provider_type))
+                .await
+                .expect("refresh");
+            let seen = seen_request.lock().expect("lock").clone().expect("request");
+            let body = seen.body_bytes.expect("body");
+            let fields = url::form_urlencoded::parse(&body)
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(fields["client_id"], template.client_id);
+            assert_eq!(
+                fields["client_secret"],
+                adapter.resolve_client_secret(None).expect("default")
+            );
+            assert_eq!(fields["refresh_token"], "old-refresh-token");
+            assert!(!format!("{adapter:?}").contains(&fields["client_secret"]));
+        }
+    }
+
+    #[test]
+    fn google_custom_client_requires_its_own_secret() {
+        for provider_type in ["gemini_cli", "antigravity"] {
+            let adapter = GenericProviderOAuthAdapter::for_provider_type(provider_type)
+                .expect("adapter")
+                .with_oauth_credentials_for_tests("custom-client", "custom-secret");
+            assert!(adapter.resolve_client_secret(None).is_err());
+            assert_eq!(
+                adapter
+                    .resolve_client_secret(Some("custom-secret".to_string()))
+                    .expect("configured secret"),
+                "custom-secret"
+            );
+            assert_eq!(
+                adapter.client_secret().expect("override"),
+                Some("custom-secret".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn google_configured_secret_overrides_the_native_app_default() {
+        for provider_type in ["gemini_cli", "antigravity"] {
+            let adapter =
+                GenericProviderOAuthAdapter::for_provider_type(provider_type).expect("adapter");
+            assert_eq!(
+                adapter
+                    .resolve_client_secret(Some("configured-secret".to_string()))
+                    .unwrap(),
+                "configured-secret"
+            );
+            let mut template = template_for_provider_type(provider_type).expect("template");
+            template.client_id = "custom-template-client";
+            template.client_id_env = None;
+            assert!(GenericProviderOAuthAdapter::new(template)
+                .resolve_client_secret(None)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn generic_adapter_debug_redacts_oauth_credentials() {
+        let adapter = GenericProviderOAuthAdapter::for_provider_type("gemini_cli")
+            .expect("gemini adapter")
+            .with_token_url_override("https://token.example.test/private-path")
+            .with_oauth_credentials_for_tests("private-client-id", "private-client-secret");
+
+        let debug = format!("{adapter:?}");
+
+        assert!(!debug.contains("private-client-id"));
+        assert!(!debug.contains("private-client-secret"));
+        assert!(!debug.contains("private-path"));
+        assert!(debug.contains(GEMINI_CLI_OAUTH_CLIENT_SECRET_ENV));
+    }
+
     /// 验证 FedRAMP 工作区声明也能投影为 Codex 账号身份。
     #[test]
     fn codex_identity_extracts_fedramp_workspace_claim() {
@@ -873,6 +1111,19 @@ mod tests {
 
         assert_eq!(auth_config.get("account_id"), Some(&json!("acct-fedramp")));
         assert_eq!(auth_config.get("is_fedramp"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn generic_identity_rejects_oversized_jwt_claims_before_decode() {
+        const MAX_UNVERIFIED_JWT_CLAIMS_BYTES: usize = 64 * 1024;
+        let max_encoded_len = MAX_UNVERIFIED_JWT_CLAIMS_BYTES
+            .saturating_add(2)
+            .checked_div(3)
+            .unwrap()
+            .saturating_mul(4);
+        let token = format!("header.{}.signature", "A".repeat(max_encoded_len + 1));
+
+        assert_eq!(decode_jwt_claims(&token), None);
     }
 
     /// 验证持久指纹按工作区成员隔离，并且 access token 轮换不改变它。
@@ -963,6 +1214,108 @@ mod tests {
                 json_body: None,
             })
         }
+    }
+
+    fn transport_context(provider_type: &str) -> ProviderOAuthTransportContext {
+        ProviderOAuthTransportContext {
+            provider_id: "provider-1".to_string(),
+            provider_type: provider_type.to_string(),
+            endpoint_id: None,
+            key_id: Some("key-1".to_string()),
+            auth_type: Some("oauth".to_string()),
+            decrypted_api_key: None,
+            decrypted_auth_config: None,
+            provider_config: None,
+            endpoint_config: None,
+            key_config: None,
+            network: crate::network::OAuthNetworkContext::provider_operation(None),
+        }
+    }
+
+    fn oauth_account(provider_type: &str) -> ProviderOAuthAccount {
+        ProviderOAuthAccount {
+            provider_type: provider_type.to_string(),
+            access_token: "old-access-token".to_string(),
+            auth_config: json!({
+                "provider_type": provider_type,
+                "refresh_token": "old-refresh-token",
+                "updated_at": 1
+            }),
+            expires_at_unix_secs: Some(1),
+            identity: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn google_oauth_fails_closed_before_network_without_client_secret() {
+        let seen_request = Arc::new(Mutex::new(None));
+        let executor = StaticExecutor {
+            seen_request: Arc::clone(&seen_request),
+            response_payload: json!({}),
+        };
+        let adapter = GenericProviderOAuthAdapter::for_provider_type("gemini_cli")
+            .expect("gemini adapter")
+            .without_oauth_client_secret_for_tests();
+        let ctx = transport_context("gemini_cli");
+
+        let authorize_error = adapter
+            .build_authorize_url(&ctx, "state", None)
+            .expect_err("authorization must fail without the configured secret");
+        assert!(matches!(authorize_error, OAuthError::InvalidRequest(_)));
+
+        let refresh_error = adapter
+            .refresh(&executor, &ctx, &oauth_account("gemini_cli"))
+            .await
+            .expect_err("refresh must fail without the configured secret");
+        assert!(matches!(refresh_error, OAuthError::InvalidRequest(_)));
+        assert!(
+            seen_request.lock().expect("mutex should lock").is_none(),
+            "credential validation must happen before the HTTP executor runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_oauth_injected_credentials_are_sent_in_token_form() {
+        let seen_request = Arc::new(Mutex::new(None));
+        let executor = StaticExecutor {
+            seen_request: Arc::clone(&seen_request),
+            response_payload: json!({
+                "access_token": "new-access-token",
+                "expires_in": 3600,
+            }),
+        };
+        let adapter = GenericProviderOAuthAdapter::for_provider_type("gemini_cli")
+            .expect("gemini adapter")
+            .with_oauth_credentials_for_tests("test-client-id", "test-client-secret");
+        let ctx = transport_context("gemini_cli");
+
+        adapter
+            .refresh(&executor, &ctx, &oauth_account("gemini_cli"))
+            .await
+            .expect("refresh should succeed");
+
+        let seen = seen_request
+            .lock()
+            .expect("mutex should lock")
+            .clone()
+            .expect("request should be captured");
+        let form = String::from_utf8(seen.body_bytes.expect("form body should exist"))
+            .expect("form body should be utf8");
+        let fields = url::form_urlencoded::parse(form.as_bytes())
+            .into_owned()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            fields.get("client_id").map(String::as_str),
+            Some("test-client-id")
+        );
+        assert_eq!(
+            fields.get("client_secret").map(String::as_str),
+            Some("test-client-secret")
+        );
+        assert_eq!(
+            fields.get("refresh_token").map(String::as_str),
+            Some("old-refresh-token")
+        );
     }
 
     /// 验证上游不返回新 refresh token 时仍保留旧 refresh token 和原成员指纹。

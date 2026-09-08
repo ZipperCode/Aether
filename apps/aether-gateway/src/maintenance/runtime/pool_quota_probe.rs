@@ -1104,6 +1104,17 @@ async fn refresh_provider_probe_keys(
     .await
 }
 
+fn pool_quota_probe_worker_error_score_reason(_error: &GatewayError) -> Value {
+    serde_json::json!({
+        "last_probe": {
+            "source": "pool_quota_probe",
+            "status": "worker_error",
+            "category": "worker_error",
+            "message": "Provider quota probe worker failed"
+        }
+    })
+}
+
 fn update_summary_from_payload(
     summary: &mut PoolQuotaProbeRunSummary,
     selected_count: usize,
@@ -1352,6 +1363,18 @@ fn probe_result_hard_state(item: &Value) -> Option<PoolMemberHardState> {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
+    // Providers frequently encode an exhausted account as HTTP 429 with a
+    // provider-specific status/message (for example RESOURCE_EXHAUSTED or
+    // `quota exceeded`) rather than the normalized `quota_exhausted` status.
+    // Preserve that distinction in the score so the member stays out of the
+    // scheduler until a successful quota probe observes a reset.
+    let serialized_item = item.to_string().to_ascii_lowercase();
+    let status_code = item.get("status_code").and_then(Value::as_u64);
+    if status == "quota_exhausted"
+        || (status_code == Some(429) && contains_quota_exhaustion_marker(&serialized_item))
+    {
+        return Some(PoolMemberHardState::QuotaExhausted);
+    }
     match status.as_str() {
         "auth_invalid" | "forbidden" => Some(PoolMemberHardState::AuthInvalid),
         "workspace_deactivated" => Some(PoolMemberHardState::Banned),
@@ -1458,6 +1481,26 @@ fn quota_probe_concurrency(provider_type: &str, configured: usize, global: usize
     } else {
         concurrency
     }
+}
+
+fn contains_quota_exhaustion_marker(value: &str) -> bool {
+    [
+        "quota exhausted",
+        "quota_exhausted",
+        "quota exceeded",
+        "quota_exceeded",
+        "insufficient_quota",
+        "resource exhausted",
+        "resource has been exhausted",
+        "resource_exhausted",
+        "usage_limit_reached",
+        "limit_reached",
+        "quota limit reached",
+        "credits exhausted",
+        "insufficient credits",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
 }
 
 async fn perform_pool_quota_probe_for_provider(
@@ -1680,13 +1723,7 @@ async fn perform_pool_quota_probe_for_provider(
                         now_ts,
                         false,
                         Some(PoolMemberHardState::Cooldown),
-                        serde_json::json!({
-                            "last_probe": {
-                                "source": "pool_quota_probe",
-                                "status": "worker_error",
-                                "message": format!("{err:?}")
-                            }
-                        }),
+                        pool_quota_probe_worker_error_score_reason(&err),
                     )
                     .await;
                 }
@@ -1694,7 +1731,7 @@ async fn perform_pool_quota_probe_for_provider(
                     provider_id = %provider_short_id,
                     provider_type,
                     key_id,
-                    error = ?err,
+                    error_category = "provider_quota_probe_failed",
                     "gateway pool quota probe failed"
                 );
             }
@@ -1974,9 +2011,12 @@ pub(crate) fn spawn_pool_quota_probe_worker(
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if let Err(err) = perform_pool_quota_probe_once_with_config(&state, config).await {
+                if perform_pool_quota_probe_once_with_config(&state, config)
+                    .await
+                    .is_err()
+                {
                     warn!(
-                        error = ?err,
+                        error_category = "pool_quota_probe_worker_failed",
                         "gateway pool quota probe worker tick failed"
                     );
                 }
@@ -1990,6 +2030,30 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn worker_error_score_reason_drops_runtime_error_details() {
+        let secret = "postgresql://admin:db-secret@db.internal/aether; Authorization: Bearer quota-secret; https://user:password@upstream.test/quota?q=secret";
+        let patch =
+            pool_quota_probe_worker_error_score_reason(&GatewayError::Internal(secret.to_string()));
+        let serialized = patch.to_string();
+
+        assert_eq!(patch["last_probe"]["status"], "worker_error");
+        assert_eq!(patch["last_probe"]["category"], "worker_error");
+        assert_eq!(
+            patch["last_probe"]["message"],
+            "Provider quota probe worker failed"
+        );
+        for sensitive in [
+            "db-secret",
+            "quota-secret",
+            "user:password",
+            "db.internal",
+            "upstream.test",
+        ] {
+            assert!(!serialized.contains(sensitive));
+        }
+    }
 
     fn key(
         id: &str,
@@ -2110,6 +2174,26 @@ mod tests {
         let selected = select_pool_quota_probe_key_ids(&keys, "codex", 2_000, 600, &stamps, 2);
 
         assert_eq!(selected, vec!["never".to_string(), "old".to_string()]);
+    }
+
+    #[test]
+    fn quota_markers_in_429_probe_results_are_hard_exhaustion() {
+        assert_eq!(
+            probe_result_hard_state(&json!({
+                "status": "rate_limited",
+                "status_code": 429,
+                "message": "RESOURCE_EXHAUSTED: quota exceeded"
+            })),
+            Some(PoolMemberHardState::QuotaExhausted)
+        );
+        assert_eq!(
+            probe_result_hard_state(&json!({
+                "status": "rate_limited",
+                "status_code": 429,
+                "message": "temporary rate limit"
+            })),
+            Some(PoolMemberHardState::Cooldown)
+        );
     }
 
     fn score(

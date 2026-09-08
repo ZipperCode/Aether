@@ -7,11 +7,10 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };
 use aether_model_fetch::{
-    aggregate_models_for_cache, apply_model_filters,
-    fetch_models_from_transports_for_client_version, global_model_matches_allowed_models,
-    json_string_list, model_catalog_upstream_metadata, model_fetch_interval_minutes,
-    model_fetch_startup_delay_seconds, model_fetch_startup_enabled, preset_models_for_provider,
-    reconcile_provider_model_whitelist_availability,
+    aggregate_models_for_cache, apply_model_filters, fetch_models_from_transports_for_management,
+    global_model_matches_allowed_models, json_string_list, model_catalog_upstream_metadata,
+    model_fetch_interval_minutes, model_fetch_startup_delay_seconds, model_fetch_startup_enabled,
+    preset_models_for_provider, reconcile_provider_model_whitelist_availability,
     selected_models_fetch_endpoints_for_api_formats, sync_provider_model_discovery_associations,
     sync_provider_model_whitelist_associations, upstream_metadata_namespace_updates,
     ModelFetchAssociationStore, ModelFetchRunSummary,
@@ -48,7 +47,10 @@ pub(crate) fn spawn_model_fetch_worker(state: AppState) -> Option<tokio::task::J
                     tokio::time::sleep(Duration::from_secs(startup_delay)).await;
                 }
                 if let Err(err) = run_model_fetch_cycle(&state, "startup").await {
-                    warn!(error = ?err, "gateway model fetch startup failed");
+                    warn!(
+                        error = %safe_model_fetch_error(&err.clone().into_message()),
+                        "gateway model fetch startup failed"
+                    );
                 }
             } else {
                 info!("gateway model fetch startup disabled");
@@ -62,7 +64,10 @@ pub(crate) fn spawn_model_fetch_worker(state: AppState) -> Option<tokio::task::J
             loop {
                 interval.tick().await;
                 if let Err(err) = run_model_fetch_cycle(&state, "tick").await {
-                    warn!(error = ?err, "gateway model fetch tick failed");
+                    warn!(
+                        error = %safe_model_fetch_error(&err.clone().into_message()),
+                        "gateway model fetch tick failed"
+                    );
                 }
             }
         },
@@ -223,7 +228,7 @@ where
     }
 
     let providers = state
-        .list_provider_catalog_providers(true)
+        .list_provider_catalog_providers_for_model_fetch(true)
         .await?
         .into_iter()
         .filter(|provider| provider_id_filter.is_none_or(|provider_id| provider.id == provider_id))
@@ -238,7 +243,7 @@ where
         .collect::<Vec<_>>();
     let mut endpoints_by_provider = HashMap::<String, Vec<StoredProviderCatalogEndpoint>>::new();
     for endpoint in state
-        .list_provider_catalog_endpoints_by_provider_ids(&provider_ids)
+        .list_provider_catalog_endpoints_for_model_fetch(&provider_ids)
         .await?
     {
         endpoints_by_provider
@@ -265,8 +270,12 @@ where
     for provider in providers {
         let endpoints = endpoints_by_provider
             .remove(&provider.id)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(sanitize_model_fetch_endpoint)
+            .collect::<Vec<_>>();
         let keys = keys_by_provider.remove(&provider.id).unwrap_or_default();
+        let provider = sanitize_model_fetch_provider(provider);
         for key in keys {
             if key_id_filter.is_some_and(|key_ids| !key_ids.contains(&key.id)) {
                 continue;
@@ -286,6 +295,32 @@ where
         }
     }
     Ok(targets)
+}
+
+/// Keep only non-secret provider metadata in a background fetch target.  The
+/// authoritative transport snapshot is reopened by ID immediately before a
+/// request, so carrying stored proxy/config JSON here would needlessly retain
+/// credentials and could expose malformed historical values to later stages.
+fn sanitize_model_fetch_provider(
+    mut provider: StoredProviderCatalogProvider,
+) -> StoredProviderCatalogProvider {
+    provider.proxy = None;
+    provider.config = None;
+    provider
+}
+
+/// Endpoint selection needs only activity, format, and identity.  Clear
+/// transport rules/proxy data because those are reloaded from the snapshot
+/// just before execution.
+fn sanitize_model_fetch_endpoint(
+    mut endpoint: StoredProviderCatalogEndpoint,
+) -> StoredProviderCatalogEndpoint {
+    endpoint.header_rules = None;
+    endpoint.body_rules = None;
+    endpoint.config = None;
+    endpoint.format_acceptance_config = None;
+    endpoint.proxy = None;
+    endpoint
 }
 
 /// 顺序执行本轮抓取目标，并将 Provider 全量白名单可用性核对合并为每个成功 Provider 一次。
@@ -509,13 +544,14 @@ async fn fetch_and_persist_key_models(
     }
 
     let mut transports = Vec::new();
+    let mut skipped_invalid_credential = false;
     for endpoint in &target.endpoints {
         match state
             .read_provider_transport_snapshot(&target.provider.id, &endpoint.id, &target.key.id)
-            .await?
+            .await
         {
-            Some(transport) => transports.push(transport),
-            None => {
+            Ok(Some(transport)) => transports.push(transport),
+            Ok(None) => {
                 warn!(
                     provider_id = %target.provider.id,
                     endpoint_id = %endpoint.id,
@@ -523,7 +559,29 @@ async fn fetch_and_persist_key_models(
                     "gateway model fetch transport snapshot unavailable"
                 );
             }
+            Err(error) if is_nonfatal_legacy_credential_error(&error) => {
+                skipped_invalid_credential = true;
+                warn!(
+                    event_name = "model_fetch_skipped_invalid_credential",
+                    log_type = "ops",
+                    provider_id = %target.provider.id,
+                    endpoint_id = %endpoint.id,
+                    key_id = %target.key.id,
+                    reason = "invalid_stored_credential",
+                    "gateway skipped model fetch for an invalid stored credential"
+                );
+            }
+            Err(error) => return Err(error),
         }
+    }
+
+    // A malformed legacy credential is isolated to its key. Do not turn it
+    // into a cycle-wide failure (or rewrite the row merely to record a fetch
+    // error), and let other eligible keys continue through the worker.
+    if transports.is_empty() && skipped_invalid_credential {
+        return Ok(KeyFetchOutcome::without_models(
+            KeyFetchDisposition::Skipped,
+        ));
     }
 
     if transports.is_empty() {
@@ -551,7 +609,7 @@ async fn fetch_and_persist_key_models(
     } else {
         None
     };
-    let result = match fetch_models_from_transports_for_client_version(
+    let result = match fetch_models_from_transports_for_management(
         state,
         &transports,
         codex_client_version.as_deref(),
@@ -560,11 +618,13 @@ async fn fetch_and_persist_key_models(
     {
         Ok(result) => result,
         Err(err) => {
-            persist_key_fetch_failure(state, &target.key, now_unix_secs, err.clone()).await?;
+            let safe_error = safe_model_fetch_error(&err);
+            persist_key_fetch_failure(state, &target.key, now_unix_secs, safe_error.clone())
+                .await?;
             warn!(
                 provider_id = %target.provider.id,
                 key_id = %target.key.id,
-                message = %err,
+                error = %safe_error,
                 "gateway model fetch failed"
             );
             return Ok(KeyFetchOutcome::without_models(KeyFetchDisposition::Failed));
@@ -577,11 +637,12 @@ async fn fetch_and_persist_key_models(
         } else {
             result.errors.join("; ")
         };
-        persist_key_fetch_failure(state, &target.key, now_unix_secs, error.clone()).await?;
+        let safe_error = safe_model_fetch_error(&error);
+        persist_key_fetch_failure(state, &target.key, now_unix_secs, safe_error.clone()).await?;
         warn!(
             provider_id = %target.provider.id,
             key_id = %target.key.id,
-            message = %error,
+            error = %safe_error,
             "gateway model fetch failed"
         );
         return Ok(KeyFetchOutcome::without_models(KeyFetchDisposition::Failed));
@@ -673,16 +734,142 @@ async fn persist_key_fetch_failure(
     now_unix_secs: u64,
     error: String,
 ) -> Result<(), GatewayError> {
+    let safe_error = safe_model_fetch_error(&error);
     state
         .update_provider_catalog_key_model_fetch_state(
             &key.id,
             key.allowed_models.as_ref(),
             Some(now_unix_secs),
-            Some(&error),
+            Some(&safe_error),
             Some(now_unix_secs),
         )
         .await?;
     Ok(())
+}
+
+pub(crate) fn safe_model_fetch_error(error: &str) -> String {
+    let trimmed = error.trim();
+    match trimmed {
+        "No supported endpoint for Rust models fetch"
+        | "Provider transport snapshot unavailable" => return trimmed.to_string(),
+        _ => {}
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(status) = model_fetch_error_http_status(&lower) {
+        return match status {
+            401 => "Upstream models fetch authentication failed (status 401)".to_string(),
+            403 => "Upstream models fetch authorization failed (status 403)".to_string(),
+            404 => "Upstream models fetch endpoint not found (status 404)".to_string(),
+            408 => "Upstream models fetch timed out (status 408)".to_string(),
+            429 => "Upstream models fetch rate limited (status 429)".to_string(),
+            _ => format!("Upstream models fetch failed (status {status})"),
+        };
+    }
+    if lower.contains("unauthorized")
+        || lower.contains("authentication failed")
+        || lower.contains("invalid api key")
+        || lower.contains("invalid token")
+    {
+        return "Upstream models fetch authentication failed".to_string();
+    }
+    if lower.contains("forbidden") || lower.contains("authorization failed") {
+        return "Upstream models fetch authorization failed".to_string();
+    }
+    if lower.contains("rate limit") || lower.contains("too many requests") {
+        return "Upstream models fetch rate limited".to_string();
+    }
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return "Upstream models fetch timed out".to_string();
+    }
+    if lower.contains("missing api key")
+        || lower.contains("missing access token")
+        || (lower.contains("requires") && lower.contains("auth"))
+    {
+        return "Provider credentials unavailable for models fetch".to_string();
+    }
+    if lower.contains("private_key")
+        || lower.contains("auth_config")
+        || lower.contains("configuration")
+    {
+        return "Provider models fetch configuration is invalid".to_string();
+    }
+    if lower.contains("response body")
+        || lower.contains("json")
+        || lower.contains("malformed")
+        || lower.contains("parse")
+        || lower.contains("no models")
+        || lower.contains("invalid response")
+    {
+        return "Upstream models fetch response was invalid".to_string();
+    }
+    if lower.contains("connect")
+        || lower.contains("connection")
+        || lower.contains("network")
+        || lower.contains("dns")
+        || lower.contains("tls")
+        || lower.contains("certificate")
+    {
+        return "Upstream models fetch connection failed".to_string();
+    }
+    "Upstream models fetch failed".to_string()
+}
+
+/// Credential decoding failures from old catalog rows are isolated by the
+/// background model-fetch worker. Normal request/admin paths remain fail
+/// closed; this predicate only controls whether one maintenance item may be
+/// skipped without aborting the whole cycle.
+fn is_nonfatal_legacy_credential_error(error: &GatewayError) -> bool {
+    let GatewayError::Internal(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    // Missing encryption configuration is an operational failure and must
+    // remain fail-closed.  Only errors that identify a stored field or a
+    // malformed legacy ciphertext are safe to isolate to one key.
+    if message.contains("encryption key is not configured") {
+        return false;
+    }
+    message.contains("provider_api_keys.api_key")
+        || message.contains("provider_api_keys.auth_config")
+        || message.contains("stored provider proxy credentials cannot be decrypted")
+        || message.contains("stored endpoint proxy credentials cannot be decrypted")
+        || message.contains("stored key proxy credentials cannot be decrypted")
+        || message.contains("stored provider proxy changed during credential migration")
+        || message.contains("stored endpoint proxy changed during credential migration")
+        || message.contains("stored key changed during credential migration")
+        || message.contains("stored provider proxy credential migration did not stabilize")
+        || message.contains("stored endpoint proxy credential migration did not stabilize")
+        || message.contains("stored key proxy credential migration did not stabilize")
+        || message.contains("legacy provider catalog credential")
+        || message.contains("provider catalog credential is not an authenticated ciphertext")
+        || message.contains("provider catalog credential contains reserved framing")
+        || message.contains("provider catalog credential authentication failed")
+        || message.contains("provider catalog credential envelope")
+}
+
+fn model_fetch_error_http_status(error: &str) -> Option<u16> {
+    [
+        "http ",
+        "status ",
+        "status=",
+        "status:",
+        "status_code=",
+        "status_code:",
+    ]
+    .into_iter()
+    .find_map(|marker| {
+        let suffix = error.split_once(marker)?.1.trim_start();
+        let digits = suffix
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .take(3)
+            .collect::<Vec<_>>();
+        (digits.len() == 3)
+            .then(|| std::str::from_utf8(&digits).ok()?.parse::<u16>().ok())
+            .flatten()
+            .filter(|status| (400..600).contains(status))
+    })
 }
 
 async fn persist_key_fetch_success(
@@ -728,7 +915,9 @@ fn now_unix_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{perform_model_fetch_once_with_state, state::ModelFetchRuntimeState};
+    use super::{
+        perform_model_fetch_once_with_state, safe_model_fetch_error, state::ModelFetchRuntimeState,
+    };
     use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot};
     use aether_data_contracts::repository::global_models::{
         AdminGlobalModelListQuery, AdminProviderModelListQuery, StoredAdminGlobalModelPage,
@@ -760,6 +949,7 @@ mod tests {
         endpoints: Arc<Vec<StoredProviderCatalogEndpoint>>,
         keys: Arc<Mutex<Vec<StoredProviderCatalogKey>>>,
         transports: Arc<HashMap<(String, String, String), GatewayProviderTransportSnapshot>>,
+        transport_errors: Arc<HashMap<(String, String, String), String>>,
         execution_results: Arc<Mutex<VecDeque<ExecutionResult>>>,
         executed_plans: Arc<Mutex<Vec<ExecutionPlan>>>,
         cached_models: Arc<Mutex<HashMap<(String, String), Vec<Value>>>>,
@@ -784,6 +974,7 @@ mod tests {
                 endpoints: Arc::new(endpoints),
                 keys: Arc::new(Mutex::new(keys)),
                 transports: Arc::new(transports),
+                transport_errors: Arc::new(HashMap::new()),
                 execution_results: Arc::new(Mutex::new(VecDeque::from(execution_results))),
                 executed_plans: Arc::new(Mutex::new(Vec::new())),
                 cached_models: Arc::new(Mutex::new(HashMap::new())),
@@ -796,6 +987,14 @@ mod tests {
 
         fn with_provider_models(self, models: Vec<StoredAdminProviderModel>) -> Self {
             *self.provider_models.lock().expect("provider models mutex") = models;
+            self
+        }
+
+        fn with_transport_errors(
+            mut self,
+            transport_errors: HashMap<(String, String, String), String>,
+        ) -> Self {
+            self.transport_errors = Arc::new(transport_errors);
             self
         }
 
@@ -1000,6 +1199,13 @@ mod tests {
             endpoint_id: &str,
             key_id: &str,
         ) -> Result<Option<GatewayProviderTransportSnapshot>, GatewayError> {
+            if let Some(error) = self.transport_errors.get(&(
+                provider_id.to_string(),
+                endpoint_id.to_string(),
+                key_id.to_string(),
+            )) {
+                return Err(GatewayError::Internal(error.clone()));
+            }
             Ok(self
                 .transports
                 .get(&(
@@ -1226,10 +1432,14 @@ mod tests {
     }
 
     fn execution_result(body: Value) -> ExecutionResult {
+        execution_result_with_status(200, body)
+    }
+
+    fn execution_result_with_status(status_code: u16, body: Value) -> ExecutionResult {
         ExecutionResult {
             request_id: "req-1".to_string(),
             candidate_id: None,
-            status_code: 200,
+            status_code,
             headers: Default::default(),
             response_observation: None,
             body: Some(aether_contracts::ResponseBody {
@@ -1438,6 +1648,56 @@ mod tests {
         assert!(!queries
             .iter()
             .any(|provider_ids| provider_ids.len() == 1 && provider_ids[0] == "provider-failed"));
+    }
+
+    #[test]
+    fn model_fetch_error_projection_discards_transport_credentials_and_urls() {
+        let error = "connection failed for https://user:password@example.test/v1/models?key=\
+                     query-secret: Authorization: Bearer transport-secret-token-value";
+
+        let safe_error = safe_model_fetch_error(error);
+
+        assert_eq!(safe_error, "Upstream models fetch connection failed");
+        for secret in [
+            "user",
+            "password",
+            "query-secret",
+            "transport-secret-token-value",
+            "Bearer",
+            "example.test",
+        ] {
+            assert!(!safe_error.contains(secret));
+        }
+    }
+
+    #[test]
+    fn model_fetch_error_projection_discards_unclassified_details() {
+        let error =
+            "opaque failure at https://user:password@example.test/private?key=query-secret; \
+                     Authorization: Bearer transport-secret-token-value";
+
+        let safe_error = safe_model_fetch_error(error);
+
+        assert_eq!(safe_error, "Upstream models fetch failed");
+        for secret in [
+            "user",
+            "password",
+            "query-secret",
+            "transport-secret-token-value",
+            "Bearer",
+            "example.test",
+        ] {
+            assert!(!safe_error.contains(secret));
+        }
+    }
+
+    #[test]
+    fn invalid_credential_classifier_does_not_swallow_missing_key_configuration() {
+        assert!(!super::is_nonfatal_legacy_credential_error(
+            &GatewayError::Internal(
+                "provider catalog credential encryption key is not configured".to_string(),
+            )
+        ));
     }
 
     #[tokio::test]
@@ -1777,6 +2037,187 @@ mod tests {
             updated.last_models_fetch_error.as_deref(),
             Some("Provider transport snapshot unavailable")
         );
+    }
+
+    // 上游独立回归与本地空目录/精确 Endpoint 对账回归并存。
+    #[tokio::test]
+    async fn model_fetch_isolates_malformed_legacy_key_from_healthy_key() {
+        let provider = sample_provider("provider-openai", "openai");
+        let endpoint = sample_endpoint(
+            "endpoint-openai-responses",
+            "provider-openai",
+            "openai:responses",
+        );
+        let mut malformed = sample_key(
+            "key-openai-malformed",
+            "provider-openai",
+            "api_key",
+            &["openai:responses"],
+        );
+        malformed.encrypted_api_key = Some("legacy-plaintext-or-corrupt".to_string());
+        malformed.allowed_models = Some(json!(["legacy-model"]));
+        malformed.last_models_fetch_error = Some("previous error".to_string());
+        let malformed_ciphertext = malformed.encrypted_api_key.clone();
+        let healthy = sample_key(
+            "key-openai-healthy",
+            "provider-openai",
+            "api_key",
+            &["openai:responses"],
+        );
+        let healthy_transport = sample_transport(
+            "openai",
+            "provider-openai",
+            "endpoint-openai-responses",
+            "key-openai-healthy",
+            "openai:responses",
+            "api_key",
+            None,
+        );
+        let state = TestState::new(
+            vec![provider],
+            vec![endpoint],
+            vec![malformed, healthy],
+            HashMap::from([(
+                (
+                    "provider-openai".to_string(),
+                    "endpoint-openai-responses".to_string(),
+                    "key-openai-healthy".to_string(),
+                ),
+                healthy_transport,
+            )]),
+            vec![execution_result(json!({
+                "data": [{"id": "gpt-healthy"}]
+            }))],
+        )
+        .with_transport_errors(HashMap::from([(
+            (
+                "provider-openai".to_string(),
+                "endpoint-openai-responses".to_string(),
+                "key-openai-malformed".to_string(),
+            ),
+            "provider_api_keys.api_key is not an authenticated ciphertext".to_string(),
+        )]));
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("one malformed key must not abort the cycle");
+
+        assert_eq!(summary.attempted, 2);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.succeeded, 1);
+        let malformed_after = state.key("key-openai-malformed");
+        assert_eq!(malformed_after.encrypted_api_key, malformed_ciphertext);
+        assert_eq!(
+            malformed_after.allowed_models,
+            Some(json!(["legacy-model"]))
+        );
+        assert_eq!(
+            malformed_after.last_models_fetch_error.as_deref(),
+            Some("previous error")
+        );
+        assert_eq!(
+            state.key("key-openai-healthy").allowed_models,
+            Some(json!(["gpt-healthy"]))
+        );
+    }
+
+    #[test]
+    fn sanitized_model_fetch_provider_and_endpoint_drop_transport_secrets() {
+        let mut provider = sample_provider("provider-sanitize", "openai");
+        provider.proxy = Some(json!({"url": "http://user:pass@example.test"}));
+        provider.config = Some(json!({"api_key": "provider-secret"}));
+        let sanitized_provider = super::sanitize_model_fetch_provider(provider);
+        assert_eq!(sanitized_provider.proxy, None);
+        assert_eq!(sanitized_provider.config, None);
+
+        let mut endpoint =
+            sample_endpoint("endpoint-sanitize", "provider-sanitize", "openai:responses");
+        endpoint.header_rules = Some(json!({"authorization": "Bearer endpoint-secret"}));
+        endpoint.body_rules = Some(json!({"token": "endpoint-secret"}));
+        endpoint.config = Some(json!({"password": "endpoint-secret"}));
+        endpoint.format_acceptance_config = Some(json!({"secret": "endpoint-secret"}));
+        endpoint.proxy = Some(json!({"url": "http://user:pass@example.test"}));
+        let sanitized_endpoint = super::sanitize_model_fetch_endpoint(endpoint);
+        assert_eq!(sanitized_endpoint.header_rules, None);
+        assert_eq!(sanitized_endpoint.body_rules, None);
+        assert_eq!(sanitized_endpoint.config, None);
+        assert_eq!(sanitized_endpoint.format_acceptance_config, None);
+        assert_eq!(sanitized_endpoint.proxy, None);
+        assert_eq!(sanitized_endpoint.id, "endpoint-sanitize");
+        assert_eq!(sanitized_endpoint.api_format, "openai:responses");
+    }
+
+    #[tokio::test]
+    async fn model_fetch_failure_does_not_persist_upstream_error_body_credentials() {
+        const UPSTREAM_SECRET: &str = "upstream-secret-token-value";
+        let provider = sample_provider("provider-openai", "openai");
+        let endpoint = sample_endpoint(
+            "endpoint-openai-responses",
+            "provider-openai",
+            "openai:responses",
+        );
+        let key = sample_key(
+            "key-openai-responses",
+            "provider-openai",
+            "api_key",
+            &["openai:responses"],
+        );
+        let transport = sample_transport(
+            "openai",
+            "provider-openai",
+            "endpoint-openai-responses",
+            "key-openai-responses",
+            "openai:responses",
+            "api_key",
+            None,
+        );
+        let state = TestState::new(
+            vec![provider],
+            vec![endpoint],
+            vec![key],
+            HashMap::from([(
+                (
+                    "provider-openai".to_string(),
+                    "endpoint-openai-responses".to_string(),
+                    "key-openai-responses".to_string(),
+                ),
+                transport,
+            )]),
+            vec![execution_result_with_status(
+                401,
+                json!({
+                    "error": {
+                        "message": format!(
+                            "Authorization: Bearer {UPSTREAM_SECRET}; api_key=query-secret; \
+                             config=/srv/provider/private.json"
+                        )
+                    }
+                }),
+            )],
+        );
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("fetch should finish with a projected failure");
+
+        assert_eq!(summary.failed, 1);
+        let persisted = state
+            .key("key-openai-responses")
+            .last_models_fetch_error
+            .expect("safe failure should be persisted");
+        assert_eq!(
+            persisted,
+            "Upstream models fetch authentication failed (status 401)"
+        );
+        for secret in [
+            UPSTREAM_SECRET,
+            "query-secret",
+            "/srv/provider/private.json",
+            "Bearer",
+            "api_key",
+        ] {
+            assert!(!persisted.contains(secret));
+        }
     }
 
     #[tokio::test]

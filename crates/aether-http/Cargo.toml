@@ -12,6 +12,5 @@ flate2.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true
+url.workspace = true

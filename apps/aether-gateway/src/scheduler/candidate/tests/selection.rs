@@ -1,10 +1,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
 use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
 use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data::repository::quota::InMemoryProviderQuotaRepository;
+use aether_data::repository::routing_profiles::InMemoryRoutingGroupRepository;
 use aether_data_contracts::repository::candidate_selection::{
     StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
 };
@@ -13,6 +15,9 @@ use aether_data_contracts::repository::candidates::{
 };
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
+use aether_data_contracts::repository::routing_profiles::{
+    CreateRoutingGroupRecord, RoutingGroupWriteRepository,
+};
 use aether_scheduler_core::{ClientSessionAffinity, SchedulerMinimalCandidateSelectionCandidate};
 use serde_json::json;
 
@@ -20,6 +25,7 @@ use crate::cache::SchedulerAffinityTarget;
 use crate::data::auth::GatewayAuthApiKeySnapshot;
 use crate::data::candidate_selection::MinimalCandidateSelectionRowSource;
 use crate::data::GatewayDataState;
+use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::{AppState, GatewayError};
 
 use super::super::affinity::build_scheduler_affinity_cache_key;
@@ -32,6 +38,41 @@ use super::super::selection::{
 use super::super::CandidateSchedulingContext;
 use super::support::{sample_auth_snapshot, sample_key, sample_provider, sample_row};
 
+/// 构造带系统默认路由策略的测试存储，排序配置从真实策略读取。
+async fn state_with_routing_default_policy(
+    data_state: GatewayDataState,
+    default_policy: serde_json::Value,
+) -> AppState {
+    let repository = Arc::new(InMemoryRoutingGroupRepository::default());
+    repository
+        .create_routing_group(CreateRoutingGroupRecord {
+            id: "selection-test-default".to_string(),
+            name: "selection-test-default".to_string(),
+            description: None,
+            enabled: true,
+            is_system_default: true,
+            sort_order: 0,
+            config_json: json!({"default_policy": default_policy}),
+            version: 1,
+            created_at: 1,
+            updated_at: 1,
+            published_at: None,
+        })
+        .await
+        .expect("routing strategy should be created");
+    AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(data_state.with_routing_group_repository_for_tests(repository))
+}
+
+/// 读取测试状态当前的必填排序配置，缺省策略使用默认值。
+async fn ordering_config(state: &AppState) -> SchedulerOrderingConfig {
+    crate::scheduler::config::read_system_default_routing_ordering_config(state)
+        .await
+        .expect("routing strategy should load")
+        .unwrap_or_default()
+}
+
 /// 测试辅助入口使用同一确定值构造具名时间和种子，保持既有选择断言不变。
 async fn select_candidate(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -42,6 +83,7 @@ async fn select_candidate(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     now_unix_secs: u64,
 ) -> Result<Option<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
+    let ordering_config = ordering_config(runtime_state).await;
     select_candidate_impl(
         selection_row_source,
         runtime_state,
@@ -56,6 +98,7 @@ async fn select_candidate(
             load_balance_seed: now_unix_secs,
         },
         false,
+        ordering_config,
     )
     .await
 }
@@ -95,6 +138,7 @@ async fn collect_selectable_candidates_with_context(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     scheduling_context: CandidateSchedulingContext,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
+    let ordering_config = ordering_config(runtime_state).await;
     collect_selectable_candidates_impl(
         selection_row_source,
         runtime_state,
@@ -106,7 +150,7 @@ async fn collect_selectable_candidates_with_context(
         None,
         scheduling_context,
         false,
-        None,
+        ordering_config,
     )
     .await
 }
@@ -202,6 +246,21 @@ fn provider_key_with_concurrent_limit(
     let mut key = sample_key(key_id, provider_id, Some(10));
     key.concurrent_limit = concurrent_limit;
     key
+}
+
+fn sealed_kiro_auth_config() -> String {
+    let credential_state = AppState::new()
+        .expect("credential state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::disabled().with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    credential_state
+        .seal_provider_catalog_key_auth_config(
+            "provider-kiro",
+            "key-kiro",
+            r#"{"refresh_token":"refreshable-session"}"#,
+        )
+        .expect("auth config should encrypt")
 }
 
 fn active_provider_key_candidate(
@@ -352,15 +411,11 @@ async fn selects_by_provider_priority_when_priority_mode_is_provider() {
         global_key_first,
     ]));
     let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
-    let state = AppState::new()
-        .expect("state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas)
-                .with_system_config_values_for_tests(vec![(
-                    "provider_priority_mode".to_string(),
-                    json!("provider"),
-                )]),
-        );
+    let state = state_with_routing_default_policy(
+        GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas),
+        json!({"priority_mode": "provider"}),
+    )
+    .await;
 
     let selected = select_candidate(
         state.data.as_ref(),
@@ -406,15 +461,11 @@ async fn selects_by_global_key_priority_when_priority_mode_is_global_key() {
         global_key_first,
     ]));
     let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
-    let state = AppState::new()
-        .expect("state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas)
-                .with_system_config_values_for_tests(vec![(
-                    "provider_priority_mode".to_string(),
-                    json!("global_key"),
-                )]),
-        );
+    let state = state_with_routing_default_policy(
+        GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas),
+        json!({"priority_mode": "global_key"}),
+    )
+    .await;
 
     let selected = select_candidate(
         state.data.as_ref(),
@@ -481,6 +532,7 @@ async fn scheduler_selection_prefers_required_capability_matches_before_priority
             load_balance_seed: 100,
         },
         false,
+        SchedulerOrderingConfig::default(),
     )
     .await
     .expect("selection should succeed")
@@ -516,15 +568,11 @@ async fn fixed_order_ignores_cached_scheduler_affinity_promotion() {
         first, second,
     ]));
     let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
-    let state = AppState::new()
-        .expect("state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas)
-                .with_system_config_values_for_tests(vec![(
-                    "scheduling_mode".to_string(),
-                    json!("fixed_order"),
-                )]),
-        );
+    let state = state_with_routing_default_policy(
+        GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas),
+        json!({"scheduling_mode": "fixed_order"}),
+    )
+    .await;
 
     let auth_snapshot = sample_auth_snapshot("affinity-key-1");
     state.remember_scheduler_affinity_target(
@@ -581,15 +629,11 @@ async fn fixed_order_disables_same_priority_affinity_hash_tiebreaker() {
         first, second,
     ]));
     let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
-    let state = AppState::new()
-        .expect("state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas)
-                .with_system_config_values_for_tests(vec![(
-                    "scheduling_mode".to_string(),
-                    json!("fixed_order"),
-                )]),
-        );
+    let state = state_with_routing_default_policy(
+        GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas),
+        json!({"scheduling_mode": "fixed_order"}),
+    )
+    .await;
 
     let auth_snapshot = sample_auth_snapshot("affinity-key-1");
     let selection = collect_selectable_candidates(
@@ -635,15 +679,11 @@ async fn cache_affinity_promotes_cached_scheduler_affinity_candidate_when_enable
         first, second,
     ]));
     let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
-    let state = AppState::new()
-        .expect("state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas)
-                .with_system_config_values_for_tests(vec![(
-                    "scheduling_mode".to_string(),
-                    json!("cache_affinity"),
-                )]),
-        );
+    let state = state_with_routing_default_policy(
+        GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas),
+        json!({"scheduling_mode": "cache_affinity"}),
+    )
+    .await;
 
     let auth_snapshot = sample_auth_snapshot("affinity-key-1");
     let client_session_affinity = ClientSessionAffinity::from_session_key("session-1");
@@ -679,6 +719,7 @@ async fn cache_affinity_promotes_cached_scheduler_affinity_candidate_when_enable
             load_balance_seed: 100,
         },
         false,
+        ordering_config(&state).await,
     )
     .await
     .expect("selection should succeed")
@@ -714,15 +755,11 @@ async fn cache_affinity_ignores_cached_scheduler_affinity_without_client_session
         first, second,
     ]));
     let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
-    let state = AppState::new()
-        .expect("state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas)
-                .with_system_config_values_for_tests(vec![(
-                    "scheduling_mode".to_string(),
-                    json!("cache_affinity"),
-                )]),
-        );
+    let state = state_with_routing_default_policy(
+        GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas),
+        json!({"scheduling_mode": "cache_affinity"}),
+    )
+    .await;
 
     let auth_snapshot = sample_auth_snapshot("affinity-key-1");
     state.remember_scheduler_affinity_target(
@@ -760,15 +797,11 @@ async fn load_balance_selection_does_not_remember_scheduler_affinity() {
         row,
     ]));
     let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
-    let state = AppState::new()
-        .expect("state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas)
-                .with_system_config_values_for_tests(vec![(
-                    "scheduling_mode".to_string(),
-                    json!("load_balance"),
-                )]),
-        );
+    let state = state_with_routing_default_policy(
+        GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas),
+        json!({"scheduling_mode": "load_balance"}),
+    )
+    .await;
     let auth_snapshot = sample_auth_snapshot("affinity-key-1");
     let client_session_affinity = ClientSessionAffinity::from_session_key("session-1");
     let cache_key = build_scheduler_affinity_cache_key(
@@ -793,6 +826,7 @@ async fn load_balance_selection_does_not_remember_scheduler_affinity() {
             load_balance_seed: 100,
         },
         false,
+        ordering_config(&state).await,
     )
     .await
     .expect("selection should succeed")
@@ -831,15 +865,11 @@ async fn load_balance_ignores_provider_priority_and_cached_affinity() {
         first, second,
     ]));
     let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
-    let state = AppState::new()
-        .expect("state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas)
-                .with_system_config_values_for_tests(vec![(
-                    "scheduling_mode".to_string(),
-                    json!("load_balance"),
-                )]),
-        );
+    let state = state_with_routing_default_policy(
+        GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas),
+        json!({"scheduling_mode": "load_balance"}),
+    )
+    .await;
 
     let auth_snapshot = sample_auth_snapshot("affinity-key-1");
     state.remember_scheduler_affinity_target(
@@ -2386,7 +2416,7 @@ async fn keeps_refreshable_kiro_candidate_selectable_with_runtime_oauth_invalid_
         vec![{
             let mut key = sample_key("key-kiro", "provider-kiro", Some(10));
             key.auth_type = "oauth".to_string();
-            key.encrypted_auth_config = Some("encrypted-refreshable-session".to_string());
+            key.encrypted_auth_config = Some(sealed_kiro_auth_config());
             key.oauth_invalid_at_unix_secs = Some(1_710_000_000);
             key.oauth_invalid_reason = Some("Kiro Token 无效或已过期".to_string());
             key
@@ -2402,7 +2432,8 @@ async fn keeps_refreshable_kiro_candidate_selectable_with_runtime_oauth_invalid_
                 provider_catalog,
                 quotas,
                 request_candidates,
-            ),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
         );
 
     let (selected, skipped) = collect_selectable_candidates_with_skip_reasons(
@@ -2446,7 +2477,7 @@ async fn keeps_refreshable_kiro_candidate_selectable_when_oauth_token_expired() 
         vec![{
             let mut key = sample_key("key-kiro", "provider-kiro", Some(10));
             key.auth_type = "oauth".to_string();
-            key.encrypted_auth_config = Some("encrypted-refreshable-session".to_string());
+            key.encrypted_auth_config = Some(sealed_kiro_auth_config());
             key.expires_at_unix_secs = Some(1_710_000_000);
             key
         }],
@@ -2461,7 +2492,8 @@ async fn keeps_refreshable_kiro_candidate_selectable_when_oauth_token_expired() 
                 provider_catalog,
                 quotas,
                 request_candidates,
-            ),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
         );
 
     let (selected, skipped) = collect_selectable_candidates_with_skip_reasons(
@@ -2505,7 +2537,7 @@ async fn keeps_kiro_candidate_selectable_after_refresh_token_failure_until_acces
         vec![{
             let mut key = sample_key("key-kiro", "provider-kiro", Some(10));
             key.auth_type = "oauth".to_string();
-            key.encrypted_auth_config = Some("encrypted-refreshable-session".to_string());
+            key.encrypted_auth_config = Some(sealed_kiro_auth_config());
             key.expires_at_unix_secs = Some(1_710_000_200);
             key.oauth_invalid_at_unix_secs = Some(1_710_000_000);
             key.oauth_invalid_reason = Some(
@@ -2525,7 +2557,8 @@ async fn keeps_kiro_candidate_selectable_after_refresh_token_failure_until_acces
                 provider_catalog,
                 quotas,
                 request_candidates,
-            ),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
         );
 
     let (selected, skipped) = collect_selectable_candidates_with_skip_reasons(
@@ -2569,7 +2602,7 @@ async fn skips_kiro_candidate_after_refresh_token_failure_and_access_token_expir
         vec![{
             let mut key = sample_key("key-kiro", "provider-kiro", Some(10));
             key.auth_type = "oauth".to_string();
-            key.encrypted_auth_config = Some("encrypted-refreshable-session".to_string());
+            key.encrypted_auth_config = Some(sealed_kiro_auth_config());
             key.expires_at_unix_secs = Some(1_710_000_000);
             key.oauth_invalid_at_unix_secs = Some(1_710_000_000);
             key.oauth_invalid_reason = Some(
@@ -2589,7 +2622,8 @@ async fn skips_kiro_candidate_after_refresh_token_failure_and_access_token_expir
                 provider_catalog,
                 quotas,
                 request_candidates,
-            ),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
         );
 
     let (selected, skipped) = collect_selectable_candidates_with_skip_reasons(
@@ -2634,7 +2668,7 @@ async fn skips_refreshable_kiro_candidate_when_oauth_marker_is_account_block() {
         vec![{
             let mut key = sample_key("key-kiro", "provider-kiro", Some(10));
             key.auth_type = "oauth".to_string();
-            key.encrypted_auth_config = Some("encrypted-refreshable-session".to_string());
+            key.encrypted_auth_config = Some(sealed_kiro_auth_config());
             key.oauth_invalid_at_unix_secs = Some(1_710_000_000);
             key.oauth_invalid_reason = Some("账户已封禁: account banned".to_string());
             key
@@ -2650,7 +2684,8 @@ async fn skips_refreshable_kiro_candidate_when_oauth_marker_is_account_block() {
                 provider_catalog,
                 quotas,
                 request_candidates,
-            ),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
         );
 
     let (selected, skipped) = collect_selectable_candidates_with_skip_reasons(

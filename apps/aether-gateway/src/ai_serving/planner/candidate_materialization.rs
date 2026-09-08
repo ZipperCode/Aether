@@ -9,7 +9,7 @@ use aether_ai_serving::{
 use aether_dispatch_core::{DispatchSequence, DispatchSequenceItem};
 use aether_routing_core::{
     rank_vector_for_candidate, CandidateKind, ResolvedRoutingPolicy, RoutingCandidateFacts,
-    RoutingCandidateTrace, RoutingDecisionTrace,
+    RoutingCandidateTrace, RoutingDecisionTrace, RoutingExecutionPolicy,
 };
 use aether_scheduler_core::{
     ClientSessionAffinity, SchedulerMinimalCandidateSelectionCandidate, SchedulerRankingOutcome,
@@ -117,6 +117,13 @@ type DecorateSkippedCandidateFn<'a> = Arc<
 #[async_trait]
 pub(crate) trait LocalExecutionAttemptSource<T>: Send {
     async fn next_execution_attempt(&mut self) -> Result<Option<T>, GatewayError>;
+
+    /// Returns the request-scoped execution behaviour selected by routing.
+    /// Execution wrappers use this snapshot before consuming the first
+    /// attempt, avoiding a second lookup against mutable system settings.
+    fn routing_execution_policy(&self) -> Option<RoutingExecutionPolicy> {
+        None
+    }
 
     async fn drain_execution_attempts(&mut self) -> Result<Vec<T>, GatewayError>;
 
@@ -1540,9 +1547,7 @@ async fn scheduler_cache_affinity_enabled(
     state: PlannerAppState<'_>,
     routing_policy: Option<&ResolvedRoutingPolicy>,
 ) -> bool {
-    scheduler_ordering_config_for_routing_policy(state, routing_policy)
-        .await
-        .scheduling_mode
+    scheduler_ordering_config_for_routing_policy(routing_policy).scheduling_mode
         == SchedulerSchedulingMode::CacheAffinity
 }
 
@@ -2471,7 +2476,7 @@ mod tests {
         Arc,
     };
 
-    use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
+    use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
     use aether_data::repository::auth::InMemoryAuthApiKeySnapshotRepository;
     use aether_data::repository::auth::StoredAuthApiKeySnapshot;
     use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
@@ -2808,7 +2813,7 @@ mod tests {
         candidate
     }
 
-    /// 验证 2,048 条候选的全局排序不读取 transport，且失效首项只在尝试时逐个 hydration 后回退。
+    /// 以逐 Key 绑定的凭据验证 2,048 条候选排序不读取 transport，失效首项仅在尝试时 hydration 后回退。
     #[tokio::test]
     async fn routed_ranking_hydrates_only_selected_candidates_in_fallback_order() {
         const CANDIDATE_COUNT: usize = 2_048;
@@ -2840,12 +2845,20 @@ mod tests {
             None,
         )
         .expect("endpoint transport should build");
-        let encrypted_key = encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "secret")
-            .expect("test key should encrypt");
+        // 只读候选夹具直接使用当前绑定格式，避免裸 Fernet 强读要求凭据迁移写入。
+        let credential_state = AppState::new()
+            .expect("credential state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
         let mut catalog_keys = Vec::with_capacity(CANDIDATE_COUNT);
         let mut rows = Vec::with_capacity(CANDIDATE_COUNT);
         for index in 0..CANDIDATE_COUNT {
             let key_id = format!("key-{index:04}");
+            let encrypted_key = credential_state
+                .seal_provider_catalog_key_api_key("provider-1", &key_id, "secret")
+                .expect("test key should encrypt with its catalog binding");
             let mut key = StoredProviderCatalogKey::new(
                 key_id.clone(),
                 "provider-1".to_string(),
@@ -2857,7 +2870,7 @@ mod tests {
             .expect("key should build")
             .with_transport_fields(
                 Some(json!(["openai:chat"])),
-                encrypted_key.clone(),
+                encrypted_key,
                 None,
                 None,
                 None,
@@ -2910,6 +2923,7 @@ mod tests {
             scheduling_mode: RoutingSchedulingMode::FixedOrder,
             keep_priority_on_conversion: false,
             sticky_key_attempts: 1,
+            execution_policy: Default::default(),
             ranking_overlay: RankingOverlay::default(),
             mutation_plan: MutationPlan::default(),
             pool_policy_overrides: Default::default(),
@@ -2957,7 +2971,13 @@ mod tests {
                 identity_skipped_candidate,
             )
             .await;
-        assert_eq!(candidate_count, CANDIDATE_COUNT);
+        // 预选错误会延迟到 next_attempt；仅计数失败时展示原错误，成功时不提前 hydration。
+        assert_eq!(
+            candidate_count,
+            CANDIDATE_COUNT,
+            "candidate loading failed before ranking: {:?}",
+            source.next_attempt().await.map(|attempt| attempt.is_some()),
+        );
         assert_eq!(transport_key_reads.load(Ordering::SeqCst), 0);
 
         let attempt = source
@@ -3060,16 +3080,11 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].key_id.as_deref(), Some("normal-key"));
         assert_eq!(stored[0].candidate_index, 2);
-        assert_eq!(
-            stored[0]
-                .extra_data
-                .as_ref()
-                .and_then(|value| value.get("dispatch_ref"))
-                .and_then(|value| value.get("SingleKey"))
-                .and_then(|value| value.get("key"))
-                .and_then(|value| value.get("key_id")),
-            Some(&json!("normal-key"))
-        );
+        assert!(stored[0]
+            .extra_data
+            .as_ref()
+            .and_then(|value| value.get("dispatch_ref"))
+            .is_none());
     }
 
     #[test]
@@ -3197,6 +3212,7 @@ mod tests {
             scheduling_mode: RoutingSchedulingMode::FixedOrder,
             keep_priority_on_conversion: false,
             sticky_key_attempts: 1,
+            execution_policy: Default::default(),
             ranking_overlay: RankingOverlay::default(),
             mutation_plan: MutationPlan::default(),
             pool_policy_overrides: Default::default(),
@@ -3242,14 +3258,23 @@ mod tests {
 
         assert!(should_cache_resolved_candidate_page(&cursor));
 
-        let fixed_order_app = AppState::new()
-            .expect("state should build")
-            .with_data_state_for_tests(
-                GatewayDataState::disabled().with_system_config_values_for_tests([(
-                    "scheduling_mode".to_string(),
-                    json!("fixed_order"),
-                )]),
-            );
+        let fixed_order_app = AppState::new().expect("state should build");
+        let fixed_order_policy = ResolvedRoutingPolicy {
+            group_id: Some("routing-group-fixed-order".to_string()),
+            group_version: Some(1),
+            selection_source: "test".to_string(),
+            requested_model: "gpt-5".to_string(),
+            resolved_model: "gpt-5".to_string(),
+            priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
+            scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
+            keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            execution_policy: Default::default(),
+            ranking_overlay: Default::default(),
+            mutation_plan: Default::default(),
+            pool_policy_overrides: Default::default(),
+            matched_rules: Vec::new(),
+        };
         let mut page_cursor = LocalCandidatePreselectionPageCursor::new(
             PlannerAppState::new(&fixed_order_app),
             &model_directive_policy,
@@ -3259,7 +3284,7 @@ mod tests {
             true,
             None,
             &auth_snapshot,
-            None,
+            Some(&fixed_order_policy),
             None,
             None,
             false,
@@ -3277,7 +3302,7 @@ mod tests {
             auth_snapshot,
             client_session_affinity: None,
             required_capabilities: None,
-            routing_policy: None,
+            routing_policy: Some(fixed_order_policy),
             sticky_session_token: None,
             request_auth_channel: None,
             skipped_user_id: "user-1".to_string(),
@@ -3377,16 +3402,11 @@ mod tests {
         );
         assert_eq!(stored[1].key_id.as_deref(), Some("normal-key"));
         assert_eq!(stored[1].candidate_index, 1);
-        assert_eq!(
-            stored[1]
-                .extra_data
-                .as_ref()
-                .and_then(|value| value.get("dispatch_ref"))
-                .and_then(|value| value.get("SingleKey"))
-                .and_then(|value| value.get("key"))
-                .and_then(|value| value.get("key_id")),
-            Some(&json!("normal-key"))
-        );
+        assert!(stored[1]
+            .extra_data
+            .as_ref()
+            .and_then(|value| value.get("dispatch_ref"))
+            .is_none());
     }
 
     #[test]
@@ -3456,7 +3476,7 @@ mod tests {
             .as_ref()
             .and_then(serde_json::Value::as_object)
             .expect("ranking metadata should persist as object extra data");
-        assert_eq!(extra_data.get("existing"), Some(&json!("value")));
+        assert!(extra_data.get("existing").is_none());
         assert_eq!(
             extra_data.get("ranking_mode"),
             Some(&json!("CacheAffinity"))
@@ -3469,14 +3489,7 @@ mod tests {
             Some(&json!("cached_affinity"))
         );
         assert_eq!(extra_data.get("demoted_by"), Some(&json!("cross_format")));
-        assert_eq!(
-            extra_data
-                .get("dispatch_ref")
-                .and_then(|value| value.get("SingleKey"))
-                .and_then(|value| value.get("key"))
-                .and_then(|value| value.get("key_id")),
-            Some(&json!("ranked-key"))
-        );
+        assert!(extra_data.get("dispatch_ref").is_none());
     }
 
     #[tokio::test]
@@ -4053,7 +4066,7 @@ mod tests {
             .as_ref()
             .and_then(serde_json::Value::as_object)
             .expect("skipped ranking metadata should persist");
-        assert_eq!(extra_data.get("existing"), Some(&json!("value")));
+        assert!(extra_data.get("existing").is_none());
         assert_eq!(
             extra_data.get("ranking_mode"),
             Some(&json!("CacheAffinity"))

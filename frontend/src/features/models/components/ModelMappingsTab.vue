@@ -257,6 +257,7 @@ import {
   updateGlobalModel,
 } from "@/api/global-models";
 import type {
+  ModelConfig,
   ModelMappingPreviewResponse,
   ModelMappingPreviewRule,
 } from "@/api/endpoints/types";
@@ -464,7 +465,8 @@ async function saveMappings() {
   saving.value = true;
   try {
     const currentModel = await getGlobalModel(props.globalModelId);
-    const updatedConfig = {
+    // 保留开放配置的可选映射字段，清空映射时删除该字段而非覆盖兄弟配置。
+    const updatedConfig: ModelConfig = {
       ...(currentModel.config || {}),
       model_mappings: cleanedMappings,
     };

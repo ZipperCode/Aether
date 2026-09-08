@@ -103,13 +103,13 @@ describe('buildUpstreamStreamConfig', () => {
 
 describe('mergeRules', () => {
   it('appends incoming rules after existing rules', () => {
-    expect(mergeRules([{ action: 'set', key: 'A' }], [{ action: 'drop', key: 'B' }], 'append')).toEqual([
-      { action: 'set', key: 'A' },
+    expect(mergeRules([{ action: 'set', key: 'A', value: 'value-a' }], [{ action: 'drop', key: 'B' }], 'append')).toEqual([
+      { action: 'set', key: 'A', value: 'value-a' },
       { action: 'drop', key: 'B' },
     ])
   })
 
   it('overwrites existing rules', () => {
-    expect(mergeRules([{ action: 'set', key: 'A' }], [], 'overwrite')).toEqual([])
+    expect(mergeRules([{ action: 'set', key: 'A', value: 'value-a' }], [], 'overwrite')).toEqual([])
   })
 })

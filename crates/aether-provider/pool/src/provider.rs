@@ -10,8 +10,8 @@ use crate::capability::{
 use crate::plan::{derive_plan_tier, normalize_provider_plan_tier};
 use crate::quota::{
     provider_pool_account_blocked, provider_pool_key_balance_below_minimum,
-    provider_pool_quota_reset_seconds, provider_pool_quota_snapshot_exhausted_decision,
-    provider_pool_quota_usage_ratio,
+    provider_pool_model_quota_exhausted, provider_pool_quota_reset_seconds,
+    provider_pool_quota_snapshot_exhausted_decision, provider_pool_quota_usage_ratio,
 };
 
 #[derive(Debug, Clone)]
@@ -85,7 +85,13 @@ pub trait ProviderPoolAdapter: Send + Sync {
         }
     }
 
+    /// 优先使用请求模型所属额度桶，仅在没有模型证据时回退账号级快照。
     fn quota_exhausted(&self, input: &ProviderPoolMemberInput<'_>) -> bool {
+        if let Some(exhausted) = input.provider_model_name.and_then(|model| {
+            provider_pool_model_quota_exhausted(input.key, input.provider_type, model)
+        }) {
+            return exhausted;
+        }
         provider_pool_quota_snapshot_exhausted_decision(input.key, input.provider_type)
             .unwrap_or(false)
     }

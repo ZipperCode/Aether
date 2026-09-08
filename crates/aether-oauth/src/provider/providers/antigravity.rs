@@ -31,6 +31,22 @@ impl Default for AntigravityProviderOAuthAdapter {
 }
 
 impl AntigravityProviderOAuthAdapter {
+    /// Supply deterministic OAuth client credentials for tests without
+    /// requiring a process-wide environment variable. Production callers
+    /// continue to resolve the secret from the configured environment.
+    #[doc(hidden)]
+    /// 为测试注入固定客户端凭据，不修改进程环境或生产配置。
+    pub fn with_oauth_credentials_for_tests(
+        mut self,
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+    ) -> Self {
+        self.inner = self
+            .inner
+            .with_oauth_credentials_for_tests(client_id, client_secret);
+        self
+    }
+
     /// 覆盖 token 地址，并继续复用 Generic 适配器的授权码与刷新令牌协议。
     pub fn with_token_url_override(mut self, token_url: impl Into<String>) -> Self {
         self.inner = self.inner.with_token_url_override(token_url);
@@ -166,13 +182,15 @@ impl ProviderOAuthAdapter for AntigravityProviderOAuthAdapter {
         self.enrich_google_identity(executor, ctx, result).await
     }
 
+    /// 导入刷新凭据后复用 token 交换网络上下文补齐邮箱，保证导入与授权码身份一致。
     async fn import_credentials(
         &self,
         executor: &dyn crate::network::OAuthHttpExecutor,
         ctx: &crate::provider::ProviderOAuthTransportContext,
         input: crate::provider::ProviderOAuthImportInput,
     ) -> Result<crate::provider::ProviderOAuthTokenSet, crate::core::OAuthError> {
-        self.inner.import_credentials(executor, ctx, input).await
+        let result = self.inner.import_credentials(executor, ctx, input).await?;
+        self.enrich_google_identity(executor, ctx, result).await
     }
 
     async fn refresh(
@@ -216,10 +234,11 @@ mod tests {
     use super::{AntigravityProviderOAuthAdapter, ANTIGRAVITY_USER_INFO_URL};
     use crate::network::{OAuthHttpExecutor, OAuthHttpRequest, OAuthHttpResponse};
     use crate::provider::{
-        ProviderOAuthAccount, ProviderOAuthAdapter, ProviderOAuthTransportContext,
+        ProviderOAuthAccount, ProviderOAuthAdapter, ProviderOAuthImportInput,
+        ProviderOAuthTransportContext,
     };
     use async_trait::async_trait;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
@@ -230,6 +249,8 @@ mod tests {
     struct GoogleOAuthExecutor {
         /// 按执行顺序保存请求，供断言 Bearer、URL 与网络上下文。
         requests: Mutex<Vec<OAuthHttpRequest>>,
+        token_payload: Option<Value>,
+        user_info_response: Option<OAuthHttpResponse>,
     }
 
     /// 构造不发起网络请求的 Antigravity OAuth 测试上下文。
@@ -252,6 +273,7 @@ mod tests {
     #[async_trait]
     impl OAuthHttpExecutor for UnusedExecutor {
         /// 元数据探测不应触网；若调用则立即暴露错误路径。
+        /// 分别响应授权码交换和邮箱查询，并保留收到的完整请求。
         async fn execute(
             &self,
             _request: OAuthHttpRequest,
@@ -262,7 +284,6 @@ mod tests {
 
     #[async_trait]
     impl OAuthHttpExecutor for GoogleOAuthExecutor {
-        /// 分别响应授权码交换和邮箱查询，并保留收到的完整请求。
         async fn execute(
             &self,
             request: OAuthHttpRequest,
@@ -273,26 +294,36 @@ mod tests {
                 .expect("requests should lock")
                 .push(request);
             match request_id.as_str() {
-                "provider-oauth:exchange-code" => Ok(OAuthHttpResponse {
-                    status_code: 200,
-                    body_text: json!({
-                        "access_token": "google-access-token",
-                        "refresh_token": "google-refresh-token",
-                        "token_type": "Bearer",
-                        "expires_in": 3600
+                "provider-oauth:exchange-code" | "provider-oauth:refresh-token" => {
+                    Ok(OAuthHttpResponse {
+                        status_code: 200,
+                        body_text: self
+                            .token_payload
+                            .clone()
+                            .unwrap_or_else(|| {
+                                json!({
+                                    "access_token": "google-access-token",
+                                    "refresh_token": "google-refresh-token",
+                                    "token_type": "Bearer",
+                                    "expires_in": 3600
+                                })
+                            })
+                            .to_string(),
+                        json_body: None,
                     })
-                    .to_string(),
-                    json_body: None,
-                }),
-                "provider-oauth:antigravity-user-info" => Ok(OAuthHttpResponse {
-                    status_code: 200,
-                    body_text: json!({
-                        "email": "antigravity@example.com",
-                        "verified_email": true
-                    })
-                    .to_string(),
-                    json_body: None,
-                }),
+                }
+                "provider-oauth:antigravity-user-info" => Ok(self
+                    .user_info_response
+                    .clone()
+                    .unwrap_or_else(|| OAuthHttpResponse {
+                        status_code: 200,
+                        body_text: json!({
+                            "email": "antigravity@example.com",
+                            "verified_email": true
+                        })
+                        .to_string(),
+                        json_body: None,
+                    })),
                 other => panic!("unexpected OAuth request: {other}"),
             }
         }
@@ -301,7 +332,8 @@ mod tests {
     /// 验证授权地址同时保留 PKCE 参数并请求离线 refresh token。
     #[test]
     fn antigravity_authorize_requests_offline_refresh_token() {
-        let adapter = AntigravityProviderOAuthAdapter::default();
+        let adapter = AntigravityProviderOAuthAdapter::default()
+            .with_oauth_credentials_for_tests("test-client-id", "test-client-secret");
         let response = adapter
             .build_authorize_url(&transport_context(), "state-1", Some("challenge-1"))
             .expect("authorize url should build");
@@ -325,7 +357,8 @@ mod tests {
     /// 验证授权码交换使用同一网络上下文查询邮箱，并写入认证配置与原始载荷。
     #[tokio::test]
     async fn antigravity_exchange_fetches_google_email_for_account_identity() {
-        let adapter = AntigravityProviderOAuthAdapter::default();
+        let adapter = AntigravityProviderOAuthAdapter::default()
+            .with_oauth_credentials_for_tests("test-client-id", "test-client-secret");
         let ctx = transport_context();
         let executor = GoogleOAuthExecutor::default();
 
@@ -361,6 +394,133 @@ mod tests {
             Some("Bearer google-access-token")
         );
         assert_eq!(requests[1].network, ctx.network);
+    }
+
+    #[tokio::test]
+    async fn antigravity_import_fetches_google_email_for_account_identity() {
+        let adapter = AntigravityProviderOAuthAdapter::default()
+            .with_oauth_credentials_for_tests("test-client-id", "test-client-secret");
+        let ctx = transport_context();
+        let executor = GoogleOAuthExecutor::default();
+
+        let result = adapter
+            .import_credentials(
+                &executor,
+                &ctx,
+                ProviderOAuthImportInput {
+                    provider_type: "antigravity".to_string(),
+                    name: None,
+                    refresh_token: Some("google-refresh-token".to_string()),
+                    raw_credentials: None,
+                    network: ctx.network.clone(),
+                },
+            )
+            .await
+            .expect("Antigravity OAuth import should succeed");
+
+        assert_eq!(result.auth_config["email"], "antigravity@example.com");
+        assert_eq!(
+            result
+                .token_set
+                .raw_payload
+                .as_ref()
+                .and_then(|payload| payload.get("email")),
+            Some(&json!("antigravity@example.com"))
+        );
+        let requests = executor.requests.lock().expect("requests should lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].request_id, "provider-oauth:refresh-token");
+        assert_eq!(requests[1].url, ANTIGRAVITY_USER_INFO_URL);
+        assert_eq!(requests[1].method, reqwest::Method::GET);
+        assert_eq!(
+            requests[1].headers.get("authorization").map(String::as_str),
+            Some("Bearer google-access-token")
+        );
+        assert_eq!(requests[1].network, ctx.network);
+    }
+
+    #[tokio::test]
+    async fn antigravity_import_skips_userinfo_when_token_payload_has_email() {
+        let adapter = AntigravityProviderOAuthAdapter::default()
+            .with_oauth_credentials_for_tests("test-client-id", "test-client-secret");
+        let ctx = transport_context();
+        let executor = GoogleOAuthExecutor {
+            token_payload: Some(json!({
+                "access_token": "google-access-token",
+                "email": "token-email@example.com"
+            })),
+            ..Default::default()
+        };
+
+        let result = adapter
+            .import_credentials(
+                &executor,
+                &ctx,
+                ProviderOAuthImportInput {
+                    provider_type: "antigravity".to_string(),
+                    name: None,
+                    refresh_token: Some("google-refresh-token".to_string()),
+                    raw_credentials: None,
+                    network: ctx.network.clone(),
+                },
+            )
+            .await
+            .expect("Antigravity OAuth import should succeed");
+
+        assert_eq!(result.auth_config["email"], "token-email@example.com");
+        assert_eq!(
+            executor
+                .requests
+                .lock()
+                .expect("requests should lock")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_import_rejects_unavailable_or_invalid_google_identity() {
+        let adapter = AntigravityProviderOAuthAdapter::default()
+            .with_oauth_credentials_for_tests("test-client-id", "test-client-secret");
+        let ctx = transport_context();
+
+        for (status_code, profile) in [
+            (401, json!({"error": "unauthorized"})),
+            (200, json!({})),
+            (200, json!({"email": "  "})),
+            (
+                200,
+                json!({"email": "unverified@example.com", "verified_email": false}),
+            ),
+        ] {
+            let executor = GoogleOAuthExecutor {
+                user_info_response: Some(OAuthHttpResponse {
+                    status_code,
+                    body_text: profile.to_string(),
+                    json_body: None,
+                }),
+                ..Default::default()
+            };
+
+            let result = adapter
+                .import_credentials(
+                    &executor,
+                    &ctx,
+                    ProviderOAuthImportInput {
+                        provider_type: "antigravity".to_string(),
+                        name: None,
+                        refresh_token: Some("google-refresh-token".to_string()),
+                        raw_credentials: None,
+                        network: ctx.network.clone(),
+                    },
+                )
+                .await;
+
+            assert!(
+                result.is_err(),
+                "invalid Google identity should reject import: {profile}"
+            );
+        }
     }
 
     /// 验证共享测试上下文仍能把禁止访问的账号元数据识别为无效。

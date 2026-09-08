@@ -117,8 +117,12 @@ public_limit.map_or(scoped_limit, |limit| limit.min(scoped_limit))
 
 - Unit tests cover default/invalid/upper-bound concurrency, 6,000 candidates,
   combined OAuth/self-check occupancy, and cancelled waiters.
-- PostgreSQL, MySQL, SQLite, and memory repositories expose the same lightweight
+- PostgreSQL and memory repositories expose the same lightweight
   projection and tests assert that secret/heavy result columns are absent.
+- Read-only candidate fixtures must seal API keys with
+  `AppState::seal_provider_catalog_key_api_key` for each actual Provider/Key ID.
+  Cloning one legacy Fernet envelope requires a migration writer and invalidates
+  a fixture intended to measure lazy reads without persistence side effects.
 - Source/architecture tests keep ordinary text planners on the dynamic source
   and keep OAuth away from the full provider-key-by-provider listing method.
 

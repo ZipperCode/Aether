@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/aether-gateway/backend/index.md", "reason": "Preserve fork contracts while integrating upstream"}
+{"file": ".trellis/spec/aether-gateway/backend/auth-maintenance-memory-contract.md", "reason": "Preserve fork contracts while integrating upstream"}
+{"file": ".trellis/spec/aether-gateway/backend/model-association-endpoint-contract.md", "reason": "Preserve fork contracts while integrating upstream"}
+{"file": ".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md", "reason": "Preserve fork contracts while integrating upstream"}
+{"file": ".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md", "reason": "Preserve fork contracts while integrating upstream"}
+{"file": ".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md", "reason": "Preserve fork contracts while integrating upstream"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Preserve fork contracts while integrating upstream"}

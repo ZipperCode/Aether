@@ -24,11 +24,52 @@ pub struct RoutingPoolPolicyOverride {
     pub scheduling_presets: Vec<RoutingSchedulingPreset>,
 }
 
-/// 首位粘性候选在故障转移前的默认总尝试次数，即同 Key 重试一次。
+/// Default number of attempts on the first-ranked (sticky) candidate before
+/// failing over: one retry on the same key.
 pub const DEFAULT_STICKY_KEY_ATTEMPTS: u32 = 2;
 
+/// Request-independent execution behaviours selected by a routing strategy.
+///
+/// These flags deliberately live beside scheduling rather than in provider
+/// transport configuration. A resolved policy is snapshotted for the request
+/// and can therefore be consumed by execution without rereading mutable
+/// system settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct RoutingExecutionPolicy {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enable_cf_heartbeat: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cyber_continue_failover: bool,
+}
+
+impl<'de> Deserialize<'de> for RoutingExecutionPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        struct LegacyCompatibleExecutionPolicy {
+            #[serde(default)]
+            enable_cf_heartbeat: bool,
+            #[serde(default)]
+            enable_openai_image_sync_heartbeat: bool,
+            #[serde(default)]
+            enable_standard_text_sync_heartbeat: bool,
+            #[serde(default)]
+            cyber_continue_failover: bool,
+        }
+
+        let value = LegacyCompatibleExecutionPolicy::deserialize(deserializer)?;
+        Ok(Self {
+            enable_cf_heartbeat: value.enable_cf_heartbeat
+                || value.enable_openai_image_sync_heartbeat
+                || value.enable_standard_text_sync_heartbeat,
+            cyber_continue_failover: value.cyber_continue_failover,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// 路由组的默认排序、调度与粘性重试策略。
 pub struct RoutingDefaultPolicy {
     /// 候选按 Provider 或全局 Key 优先级排序。
     #[serde(default)]
@@ -42,6 +83,9 @@ pub struct RoutingDefaultPolicy {
     /// 首位候选在切换前的总尝试数；后续候选各一次，`0` 和 `1` 均不重试。
     #[serde(default = "default_sticky_key_attempts")]
     pub sticky_key_attempts: u32,
+    /// 路由策略冻结的执行行为开关，与排序配置共同作用于当前请求。
+    #[serde(flatten)]
+    pub execution_policy: RoutingExecutionPolicy,
 }
 
 impl Default for RoutingDefaultPolicy {
@@ -52,13 +96,18 @@ impl Default for RoutingDefaultPolicy {
             scheduling_mode: RoutingSchedulingMode::default(),
             keep_priority_on_conversion: false,
             sticky_key_attempts: DEFAULT_STICKY_KEY_ATTEMPTS,
+            execution_policy: RoutingExecutionPolicy::default(),
         }
     }
 }
 
-/// 为缺少新字段的旧 JSON 提供稳定默认粘性尝试数。
+/// 为缺少新字段的 JSON 提供稳定默认粘性尝试数。
 fn default_sticky_key_attempts() -> u32 {
     DEFAULT_STICKY_KEY_ATTEMPTS
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -102,8 +151,8 @@ pub struct RoutingRule {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RoutingGroupConfig {
-    #[serde(default)]
-    pub allowed_models: Vec<String>,
+    /// The default policy is global for the selected strategy group. Model
+    /// differences are expressed through `model_policies` and `rules`.
     #[serde(default)]
     pub default_policy: RoutingDefaultPolicy,
     #[serde(default)]

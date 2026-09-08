@@ -195,6 +195,18 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
             "设备授权仅支持 Kiro / Windsurf / Nous provider",
         ));
     }
+    let Some(principal) = request_context
+        .decision()
+        .and_then(|decision| decision.admin_principal.as_ref())
+        .filter(|principal| {
+            principal.session_id.is_some() || principal.management_token_id.is_some()
+        })
+    else {
+        return Ok(build_internal_control_error_response(
+            http::StatusCode::UNAUTHORIZED,
+            "管理员身份不可用",
+        ));
+    };
     let endpoint_resolution =
         resolve_provider_oauth_runtime_endpoints(state, &provider, &provider_type).await?;
     let runtime_endpoint = endpoint_resolution.runtime_endpoint;
@@ -243,7 +255,12 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
         let now = current_unix_secs();
         let session_id = generate_provider_oauth_nonce();
         let session = StoredAdminProviderOAuthDeviceSession {
+            // Nous 设备会话与其他 Provider 共用发起管理员及会话绑定。
+            session_id: session_id.clone(),
             provider_id: provider_id.clone(),
+            initiated_by_user_id: principal.user_id.clone(),
+            initiated_by_session_id: principal.session_id.clone(),
+            initiated_by_management_token_id: principal.management_token_id.clone(),
             region: String::new(),
             client_id: NOUS_CLIENT_ID.to_string(),
             client_secret: String::new(),
@@ -324,10 +341,10 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
             .build_authorize_url(&ctx, &session_id, None)
         {
             Ok(authorization) => authorization,
-            Err(error) => {
+            Err(_) => {
                 return Ok(build_internal_control_error_response(
                     http::StatusCode::BAD_REQUEST,
-                    format!("Windsurf 授权 URL 构建失败: {error}"),
+                    "Windsurf 授权 URL 构建失败",
                 ));
             }
         };
@@ -335,7 +352,11 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
             build_windsurf_authorization_url(&authorization.authorize_url, &login_option);
         let now_unix_secs = current_unix_secs();
         let session = StoredAdminProviderOAuthDeviceSession {
+            session_id: session_id.clone(),
             provider_id: provider_id.clone(),
+            initiated_by_user_id: principal.user_id.clone(),
+            initiated_by_session_id: principal.session_id.clone(),
+            initiated_by_management_token_id: principal.management_token_id.clone(),
             region: String::new(),
             client_id: String::new(),
             client_secret: String::new(),
@@ -414,7 +435,11 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
         );
         let now_unix_secs = current_unix_secs();
         let session = StoredAdminProviderOAuthDeviceSession {
+            session_id: session_id.clone(),
             provider_id: provider_id.clone(),
+            initiated_by_user_id: principal.user_id.clone(),
+            initiated_by_session_id: principal.session_id.clone(),
+            initiated_by_management_token_id: principal.management_token_id.clone(),
             region: "us-east-1".to_string(),
             client_id: String::new(),
             client_secret: String::new(),
@@ -552,7 +577,11 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
     let now_unix_secs = current_unix_secs();
     let session_id = generate_provider_oauth_nonce();
     let session = StoredAdminProviderOAuthDeviceSession {
+        session_id: session_id.clone(),
         provider_id: provider_id.clone(),
+        initiated_by_user_id: principal.user_id.clone(),
+        initiated_by_session_id: principal.session_id.clone(),
+        initiated_by_management_token_id: principal.management_token_id.clone(),
         region,
         client_id,
         client_secret,

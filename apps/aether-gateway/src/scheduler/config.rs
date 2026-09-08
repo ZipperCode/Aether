@@ -85,7 +85,7 @@ impl SchedulerOrderingConfig {
         }
     }
 
-    /// 将旧调度配置投影为可持久化的默认路由策略，供一次性引导创建默认组。
+    /// 将当前调度配置投影为默认路由策略，供一次性引导创建默认组。
     pub(crate) fn to_routing_default_policy(self) -> RoutingDefaultPolicy {
         RoutingDefaultPolicy {
             priority_mode: match self.priority_mode {
@@ -99,6 +99,7 @@ impl SchedulerOrderingConfig {
             },
             keep_priority_on_conversion: self.keep_priority_on_conversion,
             sticky_key_attempts: self.sticky_key_attempts,
+            execution_policy: aether_routing_core::RoutingExecutionPolicy::default(),
         }
     }
 
@@ -113,7 +114,6 @@ impl SchedulerOrderingConfig {
     }
 }
 
-/// 将路由核心优先级枚举映射到调度器枚举。
 fn scheduler_priority_mode_from_routing(mode: RoutingSetPriorityMode) -> SchedulerPriorityMode {
     match mode {
         RoutingSetPriorityMode::Provider => SchedulerPriorityMode::Provider,
@@ -121,7 +121,6 @@ fn scheduler_priority_mode_from_routing(mode: RoutingSetPriorityMode) -> Schedul
     }
 }
 
-/// 将路由核心调度枚举映射到网关调度器枚举。
 fn scheduler_scheduling_mode_from_routing(mode: RoutingSchedulingMode) -> SchedulerSchedulingMode {
     match mode {
         RoutingSchedulingMode::FixedOrder => SchedulerSchedulingMode::FixedOrder,
@@ -130,53 +129,7 @@ fn scheduler_scheduling_mode_from_routing(mode: RoutingSchedulingMode) -> Schedu
     }
 }
 
-pub(crate) fn parse_scheduler_priority_mode(
-    value: Option<&serde_json::Value>,
-) -> SchedulerPriorityMode {
-    match value
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("global_key") => SchedulerPriorityMode::GlobalKey,
-        _ => SchedulerPriorityMode::Provider,
-    }
-}
-
-pub(crate) fn parse_keep_priority_on_conversion(value: Option<&serde_json::Value>) -> bool {
-    value.and_then(serde_json::Value::as_bool).unwrap_or(false)
-}
-
-pub(crate) fn parse_scheduler_scheduling_mode(
-    value: Option<&serde_json::Value>,
-) -> SchedulerSchedulingMode {
-    match value
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("fixed_order") => SchedulerSchedulingMode::FixedOrder,
-        Some("load_balance") => SchedulerSchedulingMode::LoadBalance,
-        _ => SchedulerSchedulingMode::CacheAffinity,
-    }
-}
-
-/// 读取无请求级策略时的有效排序配置：先取启用的系统默认路由组，再回退旧系统键。
-/// 旧键只承担迁移兜底，缺失时使用稳定默认值。
-pub(crate) async fn read_scheduler_ordering_config(
-    state: &AppState,
-) -> Result<SchedulerOrderingConfig, GatewayError> {
-    if let Some(config) = read_system_default_routing_ordering_config(state).await? {
-        return Ok(config);
-    }
-    read_legacy_scheduler_ordering_config(state).await
-}
-
-/// 从启用的系统默认路由组读取排序配置；组缺失、禁用或配置无效时返回空。
+/// Ordering config from the enabled system-default routing group, if any.
 pub(crate) async fn read_system_default_routing_ordering_config(
     state: &AppState,
 ) -> Result<Option<SchedulerOrderingConfig>, GatewayError> {
@@ -208,37 +161,6 @@ pub(crate) async fn read_system_default_routing_ordering_config(
     )))
 }
 
-/// 从旧系统配置键读取排序配置，仅作为尚未引导出默认路由组时的迁移兜底。
-pub(crate) async fn read_legacy_scheduler_ordering_config(
-    state: &AppState,
-) -> Result<SchedulerOrderingConfig, GatewayError> {
-    let priority_mode = parse_scheduler_priority_mode(
-        state
-            .read_system_config_json_value("provider_priority_mode")
-            .await?
-            .as_ref(),
-    );
-    let scheduling_mode = parse_scheduler_scheduling_mode(
-        state
-            .read_system_config_json_value("scheduling_mode")
-            .await?
-            .as_ref(),
-    );
-    let keep_priority_on_conversion = parse_keep_priority_on_conversion(
-        state
-            .read_system_config_json_value("keep_priority_on_conversion")
-            .await?
-            .as_ref(),
-    );
-    Ok(SchedulerOrderingConfig {
-        priority_mode,
-        scheduling_mode,
-        keep_priority_on_conversion,
-        // 旧配置没有粘性尝试字段，统一采用路由默认值。
-        sticky_key_attempts: DEFAULT_STICKY_KEY_ATTEMPTS,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -253,16 +175,6 @@ mod tests {
     use super::*;
     use crate::data::GatewayDataState;
 
-    /// 构造与新默认策略明显不同的旧配置，便于验证来源优先级。
-    fn legacy_values() -> [(String, serde_json::Value); 3] {
-        [
-            ("provider_priority_mode".to_string(), json!("global_key")),
-            ("scheduling_mode".to_string(), json!("load_balance")),
-            ("keep_priority_on_conversion".to_string(), json!(true)),
-        ]
-    }
-
-    /// 在内存仓库写入测试用系统默认组，并允许控制启用状态和策略内容。
     async fn create_system_default(
         repository: &InMemoryRoutingGroupRepository,
         enabled: bool,
@@ -275,6 +187,7 @@ mod tests {
                 description: None,
                 enabled,
                 is_system_default: true,
+                sort_order: 0,
                 config_json,
                 version: 1,
                 created_at: 1,
@@ -285,9 +198,8 @@ mod tests {
             .unwrap();
     }
 
-    /// 验证启用的系统默认路由组覆盖旧系统配置键。
     #[tokio::test]
-    async fn system_default_routing_group_overrides_legacy_keys() {
+    async fn system_default_routing_group_exposes_strategy_ordering() {
         let repository = Arc::new(InMemoryRoutingGroupRepository::default());
         create_system_default(
             &repository,
@@ -302,37 +214,37 @@ mod tests {
         )
         .await;
         let state = AppState::new().unwrap().with_data_state_for_tests(
-            GatewayDataState::disabled()
-                .with_system_config_values_for_tests(legacy_values())
-                .with_routing_group_repository_for_tests(repository),
+            GatewayDataState::disabled().with_routing_group_repository_for_tests(repository),
         );
 
-        let config = read_scheduler_ordering_config(&state).await.unwrap();
+        let config = read_system_default_routing_ordering_config(&state)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(config.priority_mode, SchedulerPriorityMode::Provider);
         assert_eq!(config.scheduling_mode, SchedulerSchedulingMode::FixedOrder);
         assert!(!config.keep_priority_on_conversion);
     }
 
-    /// 验证默认组缺少 `default_policy` 时采用路由核心默认值。
     #[tokio::test]
     async fn missing_default_policy_in_system_default_group_uses_routing_defaults() {
         let repository = Arc::new(InMemoryRoutingGroupRepository::default());
         create_system_default(&repository, true, json!({})).await;
         let state = AppState::new().unwrap().with_data_state_for_tests(
-            GatewayDataState::disabled()
-                .with_system_config_values_for_tests(legacy_values())
-                .with_routing_group_repository_for_tests(repository),
+            GatewayDataState::disabled().with_routing_group_repository_for_tests(repository),
         );
 
-        let config = read_scheduler_ordering_config(&state).await.unwrap();
+        let config = read_system_default_routing_ordering_config(&state)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(config, SchedulerOrderingConfig::default());
     }
 
-    /// 验证默认组禁用或仓库缺失时仍可回退旧配置。
     #[tokio::test]
-    async fn disabled_or_missing_system_default_group_falls_back_to_legacy_keys() {
+    async fn disabled_or_missing_system_default_group_uses_routing_defaults() {
         let repository = Arc::new(InMemoryRoutingGroupRepository::default());
         create_system_default(
             &repository,
@@ -341,29 +253,25 @@ mod tests {
         )
         .await;
         let with_disabled_group = AppState::new().unwrap().with_data_state_for_tests(
-            GatewayDataState::disabled()
-                .with_system_config_values_for_tests(legacy_values())
-                .with_routing_group_repository_for_tests(repository),
+            GatewayDataState::disabled().with_routing_group_repository_for_tests(repository),
         );
-        let without_repository = AppState::new().unwrap().with_data_state_for_tests(
-            GatewayDataState::disabled().with_system_config_values_for_tests(legacy_values()),
-        );
+        let without_repository = AppState::new()
+            .unwrap()
+            .with_data_state_for_tests(GatewayDataState::disabled());
 
         for state in [with_disabled_group, without_repository] {
-            let config = read_scheduler_ordering_config(&state).await.unwrap();
-            assert_eq!(config.priority_mode, SchedulerPriorityMode::GlobalKey);
-            assert_eq!(config.scheduling_mode, SchedulerSchedulingMode::LoadBalance);
-            assert!(config.keep_priority_on_conversion);
+            let config = read_system_default_routing_ordering_config(&state)
+                .await
+                .unwrap();
+            assert!(config.is_none());
         }
     }
 
-    /// 验证引导过程只创建一次默认组，并完整继承旧排序行为。
     #[tokio::test]
-    async fn bootstrap_creates_system_default_group_from_legacy_keys_once() {
+    async fn bootstrap_creates_system_default_group_from_routing_defaults_once() {
         let repository = Arc::new(InMemoryRoutingGroupRepository::default());
         let state = AppState::new().unwrap().with_data_state_for_tests(
             GatewayDataState::disabled()
-                .with_system_config_values_for_tests(legacy_values())
                 .with_routing_group_repository_for_tests(repository.clone()),
         );
 
@@ -377,9 +285,9 @@ mod tests {
         assert_eq!(
             created.config_json["default_policy"],
             json!({
-                "priority_mode": "global_key",
-                "scheduling_mode": "load_balance",
-                "keep_priority_on_conversion": true,
+                "priority_mode": "provider",
+                "scheduling_mode": "cache_affinity",
+                "keep_priority_on_conversion": false,
                 "sticky_key_attempts": DEFAULT_STICKY_KEY_ATTEMPTS
             })
         );
@@ -398,9 +306,39 @@ mod tests {
             Some(created.id)
         );
 
-        let config = read_scheduler_ordering_config(&state).await.unwrap();
-        assert_eq!(config.priority_mode, SchedulerPriorityMode::GlobalKey);
-        assert_eq!(config.scheduling_mode, SchedulerSchedulingMode::LoadBalance);
-        assert!(config.keep_priority_on_conversion);
+        let config = read_system_default_routing_ordering_config(&state)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config, SchedulerOrderingConfig::default());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_does_not_migrate_legacy_scheduler_keys() {
+        let repository = Arc::new(InMemoryRoutingGroupRepository::default());
+        let state = AppState::new().unwrap().with_data_state_for_tests(
+            GatewayDataState::disabled()
+                .with_system_config_values_for_tests([
+                    ("provider_priority_mode".to_string(), json!("global_key")),
+                    ("scheduling_mode".to_string(), json!("load_balance")),
+                    ("keep_priority_on_conversion".to_string(), json!(true)),
+                ])
+                .with_routing_group_repository_for_tests(repository),
+        );
+
+        let created = state
+            .ensure_system_default_routing_group_inner()
+            .await
+            .unwrap()
+            .expect("bootstrap should create the strategy");
+        assert_eq!(
+            created.config_json["default_policy"],
+            json!({
+                "priority_mode": "provider",
+                "scheduling_mode": "cache_affinity",
+                "keep_priority_on_conversion": false,
+                "sticky_key_attempts": DEFAULT_STICKY_KEY_ATTEMPTS
+            })
+        );
     }
 }

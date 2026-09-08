@@ -683,12 +683,11 @@ async function fetchUpstreamModels(forceRefresh = false) {
   try {
     loadingModels.value = true
     fetchingUpstreamModels.value = true
-    const result = forceRefresh
-      ? await fetchCachedModels(props.providerId, undefined, true)
-      : await fetchCachedModels(props.providerId)
+    const result = await fetchCachedModels(props.providerId, undefined, forceRefresh)
     if (!result.error) {
       upstreamModels.value = result.models
-      upstreamModelsLoaded.value = true
+      // 空列表仍清除旧缓存，但保留上游的手动获取入口。
+      upstreamModelsLoaded.value = result.models.length > 0
       // 获取上游模型后，将不在上游列表中的已选名称添加到自定义列表
       const upstreamIds = new Set(result.models.map(m => m.id))
       const customFromSelected = selectedNames.value.filter(name => !upstreamIds.has(name))

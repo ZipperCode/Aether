@@ -278,7 +278,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             field: "input[].id".to_string(),
             action: SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite,
             detail: format!(
-                "stripped {stripped_input_item_ids} incompatible OpenAI Responses input item id field(s)"
+                "normalized or removed {stripped_input_item_ids} incompatible OpenAI Responses input item id field(s)"
             ),
         });
     }

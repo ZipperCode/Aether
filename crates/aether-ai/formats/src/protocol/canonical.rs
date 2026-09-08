@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::formats::openai::responses::openai_responses_message_item_id;
 use crate::formats::openai::responses::{
     decode_gemini_tool_signature_carrier, GeminiToolSignatureCarrierDirection,
 };
@@ -58,7 +60,7 @@ pub enum CanonicalStopReason {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CanonicalToolChoice {
     Auto,
@@ -67,7 +69,7 @@ pub enum CanonicalToolChoice {
     Tool { name: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CanonicalContentBlock {
     Text {
@@ -149,7 +151,7 @@ pub enum CanonicalContentBlock {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalInstruction {
     pub role: CanonicalRole,
     #[serde(default)]
@@ -158,7 +160,7 @@ pub struct CanonicalInstruction {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalMessage {
     pub role: CanonicalRole,
     #[serde(default)]
@@ -167,7 +169,7 @@ pub struct CanonicalMessage {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalGenerationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
@@ -193,7 +195,7 @@ pub struct CanonicalGenerationConfig {
     pub top_logprobs: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalToolDefinition {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,7 +208,7 @@ pub struct CanonicalToolDefinition {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalThinkingConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -216,7 +218,7 @@ pub struct CanonicalThinkingConfig {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalResponseFormat {
     pub format_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,7 +227,7 @@ pub struct CanonicalResponseFormat {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalUsage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -255,7 +257,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CanonicalEmbeddingInput {
     String(String),
@@ -265,7 +267,7 @@ pub enum CanonicalEmbeddingInput {
     Multimodal(Vec<CanonicalEmbeddingContent>),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalEmbeddingContent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -337,7 +339,7 @@ impl CanonicalEmbeddingContent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalEmbeddingRequest {
     pub input: CanonicalEmbeddingInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,7 +356,7 @@ pub struct CanonicalEmbeddingRequest {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalRerankRequest {
     pub query: String,
     #[serde(default)]
@@ -375,7 +377,7 @@ impl CanonicalRerankRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalEmbedding {
     #[serde(default)]
     pub index: usize,
@@ -385,7 +387,7 @@ pub struct CanonicalEmbedding {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalEmbeddingResponse {
     pub id: String,
     pub model: String,
@@ -397,7 +399,7 @@ pub struct CanonicalEmbeddingResponse {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalRequest {
     #[serde(default)]
     pub model: String,
@@ -429,7 +431,7 @@ pub struct CanonicalRequest {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalResponseOutput {
     #[serde(default)]
     pub index: usize,
@@ -455,7 +457,7 @@ impl Default for CanonicalResponseOutput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalResponse {
     pub id: String,
     pub model: String,
@@ -469,6 +471,425 @@ pub struct CanonicalResponse {
     pub usage: Option<CanonicalUsage>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extensions: BTreeMap<String, Value>,
+}
+
+fn debug_json_bytes(value: &Value) -> Option<usize> {
+    serde_json::to_vec(value).ok().map(|bytes| bytes.len())
+}
+
+fn debug_json_map_bytes(value: &Map<String, Value>) -> Option<usize> {
+    serde_json::to_vec(value).ok().map(|bytes| bytes.len())
+}
+
+fn debug_json_option_bytes(value: Option<&Value>) -> Option<usize> {
+    value.and_then(debug_json_bytes)
+}
+
+fn debug_string_len(value: Option<&str>) -> Option<usize> {
+    value.map(str::len)
+}
+
+fn debug_string_list_summary(value: Option<&Vec<String>>) -> Option<(usize, usize)> {
+    value.map(|values| (values.len(), values.iter().map(String::len).sum::<usize>()))
+}
+
+fn debug_json_list_summary(value: &[Value]) -> (usize, usize) {
+    (
+        value.len(),
+        value.iter().filter_map(debug_json_bytes).sum::<usize>(),
+    )
+}
+
+impl fmt::Debug for CanonicalToolChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("CanonicalToolChoice");
+        match self {
+            Self::Auto => debug.field("kind", &"auto"),
+            Self::None => debug.field("kind", &"none"),
+            Self::Required => debug.field("kind", &"required"),
+            Self::Tool { name } => debug.field("kind", &"tool").field("name_len", &name.len()),
+        }
+        .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalContentBlock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("CanonicalContentBlock");
+        match self {
+            Self::Text { text, extensions } => debug
+                .field("kind", &"text")
+                .field("text_len", &text.len())
+                .field("extension_count", &extensions.len()),
+            Self::Thinking {
+                text,
+                signature,
+                encrypted_content,
+                extensions,
+            } => debug
+                .field("kind", &"thinking")
+                .field("text_len", &text.len())
+                .field("signature_len", &debug_string_len(signature.as_deref()))
+                .field(
+                    "encrypted_content_len",
+                    &debug_string_len(encrypted_content.as_deref()),
+                )
+                .field("extension_count", &extensions.len()),
+            Self::Image {
+                data,
+                url,
+                media_type,
+                detail,
+                extensions,
+            } => debug
+                .field("kind", &"image")
+                .field("data_len", &debug_string_len(data.as_deref()))
+                .field("url_len", &debug_string_len(url.as_deref()))
+                .field("media_type", media_type)
+                .field("detail", detail)
+                .field("extension_count", &extensions.len()),
+            Self::File {
+                data,
+                file_id,
+                file_url,
+                media_type,
+                filename,
+                extensions,
+            } => debug
+                .field("kind", &"file")
+                .field("data_len", &debug_string_len(data.as_deref()))
+                .field("file_id_len", &debug_string_len(file_id.as_deref()))
+                .field("file_url_len", &debug_string_len(file_url.as_deref()))
+                .field("media_type", media_type)
+                .field("filename_len", &debug_string_len(filename.as_deref()))
+                .field("extension_count", &extensions.len()),
+            Self::Audio {
+                data,
+                media_type,
+                format,
+                extensions,
+            } => debug
+                .field("kind", &"audio")
+                .field("data_len", &debug_string_len(data.as_deref()))
+                .field("media_type", media_type)
+                .field("format", format)
+                .field("extension_count", &extensions.len()),
+            Self::ToolUse {
+                id,
+                name,
+                input,
+                extensions,
+            } => debug
+                .field("kind", &"tool_use")
+                .field("id_len", &id.len())
+                .field("name_len", &name.len())
+                .field("input_bytes", &debug_json_bytes(input))
+                .field("extension_count", &extensions.len()),
+            Self::ToolResult {
+                tool_use_id,
+                name,
+                output,
+                content_text,
+                is_error,
+                extensions,
+            } => debug
+                .field("kind", &"tool_result")
+                .field("tool_use_id_len", &tool_use_id.len())
+                .field("name_len", &debug_string_len(name.as_deref()))
+                .field("output_bytes", &debug_json_option_bytes(output.as_ref()))
+                .field(
+                    "content_text_len",
+                    &debug_string_len(content_text.as_deref()),
+                )
+                .field("is_error", is_error)
+                .field("extension_count", &extensions.len()),
+            Self::Unknown {
+                raw_type,
+                payload,
+                extensions,
+            } => debug
+                .field("kind", &"unknown")
+                .field("raw_type_len", &raw_type.len())
+                .field("payload_bytes", &debug_json_bytes(payload))
+                .field("extension_count", &extensions.len()),
+        }
+        .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalInstruction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalInstruction")
+            .field("role", &self.role)
+            .field("text_len", &self.text.len())
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalMessage")
+            .field("role", &self.role)
+            .field("content_count", &self.content.len())
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalGenerationConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalGenerationConfig")
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field(
+                "stop_sequences",
+                &debug_string_list_summary(self.stop_sequences.as_ref()),
+            )
+            .field("n", &self.n)
+            .field("presence_penalty", &self.presence_penalty)
+            .field("frequency_penalty", &self.frequency_penalty)
+            .field("seed", &self.seed)
+            .field("logprobs", &self.logprobs)
+            .field("top_logprobs", &self.top_logprobs)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalToolDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalToolDefinition")
+            .field("name_len", &self.name.len())
+            .field(
+                "description_len",
+                &debug_string_len(self.description.as_deref()),
+            )
+            .field(
+                "parameters_bytes",
+                &debug_json_option_bytes(self.parameters.as_ref()),
+            )
+            .field("strict", &self.strict)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalThinkingConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalThinkingConfig")
+            .field("enabled", &self.enabled)
+            .field("budget_tokens", &self.budget_tokens)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalResponseFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalResponseFormat")
+            .field("format_type_len", &self.format_type.len())
+            .field(
+                "json_schema_bytes",
+                &debug_json_option_bytes(self.json_schema.as_ref()),
+            )
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalUsage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalUsage")
+            .field("input_tokens", &self.input_tokens)
+            .field(
+                "input_tokens_include_cache",
+                &self.input_tokens_include_cache,
+            )
+            .field("output_tokens", &self.output_tokens)
+            .field("total_tokens", &self.total_tokens)
+            .field("cache_read_tokens", &self.cache_read_tokens)
+            .field("cache_write_tokens", &self.cache_write_tokens)
+            .field(
+                "cache_creation_ephemeral_5m_tokens",
+                &self.cache_creation_ephemeral_5m_tokens,
+            )
+            .field(
+                "cache_creation_ephemeral_1h_tokens",
+                &self.cache_creation_ephemeral_1h_tokens,
+            )
+            .field("reasoning_tokens", &self.reasoning_tokens)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalEmbeddingInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("CanonicalEmbeddingInput");
+        match self {
+            Self::String(value) => debug
+                .field("kind", &"string")
+                .field("item_count", &1)
+                .field("total_text_bytes", &value.len()),
+            Self::StringArray(values) => debug
+                .field("kind", &"string_array")
+                .field("item_count", &values.len())
+                .field(
+                    "total_text_bytes",
+                    &values.iter().map(String::len).sum::<usize>(),
+                ),
+            Self::TokenArray(values) => debug
+                .field("kind", &"token_array")
+                .field("item_count", &values.len()),
+            Self::TokenArrayArray(values) => debug
+                .field("kind", &"token_array_array")
+                .field("item_count", &values.len())
+                .field(
+                    "total_token_count",
+                    &values.iter().map(Vec::len).sum::<usize>(),
+                ),
+            Self::Multimodal(values) => debug
+                .field("kind", &"multimodal")
+                .field("item_count", &values.len()),
+        }
+        .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalEmbeddingContent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalEmbeddingContent")
+            .field("text_len", &debug_string_len(self.text.as_deref()))
+            .field("image_len", &debug_string_len(self.image.as_deref()))
+            .field("video_len", &debug_string_len(self.video.as_deref()))
+            .field(
+                "multi_images_summary",
+                &self
+                    .multi_images
+                    .as_ref()
+                    .map(|images| (images.len(), images.iter().map(String::len).sum::<usize>())),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalEmbeddingRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalEmbeddingRequest")
+            .field("input", &self.input)
+            .field("encoding_format", &self.encoding_format)
+            .field("dimensions", &self.dimensions)
+            .field("task_len", &debug_string_len(self.task.as_deref()))
+            .field("user_len", &debug_string_len(self.user.as_deref()))
+            .field(
+                "parameters_bytes",
+                &self.parameters.as_ref().and_then(debug_json_map_bytes),
+            )
+            .field("parameter_count", &self.parameters.as_ref().map(Map::len))
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalRerankRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalRerankRequest")
+            .field("query_len", &self.query.len())
+            .field("documents", &debug_json_list_summary(&self.documents))
+            .field("top_n", &self.top_n)
+            .field("return_documents", &self.return_documents)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalEmbedding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalEmbedding")
+            .field("index", &self.index)
+            .field("embedding_len", &self.embedding.len())
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalEmbeddingResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalEmbeddingResponse")
+            .field("id_len", &self.id.len())
+            .field("model_len", &self.model.len())
+            .field("embedding_count", &self.embeddings.len())
+            .field("usage", &self.usage)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalRequest")
+            .field("model_len", &self.model.len())
+            .field("instruction_count", &self.instructions.len())
+            .field("system_len", &debug_string_len(self.system.as_deref()))
+            .field("message_count", &self.messages.len())
+            .field("embedding", &self.embedding)
+            .field("rerank", &self.rerank)
+            .field("generation", &self.generation)
+            .field("tool_count", &self.tools.len())
+            .field("tool_choice", &self.tool_choice)
+            .field("thinking", &self.thinking)
+            .field("response_format", &self.response_format)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field(
+                "metadata_bytes",
+                &debug_json_option_bytes(self.metadata.as_ref()),
+            )
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalResponseOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalResponseOutput")
+            .field("index", &self.index)
+            .field("role", &self.role)
+            .field("content_count", &self.content.len())
+            .field("stop_reason", &self.stop_reason)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalResponse")
+            .field("id_len", &self.id.len())
+            .field("model_len", &self.model.len())
+            .field("output_count", &self.outputs.len())
+            .field("content_count", &self.content.len())
+            .field("stop_reason", &self.stop_reason)
+            .field("usage", &self.usage)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
 }
 
 pub fn from_openai_chat_to_canonical_request(body_json: &Value) -> Option<CanonicalRequest> {
@@ -1321,7 +1742,12 @@ pub(crate) fn audit_gemini_cross_format_response_part(
         {
             return Err("thoughtSignature".to_string());
         }
+        // 空文本加签名是上游的不可见 reasoning 控制项；非空文本仍须明确声明 thought。
         if part.get("thought").and_then(Value::as_bool) != Some(true)
+            && part
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
             && part
                 .get("thoughtSignature")
                 .or_else(|| part.get("thought_signature"))
@@ -1374,19 +1800,21 @@ pub(crate) fn gemini_part_to_canonical_block(
 ) -> Option<CanonicalContentBlock> {
     let part_object = part.as_object()?;
     if let Some(text) = part_object.get("text").and_then(Value::as_str) {
-        if part_object
+        let thought_signature = part_object
+            .get("thoughtSignature")
+            .or_else(|| part_object.get("thought_signature"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let is_thinking = part_object
             .get("thought")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-        {
+            || (text.trim().is_empty() && thought_signature.is_some());
+        if is_thinking {
             return Some(CanonicalContentBlock::Thinking {
                 text: text.to_string(),
-                signature: part_object
-                    .get("thoughtSignature")
-                    .or_else(|| part_object.get("thought_signature"))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned),
+                signature: thought_signature,
                 encrypted_content: None,
                 extensions: gemini_extensions(
                     part_object,
@@ -4697,11 +5125,7 @@ pub(crate) fn flush_openai_responses_message_item(
     if message_content.is_empty() {
         return;
     }
-    let id = if *message_index == 0 {
-        format!("{response_id}_msg")
-    } else {
-        format!("{response_id}_msg_{message_index}")
-    };
+    let id = openai_responses_message_item_id(response_id, *message_index);
     output.push(json!({
         "type": "message",
         "id": id,
@@ -5203,7 +5627,7 @@ pub(crate) type GeminiCanonicalTools = (
     Option<Value>,
 );
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct GeminiGoogleSearchGrounding {
     pub source_field: &'static str,
     pub source_dialect: &'static str,
@@ -5211,6 +5635,23 @@ pub(crate) struct GeminiGoogleSearchGrounding {
     pub payload: Value,
     pub raw_payload: Value,
     pub output_payload: Value,
+}
+
+impl fmt::Debug for GeminiGoogleSearchGrounding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GeminiGoogleSearchGrounding")
+            .field("source_field", &self.source_field)
+            .field("source_dialect", &self.source_dialect)
+            .field("legacy", &self.legacy)
+            .field("payload_bytes", &debug_json_bytes(&self.payload))
+            .field("raw_payload_bytes", &debug_json_bytes(&self.raw_payload))
+            .field(
+                "output_payload_bytes",
+                &debug_json_bytes(&self.output_payload),
+            )
+            .finish()
+    }
 }
 
 pub(crate) fn gemini_google_search_grounding(

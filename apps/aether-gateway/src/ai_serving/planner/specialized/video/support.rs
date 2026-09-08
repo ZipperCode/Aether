@@ -140,10 +140,9 @@ pub(super) async fn list_local_video_create_candidate_attempts(
                 load_balance_seed: request_distribution_seed(),
             },
             false,
-            input
-                .routing_policy
-                .as_ref()
-                .map(SchedulerOrderingConfig::from_routing_policy),
+            crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                input.routing_policy.as_ref(),
+            ),
         )
         .await
     {
@@ -205,10 +204,9 @@ pub(super) async fn build_local_video_create_candidate_attempt_source<'a>(
                 load_balance_seed: request_distribution_seed(),
             },
             false,
-            input
-                .routing_policy
-                .as_ref()
-                .map(SchedulerOrderingConfig::from_routing_policy),
+            crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                input.routing_policy.as_ref(),
+            ),
         )
         .await
     {

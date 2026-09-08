@@ -23,8 +23,8 @@ use serde_json::json;
 
 use super::super::{
     build_router_with_state, build_state_with_execution_runtime_override,
-    sample_admin_global_model, sample_admin_provider_model, sample_endpoint, sample_key,
-    sample_provider, start_server, AppState,
+    sample_admin_global_model, sample_admin_provider_model, sample_bound_auth_config,
+    sample_bound_key, sample_endpoint, sample_provider, start_server, AppState,
 };
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
@@ -197,7 +197,8 @@ async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_select
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-openai", "OpenAI", 10);
     provider.provider_type = "openai".to_string();
-    let mut selected_key = sample_key(
+    // 保留自动模型发现标志，同时让凭据绑定真实 Provider/Key 身份。
+    let mut selected_key = sample_bound_key(
         "key-openai-selected",
         "provider-openai",
         "openai:chat",
@@ -385,7 +386,7 @@ async fn gateway_handles_admin_provider_query_models_fetches_windsurf_model_conf
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-windsurf", "Windsurf", 10);
     provider.provider_type = "windsurf".to_string();
-    let mut windsurf_key = sample_key(
+    let mut windsurf_key = sample_bound_key(
         "key-windsurf-selected",
         "provider-windsurf",
         "openai:chat",
@@ -530,7 +531,7 @@ async fn gateway_handles_admin_provider_query_models_with_openai_responses_endpo
             None,
         )
         .expect("endpoint transport should build")],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-responses",
             "provider-openai",
             "openai:responses",
@@ -581,14 +582,14 @@ async fn gateway_handles_admin_provider_query_models_with_openai_responses_endpo
 }
 
 #[test]
-fn gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache() {
+fn gateway_recovers_codex_slug_only_models_from_a_stale_legacy_cache() {
     run_provider_query_test(
-        "gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache",
-        gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache_impl,
+        "gateway_recovers_codex_slug_only_models_from_a_stale_legacy_cache",
+        gateway_recovers_codex_slug_only_models_from_a_stale_legacy_cache_impl,
     );
 }
 
-async fn gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache_impl() {
+async fn gateway_recovers_codex_slug_only_models_from_a_stale_legacy_cache_impl() {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
@@ -601,7 +602,14 @@ async fn gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache_impl
                     .expect("mutex should lock") += 1;
                 assert_eq!(
                     plan.url,
-                    "https://chatgpt.com/backend-api/codex/models?client_version=0.144.1"
+                    format!(
+                        "https://chatgpt.com/backend-api/codex/models?client_version={}",
+                        aether_ai_formats::CODEX_CLIENT_VERSION
+                    )
+                );
+                assert_eq!(
+                    plan.headers.get("user-agent").map(String::as_str),
+                    Some(aether_ai_formats::CODEX_CLIENT_USER_AGENT)
                 );
                 assert_eq!(plan.provider_api_format, "openai:responses");
                 Json(json!({
@@ -643,7 +651,7 @@ async fn gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache_impl
             "openai:responses",
             "https://chatgpt.com/backend-api/codex",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-codex-dynamic",
             "provider-codex-dynamic",
             "openai:responses",
@@ -660,16 +668,21 @@ async fn gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache_impl
         .runtime_state()
         .kv_set(
             "upstream_models:provider-codex-dynamic:key-codex-dynamic",
-            "[]".to_string(),
+            json!([{"id": "gpt-stale-legacy"}]).to_string(),
             None,
         )
         .await
-        .expect("empty legacy cache should seed");
+        .expect("stale legacy cache should seed");
     let cache_state = state.clone();
     let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    for (request_index, expected_from_cache) in [(0usize, false), (1usize, true)] {
+    for (request_index, expected_from_cache) in [
+        (0usize, false),
+        (1usize, true),
+        (2usize, false),
+        (3usize, true),
+    ] {
         let response = reqwest::Client::new()
             .post(format!("{gateway_url}/api/admin/provider-query/models"))
             .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
@@ -678,7 +691,8 @@ async fn gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache_impl
             .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
             .json(&json!({
                 "provider_id": "provider-codex-dynamic",
-                "api_key_id": "key-codex-dynamic"
+                "api_key_id": "key-codex-dynamic",
+                "force_refresh": request_index == 2,
             }))
             .send()
             .await
@@ -715,10 +729,47 @@ async fn gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache_impl
         );
         assert_eq!(
             *execution_runtime_hits.lock().expect("mutex should lock"),
-            1,
+            if request_index < 2 { 1 } else { 2 },
             "request {request_index} must not cause another upstream fetch"
         );
+        assert_eq!(
+            payload["data"]["models"][0]["display_name"],
+            if request_index == 1 {
+                "Updated shared catalog"
+            } else {
+                "Future Dynamic"
+            }
+        );
         if request_index == 0 {
+            let context = crate::model_fetch::read_codex_management_catalog(
+                &cache_state,
+                "provider-codex-dynamic",
+                "key-codex-dynamic",
+            )
+            .await
+            .unwrap();
+            let mut models = context
+                .models
+                .clone()
+                .expect("admin fetch publishes shared catalog");
+            models[0]["display_name"] = json!("Updated shared catalog");
+            let transport = cache_state
+                .read_provider_transport_snapshot(
+                    "provider-codex-dynamic",
+                    "endpoint-codex-dynamic",
+                    "key-codex-dynamic",
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            crate::model_fetch::store_codex_management_catalog(
+                &cache_state,
+                &context,
+                &[transport],
+                models,
+                None,
+            )
+            .await;
             <AppState as crate::model_fetch::ModelFetchRuntimeState>::write_upstream_models_cache(
                 &cache_state,
                 "provider-codex-dynamic",
@@ -755,7 +806,10 @@ async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_
                     .expect("mutex should lock") += 1;
                 assert_eq!(
                     plan.url,
-                    "https://chatgpt.com/backend-api/codex/models?client_version=0.144.1"
+                    format!(
+                        "https://chatgpt.com/backend-api/codex/models?client_version={}",
+                        aether_ai_formats::CODEX_CLIENT_VERSION
+                    )
                 );
                 Json(json!({
                     "request_id": "req-provider-query-codex-invalidated",
@@ -786,7 +840,7 @@ async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_
             "openai:responses",
             "https://chatgpt.com/backend-api/codex",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-codex-invalidated",
             "provider-codex",
             "openai:responses",
@@ -825,7 +879,13 @@ async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_
         .as_str()
         .expect("Codex fallback warning should be present");
     assert!(warning.contains("Codex 动态模型目录不可用"));
-    assert!(warning.contains("invalidated"));
+    // Model-fetch diagnostics are intentionally projected to a credential-safe
+    // category before being returned from the admin endpoint.  The raw
+    // upstream invalidation text must not cross the response boundary.
+    assert!(
+        warning.contains("authorization failed (status 403)"),
+        "warning={warning}"
+    );
     let model_ids = payload["data"]["models"]
         .as_array()
         .expect("models should be an array")
@@ -943,7 +1003,7 @@ async fn gateway_handles_admin_provider_query_models_respecting_key_api_formats_
             )
             .expect("endpoint transport should build"),
         ],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-cli",
             "provider-openai",
             "openai:responses",
@@ -1079,13 +1139,13 @@ async fn gateway_handles_admin_provider_query_models_aggregating_active_keys_imp
         )
         .expect("endpoint transport should build")],
         vec![
-            sample_key(
+            sample_bound_key(
                 "key-openai-1",
                 "provider-openai",
                 "openai:chat",
                 "sk-test-1",
             ),
-            sample_key(
+            sample_bound_key(
                 "key-openai-2",
                 "provider-openai",
                 "openai:chat",
@@ -1174,7 +1234,7 @@ async fn gateway_handles_admin_provider_query_models_for_fixed_provider_without_
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-codex-oauth",
             "provider-codex",
             "openai:responses",
@@ -1294,7 +1354,7 @@ async fn gateway_handles_admin_provider_query_test_model_locally_with_trusted_ad
             "openai:chat",
             "https://api.openai.example/v1",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-primary",
             "provider-openai",
             "openai:chat",
@@ -1421,13 +1481,14 @@ async fn gateway_capability_test_pins_single_candidate_without_failover_impl() {
             inactive_endpoint,
         ],
         vec![
-            sample_key(
+            // 只读传输目录使用已绑定凭据，不依赖本测试未安装的迁移写入器。
+            sample_bound_key(
                 "key-capability-primary",
                 "provider-capability",
                 "openai:chat",
                 "sk-capability-secret",
             ),
-            sample_key(
+            sample_bound_key(
                 "key-capability-reference",
                 "provider-capability",
                 "openai:chat",
@@ -1759,7 +1820,7 @@ async fn gateway_handles_admin_provider_query_embedding_model_test_impl() {
             "openai:embedding",
             "https://api.siliconflow.example",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-siliconflow-embedding",
             "provider-siliconflow",
             "openai:embedding",
@@ -1880,7 +1941,7 @@ async fn gateway_handles_admin_provider_query_doubao_text_embedding_model_test_i
             "doubao:embedding",
             "https://ark.volces.example/api/v3",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-doubao-embedding",
             "provider-doubao",
             "doubao:embedding",
@@ -2002,7 +2063,7 @@ async fn gateway_handles_admin_provider_query_gemini_embedding_model_test_impl()
             "gemini:embedding",
             "https://generativelanguage.googleapis.com/v1beta",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-gemini-embedding",
             "provider-gemini",
             "gemini:embedding",
@@ -2120,7 +2181,7 @@ async fn gateway_handles_admin_provider_query_vertex_gemini_embedding_model_test
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-vertex-ai", "Vertex AI", 10);
     provider.provider_type = "vertex_ai".to_string();
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-vertex-gemini-embedding",
         "provider-vertex-ai",
         "gemini:embedding",
@@ -2267,7 +2328,7 @@ async fn gateway_handles_admin_provider_query_jina_embedding_model_test_impl() {
             "jina:embedding",
             "https://api.jina.example",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-jina-embedding",
             "provider-jina-embedding",
             "jina:embedding",
@@ -2389,7 +2450,7 @@ async fn gateway_handles_admin_provider_query_openai_rerank_model_test_impl() {
             "openai:rerank",
             "https://api.openai.example/v1",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-rerank",
             "provider-openai-rerank",
             "openai:rerank",
@@ -2517,7 +2578,7 @@ async fn gateway_handles_admin_provider_query_rerank_model_test_impl() {
             "jina:rerank",
             "https://api.jina.example",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-jina-rerank",
             "provider-jina",
             "jina:rerank",
@@ -2648,7 +2709,7 @@ async fn gateway_maps_admin_provider_model_before_model_list_test_request_impl()
             "openai:chat",
             "https://api.minimax.example",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-minimax-primary",
             "provider-minimax",
             "openai:chat",
@@ -2892,7 +2953,7 @@ async fn gateway_streams_codex_openai_responses_upstream_for_admin_pool_model_te
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![endpoint],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-codex-primary",
             "provider-codex",
             "openai:responses",
@@ -3050,20 +3111,18 @@ async fn gateway_executes_codex_search_admin_pool_model_test_with_search_contrac
         "https://chatgpt.com/backend-api/codex",
     );
     endpoint.config = Some(json!({"upstream_stream_policy": "force_stream"}));
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-codex-search",
         "provider-codex-search",
         "openai:search",
         "codex-search-access-token",
     );
     key.auth_type = "oauth".to_string();
-    key.encrypted_auth_config = Some(
-        aether_crypto::encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{"provider_type":"codex","account_id":"account-search-admin","is_fedramp":true}"#,
-        )
-        .expect("auth config should encrypt"),
-    );
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-codex-search",
+        "key-codex-search",
+        r#"{"provider_type":"codex","account_id":"account-search-admin","is_fedramp":true}"#,
+    ));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![endpoint],
@@ -3190,24 +3249,22 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtim
     let mut provider = sample_provider("provider-grok", "Grok", 10);
     provider.provider_type = "grok".to_string();
     provider.config = Some(json!({"pool_advanced": {}}));
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-grok-oauth",
         "provider-grok",
         "openai:responses",
         "__placeholder__",
     );
     key.auth_type = "oauth".to_string();
-    key.encrypted_auth_config = Some(
-        aether_crypto::encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-grok",
+        "key-grok-oauth",
+        r#"{
                 "provider_type":"grok",
                 "sso_token":"grok-sso",
                 "sso_rw_token":"grok-rw"
             }"#,
-        )
-        .expect("auth config should encrypt"),
-    );
+    ));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![sample_endpoint(
@@ -3327,7 +3384,7 @@ async fn gateway_streams_windsurf_connect_upstream_for_admin_model_test_impl() {
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-windsurf", "Windsurf", 10);
     provider.provider_type = "windsurf".to_string();
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-windsurf-primary",
         "provider-windsurf",
         "openai:chat",
@@ -3439,7 +3496,7 @@ async fn gateway_uses_pool_scheduler_order_for_admin_pool_model_test_impl() {
             ]
         }
     }));
-    let mut free_key = sample_key(
+    let mut free_key = sample_bound_key(
         "key-codex-free",
         "provider-codex",
         "openai:responses",
@@ -3454,7 +3511,7 @@ async fn gateway_uses_pool_scheduler_order_for_admin_pool_model_test_impl() {
             "usage_ratio": 0.1
         }
     }));
-    let mut plus_key = sample_key(
+    let mut plus_key = sample_bound_key(
         "key-codex-plus",
         "provider-codex",
         "openai:responses",
@@ -3647,13 +3704,13 @@ async fn gateway_handles_admin_provider_query_test_model_failover_locally_with_t
             "https://api.openai.example/v1",
         )],
         vec![
-            sample_key(
+            sample_bound_key(
                 "key-openai-first",
                 "provider-openai",
                 "openai:chat",
                 "sk-test-first",
             ),
-            sample_key(
+            sample_bound_key(
                 "key-openai-second",
                 "provider-openai",
                 "openai:chat",
@@ -3776,17 +3833,17 @@ async fn gateway_handles_admin_provider_query_test_model_for_kiro_locally_impl()
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-kiro", "Kiro", 10);
     provider.provider_type = "kiro".to_string();
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-kiro-primary",
         "provider-kiro",
         "claude:messages",
         "__placeholder__",
     );
     key.auth_type = "oauth".to_string();
-    key.encrypted_auth_config = Some(
-        aether_crypto::encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-kiro",
+        "key-kiro-primary",
+        r#"{
                 "provider_type":"kiro",
                 "auth_method":"idc",
                 "access_token":"cached-kiro-token",
@@ -3798,9 +3855,7 @@ async fn gateway_handles_admin_provider_query_test_model_for_kiro_locally_impl()
                 "client_id":"client-id",
                 "client_secret":"client-secret"
             }"#,
-        )
-        .expect("auth config should encrypt"),
-    );
+    ));
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
@@ -3913,17 +3968,17 @@ async fn gateway_uses_kiro_mapped_model_name_for_explicit_model_mapping_test_imp
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-kiro", "Kiro", 10);
     provider.provider_type = "kiro".to_string();
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-kiro-primary",
         "provider-kiro",
         "claude:messages",
         "__placeholder__",
     );
     key.auth_type = "oauth".to_string();
-    key.encrypted_auth_config = Some(
-        aether_crypto::encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-kiro",
+        "key-kiro-primary",
+        r#"{
                 "provider_type":"kiro",
                 "auth_method":"idc",
                 "access_token":"cached-kiro-token",
@@ -3935,9 +3990,7 @@ async fn gateway_uses_kiro_mapped_model_name_for_explicit_model_mapping_test_imp
                 "client_id":"client-id",
                 "client_secret":"client-secret"
             }"#,
-        )
-        .expect("auth config should encrypt"),
-    );
+    ));
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
@@ -4124,12 +4177,12 @@ async fn gateway_handles_admin_provider_query_test_model_failover_for_kiro_local
     let mut provider = sample_provider("provider-kiro", "Kiro", 10);
     provider.provider_type = "kiro".to_string();
     let build_key = |id: &str| {
-        let mut key = sample_key(id, "provider-kiro", "claude:messages", "__placeholder__");
+        let mut key = sample_bound_key(id, "provider-kiro", "claude:messages", "__placeholder__");
         key.auth_type = "oauth".to_string();
-        key.encrypted_auth_config = Some(
-            aether_crypto::encrypt_python_fernet_plaintext(
-                DEVELOPMENT_ENCRYPTION_KEY,
-                r#"{
+        key.encrypted_auth_config = Some(sample_bound_auth_config(
+            "provider-kiro",
+            id,
+            r#"{
                     "provider_type":"kiro",
                     "auth_method":"idc",
                     "access_token":"cached-kiro-token",
@@ -4141,9 +4194,7 @@ async fn gateway_handles_admin_provider_query_test_model_failover_for_kiro_local
                     "client_id":"client-id",
                     "client_secret":"client-secret"
                 }"#,
-            )
-            .expect("auth config should encrypt"),
-        );
+        ));
         key
     };
 
@@ -4287,12 +4338,12 @@ async fn gateway_retries_kiro_failover_after_http_error_without_message_impl() {
     let mut provider = sample_provider("provider-kiro", "Kiro", 10);
     provider.provider_type = "kiro".to_string();
     let build_key = |id: &str| {
-        let mut key = sample_key(id, "provider-kiro", "claude:messages", "__placeholder__");
+        let mut key = sample_bound_key(id, "provider-kiro", "claude:messages", "__placeholder__");
         key.auth_type = "oauth".to_string();
-        key.encrypted_auth_config = Some(
-            aether_crypto::encrypt_python_fernet_plaintext(
-                DEVELOPMENT_ENCRYPTION_KEY,
-                r#"{
+        key.encrypted_auth_config = Some(sample_bound_auth_config(
+            "provider-kiro",
+            id,
+            r#"{
                     "provider_type":"kiro",
                     "auth_method":"idc",
                     "access_token":"cached-kiro-token",
@@ -4304,9 +4355,7 @@ async fn gateway_retries_kiro_failover_after_http_error_without_message_impl() {
                     "client_id":"client-id",
                     "client_secret":"client-secret"
                 }"#,
-            )
-            .expect("auth config should encrypt"),
-        );
+        ));
         key
     };
 
@@ -4453,7 +4502,7 @@ async fn gateway_handles_non_kiro_multi_model_failover_locally_impl() {
             "openai:chat",
             "https://api.openai.example/v1",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-primary",
             "provider-openai",
             "openai:chat",
@@ -4633,7 +4682,7 @@ async fn gateway_handles_openai_responses_test_model_locally_impl() {
             "openai:responses",
             "https://tiger.bookapi.cc/codex",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-cli",
             "provider-openai",
             "openai:responses",
@@ -4765,7 +4814,7 @@ async fn gateway_handles_openai_image_test_model_locally_impl() {
             "openai:image",
             "https://api.openai.example/v1",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-image",
             "provider-openai",
             "openai:image",
@@ -4829,7 +4878,7 @@ async fn gateway_reports_transport_unsupported_reason_for_non_kiro_provider_impl
             "gemini:generate_content",
             "https://cloudcode-pa.googleapis.com",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-antigravity-gemini",
             "provider-antigravity",
             "gemini:generate_content",
@@ -4980,26 +5029,24 @@ async fn gateway_handles_antigravity_endpoint_test_model_locally_impl() {
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-antigravity", "Antigravity", 10);
     provider.provider_type = "antigravity".to_string();
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-antigravity-gemini",
         "provider-antigravity",
         "gemini:generate_content",
         "cached-antigravity-token",
     );
     key.auth_type = "oauth".to_string();
-    key.encrypted_auth_config = Some(
-        aether_crypto::encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-antigravity",
+        "key-antigravity-gemini",
+        r#"{
                 "provider_type":"antigravity",
                 "project_id":"project-ant-123",
                 "client_version":"1.2.3",
                 "session_id":"sess-ant-123",
                 "refresh_token":"rt-ant-123"
             }"#,
-        )
-        .expect("auth config should encrypt"),
-    );
+    ));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![sample_endpoint(
@@ -5163,20 +5210,18 @@ async fn gateway_hydrates_antigravity_project_id_from_load_code_assist_for_test_
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-antigravity", "Antigravity", 10);
     provider.provider_type = "antigravity".to_string();
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-antigravity-gemini",
         "provider-antigravity",
         "gemini:generate_content",
         "cached-antigravity-token",
     );
     key.auth_type = "oauth".to_string();
-    key.encrypted_auth_config = Some(
-        aether_crypto::encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{"provider_type":"antigravity","refresh_token":"rt-antigravity-123"}"#,
-        )
-        .expect("auth config should encrypt"),
-    );
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-antigravity",
+        "key-antigravity-gemini",
+        r#"{"provider_type":"antigravity","refresh_token":"rt-antigravity-123"}"#,
+    ));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![sample_endpoint(
@@ -5305,13 +5350,13 @@ async fn gateway_prefers_supported_non_kiro_endpoint_when_api_format_is_omitted_
             ),
         ],
         vec![
-            sample_key(
+            sample_bound_key(
                 "key-openai-cli",
                 "provider-openai",
                 "openai:responses",
                 "sk-test-cli",
             ),
-            sample_key(
+            sample_bound_key(
                 "key-openai-chat",
                 "provider-openai",
                 "openai:chat",
@@ -5419,7 +5464,7 @@ async fn gateway_prefers_transport_supported_non_kiro_endpoint_when_api_format_i
                 "https://api.openai.example/v1",
             ),
         ],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-chat",
             "provider-openai",
             "openai:chat",
@@ -5522,7 +5567,7 @@ async fn gateway_prefers_supported_non_kiro_endpoint_with_compatible_key_when_ap
                 "https://api.openai.example/v1",
             ),
         ],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-chat",
             "provider-openai",
             "openai:chat",
@@ -5624,7 +5669,7 @@ async fn gateway_uses_compatible_cli_endpoint_when_api_format_is_omitted_impl() 
                 "https://api.openai.example/v1",
             ),
         ],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-cli",
             "provider-openai",
             "openai:responses",
@@ -5724,7 +5769,7 @@ async fn gateway_uses_runnable_cli_endpoint_after_chat_preference_when_api_forma
         "openai:responses",
         "https://api.openai.example/v1",
     );
-    let mut shared_key = sample_key(
+    let mut shared_key = sample_bound_key(
         "key-openai-shared",
         "provider-openai",
         "openai:chat",
@@ -5825,7 +5870,7 @@ async fn gateway_handles_openai_responses_test_model_failover_locally_impl() {
             "openai:responses",
             "https://api.openai.example/v1",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-cli",
             "provider-openai",
             "openai:responses",
@@ -5926,7 +5971,7 @@ async fn gateway_handles_claude_cli_test_model_locally_impl() {
             "claude:messages",
             "https://api.anthropic.example/v1",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-claude-cli",
             "provider-claude",
             "claude:messages",
@@ -6021,7 +6066,7 @@ async fn gateway_uses_compatible_claude_cli_endpoint_when_api_format_is_omitted_
             "claude:messages",
             "https://api.anthropic.example/v1",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-claude-cli",
             "provider-claude",
             "claude:messages",
@@ -6117,7 +6162,7 @@ async fn gateway_handles_claude_cli_test_model_failover_locally_impl() {
             "claude:messages",
             "https://api.anthropic.example/v1",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-claude-cli",
             "provider-claude",
             "claude:messages",
@@ -6221,7 +6266,7 @@ async fn gateway_handles_gemini_cli_test_model_locally_impl() {
             "gemini:generate_content",
             "https://generativelanguage.googleapis.com",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-gemini-cli",
             "provider-gemini",
             "gemini:generate_content",
@@ -6330,20 +6375,18 @@ async fn gateway_handles_gemini_cli_test_model_with_oauth_header_fallback_impl()
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-gemini", "Gemini", 10);
     provider.provider_type = "gemini_cli".to_string();
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-gemini-cli",
         "provider-gemini",
         "gemini:generate_content",
         "cached-gemini-cli-token",
     );
     key.auth_type = "oauth".to_string();
-    key.encrypted_auth_config = Some(
-        aether_crypto::encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{"provider_type":"gemini_cli","project_id":"project-1"}"#,
-        )
-        .expect("auth config should encrypt"),
-    );
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-gemini",
+        "key-gemini-cli",
+        r#"{"provider_type":"gemini_cli","project_id":"project-1"}"#,
+    ));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![sample_endpoint(
@@ -6485,20 +6528,18 @@ async fn gateway_hydrates_gemini_cli_project_id_from_load_code_assist_for_test_m
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-gemini", "Gemini", 10);
     provider.provider_type = "gemini_cli".to_string();
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-gemini-cli",
         "provider-gemini",
         "gemini:generate_content",
         "cached-gemini-cli-token",
     );
     key.auth_type = "oauth".to_string();
-    key.encrypted_auth_config = Some(
-        aether_crypto::encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{"provider_type":"gemini_cli","refresh_token":"rt-gemini-cli-123"}"#,
-        )
-        .expect("auth config should encrypt"),
-    );
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-gemini",
+        "key-gemini-cli",
+        r#"{"provider_type":"gemini_cli","refresh_token":"rt-gemini-cli-123"}"#,
+    ));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![sample_endpoint(
@@ -6618,7 +6659,7 @@ async fn gateway_uses_compatible_gemini_cli_endpoint_when_api_format_is_omitted_
             "gemini:generate_content",
             "https://generativelanguage.googleapis.com",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-gemini-cli",
             "provider-gemini",
             "gemini:generate_content",
@@ -6714,7 +6755,7 @@ async fn gateway_handles_gemini_cli_test_model_failover_locally_impl() {
             "gemini:generate_content",
             "https://generativelanguage.googleapis.com",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-gemini-cli",
             "provider-gemini",
             "gemini:generate_content",
@@ -6830,20 +6871,18 @@ async fn gateway_unwraps_gemini_cli_v1internal_response_for_failover_model_test_
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-gemini-cli", "Gemini CLI", 10);
     provider.provider_type = "gemini_cli".to_string();
-    let mut key = sample_key(
+    let mut key = sample_bound_key(
         "key-gemini-cli",
         "provider-gemini-cli",
         "gemini:generate_content",
         "cached-gemini-cli-token",
     );
     key.auth_type = "oauth".to_string();
-    key.encrypted_auth_config = Some(
-        aether_crypto::encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{"provider_type":"gemini_cli","project_id":"project-1"}"#,
-        )
-        .expect("auth config should encrypt"),
-    );
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-gemini-cli",
+        "key-gemini-cli",
+        r#"{"provider_type":"gemini_cli","project_id":"project-1"}"#,
+    ));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![sample_endpoint(
@@ -6945,7 +6984,7 @@ async fn gateway_handles_admin_provider_query_test_model_failover_with_single_mo
             "openai:chat",
             "https://api.openai.example/v1",
         )],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-openai-alias",
             "provider-openai",
             "openai:chat",
@@ -7066,13 +7105,13 @@ async fn gateway_retries_non_kiro_failover_after_http_error_without_message_impl
             "https://api.openai.example/v1",
         )],
         vec![
-            sample_key(
+            sample_bound_key(
                 "key-openai-first",
                 "provider-openai",
                 "openai:chat",
                 "sk-test-first",
             ),
-            sample_key(
+            sample_bound_key(
                 "key-openai-second",
                 "provider-openai",
                 "openai:chat",
@@ -7193,13 +7232,13 @@ async fn gateway_retries_non_kiro_failover_after_success_status_without_body_imp
             "https://api.openai.example/v1",
         )],
         vec![
-            sample_key(
+            sample_bound_key(
                 "key-openai-first",
                 "provider-openai",
                 "openai:chat",
                 "sk-test-first",
             ),
-            sample_key(
+            sample_bound_key(
                 "key-openai-second",
                 "provider-openai",
                 "openai:chat",
@@ -7249,7 +7288,9 @@ async fn gateway_retries_non_kiro_failover_after_success_status_without_body_imp
     assert_eq!(attempts[0]["status_code"], json!(200));
     assert_eq!(
         attempts[0]["error_message"],
-        json!("Provider returned HTTP 200 without a model-test response body")
+        // Attempt diagnostics intentionally expose only the status class;
+        // detailed provider response text is not returned to the admin UI.
+        json!("HTTP 200")
     );
     assert_eq!(attempts[1]["status"], json!("success"));
 

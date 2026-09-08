@@ -425,6 +425,7 @@ mod tests {
         assert_eq!(input[1]["type"], "message");
     }
 
+    /// 验证共享最终化只为官方消息建立稳定 ID，并保留函数清理与 call_id 配对。
     #[test]
     fn finalization_strips_invalid_official_openai_input_item_ids() {
         let mut body = json!({
@@ -474,7 +475,13 @@ mod tests {
         .expect("invalid official OpenAI item IDs should be sanitized before validation");
 
         let input = body["input"].as_array().expect("input array");
-        assert!(input[0].get("id").is_none());
+        assert_eq!(
+            input[0]["id"],
+            super::super::responses::openai_responses_message_item_id(
+                "item_e19637e60faa53da843e731c",
+                0
+            )
+        );
         assert_eq!(input[0]["content"][0]["text"], "done");
         assert_eq!(input[1]["id"], "msg_valid");
         assert!(input[2].get("id").is_none());
