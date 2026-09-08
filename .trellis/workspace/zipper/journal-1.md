@@ -526,3 +526,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 22: 优化 CI 失败反馈与重复编译
+
+**Date**: 2026-09-08
+**Task**: 优化 CI 失败反馈与重复编译
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+审计8个Rust CI和1个Release运行：Gateway编译/测试主导，失败主要是合同/夹具漂移。统一本地/CI检查入口、lib+bins/no-fail-fast、工具链/cache flags/trigger对齐，修复worktree Git watch重复编译。保留17 jobs和全部门禁；24次最小Cargo检查及命令/YAML/供应链回归通过。未push/dispatch/部署，实际GitHub提速未测，临时产物和进程已清理。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0da344f56` | (see git log) |
+
+### Status
+
+[OK] **Completed**
