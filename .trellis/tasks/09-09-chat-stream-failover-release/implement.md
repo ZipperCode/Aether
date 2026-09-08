@@ -15,9 +15,9 @@
 - [x] 修改前复现 → 最小根因修复 → 相关检查。
 - [x] 独立 review/修正 → 模拟和质量验证通过。
 - [x] 更新合同及证据，中文提交并推送 origin/master。
-- [ ] 精确 SHA GitHub 必需 CI 全部成功；失败修复后正常提交再验证。
-- [ ] 推送下一未占用应用 patch tag，跟进 release/产物。
-- [ ] 完整审计、清理、归档，全部完成后 update_goal。
+- [x] 精确 SHA GitHub 必需 CI 全部成功；失败修复后正常提交再验证。
+- [x] 推送下一未占用应用 patch tag，跟进 release/产物。
+- [x] 完整审计与清理；归档/journal由后续Trellis自动提交记录证明，最终目标由update_goal审计收口。
 
 ## 验证策略与进度
 
@@ -53,3 +53,10 @@
 - Rust CI34259830393失败：Gateway 5462执行、5461通过、1失败、3跳过。唯一失败 execute_execution_runtime_stream_records_first_stream_event_before_visible_text（315.782s）。其他叶子作业均成功，未推tag。下一步由原review owner有界复现/修复此流首事件回归后再提交和运行新SHA CI。
 
 - CI唯一失败已由原独立reviewer修复：预提交首Data即非终态记账，handoff去重，fixture并发释放消除互锁。49/49相关测试、Clippy、fmt/diff全部通过，具体证据见verification.md。仅execution.rs与合同/证据追加，下一步正常追加提交推送，不改写历史、不移动tag。
+
+- 追加修复7eaea44b082d2cdd1e4b0133ee04c83fb7b703ca已正常推送并核对远端一致。新Rust CI34263635757正在运行：https://github.com/ZipperCode/Aether/actions/runs/34263635757。只有该精确SHA全门禁成功才放行tag。
+
+- 34263635757已核验completed/success，headSha严格等于7eaea44b082d2cdd1e4b0133ee04c83fb7b703ca，18/18作业success；watch句柄64639正常exit0。
+- CI通过后重新核对远端latest v0.7.31且v0.7.32未占用，创建annotated应用tag v0.7.32并仅推该ref，目标为上述精确SHA。下一步跟进release终态与产物，不部署。
+
+- Release34265118756 8/8成功，v0.7.32已latest稳定发布，6资产、checksum/provenance与双架构镜像核验通过。详细数据见release-verification.md；所有任务临时文件/进程已清理，未部署。下一步仅提交证据、归档及journal并推送记录。

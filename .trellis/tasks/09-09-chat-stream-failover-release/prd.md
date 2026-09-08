@@ -18,8 +18,8 @@
 - [x] A3：正常首段不丢失/重复，分块错误不误判成功；有效内容输出后错误仍在本流终止，不拼接下一家回答。
 - [x] A4：保留同 Key 重试、显式 stop 规则、候选单次结算及 usage 归属；修复共享实际调用链，不留重复路径。
 - [x] A5：独立 review/修正、模拟回归及最小相关检查通过，命令和证据可追溯。
-- [ ] A6：中文提交并正常推送 origin/master；精确 SHA 全部必需 GitHub CI 成功后创建并推送下一未占用应用补丁 tag。
-- [ ] A7：跟进 tag 的既有 release 工作流和产物，记录 tag/commit/CI/release 关系，清理并收口。
+- [x] A6：中文提交并正常推送 origin/master；精确 SHA 全部必需 GitHub CI 成功后创建并推送下一未占用应用补丁 tag。
+- [x] A7：跟进 tag 的既有 release 工作流和产物，记录 tag/commit/CI/release 关系，清理并收口。
 
 ## 边界与决策
 
