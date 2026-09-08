@@ -2704,9 +2704,9 @@ mod tests {
         );
     }
 
+    /// 验证完整目录快照中的低余额热成员退队，并回退到仍可用的冷成员。
     #[test]
     fn pool_scheduler_evicts_low_balance_active_probe_member() {
-        // 验证低余额热成员会释放 active-probe，并回退到仍可用的冷成员。
         let provider_config = Some(json!({
             "pool_advanced": {"probing_enabled": true}
         }));
@@ -2732,13 +2732,16 @@ mod tests {
                 ..AdminProviderPoolRuntimeState::default()
             },
         )]);
-        let key_context_by_id = BTreeMap::from([(
-            "key-hot".to_string(),
-            PoolMemberSignals {
-                balance_below_minimum: true,
-                ..PoolMemberSignals::default()
-            },
-        )]);
+        let key_context_by_id = BTreeMap::from([
+            (
+                "key-hot".to_string(),
+                PoolMemberSignals {
+                    balance_below_minimum: true,
+                    ..PoolMemberSignals::default()
+                },
+            ),
+            ("key-cold".to_string(), PoolMemberSignals::default()),
+        ]);
 
         let outcome = apply_local_execution_pool_scheduler_with_runtime_map_outcome(
             vec![key_hot, key_cold],
@@ -2746,10 +2749,24 @@ mod tests {
             &key_context_by_id,
         );
 
-        assert_eq!(outcome.candidates[0].candidate.key_id, "key-cold");
         assert_eq!(
-            outcome.skipped[0].skip_reason,
-            aether_pool_core::POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON
+            outcome
+                .candidates
+                .iter()
+                .map(|item| item.candidate.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-cold"]
+        );
+        assert_eq!(
+            outcome
+                .skipped
+                .iter()
+                .map(|item| (item.candidate.key_id.as_str(), item.skip_reason))
+                .collect::<Vec<_>>(),
+            vec![(
+                "key-hot",
+                aether_pool_core::POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON
+            )]
         );
         assert_eq!(
             outcome
@@ -2811,9 +2828,9 @@ mod tests {
             .is_empty());
     }
 
+    /// 验证已知订阅耗尽始终使热成员退队，历史开关的任一取值都不能绕过过滤。
     #[test]
-    fn active_probe_subscription_exhaustion_respects_existing_switch() {
-        // 验证 active-probe 预过滤不会绕过 subscription exhaustion 的显式开关。
+    fn active_probe_subscription_exhaustion_ignores_historical_switch() {
         let key_context_by_id = BTreeMap::from([(
             "key-hot".to_string(),
             PoolMemberSignals {
@@ -2821,60 +2838,37 @@ mod tests {
                 ..PoolMemberSignals::default()
             },
         )]);
-        let disabled = sample_eligible_candidate(
-            "provider-pool",
-            "endpoint-1",
-            "key-hot",
-            10,
-            Some(json!({
-                "pool_advanced": {"probing_enabled": true}
-            })),
-        );
-        let mut disabled_runtime = BTreeMap::from([(
-            "provider-pool".to_string(),
-            AdminProviderPoolRuntimeState {
-                active_probe_member_ids: BTreeSet::from(["key-hot".to_string()]),
-                ..AdminProviderPoolRuntimeState::default()
-            },
-        )]);
-        assert!(prune_unschedulable_active_probe_members_for_request(
-            &mut disabled_runtime,
-            &[disabled],
-            &key_context_by_id,
-        )
-        .is_empty());
-        assert!(disabled_runtime["provider-pool"]
-            .active_probe_member_ids
-            .contains("key-hot"));
-
-        let enabled = sample_eligible_candidate(
-            "provider-pool",
-            "endpoint-1",
-            "key-hot",
-            10,
-            Some(json!({
-                "pool_advanced": {
-                    "probing_enabled": true,
-                    "skip_exhausted_accounts": true
-                }
-            })),
-        );
-        let mut enabled_runtime = BTreeMap::from([(
-            "provider-pool".to_string(),
-            AdminProviderPoolRuntimeState {
-                active_probe_member_ids: BTreeSet::from(["key-hot".to_string()]),
-                ..AdminProviderPoolRuntimeState::default()
-            },
-        )]);
-        let evicted = prune_unschedulable_active_probe_members_for_request(
-            &mut enabled_runtime,
-            &[enabled],
-            &key_context_by_id,
-        );
-        assert_eq!(
-            evicted.get("provider-pool"),
-            Some(&BTreeSet::from(["key-hot".to_string()]))
-        );
+        for skip_exhausted_accounts in [false, true] {
+            let candidate = sample_eligible_candidate(
+                "provider-pool",
+                "endpoint-1",
+                "key-hot",
+                10,
+                Some(json!({
+                    "pool_advanced": {
+                        "probing_enabled": true,
+                        "skip_exhausted_accounts": skip_exhausted_accounts
+                    }
+                })),
+            );
+            let mut runtime = BTreeMap::from([(
+                "provider-pool".to_string(),
+                AdminProviderPoolRuntimeState {
+                    active_probe_member_ids: BTreeSet::from(["key-hot".to_string()]),
+                    ..AdminProviderPoolRuntimeState::default()
+                },
+            )]);
+            let evicted = prune_unschedulable_active_probe_members_for_request(
+                &mut runtime,
+                &[candidate],
+                &key_context_by_id,
+            );
+            assert_eq!(
+                evicted.get("provider-pool"),
+                Some(&BTreeSet::from(["key-hot".to_string()]))
+            );
+            assert!(runtime["provider-pool"].active_probe_member_ids.is_empty());
+        }
     }
 
     #[tokio::test]

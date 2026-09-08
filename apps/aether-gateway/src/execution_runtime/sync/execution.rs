@@ -4123,7 +4123,7 @@ mod tests {
         assert_eq!(body["error"]["message"], "Upstream response too large");
     }
 
-    /// 验证本地同步执行缺少兼容 Endpoint 时，在真实 Key 准入后按 credential 范围重试且不惩罚 Key。
+    /// 验证同步能力缺失在真实 Key 准入后按凭据重试，内部原因头不外传且原错误正文不变。
     #[tokio::test]
     async fn no_local_sync_plans_retries_at_credential_scope_without_key_penalty() {
         let request_id = "req-sync-endpoint-capability-mismatch";
@@ -4209,7 +4209,14 @@ mod tests {
                 .headers()
                 .get(crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
                 .and_then(|value| value.to_str().ok()),
-            Some("no_local_sync_plans")
+            None
+        );
+        let fallback_body = to_bytes(fallback.into_body(), usize::MAX)
+            .await
+            .expect("fallback body should read");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fallback_body).expect("fallback body should be JSON"),
+            json!({"error": {"message": "unsupported endpoint format"}})
         );
 
         let candidates = request_candidate_repository

@@ -10,8 +10,10 @@ describe('provider key batch import UI contract', () => {
   it('shows the entry for every key-managed provider', () => {
     const source = readSource('src/features/providers/components/ProviderDetailDrawer.vue')
 
-    expect(source).toContain('isKeyManagedProviderType(provider.provider_type)')
-    expect(source).toContain('isKeyManagedProviderType(provider?.provider_type)')
+    // 按钮和弹窗共用密钥型判断；弹窗先确认 provider 非空，不依赖可选链写法。
+    expect(source).toContain('v-if="endpoints.length > 0 && isKeyManagedProviderType(provider.provider_type)"')
+    expect(source).toContain('@click="keyBatchImportDialogOpen = true"')
+    expect(source).toContain('v-if="open && keyBatchImportDialogOpen && provider && isKeyManagedProviderType(provider.provider_type)"')
     expect(source).not.toContain("provider.provider_type === 'custom'")
     expect(source).toContain('<ProviderKeyBatchImportDialog')
     expect(source).toContain('keyBatchImportDialogOpen')

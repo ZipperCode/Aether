@@ -1390,7 +1390,7 @@ mod transport_tests {
     }
 
     #[test]
-    /// 验证 OAuth、凭据轮换及本地调度 CAS 都遵守上游的 Debug 敏感数据约束。
+    /// 验证调度 CAS 完全省略敏感字段，OAuth 与凭据轮换 CAS 保留脱敏标记且不泄露凭据。
     fn provider_catalog_cas_debug_output_redacts_credential_fences() {
         let scheduling = ProviderCatalogKeySchedulingStateCasUpdate {
             key_id: "key-debug".to_string(),
@@ -1401,14 +1401,14 @@ mod transport_tests {
             scheduling: Some(serde_json::json!({"reason": "scheduling-new-canary"})),
             updated_at_unix_secs: Some(125),
         };
-        assert_debug_redacts(
-            &scheduling,
-            &[
-                "scheduling-api-key-canary",
-                "scheduling-auth-config-canary",
-                "scheduling-old-canary",
-                "scheduling-new-canary",
-            ],
+        // 调度 CAS 使用非穷尽 Debug，精确限定安全字段，不能要求被省略字段输出脱敏标记。
+        assert_eq!(
+            format!("{scheduling:?}"),
+            concat!(
+                "ProviderCatalogKeySchedulingStateCasUpdate { ",
+                "key_id: \"key-debug\", expected_auth_type: \"oauth\", ",
+                "updated_at_unix_secs: Some(125), .. }",
+            ),
         );
 
         let fence = ProviderCatalogKeyOAuthCredentialFence {

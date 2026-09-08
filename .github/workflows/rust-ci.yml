@@ -376,7 +376,8 @@ jobs:
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
           AETHER_REQUIRE_LOCAL_POSTGRES_TESTS: "true"
-        run: cargo nextest run -p aether-data
+        # 收集本任务全部失败后仍返回非零，避免首个失败隐藏剩余测试。
+        run: cargo nextest run -p aether-data --no-fail-fast
 
       - name: Show sccache stats
         if: always()
@@ -456,7 +457,8 @@ jobs:
         env:
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
-        run: cargo nextest run --workspace --exclude aether-gateway --exclude aether-data --exclude aether-integration-tests
+        # 保留原排除范围，收集所有失败而不跳过或忽略失败结果。
+        run: cargo nextest run --workspace --exclude aether-gateway --exclude aether-data --exclude aether-integration-tests --no-fail-fast
 
       - name: Show sccache stats
         if: always()

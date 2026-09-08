@@ -754,6 +754,7 @@ async fn gateway_models_list_publishes_enabled_global_models_without_provider_mo
     gateway_handle.abort();
 }
 
+/// 用真实 Provider/Endpoint 目录解析受限 ID，模型列表仍仅暴露该 Provider 的静态关联。
 #[tokio::test]
 async fn gateway_models_list_keeps_provider_restricted_keys_within_static_associations() {
     let restricted_snapshot = StoredAuthApiKeySnapshot::new(
@@ -806,6 +807,16 @@ async fn gateway_models_list_keeps_provider_restricted_keys_within_static_associ
             "visible-model",
         ),
     ]));
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-allowed", "allowed", 10)],
+        vec![sample_endpoint(
+            "endpoint-allowed",
+            "provider-allowed",
+            "openai:chat",
+            "https://api.example.test",
+        )],
+        Vec::new(),
+    ));
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -815,6 +826,7 @@ async fn gateway_models_list_keeps_provider_restricted_keys_within_static_associ
                     auth_repository,
                 )
                 .with_model_catalog_reader(model_catalog_repository)
+                .with_provider_catalog_reader(provider_catalog_repository)
                 .with_global_model_repository_for_tests(global_model_repository),
             ),
     );
@@ -827,8 +839,9 @@ async fn gateway_models_list_keeps_provider_restricted_keys_within_static_associ
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
     assert_eq!(payload["data"].as_array().map(Vec::len), Some(1));
     assert_eq!(payload["data"][0]["id"], "visible-model");
 

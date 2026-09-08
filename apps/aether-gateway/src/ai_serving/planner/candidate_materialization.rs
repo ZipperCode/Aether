@@ -3139,8 +3139,9 @@ mod tests {
             .is_none());
     }
 
+    /// 验证非路由显式亲和页可缓存，而粘性请求及全局路由聚合页始终绕过缓存。
     #[tokio::test]
-    async fn resolved_candidate_page_cache_requires_fixed_order_or_explicit_affinity() {
+    async fn resolved_candidate_page_cache_preserves_affinity_and_routed_page_boundaries() {
         let app = AppState::new().expect("state should build");
         let auth_snapshot = sample_auth_snapshot();
         let model_directive_policy =
@@ -3199,7 +3200,7 @@ mod tests {
 
         assert!(!should_cache_resolved_candidate_page(&cursor));
 
-        // 路由聚合页即使满足固定排序，也不得缓存包含完整 transport 的解析结果。
+        // 路由聚合页的轻量候选仍包含请求级全局排序与后备链，不能跨请求复用。
         cursor.client_session_affinity =
             Some(ClientSessionAffinity::from_session_key("routed-session"));
         cursor.routing_policy = Some(ResolvedRoutingPolicy {
@@ -3327,7 +3328,11 @@ mod tests {
             deferred_error: None,
         };
 
-        assert!(should_cache_resolved_candidate_page(&cursor));
+        // 固定排序只满足底层优先级页条件，不能覆盖外层路由聚合页的缓存禁用规则。
+        assert!(cursor
+            .page_cursor
+            .should_cache_current_priority_resolved_page());
+        assert!(!should_cache_resolved_candidate_page(&cursor));
     }
 
     #[tokio::test]

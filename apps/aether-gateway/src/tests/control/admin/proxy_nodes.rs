@@ -1520,6 +1520,7 @@ async fn gateway_tests_connected_tunnel_proxy_nodes_with_active_probe() {
     gateway_handle.abort();
 }
 
+/// 删除代理后清空各级引用，普通读取隐藏配置墓碑但强读仍能确认持久化删除。
 #[tokio::test]
 async fn gateway_deletes_proxy_nodes_and_clears_proxy_refs_locally() {
     let mut manual_node = sample_proxy_node("manual-node-1");
@@ -1594,15 +1595,24 @@ async fn gateway_deletes_proxy_nodes_and_clears_proxy_refs_locally() {
             .find_system_config_value("system_proxy_node_id")
             .await
             .expect("system config lookup should succeed"),
-        Some(serde_json::Value::Null)
+        None
     );
     assert_eq!(
         data_state
             .find_system_config_value("external_models_proxy_node_id")
             .await
             .expect("external models proxy config lookup should succeed"),
-        Some(serde_json::Value::Null)
+        None
     );
+    for config_key in ["system_proxy_node_id", "external_models_proxy_node_id"] {
+        let tombstone = data_state
+            .find_system_config_value_with_revision_strong(config_key)
+            .await
+            .expect("proxy config tombstone should read")
+            .expect("proxy config deletion should retain its revision");
+        assert_eq!(tombstone.value, serde_json::Value::Null);
+        assert!(tombstone.revision > 0);
+    }
 
     let provider_ids = vec!["provider-1".to_string()];
     let providers = data_state
@@ -1624,6 +1634,7 @@ async fn gateway_deletes_proxy_nodes_and_clears_proxy_refs_locally() {
     gateway_handle.abort();
 }
 
+/// 缓存清理失败不回滚代理引用删除；墓碑持久化后其余目录引用仍全部清除。
 #[tokio::test]
 async fn gateway_continues_proxy_reference_cleanup_when_external_models_cache_delete_fails() {
     let mut manual_node = sample_proxy_node("manual-node-cache-failure");
@@ -1693,8 +1704,15 @@ async fn gateway_continues_proxy_reference_cleanup_when_external_models_cache_de
             .find_system_config_value("external_models_proxy_node_id")
             .await
             .expect("external models proxy config lookup should succeed"),
-        Some(serde_json::Value::Null)
+        None
     );
+    let tombstone = data_state
+        .find_system_config_value_with_revision_strong("external_models_proxy_node_id")
+        .await
+        .expect("proxy config tombstone should read")
+        .expect("proxy config deletion should retain its revision");
+    assert_eq!(tombstone.value, serde_json::Value::Null);
+    assert!(tombstone.revision > 0);
     assert!(data_state
         .find_proxy_node("manual-node-cache-failure")
         .await

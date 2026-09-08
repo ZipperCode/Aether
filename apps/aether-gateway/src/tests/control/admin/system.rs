@@ -672,6 +672,7 @@ async fn gateway_handles_admin_system_settings_locally_with_trusted_admin_princi
     upstream_handle.abort();
 }
 
+/// 验证恢复备份可恢复已设密钥，交互导出不带密钥，未设值墓碑均不列出。
 #[tokio::test]
 async fn gateway_handles_admin_system_config_export_locally_with_trusted_admin_principal() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
@@ -862,11 +863,17 @@ async fn gateway_handles_admin_system_config_export_locally_with_trusted_admin_p
             .expect("SMTP password should be recoverable")["value"],
         "smtp-secret"
     );
+    assert!(recovery_system_configs
+        .iter()
+        .all(|entry| entry["key"] != "turnstile_secret_key"));
     assert_eq!(
-        recovery_system_configs
-            .iter()
-            .find(|entry| entry["key"] == "turnstile_secret_key")
-            .expect("unset Turnstile secret should remain recoverable")["value"],
+        state
+            .data
+            .find_system_config_value_with_revision_strong("turnstile_secret_key")
+            .await
+            .expect("unset secret tombstone should read")
+            .expect("unset secret fixture should retain its tombstone")
+            .value,
         serde_json::Value::Null
     );
 

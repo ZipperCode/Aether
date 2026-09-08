@@ -834,7 +834,7 @@ fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exhaust_af
     );
 }
 
-/// 执行“唯一 Chat 候选及其默认同 Key 重试均失败”的用量与候选记录验证。
+/// 验证唯一 Chat 候选及默认同 Key 重试均失败，basic 采集只记录用量与候选诊断。
 async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exhaust_after_retryable_sync_failure_impl(
 ) {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
@@ -896,7 +896,7 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
             )
             .with_system_config_values_for_tests([(
                 "request_record_level".to_string(),
-                json!("full"),
+                json!("basic"),
             )]),
         )
         .with_usage_runtime_for_tests(UsageRuntimeConfig {
@@ -987,7 +987,7 @@ fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable_witho
     );
 }
 
-/// 执行“同步传输不可用且无计划回退”的失败用量记录验证。
+/// 验证同步传输不可用且无计划回退时，basic 采集保留失败用量而不记录正文。
 async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable_without_plan_fallback_impl(
 ) {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
@@ -1032,7 +1032,7 @@ async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable
             )
             .with_system_config_values_for_tests([(
                 "request_record_level".to_string(),
-                json!("full"),
+                json!("basic"),
             )]),
         )
         .with_usage_runtime_for_tests(UsageRuntimeConfig {
@@ -1233,6 +1233,7 @@ fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_exhaus
     );
 }
 
+/// 验证 Claude 无候选时 basic 采集保留结构化路由原因，不持久化客户端错误正文。
 async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_exhaustion_impl() {
     fn sample_claude_auth_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
         StoredAuthApiKeySnapshot::new(
@@ -1346,7 +1347,7 @@ async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_
         )
         .with_system_config_values_for_tests([(
             "request_record_level".to_string(),
-            json!("full"),
+            json!("basic"),
         )]),
     )
     .with_usage_runtime_for_tests(UsageRuntimeConfig {
@@ -1850,6 +1851,7 @@ fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_skipped
     );
 }
 
+/// 验证 Claude CLI 全部候选跳过时 basic 采集仍保留原请求头与候选诊断，不记录正文。
 async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_skipped_impl() {
     fn sample_auth_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
         StoredAuthApiKeySnapshot::new(
@@ -2042,7 +2044,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
         )
         .with_system_config_values_for_tests([(
             "request_record_level".to_string(),
-            json!("full"),
+            json!("basic"),
         )]),
     )
     .with_usage_runtime_for_tests(UsageRuntimeConfig {
@@ -2161,6 +2163,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
     upstream_handle.abort();
 }
 
+/// 验证 basic 模式下大正文与深层 metadata 不进入失败 usage 正文存储，候选诊断仍完整。
 #[test]
 fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude_cli_runtime_miss()
 {
@@ -2342,7 +2345,8 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
                     )
                     .with_system_config_values_for_tests([(
                         "request_record_level".to_string(),
-                        json!("full"),
+                        // 此用例验证大请求的 basic 轻量采集，不应启用 full 正文存储。
+                        json!("basic"),
                     )]),
                 )
                 .with_usage_runtime_for_tests(UsageRuntimeConfig {

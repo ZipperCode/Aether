@@ -102,11 +102,12 @@ fn parse_http_url(value: &str) -> Option<Url> {
     .then_some(url)
 }
 
+/// 读取最后一行转发协议头的末项，仅识别 HTTP(S)；调用方负责确认代理可信。
 fn forwarded_proto(headers: &HeaderMap) -> Option<&'static str> {
     let value = headers
         .get_all("x-forwarded-proto")
         .iter()
-        .last()?
+        .next_back()?
         .to_str()
         .ok()?
         .rsplit(',')

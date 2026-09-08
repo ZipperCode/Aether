@@ -40,8 +40,9 @@ def make_package(root, build_script, toolchain):
 def check(package, environment, label, version, *, rerun, build_type="source"):
     """断言真实执行次数、Fresh 与版本，并返回 Cargo 输出供 packed 路径断言。"""
     target = package / "target"
+    # 仅固定被解析的 Cargo 输出，避免 CI 的强制颜色控制码打断 Fresh 文本断言。
     output = run(
-        ["cargo", "check", "--offline", "-vv"], package,
+        ["cargo", "check", "--offline", "-vv", "--color", "never"], package,
         {**environment, "CARGO_TARGET_DIR": str(target)},
     )
     executions = output.count("] cargo:rustc-env=AETHER_BUILD_VERSION=")

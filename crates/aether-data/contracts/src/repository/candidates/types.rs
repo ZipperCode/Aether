@@ -102,6 +102,7 @@ define_candidate_diagnostic_categories!(
         "connect_timeout",
         "control_fallback",
         "downstream_disconnect",
+        "endpoint_capability_mismatch",
         "execution_runtime_http_error",
         "execution_runtime_stream_chunk_decode_error",
         "execution_runtime_stream_frame_decode_error",
@@ -2316,6 +2317,7 @@ mod tests {
         assert!(!serialized.contains("session=secret"));
     }
 
+    /// 持久化仅保留已登记诊断类别；内部能力不匹配经重复投影仍可归因，未知值保持未分类。
     #[test]
     fn candidate_persistence_keeps_only_known_diagnostic_categories() {
         let mut record = UpsertRequestCandidateRecord {
@@ -2371,6 +2373,19 @@ mod tests {
         record.error_type = Some("Upstream5xx".to_string());
         record.sanitize_for_persistence();
         assert_eq!(record.error_type.as_deref(), Some("upstream5xx"));
+
+        // 同步与流式执行均生成此固定内部类别，不能被持久化投影降级成未知错误。
+        record.error_type = Some("endpoint_capability_mismatch".to_string());
+        record.sanitize_for_persistence();
+        assert_eq!(
+            record.error_type.as_deref(),
+            Some("endpoint_capability_mismatch")
+        );
+        record.sanitize_for_persistence();
+        assert_eq!(
+            record.error_type.as_deref(),
+            Some("endpoint_capability_mismatch")
+        );
 
         for reason in REQUEST_CANDIDATE_SKIP_REASONS {
             assert_eq!(

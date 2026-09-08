@@ -1005,6 +1005,7 @@ async fn gateway_returns_service_unavailable_for_admin_provider_create_without_p
     upstream_handle.abort();
 }
 
+/// 验证自定义 Provider 更新保留适用配置，并不产生 Claude Code 专用配置。
 #[tokio::test]
 async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
@@ -1121,7 +1122,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
     );
     assert_eq!(payload["stream_first_byte_timeout"], 11.0);
     assert_eq!(payload["proxy"], json!({"url": "https://proxy.example/"}));
-    assert_eq!(payload["claude_code_advanced"], json!({"pool_size": 2}));
+    assert_eq!(payload.get("claude_code_advanced"), Some(&json!(null)));
     assert_eq!(payload["pool_advanced"], json!({}));
     assert_eq!(payload["failover_rules"], json!({"strategy": "ordered"}));
     assert_eq!(payload["chat_pii_redaction"], json!({"enabled": true}));

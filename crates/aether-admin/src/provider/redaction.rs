@@ -866,6 +866,7 @@ fn account_status_reason(code: &str, blocked: bool) -> Option<&'static str> {
     }
 }
 
+/// 投影管理端可展示的额度字段；保留余额快照版本、类型和精确金额，丢弃未知诊断。
 fn project_quota_status_snapshot(value: Option<&Value>) -> Value {
     let source = value.and_then(Value::as_object);
     let exhausted = source
@@ -894,6 +895,7 @@ fn project_quota_status_snapshot(value: Option<&Value>) -> Value {
         return Value::Object(projected);
     };
     for field in [
+        "schema_version",
         "version",
         "observed_at",
         "usage_ratio",
@@ -908,6 +910,7 @@ fn project_quota_status_snapshot(value: Option<&Value>) -> Value {
         copy_json_bool_or_null(source, &mut projected, field);
     }
     for field in [
+        "kind",
         "provider_type",
         "freshness",
         "source",
@@ -937,7 +940,31 @@ fn project_quota_status_snapshot(value: Option<&Value>) -> Value {
             Value::Array(windows.iter().filter_map(project_quota_window).collect()),
         );
     }
+    if let Some(balances) = source.get("balances").and_then(Value::as_array) {
+        projected.insert(
+            "balances".to_string(),
+            Value::Array(balances.iter().filter_map(project_quota_balance).collect()),
+        );
+    }
     Value::Object(projected)
+}
+
+/// 余额单位沿用快照标记；五类金额仅接受有限数值字符串或 null，原样保留小数精度。
+fn project_quota_balance(value: &Value) -> Option<Value> {
+    let source = value.as_object()?;
+    let mut projected = Map::new();
+    copy_safe_token_string_or_null(source, &mut projected, "unit");
+    for field in ["available", "total", "granted", "topped_up", "used"] {
+        if let Some(value) = source.get(field).filter(|value| {
+            value.is_null()
+                || value
+                    .as_str()
+                    .is_some_and(|amount| amount.parse::<f64>().is_ok_and(f64::is_finite))
+        }) {
+            projected.insert(field.to_string(), value.clone());
+        }
+    }
+    Some(Value::Object(projected))
 }
 
 fn quota_status_label(code: &str) -> Option<&'static str> {
@@ -2571,6 +2598,54 @@ mod tests {
         let serialized = projected.to_string();
         assert!(!serialized.contains("upstream-secret"));
         assert!(!serialized.contains("user:password"));
+    }
+
+    /// 余额金额和单位经过重复管理端投影仍精确保留，未知字段及伪装成金额的诊断不得透出。
+    #[test]
+    fn provider_status_projection_preserves_exact_balance_amounts() {
+        let projected = admin_provider_status_snapshot_safe_json(Some(&json!({
+            "quota": {
+                "schema_version": 1,
+                "kind": "balance",
+                "provider_type": "deepseek",
+                "balances": [{
+                    "unit": "USD",
+                    "available": "9007199254740993.123400",
+                    "total": "13.82",
+                    "granted": "0.00",
+                    "topped_up": "13.82",
+                    "used": "-0.01",
+                    "authorization": "Bearer balance-secret"
+                }, {
+                    "unit": "CNY",
+                    "available": "Bearer balance-secret",
+                    "total": null,
+                    "used": "NaN"
+                }, "balance-secret"],
+                "unknown": "balance-secret"
+            }
+        })));
+        assert_eq!(projected.pointer("/quota/schema_version"), Some(&json!(1)));
+        assert_eq!(projected.pointer("/quota/kind"), Some(&json!("balance")));
+        assert_eq!(
+            projected.pointer("/quota/balances"),
+            Some(&json!([{
+                "unit": "USD",
+                "available": "9007199254740993.123400",
+                "total": "13.82",
+                "granted": "0.00",
+                "topped_up": "13.82",
+                "used": "-0.01"
+            }, {
+                "unit": "CNY",
+                "total": null
+            }]))
+        );
+        assert!(!projected.to_string().contains("balance-secret"));
+        assert_eq!(
+            admin_provider_status_snapshot_safe_json(Some(&projected)),
+            projected
+        );
     }
 
     #[test]

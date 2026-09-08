@@ -88,6 +88,15 @@ for job, stage in (("fmt", "fmt"), ("clippy_gateway", "clippy-gateway"), ("test_
     assert "continue-on-error:" not in jobs[job]
     assert "run: cargo" not in jobs[job], "duplicated command owner"
 
+# 两个已出现提前中止的任务必须收集全部失败，保持原测试范围且禁止吞掉失败状态。
+for job, command in (
+    ("test_data", "cargo nextest run -p aether-data --no-fail-fast"),
+    ("test_rest", "cargo nextest run --workspace --exclude aether-gateway --exclude aether-data --exclude aether-integration-tests --no-fail-fast"),
+):
+    commands = re.findall(r"^        run: (cargo nextest run .+)$", jobs[job], re.M)
+    assert commands == [command], (job, commands)
+    assert "continue-on-error:" not in jobs[job]
+
 gateway_env = jobs["test_gateway"].split("    steps:\n", 1)[0]
 assert re.search(r'^    env:\n(?:      #.*\n)*      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"$', gateway_env, re.M)
 assert jobs["test_gateway"].count("RUSTFLAGS:") == 1

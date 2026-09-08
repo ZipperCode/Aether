@@ -140,6 +140,7 @@ fn ai_serving_target_structure_removes_legacy_pipeline_boundary() {
     );
 }
 
+/// 验证 serving 拥有执行策略，网关仅以端口适配运行时及两类候选的共享排序。
 #[test]
 fn ai_serving_crate_owns_attempt_loop_without_gateway_runtime_deps() {
     let serving_manifest = read_workspace_file("crates/aether-ai/serving/Cargo.toml");
@@ -457,7 +458,10 @@ fn ai_serving_crate_owns_attempt_loop_without_gateway_runtime_deps() {
         read_workspace_file("apps/aether-gateway/src/ai_serving/planner/candidate_ranking.rs");
     for pattern in [
         "run_ai_candidate_ranking(&port",
-        "impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort",
+        "impl<Candidate> AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_, Candidate>",
+        "Candidate: LocalCandidateRankingTarget",
+        "impl LocalCandidateRankingTarget for EligibleLocalExecutionCandidate",
+        "impl LocalCandidateRankingTarget for RankedLocalExecutionCandidate",
         "build_ai_rankable_candidate(",
         "ai_ranking_context(",
         "build_rankable_candidate",
@@ -5042,6 +5046,7 @@ fn ai_serving_legacy_api_format_names_stay_out_of_primary_paths() {
     }
 }
 
+/// 将退休格式别名限制在明确的迁移或负向测试文件，禁止重新进入普通业务路径。
 #[test]
 fn retired_api_format_occurrences_are_whitelisted() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5062,6 +5067,8 @@ fn retired_api_format_occurrences_are_whitelisted() {
         "crates/aether-ai/formats/src/formats/registry.rs",
         "crates/aether-data/runtime/src/migrate.rs",
         "crates/aether-data/runtime/src/lifecycle/migrate/tests.rs",
+        // 该迁移回归用旧别名数组验证非空策略原样保留，而非重新接受退休格式。
+        "crates/aether-data/runtime/src/lifecycle/migrate/tests/policy_nulls.rs",
         "crates/aether-usage/runtime/src/report.rs",
         "frontend/src/api/endpoints/types/__tests__/api-format.spec.ts",
         "frontend/src/views/admin/module-management/modelDirectivesConfig.ts",

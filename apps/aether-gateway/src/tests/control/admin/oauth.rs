@@ -173,6 +173,105 @@ fn sample_kiro_device_access_token_without_email() -> String {
     format!("{header}.{payload}.sig")
 }
 
+/// 提供设备会话引用的在线手动节点；代理地址仅进入模拟执行计划，不会真实连接。
+fn kiro_device_poll_proxy_repository() -> Arc<InMemoryProxyNodeRepository> {
+    let mut node = sample_proxy_node("proxy-node-kiro");
+    // 本例通过手动 HTTP 代理解析路由，不需要启动隧道或访问外部代理服务。
+    node.status = "online".to_string();
+    node.is_manual = true;
+    node.tunnel_mode = false;
+    node.tunnel_connected = false;
+    node.proxy_url = Some("http://proxy.example:8080".to_string());
+    Arc::new(InMemoryProxyNodeRepository::seed(vec![node]))
+}
+
+/// 模拟设备授权实际使用的 IDC、Profile 发现和邮箱/额度请求，断言原生客户端与代理绑定。
+/// `token_payload` 是当前阶段的虚构令牌响应；`email` 只通过模拟的上游额度接口返回。
+fn kiro_device_poll_execution_result(
+    plan: &ExecutionPlan,
+    token_payload: Value,
+    email: &str,
+) -> Value {
+    assert_eq!(
+        plan.proxy
+            .as_ref()
+            .and_then(|proxy| proxy.node_id.as_deref()),
+        Some("proxy-node-kiro")
+    );
+    let payload = match plan.request_id.as_str() {
+        "kiro_device_poll" | "provider-oauth:kiro-idc-refresh" => {
+            assert_eq!(plan.method, "POST");
+            assert_eq!(plan.url, "https://oidc.us-east-1.amazonaws.com/token");
+            assert_eq!(
+                plan.headers.get("user-agent").map(String::as_str),
+                Some("node")
+            );
+            let body = plan.body.json_body.as_ref().expect("IDC body should exist");
+            assert_eq!(body["clientId"], "kiro-device-client");
+            assert_eq!(body["clientSecret"], "kiro-device-secret");
+            assert_eq!(
+                body["grantType"],
+                if plan.request_id == "kiro_device_poll" {
+                    "urn:ietf:params:oauth:grant-type:device_code"
+                } else {
+                    "refresh_token"
+                }
+            );
+            token_payload
+        }
+        "provider-oauth:kiro-profile-discovery" => {
+            assert_eq!(plan.method, "POST");
+            assert_eq!(
+                plan.url,
+                "https://q.us-east-1.amazonaws.com/ListAvailableProfiles"
+            );
+            assert_eq!(
+                plan.headers.get("authorization"),
+                Some(&format!(
+                    "Bearer {}",
+                    token_payload["accessToken"]
+                        .as_str()
+                        .expect("fixture access token should exist")
+                ))
+            );
+            assert!(plan.headers["x-amz-user-agent"].contains("KiroIDE"));
+            json!({"profiles": [{"arn": "arn:aws:kiro:profile/device-poll"}]})
+        }
+        request_id => {
+            // 授权后的异步额度刷新也经过相同执行通道；不把它误当成另一次设备轮询。
+            assert!(request_id == "kiro_device_email" || request_id.starts_with("kiro-quota:"));
+            assert_eq!(plan.method, "GET");
+            assert!(plan
+                .url
+                .starts_with("https://q.us-east-1.amazonaws.com/getUsageLimits?"));
+            assert_eq!(
+                plan.headers.get("authorization"),
+                Some(&format!(
+                    "Bearer {}",
+                    token_payload["accessToken"]
+                        .as_str()
+                        .expect("fixture access token should exist")
+                ))
+            );
+            json!({
+                "subscriptionInfo": {"subscriptionTitle": "KIRO PRO+"},
+                "usageBreakdownList": [{
+                    "currentUsageWithPrecision": 5.0,
+                    "usageLimitWithPrecision": 20.0,
+                    "nextDateReset": 1_900_000_000u64
+                }],
+                "desktopUserInfo": {"email": email}
+            })
+        }
+    };
+    json!({
+        "request_id": plan.request_id,
+        "status_code": 200,
+        "headers": {"content-type": "application/json"},
+        "body": {"json_body": payload}
+    })
+}
+
 fn sample_codex_access_token_with_profile_email_claims(
     email: &str,
     account_id: &str,
@@ -1504,6 +1603,7 @@ async fn gateway_handles_admin_provider_oauth_device_authorize_for_kiro_google_s
     assert_eq!(stored["status"], "pending");
 }
 
+/// 验证受信任管理员的设备授权完成 IDC 复验与 Profile 发现后持久化绑定凭据。
 #[test]
 fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_admin_principal() {
     run_admin_oauth_test(
@@ -1512,6 +1612,7 @@ fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_admin_p
     );
 }
 
+/// 完整模拟授权执行通道，保留授权状态、邮箱、代理和凭据落库断言。
 async fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_admin_principal_impl(
 ) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
@@ -1529,17 +1630,26 @@ async fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_a
     let access_token = sample_kiro_device_access_token("kiro@example.com");
     let expected_access_token = access_token.clone();
     let token_server = Router::new().route(
-        "/token",
-        post(move |_request: Request| {
+        "/v1/execute/sync",
+        post(move |Json(plan): Json<ExecutionPlan>| {
             let token_hits_inner = Arc::clone(&token_hits_clone);
             let access_token_inner = access_token.clone();
             async move {
-                *token_hits_inner.lock().expect("mutex should lock") += 1;
-                Json(json!({
-                    "accessToken": access_token_inner,
-                    "refreshToken": "kiro-device-refresh-token",
-                    "expiresIn": 1800,
-                }))
+                if matches!(
+                    plan.request_id.as_str(),
+                    "kiro_device_poll" | "provider-oauth:kiro-idc-refresh"
+                ) {
+                    *token_hits_inner.lock().expect("mutex should lock") += 1;
+                }
+                Json(kiro_device_poll_execution_result(
+                    &plan,
+                    json!({
+                        "accessToken": access_token_inner,
+                        "refreshToken": "kiro-device-refresh-token",
+                        "expiresIn": 1800,
+                    }),
+                    "kiro@example.com",
+                ))
             }
         }),
     );
@@ -1554,12 +1664,12 @@ async fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_a
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (token_url, token_handle) = start_server(token_server).await;
-    let state = AppState::new()
-        .expect("gateway should build")
+    let state = build_state_with_execution_runtime_override(token_url)
         .with_data_state_for_tests(
             GatewayDataState::with_provider_catalog_repository_for_tests(
                 provider_catalog_repository.clone(),
             )
+            .attach_proxy_node_repository_for_tests(kiro_device_poll_proxy_repository())
             .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
         )
         .with_provider_oauth_device_session_entry_for_tests(
@@ -1580,9 +1690,7 @@ async fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_a
                 "replaced": false,
                 "error_msg": null,
             }),
-        )
-        .with_provider_oauth_token_url_for_tests("kiro_device_poll", format!("{token_url}/token"))
-        .with_provider_oauth_token_url_for_tests("kiro_idc_refresh", token_url.to_string());
+        );
     let gateway = build_router_with_state(state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -1648,6 +1756,10 @@ async fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_a
     assert_eq!(auth_config["provider_type"], "kiro");
     assert_eq!(auth_config["auth_method"], "idc");
     assert_eq!(auth_config["refresh_token"], "kiro-device-refresh-token");
+    assert_eq!(
+        auth_config["profile_arn"],
+        "arn:aws:kiro:profile/device-poll"
+    );
     assert_eq!(auth_config["email"], "kiro@example.com");
     assert_eq!(auth_config["client_id"], "kiro-device-client");
     assert_eq!(auth_config["client_secret"], "kiro-device-secret");
@@ -1926,6 +2038,7 @@ async fn gateway_keeps_admin_provider_oauth_device_poll_pending_for_authorizatio
     token_handle.abort();
 }
 
+/// 验证设备授权使用 IDC 轮换后的令牌发现 Profile，并向上游查询缺失邮箱。
 #[test]
 fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_email() {
     run_admin_oauth_test(
@@ -1934,6 +2047,7 @@ fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_email() {
     );
 }
 
+/// 记录两次授权请求及独立邮箱查询，确保轮换凭据、邮箱和 Profile 一并落库。
 async fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_email_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
@@ -1947,76 +2061,53 @@ async fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_emai
 
     let token_requests = Arc::new(Mutex::new(Vec::<String>::new()));
     let token_requests_clone = Arc::clone(&token_requests);
+    let usage_hits = Arc::new(Mutex::new(0usize));
+    let usage_hits_clone = Arc::clone(&usage_hits);
     let initial_access_token = sample_kiro_device_access_token_without_email();
     let refreshed_access_token = sample_kiro_device_access_token_without_email();
     let expected_refreshed_access_token = refreshed_access_token.clone();
     let token_server = Router::new().route(
-        "/token",
-        post(move |request: Request| {
+        "/v1/execute/sync",
+        post(move |Json(plan): Json<ExecutionPlan>| {
             let token_requests_inner = Arc::clone(&token_requests_clone);
+            let usage_hits_inner = Arc::clone(&usage_hits_clone);
             let initial_access_token_inner = initial_access_token.clone();
             let refreshed_access_token_inner = refreshed_access_token.clone();
             async move {
-                let raw_body = String::from_utf8(
-                    to_bytes(request.into_body(), usize::MAX)
-                        .await
-                        .expect("body should read")
-                        .to_vec(),
-                )
-                .expect("body should be utf8");
-                token_requests_inner
-                    .lock()
-                    .expect("mutex should lock")
-                    .push(raw_body.clone());
-                if raw_body.contains("urn:ietf:params:oauth:grant-type:device_code") {
-                    return Json(json!({
+                if matches!(
+                    plan.request_id.as_str(),
+                    "kiro_device_poll" | "provider-oauth:kiro-idc-refresh"
+                ) {
+                    let body = plan.body.json_body.as_ref().expect("IDC body should exist");
+                    token_requests_inner
+                        .lock()
+                        .expect("mutex should lock")
+                        .push(body.to_string());
+                    if plan.request_id == "provider-oauth:kiro-idc-refresh" {
+                        assert_eq!(body["refreshToken"], "kiro-device-refresh-token-initial");
+                    }
+                }
+                if plan.request_id == "kiro_device_email" {
+                    *usage_hits_inner.lock().expect("mutex should lock") += 1;
+                }
+                let token_payload = if plan.request_id == "kiro_device_poll" {
+                    json!({
                         "accessToken": initial_access_token_inner,
                         "refreshToken": "kiro-device-refresh-token-initial",
                         "expiresIn": 1800,
-                    }))
-                    .into_response();
-                }
-                if raw_body.contains("\"grantType\":\"refresh_token\"") {
-                    return Json(json!({
+                    })
+                } else {
+                    json!({
                         "accessToken": refreshed_access_token_inner,
                         "refreshToken": "kiro-device-refresh-token-rotated",
                         "expiresIn": 2400,
-                    }))
-                    .into_response();
-                }
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": "unexpected_request",
-                        "body": raw_body,
-                    })),
-                )
-                    .into_response()
-            }
-        }),
-    );
-
-    let usage_hits = Arc::new(Mutex::new(0usize));
-    let usage_hits_clone = Arc::clone(&usage_hits);
-    let usage_server = Router::new().route(
-        "/getUsageLimits",
-        get(move |_request: Request| {
-            let usage_hits_inner = Arc::clone(&usage_hits_clone);
-            async move {
-                *usage_hits_inner.lock().expect("mutex should lock") += 1;
-                Json(json!({
-                    "subscriptionInfo": {
-                        "subscriptionTitle": "KIRO PRO+"
-                    },
-                    "usageBreakdownList": [{
-                        "currentUsageWithPrecision": 5.0,
-                        "usageLimitWithPrecision": 20.0,
-                        "nextDateReset": 1_900_000_000u64
-                    }],
-                    "desktopUserInfo": {
-                        "email": "kiro-usage@example.com"
-                    }
-                }))
+                    })
+                };
+                Json(kiro_device_poll_execution_result(
+                    &plan,
+                    token_payload,
+                    "kiro-usage@example.com",
+                ))
             }
         }),
     );
@@ -2031,13 +2122,12 @@ async fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_emai
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (token_url, token_handle) = start_server(token_server).await;
-    let (usage_url, usage_handle) = start_server(usage_server).await;
-    let state = AppState::new()
-        .expect("gateway should build")
+    let state = build_state_with_execution_runtime_override(token_url)
         .with_data_state_for_tests(
             GatewayDataState::with_provider_catalog_repository_for_tests(
                 provider_catalog_repository.clone(),
             )
+            .attach_proxy_node_repository_for_tests(kiro_device_poll_proxy_repository())
             .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
         )
         .with_provider_oauth_device_session_entry_for_tests(
@@ -2058,12 +2148,6 @@ async fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_emai
                 "replaced": false,
                 "error_msg": null,
             }),
-        )
-        .with_provider_oauth_token_url_for_tests("kiro_device_poll", format!("{token_url}/token"))
-        .with_provider_oauth_token_url_for_tests("kiro_idc_refresh", token_url.to_string())
-        .with_provider_oauth_token_url_for_tests(
-            "kiro_device_email",
-            format!("{usage_url}/getUsageLimits"),
         );
     let gateway = build_router_with_state(state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -2150,12 +2234,15 @@ async fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_emai
         "kiro-device-refresh-token-rotated"
     );
     assert_eq!(auth_config["email"], "kiro-usage@example.com");
+    assert_eq!(
+        auth_config["profile_arn"],
+        "arn:aws:kiro:profile/device-poll"
+    );
     assert_eq!(auth_config["client_id"], "kiro-device-client");
     assert_eq!(auth_config["client_secret"], "kiro-device-secret");
     assert_eq!(auth_config["region"], "us-east-1");
 
     gateway_handle.abort();
-    usage_handle.abort();
     token_handle.abort();
     upstream_handle.abort();
 }
@@ -5524,6 +5611,7 @@ async fn gateway_import_refresh_token_surfaces_execution_runtime_error_detail_im
     execution_runtime_handle.abort();
 }
 
+/// 验证社会登录批量导入可用完整上游凭据替换已停用的同邮箱 Key。
 #[test]
 fn gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_admin_principal() {
     run_admin_oauth_test(
@@ -5532,6 +5620,7 @@ fn gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_admin_pr
     );
 }
 
+/// 刷新响应携带已发现的 Profile，保持本例只验证刷新与停用重复项替换。
 async fn gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_admin_principal_impl()
 {
     let upstream_hits = Arc::new(Mutex::new(0usize));
@@ -5556,6 +5645,8 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_ad
                     "accessToken": sample_kiro_device_access_token("kiro-batch@example.com"),
                     "refreshToken": "kiro-batch-refresh-token-new",
                     "expiresIn": 1800,
+                    // 社会登录刷新可直接返回 Profile，无须再通过另一个上游接口发现。
+                    "profileArn": "arn:aws:kiro:profile/batch-import",
                 }))
             }
         }),
@@ -5661,12 +5752,17 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_ad
     assert_eq!(auth_config["auth_method"], "social");
     assert_eq!(auth_config["email"], "kiro-batch@example.com");
     assert_eq!(auth_config["refresh_token"], "kiro-batch-refresh-token-new");
+    assert_eq!(
+        auth_config["profile_arn"],
+        "arn:aws:kiro:profile/batch-import"
+    );
 
     gateway_handle.abort();
     refresh_handle.abort();
     upstream_handle.abort();
 }
 
+/// 验证批量导入仍可替换启用但 OAuth 已过期的同邮箱 Key，并清除失效状态。
 #[test]
 fn gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_duplicate() {
     run_admin_oauth_test(
@@ -5675,6 +5771,7 @@ fn gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_duplicate
     );
 }
 
+/// 使用携带 Profile 的社会登录刷新响应，保留轮换令牌、代理和失效恢复断言。
 async fn gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_duplicate_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
@@ -5698,6 +5795,8 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_dup
                     "accessToken": sample_kiro_device_access_token("kiro-batch@example.com"),
                     "refreshToken": "kiro-batch-refresh-token-replaced",
                     "expiresIn": 1800,
+                    // 完整刷新结果避免与本用例无关的 Profile 发现请求依赖外部服务。
+                    "profileArn": "arn:aws:kiro:profile/batch-import",
                 }))
             }
         }),
@@ -5809,6 +5908,10 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_dup
     assert_eq!(
         auth_config["refresh_token"],
         "kiro-batch-refresh-token-replaced"
+    );
+    assert_eq!(
+        auth_config["profile_arn"],
+        "arn:aws:kiro:profile/batch-import"
     );
 
     gateway_handle.abort();

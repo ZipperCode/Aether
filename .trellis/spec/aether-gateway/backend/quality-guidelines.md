@@ -187,6 +187,12 @@ The gateway command is `cargo nextest run -p aether-gateway --lib --bins
   inherits its host linker; the entry does not install tools or modify `.env`.
 - Gateway tests collect all failures in the selected lib/bin targets and return
   nonzero on failure. Do not retry or silently suppress failing tests.
+- Data and Workspace Rest nextest jobs also collect all failures after an
+  observed fail-fast run left sibling cases unexecuted. Their package/feature,
+  PostgreSQL and aggregate gate requirements remain unchanged.
+- Fixtures parsing Cargo text must select `--color never` at their own Cargo
+  call. CI's inherited `CARGO_TERM_COLOR=always` must not insert ANSI escapes
+  into machine assertions; test the fixture under the real CI environment.
 - CI setup selects the repository's pinned Rust version. Build/toolchain,
   VSCodex and shared-check changes must trigger both push and PR verification.
 - Version watches use Git-resolved HEAD and symbolic-ref paths, not an assumed
@@ -205,6 +211,7 @@ The gateway command is `cargo nextest run -p aether-gateway --lib --bins
 | Packed branch becomes loose | Detect the change, then retain only exact-file watches |
 | Source archive lacks Git | Stable package/version fallback without missing watch paths |
 | Gateway has several failing tests | Collect them in one run and return failure |
+| CI forces colored Cargo output | Parsing fixture owns plain output; actual Fresh/execution assertions remain |
 | `--dry-run` | Print actual command/env plans without executing them or claiming PASS |
 
 ### 5. Good / Base / Bad Cases
@@ -233,4 +240,63 @@ The gateway command is `cargo nextest run -p aether-gateway --lib --bins
 ```text
 Wrong: watch ../../.git/HEAD unconditionally; copy different local/CI commands.
 Correct: resolve real Git inputs; call the same gateway check entry from both.
+```
+
+## Scenario: Shared persistence projections retain domain meaning
+
+### 1. Scope / Trigger
+
+Apply when merging changes to admin quota/status projection, candidate
+diagnostic normalization, or their memory/PostgreSQL persistence paths.
+
+### 2. Signatures
+
+- `admin_provider_status_snapshot_safe_json` projects `quota.schema_version`,
+  `quota.kind` and `quota.balances[]` for existing balance snapshots.
+- `REQUEST_CANDIDATE_ERROR_TYPES` owns trusted candidate error categories for
+  both `sanitize_for_persistence` and PostgreSQL candidate UPSERT generation.
+
+### 3. Contracts
+
+- Preserve each existing balance unit and optional `available`, `total`,
+  `granted`, `topped_up`, `used` decimal string unchanged, including precision
+  and trailing zeroes. Do not convert currency or round during projection.
+- Repeated projection is stable; unrelated or invalid diagnostics remain
+  omitted under the existing projection rules.
+- A fixed internal error emitted by real execution must be registered at the
+  shared owner, including `endpoint_capability_mismatch`; unknown categories
+  still become `unclassified_error`. Do not weaken Gateway assertions or add
+  a second SQL registry to compensate for a missing category.
+
+### 4. Validation & Error Matrix
+
+| Input | Required result |
+| --- | --- |
+| Valid balance snapshot projected twice | Same typed fields and exact decimal strings |
+| Unknown secret-like snapshot field | Omitted by existing projection policy |
+| Trusted internal capability mismatch persisted | Retain its registered category in memory and PostgreSQL |
+| Unknown candidate error type | Preserve the existing unclassified fallback |
+
+### 5. Good / Base / Bad Cases
+
+- Good: the original Gateway balance and error-category regressions remain
+  unchanged while the shared projector/registry is repaired.
+- Base: non-balance quota windows and other registered categories are unchanged.
+- Bad: updating expected balance to absent or expected error to unclassified
+  when real execution produced the correct domain fact before projection.
+
+### 6. Tests Required
+
+- `provider_status_projection_preserves_exact_balance_amounts` covers repeated
+  projection, optional amounts, exact strings and diagnostic omission.
+- `candidate_persistence_keeps_only_known_diagnostic_categories` covers trusted
+  capability mismatch, idempotence and existing unknown-category rejection.
+- Keep the original Gateway balance and sync/stream classification assertions;
+  report separately when only the owning-crate regression was locally rerun.
+
+### 7. Wrong vs Correct
+
+```text
+Wrong: weaken each caller's test after a shared projection loses its fields.
+Correct: repair the one shared projection/registry and preserve caller contracts.
 ```

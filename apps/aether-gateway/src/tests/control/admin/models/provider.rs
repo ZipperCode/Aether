@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::super::super::{
     build_router_with_state, sample_admin_global_model, sample_admin_provider_model,
-    sample_endpoint, sample_key, sample_provider, start_server, AppState,
+    sample_bound_key, sample_endpoint, sample_key, sample_provider, start_server, AppState,
 };
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
@@ -286,6 +286,7 @@ async fn gateway_creates_admin_provider_model_locally_with_trusted_admin_princip
     upstream_handle.abort();
 }
 
+/// 在只读目录中使用绑定密钥，验证全局模型正则仍从缓存发现精确 Endpoint。
 #[tokio::test]
 async fn gateway_uses_global_model_regex_to_infer_created_model_endpoint_binding() {
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
@@ -304,7 +305,7 @@ async fn gateway_uses_global_model_regex_to_infer_created_model_endpoint_binding
                 "https://claude.example",
             ),
         ],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-mixed",
             "provider-mixed",
             "claude:messages",
@@ -358,8 +359,9 @@ async fn gateway_uses_global_model_regex_to_infer_created_model_endpoint_binding
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
     let model_id = payload["id"].as_str().expect("model id should exist");
     let bindings = global_model_repository
         .list_model_endpoint_bindings(&[model_id.to_string()])
@@ -836,6 +838,7 @@ async fn gateway_rebuilds_automatic_endpoint_bindings_when_model_mapping_changes
     gateway_handle.abort();
 }
 
+/// 模型重命名后按新的发现证据替换自动绑定，绑定密钥不触发只读目录迁移。
 #[tokio::test]
 async fn gateway_rebuilds_automatic_endpoint_bindings_when_provider_model_name_changes() {
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
@@ -854,7 +857,7 @@ async fn gateway_rebuilds_automatic_endpoint_bindings_when_provider_model_name_c
                 "https://new.example",
             ),
         ],
-        vec![sample_key(
+        vec![sample_bound_key(
             "key-mixed",
             "provider-mixed",
             "claude:messages",
@@ -923,7 +926,9 @@ async fn gateway_rebuilds_automatic_endpoint_bindings_when_provider_model_name_c
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
     let bindings = global_model_repository
         .list_model_endpoint_bindings(&["model-claude-opus".to_string()])
         .await

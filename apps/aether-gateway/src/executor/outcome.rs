@@ -1305,6 +1305,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    /// 验证 full 采集的延迟响应立即进入失败免计费终态，诊断原因保留在结构化字段。
     #[tokio::test]
     async fn deferred_upstream_response_records_failed_void_usage_immediately() {
         let request_id = "req-deferred-upstream-terminal";
@@ -1314,7 +1315,11 @@ mod tests {
             .with_data_state_for_tests(
                 crate::data::GatewayDataState::with_usage_repository_for_tests(Arc::clone(
                     &usage_repository,
-                )),
+                ))
+                .with_system_config_values_for_tests([(
+                    "request_record_level".to_string(),
+                    json!("full"),
+                )]),
             )
             .with_usage_runtime_for_tests(UsageRuntimeConfig {
                 enabled: true,
@@ -1348,6 +1353,8 @@ mod tests {
         exhaustion.upstream_status_code = Some(503);
         exhaustion.upstream_error_type = Some("endpoint_capability_mismatch".to_string());
         exhaustion.upstream_error_message = Some("no_local_stream_plans".to_string());
+        exhaustion.data.local_execution_runtime_miss_reason =
+            Some("no_local_stream_plans".to_string());
 
         record_failed_usage_for_deferred_upstream_response(
             &state,
@@ -1367,8 +1374,11 @@ mod tests {
         assert_eq!(stored.status, "failed");
         assert_eq!(stored.billing_status, "void");
         assert_eq!(stored.status_code, Some(503));
+        // 持久化合同不保留旧 error_message 展示字段，原因必须由专用路由字段承接。
+        assert!(stored.error_message.is_none());
+        assert_eq!(stored.error_category.as_deref(), Some("server_error"));
         assert_eq!(
-            stored.error_message.as_deref(),
+            stored.routing_local_execution_runtime_miss_reason(),
             Some("no_local_stream_plans")
         );
         assert_eq!(

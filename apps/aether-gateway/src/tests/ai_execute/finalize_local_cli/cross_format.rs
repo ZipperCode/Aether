@@ -982,6 +982,7 @@ fn gateway_executes_openai_responses_antigravity_cross_format_upstream_stream_vi
     );
 }
 
+/// 验证 Antigravity 流在本地完成跨格式转换，完整响应与顶层 responseId 派生的消息身份一致。
 async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_stream_via_local_finalize_response_impl(
 ) {
     use base64::Engine as _;
@@ -1475,8 +1476,8 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
             "output_text": "Hello Antigravity",
             "output": [{
                 "type": "message",
-                // 跨格式输出使用共享稳定消息 ID，而不是拼接上游响应 ID。
-                "id": openai_responses_message_item_id("resp-local-stream", 0),
+                // Gemini 顶层 responseId 已在首个事件解析，消息 ID 必须使用同一真实响应身份。
+                "id": openai_responses_message_item_id("resp_antigravity_cli_xfmt_123", 0),
                 "role": "assistant",
                 "status": "completed",
                 "content": [{

@@ -2693,18 +2693,25 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         })
         .await
         .expect("global models should read after quota refresh");
-    assert_eq!(global_models.total, 1);
-    assert_eq!(global_models.items, vec![existing_global_model]);
-    let provider_models = global_model_repository
-        .list_admin_provider_models(&AdminProviderModelListQuery {
-            provider_id: "provider-antigravity".to_string(),
-            is_active: None,
-            offset: 0,
-            limit: 100,
-        })
-        .await
-        .expect("Antigravity provider models should read after quota refresh");
-    assert!(provider_models.is_empty());
+    // 额度发现会导入三个可路由模型；原有全局模型复用不改写，内部模型不入库。
+    assert_eq!(global_models.total, 3);
+    // 列表动态补充关联计数；除此之外原记录（包括定价和手动配置）必须保持不变。
+    let mut existing_global_model = existing_global_model;
+    existing_global_model.provider_count = 1;
+    existing_global_model.active_provider_count = 1;
+    assert!(global_models.items.contains(&existing_global_model));
+    assert_eq!(
+        global_models
+            .items
+            .iter()
+            .map(|model| model.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "claude-sonnet-4",
+            "gemini-2.5-pro",
+            "gemini-3.7-flash-tiered",
+        ])
+    );
     assert_eq!(
         reloaded[0]
             .upstream_metadata
@@ -2787,6 +2794,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         .iter()
         .map(|model| model.provider_model_name.as_str())
         .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(imported_provider_models.len(), 3);
     assert!(imported_model_names.contains("claude-sonnet-4"));
     assert!(imported_model_names.contains("gemini-2.5-pro"));
     assert!(imported_model_names.contains("gemini-3.7-flash-tiered"));

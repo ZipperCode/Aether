@@ -113,8 +113,9 @@ describe('i18n infrastructure', () => {
 
   it('translates common legacy phrases without adding new message entry points', () => {
     expect(translateLegacyText('请求记录清理策略', 'en-US')).toBe('Request log cleanup policy')
+    // 界面词典覆盖基础词典的同名条目，保留当前配置模型别名的提示语义。
     expect(translateLegacyText('点击上方"添加映射"按钮为模型创建名称映射', 'en-US')).toBe(
-      'Click Add mapping to create a model name mapping.',
+      'Add a mapping to configure model name aliases',
     )
     expect(translateLegacyText('添加映射', 'en-US')).toBe('Add mapping')
     expect(translateLegacyText('转换提供商类型', 'en-US')).toBe('Convert provider type')

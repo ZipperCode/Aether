@@ -2043,6 +2043,7 @@ mod tests {
         .await;
     }
 
+    /// 验证 full 采集下延迟响应只记账一次，未交给采集器的正文标为不可用而非禁用。
     #[tokio::test]
     async fn openai_image_sync_heartbeat_records_deferred_usage_for_shell_response_once() {
         let request_id = "trace-image-heartbeat-retry";
@@ -2055,7 +2056,11 @@ mod tests {
                 crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
                     request_candidate_repository,
                     Arc::clone(&usage_repository),
-                ),
+                )
+                .with_system_config_values_for_tests([(
+                    "request_record_level".to_string(),
+                    json!("full"),
+                )]),
             )
             .with_usage_runtime_for_tests(UsageRuntimeConfig {
                 enabled: true,
@@ -2636,6 +2641,7 @@ mod tests {
         .await;
     }
 
+    /// 验证 full 采集下文本心跳保留延迟上游归因，未采集正文仍为不可用。
     #[tokio::test]
     async fn standard_text_sync_heartbeat_records_deferred_usage_for_shell_response() {
         let plan = test_standard_text_heartbeat_plan(
@@ -2685,7 +2691,11 @@ mod tests {
                 crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
                     candidate_repository,
                     Arc::clone(&usage_repository),
-                ),
+                )
+                .with_system_config_values_for_tests([(
+                    "request_record_level".to_string(),
+                    json!("full"),
+                )]),
             )
             .with_usage_runtime_for_tests(UsageRuntimeConfig {
                 enabled: true,

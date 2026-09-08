@@ -10990,6 +10990,7 @@ mod tests {
         );
     }
 
+    /// 验证能力缺失在内部按凭据重试且不惩罚 Key，客户端仅收到原错误正文而不带内部原因头。
     #[tokio::test]
     async fn no_local_stream_plans_retries_at_credential_scope_without_key_penalty() {
         let request_id = "req-endpoint-capability-mismatch";
@@ -11118,7 +11119,14 @@ mod tests {
                 .headers()
                 .get(crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
                 .and_then(|value| value.to_str().ok()),
-            Some("no_local_stream_plans")
+            None
+        );
+        let fallback_body = to_bytes(fallback.into_body(), usize::MAX)
+            .await
+            .expect("fallback body should read");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fallback_body).expect("fallback body should be JSON"),
+            json!({"error": {"message": "unsupported endpoint format"}})
         );
 
         let candidates = request_candidate_repository
@@ -11776,7 +11784,8 @@ mod tests {
     const LOCAL_TUNNEL_TEST_PSK: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
     const LOCAL_TUNNEL_TEST_GENERATION: &str = "stream-test-generation-1";
 
-    fn authenticated_local_tunnel_test_state() -> AppState {
+    /// 一次装配节点认证和计划对应的强读 Key，避免替换数据状态时丢失隧道节点。
+    fn authenticated_local_tunnel_test_state(plan: &ExecutionPlan) -> AppState {
         let node = StoredProxyNode::new(
             "node-1".to_string(),
             "Node 1".to_string(),
@@ -11817,7 +11826,8 @@ mod tests {
         let data = crate::data::GatewayDataState::with_proxy_node_repository_for_tests(Arc::new(
             InMemoryProxyNodeRepository::seed([node]),
         ))
-        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY)
+        .with_provider_catalog_reader(Arc::new(provider_catalog_for_plan(plan, None)));
         AppState::new()
             .expect("app state should build")
             .with_data_state_for_tests(data)
@@ -14325,6 +14335,7 @@ mod tests {
         );
     }
 
+    /// 验证 Connect 错误完整转换给客户端，同时 basic 采集不持久化上游或客户端正文。
     #[tokio::test]
     async fn execute_stream_from_frame_stream_decodes_non_success_windsurf_connect_error_body() {
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
@@ -14336,7 +14347,7 @@ mod tests {
             )
             .with_system_config_values_for_tests([(
                 "request_record_level".to_string(),
-                json!("full"),
+                json!("basic"),
             )]);
         let state = AppState::new()
             .expect("app state should build")
@@ -14380,7 +14391,7 @@ mod tests {
             )
             .with_system_config_values_for_tests([(
                 "request_record_level".to_string(),
-                json!("full"),
+                json!("basic"),
             )])
             .with_provider_catalog_reader(Arc::new(provider_catalog_stop_429_for_plan(&plan)))
             .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
@@ -15717,11 +15728,7 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
-        let state = authenticated_local_tunnel_test_state().with_data_state_for_tests(
-            crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
-                provider_catalog_for_plan(&plan, None),
-            )),
-        );
+        let state = authenticated_local_tunnel_test_state(&plan);
         let tunnel_app = state.tunnel.app_state();
         let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
         let (proxy_close_tx, _) = watch::channel(false);
@@ -15854,11 +15861,7 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
-        let state = authenticated_local_tunnel_test_state().with_data_state_for_tests(
-            crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
-                provider_catalog_for_plan(&plan, None),
-            )),
-        );
+        let state = authenticated_local_tunnel_test_state(&plan);
         let tunnel_app = state.tunnel.app_state();
         let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
         let (proxy_close_tx, _) = watch::channel(false);

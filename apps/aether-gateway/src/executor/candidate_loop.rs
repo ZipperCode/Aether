@@ -2970,6 +2970,7 @@ mod tests {
         }
     }
 
+    /// 验证真实 Key 准入后的下一候选规划错误原样返回，并释放已预留的 HTTP 计划费用。
     #[tokio::test]
     async fn dynamic_sync_planning_error_releases_reserved_http_plan_cost() {
         let now_unix_secs = current_unix_ms() / 1_000;
@@ -3015,8 +3016,27 @@ mod tests {
                 updated_at_unix_secs: now_unix_secs.saturating_sub(60),
             },
         });
+        // 同步执行即使被测试替身接管，也必须读取计划所属 Provider 的真实 Key。
+        let key =
+            aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
+                "key-1".to_string(),
+                "provider-1".to_string(),
+                "planning-error-key".to_string(),
+                "api_key".to_string(),
+                None,
+                true,
+            )
+            .expect("provider key should build");
+        let provider_catalog = Arc::new(
+            aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository::seed(
+                vec![],
+                vec![],
+                vec![key],
+            ),
+        );
         let data = crate::data::GatewayDataState::with_billing_reader_for_tests(billing)
-            .with_settlement_writer_for_tests(settlement.clone());
+            .with_settlement_writer_for_tests(settlement.clone())
+            .with_provider_catalog_reader(provider_catalog);
         let state = AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(data)

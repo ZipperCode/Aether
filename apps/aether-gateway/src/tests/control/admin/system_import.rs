@@ -1282,6 +1282,7 @@ async fn gateway_rejects_ldap_filter_and_attribute_injection_before_system_impor
     gateway_handle.abort();
 }
 
+/// 验证导入持久化与无密钥导出；跳过旧代理后保留直连墓碑而不导出已删除配置。
 async fn gateway_imports_admin_system_config_locally_and_persists_data_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
@@ -1515,14 +1516,18 @@ async fn gateway_imports_admin_system_config_locally_and_persists_data_impl() {
         .find(|entry| entry["key"] == "smtp_password");
     let exported_external_models_proxy = exported_system_configs
         .iter()
-        .find(|entry| entry["key"] == "external_models_proxy_node_id")
-        .expect("external models proxy should exist");
+        .find(|entry| entry["key"] == "external_models_proxy_node_id");
     assert_eq!(exported_site_name["value"], "Imported Aether");
     assert!(exported_smtp_password.is_none());
-    assert_eq!(
-        exported_external_models_proxy["value"],
-        serde_json::Value::Null
-    );
+    assert!(exported_external_models_proxy.is_none());
+    let tombstone = state
+        .data
+        .find_system_config_value_with_revision_strong("external_models_proxy_node_id")
+        .await
+        .expect("direct proxy tombstone should read")
+        .expect("skipped legacy proxy should persist a tombstone");
+    assert_eq!(tombstone.value, serde_json::Value::Null);
+    assert!(tombstone.revision > 0);
     let serialized = export_payload.to_string();
     for secret in ["ops-secret", "bind-secret", "linuxdo-secret", "smtp-secret"] {
         assert!(!serialized.contains(secret), "leaked secret: {secret}");
@@ -4740,6 +4745,7 @@ fn gateway_skips_proxy_nodes_during_admin_system_config_import() {
     );
 }
 
+/// 旧代理节点不导入，其选择器改为直连，并保留配置删除的版本记录。
 async fn gateway_skips_proxy_nodes_during_admin_system_config_import_impl() {
     let data_state = build_empty_admin_system_data_state();
     let gateway = build_router_with_state(
@@ -4799,8 +4805,15 @@ async fn gateway_skips_proxy_nodes_during_admin_system_config_import_impl() {
             .find_system_config_value("external_models_proxy_node_id")
             .await
             .expect("external models proxy config lookup should succeed"),
-        Some(Value::Null)
+        None
     );
+    let tombstone = data_state
+        .find_system_config_value_with_revision_strong("external_models_proxy_node_id")
+        .await
+        .expect("direct proxy tombstone should read")
+        .expect("skipped legacy proxy should retain its config revision");
+    assert_eq!(tombstone.value, Value::Null);
+    assert!(tombstone.revision > 0);
 
     gateway_handle.abort();
 }
