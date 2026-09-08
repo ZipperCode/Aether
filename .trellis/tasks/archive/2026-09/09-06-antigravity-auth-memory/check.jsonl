@@ -1,0 +1,2 @@
+{"file":".trellis/spec/aether-gateway/backend/auth-maintenance-memory-contract.md","reason":"Quality gate must verify shared gate, bounded materialization, and candidate cache constraints."}
+{"file":".trellis/spec/aether-gateway/backend/quality-guidelines.md","reason":"Gateway backend validation and code-quality expectations."}
