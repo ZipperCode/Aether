@@ -571,3 +571,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 24: 发布并验证 Aether v0.7.31
+
+**Date**: 2026-09-08
+**Task**: 发布并验证 Aether v0.7.31
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+按既有精确SHA门禁发布annotated v0.7.31，Release34230430079已8/8成功（17m52s）。6资产齐全：amd64/arm64包、VSIX、安装脚本、校验和与来源签名；小资产本地hash、tar服务端digest/SHA256SUMS、gh attestation验证通过。GHCR0.7.31双架构index sha256:8c46830568ae69725b47b1022787942382e2cee4d54e25640f5d4aac048de082。独占临时下载已清理；未部署、未改产品或已有tag。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `74abb40cf` | (see git log) |
+
+### Status
+
+[OK] **Completed**
