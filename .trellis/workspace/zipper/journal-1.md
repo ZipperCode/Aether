@@ -593,3 +593,26 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 25: 修复 Chat 首段错误故障转移并发布 v0.7.32
+
+**Date**: 2026-09-09
+**Task**: 修复 Chat 首段错误故障转移并发布 v0.7.32
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+修复预提交错误切换与首字节记账，独立review后49项回归通过；精确SHA CI18/18及Release8/8成功，已推v0.7.32并核验6资产/双架构镜像，未部署。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c1e994159` | (see git log) |
+| `7eaea44b0` | (see git log) |
+
+### Status
+
+[OK] **Completed**
