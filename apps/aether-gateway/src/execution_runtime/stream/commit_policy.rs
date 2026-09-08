@@ -14,7 +14,7 @@ const GEMINI_PRECOMMIT_MAX_WAIT: Duration = Duration::from_millis(750);
 pub(super) enum StreamCommitPolicy {
     /// 收到响应头即可提交，适用于无需检查首段的直通流。
     ResponseHeaders,
-    /// 先分类首个完整正文或事件，保留同格式 Responses 错误回退边界。
+    /// 先分类首个完整正文或事件，保留同格式 Chat/Responses 错误回退边界。
     FirstClassifiedBody,
     /// 等待 Anthropic 首个客户端可见语义事件或错误。
     FirstAnthropicSemanticEvent {
@@ -33,7 +33,7 @@ pub(super) enum StreamCommitPolicy {
 }
 
 impl StreamCommitPolicy {
-    /// 根据上下游格式与响应类型选择提交时机；同格式 Responses SSE 必须先分类首段，避免把流内错误提交成 HTTP 200。
+    /// 根据上下游格式与响应类型选择提交时机；同格式 Chat/Responses SSE 必须先分类首段，避免把流内错误提交成 HTTP 200。
     #[allow(clippy::too_many_arguments)]
     pub(super) fn for_response(
         has_direct_finalize: bool,
@@ -58,7 +58,8 @@ impl StreamCommitPolicy {
             .unwrap_or_default()
             .to_ascii_lowercase();
         if content_type.contains("text/event-stream") {
-            if provider_api_format.eq_ignore_ascii_case("openai:responses")
+            if (provider_api_format.eq_ignore_ascii_case("openai:responses")
+                || provider_api_format.eq_ignore_ascii_case("openai:chat"))
                 && provider_api_format.eq_ignore_ascii_case(client_api_format)
             {
                 return Self::FirstClassifiedBody;
@@ -637,9 +638,9 @@ mod tests {
         .commits_on_response_headers());
     }
 
-    /// 验证同格式 Responses SSE 会等待首段分类，同时不改变 Chat Completions 的响应头提交策略。
+    /// 验证同格式 Chat/Responses SSE 均等待首段分类；其他格式沿用原有策略。
     #[test]
-    fn policy_prefetches_same_format_openai_responses_sse_only() {
+    fn policy_prefetches_same_format_openai_chat_and_responses_sse() {
         let responses = StreamCommitPolicy::for_response(
             true,
             Some("text/event-stream; charset=utf-8"),
@@ -652,16 +653,18 @@ mod tests {
         assert_eq!(responses, StreamCommitPolicy::FirstClassifiedBody);
         assert!(!responses.commits_on_response_headers());
 
-        assert!(StreamCommitPolicy::for_response(
-            true,
-            Some("text/event-stream"),
-            "openai:chat",
-            "openai:chat",
-            false,
-            false,
-            false,
-        )
-        .commits_on_response_headers());
+        assert_eq!(
+            StreamCommitPolicy::for_response(
+                true,
+                Some("text/event-stream"),
+                "openai:chat",
+                "openai:chat",
+                false,
+                false,
+                false,
+            ),
+            StreamCommitPolicy::FirstClassifiedBody
+        );
     }
 
     /// 验证 Gemini SSE 即使存在本地改写器也先经过有界语义门。

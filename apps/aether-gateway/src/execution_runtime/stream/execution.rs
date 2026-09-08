@@ -6945,9 +6945,10 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 provider_prefetched_body_bytes = provider_prefetched_body.len(),
                                 "gateway detected embedded error while prefetching execution runtime stream"
                             );
-                            if plan
+                            if (plan
                                 .provider_api_format
                                 .eq_ignore_ascii_case("openai:responses")
+                                || plan.provider_api_format.eq_ignore_ascii_case("openai:chat"))
                                 && plan
                                     .provider_api_format
                                     .eq_ignore_ascii_case(&plan.client_api_format)
@@ -7371,6 +7372,9 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     let native_anthropic_stream_for_report = stream_commit_policy.is_native_anthropic();
     let plan_for_report = plan;
     let emit_passthrough_sse_terminal_error = (skip_direct_finalize_prefetch
+        // Chat 改为首段分类后仍是原始字节透传，提交后的传输错误须保留原来的流内终止事件。
+        || (plan_for_report.provider_api_format.eq_ignore_ascii_case("openai:chat")
+            && plan_for_report.provider_api_format.eq_ignore_ascii_case(&plan_for_report.client_api_format))
         || stream_commit_policy.is_native_anthropic()
         || normalized_declared_stream_headers)
         && (response_headers_indicate_sse(&upstream_headers) || normalized_declared_stream_headers)

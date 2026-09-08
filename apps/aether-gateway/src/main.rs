@@ -2632,14 +2632,15 @@ async fn run_data_export(
     Ok(())
 }
 
+/// 在 Unix 上原子写入私有数据库导出，overwrite 决定是否替换已有目标；其他平台返回 Unsupported 且不写文件。
 fn write_atomic_private_export(path: &Path, bytes: &[u8], overwrite: bool) -> io::Result<()> {
     #[cfg(not(unix))]
     {
         let _ = (path, bytes, overwrite);
-        return Err(io::Error::new(
+        Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "private atomic database exports currently require Unix filesystem checks",
-        ));
+        ))
     }
 
     #[cfg(unix)]

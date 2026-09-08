@@ -127,6 +127,7 @@ pub(super) fn stream_client_error_status_code_for_upstream_status(status_code: u
     client_error_status_code_for_upstream_status(status_code)
 }
 
+/// 分类首段正文；SSE 只检查完整记录，分块尾部继续等待，非 SSE JSON 保留既有解析行为。
 pub(super) fn inspect_prefetched_stream_body(
     headers: &BTreeMap<String, String>,
     body: &[u8],
@@ -151,6 +152,32 @@ pub(super) fn inspect_prefetched_stream_body(
         }
     }
 
+    // 复用语义提交门的记录边界；控制字段不代表内容，同一事件的多行 data 必须合并后分类。
+    if content_type.contains("text/event-stream") {
+        let mut remaining = stripped;
+        while let Some((record_end, separator_len)) =
+            super::commit_policy::find_sse_record_boundary(remaining)
+        {
+            let record = String::from_utf8_lossy(&remaining[..record_end]);
+            remaining = &remaining[record_end + separator_len..];
+            let data = record
+                .split(['\r', '\n'])
+                .filter_map(|line| line.strip_prefix("data:"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if data.trim().is_empty() {
+                continue;
+            }
+            if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&data) {
+                if has_nested_error(&json_body) {
+                    return StreamPrefetchInspection::EmbeddedError(json_body);
+                }
+            }
+            // 完整且非空的未知 data 也保持原有透传边界，不修改上游字节。
+            return StreamPrefetchInspection::NonError;
+        }
+        return StreamPrefetchInspection::NeedMore;
+    }
     let text = String::from_utf8_lossy(body);
     let mut saw_meaningful_line = false;
     for line in text.lines().take(MAX_STREAM_PREFETCH_FRAMES) {
@@ -159,7 +186,7 @@ pub(super) fn inspect_prefetched_stream_body(
             continue;
         }
 
-        let data_line = line.strip_prefix("data: ").unwrap_or(line).trim();
+        let data_line = line.strip_prefix("data:").unwrap_or(line).trim();
         if data_line.is_empty() {
             continue;
         }
@@ -281,7 +308,73 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{append_error_frame_payload, MAX_ERROR_BODY_BYTES};
+    use super::{
+        append_error_frame_payload, inspect_prefetched_stream_body, StreamPrefetchInspection,
+        MAX_ERROR_BODY_BYTES,
+    };
+    use std::collections::BTreeMap;
+
+    /// 控制记录不能触发提交，多行 data 错误在 LF、CRLF、CR 三种合法行尾下均须识别。
+    #[test]
+    fn prefetch_classification_ignores_controls_and_joins_data_lines() {
+        let headers = BTreeMap::from([("content-type".into(), "text/event-stream".into())]);
+        for newline in ["\n", "\r\n", "\r"] {
+            let controls = format!(": ping{newline}{newline}id: first{newline}retry: 1000{newline}event: error{newline}{newline}data:{newline}{newline}");
+            assert!(matches!(
+                inspect_prefetched_stream_body(&headers, controls.as_bytes()),
+                StreamPrefetchInspection::NeedMore
+            ));
+            let error = format!("{controls}event: error{newline}data:{{\"error\":{newline}data:{{\"type\":\"server_error\"}}}}{newline}{newline}");
+            assert!(matches!(
+                inspect_prefetched_stream_body(&headers, error.as_bytes()),
+                StreamPrefetchInspection::EmbeddedError(_)
+            ));
+            let success = format!("data: {{\"choices\":[]}}{newline}{newline}{error}");
+            assert!(matches!(
+                inspect_prefetched_stream_body(&headers, success.as_bytes()),
+                StreamPrefetchInspection::NonError
+            ));
+        }
+    }
+
+    /// 任意传输切点都不能提前提交错误事件；完整正常首事件与非 SSE JSON 仍按原顺序分类。
+    #[test]
+    fn prefetch_classification_waits_for_complete_sse_error_record() {
+        let headers = BTreeMap::from([("content-type".into(), "text/event-stream".into())]);
+        for newline in ["\n", "\r\n"] {
+            let error = format!(": ping{newline}{newline}data:{{\"error\":{{\"type\":\"server_error\"}}}}{newline}{newline}");
+            // CRLF 空行在最后 CR 时已可识别为合法 CR 结尾，因此只检查 JSON 与数据行内部切点。
+            let data_line_end = error.find(&format!("{newline}{newline}data:")).unwrap()
+                + format!("{newline}{newline}data:").len();
+            for end in data_line_end..error.len() - 2 * newline.len() {
+                assert!(
+                    matches!(
+                        inspect_prefetched_stream_body(&headers, &error.as_bytes()[..end]),
+                        StreamPrefetchInspection::NeedMore
+                    ),
+                    "early classification at byte {end}"
+                );
+            }
+            assert!(matches!(
+                inspect_prefetched_stream_body(&headers, error.as_bytes()),
+                StreamPrefetchInspection::EmbeddedError(_)
+            ));
+            let successful_first = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"hello\"}}}}]}}{newline}{newline}{error}");
+            assert!(matches!(
+                inspect_prefetched_stream_body(&headers, successful_first.as_bytes()),
+                StreamPrefetchInspection::NonError
+            ));
+        }
+        let json_headers = BTreeMap::from([("content-type".into(), "application/json".into())]);
+        assert!(matches!(
+            inspect_prefetched_stream_body(&json_headers, br#"{"choices":[]}"#),
+            StreamPrefetchInspection::NonError
+        ));
+        assert!(matches!(
+            inspect_prefetched_stream_body(&headers, br#"{"error":{"type":"server_error"}}"#),
+            StreamPrefetchInspection::EmbeddedError(_)
+        ));
+    }
 
     #[test]
     fn oversized_base64_error_frame_is_rejected_before_decode() {

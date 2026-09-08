@@ -24,6 +24,7 @@ use super::{
     VideoTaskTruthSourceMode,
 };
 
+mod chat_failover;
 mod decision;
 mod image;
 mod pii_redaction;

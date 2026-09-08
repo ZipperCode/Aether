@@ -535,6 +535,7 @@ async fn gateway_settles_stream_attempt_when_client_disconnects_before_first_byt
     execution_runtime_handle.abort();
 }
 
+/// 首段错误在提交前耗尽候选时返回既有 503，不能再把错误流伪装成 HTTP 200。
 #[test]
 fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error() {
     run_lifecycle_test(
@@ -543,6 +544,7 @@ fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error() {
     );
 }
 
+/// 验证客户端耗尽响应与上游 429 候选事实分别保留，且不会回落到公共代理路径。
 async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error_impl() {
     let public_hits = Arc::new(Mutex::new(0usize));
     let public_hits_clone = Arc::clone(&public_hits);
@@ -607,7 +609,7 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error_
                     auth_repository,
                     candidate_selection_repository,
                     provider_catalog_repository,
-                    request_candidate_repository,
+                    Arc::clone(&request_candidate_repository),
                     DEVELOPMENT_ENCRYPTION_KEY,
                 ),
             ),
@@ -630,17 +632,29 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error_
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         response
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
-        Some("text/event-stream")
+        Some("application/json")
     );
     let body_text = response.text().await.expect("response body should read");
-    assert!(body_text.contains("\"rate_limit_error\""));
-    assert!(body_text.contains("\"slow down\""));
+    let body: serde_json::Value =
+        serde_json::from_str(&body_text).expect("error body should be JSON");
+    assert!(body.get("error").is_some(), "{body_text}");
+    let candidates = request_candidate_repository
+        .list_by_request_id("trace-openai-chat-stream-prefetch-error-123")
+        .await
+        .expect("failed candidates should read");
+    assert!(!candidates.is_empty());
+    assert!(candidates.iter().all(|candidate| {
+        candidate.status == RequestCandidateStatus::Failed
+            && candidate.status_code == Some(429)
+            && candidate.error_type.as_deref() == Some("rate_limit_error")
+            && candidate.error_message.as_deref() == Some("slow down")
+    }));
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
