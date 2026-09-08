@@ -2857,6 +2857,7 @@ mod tests {
         assert_eq!(executed_urls.lock().expect("executed_urls lock").len(), 2);
     }
 
+    /// 分页失败保留固定 HTTP 错误分类，不把不完整模型集视为 Endpoint 的权威结果。
     #[tokio::test]
     async fn vertex_pagination_failure_does_not_claim_endpoint_authority() {
         let executed_urls = Arc::new(Mutex::new(Vec::new()));
@@ -2892,7 +2893,10 @@ mod tests {
         assert!(outcome.cached_models.is_empty());
         assert!(outcome.successful_endpoint_ids.is_empty());
         assert_eq!(outcome.errors.len(), 1);
-        assert!(outcome.errors[0].contains("page unavailable"));
+        assert_eq!(
+            outcome.errors[0],
+            "vertex google models fetch failed: HTTP 503: upstream service failed"
+        );
         assert_eq!(executed_urls.lock().expect("executed_urls lock").len(), 2);
     }
 

@@ -7407,10 +7407,12 @@ mod tests {
             Some(Arc::clone(&self.queue))
         }
 
+        /// 先建立释放等待器，再发布开始信号，避免另一运行时的释放广播先于等待器创建。
         async fn body_capture_policy(&self) -> Result<UsageBodyCapturePolicy, DataLayerError> {
+            let released = self.release_policy.notified();
             self.policy_reads.fetch_add(1, Ordering::AcqRel);
             self.policy_started.notify_one();
-            self.release_policy.notified().await;
+            released.await;
             Ok(UsageBodyCapturePolicy::default())
         }
     }
@@ -11899,6 +11901,47 @@ mod tests {
             runtime.metrics_snapshot().terminal_submission_max_pending,
             2
         );
+    }
+
+    /// 固定开始通知与释放等待之间的交错，确保策略夹具不会丢失提前到达的释放广播。
+    #[test]
+    fn blocking_policy_store_keeps_release_during_start_notification() {
+        use std::future::Future;
+        use std::task::{Context, Wake, Waker};
+
+        /// 在策略开始通知唤醒测试时立即释放策略，模拟另一个运行时抢先执行。
+        struct ReleasePolicyOnWake {
+            /// 与策略读取共享的释放通知，不另行保留通知许可。
+            release_policy: Arc<tokio::sync::Notify>,
+        }
+
+        impl Wake for ReleasePolicyOnWake {
+            /// 同步发出释放广播，将竞争窗口变成可重复的执行顺序。
+            fn wake(self: Arc<Self>) {
+                self.release_policy.notify_waiters();
+            }
+        }
+
+        let store = BlockingPolicyQueueConfiguredUsageStore {
+            queue: Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default())),
+            policy_started: Arc::new(tokio::sync::Notify::new()),
+            release_policy: Arc::new(tokio::sync::Notify::new()),
+            policy_reads: Arc::new(AtomicUsize::new(0)),
+        };
+        let waker = Waker::from(Arc::new(ReleasePolicyOnWake {
+            release_policy: Arc::clone(&store.release_policy),
+        }));
+        let mut context = Context::from_waker(&waker);
+        let policy_started = store.policy_started.notified();
+        let mut policy_started = std::pin::pin!(policy_started);
+        assert!(policy_started.as_mut().poll(&mut context).is_pending());
+
+        let mut policy = store.body_capture_policy();
+        assert!(
+            policy.as_mut().poll(&mut context).is_ready(),
+            "policy release during start notification must not be lost"
+        );
+        assert_eq!(store.policy_reads.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]

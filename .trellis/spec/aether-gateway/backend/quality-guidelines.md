@@ -193,6 +193,10 @@ The gateway command is `cargo nextest run -p aether-gateway --lib --bins
 - Fixtures parsing Cargo text must select `--color never` at their own Cargo
   call. CI's inherited `CARGO_TERM_COLOR=always` must not insert ANSI escapes
   into machine assertions; test the fixture under the real CI environment.
+- A cross-runtime fixture that announces work and waits for release must create
+  its release `Notified` before sending the started notification. Otherwise
+  `notify_waiters` can be lost between the two operations. Use deterministic
+  interleaving coverage; do not hide that race by increasing timeout or retrying.
 - CI setup selects the repository's pinned Rust version. Build/toolchain,
   VSCodex and shared-check changes must trigger both push and PR verification.
 - Version watches use Git-resolved HEAD and symbolic-ref paths, not an assumed

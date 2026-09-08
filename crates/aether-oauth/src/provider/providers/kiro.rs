@@ -973,13 +973,16 @@ mod tests {
         }
     }
 
+    /// 按请求类型返回本地响应，并保留刷新到 Profile 发现的完整调用顺序。
     #[derive(Debug, Clone)]
     struct RoutingExecutor {
+        /// 顺序记录所有请求，避免后续发现请求覆盖待校验的令牌刷新请求。
         seen_requests: Arc<Mutex<Vec<OAuthHttpRequest>>>,
     }
 
     #[async_trait]
     impl OAuthHttpExecutor for RoutingExecutor {
+        /// 仅模拟已知刷新和发现请求；未建模的请求直接使测试失败。
         async fn execute(
             &self,
             request: OAuthHttpRequest,
@@ -990,6 +993,11 @@ mod tests {
                 .expect("mutex should lock")
                 .push(request);
             let response = match request_id.as_str() {
+                "provider-oauth:kiro-social-refresh" => json!({
+                    "accessToken": "new-access-token",
+                    "refreshToken": "r".repeat(120),
+                    "expiresIn": 3600
+                }),
                 "provider-oauth:kiro-idc-refresh" => json!({
                     "accessToken": "new-idc-access-token",
                     "refreshToken": "i".repeat(120),
@@ -1106,16 +1114,12 @@ mod tests {
         assert_eq!(auth_config.effective_api_region(), super::DEFAULT_REGION);
     }
 
+    /// 恶意认证区域必须同时约束刷新与后续发现地址，不能只校验最后一次请求。
     #[tokio::test]
     async fn refresh_urls_use_safe_default_for_malicious_auth_region() {
-        let seen_request = Arc::new(Mutex::new(None));
-        let executor = StaticExecutor {
-            seen_request: Arc::clone(&seen_request),
-            response: json!({
-                "accessToken": "new-access-token",
-                "refreshToken": "r".repeat(120),
-                "expiresIn": 3600
-            }),
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = RoutingExecutor {
+            seen_requests: Arc::clone(&seen_requests),
         };
         let auth_config = KiroAuthConfig {
             auth_method: Some("social".to_string()),
@@ -1134,21 +1138,46 @@ mod tests {
             access_token: None,
         };
 
-        KiroProviderOAuthAdapter::default()
+        let refreshed = KiroProviderOAuthAdapter::default()
             .refresh_auth_config(&executor, &test_ctx(), &auth_config)
             .await
             .expect("refresh should succeed");
 
-        let seen = seen_request
-            .lock()
-            .expect("mutex should lock")
-            .clone()
-            .expect("request should be captured");
+        let seen = seen_requests.lock().expect("mutex should lock").clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].request_id, "provider-oauth:kiro-social-refresh");
         assert_eq!(
-            seen.url,
+            seen[0].url,
             "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
         );
-        assert!(!seen.url.contains("attacker.example"));
+        assert_eq!(seen[1].request_id, "provider-oauth:kiro-profile-discovery");
+        assert_eq!(
+            seen[1].url,
+            "https://q.us-east-1.amazonaws.com/ListAvailableProfiles"
+        );
+        for request in &seen {
+            assert_eq!(request.method, reqwest::Method::POST);
+            assert!(!request.url.contains("attacker.example"));
+        }
+        assert_eq!(
+            seen[0]
+                .json_body
+                .as_ref()
+                .expect("refresh body should exist")["refreshToken"],
+            json!("r".repeat(120))
+        );
+        assert_eq!(
+            seen[1].headers.get("host").map(String::as_str),
+            Some("q.us-east-1.amazonaws.com")
+        );
+        assert_eq!(
+            seen[1].headers.get("authorization").map(String::as_str),
+            Some("Bearer new-access-token")
+        );
+        assert_eq!(
+            refreshed.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/demo")
+        );
     }
 
     #[tokio::test]

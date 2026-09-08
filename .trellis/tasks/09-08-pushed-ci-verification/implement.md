@@ -44,3 +44,11 @@
 - check已获准在 `crates/aether-data/contracts/src/repository/candidates/types.rs` 增加此单一类别+现有同层回归；对应contracts测试1/1、admin/contracts范围Clippy均通过，PostgreSQL沿用同一常量。
 - 为避免仅一项类别登记再本地重建整个Gateway，最终2项不标本地PASS，交下一次精确SHA Linux CI确认；其余有效结果复用。28个产品修改均归本任务，所有写代理/编译已终态。
 - Root已完成共享规范与break-loop事实复盘，立即统一commit/push，不追加全量前置门槛。
+
+## 第二轮 CI 与末批修复
+
+- 已正常推送9026380d1957e7a57a746a409335f15eb1675515，run34217818968终态15成功/3失败；Gateway5456/5456、Frontend1635/1635及Build、Data372/372、全部Clippy均通过。原41处观测失败已修复。
+- Rest完整no-fail-fast跑到先前未执行后半段，新5失败为model-fetch1、Kiro1、Tunnel2、usage顺序1；修复仅4文件，完整根因见second-ci四收据。
+- 独立check：model-fetch3/3、OAuth2/2、usage确定性交错+原失败+两个共享fixture共4/4通过；Tunnel仅补精确wire静态类别，原测试未改，本地未重跑2项。
+- Tunnel production-only严格Clippy仅因3处既有Windows dead_code失败（未改文件）；不加allow、不改无关平台函数，不伪称本地通过，下轮LinuxCI认证。没有Gateway重新构建或全量本地套件。
+- 全部writer/check已归还；Root正常commit/push最后4文件并继续精确SHA CI，不结束在“已push但CI未知”。

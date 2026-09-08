@@ -120,7 +120,7 @@ fn stream_reset_message(frame: &TunnelFrame) -> String {
     }
 }
 
-/// Project an internal stream failure to a bounded, protocol-safe message.
+/// 将内部流失败归为固定的协议安全类别，保留已知超限码而不透传上游诊断。
 ///
 /// Hyper, URL, DNS, TLS, and proxy errors can include complete request URLs,
 /// query credentials, private addresses, or implementation details.  Tunnel
@@ -128,6 +128,9 @@ fn stream_reset_message(frame: &TunnelFrame) -> String {
 /// gateway, so never put those error strings on the wire (or in logs).
 fn safe_stream_error_message(message: &str) -> &'static str {
     let lower = message.trim().to_ascii_lowercase();
+    if lower == "response_too_large" {
+        return "response_too_large";
+    }
     if lower == "tunnel overloaded" {
         return "tunnel overloaded";
     }
