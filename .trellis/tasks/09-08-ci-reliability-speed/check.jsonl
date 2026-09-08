@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/aether-gateway/backend/index.md", "reason": "Verify cause, scope, command parity and measurement boundaries"}
+{"file": ".trellis/spec/aether-gateway/backend/quality-guidelines.md", "reason": "Verify cause, scope, command parity and measurement boundaries"}
+{"file": ".trellis/tasks/09-08-ci-reliability-speed/research/github-runs.md", "reason": "Verify cause, scope, command parity and measurement boundaries"}
+{"file": ".trellis/tasks/09-08-ci-reliability-speed/research/workflow-build.md", "reason": "Verify cause, scope, command parity and measurement boundaries"}
+{"file": ".trellis/tasks/09-08-ci-reliability-speed/research/build-implementation.md", "reason": "Reuse measured real minimal Cargo invalidation evidence"}
+{"file": ".trellis/tasks/09-08-ci-reliability-speed/research/pipeline-implementation.md", "reason": "Verify unchanged job gates and shared command contract"}

@@ -153,3 +153,84 @@ public_limit.map_or(scoped_limit, |limit| limit.min(scoped_limit))
 <!-- What reviewers should check -->
 
 (To be filled by the team)
+
+---
+
+## Scenario: Shared gateway CI commands and build-version inputs
+
+### 1. Scope / Trigger
+
+- Apply when changing gateway build scripts, CI commands, toolchains, cache inputs,
+  target selection, or local pre-push verification.
+- A focused native check is not proof of Linux CI, real PostgreSQL, or release
+  compatibility; retain the separate existing gates and exact-SHA release flow.
+
+### 2. Signatures
+
+```text
+python tools/ci.py preflight
+python tools/ci.py gateway
+python tools/ci.py preflight --dry-run
+python tests/ci_contract_test.py
+python tests/gateway_build_watch_test.py
+```
+
+`preflight` runs format, gateway Clippy and gateway tests in that order.
+The gateway command is `cargo nextest run -p aether-gateway --lib --bins
+--no-fail-fast --locked`; it still builds distinct lib/bin test artifacts.
+
+### 3. Contracts
+
+- `tools/ci.py` owns the local/CI argument arrays and child profile overrides:
+  incremental, dev debug and test debug are `0`; gateway test stack is 16 MiB.
+- Linux mold flags are job-scoped before cache restoration. Local execution
+  inherits its host linker; the entry does not install tools or modify `.env`.
+- Gateway tests collect all failures in the selected lib/bin targets and return
+  nonzero on failure. Do not retry or silently suppress failing tests.
+- CI setup selects the repository's pinned Rust version. Build/toolchain,
+  VSCodex and shared-check changes must trigger both push and PR verification.
+- Version watches use Git-resolved HEAD and symbolic-ref paths, not an assumed
+  `.git` directory. A packed-only branch temporarily watches its packed ref and
+  closest existing parent, then returns to exact-file watches once loose.
+- Source archives retain the stable `build.rs` and explicit environment watches.
+  Keep version precedence and tunnel-tag exclusion unchanged; do not add broad
+  Git/index/tag watching as an incidental speed fix.
+
+### 4. Validation & Error Matrix
+
+| Input or change | Required result |
+| --- | --- |
+| Unchanged normal/linked checkout | Build script remains Fresh, with zero executions |
+| Current branch/HEAD or explicit version advances | Execute the script once and publish the new version |
+| Packed branch becomes loose | Detect the change, then retain only exact-file watches |
+| Source archive lacks Git | Stable package/version fallback without missing watch paths |
+| Gateway has several failing tests | Collect them in one run and return failure |
+| `--dry-run` | Print actual command/env plans without executing them or claiming PASS |
+
+### 5. Good / Base / Bad Cases
+
+- Good: a gateway contract change is checked through the same entry locally and
+  in CI, so sibling fixture failures are visible together.
+- Base: an unchanged worktree reuses its build-script result.
+- Bad: checking only compilation after changing runtime contracts, repeatedly
+  fixing the first remote failure, or claiming a command merge removes all
+  compilation cost or proves an unmeasured CI speedup.
+
+### 6. Tests Required
+
+- The command fixture invokes the real dispatcher with mocked subprocesses and
+  checks targets, order, env, failure propagation and nonexecuting dry-run.
+- The build-watch fixture uses a dependency-free temporary Cargo package and
+  observes actual script execution counts/version output for checkout,
+  worktree, packed/detached refs, archive and explicit version inputs.
+- Parse the workflow and retain all required job IDs and aggregate conditions.
+  Configuration-only changes do not require rebuilding the full gateway.
+- Report remote runtime improvement only after a comparable actual Actions run;
+  separate compile/link time, test execution and summed runner time.
+
+### 7. Wrong vs Correct
+
+```text
+Wrong: watch ../../.git/HEAD unconditionally; copy different local/CI commands.
+Correct: resolve real Git inputs; call the same gateway check entry from both.
+```

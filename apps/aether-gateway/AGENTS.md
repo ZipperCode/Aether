@@ -54,8 +54,14 @@ src/
 
 ```bash
 cargo check -p aether-gateway
-cargo clippy -p aether-gateway --lib --bins --examples -- -D warnings
-RUST_MIN_STACK=16777216 cargo nextest run -p aether-gateway --lib
-RUST_MIN_STACK=16777216 cargo nextest run -p aether-gateway --bin aether-gateway
+python tools/ci.py preflight --dry-run
+python tools/ci.py preflight
+python tools/ci.py clippy-gateway
+python tools/ci.py gateway
 cargo run -p aether-gateway -- --app-port 8084
 ```
+
+- 从仓库根目录运行；需预先安装 Python 3、仓库固定的 Rust 1.95.0（含 rustfmt/Clippy）、宿主平台编译链接工具及 cargo-nextest。入口不安装工具、不读取 `.env`、不启动服务。
+- `preflight` 依次执行全仓格式检查、Gateway Clippy（lib/bins/examples）和 Gateway 测试（lib/bins）；任一阶段失败即返回失败。Gateway 使用 `--no-fail-fast --locked`，一次收集所有测试失败，仍返回非零退出码。
+- 入口统一 CI 的 incremental=0、dev/test debug=0 和 Gateway 16 MiB 测试栈；`--dry-run` 仅展示计划，并非编译或测试通过。已有 Bash/Make 环境可用 `make ci` / `make preflight` / `make ci-gateway`。
+- 这不是完整工作区、前端或真实 PostgreSQL CI；原生 Windows 与 Linux CI 的 OS/linker/数据库条件仍不同，Linux mold 只在 CI job 中配置，不强制用于本地。

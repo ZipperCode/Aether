@@ -6,7 +6,7 @@ DEV_RUST_LOG := $(RUST_LOG)
 endif
 export DEV_RUST_LOG
 
-.PHONY: dev dev-backend dev-frontend db-status db-prepare migration backfill
+.PHONY: dev dev-backend dev-frontend db-status db-prepare migration backfill ci preflight ci-gateway
 
 define DEV_BACKEND_SCRIPT
 set -euo pipefail
@@ -597,3 +597,11 @@ migration:
 
 backfill:
 	@DB_TASK_COMMAND="--apply-backfills" DB_TASK_LABEL="数据库 backfill" $(SHELL) -euo pipefail -c "$$DB_TASK_SCRIPT"
+
+# 仅网关预检：格式、Clippy 和 lib/bins 测试，不代表完整工作区/前端/数据库 CI。
+ci preflight:
+	python3 tools/ci.py preflight
+
+# 单独运行同一网关测试计划；原生 Windows 可直接使用 python tools/ci.py gateway。
+ci-gateway:
+	python3 tools/ci.py gateway
