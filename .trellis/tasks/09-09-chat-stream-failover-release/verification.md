@@ -44,3 +44,11 @@ git diff --check
 3. 防复发采用现有FirstClassifiedBody、完整record分类及严格三家HTTP回归，已更新执行生命周期spec。
 4. 共用首段分类的Responses回归通过，不扩展通用调度或新配置。
 5. 证据进入本任务和既有spec，仓库无对应模板源码，不复制其他项目模板路径。
+
+## 完整 CI 暴露的首事件时间回归及修复
+
+- c1e994159 的 Rust CI34259830393：5462个Gateway测试执行、5461通过、1失败、3跳过。唯一失败为 execute_execution_runtime_stream_records_first_stream_event_before_visible_text，315.782s，断言首个上游事件应记录first_byte。
+- 原fixture先await响应再release_text，在新的预读取合同下形成互锁；产品预读取也只缓存时间，streaming记录被推迟。独立review修复这两个实际问题，不提高超时、不删断言。
+- execution.rs复用maybe_record_first_stream_event_started：首Data（包括空Data）立即非终态记账，HTTP仍未提交；handoff不重复初始化。fixture并发执行并先查first_byte/streaming、确认响应未完成，再释放可见正文。
+- 最终测试 session92664：49 passed/0failed/0ignored，5319filtered，编译10m11s/执行2.98s；上一完整47项命令追加两个过滤条件 execute_execution_runtime_stream_records_first_stream_event_before_visible_text 和 execute_execution_runtime_stream_records_first_data_as_streaming_before_terminal_telemetry。
+- 最终Clippy40830 PASS/3m29s；fmt/diff13167 PASS。所有编辑在测试前完成、所有进程退出，无未解决finding。三家调用、usage归C/token(3,2,5)与单终态仍通过。

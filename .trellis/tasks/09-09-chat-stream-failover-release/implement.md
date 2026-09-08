@@ -14,7 +14,7 @@
 - [x] 配置上下文、启动任务并派发。
 - [x] 修改前复现 → 最小根因修复 → 相关检查。
 - [x] 独立 review/修正 → 模拟和质量验证通过。
-- [ ] 更新合同及证据，中文提交并推送 origin/master。
+- [x] 更新合同及证据，中文提交并推送 origin/master。
 - [ ] 精确 SHA GitHub 必需 CI 全部成功；失败修复后正常提交再验证。
 - [ ] 推送下一未占用应用 patch tag，跟进 release/产物。
 - [ ] 完整审计、清理、归档，全部完成后 update_goal。
@@ -44,3 +44,12 @@
 - 额外授权仅 main.rs 非Unix导出函数移除 needless_return 并中文说明，行为不变。它在测试后修改，由最终Clippy覆盖，不重复不相关lib测试。
 - 最终 python tools/ci.py clippy-gateway PASS（lib/bins/examples、-D warnings，5.33s）；fmt/diff session61896 PASS。无未解决产品finding，无活动任务进程。
 - 当前工作交接：产品7文件、spec合同更新及任务证据由Root收口。下一步提交并推送，精确SHA等待完整CI。
+
+## GitHub CI
+
+- 修复提交 c1e9941595e8cfc8ffe57b6e77a0762b68f7d3c2 已正常推送 origin/master；不是强推，无tag提前发布。
+- 下一步查询该精确SHA的Rust CI全部作业，成功前禁止创建应用tag。
+
+- Rust CI34259830393失败：Gateway 5462执行、5461通过、1失败、3跳过。唯一失败 execute_execution_runtime_stream_records_first_stream_event_before_visible_text（315.782s）。其他叶子作业均成功，未推tag。下一步由原review owner有界复现/修复此流首事件回归后再提交和运行新SHA CI。
+
+- CI唯一失败已由原独立reviewer修复：预提交首Data即非终态记账，handoff去重，fixture并发释放消除互锁。49/49相关测试、Clippy、fmt/diff全部通过，具体证据见verification.md。仅execution.rs与合同/证据追加，下一步正常追加提交推送，不改写历史、不移动tag。

@@ -51,6 +51,11 @@ schedules the cancelled settlement path unless the watchdog already owns it.
   error record remains pending. Keep LF, CRLF and CR record boundaries working.
 - Inspection must not rewrite successful upstream bytes or unknown fields.
   Preserve the existing prefetch limits, first-byte budget and terminal owner.
+- First-upstream-event accounting is independent of HTTP commitment. The first
+  `Data` frame, including an empty frame, records first-byte time and nonterminal
+  streaming state during prefetch. Reuse the existing event-recording owner;
+  response handoff must not initialize the same event again. An early error may
+  still fail over before client-visible output and settle through its one owner.
 - Archived `upstream_response` status/headers may be reconstructed from a
   terminal provider error. Do not infer original wire status or commitment
   timing from those normalized fields alone.
@@ -82,6 +87,7 @@ schedules the cancelled settlement path unless the watchdog already owns it.
 | Provider fails after visible output | Emit the protocol failure terminal in the same stream. |
 | Chat first event is an error, including fragmented/multiline SSE | Honor failover and reach the next eligible provider before handing off a response. |
 | Only SSE comments, id or retry records arrive | Keep waiting within the existing prefetch budget. |
+| First Data arrives before any visible text | Persist first-byte/streaming while HTTP response remains uncommitted. |
 | Provider explicitly stops on the first error status | Return that error without contacting the next provider. |
 | Client closes after a complete terminal event | Preserve completed/failed terminal state, not cancellation. |
 
@@ -113,6 +119,11 @@ schedules the cancelled settlement path unless the watchdog already owns it.
 - `execution_runtime::stream::error::tests` covers complete-record boundaries,
   control-only records, multiline data, incomplete errors and a normal first
   event preceding a later error. Keep same-format Responses regressions green.
+- `execute_execution_runtime_stream_records_first_stream_event_before_visible_text`
+  drives response execution concurrently, asserts first-byte/streaming before
+  releasing visible data, and asserts that the HTTP task is not yet complete.
+  Pair with `execute_execution_runtime_stream_records_first_data_as_streaming_before_terminal_telemetry`.
+  Never await the precommitted response before releasing the event it requires.
 - Candidate loop: `stream_candidate_watchdog_failover_gets_fresh_first_byte_budget`,
   `stream_candidate_watchdog_same_provider_retries_get_fresh_first_byte_budget`,
   `stream_candidate_watchdog_starts_first_byte_budget_after_admission`, plus

@@ -5719,6 +5719,7 @@ fn usage_refresh_telemetry(
     }
 }
 
+/// 首次观察上游 Data 时提交非终态 streaming 记账并返回 true；不表示下游 HTTP 已提交。
 fn maybe_record_first_stream_event_started(
     state: &AppState,
     lifecycle_seed: &LifecycleUsageSeed,
@@ -5727,17 +5728,17 @@ fn maybe_record_first_stream_event_started(
     event_observed_at: Instant,
     upstream_telemetry: Option<&ExecutionTelemetry>,
     usage_stream_telemetry: &mut Option<ExecutionTelemetry>,
-) {
+) -> bool {
     if !maybe_capture_first_stream_event_telemetry(
         stream_started_at,
         event_observed_at,
         upstream_telemetry,
         usage_stream_telemetry,
     ) {
-        return;
+        return false;
     }
     let Some(telemetry) = usage_stream_telemetry.as_ref() else {
-        return;
+        return false;
     };
     state.usage_runtime.record_stream_started(
         state.usage_lifecycle_data_state().as_ref(),
@@ -5745,6 +5746,7 @@ fn maybe_record_first_stream_event_started(
         status_code,
         Some(telemetry),
     );
+    true
 }
 
 fn build_terminal_stream_telemetry(
@@ -6779,7 +6781,10 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             let frame_observed_at = observed_frame.observed_at;
             match observed_frame.frame.payload {
                 StreamFramePayload::Data { chunk_b64, text } => {
-                    if maybe_capture_first_stream_event_telemetry(
+                    if maybe_record_first_stream_event_started(
+                        state,
+                        &lifecycle_seed,
+                        status_code,
                         stream_started_at,
                         frame_observed_at,
                         prefetched_telemetry.as_ref(),
@@ -7302,12 +7307,15 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             .as_ref()
             .map(|telemetry| usage_refresh_telemetry(telemetry, None))
     });
-    state.usage_runtime.record_stream_started(
-        state.usage_lifecycle_data_state().as_ref(),
-        &lifecycle_seed,
-        status_code,
-        initial_usage_telemetry.as_ref(),
-    );
+    // 预读已在首个 Data 到达时提交首字节记账；无 Data 的头部透传仍沿用原有 streaming 初始化。
+    if prefetched_usage_telemetry.is_none() {
+        state.usage_runtime.record_stream_started(
+            state.usage_lifecycle_data_state().as_ref(),
+            &lifecycle_seed,
+            status_code,
+            initial_usage_telemetry.as_ref(),
+        );
+    }
     if let Some(snapshot) = request_candidate_status_snapshot {
         let latency_ms = prefetched_telemetry
             .as_ref()
@@ -15102,7 +15110,7 @@ mod tests {
         server.abort();
     }
 
-    /// 验证远程流首个协议事件早于可见文本时，首字节与 streaming 状态仍及时落账。
+    /// 验证远程流首事件先于可见文本时及时落账，但正文分类完成前不能交付 HTTP 响应。
     #[tokio::test]
     async fn execute_execution_runtime_stream_records_first_stream_event_before_visible_text() {
         let listener = crate::test_support::bind_loopback_listener()
@@ -15221,23 +15229,28 @@ mod tests {
         )
         .with_execution_runtime_candidate(true);
 
-        let response = execute_execution_runtime_stream(
-            &state,
-            plan,
-            "trace-live-stream-first-event",
-            &decision,
-            "openai_chat_stream",
-            None,
-            Some(json!({
-                "provider_api_format": "openai:chat",
-                "client_api_format": "openai:chat",
-            })),
-        )
-        .await
-        .expect("execution should succeed")
-        .expect("execution should return a client response");
+        // 执行必须与用量观察并发；等待响应后才放行正文会与首段提交门互锁。
+        let execution_task = tokio::spawn(async move {
+            execute_execution_runtime_stream(
+                &state,
+                plan,
+                "trace-live-stream-first-event",
+                &decision,
+                "openai_chat_stream",
+                None,
+                Some(json!({
+                    "provider_api_format": "openai:chat",
+                    "client_api_format": "openai:chat",
+                })),
+            )
+            .await
+            .expect("execution should succeed")
+            .expect("execution should return a client response")
+        });
 
-        first_event_seen.notified().await;
+        tokio::time::timeout(Duration::from_secs(15), first_event_seen.notified())
+            .await
+            .expect("upstream should emit the first event before visible text is released");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let first_event_usage = loop {
             let usage = usage_repository
@@ -15256,8 +15269,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         assert!(first_event_usage.first_byte_time_ms.is_some());
+        assert!(
+            !execution_task.is_finished(),
+            "recording first byte must not commit HTTP success before a classified body"
+        );
 
         release_text.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(15), execution_task)
+            .await
+            .expect("classified visible text should release the response")
+            .expect("execution task should complete");
         text_seen.notified().await;
 
         release_terminal.notify_one();
@@ -15268,6 +15289,7 @@ mod tests {
         assert!(text.contains("\"content\":\"hello\""));
 
         server.abort();
+        let _ = server.await;
     }
 
     /// 验证远程运行时返回 Responses 同步 JSON 时，网关通过真实 Key 准入并桥接为 SSE。
