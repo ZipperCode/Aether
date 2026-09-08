@@ -4,8 +4,8 @@
 - [x] 捕获Rust CI34210248162，读取首个完成失败job原始日志。
 - [x] 修复build-watch fixture对CI颜色环境的真实差异，验证相同CI env下仍通过。
 - [x] 等当前run完成并收集其他真实失败；全部35个Gateway失败已列出，按下方明确文件分组继续。
-- [ ] 独占check审查本次修复；Root统一commit/push并跟进精确新SHA CI直到成功或确有外部阻塞。
-- [ ] 归档和清理；不tag/release/deploy。
+- [x] 独占check审查本次修复；Root统一commit/push，最终精确SHA CI已成功。
+- [x] 清理任务临时资源，保留正常缓存；按finish-work归档本任务，不tag/release/deploy。
 
 ## 初始所有权
 
@@ -52,3 +52,10 @@
 - 独立check：model-fetch3/3、OAuth2/2、usage确定性交错+原失败+两个共享fixture共4/4通过；Tunnel仅补精确wire静态类别，原测试未改，本地未重跑2项。
 - Tunnel production-only严格Clippy仅因3处既有Windows dead_code失败（未改文件）；不加allow、不改无关平台函数，不伪称本地通过，下轮LinuxCI认证。没有Gateway重新构建或全量本地套件。
 - 全部writer/check已归还；Root正常commit/push最后4文件并继续精确SHA CI，不结束在“已push但CI未知”。
+
+## 最终 CI 成功
+
+- 正常推送74abb40cfd8f4c9df93ce657c8bbcbf9996acda6后，run34220941447的18/18展开jobs全部成功，最终check于2026-09-08 11:47:44 UTC完成。
+- Gateway5456/5456、Rest3545/3545、Frontend1635/1635及Build、Data372/372、adapter225、integration26、PostgreSQL烟测及全部LinuxClippy通过。原Gateway35及Rest5均有实际PASS证据。
+- Root已直接复核GitHubheadSha/status/conclusion/jobs；本地和远端产品HEAD均74abb40cf，后续只有任务/规范/日志收尾，不改变已认证产品源码。
+- 此次共初次push+两批集中修复push，不删除或跳过新增失败测试。详尽各轮证据留research；任务完成，不继续后台监测。

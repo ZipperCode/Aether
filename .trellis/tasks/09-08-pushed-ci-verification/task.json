@@ -15,12 +15,12 @@
   "branch": null,
   "base_branch": "master",
   "worktree_path": null,
-  "commit": null,
+  "commit": "74abb40cfd8f4c9df93ce657c8bbcbf9996acda6",
   "pr_url": null,
   "subtasks": [],
   "children": [],
   "parent": null,
   "relatedFiles": [],
-  "notes": "",
+  "notes": "首次立即push后分两批修复实际CI失败；最终74abb40cf对应run34220941447已18/18成功，Gateway5456/Rest3545/Frontend1635/Data372通过。无发布部署、无任务临时进程，保留正常Cargo缓存；收尾提交仅任务/规范/日志。",
   "meta": {}
 }

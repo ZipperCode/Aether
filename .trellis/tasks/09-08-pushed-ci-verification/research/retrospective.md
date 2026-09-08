@@ -18,7 +18,7 @@
 | P0 | 真实环境回归 | Cargo解析夹具显式plain输出，并在CI四环境变量下运行 | DONE |
 | P0 | 单一合同拥有者 | 余额共享projection、候选错误共享registry修复并原位回归 | DONE |
 | P1 | 完整失败收集 | Data/Rest保留全目标并no-fail-fast，不忽略失败 | DONE |
-| P1 | 精确SHA验证 | 本地最小验证后正常push，Linux完整CI是最终证据 | PENDING |
+| P1 | 精确SHA验证 | 74abb40cf的Rust CI34220941447已18/18成功 | DONE |
 
 ## 4. Systematic Expansion
 
@@ -31,4 +31,4 @@
 - [x] 已在现有Gateway quality spec记录CI颜色确定性与全失败收集。
 - [x] 已记录余额/候选诊断共享投影的签名、边界与回归。
 - [x] 原始CI完整35失败矩阵和本地批次结果保存在任务research。
-- [ ] 最终新SHA的CI终态和新发现继续补证，不能把待验证标成成功。
+- [x] 最终74abb40cf的CI终态已实证；Gateway35旧失败、Rest5后续失败全部PASS，报告为run-34220941447.md。

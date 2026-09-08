@@ -15,15 +15,15 @@
 ## Acceptance Criteria
 
 - [x] 首次已提交代码正常推送，捕获精确 SHA 对应的 CI run。
-- [ ] 本轮所有实际失败有具体日志、根因、最小修复和对应验证。
-- [ ] 修复提交推送后，最终目标 SHA 的 Rust CI 成功；如有真实外部阻塞，准确报告而非声称通过。
-- [ ] 记录实际时间与失败类型，不将新增全量上游合并的运行与旧样本作无控制的提速承诺。
-- [ ] 本地工作区收口、任务归档和任务自有临时资源清理；无发布/部署。
+- [x] 本轮所有实际失败有具体日志、根因、最小修复和对应验证。
+- [x] 修复提交推送后，最终目标 SHA 的 Rust CI 成功；如有真实外部阻塞，准确报告而非声称通过。
+- [x] 记录实际时间与失败类型，不将新增全量上游合并的运行与旧样本作无控制的提速承诺。
+- [x] 本地产品工作区收口，任务自有临时资源清理；仅剩本任务归档记录，无发布/部署。
 
 ## Evidence / Current State
 
-- 本地/远端 master 均为 `948c1c16f`；第一轮 CI https://github.com/ZipperCode/Aether/actions/runs/34210248162。
-- 首个失败 job `102009266027`：Rust fmt PASS，CI dispatcher fixture PASS，build-watch fixture在 unchanged输出Fresh但字符串断言失败；CI全局 `CARGO_TERM_COLOR=always`，疑似ANSI控制码差异，需以原始输出确认。
-- 其余 jobs仍运行，保持当前远端执行收集失败，不提前push触发取消。
-
-首轮已终态：Gateway完整no-fail-fast暴露35项失败，其他6个独立断言/lint点已修复并经独立检查；全列表/时间/18job矩阵在 research/run-34210248162.md。按4个非重叠写集解决共享根因后统一验证推送，不将新增Gateway失败排除在本次交付之外。
+- 第一轮 `948c1c16f` / run34210248162：完整Gateway收集35失败，其他6个断言/lint点，按共同根因集中修复；不是逐个失败反复push。
+- 第二轮 `9026380d1` / run34217818968：Gateway5456、Frontend1635及Build、Data372和LinuxClippy全部通过；Rest完整跑到前轮未执行部分后新增5失败，按4文件修复。
+- 最终代码 `74abb40cfd8f4c9df93ce657c8bbcbf9996acda6` / https://github.com/ZipperCode/Aether/actions/runs/34220941447：Root直接核验 headSha匹配、completed/success、18/18 jobs成功、unsuccessful为空。
+- 最终Gateway5456、Rest3545、Frontend1635、Data372全部通过；既有skip单独记录。整轮18m31s，Gateway编译5m31s/测试738.786s，无受控百分比提速承诺。
+- 最终报告见 research/run-34220941447.md；没有遗留任务进程/临时文件，正常Cargo缓存保留用于复用，不删除用户缓存。
