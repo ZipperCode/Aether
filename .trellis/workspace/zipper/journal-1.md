@@ -504,3 +504,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 21: 完整同步上游 main 并保留本地增强
+
+**Date**: 2026-09-08
+**Task**: 完整同步上游 main 并保留本地增强
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+完整合并上游 c7e403b41，保留本地认证内存、Endpoint、余额/额度阻断与 Responses 契约；229 初始冲突解决，workspace all-targets 与前端类型通过，38 项 Rust 和 423 项前端定向测试通过。修复 3 处测试夹具，更新退役数据库和新生命周期规范。已合回本地 master、清理临时 worktree/分支/缓存；未推送、部署或操作现有数据库。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c170f83e9` | (see git log) |
+
+### Status
+
+[OK] **Completed**
