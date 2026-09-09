@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 25
+- **Total Sessions**: 26
 - **Last Active**: 2026-09-09
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~618 | Active |
+| `journal-1.md` | ~640 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 26 | 2026-09-09 | 修复 Antigravity 工具 Schema 元声明兼容 | `cbf1346fe` | `master` |
 | 25 | 2026-09-09 | 修复 Chat 首段错误故障转移并发布 v0.7.32 | `c1e994159`, `7eaea44b0` | `master` |
 | 24 | 2026-09-08 | 发布并验证 Aether v0.7.31 | `74abb40cf` | `master` |
 | 23 | 2026-09-08 | 首次推送后集中修复并完成完整 CI 认证 | `9026380d1`, `74abb40cf` | `master` |

@@ -616,3 +616,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 26: 修复 Antigravity 工具 Schema 元声明兼容
+
+**Date**: 2026-09-09
+**Task**: 修复 Antigravity 工具 Schema 元声明兼容
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+修复公开 Gemini 到 Antigravity 私有接口的 $schema 元声明 400；保留参数别名优先级、嵌套结构、业务同名属性、字面数据、引用与联合类型。合成 12 工具回归先失败后通过，独立复查 6 项 Antigravity 与 5 项 Gemini 同格式测试、Clippy、Rust 编译及格式检查通过。仅复用本机 NASM/CMake 进程环境；未部署、未推送、未调用上游模型。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `cbf1346fe` | (see git log) |
+
+### Status
+
+[OK] **Completed**
