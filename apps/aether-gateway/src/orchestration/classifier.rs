@@ -437,11 +437,45 @@ pub(crate) fn classify_local_quota_exhaustion(
     None
 }
 
+/// 先执行全局终止规则，再按既有提供商规则和持久额度证据决定重试范围。
 fn classify_local_failover_with_quota_evidence(
     policy: &LocalFailoverPolicy,
     input: LocalFailoverInput<'_>,
     quota_evidence: Option<LocalQuotaExhaustionEvidence>,
 ) -> LocalFailoverClassification {
+    if input.status_code >= 400
+        && policy.routing_rules.error_stop_patterns.iter().any(|rule| {
+            failover_pattern_matches(
+                &rule.pattern,
+                &rule.status_codes,
+                input.response_text,
+                input.status_code,
+            )
+        })
+    {
+        return LocalFailoverClassification::StopErrorPattern;
+    }
+    if input.status_code == 200
+        && policy
+            .routing_rules
+            .success_failover_patterns
+            .iter()
+            .any(|rule| {
+                failover_pattern_matches(
+                    &rule.pattern,
+                    &rule.status_codes,
+                    input.response_text,
+                    input.status_code,
+                )
+            })
+    {
+        // 全局成功规则可要求重试，但不能把已识别的额度耗尽降为同凭据候选重试。
+        return if quota_evidence.is_some() {
+            LocalFailoverClassification::RetryQuotaExhausted
+        } else {
+            LocalFailoverClassification::RetrySuccessPattern
+        };
+    }
     if policy.stop_status_codes.contains(&input.status_code) {
         return LocalFailoverClassification::StopStatusCode;
     }
@@ -807,13 +841,27 @@ fn local_failover_regex_rule_matches(
     response_text: Option<&str>,
     status_code: u16,
 ) -> bool {
-    if !rule.status_codes.is_empty() && !rule.status_codes.contains(&status_code) {
+    failover_pattern_matches(
+        &rule.pattern,
+        &rule.status_codes,
+        response_text,
+        status_code,
+    )
+}
+
+fn failover_pattern_matches(
+    pattern: &str,
+    status_codes: &std::collections::BTreeSet<u16>,
+    response_text: Option<&str>,
+    status_code: u16,
+) -> bool {
+    if !status_codes.is_empty() && !status_codes.contains(&status_code) {
         return false;
     }
 
-    let pattern = rule.pattern.trim();
+    let pattern = pattern.trim();
     if pattern.is_empty() {
-        return !rule.status_codes.is_empty();
+        return !status_codes.is_empty();
     }
 
     let Some(response_text) = response_text else {
@@ -827,6 +875,93 @@ fn local_failover_regex_rule_matches(
 
 #[cfg(test)]
 mod tests {
+    /// 全局 HTTP 200 正则与明确额度错误重叠时，保留凭据级重试和持久额度证据。
+    #[test]
+    fn global_success_pattern_preserves_quota_credential_scope() {
+        let policy = super::LocalFailoverPolicy {
+            routing_rules: aether_routing_core::RoutingFailoverRules {
+                success_failover_patterns: vec![aether_routing_core::RoutingFailoverRule {
+                    pattern: "insufficient_quota".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let body = r#"{"error":{"code":"insufficient_quota"}}"#;
+        let input = super::LocalFailoverInput::new(200, Some(body));
+        assert!(super::classify_local_quota_exhaustion(&policy, input).is_some());
+        assert_eq!(
+            super::classify_local_failover(&policy, input),
+            super::LocalFailoverClassification::RetryQuotaExhausted
+        );
+    }
+
+    #[test]
+    fn routing_rules_precede_provider_rules_and_keep_provider_fallback() {
+        let policy = super::LocalFailoverPolicy {
+            routing_rules: aether_routing_core::RoutingFailoverRules {
+                success_failover_patterns: vec![aether_routing_core::RoutingFailoverRule {
+                    pattern: "(?i)capacity.*exhausted".to_string(),
+                    ..Default::default()
+                }],
+                error_stop_patterns: vec![aether_routing_core::RoutingFailoverRule {
+                    pattern: "invalid.*parameter".to_string(),
+                    status_codes: [400].into_iter().collect(),
+                }],
+            },
+            stop_status_codes: [200, 403].into_iter().collect(),
+            continue_status_codes: [400].into_iter().collect(),
+            ..Default::default()
+        };
+        for (status, body, expected) in [
+            (
+                200,
+                "CAPACITY exhausted",
+                super::LocalFailoverClassification::RetrySuccessPattern,
+            ),
+            (
+                400,
+                "invalid request parameter",
+                super::LocalFailoverClassification::StopErrorPattern,
+            ),
+            (
+                400,
+                "capacity exhausted",
+                super::LocalFailoverClassification::RetryStatusCode,
+            ),
+            (
+                403,
+                "permission denied",
+                super::LocalFailoverClassification::StopStatusCode,
+            ),
+            (
+                429,
+                "rate limited",
+                super::LocalFailoverClassification::RetryUpstreamFailure,
+            ),
+        ] {
+            assert_eq!(
+                super::classify_local_failover(
+                    &policy,
+                    super::LocalFailoverInput::new(status, Some(body))
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn provider_transport_stop_rule_is_respected() {
+        let policy = super::LocalFailoverPolicy {
+            stop_on_transport_errors: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::classify_local_transport_error(&policy),
+            super::LocalTransportFailoverClassification::StopTransportError
+        );
+    }
     use std::collections::BTreeSet;
 
     use super::{

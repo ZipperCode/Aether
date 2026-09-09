@@ -4,7 +4,7 @@ use aether_contracts::ExecutionPlan;
 use serde_json::{json, Value};
 use tracing::debug;
 
-use aether_routing_core::RoutingExecutionPolicy;
+use aether_routing_core::{RoutingExecutionPolicy, RoutingFailoverRules};
 
 use crate::provider_transport::GatewayProviderTransportSnapshot;
 use crate::AppState;
@@ -16,6 +16,7 @@ pub(crate) const ROUTING_EXECUTION_POLICY_REPORT_FIELD: &str = "routing_executio
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalFailoverPolicy {
+    pub(crate) routing_rules: RoutingFailoverRules,
     pub(crate) max_retries: Option<u64>,
     pub(crate) max_transfer_count: u64,
     pub(crate) max_transfer_timeout_seconds: u64,
@@ -32,6 +33,7 @@ pub(crate) struct LocalFailoverPolicy {
 impl Default for LocalFailoverPolicy {
     fn default() -> Self {
         Self {
+            routing_rules: RoutingFailoverRules::default(),
             max_retries: None,
             max_transfer_count: 0,
             max_transfer_timeout_seconds: 0,
@@ -53,6 +55,7 @@ pub(crate) struct LocalFailoverRegexRule {
     pub(crate) status_codes: BTreeSet<u16>,
 }
 
+/// 合并当前提供商规则与请求级路由快照，保留额度耗尽规则及两级诊断计数。
 pub(crate) async fn resolve_local_failover_policy(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -65,8 +68,10 @@ pub(crate) async fn resolve_local_failover_policy(
         Ok(Some(transport)) => local_failover_policy_from_transport(&transport),
         Ok(None) | Err(_) => LocalFailoverPolicy::default(),
     };
-    let cyber_continue_failover = routing_execution_policy_from_report_context(report_context)
-        .is_some_and(|policy| policy.cyber_continue_failover);
+    let routing_policy =
+        routing_execution_policy_from_report_context(report_context).unwrap_or_default();
+    let cyber_continue_failover = routing_policy.cyber_continue_failover;
+    policy.routing_rules = routing_policy.failover_rules;
     policy.stop_cyber_policy_errors = !cyber_continue_failover;
     debug!(
         event_name = "local_failover_policy_loaded",
@@ -85,6 +90,8 @@ pub(crate) async fn resolve_local_failover_policy(
         success_failover_pattern_count = policy.success_failover_patterns.len(),
         error_stop_pattern_count = policy.error_stop_patterns.len(),
         quota_exhaustion_pattern_count = policy.quota_exhaustion_patterns.len(),
+        global_success_pattern_count = policy.routing_rules.success_failover_patterns.len(),
+        global_stop_pattern_count = policy.routing_rules.error_stop_patterns.len(),
         cyber_continue_failover,
         "gateway loaded local failover policy from transport snapshot"
     );
@@ -127,6 +134,7 @@ pub(crate) fn local_failover_policy_from_transport(
         });
 
     LocalFailoverPolicy {
+        routing_rules: RoutingFailoverRules::default(),
         max_retries,
         max_transfer_count: provider_config
             .and_then(|value| value.get("max_transfer_count"))
@@ -192,6 +200,10 @@ pub(crate) fn local_failover_policy_from_report_context(
         .as_object()?;
 
     Some(LocalFailoverPolicy {
+        routing_rules: object
+            .get("routing_rules")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default(),
         max_retries: object.get("max_retries").and_then(parse_u64_value),
         max_transfer_count: object
             .get("max_transfer_count")
@@ -282,6 +294,7 @@ fn parse_status_code_list(value: &Value) -> BTreeSet<u16> {
 
 fn local_failover_policy_to_value(policy: &LocalFailoverPolicy) -> Value {
     json!({
+        "routing_rules": policy.routing_rules,
         "max_retries": policy.max_retries,
         "max_transfer_count": policy.max_transfer_count,
         "max_transfer_timeout_seconds": policy.max_transfer_timeout_seconds,
@@ -541,6 +554,7 @@ mod tests {
         assert_eq!(
             local_failover_policy_from_report_context(Some(&report_context)),
             Some(LocalFailoverPolicy {
+                routing_rules: Default::default(),
                 max_retries: Some(2),
                 max_transfer_count: 10,
                 max_transfer_timeout_seconds: 60,

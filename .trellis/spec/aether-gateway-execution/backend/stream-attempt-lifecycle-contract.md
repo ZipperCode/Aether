@@ -15,8 +15,8 @@ struct AttemptCancellationGuard { /* compact pending-attempt settlement state */
 async fn fail_and_disarm(&mut self, error: &GatewayError);
 // Start a fresh candidate timer only after execution admission succeeds.
 let timeout_duration = resolve_stream_candidate_watchdog_timeout(plan, report_context);
-// 同格式 Chat/Responses 在交付响应前分类首个完整正文或事件。
-StreamCommitPolicy::FirstClassifiedBody;
+// 标准文本 SSE 在交付响应前等待首个完整业务事件，开场控制事件仍缓冲。
+StreamCommitPolicy::FirstSseSemanticEvent;
 ```
 
 The guard is armed while a candidate is pending. A successful stream handoff
@@ -41,10 +41,11 @@ schedules the cancelled settlement path unless the watchdog already owns it.
 - Candidate selection may continue only before client-visible output. Once a
   protocol-visible event is emitted, a later terminal provider error stays in
   that stream and is rendered as the complete client-format failure terminal.
-- Same-format OpenAI Chat and Responses SSE use `FirstClassifiedBody`, not
-  response-header-only commitment. A first provider error follows the existing
-  failover/stop policy before response handoff; do not increase retry counts to
-  compensate for a prematurely committed stream.
+- Standard OpenAI Chat/Responses SSE use `FirstSseSemanticEvent`, not response
+  headers or role-only/created opening events as the commitment boundary.
+  A complete structured error wins over success-pattern matching before visible
+  output. `FirstClassifiedBody` remains only for its existing non-SSE/conversion
+  and explicit image-prefetch callers. Do not add retries to mask early commit.
 - SSE classification consumes complete records using the existing boundary
   parser. Comments, `id`, `retry`, and other control-only records do not commit
   a response. Join a record's `data` fields before JSON classification; a split
@@ -62,8 +63,18 @@ schedules the cancelled settlement path unless the watchdog already owns it.
 - A non-empty Gemini `thought` is client-visible; a signature-only part is not.
   Tool-call content is visible even when marked as thought metadata.
 - A downstream close after a complete client-visible terminal event is treated
-  as completed. A close before a terminal event remains cancelled unless an
-  explicit terminal failure already owns the outcome.
+  as completed. After policy selection, `cancel_on_client_disconnect=false`
+  (including a missing field) instead drains the original request/response to
+  its normal outcome on disconnect, retaining permits and diagnostics without
+  aggregating body bytes. Explicit `true` cancels unfinished execution; before
+  policy resolution disconnect still cancels immediately.
+- The disconnect option is frozen in the resolved request policy. Responses WS
+  completes only the active turn when continuation is enabled; this creates no
+  durable background job or permanently idle session.
+- Explicit cancellation has zero token/cache/image charges. A configured
+  `price_per_request` still incurs its one request fee and multiplier through
+  the server-owned `cancelled_request_fee` marker, wallet and cost reservation.
+  A cancelled/499 audit may therefore be settled; absence of that fee stays void.
 - The existing stream watchdog observes lifecycle state but does not race the
   terminal writer. It calls `mark_abandoned()` before dropping execution;
   the guard respects `abandoned()`. Started terminalization must finish.
@@ -79,7 +90,9 @@ schedules the cancelled settlement path unless the watchdog already owns it.
 | Candidate one consumes most of its first-byte budget | Candidate two receives its own full configured budget. |
 | Execution admission takes time before retry | Start the candidate timer after admission succeeds. |
 | Admission times out | Persist one Failed/429 outcome, not Cancelled/499. |
-| Client disconnects before first byte | Persist one cancelled candidate and one cancelled usage outcome. |
+| Client disconnects after policy selection, default false | Finish/drain original attempt and settle its real outcome; retain permits. |
+| Explicit cancellation enabled and client disconnects | Cancel once; charge only configured per-request fee, otherwise void. |
+| Disconnect occurs before policy selection | Cancel immediately through the existing owner. |
 | Response-body finalizer takes ownership | Disarm the pre-response guard; do not duplicate settlement. |
 | Watchdog times out before dropping execution | Mark abandoned first; guard must not overwrite timeout. |
 | Non-empty Gemini thought is emitted | Commit that candidate and forbid later failover. |
@@ -111,7 +124,11 @@ schedules the cancelled settlement path unless the watchdog already owns it.
 ## 6. Tests Required
 
 - Gateway lifecycle:
-  `gateway_settles_stream_attempt_when_client_disconnects_before_first_byte`.
+  `gateway_settles_stream_attempt_when_client_disconnects_before_first_byte`
+  explicitly selects immediate cancellation. Cover default continuation and
+  explicit cancel before headers/first frame/after content, including WS turns.
+- Billing/usage regressions verify cancelled per-request fee versus no fee,
+  token/image zero charges, retained admission and wallet/cost-reservation state.
 - `chat_stream_failover_*`: assert actual HTTP call counts `[2, 1, 1]` for
   first-error/split-error success; `[2, 1, 0]` for visible-output and explicit
   stop cases, exact success bytes including unknown fields, final provider

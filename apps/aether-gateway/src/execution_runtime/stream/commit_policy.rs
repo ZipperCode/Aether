@@ -14,8 +14,15 @@ const GEMINI_PRECOMMIT_MAX_WAIT: Duration = Duration::from_millis(750);
 pub(super) enum StreamCommitPolicy {
     /// 收到响应头即可提交，适用于无需检查首段的直通流。
     ResponseHeaders,
-    /// 先分类首个完整正文或事件，保留同格式 Chat/Responses 错误回退边界。
+    /// 非 SSE 或转换路径先分类完整正文，提交前识别嵌入错误。
     FirstClassifiedBody,
+    /// 按完整 SSE 记录跳过开场事件，在首个业务输出或错误处作提交决策。
+    FirstSseSemanticEvent {
+        /// 提交前缓存上限；沿用共享首段字节预算。
+        max_bytes: usize,
+        /// 等待首个语义事件的时间预算。
+        max_wait: Duration,
+    },
     /// 等待 Anthropic 首个客户端可见语义事件或错误。
     FirstAnthropicSemanticEvent {
         /// 提交前最多缓存的上游字节数，达到上限后为防止无界缓冲而提交。
@@ -48,21 +55,20 @@ impl StreamCommitPolicy {
             return Self::FirstClassifiedBody;
         }
 
-        if force_prefetch {
-            return Self::FirstClassifiedBody;
-        }
-
         let content_type = content_type
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or_default()
             .to_ascii_lowercase();
         if content_type.contains("text/event-stream") {
-            if (provider_api_format.eq_ignore_ascii_case("openai:responses")
-                || provider_api_format.eq_ignore_ascii_case("openai:chat"))
-                && provider_api_format.eq_ignore_ascii_case(client_api_format)
+            if provider_api_format.eq_ignore_ascii_case("openai:image")
+                || client_api_format.eq_ignore_ascii_case("openai:image")
             {
-                return Self::FirstClassifiedBody;
+                return if force_prefetch {
+                    Self::FirstClassifiedBody
+                } else {
+                    Self::ResponseHeaders
+                };
             }
             if provider_api_format.eq_ignore_ascii_case("claude:messages")
                 && provider_api_format.eq_ignore_ascii_case(client_api_format)
@@ -80,7 +86,14 @@ impl StreamCommitPolicy {
                     max_wait: GEMINI_PRECOMMIT_MAX_WAIT,
                 };
             }
-            return Self::ResponseHeaders;
+            return Self::FirstSseSemanticEvent {
+                max_bytes: MAX_STREAM_PREFETCH_BYTES,
+                max_wait: Duration::from_secs(30),
+            };
+        }
+
+        if force_prefetch {
+            return Self::FirstClassifiedBody;
         }
 
         if has_private_stream_normalizer || has_local_stream_rewriter {
@@ -111,7 +124,9 @@ impl StreamCommitPolicy {
     pub(super) const fn requires_bounded_frame_wait(self) -> bool {
         matches!(
             self,
-            Self::FirstAnthropicSemanticEvent { .. } | Self::FirstGeminiSemanticEvent { .. }
+            Self::FirstAnthropicSemanticEvent { .. }
+                | Self::FirstGeminiSemanticEvent { .. }
+                | Self::FirstSseSemanticEvent { .. }
         )
     }
 
@@ -119,7 +134,8 @@ impl StreamCommitPolicy {
     pub(super) const fn max_precommit_wait(self) -> Option<Duration> {
         match self {
             Self::FirstAnthropicSemanticEvent { max_wait, .. }
-            | Self::FirstGeminiSemanticEvent { max_wait, .. } => Some(max_wait),
+            | Self::FirstGeminiSemanticEvent { max_wait, .. }
+            | Self::FirstSseSemanticEvent { max_wait, .. } => Some(max_wait),
             Self::ResponseHeaders | Self::FirstClassifiedBody => None,
         }
     }
@@ -132,6 +148,17 @@ impl StreamCommitPolicy {
     /// 判断当前策略是否为 Gemini 语义门，供通用正文检查避免重复消费。
     pub(super) const fn is_gemini(self) -> bool {
         matches!(self, Self::FirstGeminiSemanticEvent { .. })
+    }
+
+    /// 用本候选的首字节预算配置语义等待，不沿用前一候选的截止时间。
+    pub(super) fn with_precommit_wait(mut self, wait: Duration) -> Self {
+        match &mut self {
+            Self::FirstAnthropicSemanticEvent { max_wait, .. }
+            | Self::FirstGeminiSemanticEvent { max_wait, .. }
+            | Self::FirstSseSemanticEvent { max_wait, .. } => *max_wait = wait,
+            _ => {}
+        }
+        self
     }
 }
 
@@ -175,6 +202,8 @@ pub(super) struct StreamCommitGate {
     anthropic: AnthropicSsePrecommitInspector,
     /// Gemini SSE 增量检查器。
     gemini: GeminiSsePrecommitInspector,
+    /// 通用 SSE 增量检查器，完整记录分类与首字节记账相互独立。
+    generic: GenericSsePrecommitInspector,
 }
 
 impl StreamCommitGate {
@@ -191,6 +220,7 @@ impl StreamCommitGate {
             observed_bytes: 0,
             anthropic: AnthropicSsePrecommitInspector::default(),
             gemini: GeminiSsePrecommitInspector::default(),
+            generic: GenericSsePrecommitInspector::default(),
         }
     }
 
@@ -216,6 +246,9 @@ impl StreamCommitGate {
             }
             StreamCommitPolicy::FirstGeminiSemanticEvent { max_bytes, .. } => {
                 (max_bytes, self.gemini.observe(chunk, max_bytes))
+            }
+            StreamCommitPolicy::FirstSseSemanticEvent { max_bytes, .. } => {
+                (max_bytes, self.generic.observe(chunk, max_bytes))
             }
             StreamCommitPolicy::ResponseHeaders | StreamCommitPolicy::FirstClassifiedBody => {
                 return StreamPrecommitObservation::Pending;
@@ -271,6 +304,152 @@ enum SemanticSseObservation {
         /// 供统一错误处理路径消费的结构化正文。
         body_json: Value,
     },
+}
+
+#[derive(Debug, Default)]
+struct GenericSsePrecommitInspector {
+    buffered: Vec<u8>,
+}
+
+impl GenericSsePrecommitInspector {
+    fn observe(&mut self, chunk: &[u8], max_bytes: usize) -> SemanticSseObservation {
+        let remaining = max_bytes.saturating_sub(self.buffered.len());
+        self.buffered
+            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        while let Some((record_end, separator_len)) = find_sse_record_boundary(&self.buffered) {
+            let record = self.buffered[..record_end].to_vec();
+            self.buffered.drain(..record_end + separator_len);
+            match classify_generic_sse_record(&record) {
+                SemanticSseObservation::Pending => {}
+                observation => return observation,
+            }
+        }
+        if chunk.len() > remaining {
+            SemanticSseObservation::SemanticEvent
+        } else {
+            SemanticSseObservation::Pending
+        }
+    }
+}
+
+fn classify_generic_sse_record(record: &[u8]) -> SemanticSseObservation {
+    let Ok(record) = std::str::from_utf8(record) else {
+        return SemanticSseObservation::SemanticEvent;
+    };
+    let normalized = record.replace("\r\n", "\n").replace('\r', "\n");
+    let event_type = normalized
+        .lines()
+        .find_map(|line| line.strip_prefix("event:").map(str::trim));
+    let data = normalized
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.trim().is_empty() || matches!(event_type, Some("ping" | "heartbeat" | "keepalive")) {
+        return SemanticSseObservation::Pending;
+    }
+    if data.trim() == "[DONE]" {
+        return SemanticSseObservation::SemanticEvent;
+    }
+    let Ok(body_json) = serde_json::from_str::<Value>(data.trim()) else {
+        return SemanticSseObservation::SemanticEvent;
+    };
+    let payload_type = body_json.get("type").and_then(Value::as_str).or(event_type);
+    if payload_type.is_some_and(is_anthropic_semantic_event_type) {
+        return classify_anthropic_sse_record(record.as_bytes());
+    }
+    let error = body_json
+        .get("error")
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            body_json
+                .pointer("/response/error")
+                .filter(|value| !value.is_null())
+        });
+    if error.is_some()
+        || matches!(payload_type, Some("error" | "response.failed"))
+        || body_json.get("status").and_then(Value::as_str) == Some("failed")
+    {
+        let failure = error
+            .map(|error| serde_json::json!({ "error": error }))
+            .unwrap_or_else(|| body_json.clone());
+        return SemanticSseObservation::Error {
+            status_code: crate::execution_runtime::submission::resolve_local_sync_error_status_code(
+                200, &failure,
+            ),
+            body_json: failure,
+        };
+    }
+    if matches!(
+        payload_type,
+        Some("ping" | "response.created" | "response.in_progress" | "response.queued")
+    ) {
+        return SemanticSseObservation::Pending;
+    }
+    if payload_type == Some("response.output_item.added")
+        && matches!(
+            body_json.pointer("/item/type").and_then(Value::as_str),
+            Some("message" | "reasoning")
+        )
+        && body_json
+            .pointer("/item/content")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        && body_json
+            .pointer("/item/summary")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
+        return SemanticSseObservation::Pending;
+    }
+    if matches!(
+        payload_type,
+        Some("response.content_part.added" | "response.reasoning_summary_part.added")
+    ) && matches!(
+        body_json.pointer("/part/type").and_then(Value::as_str),
+        Some("output_text" | "summary_text" | "refusal")
+    ) && !body_json
+        .pointer("/part/text")
+        .is_some_and(value_has_semantic_content)
+        && !body_json
+            .pointer("/part/refusal")
+            .is_some_and(value_has_semantic_content)
+    {
+        return SemanticSseObservation::Pending;
+    }
+    if let Some(choices) = body_json.get("choices").and_then(Value::as_array) {
+        let semantic = choices.iter().any(|choice| {
+            choice
+                .get("finish_reason")
+                .is_some_and(|value| !value.is_null())
+                || choice.get("text").is_some_and(value_has_semantic_content)
+                || choice
+                    .get("delta")
+                    .or_else(|| choice.get("message"))
+                    .and_then(Value::as_object)
+                    .is_some_and(|delta| {
+                        delta.iter().any(|(name, value)| {
+                            name != "role" && value_has_semantic_content(value)
+                        })
+                    })
+        });
+        return if semantic {
+            SemanticSseObservation::SemanticEvent
+        } else {
+            SemanticSseObservation::Pending
+        };
+    }
+    SemanticSseObservation::SemanticEvent
+}
+
+fn value_has_semantic_content(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+        _ => true,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -420,7 +599,30 @@ fn classify_anthropic_sse_record(record: &[u8]) -> SemanticSseObservation {
         (None, Some(payload_type)) => Some(payload_type),
         _ => None,
     };
-    if semantic_type.is_some_and(is_anthropic_semantic_event_type) {
+    let setup_only = match semantic_type {
+        Some("message_start") => body_json
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        Some("content_block_start") => {
+            let block_type = body_json
+                .pointer("/content_block/type")
+                .and_then(Value::as_str);
+            matches!(block_type, Some("text" | "thinking"))
+                && !body_json
+                    .pointer("/content_block/text")
+                    .is_some_and(value_has_semantic_content)
+                && !body_json
+                    .pointer("/content_block/thinking")
+                    .is_some_and(value_has_semantic_content)
+        }
+        Some("content_block_stop") => true,
+        Some("message_delta") => body_json
+            .pointer("/delta/stop_reason")
+            .is_none_or(Value::is_null),
+        _ => false,
+    };
+    if !setup_only && semantic_type.is_some_and(is_anthropic_semantic_event_type) {
         SemanticSseObservation::SemanticEvent
     } else {
         SemanticSseObservation::Pending
@@ -576,6 +778,128 @@ pub(super) fn anthropic_error_status_code(body_json: &Value) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    /// 通用语义门延续本地完整记录合同：控制记录不提交，多行错误在不同换行与任意分片后才分类。
+    #[test]
+    fn generic_sse_preserves_multiline_record_boundaries_and_control_only_records() {
+        for newline in ["\n", "\r\n", "\r"] {
+            let controls = ": ping\nid: request-1\nretry: 1000\n\n".replace('\n', newline);
+            let failure = "data: {\ndata: \"error\": {\"type\":\"rate_limit_error\",\"message\":\"slow down\"}\ndata: }\n\n".replace('\n', newline);
+            for split in 1..failure.len() {
+                let mut gate = super::StreamCommitGate::new(
+                    super::StreamCommitPolicy::FirstSseSemanticEvent {
+                        max_bytes: 4096,
+                        max_wait: std::time::Duration::from_secs(1),
+                    },
+                );
+                assert_eq!(
+                    gate.observe_provider_bytes(controls.as_bytes()),
+                    super::StreamPrecommitObservation::Pending
+                );
+                let first = gate.observe_provider_bytes(&failure.as_bytes()[..split]);
+                // CRLF 的最终 LF 只补齐已由 CR 识别的空行，不是新事件内容。
+                if matches!(
+                    first,
+                    super::StreamPrecommitObservation::UpstreamError { .. }
+                ) {
+                    assert_eq!(newline, "\r\n");
+                    assert_eq!(split, failure.len() - 1);
+                } else {
+                    assert_eq!(first, super::StreamPrecommitObservation::Pending);
+                    assert!(matches!(
+                        gate.observe_provider_bytes(&failure.as_bytes()[split..]),
+                        super::StreamPrecommitObservation::UpstreamError {
+                            status_code: 429,
+                            ..
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_streams_only_prefetch_when_explicitly_requested() {
+        for force_prefetch in [false, true] {
+            let policy = super::StreamCommitPolicy::for_response(
+                true,
+                Some("text/event-stream"),
+                "openai:image",
+                "openai:image",
+                false,
+                false,
+                force_prefetch,
+            );
+            assert_eq!(policy.commits_on_response_headers(), !force_prefetch);
+            assert!(!policy.requires_bounded_frame_wait());
+        }
+    }
+
+    #[test]
+    fn generic_sse_waits_through_setup_and_classifies_fragmented_errors() {
+        let setup = b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+        let failure = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"capacity exhausted\"}}}\n\n";
+        for split in 1..failure.len() {
+            let policy = super::StreamCommitPolicy::FirstSseSemanticEvent {
+                max_bytes: 4096,
+                max_wait: std::time::Duration::from_secs(1),
+            };
+            let mut gate = super::StreamCommitGate::new(policy);
+            assert_eq!(
+                gate.observe_provider_bytes(setup),
+                super::StreamPrecommitObservation::Pending
+            );
+            for control in [
+                b"event: ping\ndata: keepalive\n\n".as_slice(),
+                b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"summary\":[]}}\n\n".as_slice(),
+                b"data: {\"type\":\"response.reasoning_summary_part.added\",\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n".as_slice(),
+            ] {
+                assert_eq!(gate.observe_provider_bytes(control), super::StreamPrecommitObservation::Pending);
+            }
+            assert_eq!(
+                gate.observe_provider_bytes(&failure[..split]),
+                super::StreamPrecommitObservation::Pending
+            );
+            assert!(matches!(
+                gate.observe_provider_bytes(&failure[split..]),
+                super::StreamPrecommitObservation::UpstreamError { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn generic_sse_commits_on_content_or_tool_call_but_not_role() {
+        for output in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-1\"}]}}]}\n\n",
+        ] {
+            let mut gate =
+                super::StreamCommitGate::new(super::StreamCommitPolicy::FirstSseSemanticEvent {
+                    max_bytes: 4096,
+                    max_wait: std::time::Duration::from_secs(1),
+                });
+            assert_eq!(gate.observe_provider_bytes(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n"), super::StreamPrecommitObservation::Pending);
+            assert_eq!(
+                gate.observe_provider_bytes(output.as_bytes()),
+                super::StreamPrecommitObservation::Commit
+            );
+            assert_eq!(
+                gate.observe_provider_bytes(b"data: {\"error\":{\"message\":\"late error\"}}\n\n"),
+                super::StreamPrecommitObservation::Commit
+            );
+        }
+    }
+
+    #[test]
+    fn native_anthropic_setup_does_not_hide_an_early_error() {
+        let mut gate =
+            super::StreamCommitGate::new(super::StreamCommitPolicy::FirstAnthropicSemanticEvent {
+                max_bytes: 4096,
+                max_wait: std::time::Duration::from_secs(1),
+            });
+        assert_eq!(gate.observe_provider_bytes(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[]}}\n\n"), super::StreamPrecommitObservation::Pending);
+        assert_eq!(gate.observe_provider_bytes(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"), super::StreamPrecommitObservation::Pending);
+        assert!(matches!(gate.observe_provider_bytes(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n"), super::StreamPrecommitObservation::UpstreamError { status_code: 529, .. }));
+    }
     use std::time::Duration;
 
     use super::{
@@ -625,7 +949,7 @@ mod tests {
             false,
             false,
         )
-        .commits_on_response_headers());
+        .requires_bounded_frame_wait());
         assert!(StreamCommitPolicy::for_response(
             true,
             Some("text/event-stream"),
@@ -635,10 +959,10 @@ mod tests {
             true,
             false,
         )
-        .commits_on_response_headers());
+        .requires_bounded_frame_wait());
     }
 
-    /// 验证同格式 Chat/Responses SSE 均等待首段分类；其他格式沿用原有策略。
+    /// 验证同格式 Chat/Responses SSE 均等待完整语义记录，不凭响应头或开场记录提交。
     #[test]
     fn policy_prefetches_same_format_openai_chat_and_responses_sse() {
         let responses = StreamCommitPolicy::for_response(
@@ -650,10 +974,13 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(responses, StreamCommitPolicy::FirstClassifiedBody);
+        assert!(matches!(
+            responses,
+            StreamCommitPolicy::FirstSseSemanticEvent { .. }
+        ));
         assert!(!responses.commits_on_response_headers());
 
-        assert_eq!(
+        assert!(matches!(
             StreamCommitPolicy::for_response(
                 true,
                 Some("text/event-stream"),
@@ -663,8 +990,8 @@ mod tests {
                 false,
                 false,
             ),
-            StreamCommitPolicy::FirstClassifiedBody
-        );
+            StreamCommitPolicy::FirstSseSemanticEvent { .. }
+        ));
     }
 
     /// 验证 Gemini SSE 即使存在本地改写器也先经过有界语义门。
@@ -851,8 +1178,8 @@ mod tests {
         let mut gate = StreamCommitGate::new(native_anthropic_policy());
         let observation = gate.observe_provider_bytes(
             concat!(
-                "event: message_start\n",
-                "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
                 "event: error\n",
                 "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n",
             )

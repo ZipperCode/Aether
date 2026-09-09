@@ -784,6 +784,7 @@ fn standard_text_sync_heartbeat_client_api_format_for_plan_kind(plan_kind: &str)
     }
 }
 
+/// 在单个心跳执行任务内应用断连策略，并由既有 owner 结算延迟上游失败。
 fn build_standard_text_sync_heartbeat_shell_response<F, Fut>(
     state: AppState,
     parts: http::request::Parts,
@@ -820,6 +821,7 @@ where
     let started_at = Instant::now();
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(1);
     let request_diagnostics = current_request_diagnostics();
+    let cancel_on_disconnect = crate::request_lifecycle::cancel_on_client_disconnect();
 
     let headers = BTreeMap::from([(
         CONTENT_TYPE.as_str().to_string(),
@@ -852,7 +854,11 @@ where
 
     tokio::spawn(async move {
         scope_request_diagnostics_with(request_diagnostics, async move {
-            let mut result = execute(state, parts, trace_id, decision, plan_kind, started_at).await;
+            let mut result = tokio::select! {
+                biased;
+                _ = tx.closed(), if cancel_on_disconnect => return,
+                result = execute(state, parts, trace_id, decision, plan_kind, started_at) => result,
+            };
             if let Ok(LocalExecutionRequestOutcome::Responded(response)) = &mut result {
                 if let Some(exhaustion) = take_deferred_upstream_exhaustion(response) {
                     record_failed_usage_for_deferred_upstream_response(
@@ -1117,6 +1123,7 @@ fn build_openai_image_sync_heartbeat_shell_response(
     )
 }
 
+/// 保留图片单次执行和延迟失败结算，启用断连取消时终止同一个执行 future。
 fn build_openai_image_sync_heartbeat_shell_response_with_executor<F, Fut>(
     state: AppState,
     request_path: String,
@@ -1153,6 +1160,7 @@ where
     let started_at = Instant::now();
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(1);
     let request_diagnostics = current_request_diagnostics();
+    let cancel_on_disconnect = crate::request_lifecycle::cancel_on_client_disconnect();
 
     let headers = BTreeMap::from([(
         CONTENT_TYPE.as_str().to_string(),
@@ -1185,7 +1193,7 @@ where
 
     tokio::spawn(async move {
         scope_request_diagnostics_with(request_diagnostics, async move {
-            let mut result = execute(
+            let execution = execute(
                 state,
                 request_path,
                 trace_id,
@@ -1194,8 +1202,12 @@ where
                 attempts,
                 transfer_tracker,
                 started_at,
-            )
-            .await;
+            );
+            let mut result = tokio::select! {
+                biased;
+                _ = tx.closed(), if cancel_on_disconnect => return,
+                result = execution => result,
+            };
             if let Ok(LocalExecutionRequestOutcome::Responded(response)) = &mut result {
                 if let Some(exhaustion) = take_deferred_upstream_exhaustion(response) {
                     record_failed_usage_for_deferred_upstream_response(
@@ -2582,6 +2594,45 @@ mod tests {
         })
         .await
         .expect("background completion should release admission");
+    }
+
+    #[tokio::test]
+    async fn standard_text_sync_heartbeat_cancels_when_routing_policy_enables_it() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (mut release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let response = crate::request_lifecycle::run_request(async move {
+            crate::request_lifecycle::configure_client_disconnect(
+                aether_routing_core::RoutingExecutionPolicy {
+                    cancel_on_client_disconnect: true,
+                    ..Default::default()
+                },
+            );
+            let (parts, _) = http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .body(())
+                .unwrap()
+                .into_parts();
+            build_standard_text_sync_heartbeat_shell_response(
+                AppState::new().unwrap(),
+                parts,
+                "trace-heartbeat-disconnect".to_string(),
+                test_standard_text_heartbeat_decision(),
+                TEST_STANDARD_TEXT_SYNC_PLAN_KIND.to_string(),
+                move |_, _, _, _, _, _| async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(LocalExecutionRequestOutcome::NoPath)
+                },
+            )
+        })
+        .await
+        .unwrap();
+        started_rx.await.unwrap();
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), release_tx.closed())
+            .await
+            .expect("heartbeat must drop upstream execution immediately");
     }
 
     #[tokio::test]

@@ -249,3 +249,160 @@ impl fmt::Display for FormatError {
 }
 
 impl Error for FormatError {}
+
+impl FormatError {
+    /// 将转换错误投影成可导出的结构化诊断，保留格式和已知原因，不伪造字段路径。
+    pub fn diagnostic(&self) -> Value {
+        let (code, operation, field, reason) = match self {
+            Self::UnsupportedFormat(_) => ("unsupported_format", "select_format", None, None),
+            Self::RequestParseFailed { .. } => {
+                ("request_parse_failed", "parse_request", None, None)
+            }
+            Self::RequestEmitFailed { .. } => ("request_emit_failed", "emit_request", None, None),
+            Self::ResponseParseFailed { .. } => {
+                ("response_parse_failed", "parse_response", None, None)
+            }
+            Self::ResponseBlocked { reason, .. } => {
+                ("response_blocked", "parse_response", None, Some(reason))
+            }
+            Self::EmptyResponse { .. } => ("empty_response", "parse_response", None, None),
+            Self::ResponseEmitFailed { .. } => {
+                ("response_emit_failed", "emit_response", None, None)
+            }
+            Self::UnsupportedField { field, reason, .. } => {
+                ("unsupported_field", "validate", Some(field), Some(reason))
+            }
+            Self::UnauditedField { field, reason, .. } => {
+                ("unaudited_field", "validate", Some(field), Some(reason))
+            }
+            Self::InvalidEnumValue { field, .. } => {
+                ("invalid_enum_value", "validate", Some(field), None)
+            }
+            Self::LossyConversionBlocked { field, reason, .. } => (
+                "lossy_conversion_blocked",
+                "convert",
+                Some(field),
+                Some(reason),
+            ),
+            Self::InvalidTargetField { field, reason, .. } => (
+                "invalid_target_field",
+                "validate_target",
+                Some(field),
+                Some(reason),
+            ),
+        };
+        let path = field.map(|field| {
+            let path = if field.starts_with('$') {
+                field.clone()
+            } else {
+                format!("$.{field}")
+            };
+            path.replace("[]", "[*]")
+        });
+        let mut diagnostic = json!({
+            "code": code,
+            "operation": operation,
+            "path": path.as_deref().unwrap_or("$"),
+            "path_source": if path.is_some() { "structured" } else { "unavailable" },
+            "reason": reason,
+            "expected": reason,
+            "actual": null,
+            "missing_context": if path.is_some() { vec![] } else { vec!["field_path", "underlying_cause"] }
+        });
+        if let Self::InvalidEnumValue { value, .. } = self {
+            diagnostic["actual"] = json!(value);
+        }
+        match self {
+            Self::UnsupportedFormat(format)
+            | Self::RequestParseFailed { format }
+            | Self::RequestEmitFailed { format }
+            | Self::ResponseParseFailed { format }
+            | Self::ResponseBlocked { format, .. }
+            | Self::EmptyResponse { format }
+            | Self::ResponseEmitFailed { format }
+            | Self::UnsupportedField { format, .. }
+            | Self::InvalidEnumValue { format, .. }
+            | Self::InvalidTargetField { format, .. } => diagnostic["format"] = json!(format),
+            _ => {}
+        }
+        if let Self::UnauditedField {
+            source_format,
+            target_format,
+            ..
+        }
+        | Self::LossyConversionBlocked {
+            source_format,
+            target_format,
+            ..
+        } = self
+        {
+            diagnostic["source_format"] = json!(source_format);
+            diagnostic["target_format"] = json!(target_format);
+        }
+        diagnostic
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::FormatError;
+    use serde_json::json;
+
+    /// 本地 Gemini 拦截和空候选错误必须保留在上游新增的导出诊断合同中。
+    #[test]
+    fn gemini_terminal_diagnostics_keep_local_error_categories() {
+        for (error, code, reason) in [
+            (
+                FormatError::ResponseBlocked {
+                    format: "gemini:generate_content".to_string(),
+                    reason: "SAFETY".to_string(),
+                },
+                "response_blocked",
+                json!("SAFETY"),
+            ),
+            (
+                FormatError::EmptyResponse {
+                    format: "gemini:generate_content".to_string(),
+                },
+                "empty_response",
+                json!(null),
+            ),
+        ] {
+            let diagnostic = error.diagnostic();
+            assert_eq!(diagnostic["code"], code);
+            assert_eq!(diagnostic["format"], "gemini:generate_content");
+            assert_eq!(diagnostic["reason"], reason);
+            assert_eq!(diagnostic["operation"], "parse_response");
+            assert_eq!(diagnostic["path_source"], "unavailable");
+        }
+    }
+
+    #[test]
+    fn enum_diagnostic_retains_full_path_and_actual_value() {
+        let diagnostic = FormatError::InvalidEnumValue {
+            format: "openai:chat".to_string(),
+            field: "choices[].finish_reason".to_string(),
+            value: "future_reason".to_string(),
+        }
+        .diagnostic();
+        assert_eq!(diagnostic["code"], "invalid_enum_value");
+        assert_eq!(diagnostic["path"], "$.choices[*].finish_reason");
+        assert_eq!(diagnostic["actual"], "future_reason");
+        assert_eq!(diagnostic["format"], "openai:chat");
+    }
+
+    #[test]
+    fn generic_parse_failure_reports_missing_cause_without_a_fake_path() {
+        let diagnostic = FormatError::ResponseParseFailed {
+            format: "claude:messages".to_string(),
+        }
+        .diagnostic();
+        assert_eq!(diagnostic["code"], "response_parse_failed");
+        assert_eq!(diagnostic["operation"], "parse_response");
+        assert_eq!(diagnostic["path_source"], "unavailable");
+        assert_eq!(
+            diagnostic["missing_context"],
+            json!(["field_path", "underlying_cause"])
+        );
+    }
+}

@@ -18,6 +18,7 @@ fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_stream_
     );
 }
 
+/// Gemini CLI 公共流接口默认输出 JSON 数组，上游 SSE 仅为内部传输格式。
 async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision_impl(
 ) {
     #[derive(Debug, Clone)]
@@ -327,7 +328,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_s
                     });
                 let frames = concat!(
                     "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
-                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"candidates\\\":[]}\\n\\n\"}}\n",
+                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"candidates\\\":[{\\\"content\\\":{\\\"parts\\\":[{\\\"text\\\":\\\"ok\\\"}]},\\\"finishReason\\\":\\\"STOP\\\"}]}\\n\\n\"}}\n",
                     "{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":34,\"upstream_bytes\":26}}}\n",
                     "{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n"
                 );
@@ -397,7 +398,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_s
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.text().await.expect("body should read"),
-        "[{\"candidates\":[]}]"
+        "[{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}]"
     );
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -469,6 +470,7 @@ fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_refres
     );
 }
 
+/// OAuth 刷新后的非空流正文仍按公共 Gemini JSON 数组合同交付。
 async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeStreamRequest {
@@ -848,7 +850,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
                     });
                 let frames = concat!(
                     "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
-                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"response\\\":{\\\"candidates\\\":[]},\\\"remainingCredits\\\":42,\\\"consumedCredits\\\":1,\\\"traceId\\\":\\\"trace-upstream-1\\\"}\\n\\n\"}}\n",
+                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"response\\\":{\\\"candidates\\\":[{\\\"content\\\":{\\\"parts\\\":[{\\\"text\\\":\\\"ok\\\"}]},\\\"finishReason\\\":\\\"STOP\\\"}]},\\\"remainingCredits\\\":42,\\\"consumedCredits\\\":1,\\\"traceId\\\":\\\"trace-upstream-1\\\"}\\n\\n\"}}\n",
                     "{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":34,\"upstream_bytes\":26}}}\n",
                     "{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n"
                 );
@@ -936,7 +938,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.text().await.expect("body should read"),
-        "[{\"candidates\":[]}]"
+        "[{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}]"
     );
 
     let seen_refresh_request = seen_refresh
@@ -1044,6 +1046,7 @@ fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_with_loc
     );
 }
 
+/// Vertex 后端的内部 SSE 经过默认公共 Gemini 流接口时保留 JSON 数组封装。
 async fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision_impl(
 ) {
     #[derive(Debug, Clone)]
@@ -1357,7 +1360,7 @@ async fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_wi
                     });
                 let frames = concat!(
                     "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
-                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"candidates\\\":[]}\\n\\n\"}}\n",
+                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"candidates\\\":[{\\\"content\\\":{\\\"parts\\\":[{\\\"text\\\":\\\"ok\\\"}]},\\\"finishReason\\\":\\\"STOP\\\"}]}\\n\\n\"}}\n",
                     "{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":34,\"upstream_bytes\":26}}}\n",
                     "{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n"
                 );
@@ -1425,7 +1428,7 @@ async fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_wi
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.text().await.expect("body should read"),
-        "[{\"candidates\":[]}]"
+        "[{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}]"
     );
 
     let seen_execution_runtime_request = seen_execution_runtime

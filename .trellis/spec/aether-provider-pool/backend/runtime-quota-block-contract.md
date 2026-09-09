@@ -106,6 +106,10 @@ quota_exhaustion_patterns?: FailoverRuleItem[]
 - HTTP 200 quota error envelopes are still failures: skip health/adaptive/Pool
   success effects and success-only response finalizers even when an existing
   stop rule prevents replaying the request on another candidate.
+- A strategy-level HTTP 200 success-transfer rule matching that same explicit
+  quota failure must retain `RetryQuotaExhausted` and credential-scoped retry.
+  Do not downgrade it to same-Key retry or success accounting merely because
+  the broader routing rule also matched.
 - Recovery is idempotent and returns `{ key_id, cleared, message }`. It clears
   only scheduling quota state, rebuilds the Pool score, and preserves manual
   disablement, OAuth, cooldown, health, and unrelated hard states.
@@ -142,7 +146,8 @@ quota_exhaustion_patterns?: FailoverRuleItem[]
 
 - Classifier assertions: New API, One API, and Sub2API exact codes; HTTP 402;
   weak two-hit confirmation; intervening non-quota response; reset headers and
-  body fields; transient rate-limit codes; configured HTTP 200 error envelopes.
+  body fields; transient rate-limit codes; configured HTTP 200 error envelopes
+  overlapping strategy-level success-transfer patterns.
 - Repository assertions: CAS success/conflict on memory and PostgreSQL, including
   credential replacement and concurrent suspicion increments.
 - Scheduling assertions: ordinary, Pool, sticky, cached, active-probe, restart,

@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/aether-gateway/backend/quality-guidelines.md", "reason": "Preserve local fixes while adopting approved upstream semantics"}
+{"file": ".trellis/spec/aether-gateway-execution/backend/stream-attempt-lifecycle-contract.md", "reason": "Preserve local fixes while adopting approved upstream semantics"}
+{"file": ".trellis/spec/aether-provider-transport/backend/antigravity-tool-schema-contract.md", "reason": "Preserve local fixes while adopting approved upstream semantics"}
+{"file": ".trellis/spec/aether-routing-core/backend/routing-ordering-sticky-retry-contract.md", "reason": "Preserve local fixes while adopting approved upstream semantics"}
+{"file": ".trellis/spec/aether-gateway/backend/auth-maintenance-memory-contract.md", "reason": "Preserve local fixes while adopting approved upstream semantics"}
+{"file": ".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md", "reason": "Preserve local fixes while adopting approved upstream semantics"}

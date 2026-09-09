@@ -70,6 +70,12 @@ Native same-format SSE preserves event names, event order, JSON fields, and unkn
 
 For native `openai:responses` SSE, classify the first complete body/event before committing downstream HTTP 2xx. If that first body is an embedded error and no output is client-visible, preserve the real error status or use the existing candidate-failover path. Do not expose a bare `{ "error": ... }` object as a successful Response: successful Responses require an `id`, while a post-commit `response.failed` event requires a complete Response object.
 
+Standard text SSE buffers protocol opening events until the first semantic
+content or normal terminal. Created/role-only frames do not end failover;
+complete structured errors are classified before success regex matching. On
+handoff preserve buffered original bytes/order, and never switch providers
+after visible text, reasoning, tools or a delivered normal terminal.
+
 For cross-format Gemini streams, the first non-empty `thought` is visible
 reasoning output and commits the candidate. Signature-only control parts remain
 non-visible. If a tool-call terminal error arrives after visible reasoning or a
@@ -165,7 +171,8 @@ For native Responses streaming failures, the correct boundary is:
 ```text
 inspect the first complete event before downstream 2xx
 -> embedded error with no visible output: preserve non-2xx or retry
--> valid Responses event: commit and preserve the original stream bytes
+-> opening-only Responses event: continue bounded prefetch
+-> semantic content or normal terminal: commit original bytes in order
 ```
 
 For native request bytes, the correct boundary is:
