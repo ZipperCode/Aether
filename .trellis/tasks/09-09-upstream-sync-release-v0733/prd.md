@@ -22,10 +22,14 @@
 
 ## Acceptance Criteria
 
-- [ ] 双方历史均保留，冲突/标记清零，本地新增修复有明确保留证据。
-- [ ] 相关最小本地检查通过，统一push后的完整GitHub Rust CI对精确最终SHA成功。
-- [ ] 新annotated v0.7.33只指向已认证SHA，Release工作流及产物核验通过。
-- [ ] 隔离worktree/临时分支安全合回并清理，任务证据归档，本地/远端同步。
+- [x] 双方历史均保留，冲突/标记清零，本地新增修复有明确保留证据。
+- [x] 相关最小本地检查通过，统一push后的完整GitHub Rust CI对精确最终SHA成功。
+- [x] 新annotated v0.7.33只指向已认证SHA，Release工作流及产物核验通过。
+- [x] 隔离worktree/临时分支安全合回并清理，完成任务证据，按finish-work归档并同步远端。
+
+## 完成证据
+
+合并c2c30e60d保留两方历史；Rust CI34313596660首轮18/18成功；v0.7.33→c2c30e60d，Release34315225804首轮8/8成功。6资产/小文件hash/tar摘要/来源签名/GHCR双架构验证全部通过。详见research/ci-release.md；产品未部署，正常缓存保留。
 
 ## Out of Scope
 

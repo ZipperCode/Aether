@@ -14,13 +14,13 @@
   "completedAt": null,
   "branch": "codex/upstream-release-20260909",
   "base_branch": "master",
-  "worktree_path": "C:/Users/Zipper/AppData/Local/Temp/aether-upstream-release-20260909",
-  "commit": null,
+  "worktree_path": null,
+  "commit": "c2c30e60d3543fbde19ebc6e1d9f083033649ee0",
   "pr_url": null,
   "subtasks": [],
   "children": [],
   "parent": null,
   "relatedFiles": [],
-  "notes": "",
+  "notes": "合并c2c30e60d已push，CI34313596660首轮18/18成功；annotated v0.7.33指向同SHA，Release34315225804首轮8/8成功，6资产与双架构镜像/来源签名核验通过。worktree和临时分支已清理；未部署。",
   "meta": {}
 }
