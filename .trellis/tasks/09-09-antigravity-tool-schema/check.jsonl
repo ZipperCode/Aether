@@ -1,0 +1,5 @@
+{"file":".trellis/spec/aether-provider-transport/backend/index.md","reason":"Full task package contract review"}
+{"file":".trellis/spec/aether-provider-transport/backend/quality-guidelines.md","reason":"Relevant quality checks"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Public Gemini versus private Antigravity boundary preservation"}
+{"file":".trellis/tasks/09-09-antigravity-tool-schema/research/evidence.md","reason":"Verify no lossy 9Router behavior or unjustified private-wire assumptions"}
+{"file":".trellis/spec/aether-provider-transport/backend/antigravity-tool-schema-contract.md","reason":"Final review of the narrow executable Schema contract"}

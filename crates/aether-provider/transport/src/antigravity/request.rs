@@ -139,7 +139,7 @@ fn normalize_antigravity_builtin_tool_names(request: &mut Map<String, Value>) {
     }
 }
 
-/// 将私有 envelope 内两种 JSON Schema 别名统一为最终 wire 字段 `parameters`。
+/// 将私有 envelope 内两种 JSON Schema 别名统一为 `parameters`，并清理其 Schema 元声明；已有参数优先。
 fn normalize_antigravity_function_declaration_parameters(request: &mut Map<String, Value>) {
     let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) else {
         return;
@@ -167,7 +167,55 @@ fn normalize_antigravity_function_declaration_parameters(request: &mut Map<Strin
                         .entry("parameters".to_string())
                         .or_insert(parameters);
                 }
+                if let Some(parameters) = declaration_object.get_mut("parameters") {
+                    remove_antigravity_schema_dialect(parameters);
+                }
             }
+        }
+    }
+}
+
+/// 只移除 Schema 节点的 `$schema`；按关键字区分子 Schema、命名映射与字面数据，保留引用和所有约束。
+fn remove_antigravity_schema_dialect(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    object.remove("$schema");
+    for (key, value) in object {
+        match key.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+            | "dependencies" => {
+                if let Some(schemas) = value.as_object_mut() {
+                    for child in schemas.values_mut() {
+                        remove_antigravity_schema_dialect(child);
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                if let Some(schemas) = value.as_array_mut() {
+                    for child in schemas {
+                        remove_antigravity_schema_dialect(child);
+                    }
+                }
+            }
+            "items" if value.is_array() => {
+                for child in value.as_array_mut().unwrap() {
+                    remove_antigravity_schema_dialect(child);
+                }
+            }
+            "items"
+            | "additionalItems"
+            | "additionalProperties"
+            | "unevaluatedItems"
+            | "unevaluatedProperties"
+            | "contains"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema" => remove_antigravity_schema_dialect(value),
+            _ => {}
         }
     }
 }
@@ -205,6 +253,10 @@ mod tests {
         AntigravityEnvelopeRequestType, AntigravityRequestAuth, AntigravityRequestEnvelopeSupport,
     };
     use crate::antigravity::ANTIGRAVITY_REQUEST_USER_AGENT;
+    use crate::same_format_provider::{
+        build_same_format_provider_request_body, SameFormatProviderFamily,
+        SameFormatProviderRequestBodyInput,
+    };
 
     fn sample_auth() -> AntigravityRequestAuth {
         AntigravityRequestAuth {
@@ -474,7 +526,175 @@ mod tests {
         );
     }
 
-    /// 验证 camelCase 与 snake_case Schema 别名均规范为最终 `parameters` 字段。
+    /// 用十二个合成工具复现线上元声明错误，覆盖公开 Gemini、两种声明拼写及已有 envelope。
+    #[test]
+    fn antigravity_envelope_removes_schema_metadata_from_twelve_tools() {
+        for declarations_key in ["functionDeclarations", "function_declarations"] {
+            let mut declarations = Vec::new();
+            let mut expected_declarations = Vec::new();
+            for index in 0..12 {
+                let parameters = json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string", "minLength": 1}},
+                    "required": ["query"]
+                });
+                let mut declaration = json!({"name": format!("lookup_{index}")});
+                declaration["parameters"] = parameters.clone();
+                expected_declarations.push(declaration.clone());
+                declaration.as_object_mut().unwrap().remove("parameters");
+                let field = [
+                    "parameters",
+                    "parametersJsonSchema",
+                    "parameters_json_schema",
+                ][index % 3];
+                declaration[field] = parameters;
+                declaration[field]["$schema"] =
+                    json!("https://json-schema.org/draft/2020-12/schema");
+                declarations.push(declaration);
+            }
+            let request_body = json!({
+                "contents": [{"role": "user", "parts": [{"text": "synthetic schema regression"}]}],
+                "tools": [{(declarations_key): declarations}]
+            });
+            let original = request_body.clone();
+            let gemini_body =
+                build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
+                    body_json: &request_body,
+                    mapped_model: "gemini-upstream",
+                    client_api_format: "gemini:generate_content",
+                    provider_api_format: "gemini:generate_content",
+                    source_model: None,
+                    family: SameFormatProviderFamily::Gemini,
+                    body_rules: None,
+                    request_headers: None,
+                    upstream_is_stream: true,
+                    force_body_stream_field: false,
+                    kiro_auth_config: None,
+                    is_claude_code: false,
+                    enable_model_directives: false,
+                })
+                .expect("ordinary Gemini body should build");
+            assert_eq!(gemini_body, original);
+
+            for source in [gemini_body.clone(), json!({"request": gemini_body})] {
+                let original_source = source.clone();
+                let AntigravityRequestEnvelopeSupport::Supported(envelope) =
+                    build_antigravity_safe_v1internal_request(
+                        &sample_auth(),
+                        "synthetic-schema-regression",
+                        "gemini-upstream",
+                        &source,
+                        AntigravityEnvelopeRequestType::Agent,
+                    )
+                else {
+                    panic!("schema envelope should be supported");
+                };
+                assert_eq!(
+                    envelope["request"]["tools"][0][declarations_key],
+                    json!(expected_declarations)
+                );
+                assert_eq!(envelope["request"]["contents"], original["contents"]);
+                assert!(envelope["request"].get("request").is_none());
+                assert_eq!(source, original_source);
+            }
+            assert_eq!(request_body, original);
+        }
+    }
+
+    /// 验证嵌套 Schema 的元声明被移除，但业务同名属性、字面数据、引用、联合分支与扩展完整保留。
+    #[test]
+    fn antigravity_schema_cleanup_preserves_schema_structure_and_literal_data() {
+        let expected = json!({
+            "type": "object",
+            "properties": {
+                "$schema": {
+                    "type": "string",
+                    "default": {"$schema": "default data"},
+                    "examples": [{"$schema": "example data"}],
+                    "const": {"$schema": "constant data"},
+                    "enum": [{"$schema": "enum data"}]
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "anyOf": [
+                            {"$ref": "#/$defs/entry"},
+                            {"type": "object", "properties": {"value": {"type": "string"}}}
+                        ]
+                    }
+                }
+            },
+            "$defs": {"entry": {"type": "string"}, "$schema": {"type": "number"}},
+            "definitions": {"legacy": {"type": "boolean"}},
+            "patternProperties": {"^x": {"type": "number"}},
+            "dependentSchemas": {"rows": {"required": ["$schema"]}},
+            "dependencies": {"rows": ["$schema"], "$schema": {"required": ["rows"]}},
+            "allOf": [{"minProperties": 1}, true],
+            "oneOf": [{"required": ["rows"]}, {"required": ["$schema"]}],
+            "additionalProperties": {"type": "string"},
+            "unevaluatedProperties": false,
+            "propertyNames": {"minLength": 1},
+            "not": {"maxProperties": 0},
+            "if": {"required": ["rows"]},
+            "then": {"required": ["$schema"]},
+            "else": {"maxProperties": 1},
+            "contentSchema": {"type": "object"},
+            "x-extension": {"$schema": "opaque data", "properties": {"$schema": "data"}}
+        });
+        let mut parameters = expected.clone();
+        for path in [
+            "",
+            "/properties/$schema",
+            "/properties/rows",
+            "/properties/rows/items",
+            "/properties/rows/items/anyOf/0",
+            "/properties/rows/items/anyOf/1",
+            "/properties/rows/items/anyOf/1/properties/value",
+            "/$defs/entry",
+            "/$defs/$schema",
+            "/definitions/legacy",
+            "/patternProperties/^x",
+            "/dependentSchemas/rows",
+            "/dependencies/$schema",
+            "/allOf/0",
+            "/oneOf/0",
+            "/oneOf/1",
+            "/additionalProperties",
+            "/propertyNames",
+            "/not",
+            "/if",
+            "/then",
+            "/else",
+            "/contentSchema",
+        ] {
+            parameters.pointer_mut(path).unwrap()["$schema"] = json!("schema dialect");
+        }
+        super::remove_antigravity_schema_dialect(&mut parameters);
+        assert_eq!(parameters, expected);
+
+        for keyword in ["items", "prefixItems"] {
+            let mut tuple = json!({
+                "type": "array",
+                (keyword): [{"$schema": "dialect", "type": "string"}, false],
+                "additionalItems": {"$schema": "dialect", "type": "number"},
+                "unevaluatedItems": {"$schema": "dialect", "type": "boolean"},
+                "contains": {"$schema": "dialect", "const": {"$schema": "literal"}}
+            });
+            super::remove_antigravity_schema_dialect(&mut tuple);
+            assert_eq!(
+                tuple,
+                json!({
+                    "type": "array",
+                    (keyword): [{"type": "string"}, false],
+                    "additionalItems": {"type": "number"},
+                    "unevaluatedItems": {"type": "boolean"},
+                    "contains": {"const": {"$schema": "literal"}}
+                })
+            );
+        }
+    }
+
+    /// 验证 Schema 别名优先级不变：已有 `parameters` 优先，否则 camelCase 优先于 snake_case。
     #[test]
     fn antigravity_envelope_normalizes_json_schema_parameter_spellings() {
         let request_body = json!({
@@ -489,6 +709,17 @@ mod tests {
                 }, {
                     "name": "weather",
                     "parameters_json_schema": { "type": "object" }
+                }, {
+                    "name": "existing",
+                    "parameters": { "$schema": "dialect", "type": "object", "required": ["keep"] },
+                    "parametersJsonSchema": { "type": "string" },
+                    "parameters_json_schema": { "type": "number" }
+                }, {
+                    "name": "camel_precedence",
+                    "parametersJsonSchema": { "$schema": "dialect", "type": "boolean" },
+                    "parameters_json_schema": { "type": "number" }
+                }, {
+                    "name": "no_parameters"
                 }]
             }]
         });
@@ -511,5 +742,15 @@ mod tests {
         assert_eq!(declarations[1]["parameters"]["type"], "object");
         assert!(declarations[0].get("parametersJsonSchema").is_none());
         assert!(declarations[1].get("parameters_json_schema").is_none());
+        assert_eq!(
+            declarations[2]["parameters"],
+            json!({"type": "object", "required": ["keep"]})
+        );
+        assert_eq!(declarations[3]["parameters"], json!({"type": "boolean"}));
+        assert!(declarations[4].get("parameters").is_none());
+        for declaration in declarations.as_array().unwrap() {
+            assert!(declaration.get("parametersJsonSchema").is_none());
+            assert!(declaration.get("parameters_json_schema").is_none());
+        }
     }
 }

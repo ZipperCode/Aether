@@ -1,0 +1,4 @@
+{"file":".trellis/spec/aether-provider-transport/backend/index.md","reason":"Package ownership and existing contract pointers"}
+{"file":".trellis/spec/aether-provider-transport/backend/quality-guidelines.md","reason":"Relevant package quality requirements"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Avoid duplicating broader schema converters with different semantics"}
+{"file":".trellis/tasks/09-09-antigravity-tool-schema/research/evidence.md","reason":"Verified failure, real paths, and non-lossy compatibility boundaries"}
