@@ -638,3 +638,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 27: 合并上游并在 CI 成功后发布 v0.7.33
+
+**Date**: 2026-09-09
+**Task**: 合并上游并在 CI 成功后发布 v0.7.33
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+完整合并上游361952ada的8项更新，保留本地Chat首段错误、首字节记账和Antigravity Schema修复；13冲突收口，本地39Rust/48前端及类型检查通过。精确SHA CI34313596660首轮18/18成功，Gateway5502/Rest3575/Frontend1706/Data372通过；随后v0.7.33→c2c30e60d，Release34315225804首轮8/8成功，6资产及签名/校验和/GHCR双架构核验通过。worktree/临时分支/下载已清理，保留正常缓存，未部署。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c2c30e60d` | (see git log) |
+
+### Status
+
+[OK] **Completed**
