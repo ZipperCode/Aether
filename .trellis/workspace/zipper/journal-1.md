@@ -660,3 +660,37 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 28: 提交提供商初始健康度修复
+
+**Date**: 2026-09-11
+**Task**: 提交提供商初始健康度修复
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+提交范围限于提供商健康度摘要、定向回归和 API 文档；启用端点无观测使用初始满分，已有观测只汇总真实分数。保留无 Key 页面灰色及停用状态。
+
+### Main Changes
+
+- 独立只读复核完成；修正文档边界并补中文说明，运行逻辑未改。未提交其他 Antigravity 改动，未归档其活动任务。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2625079c1` | (see git log) |
+
+### Testing
+
+- [OK] 沿用上一轮同逻辑 Docker 定向测试：admin_provider_summary_health，5 passed / 0 failed / 5431 filtered；本轮 scoped rustfmt 和 diff --check 通过。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 本轮仅本地提交，未推送或部署。

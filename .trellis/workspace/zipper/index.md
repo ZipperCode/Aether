@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 27
-- **Last Active**: 2026-09-09
+- **Total Sessions**: 28
+- **Last Active**: 2026-09-11
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~662 | Active |
+| `journal-1.md` | ~696 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 28 | 2026-09-11 | 提交提供商初始健康度修复 | `2625079c1` | `master` |
 | 27 | 2026-09-09 | 合并上游并在 CI 成功后发布 v0.7.33 | `c2c30e60d` | `master` |
 | 26 | 2026-09-09 | 修复 Antigravity 工具 Schema 元声明兼容 | `cbf1346fe` | `master` |
 | 25 | 2026-09-09 | 修复 Chat 首段错误故障转移并发布 v0.7.32 | `c1e994159`, `7eaea44b0` | `master` |
