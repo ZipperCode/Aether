@@ -34,6 +34,7 @@ fn endpoint_timestamp_or_now(value: Option<u64>, now_unix_secs: u64) -> serde_js
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// 汇总提供商配置、配额和端点健康度；启用端点尚无观测时保留初始满分，已有观测只计算真实分数。
 pub(crate) fn build_admin_provider_summary_value(
     provider: &StoredProviderCatalogProvider,
     endpoints: &[StoredProviderCatalogEndpoint],
@@ -98,8 +99,16 @@ pub(crate) fn build_admin_provider_summary_value(
                 .filter_map(|key| provider_key_health_score(key, &endpoint.api_format))
                 .filter(|score| score.is_finite())
                 .collect::<Vec<_>>();
-            let health_score =
-                (!scores.is_empty()).then(|| scores.iter().sum::<f64>() / scores.len() as f64);
+            // 活跃端点尚无有效观测时保持新配置的满格健康度；已有观测时只汇总真实分数，避免未使用密钥抬高结果。
+            let health_score = if !scores.is_empty() {
+                Some(scores.iter().sum::<f64>() / scores.len() as f64)
+            } else if endpoint.is_active
+                && (endpoint_keys.is_empty() || endpoint_keys.iter().any(|key| key.is_active))
+            {
+                Some(1.0)
+            } else {
+                None
+            };
             if let Some(score) = health_score {
                 endpoint_health_scores.push(score);
             }

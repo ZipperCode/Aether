@@ -197,7 +197,8 @@ async fn admin_provider_summary_health_does_not_inflate_observed_scores_with_mis
 }
 
 #[tokio::test]
-async fn admin_provider_summary_health_is_unknown_without_active_observations() {
+/// 验证启用端点未观测时返回初始满分，只有停用密钥或完全无端点时仍返回未知。
+async fn admin_provider_summary_health_defaults_active_endpoints_without_observations() {
     let endpoint = sample_endpoint(
         "endpoint-chat",
         "provider-openai",
@@ -215,17 +216,21 @@ async fn admin_provider_summary_health_is_unknown_without_active_observations() 
             "openai:chat",
             "test",
         )],
-        vec![disabled_key],
     ] {
         let payload = provider_health_summary(std::slice::from_ref(&endpoint), &keys).await;
 
-        assert_eq!(
-            payload["endpoint_health_details"][0]["health_score"],
-            json!(null)
-        );
-        assert_eq!(payload["avg_health_score"], json!(null));
+        assert_eq!(payload["endpoint_health_details"][0]["health_score"], 1.0);
+        assert_eq!(payload["avg_health_score"], 1.0);
         assert_eq!(payload["unhealthy_endpoints"], 0);
     }
+
+    let payload = provider_health_summary(std::slice::from_ref(&endpoint), &[disabled_key]).await;
+    assert_eq!(
+        payload["endpoint_health_details"][0]["health_score"],
+        json!(null)
+    );
+    assert_eq!(payload["avg_health_score"], json!(null));
+    assert_eq!(payload["unhealthy_endpoints"], 0);
 
     let payload = provider_health_summary(&[], &[]).await;
     assert_eq!(payload["avg_health_score"], json!(null));
@@ -233,7 +238,9 @@ async fn admin_provider_summary_health_is_unknown_without_active_observations() 
 }
 
 #[tokio::test]
-async fn admin_provider_summary_health_excludes_disabled_and_unobserved_endpoints() {
+/// 验证停用端点不参与平均，尚未观测的启用端点使用初始满分。
+async fn admin_provider_summary_health_excludes_disabled_endpoints_and_defaults_unobserved_active_endpoints(
+) {
     let mut disabled_endpoint = sample_endpoint(
         "endpoint-disabled",
         "provider-openai",
@@ -280,15 +287,12 @@ async fn admin_provider_summary_health_excludes_disabled_and_unobserved_endpoint
     let payload = provider_health_summary(&endpoints, &keys).await;
 
     assert_eq!(payload["endpoint_health_details"][0]["health_score"], 0.8);
-    assert_eq!(
-        payload["endpoint_health_details"][1]["health_score"],
-        json!(null)
-    );
+    assert_eq!(payload["endpoint_health_details"][1]["health_score"], 1.0);
     assert_eq!(
         payload["endpoint_health_details"][2]["health_score"],
         json!(null)
     );
-    assert_eq!(payload["avg_health_score"], 0.8);
+    assert_eq!(payload["avg_health_score"], 0.9);
     assert_eq!(payload["unhealthy_endpoints"], 0);
 }
 
