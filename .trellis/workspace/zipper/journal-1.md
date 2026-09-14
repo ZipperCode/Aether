@@ -694,3 +694,39 @@
 ### Next Steps
 
 - 本轮仅本地提交，未推送或部署。
+
+
+## Session 29: 修复 Anthropic SSE 保活破坏工具流
+
+**Date**: 2026-09-14
+**Task**: 修复 Anthropic SSE 保活破坏工具流
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+共享 SSE 输出仅在完整事件边界插入保活；11 项测试、旧逻辑反向验证及 gateway cargo check 完成，合回 master 并保留 Antigravity WIP。
+
+### Main Changes
+
+- 用三个布尔状态跟踪实际输出边界，保留原生工具、思考和签名
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1b279b1c0` | (see git log) |
+| `c4c47d565` | (see git log) |
+| `ed0b2da76` | (see git log) |
+
+### Testing
+
+- [OK] 11 passed / 0 failed；旧输出函数回归按预期 1 failed；cargo check 通过；任务版本 rustfmt 通过
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 生产发布及真实智普客户端复测另行安排；既有超过 1 MiB 过滤尾段问题已记录
