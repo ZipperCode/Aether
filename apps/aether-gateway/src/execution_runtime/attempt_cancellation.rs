@@ -296,7 +296,10 @@ impl Drop for AttemptCancellationGuard {
             );
             return;
         };
+        let usage_producer = state.usage_runtime.track_producer();
         handle.spawn(async move {
+            // 保持 usage producer 存活到结算任务结束，避免结算写入期间生产者计数提前归零。
+            let _usage_producer = usage_producer;
             settle_attempt(
                 state,
                 armed,
