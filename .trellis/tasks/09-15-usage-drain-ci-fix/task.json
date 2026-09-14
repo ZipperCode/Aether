@@ -1,0 +1,29 @@
+{
+  "id": "usage-drain-ci-fix",
+  "name": "usage-drain-ci-fix",
+  "title": "修复发布 CI 的用量队列等待竞态",
+  "description": "Fix the asynchronous test drain race before v0.7.34 exact-SHA CI and release.",
+  "status": "in_progress",
+  "dev_type": "backend",
+  "scope": "usage-runtime-tests",
+  "package": "aether-usage-runtime",
+  "priority": "P2",
+  "creator": "zipper",
+  "assignee": "zipper",
+  "createdAt": "2026-09-15",
+  "completedAt": null,
+  "branch": "codex/release-v0.7.34-ci",
+  "base_branch": "master",
+  "worktree_path": "C:/Users/Zipper/AppData/Local/Temp/aether-release-v0.7.34-ci-20260915",
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "crates/aether-usage/runtime/src/runtime.rs",
+    ".trellis/spec/aether-usage-runtime/backend/quality-guidelines.md"
+  ],
+  "notes": "",
+  "meta": {}
+}

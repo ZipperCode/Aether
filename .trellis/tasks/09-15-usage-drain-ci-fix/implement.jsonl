@@ -1,0 +1,2 @@
+{"file":".trellis/spec/aether-usage-runtime/backend/quality-guidelines.md","reason":"Usage runtime test conventions"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Shared helper callers and minimal synchronization fix"}

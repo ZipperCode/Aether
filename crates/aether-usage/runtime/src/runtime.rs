@@ -7417,8 +7417,12 @@ mod tests {
         timeout(Duration::from_secs(5), async {
             loop {
                 let snapshot = runtime.metrics_snapshot();
+                // Terminal calls can finish before submission-worker bookkeeping; an empty
+                // retry queue alone does not mean the lifecycle dispatchers have drained.
                 if snapshot.enqueue_retry_recovered_total >= expected_recovered
                     && snapshot.enqueue_retry_pending == 0
+                    && snapshot.lifecycle_submission_pending == 0
+                    && snapshot.ordered_lifecycle_pending == 0
                 {
                     return;
                 }
@@ -7427,6 +7431,67 @@ mod tests {
         })
         .await
         .expect("local usage enqueue dispatcher should drain");
+    }
+
+    #[tokio::test]
+    async fn enqueue_dispatcher_drain_waits_for_lifecycle_and_ordered_completion() {
+        let runtime = UsageRuntime::new(UsageRuntimeConfig {
+            enabled: true,
+            ..UsageRuntimeConfig::default()
+        })
+        .expect("usage runtime should build");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        assert!(runtime
+            .lifecycle_submission
+            .dispatch(Box::new(TestLifecycleSubmissionItem {
+                request_id: "drain-lifecycle-blocker".to_string(),
+                priority: LifecycleSubmissionPriority::Terminal,
+                started: Some(Arc::clone(&started)),
+                release: Some(Arc::clone(&release)),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            })));
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("lifecycle worker should start the blocker");
+        let snapshot = runtime.metrics_snapshot();
+        assert_eq!(snapshot.lifecycle_submission_pending, 1);
+        assert_eq!(snapshot.ordered_lifecycle_pending, 0);
+        assert_eq!(snapshot.enqueue_retry_pending, 0);
+
+        // Hold real worker completion so the regression does not depend on scheduler timing.
+        let drain = std::pin::pin!(wait_for_enqueue_dispatcher_to_drain(&runtime, 0));
+        let pending = futures_util::poll!(drain).is_pending();
+        release.notify_one();
+        assert!(
+            pending,
+            "drain must wait for lifecycle submission completion"
+        );
+        wait_for_enqueue_dispatcher_to_drain(&runtime, 0).await;
+
+        let completion = timeout(
+            Duration::from_secs(1),
+            runtime.await_lifecycle_submission_turn("drain-ordered-blocker"),
+        )
+        .await
+        .expect("ordered barrier should start")
+        .expect("ordered barrier should be accepted");
+        timeout(Duration::from_secs(1), async {
+            while runtime.metrics_snapshot().lifecycle_submission_pending != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("submission bookkeeping should finish while the ordered turn is held");
+        let snapshot = runtime.metrics_snapshot();
+        assert_eq!(snapshot.ordered_lifecycle_pending, 1);
+        assert_eq!(snapshot.enqueue_retry_pending, 0);
+
+        let drain = std::pin::pin!(wait_for_enqueue_dispatcher_to_drain(&runtime, 0));
+        let pending = futures_util::poll!(drain).is_pending();
+        completion.complete();
+        assert!(pending, "drain must wait for ordered lifecycle completion");
+        wait_for_enqueue_dispatcher_to_drain(&runtime, 0).await;
     }
 
     #[async_trait]

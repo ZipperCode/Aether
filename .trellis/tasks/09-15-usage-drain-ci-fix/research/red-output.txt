@@ -1,0 +1,20 @@
+
+running 1 test
+test runtime::tests::enqueue_dispatcher_drain_waits_for_lifecycle_and_ordered_completion ... FAILED
+
+failures:
+
+failures:
+    runtime::tests::enqueue_dispatcher_drain_waits_for_lifecycle_and_ordered_completion
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 366 filtered out; finished in 0.00s
+
+
+   Compiling aether-usage-runtime v0.1.0 (C:\Users\Zipper\AppData\Local\Temp\aether-release-v0.7.34-ci-20260915\crates\aether-usage\runtime)
+    Finished `test` profile [unoptimized] target(s) in 24.46s
+     Running unittests src\lib.rs (target\debug\deps\aether_usage_runtime-41bec7712d3918ad.exe)
+
+thread 'runtime::tests::enqueue_dispatcher_drain_waits_for_lifecycle_and_ordered_completion' (50920) panicked at crates\aether-usage\runtime\src\runtime.rs:7464:9:
+drain must wait for lifecycle submission completion
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p aether-usage-runtime --lib`
