@@ -730,3 +730,25 @@
 ### Next Steps
 
 - 生产发布及真实智普客户端复测另行安排；既有超过 1 MiB 过滤尾段问题已记录
+
+
+## Session 30: 修复 v0.7.34 发布 CI 的队列等待竞态
+
+**Date**: 2026-09-15
+**Task**: 修复 v0.7.34 发布 CI 的队列等待竞态
+**Package**: aether-usage-runtime
+**Branch**: `master`
+
+### Summary
+
+补齐共享测试等待条件，5 项测试通过且旧条件反向验证失败；生产逻辑未变，继续完整 CI 与发布门禁。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `97bed12b1` | (see git log) |
+
+### Status
+
+[OK] **Completed**
