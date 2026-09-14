@@ -40,6 +40,8 @@ use crate::data::GatewayDataState;
 
 const ADMIN_PROVIDERS_DATA_UNAVAILABLE_DETAIL: &str = "Admin provider catalog data unavailable";
 
+mod health;
+
 async fn provider_health_summary(
     endpoints: &[StoredProviderCatalogEndpoint],
     keys: &[StoredProviderCatalogKey],
@@ -170,6 +172,7 @@ async fn admin_provider_summary_health_ignores_disabled_keys() {
 }
 
 #[tokio::test]
+/// 验证未观测密钥和其他格式的分数不会抬高当前格式的真实故障分数。
 async fn admin_provider_summary_health_does_not_inflate_observed_scores_with_missing_data() {
     let endpoint = sample_endpoint(
         "endpoint-chat",
@@ -183,7 +186,7 @@ async fn admin_provider_summary_health_does_not_inflate_observed_scores_with_mis
         sample_key("key-unobserved", "provider-openai", "openai:chat", "test"),
         sample_key("key-other-format", "provider-openai", "openai:chat", "test")
             .with_health_fields(
-                Some(json!({"openai:responses": {"health_score": 1.0}})),
+                Some(json!({"openai:responses": {"health_score": 0.0}})),
                 None,
             ),
     ];
@@ -197,7 +200,35 @@ async fn admin_provider_summary_health_does_not_inflate_observed_scores_with_mis
 }
 
 #[tokio::test]
-/// 验证启用端点未观测时返回初始满分，只有停用密钥或完全无端点时仍返回未知。
+/// 验证缺失、无效或只有其他格式的健康记录均保留启用密钥的初始满分。
+async fn admin_provider_summary_health_defaults_unobserved_enabled_keys_to_one() {
+    let endpoint = sample_endpoint(
+        "endpoint-chat",
+        "provider-openai",
+        "openai:chat",
+        "https://api.openai.example",
+    );
+    for health in [
+        None,
+        Some(json!({})),
+        Some(json!({"openai:chat": {"consecutive_failures": 0}})),
+        Some(json!({"openai:chat": {"health_score": null}})),
+        Some(json!({"openai:chat": {"health_score": "invalid"}})),
+        Some(json!({"openai:responses": {"health_score": 0.0}})),
+    ] {
+        let key = sample_key("key-unobserved", "provider-openai", "openai:chat", "test")
+            .with_health_fields(health, None);
+        let payload = provider_health_summary(std::slice::from_ref(&endpoint), &[key]).await;
+
+        assert_eq!(payload["endpoint_health_details"][0]["health_score"], 1.0);
+        assert_eq!(payload["endpoint_health_details"][0]["active_keys"], 1);
+        assert_eq!(payload["avg_health_score"], 1.0);
+        assert_eq!(payload["unhealthy_endpoints"], 0);
+    }
+}
+
+#[tokio::test]
+/// 验证无密钥的启用端点保留初始满分，只有停用密钥或完全无端点时仍返回未知。
 async fn admin_provider_summary_health_defaults_active_endpoints_without_observations() {
     let endpoint = sample_endpoint(
         "endpoint-chat",
@@ -208,21 +239,10 @@ async fn admin_provider_summary_health_defaults_active_endpoints_without_observa
     let mut disabled_key = sample_key("key-disabled", "provider-openai", "openai:chat", "test")
         .with_health_fields(Some(json!({"openai:chat": {"health_score": 0.2}})), None);
     disabled_key.is_active = false;
-    for keys in [
-        Vec::new(),
-        vec![sample_key(
-            "key-unobserved",
-            "provider-openai",
-            "openai:chat",
-            "test",
-        )],
-    ] {
-        let payload = provider_health_summary(std::slice::from_ref(&endpoint), &keys).await;
-
-        assert_eq!(payload["endpoint_health_details"][0]["health_score"], 1.0);
-        assert_eq!(payload["avg_health_score"], 1.0);
-        assert_eq!(payload["unhealthy_endpoints"], 0);
-    }
+    let payload = provider_health_summary(std::slice::from_ref(&endpoint), &[]).await;
+    assert_eq!(payload["endpoint_health_details"][0]["health_score"], 1.0);
+    assert_eq!(payload["avg_health_score"], 1.0);
+    assert_eq!(payload["unhealthy_endpoints"], 0);
 
     let payload = provider_health_summary(std::slice::from_ref(&endpoint), &[disabled_key]).await;
     assert_eq!(
@@ -286,12 +306,21 @@ async fn admin_provider_summary_health_excludes_disabled_endpoints_and_defaults_
 
     let payload = provider_health_summary(&endpoints, &keys).await;
 
-    assert_eq!(payload["endpoint_health_details"][0]["health_score"], 0.8);
-    assert_eq!(payload["endpoint_health_details"][1]["health_score"], 1.0);
-    assert_eq!(
-        payload["endpoint_health_details"][2]["health_score"],
-        json!(null)
-    );
+    let details = payload["endpoint_health_details"]
+        .as_array()
+        .expect("endpoint health details should be an array");
+    for (api_format, health_score, is_active) in [
+        ("openai:chat", json!(0.8), true),
+        ("openai:responses", json!(null), false),
+        ("openai:embedding", json!(1.0), true),
+    ] {
+        let detail = details
+            .iter()
+            .find(|detail| detail["api_format"] == api_format)
+            .expect("endpoint health detail should exist");
+        assert_eq!(detail["health_score"], health_score, "{api_format}");
+        assert_eq!(detail["is_active"], is_active, "{api_format}");
+    }
     assert_eq!(payload["avg_health_score"], 0.9);
     assert_eq!(payload["unhealthy_endpoints"], 0);
 }

@@ -1,9 +1,8 @@
 use aether_scheduler_core::{ClientSessionAffinity, SchedulerMinimalCandidateSelectionCandidate};
 use std::time::Duration;
-use tokio::time::Instant;
 
 use super::{GatewayAuthApiKeySnapshot, PlannerAppState};
-use crate::clock::{current_unix_secs, request_distribution_seed};
+use crate::clock::request_distribution_seed;
 use crate::constants::{
     API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS, API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS,
 };
@@ -102,11 +101,21 @@ impl<'a> PlannerAppState<'a> {
         ),
         GatewayError,
     > {
-        let wait_timeout = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS);
-        let wait_interval = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS.max(1));
-        let wait_deadline = Instant::now() + wait_timeout;
-        let mut attempt_context = scheduling_context;
-        loop {
+        let CandidateSchedulingContext {
+            now_unix_secs,
+            load_balance_seed,
+        } = scheduling_context;
+        crate::scheduler::candidate::select_with_auth_concurrency_wait(
+            self.app(),
+            auth_snapshot,
+            now_unix_secs,
+            Duration::from_millis(API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS),
+            Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS),
+            |attempt_now_unix_secs| async move {
+                let attempt_context = CandidateSchedulingContext {
+                    now_unix_secs: attempt_now_unix_secs,
+                    load_balance_seed,
+                };
             let result = crate::scheduler::candidate::list_selectable_candidates_with_skip_reasons_for_request_operation(
                 self.app().data.as_ref(),
                 self.app(),
@@ -123,21 +132,13 @@ impl<'a> PlannerAppState<'a> {
             )
             .await?;
 
-            if !crate::scheduler::candidate::is_exact_all_skipped_by_auth_limit(
+            let auth_limit_blocked = crate::scheduler::candidate::is_exact_all_skipped_by_auth_limit(
                 &result.0, &result.1,
-            ) {
-                return Ok(result);
-            }
-
-            let now = Instant::now();
-            if now >= wait_deadline {
-                return Ok(result);
-            }
-
-            let remaining = wait_deadline.duration_since(now);
-            tokio::time::sleep(wait_interval.min(remaining)).await;
-            attempt_context.now_unix_secs = current_unix_secs();
-        }
+            );
+            Ok((result, auth_limit_blocked))
+            },
+        )
+        .await
     }
 
     /// 对调用方枚举出的候选应用权限、亲和及具名时间/种子上下文。
@@ -185,13 +186,22 @@ impl<'a> PlannerAppState<'a> {
         scheduling_context: CandidateSchedulingContext,
         ordering_config: SchedulerOrderingConfig,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
-        let wait_timeout = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS);
-        let wait_interval = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS.max(1));
-        let wait_deadline = Instant::now() + wait_timeout;
-        let mut attempt_context = scheduling_context;
-
-        loop {
-            let (result, auth_limit_blocked) = crate::scheduler::candidate::list_selectable_candidates_for_required_capability_without_requested_model_with_auth_limit_signal(
+        let CandidateSchedulingContext {
+            now_unix_secs,
+            load_balance_seed,
+        } = scheduling_context;
+        crate::scheduler::candidate::select_with_auth_concurrency_wait(
+            self.app(),
+            auth_snapshot,
+            now_unix_secs,
+            Duration::from_millis(API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS),
+            Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS),
+            |attempt_now_unix_secs| {
+                let attempt_context = CandidateSchedulingContext {
+                    now_unix_secs: attempt_now_unix_secs,
+                    load_balance_seed,
+                };
+                crate::scheduler::candidate::list_selectable_candidates_for_required_capability_without_requested_model_with_auth_limit_signal(
                 self.app().data.as_ref(),
                 self.app(),
                 candidate_api_format,
@@ -202,20 +212,8 @@ impl<'a> PlannerAppState<'a> {
                 attempt_context,
                 ordering_config,
             )
-            .await?;
-
-            if !auth_limit_blocked {
-                return Ok(result);
-            }
-
-            let now = Instant::now();
-            if now >= wait_deadline {
-                return Ok(result);
-            }
-
-            let remaining = wait_deadline.duration_since(now);
-            tokio::time::sleep(wait_interval.min(remaining)).await;
-            attempt_context.now_unix_secs = current_unix_secs();
-        }
+            },
+        )
+        .await
     }
 }
