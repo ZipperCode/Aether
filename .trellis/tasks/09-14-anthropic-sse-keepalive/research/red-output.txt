@@ -1,0 +1,20 @@
+
+running 1 test
+test execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_for_prefetched_and_live_event_boundaries ... FAILED
+
+failures:
+
+failures:
+    execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_for_prefetched_and_live_event_boundaries
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5533 filtered out; finished in 0.01s
+
+   Compiling aether-gateway v0.1.0 (/build/apps/aether-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13m 07s
+     Running unittests src/lib.rs (target/debug/deps/aether_gateway-860012414b105e9c)
+
+thread 'execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_for_prefetched_and_live_event_boundaries' (295) panicked at apps/aether-gateway/src/execution_runtime/stream/execution_sse_body_tests.rs:140:25:
+no heartbeat inside a partial event: newline="\n", filter=false, prefetched=false, fragment=0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p aether-gateway --lib`
+

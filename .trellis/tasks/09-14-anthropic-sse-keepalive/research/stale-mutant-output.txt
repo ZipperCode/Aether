@@ -1,0 +1,36 @@
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.79s
+running 11 tests
+     Running unittests src/lib.rs (target/debug/deps/aether_gateway-860012414b105e9c)
+
+test execution_runtime::stream::execution::sse_body_tests::sse_body_stream_boundary_distinguishes_crlf_and_nonempty_lines ... ok
+thread 'execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_for_prefetched_and_live_event_boundaries' (21) panicked at apps/aether-gateway/src/execution_runtime/stream/execution_sse_body_tests.rs:140:25:
+no heartbeat inside a partial event: newline="\n", filter=false, prefetched=false, fragment=0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'execution_runtime::stream::execution::sse_body_tests::sse_body_stream_http_preserves_native_anthropic_tool_roundtrip' (19) panicked at apps/aether-gateway/src/execution_runtime/stream/execution_sse_body_tests.rs:355:9:
+a heartbeat must not split either tool's JSON on the HTTP wire
+
+thread 'execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_after_control_filter_overflow' (20) panicked at apps/aether-gateway/src/execution_runtime/stream/execution_sse_body_tests.rs:193:5:
+test execution_runtime::stream::execution::tests::sse_body_stream_filters_control_blocks_across_chunk_boundaries ... ok
+test execution_runtime::stream::execution::tests::sse_body_stream_drops_upstream_control_only_blocks ... ok
+test execution_runtime::stream::execution::tests::native_anthropic_sse_body_ends_at_message_stop_while_sender_is_alive ... ok
+test execution_runtime::stream::execution::tests::sse_body_stream_uses_local_keepalive_when_prefetched_blocks_are_control_only ... ok
+test execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_for_prefetched_and_live_event_boundaries ... FAILED
+test execution_runtime::stream::execution::tests::sse_body_stream_emits_initial_and_periodic_keepalive_without_business_chunks ... ok
+filter overflow must not allow a heartbeat inside emitted JSON
+error: test failed, to rerun pass `-p aether-gateway --lib`
+test execution_runtime::stream::execution::tests::sse_body_stream_forwards_data_line_before_block_boundary ... ok
+test execution_runtime::stream::execution::sse_body_tests::sse_body_stream_http_preserves_native_anthropic_tool_roundtrip ... FAILED
+test execution_runtime::stream::execution::tests::sse_body_stream_filters_control_blocks_without_synthetic_keepalive ... ok
+test execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_after_control_filter_overflow ... FAILED
+
+failures:
+
+failures:
+    execution_runtime::stream::execution::sse_body_tests::sse_body_stream_http_preserves_native_anthropic_tool_roundtrip
+    execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_after_control_filter_overflow
+    execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_for_prefetched_and_live_event_boundaries
+
+test result: FAILED. 8 passed; 3 failed; 0 ignored; 0 measured; 5523 filtered out; finished in 0.08s
+

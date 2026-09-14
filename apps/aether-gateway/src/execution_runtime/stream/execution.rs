@@ -5164,6 +5164,7 @@ fn build_sse_body_stream(
         let mut upstream_control_filter = filter_control_blocks.then(SseControlBlockFilter::default);
         let mut anthropic_completion_tracker =
             anthropic_message_stop_terminates_body.then(ClientVisibleStreamCompletionTracker::default);
+        let mut event_boundary = SseEventBoundary::default();
         let mut sent_prefetched_chunk = false;
         for chunk in prefetched_chunks_for_body {
             if let Some(mut chunk) = filter_upstream_sse_control_chunk(&mut upstream_control_filter, chunk) {
@@ -5172,6 +5173,9 @@ fn build_sse_body_stream(
                     &mut chunk,
                 );
                 sent_prefetched_chunk = true;
+                if emit_keepalive {
+                    event_boundary.observe(chunk.as_ref());
+                }
                 yield Ok(chunk);
                 if completed {
                     return;
@@ -5200,6 +5204,7 @@ fn build_sse_body_stream(
                                         anthropic_completion_tracker.as_mut(),
                                         &mut chunk,
                                     );
+                                    event_boundary.observe(chunk.as_ref());
                                     yield Ok(chunk);
                                     if completed {
                                         break;
@@ -5210,7 +5215,17 @@ fn build_sse_body_stream(
                         }
                     }
                     _ = keepalive.tick() => {
-                        yield Ok(Bytes::from_static(SSE_KEEPALIVE_BYTES));
+                        // Transport chunks can end inside JSON; comments must wait for an SSE record boundary.
+                        if !event_boundary.event_open {
+                            event_boundary.observe(SSE_KEEPALIVE_BYTES);
+                            yield Ok(Bytes::from_static(SSE_KEEPALIVE_BYTES));
+                        } else {
+                            debug!(
+                                event_name = "sse_keepalive_skipped_partial_event",
+                                log_type = "ops",
+                                "gateway skipped SSE keepalive because a client-visible event is incomplete"
+                            );
+                        }
                     }
                 }
             }
@@ -5250,6 +5265,35 @@ fn build_sse_body_stream(
                     flush_upstream_sse_control_filter(&mut upstream_control_filter)
                 {
                     yield Ok(chunk);
+                }
+            }
+        }
+    }
+}
+
+/// Track emitted SSE framing without buffering payloads, including CRLF split across chunks.
+#[derive(Default)]
+struct SseEventBoundary {
+    line_nonempty: bool,
+    event_open: bool,
+    skip_next_lf: bool,
+}
+
+impl SseEventBoundary {
+    fn observe(&mut self, chunk: &[u8]) {
+        for &byte in chunk {
+            if std::mem::take(&mut self.skip_next_lf) && byte == b'\n' {
+                continue;
+            }
+            match byte {
+                b'\r' | b'\n' => {
+                    self.event_open = self.line_nonempty;
+                    self.line_nonempty = false;
+                    self.skip_next_lf = byte == b'\r';
+                }
+                _ => {
+                    self.line_nonempty = true;
+                    self.event_open = true;
                 }
             }
         }
@@ -9070,6 +9114,10 @@ fn copy_stream_execution_credential_fingerprint(
         fingerprint,
     );
 }
+
+#[cfg(test)]
+#[path = "execution_sse_body_tests.rs"]
+mod sse_body_tests;
 
 #[cfg(test)]
 mod tests {

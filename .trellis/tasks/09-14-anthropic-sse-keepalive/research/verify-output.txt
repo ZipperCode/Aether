@@ -1,0 +1,73 @@
+
+running 11 tests
+test execution_runtime::stream::execution::sse_body_tests::sse_body_stream_boundary_distinguishes_crlf_and_nonempty_lines ... ok
+test execution_runtime::stream::execution::tests::sse_body_stream_filters_control_blocks_across_chunk_boundaries ... ok
+test execution_runtime::stream::execution::tests::sse_body_stream_drops_upstream_control_only_blocks ... ok
+test execution_runtime::stream::execution::tests::sse_body_stream_uses_local_keepalive_when_prefetched_blocks_are_control_only ... ok
+test execution_runtime::stream::execution::tests::native_anthropic_sse_body_ends_at_message_stop_while_sender_is_alive ... ok
+test execution_runtime::stream::execution::tests::sse_body_stream_emits_initial_and_periodic_keepalive_without_business_chunks ... ok
+test execution_runtime::stream::execution::tests::sse_body_stream_forwards_data_line_before_block_boundary ... ok
+test execution_runtime::stream::execution::tests::sse_body_stream_filters_control_blocks_without_synthetic_keepalive ... ok
+   Compiling aether-gateway v0.1.0 (/build/apps/aether-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7m 05s
+     Running unittests src/lib.rs (target/debug/deps/aether_gateway-860012414b105e9c)
+    Checking tokio-util v0.7.18
+    Checking aether-contracts v0.1.0 (/build/crates/aether-contracts)
+    Checking aether-routing-core v0.1.0 (/build/crates/aether-routing-core)
+    Checking aether-cache v0.1.0 (/build/crates/aether-cache)
+    Checking aether-wallet v0.1.0 (/build/crates/aether-wallet)
+    Checking aether-crypto v0.1.0 (/build/crates/aether-crypto)
+    Checking h2 v0.4.16
+    Checking combine v4.6.7
+    Checking aether-ai-formats v0.1.0 (/build/crates/aether-ai/formats)
+    Checking tower-http v0.6.8
+    Checking aether-data-query v0.1.0 (/build/crates/aether-data/query)
+    Checking http2 v0.5.17
+    Checking aether-task-core v0.1.0 (/build/crates/aether-task/core)
+    Checking hyper v1.8.1
+    Checking wreq v6.0.0-rc.28
+    Checking redis v0.28.2
+    Checking hyper-util v0.1.20
+    Checking aether-admission-core v0.1.0 (/build/crates/aether-admission-core)
+    Checking axum v0.8.8
+    Checking hyper-rustls v0.27.7
+    Checking reqwest v0.12.28
+test execution_runtime::stream::execution::sse_body_tests::sse_body_stream_http_preserves_native_anthropic_tool_roundtrip ... ok
+test execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_after_control_filter_overflow ... ok
+test execution_runtime::stream::execution::sse_body_tests::sse_body_stream_keepalive_waits_for_prefetched_and_live_event_boundaries ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 5523 filtered out; finished in 1.18s
+
+    Checking aether-oauth v0.1.0 (/build/crates/aether-oauth)
+    Checking aether-http v0.1.0 (/build/crates/aether-http)
+    Checking reqwest v0.13.4
+    Checking aether-runtime v0.1.0 (/build/crates/aether-runtime/base)
+    Checking aether-gateway-tunnel v0.1.0 (/build/crates/aether-gateway/tunnel)
+    Checking object_store v0.14.1
+    Checking ldap3 v0.12.1
+    Checking aether-task-runtime v0.1.0 (/build/crates/aether-task/runtime)
+    Checking wreq-util v3.0.0-rc.10
+    Checking aether-gateway-execution v0.1.0 (/build/crates/aether-gateway/execution)
+    Checking aether-dispatch-core v0.1.0 (/build/crates/aether-dispatch-core)
+    Checking aether-gateway-control v0.1.0 (/build/crates/aether-gateway/control)
+    Checking aether-data-contracts v0.1.0 (/build/crates/aether-data/contracts)
+    Checking aether-gateway-frontdoor v0.1.0 (/build/crates/aether-gateway/frontdoor)
+    Checking aether-runtime-state v0.1.0 (/build/crates/aether-runtime/state)
+    Checking aether-data-postgres v0.1.0 (/build/crates/aether-data/adapters/postgres)
+    Checking aether-video-tasks-core v0.1.0 (/build/crates/aether-video-tasks-core)
+    Checking aether-pool-core v0.1.0 (/build/crates/aether-pool-core)
+    Checking aether-scheduler-core v0.1.0 (/build/crates/aether-scheduler-core)
+    Checking aether-ai-serving v0.1.0 (/build/crates/aether-ai/serving)
+    Checking aether-provider-transport v0.1.0 (/build/crates/aether-provider/transport)
+    Checking aether-gateway-workers v0.1.0 (/build/crates/aether-gateway/workers)
+    Checking aether-provider-pool v0.1.0 (/build/crates/aether-provider/pool)
+    Checking aether-model-fetch v0.1.0 (/build/crates/aether-model-fetch)
+    Checking aether-data v0.1.0 (/build/crates/aether-data/runtime)
+    Checking aether-usage-runtime v0.1.0 (/build/crates/aether-usage/runtime)
+    Checking aether-billing v0.1.0 (/build/crates/aether-billing)
+    Checking aether-admin v0.1.0 (/build/crates/aether-admin)
+    Checking aether-gateway v0.1.0 (/build/apps/aether-gateway)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12m 32s
+error: 'rustfmt' is not installed for the toolchain '1.95.0-x86_64-unknown-linux-gnu'.
+help: run `rustup component add rustfmt` to install it
+

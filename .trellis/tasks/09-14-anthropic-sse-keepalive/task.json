@@ -1,0 +1,30 @@
+{
+  "id": "anthropic-sse-keepalive",
+  "name": "anthropic-sse-keepalive",
+  "title": "修复 Anthropic SSE 保活破坏工具调用",
+  "description": "Keep gateway SSE heartbeats outside partially emitted Anthropic tool events; preserve native payloads and validate final loopback HTTP bytes.",
+  "status": "in_progress",
+  "dev_type": "backend",
+  "scope": "gateway-stream",
+  "package": "aether-gateway",
+  "priority": "P2",
+  "creator": "zipper",
+  "assignee": "zipper",
+  "createdAt": "2026-09-14",
+  "completedAt": null,
+  "branch": "codex/anthropic-sse-keepalive",
+  "base_branch": "master",
+  "worktree_path": "D:/Project/GitHub/Aether-anthropic-sse-keepalive",
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "apps/aether-gateway/src/execution_runtime/stream/execution.rs",
+    "apps/aether-gateway/src/execution_runtime/stream/execution_sse_body_tests.rs",
+    ".trellis/spec/aether-gateway/backend/sse-keepalive-framing-contract.md"
+  ],
+  "notes": "",
+  "meta": {}
+}
