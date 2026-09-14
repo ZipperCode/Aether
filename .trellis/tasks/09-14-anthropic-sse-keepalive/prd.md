@@ -21,7 +21,7 @@ Fix the approved, reproducible shared SSE-output defect that can interrupt nativ
 - [x] Prefetched/live fragments, consecutive tool calls, escaped/UTF-8 content, LF/CRLF splits and message_stop are covered.
 - [x] A local mock upstream validates final HTTP response bytes and complete tool-call/result correspondence without real-provider inference.
 - [x] Scoped SSE tests, gateway Rust check and changed-file formatting pass; independent review completes.
-- [ ] Contract recorded, task-scoped changes committed and merged into master; original WIP preserved.
+- [x] Contract recorded, task-scoped changes committed and merged into master; original WIP preserved.
 
 ## Exclusions
 No production deployment/restart/configuration changes, paid inference, credential changes or changes to the unrelated Antigravity task.

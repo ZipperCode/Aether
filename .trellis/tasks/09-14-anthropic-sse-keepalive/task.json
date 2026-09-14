@@ -14,8 +14,8 @@
   "completedAt": null,
   "branch": "codex/anthropic-sse-keepalive",
   "base_branch": "master",
-  "worktree_path": "D:/Project/GitHub/Aether-anthropic-sse-keepalive",
-  "commit": null,
+  "worktree_path": null,
+  "commit": "1b279b1c0a61eaeee1e91260a52407f83f4fab81",
   "pr_url": null,
   "subtasks": [],
   "children": [],
@@ -25,6 +25,6 @@
     "apps/aether-gateway/src/execution_runtime/stream/execution_sse_body_tests.rs",
     ".trellis/spec/aether-gateway/backend/sse-keepalive-framing-contract.md"
   ],
-  "notes": "",
+  "notes": "11 SSE tests passed; original-wrapper regression failed as expected; gateway cargo check passed; pinned host formatting passed. Merged master, original WIP preserved. No production deployment/inference.",
   "meta": {}
 }

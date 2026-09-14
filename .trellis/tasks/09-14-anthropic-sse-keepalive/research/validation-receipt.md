@@ -23,8 +23,11 @@ The first return from the newer-mtime red bind overlay to the older-mtime fixed 
 - Both changed Rust files pass `rustfmt --edition 2021 --config skip_children=true --check`; staged and unstaged `git diff --check` pass.
 - No full-workspace test suite, Clippy or live-provider run was performed; these are outside the approved scoped test/check plan.
 
-## Integration pending
-- Commit, protected merge and original WIP preservation check.
+## Integration result
+- Fix commit 1b279b1c0a61eaeee1e91260a52407f83f4fab81 plus evidence-cleanup commit c4c47d56563eb69874b6e34f9ba3b8dcee651e18 were fast-forwarded into master.
+- Original WIP preserved: 31 non-overlap files are byte-identical; both overlap files match exact original WIP plus the approved SSE changes. The only stash-apply conflict was resolved by retaining the new sse_body_tests module and Antigravity pub(crate) mod tests visibility. No WIP was committed; index is empty. See integration-receipt.json.
+- Merged dirty-tree formatting reports one pre-existing Antigravity fixture layout difference (encrypted_psk expression). The original pre-task backup produces the identical formatting diff; it was deliberately preserved. The reviewed/committed task-only source passes formatting.
+- Runtime tests were run on the isolated task source; no claim is made that the unrelated dirty Antigravity worktree has passed a new full build.
 
 ## Limits
 Live GLM/Claude acceptance and production deployment are unverified and excluded. The HTTP regression is an actual two-hop loopback test around the production output wrapper; it does not boot the complete auth/routing/billing stack. General >1 MiB filter continuation corruption is an existing separately recorded limitation.

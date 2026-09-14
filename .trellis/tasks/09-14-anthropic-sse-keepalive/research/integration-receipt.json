@@ -1,0 +1,12 @@
+{
+  "merged_head": "c4c47d56563eb69874b6e34f9ba3b8dcee651e18",
+  "original_wip_files": 33,
+  "byte_identical_nonoverlap_files": 31,
+  "overlap_files_verified_as_exact_original_wip_plus_task_changes": [
+    "apps/aether-gateway/src/execution_runtime/stream/execution.rs",
+    ".trellis/spec/aether-gateway/backend/index.md"
+  ],
+  "resolved_conflict": "Preserved new sse_body_tests module and Antigravity pub(crate) mod tests visibility",
+  "new_test_file_matches_reviewed_worktree": true,
+  "index_empty": true
+}
