@@ -17,4 +17,3 @@ thread 'execution_runtime::stream::execution::sse_body_tests::sse_body_stream_ke
 no heartbeat inside a partial event: newline="\n", filter=false, prefetched=false, fragment=0
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 error: test failed, to rerun pass `-p aether-gateway --lib`
-

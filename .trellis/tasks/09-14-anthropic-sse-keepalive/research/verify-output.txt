@@ -70,4 +70,3 @@ test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 5523 filtered out; 
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 12m 32s
 error: 'rustfmt' is not installed for the toolchain '1.95.0-x86_64-unknown-linux-gnu'.
 help: run `rustup component add rustfmt` to install it
-
