@@ -8,3 +8,7 @@
 - Temporarily removing only the two added drain conditions deterministically failed the new regression: 0 passed, 1 failed, 366 filtered, 0.00s. Failure: drain must wait for lifecycle submission completion. See red-output.txt. The original bytes were restored in finally.
 - Reviewed/restored source SHA-256: 00C67F54F6F01E6033D32874698F87B90213697E354A7206942A9A1E1A63052C. All changes are under cfg(test); production queue logic, timeouts, capacities and assertions are unchanged.
 - Independent review, pinned Rust formatting and git diff checks passed. Coordinator will merge without changing the 33 original WIP files and require a fresh full exact-SHA GitHub CI gate before v0.7.34.
+
+## Local integration
+
+Commit 97bed12b14852b096f72cf22ce52f0108b29e9cc fast-forwarded into master. All 33 original WIP files are byte-identical before/after merge and index is empty. No stash or conflict was required. The next GitHub CI candidate includes only this test synchronization repair plus task records.

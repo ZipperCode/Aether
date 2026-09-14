@@ -15,7 +15,7 @@ Fix the asynchronous test drain race before v0.7.34 exact-SHA CI and release.
 
 - [x] The original failing test and directly affected caller tests pass locally; deterministic coverage demonstrates the missing wait if feasible with existing fixtures.
 - [x] Scoped Rust formatting and independent review pass; no new dependencies or production behavior changes.
-- [ ] Commit the scoped fix and merge into master with WIP intact; coordinator resumes exact-SHA CI before creating v0.7.34.
+- [x] Commit the scoped fix and merge into master with WIP intact; coordinator resumes exact-SHA CI before creating v0.7.34.
 
 ## Notes
 

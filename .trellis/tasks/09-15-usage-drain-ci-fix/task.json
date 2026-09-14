@@ -14,8 +14,8 @@
   "completedAt": null,
   "branch": "codex/release-v0.7.34-ci",
   "base_branch": "master",
-  "worktree_path": "C:/Users/Zipper/AppData/Local/Temp/aether-release-v0.7.34-ci-20260915",
-  "commit": null,
+  "worktree_path": null,
+  "commit": "97bed12b14852b096f72cf22ce52f0108b29e9cc",
   "pr_url": null,
   "subtasks": [],
   "children": [],
@@ -24,6 +24,6 @@
     "crates/aether-usage/runtime/src/runtime.rs",
     ".trellis/spec/aether-usage-runtime/backend/quality-guidelines.md"
   ],
-  "notes": "",
+  "notes": "5 related tests passed; old-condition mutation failed as expected; test-only diff reviewed and merged master; original 33 WIP files byte-identical. Release CI continues separately.",
   "meta": {}
 }
