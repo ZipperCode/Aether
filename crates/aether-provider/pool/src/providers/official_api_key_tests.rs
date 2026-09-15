@@ -176,11 +176,12 @@ fn balance_and_subscription_are_not_conflated() {
 
 #[test]
 fn parses_zhipu_credit_limits_for_personal_and_team_plans() {
+    // 官方窗口由时间单位和数量共同确定，样本必须显式给出 5 小时与 1 周。
     let parsed = parse_at(
         "zhipu",
         json!({"success":true,"data":{"level":"TEAM_PRO","limits":[
-            {"type":"CREDIT_LIMIT","unit":3,"currentValue":250,"usage":2000,"percentage":12.5,"nextResetTime":1_900_000_000_000u64},
-            {"type":"CREDIT_LIMIT","unit":6,"currentValue":1000,"usage":10000,"percentage":10,"nextResetTime":1_900_100_000_000u64}
+            {"type":"CREDIT_LIMIT","unit":3,"number":5,"currentValue":250,"usage":2000,"percentage":12.5,"nextResetTime":1_900_000_000_000u64},
+            {"type":"CREDIT_LIMIT","unit":6,"number":1,"currentValue":1000,"usage":10000,"percentage":10,"nextResetTime":1_900_100_000_000u64}
         ]}}),
     );
 
