@@ -15,7 +15,7 @@
 - GitHub Pages 站点已删除，Pages API 返回 404，公开站点撤下。
 - 清理提交合回开始时的 master 并推送；核对对应 GitHub CI 结果。
 - v0.7.34 的 annotated tag 和发布资产不变。
-- 现有 33 个 WIP 文件逐字节保持，任务 worktree 完成后清理。
+- 本任务不覆盖或代提交现有 33 个 WIP 文件；记录其他任务的并发更新并保留最新内容，任务 worktree 完成后清理。
 
 ## 边界
 仅删除 Pages 工作流，记录停用契约。保持 frontend/vite.config.ts 的 base 为 /，不修改生产服务、权限保护规则、Release/Nightly/普通 CI 定义，不新增测试框架或配置，不创建第二个版本 tag。
