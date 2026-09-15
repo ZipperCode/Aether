@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 31
+- **Total Sessions**: 32
 - **Last Active**: 2026-09-15
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~786 | Active |
+| `journal-1.md` | ~817 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 32 | 2026-09-15 | Antigravity 签名恢复与 v0.7.35 发布 | `52df0e624`, `c29615c2a` | `master` |
 | 31 | 2026-09-15 | 恢复停用 GitHub Pages | `74d7670f6`, `73dcdc219` | `master` |
 | 30 | 2026-09-15 | 修复 v0.7.34 发布 CI 的队列等待竞态 | `97bed12b1` | `master` |
 | 29 | 2026-09-14 | 修复 Anthropic SSE 保活破坏工具流 | `1b279b1c0`, `c4c47d565`, `ed0b2da76` | `master` |

@@ -784,3 +784,34 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 32: Antigravity 签名恢复与 v0.7.35 发布
+
+**Date**: 2026-09-15
+**Task**: Antigravity 签名恢复与 v0.7.35 发布
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+完成独立源码检查及必要修正，提交并推送本地改动；精确源码 SHA 的 Rust CI 18/18 通过后创建 v0.7.35，Release 8/8 通过，六个发布文件、签名来源及 GHCR 双架构全部验证。
+
+### Main Changes
+
+- 修正取消快照、普通流式正文复制、管理端失败 capture 和同步终态诊断；归档已完成任务。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `52df0e624` | (see git log) |
+| `c29615c2a` | (see git log) |
+
+### Testing
+
+- [OK] GitHub CI：网关 5624 通过；相关 Antigravity 回归 10+8+1 通过；发布六个文件本地 SHA256 与 GitHub 一致，签名证明绑定源码 52df0e624。
+
+### Status
+
+[OK] **Completed**
