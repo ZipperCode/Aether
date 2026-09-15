@@ -752,3 +752,35 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 31: 恢复停用 GitHub Pages
+
+**Date**: 2026-09-15
+**Task**: 恢复停用 GitHub Pages
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+按用户明确选择撤下 GitHub Pages 并删除回流的发布工作流；API 与公网均为 404，v0.7.34 tag 和六个发布资产保持不变。清理合回 master 后由并行 Antigravity 提交 52df0e624 承接，CI 34912705285 的 18 项检查全部通过。
+
+### Main Changes
+
+- 删除 Pages 工作流并记录停用契约，保留其他工作流和前端配置。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `74d7670f6` | (see git log) |
+| `73dcdc219` | (see git log) |
+
+### Testing
+
+- [OK] 本地 CI contract check、独立审查、diff check 通过；Pages DELETE 204，API/公网 GET 404。
+- [OK] 包含清理的提交 52df0e624：GitHub CI 34912705285 通过 18/18。
+
+### Status
+
+[OK] **Completed**
