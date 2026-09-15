@@ -815,3 +815,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 33: Official provider quota sources and live verification
+
+**Date**: 2026-09-15
+**Task**: Official provider quota sources and live verification
+**Package**: aether-provider-pool
+**Branch**: `codex/official-quota-ci`
+
+### Summary
+
+Implemented independent quota sources, official plan recognition, regional query rules, accurate decimal units and safe quota scheduling. Authorized read-only verification used 9 keys and 11 official quota GET requests; credentials and private account responses are excluded from repository artifacts. Frontend type-check, targeted static checks and sanitized sample/live response replay passed. Applied the 44 task files cleanly onto current origin/master in an isolated worktree, preserving unrelated local work. Full compilation and tests are CI-only and will be verified on the pushed GitHub Actions run.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6fc2fdd3c` | (see git log) |
+
+### Status
+
+[OK] **Completed**
