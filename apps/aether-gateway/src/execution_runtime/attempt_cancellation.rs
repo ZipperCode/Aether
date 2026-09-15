@@ -54,7 +54,8 @@ fn elapsed_ms_since(started_at: Instant) -> u64 {
 /// every capture state, body reference and derived request fact from the real
 /// plan and report context but keeps neither body. The terminal write it
 /// produces therefore preserves the capture the `pending` write recorded instead
-/// of clearing it.
+/// of clearing it. Only signature recovery retains the changed provider body so
+/// cancellation can replace the original pending capture with the actual send.
 struct ArmedAttempt {
     request_id: String,
     candidate_id: Option<String>,
@@ -132,6 +133,34 @@ impl AttemptCancellationGuard {
     /// 正常终态或响应体 finalizer 已接管后，解除取消路径的结算所有权。
     pub(crate) fn disarm(&mut self) {
         self.armed = None;
+    }
+
+    /// 恢复请求正文后刷新取消终态快照，避免取消路径覆盖签名恢复诊断与最终捕获。
+    pub(crate) fn refresh_signature_recovery(&mut self, report_context: Option<&Value>) {
+        let Some(context) = report_context.filter(|context| {
+            context
+                .get(crate::execution_runtime::antigravity_signature::RECOVERY_FIELD)
+                .is_some()
+        }) else {
+            return;
+        };
+        if let Some(progress) = self.watchdog.as_ref() {
+            progress.set_recovery_context(Some(context));
+        }
+        let Some(armed) = self.armed.as_mut() else {
+            return;
+        };
+        if let Some(snapshot) = armed.candidate.as_mut() {
+            snapshot.signature_recovery = context
+                .get(crate::execution_runtime::antigravity_signature::RECOVERY_FIELD)
+                .cloned();
+        }
+        if let Some(usage_seed) = armed.usage_seed.as_mut() {
+            if let Some(body) = context.get("provider_request_body") {
+                // capture 正文使用专用字段；塞进 metadata 不会更新实际保存的请求。
+                usage_seed.provider_request_body = Some(body.clone());
+            }
+        }
     }
 
     /// 对未交给响应体的失败结算一次；准入超时保留 429，其余错误不持久化内部敏感细节。
@@ -317,6 +346,78 @@ impl Drop for AttemptCancellationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_runtime::antigravity_signature::{
+        tests::{context, rejection, signature_plan},
+        AntigravitySignatureRecovery, RECOVERY_FIELD,
+    };
+
+    /// 普通候选不复制正文；恢复时取消与 watchdog 快照保留实际正文及固定诊断。
+    #[tokio::test]
+    async fn antigravity_signature_cancellation_snapshot_keeps_actual_capture() {
+        let state = AppState::new().unwrap().with_usage_runtime_for_tests(
+            aether_usage_runtime::UsageRuntimeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let mut plan = signature_plan(true, "http://localhost/");
+        let mut report_context = context(&plan);
+        report_context.as_mut().unwrap()["provider_request_body"] =
+            plan.body.json_body.clone().unwrap();
+        let watchdog = StreamCandidateWatchdogProgress::shared();
+        let mut guard = AttemptCancellationGuard::disarmed(&state, "cancelled", "cancelled");
+        guard.watchdog = Some(Arc::clone(&watchdog));
+        guard.arm(
+            &plan,
+            report_context.as_ref(),
+            snapshot_local_request_candidate_status(&plan, report_context.as_ref()).as_ref(),
+            0,
+            Instant::now(),
+        );
+        let original_metadata = guard
+            .armed
+            .as_ref()
+            .unwrap()
+            .usage_seed
+            .as_ref()
+            .unwrap()
+            .request_metadata
+            .clone();
+        guard.refresh_signature_recovery(report_context.as_ref());
+        assert!(watchdog.recovery_context().is_none());
+        let seed = guard.armed.as_ref().unwrap().usage_seed.as_ref().unwrap();
+        assert!(seed.provider_request_body.is_none());
+        assert_eq!(seed.request_metadata, original_metadata);
+
+        let mut recovery = AntigravitySignatureRecovery::new(&plan, report_context.as_ref());
+        assert!(recovery
+            .prepare_retry(
+                &mut plan,
+                &mut report_context,
+                400,
+                Some(&rejection()),
+                None,
+            )
+            .unwrap());
+        recovery.apply_to_context(&mut report_context);
+        guard.refresh_signature_recovery(report_context.as_ref());
+        let armed = guard.armed.as_ref().unwrap();
+        let seed = armed.usage_seed.as_ref().unwrap();
+        assert_eq!(seed.provider_request_body, plan.body.json_body);
+        assert!(seed.request_body.is_none());
+        assert_eq!(
+            armed.candidate.as_ref().unwrap().signature_recovery,
+            recovery.diagnostic()
+        );
+        let watched = watchdog.recovery_context().unwrap();
+        assert_eq!(
+            watched["provider_request_body"],
+            plan.body.json_body.as_ref().unwrap().clone()
+        );
+        assert_eq!(watched[RECOVERY_FIELD], recovery.diagnostic().unwrap());
+        assert!(watched.get("original_request_body").is_none());
+        guard.disarm();
+    }
     use aether_contracts::RequestBody;
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::repository::usage::InMemoryUsageReadRepository;

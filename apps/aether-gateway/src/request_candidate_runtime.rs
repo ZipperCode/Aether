@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::clock::current_unix_ms;
+use crate::execution_runtime::antigravity_signature::RECOVERY_FIELD;
 use crate::log_ids::short_request_id;
 use crate::GatewayError;
 
@@ -83,6 +84,7 @@ fn request_candidate_seed_write_timeout() -> Duration {
 }
 
 #[derive(Debug, Clone)]
+/// 候选身份与固定字段恢复证据的轻量快照，不持有请求正文或传输凭据。
 pub(crate) struct LocalRequestCandidateStatusSnapshot {
     candidate_id: String,
     request_id: String,
@@ -93,6 +95,9 @@ pub(crate) struct LocalRequestCandidateStatusSnapshot {
     provider_id: String,
     endpoint_id: String,
     key_id: String,
+    /// 避免异步终态状态写入覆盖已观察到的签名拒绝/恢复结果。
+    /// 签名恢复固定诊断，供取消/终态快照保持一致。
+    pub(crate) signature_recovery: Option<Value>,
 }
 
 #[async_trait]
@@ -257,6 +262,7 @@ fn request_candidate_status_label(status: RequestCandidateStatus) -> &'static st
     }
 }
 
+/// 在执行现场捕获身份及恢复证据，供异步终态写入原样传递。
 pub(crate) fn snapshot_local_request_candidate_status(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
@@ -289,6 +295,9 @@ pub(crate) fn snapshot_local_request_candidate_status(
         provider_id: plan.provider_id.clone(),
         endpoint_id: plan.endpoint_id.clone(),
         key_id: plan.key_id.clone(),
+        signature_recovery: report_context
+            .and_then(|context| context.get(RECOVERY_FIELD))
+            .cloned(),
     })
 }
 
@@ -376,6 +385,11 @@ pub(crate) async fn record_local_request_candidate_status(
     };
     record.skip_reason =
         local_request_candidate_skip_reason(record.status, record.error_type.as_deref());
+    if let Some(recovery) = report_context.and_then(|context| context.get(RECOVERY_FIELD)) {
+        record
+            .extra_data
+            .get_or_insert_with(|| serde_json::json!({}))[RECOVERY_FIELD] = recovery.clone();
+    }
     persist_local_request_candidate_status_record(state, record).await;
 }
 
@@ -456,7 +470,10 @@ fn build_local_request_candidate_status_snapshot_record(
         error_message,
         latency_ms,
         concurrent_requests: None,
-        extra_data: None,
+        extra_data: snapshot
+            .signature_recovery
+            .as_ref()
+            .map(|recovery| serde_json::json!({RECOVERY_FIELD: recovery})),
         required_capabilities: None,
         created_at_unix_ms: None,
         started_at_unix_ms,
@@ -498,6 +515,7 @@ pub(crate) async fn record_local_request_candidate_status_snapshot(
     persist_local_request_candidate_status_record(state, record).await;
 }
 
+/// 报告驱动的候选状态保留恢复证据，不能被调度器的固定字段投影丢弃。
 pub(crate) async fn record_report_request_candidate_status(
     state: &(impl RequestCandidateRuntimeReader + RequestCandidateRuntimeWriter + ?Sized),
     report_context: Option<&Value>,
@@ -516,12 +534,17 @@ pub(crate) async fn record_report_request_candidate_status(
     let request_id_for_log = short_request_id(request_id.as_str());
     let candidate_index = slot.candidate_index;
     let retry_index = slot.retry_index;
-    let record =
+    let mut record =
         build_report_request_candidate_status_record(ReportRequestCandidateStatusRecordInput {
             slot,
             status_update,
             now_unix_ms: current_unix_ms(),
         });
+    if let Some(recovery) = report_context.and_then(|context| context.get(RECOVERY_FIELD)) {
+        record
+            .extra_data
+            .get_or_insert_with(|| serde_json::json!({}))[RECOVERY_FIELD] = recovery.clone();
+    }
     let candidate_id = record.id.clone();
     let status = record.status;
 

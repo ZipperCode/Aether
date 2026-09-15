@@ -674,6 +674,7 @@ mod tests {
             scheduler_skip_reason: None,
         };
         let execution = ProviderQueryExecutionOutcome {
+            signature_recovery: None,
             status: "success",
             skip_reason: None,
             error_message: None,
@@ -730,6 +731,7 @@ mod tests {
             scheduler_skip_reason: None,
         };
         let mut execution = ProviderQueryExecutionOutcome {
+            signature_recovery: None,
             status: "failed",
             skip_reason: None,
             error_message: Some(
@@ -800,6 +802,7 @@ mod tests {
             scheduler_skip_reason: None,
         };
         let execution = ProviderQueryExecutionOutcome {
+            signature_recovery: None,
             status: "success",
             skip_reason: None,
             error_message: None,

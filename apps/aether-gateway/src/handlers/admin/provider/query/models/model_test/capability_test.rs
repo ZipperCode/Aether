@@ -2061,6 +2061,7 @@ mod tests {
         response_body: Option<Value>,
     ) -> ProviderQueryExecutionOutcome {
         ProviderQueryExecutionOutcome {
+            signature_recovery: None,
             status,
             skip_reason: None,
             error_message: error_message.map(ToOwned::to_owned),

@@ -3,12 +3,176 @@ use crate::handlers::admin::request::AdminGatewayProviderTransportSnapshot;
 use base64::Engine as _;
 use serde_json::json;
 
+/// 后台固定计划执行首次保留签名、第二次沿用账号，返回的计划正文与恢复诊断反映实际请求。
+#[tokio::test]
+async fn antigravity_signature_admin_fixed_plan_recovery() {
+    use crate::execution_runtime::antigravity_signature::tests::{
+        signature_plan, signature_server,
+    };
+    for statuses in [vec![400, 200], vec![400, 400], vec![200]] {
+        let server = signature_server(false, statuses.clone()).await;
+        let mut plan = signature_plan(false, &server.url);
+        let original = plan.body.clone();
+        let state = AppState::new().unwrap();
+        let (result, diagnostic) = provider_query_execute_antigravity_plan(
+            &AdminAppState::new(&state),
+            "admin-signature-test",
+            &mut plan,
+        )
+        .await
+        .unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(result.status_code, *statuses.last().unwrap());
+        assert_eq!(requests.len(), statuses.len());
+        assert_eq!(requests[0].1, original.json_body.unwrap());
+        assert_eq!(requests.last().unwrap().1, plan.body.json_body.unwrap());
+        if statuses[0] == 400 {
+            assert_eq!(
+                requests[0].0.get("authorization"),
+                requests[1].0.get("authorization")
+            );
+            assert_eq!(diagnostic.as_ref().unwrap()["original_status"], 400);
+            assert_eq!(diagnostic.unwrap()["final_status"], result.status_code);
+        } else {
+            assert!(diagnostic.is_none());
+        }
+    }
+}
+
+/// 管理员固定目标经已认证 tunnel 发送原正文与一次兼容正文，认证头和节点保持不变。
+#[tokio::test]
+async fn antigravity_signature_admin_authenticated_tunnel_recovery() {
+    use crate::execution_runtime::antigravity_signature::tests::{rejection, signature_plan};
+    use crate::execution_runtime::stream::tests::{
+        authenticated_local_tunnel_test_state, recv_tunnel_test_frame,
+        LOCAL_TUNNEL_TEST_GENERATION, LOCAL_TUNNEL_TEST_PSK,
+    };
+    use crate::tunnel::{tunnel_protocol, TunnelProxyConn};
+    use axum::extract::ws::Message;
+    use serde_json::Value;
+    use std::sync::Arc;
+    use tokio::sync::watch;
+
+    let mut plan = signature_plan(false, "https://example.com/v1internal:generateContent");
+    plan.proxy = Some(
+        serde_json::from_value(json!({
+            "enabled": true, "mode": "tunnel", "node_id": "node-1", "label": "relay-node",
+            "extra": {"tunnel_base_url": "http://127.0.0.1:1"}
+        }))
+        .unwrap(),
+    );
+    let original = plan.body.clone();
+    let state = authenticated_local_tunnel_test_state(&plan).await;
+    let tunnel_app = state.tunnel.app_state();
+    let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(16);
+    let (close_tx, _) = watch::channel(false);
+    tunnel_app.hub.register_proxy(Arc::new(
+        TunnelProxyConn::new(
+            905,
+            "node-1".to_string(),
+            "signature-node".to_string(),
+            proxy_tx,
+            close_tx,
+            16,
+            2,
+        )
+        .with_tunnel_generation(LOCAL_TUNNEL_TEST_GENERATION.to_string())
+        .with_authenticated_key(LOCAL_TUNNEL_TEST_PSK.to_string()),
+    ));
+    let task = tokio::spawn(async move {
+        provider_query_execute_antigravity_plan(
+            &AdminAppState::new(&state),
+            "admin-tunnel-signature",
+            &mut plan,
+        )
+        .await
+    });
+    let mut auth = Vec::new();
+    for attempt in 0..2 {
+        let (header, bytes) = loop {
+            let Message::Binary(bytes) =
+                recv_tunnel_test_frame(&mut proxy_rx, "admin tunnel headers").await
+            else {
+                panic!("expected tunnel headers")
+            };
+            let header = tunnel_protocol::FrameHeader::parse(&bytes).unwrap();
+            if header.msg_type == tunnel_protocol::REQUEST_HEADERS {
+                break (header, bytes);
+            }
+        };
+        let meta: tunnel_protocol::RequestMeta =
+            serde_json::from_slice(&tunnel_protocol::decode_payload(&bytes, &header).unwrap())
+                .unwrap();
+        auth.push(meta.headers.get("authorization").cloned());
+        let Message::Binary(body_bytes) =
+            recv_tunnel_test_frame(&mut proxy_rx, "admin tunnel body").await
+        else {
+            panic!("expected tunnel body")
+        };
+        let body_header = tunnel_protocol::FrameHeader::parse(&body_bytes).unwrap();
+        let body: Value = serde_json::from_slice(
+            &tunnel_protocol::decode_payload(&body_bytes, &body_header).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["request"]["contents"][0]["parts"][0]["thoughtSignature"],
+            if attempt == 0 {
+                "foreign-signature"
+            } else {
+                "skip_thought_signature_validator"
+            }
+        );
+        let status = if attempt == 0 { 400 } else { 200 };
+        let meta = serde_json::to_vec(&tunnel_protocol::ResponseMeta {
+            status,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+        })
+        .unwrap();
+        let mut frame = tunnel_protocol::encode_frame(
+            header.stream_id,
+            tunnel_protocol::RESPONSE_HEADERS,
+            0,
+            &meta,
+        );
+        tunnel_app.hub.handle_proxy_frame(905, &mut frame).await;
+        let payload = if attempt == 0 {
+            rejection().to_string()
+        } else {
+            json!({"candidates":[{"content":{"role":"model","parts":[{"text":"OK"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}).to_string()
+        };
+        let mut frame = tunnel_protocol::encode_frame(
+            header.stream_id,
+            tunnel_protocol::RESPONSE_BODY,
+            0,
+            payload.as_bytes(),
+        );
+        tunnel_app.hub.handle_proxy_frame(905, &mut frame).await;
+        let mut frame =
+            tunnel_protocol::encode_frame(header.stream_id, tunnel_protocol::STREAM_END, 0, &[]);
+        tunnel_app.hub.handle_proxy_frame(905, &mut frame).await;
+    }
+    let (result, diagnostic) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    assert_eq!(auth[0], auth[1]);
+    assert_eq!(diagnostic.unwrap()["final_status"], 200);
+    assert_eq!(
+        original.json_body.as_ref().unwrap()["request"]["contents"][0]["parts"][0]
+            ["thoughtSignature"],
+        "foreign-signature"
+    );
+}
+
 fn sample_model_probe_execution(
     status: &'static str,
     status_code: Option<u16>,
     error_message: Option<String>,
 ) -> ProviderQueryExecutionOutcome {
     ProviderQueryExecutionOutcome {
+        signature_recovery: None,
         status,
         skip_reason: None,
         error_message,

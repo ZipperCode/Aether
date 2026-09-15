@@ -1491,6 +1491,40 @@ pub(crate) async fn execute_sync_plan_with_report_context(
     }
 }
 
+/// 通过现有本地 tunnel 执行同步计划，并把响应头观察值交给候选生命周期。
+///
+/// 同步候选的签名恢复需要在首次响应到达时记录 OAuth/候选状态；正文收集、超时和
+/// tunnel 鉴权仍统一复用 `execute_sync_plan_via_local_tunnel` 的内部实现。
+pub(crate) async fn execute_sync_plan_via_local_tunnel_with_response_started<F>(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    on_response_started: F,
+) -> Result<Option<ExecutionResult>, ExecutionRuntimeTransportError>
+where
+    F: FnOnce(DirectSyncResponseStarted) + Send + 'static,
+{
+    if resolve_local_tunnel_node_id(state, plan.proxy.as_ref()).is_none() {
+        return Ok(None);
+    }
+    with_non_stream_total_timeout(
+        plan,
+        execute_sync_plan_via_local_tunnel_inner(
+            state,
+            plan,
+            report_context,
+            Some(Box::new(on_response_started)),
+        ),
+    )
+    .await
+    .map(Some)
+}
+
+/// 判断执行计划是否绑定了当前进程已认证的本地 tunnel 节点。
+pub(crate) fn has_local_tunnel_proxy(state: &AppState, plan: &ExecutionPlan) -> bool {
+    resolve_local_tunnel_node_id(state, plan.proxy.as_ref()).is_some()
+}
+
 pub(crate) async fn execute_stream_plan_via_local_tunnel(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -1645,15 +1679,18 @@ async fn execute_sync_plan_via_local_tunnel(
 ) -> Result<ExecutionResult, ExecutionRuntimeTransportError> {
     with_non_stream_total_timeout(
         plan,
-        execute_sync_plan_via_local_tunnel_inner(state, plan, report_context),
+        execute_sync_plan_via_local_tunnel_inner(state, plan, report_context, None),
     )
     .await
 }
+
+type SyncResponseStartedCallback = Box<dyn FnOnce(DirectSyncResponseStarted) + Send>;
 
 async fn execute_sync_plan_via_local_tunnel_inner(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
+    on_response_started: Option<SyncResponseStartedCallback>,
 ) -> Result<ExecutionResult, ExecutionRuntimeTransportError> {
     let node_id = resolve_local_tunnel_node_id(state, plan.proxy.as_ref()).ok_or_else(|| {
         ExecutionRuntimeTransportError::RelayError("local tunnel node unavailable".to_string())
@@ -1708,16 +1745,24 @@ async fn execute_sync_plan_via_local_tunnel_inner(
         response_headers_observed_at_unix_ms,
         request_order_id,
     };
-    crate::orchestration::spawn_local_oauth_success_effect(
-        state.clone(),
-        plan,
-        report_context,
-        crate::orchestration::LocalOAuthSuccessEffect {
+    if let Some(on_response_started) = on_response_started {
+        on_response_started(DirectSyncResponseStarted {
             status_code,
-            request_started_at_unix_ms: Some(response_observation.request_started_at_unix_ms),
-            request_order_id: Some(&response_observation.request_order_id),
-        },
-    );
+            ttfb_ms,
+            response_observation: response_observation.clone(),
+        });
+    } else {
+        crate::orchestration::spawn_local_oauth_success_effect(
+            state.clone(),
+            plan,
+            report_context,
+            crate::orchestration::LocalOAuthSuccessEffect {
+                status_code,
+                request_started_at_unix_ms: Some(response_observation.request_started_at_unix_ms),
+                request_order_id: Some(&response_observation.request_order_id),
+            },
+        );
+    }
     let proxy_timing = execution_header_for_log(&headers, "x-proxy-timing").unwrap_or("-");
     let (body_bytes, stream_ttfb_ms) =
         collect_local_tunnel_response_body(response, plan, started_at, response_body_limit_bytes)

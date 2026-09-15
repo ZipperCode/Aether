@@ -2019,14 +2019,26 @@ where
     let outcome = match execution_result {
         Some(result) => result.map(StreamCandidateWatchdogOutcome::Executed),
         None => {
+            let recovery_context = watchdog_progress.recovery_context().map(|recovery| {
+                let mut merged = report_context
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if let (Some(base), Some(extra)) = (merged.as_object_mut(), recovery.as_object()) {
+                    for (key, value) in extra {
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+                merged
+            });
+            let terminal_context = recovery_context.as_ref().or(report_context);
             state
-                .record_admission_candidate_stream_timeout(plan, report_context)
+                .record_admission_candidate_stream_timeout(plan, terminal_context)
                 .await;
             let finished_at_unix_ms = current_unix_ms();
             let request_id = short_request_id(plan.request_id.as_str());
             let provider_name = plan.provider_name.as_deref().unwrap_or("-");
             let model_name = plan.model_name.as_deref().unwrap_or("-");
-            let candidate_index = parse_request_candidate_report_context(report_context)
+            let candidate_index = parse_request_candidate_report_context(terminal_context)
                 .and_then(|context| context.candidate_index)
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
@@ -2034,7 +2046,7 @@ where
             record_local_request_candidate_status(
                 state,
                 plan,
-                report_context,
+                terminal_context,
                 SchedulerRequestCandidateStatusUpdate {
                     status: RequestCandidateStatus::Failed,
                     status_code: None,

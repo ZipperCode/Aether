@@ -26,6 +26,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Model Capability Test](./model-capability-test-contract.md) | Pinned target/reference execution, random suite, scoring, API, and UI boundary | Current |
 | [Provider Model Association Endpoint Evidence](./model-association-endpoint-contract.md) | Default-path discovery, exact association, Endpoint propagation, fallback, and race contract | Current |
 | [Authentication Maintenance Memory](./auth-maintenance-memory-contract.md) | Revision snapshots, lazy transport hydration, compact model-fetch reads, and bounded maintenance startup | Current |
+| [Antigravity Signature Recovery](../../aether-provider-transport/backend/antigravity-signature-recovery-contract.md) | Same-account recovery, deadline and terminal diagnostic ownership | Current |
 
 ---
 

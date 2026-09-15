@@ -166,6 +166,7 @@ struct ProviderQueryTestAttempt {
 }
 
 #[derive(Debug, Clone)]
+/// 固定候选执行结果；恢复诊断只供内部追踪持久化，不改变公开测试响应。
 struct ProviderQueryExecutionOutcome {
     status: &'static str,
     skip_reason: Option<String>,
@@ -177,10 +178,14 @@ struct ProviderQueryExecutionOutcome {
     request_body: Value,
     response_headers: BTreeMap<String, String>,
     response_body: Option<Value>,
+    /// 签名恢复的首次拒绝及最终结果，不含请求正文或凭据。
+    signature_recovery: Option<Value>,
 }
 
 #[derive(Default)]
 struct ProviderQueryTestTraceUpdate<'a> {
+    /// 内部执行结果附带的签名恢复证据，合并到候选扩展字段。
+    signature_recovery: Option<&'a Value>,
     skip_reason: Option<&'a str>,
     error_message: Option<&'a str>,
     status_code: Option<u16>,
@@ -266,9 +271,14 @@ async fn provider_query_persist_test_candidate_trace(
         error_message: update.error_message.map(ToOwned::to_owned),
         latency_ms: update.latency_ms,
         concurrent_requests: None,
-        extra_data: Some(provider_query_test_candidate_trace_extra_data(
-            provider, candidate,
-        )),
+        extra_data: Some({
+            let mut extra = provider_query_test_candidate_trace_extra_data(provider, candidate);
+            if let Some(recovery) = update.signature_recovery {
+                extra[crate::execution_runtime::antigravity_signature::RECOVERY_FIELD] =
+                    recovery.clone();
+            }
+            extra
+        }),
         required_capabilities: None,
         created_at_unix_ms: Some(current_unix_ms()),
         started_at_unix_ms: update.started_at_unix_ms,
@@ -409,6 +419,7 @@ async fn provider_query_finish_test_candidate_trace(
         status,
         ProviderQueryTestTraceUpdate {
             skip_reason: execution.skip_reason.as_deref(),
+            signature_recovery: execution.signature_recovery.as_ref(),
             error_message: projected_error_message.as_deref(),
             status_code: execution.status_code,
             latency_ms: execution.latency_ms,
@@ -514,6 +525,7 @@ fn provider_query_skipped_execution_outcome(
     skip_reason: impl Into<String>,
 ) -> ProviderQueryExecutionOutcome {
     ProviderQueryExecutionOutcome {
+        signature_recovery: None,
         status: "skipped",
         skip_reason: Some(skip_reason.into()),
         error_message: None,
@@ -1955,6 +1967,7 @@ async fn provider_query_execute_kiro_test_candidate(
         .await?
     else {
         return Ok(ProviderQueryExecutionOutcome {
+            signature_recovery: None,
             status: "failed",
             skip_reason: None,
             error_message: Some("oauth auth failed".to_string()),
@@ -1986,6 +1999,7 @@ async fn provider_query_execute_kiro_test_candidate(
         Some(body) => body,
         None => {
             return Ok(ProviderQueryExecutionOutcome {
+                signature_recovery: None,
                 status: "failed",
                 skip_reason: None,
                 error_message: Some("provider request body build failed".to_string()),
@@ -2079,6 +2093,7 @@ async fn provider_query_execute_kiro_test_candidate(
     };
 
     Ok(ProviderQueryExecutionOutcome {
+        signature_recovery: None,
         status: if did_fail || error_message.is_some() {
             "failed"
         } else {
@@ -2454,6 +2469,7 @@ async fn provider_query_execute_openai_image_test_candidate(
         )
     }) else {
         return Ok(ProviderQueryExecutionOutcome {
+            signature_recovery: None,
             status: "failed",
             skip_reason: None,
             error_message: Some("provider request headers build failed".to_string()),
@@ -2607,6 +2623,7 @@ async fn provider_query_execute_openai_image_test_candidate(
     };
 
     Ok(ProviderQueryExecutionOutcome {
+        signature_recovery: None,
         status: if did_fail || error_message.is_some() {
             "failed"
         } else {
@@ -2677,6 +2694,64 @@ async fn provider_query_finalize_antigravity_result(
         .map_err(|err| GatewayError::Internal(err.to_string()))
 }
 
+/// 管理员固定计划的同账号一次恢复，复用原发送路径并回传内部诊断。
+async fn provider_query_execute_antigravity_plan(
+    state: &AdminAppState<'_>,
+    trace_id: &str,
+    plan: &mut ExecutionPlan,
+) -> Result<(aether_contracts::ExecutionResult, Option<Value>), (GatewayError, Option<Value>)> {
+    let started_at = std::time::Instant::now();
+    let mut recovery_context = Some(json!({"envelope_name": "antigravity:v1internal"}));
+    let mut signature_recovery =
+        crate::execution_runtime::antigravity_signature::AntigravitySignatureRecovery::new(
+            plan,
+            recovery_context.as_ref(),
+        );
+    let mut result = match state
+        .execute_execution_runtime_sync_plan(Some(trace_id), plan)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            signature_recovery.observe_transport_error();
+            return Err((error, signature_recovery.diagnostic()));
+        }
+    };
+    match signature_recovery.prepare_retry(
+        plan,
+        &mut recovery_context,
+        result.status_code,
+        result
+            .body
+            .as_ref()
+            .and_then(|body| body.json_body.as_ref()),
+        result.response_observation.as_ref(),
+    ) {
+        Ok(true) => {
+            result = match state
+                .execute_execution_runtime_sync_plan(Some(trace_id), plan)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    signature_recovery.observe_transport_error();
+                    return Err((error, signature_recovery.diagnostic()));
+                }
+            };
+        }
+        Ok(false) => {}
+        Err(error) => return Err((error, signature_recovery.diagnostic())),
+    }
+    signature_recovery.observe(result.status_code, result.response_observation.as_ref());
+    if signature_recovery.has_prepared_retry() {
+        if let Some(telemetry) = result.telemetry.as_mut() {
+            telemetry.elapsed_ms = Some(started_at.elapsed().as_millis() as u64);
+        }
+    }
+    Ok((result, signature_recovery.diagnostic()))
+}
+
+/// 固定 Antigravity 候选测试保留首次签名，拒绝后只重试该候选并返回真实最终请求捕获。
 async fn provider_query_execute_antigravity_test_candidate(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
@@ -2770,6 +2845,7 @@ async fn provider_query_execute_antigravity_test_candidate(
         AntigravityRequestEnvelopeSupport::Supported(envelope) => envelope,
         AntigravityRequestEnvelopeSupport::Unsupported(_) => {
             return Ok(ProviderQueryExecutionOutcome {
+                signature_recovery: None,
                 status: "failed",
                 skip_reason: None,
                 error_message: Some("provider request body build failed".to_string()),
@@ -2833,7 +2909,7 @@ async fn provider_query_execute_antigravity_test_candidate(
         &auth_value,
     );
 
-    let plan = ExecutionPlan {
+    let mut plan = ExecutionPlan {
         request_id: trace_id.to_string(),
         candidate_id: Some(format!("provider-query-{}", candidate.key.id)),
         provider_name: Some(provider.name.clone()),
@@ -2857,9 +2933,35 @@ async fn provider_query_execute_antigravity_test_candidate(
         timeouts: state.resolve_transport_execution_timeouts(&transport),
     };
 
-    let result = state
-        .execute_execution_runtime_sync_plan(Some(trace_id), &plan)
-        .await?;
+    let execution = provider_query_execute_antigravity_plan(state, trace_id, &mut plan).await;
+    // 成功与传输失败均报告实际发送的最终正文，不能退回恢复前的局部副本。
+    let provider_request_body = plan
+        .body
+        .json_body
+        .clone()
+        .expect("Antigravity test uses JSON body");
+    let (result, signature_recovery) = match execution {
+        Ok(value) => value,
+        Err((error, diagnostic)) => {
+            // 无签名恢复时保持原有错误传播，由外层统一记录失败。
+            if diagnostic.is_none() {
+                return Err(error);
+            }
+            return Ok(ProviderQueryExecutionOutcome {
+                signature_recovery: diagnostic,
+                status: "failed",
+                skip_reason: None,
+                error_message: Some("model test execution failed".to_string()),
+                status_code: None,
+                latency_ms: None,
+                request_url,
+                request_headers,
+                request_body: provider_request_body,
+                response_headers: BTreeMap::new(),
+                response_body: None,
+            });
+        }
+    };
     let response_body = if result.status_code < 400 {
         provider_query_finalize_antigravity_result(
             route_path,
@@ -2882,6 +2984,7 @@ async fn provider_query_execute_antigravity_test_candidate(
     };
 
     Ok(ProviderQueryExecutionOutcome {
+        signature_recovery,
         status: if did_fail { "failed" } else { "success" },
         skip_reason: None,
         error_message,
@@ -2977,6 +3080,7 @@ async fn provider_query_execute_grok_test_candidate(
         },
     ) else {
         return Ok(ProviderQueryExecutionOutcome {
+            signature_recovery: None,
             status: "failed",
             skip_reason: None,
             error_message: Some("provider request headers build failed".to_string()),
@@ -3025,6 +3129,7 @@ async fn provider_query_execute_grok_test_candidate(
         Ok(result) => result,
         Err(err) => {
             return Ok(ProviderQueryExecutionOutcome {
+                signature_recovery: None,
                 status: "failed",
                 skip_reason: None,
                 error_message: Some(format!("model test execution failed: {err:?}")),
@@ -3054,6 +3159,7 @@ async fn provider_query_execute_grok_test_candidate(
     };
 
     Ok(ProviderQueryExecutionOutcome {
+        signature_recovery: None,
         status: if did_fail { "failed" } else { "success" },
         skip_reason: None,
         error_message,
@@ -3589,6 +3695,7 @@ async fn provider_query_execute_standard_test_candidate(
         Some(&parts.headers),
     ) {
         return Ok(ProviderQueryExecutionOutcome {
+            signature_recovery: None,
             status: "failed",
             skip_reason: None,
             error_message: Some("provider request headers build failed".to_string()),
@@ -3691,6 +3798,7 @@ async fn provider_query_execute_standard_test_candidate(
     };
 
     Ok(ProviderQueryExecutionOutcome {
+        signature_recovery: None,
         status: if did_fail { "failed" } else { "success" },
         skip_reason: None,
         error_message,
@@ -3798,6 +3906,7 @@ async fn provider_query_execute_windsurf_test_candidate(
         upstream_is_stream,
     ) else {
         return Ok(ProviderQueryExecutionOutcome {
+            signature_recovery: None,
             status: "failed",
             skip_reason: None,
             error_message: Some("provider request headers build failed".to_string()),
@@ -3867,6 +3976,7 @@ async fn provider_query_execute_windsurf_test_candidate(
     };
 
     Ok(ProviderQueryExecutionOutcome {
+        signature_recovery: None,
         status: if did_fail { "failed" } else { "success" },
         skip_reason: None,
         error_message,

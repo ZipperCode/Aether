@@ -2,6 +2,49 @@ use serde_json::{Map, Value};
 
 use super::auth::{AntigravityRequestAuth, ANTIGRAVITY_REQUEST_USER_AGENT};
 
+/// 只识别真实 HTTP 400 的 Gemini 签名拒绝；调用方还必须确认 Antigravity 适配身份。
+pub fn is_antigravity_corrupted_thought_signature(status_code: u16, body: &Value) -> bool {
+    status_code == 400
+        && body.pointer("/error/status").and_then(Value::as_str) == Some("INVALID_ARGUMENT")
+        && body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.trim().trim_end_matches('.').trim_end() == "Corrupted thought signature"
+            })
+}
+
+/// 上游明确拒绝后克隆历史请求，仅替换 model 消息 part 自身已有的签名；无变化时不重试。
+pub fn repair_antigravity_thought_signatures(body: &Value) -> Option<Value> {
+    let mut repaired = body.clone();
+    let request = if body.pointer("/request/contents").is_some() {
+        repaired.get_mut("request")?
+    } else {
+        &mut repaired
+    };
+    let contents = request.get_mut("contents")?.as_array_mut()?;
+    let mut changed = false;
+    for content in contents {
+        if content.get("role").and_then(Value::as_str) != Some("model") {
+            continue;
+        }
+        let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts {
+            for alias in ["thoughtSignature", "thought_signature"] {
+                if let Some(signature) = part.get_mut(alias) {
+                    if signature.as_str() != Some("skip_thought_signature_validator") {
+                        *signature = Value::String("skip_thought_signature_validator".to_string());
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    changed.then_some(repaired)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AntigravityEnvelopeRequestType {
     Agent,
@@ -250,6 +293,7 @@ mod tests {
 
     use super::{
         build_antigravity_safe_v1internal_request, classify_antigravity_safe_request_body,
+        is_antigravity_corrupted_thought_signature, repair_antigravity_thought_signatures,
         AntigravityEnvelopeRequestType, AntigravityRequestAuth, AntigravityRequestEnvelopeSupport,
     };
     use crate::antigravity::ANTIGRAVITY_REQUEST_USER_AGENT;
@@ -264,6 +308,104 @@ mod tests {
             client_version: None,
             session_id: None,
         }
+    }
+
+    /// 仅接受已确认的 HTTP 400 Gemini 错误结构，避免普通签名文案触发语义降级。
+    #[test]
+    fn corrupted_thought_signature_requires_exact_http_error_contract() {
+        let matching = json!({
+            "error": {
+                "status": "INVALID_ARGUMENT",
+                "message": "  Corrupted thought signature...  "
+            }
+        });
+
+        assert!(is_antigravity_corrupted_thought_signature(400, &matching));
+        assert!(!is_antigravity_corrupted_thought_signature(200, &matching));
+        assert!(!is_antigravity_corrupted_thought_signature(
+            400,
+            &json!({"error": {"status": "FAILED_PRECONDITION", "message": "Corrupted thought signature."}}),
+        ));
+        assert!(!is_antigravity_corrupted_thought_signature(
+            400,
+            &json!({"error": {"status": "INVALID_ARGUMENT", "message": "Invalid thought signature."}}),
+        ));
+    }
+
+    /// 定点替换公开与私有正文中的历史 model 签名，同时保留用户/工具数据及原始输入。
+    #[test]
+    fn thought_signature_repair_is_scoped_and_immutable() {
+        let contents = json!([
+            {
+                "role": "model",
+                "parts": [
+                    {
+                        "thoughtSignature": "foreign-signature",
+                        "thought_signature": "foreign-snake-signature",
+                        "thought": "keep reasoning",
+                        "functionCall": {"name": "lookup", "args": {"thoughtSignature": "tool-data"}}
+                    },
+                    {"text": "no signature is inserted"}
+                ]
+            },
+            {
+                "role": "user",
+                "parts": [{"thoughtSignature": "user-data", "text": "keep"}]
+            }
+        ]);
+
+        for source in [
+            json!({"contents": contents.clone(), "metadata": {"thoughtSignature": "root-data"}}),
+            json!({"request": {"contents": contents.clone()}, "thoughtSignature": "envelope-data"}),
+        ] {
+            let original = source.clone();
+            let repaired = repair_antigravity_thought_signatures(&source)
+                .expect("historical model signatures should be replaceable");
+            let repaired_contents = repaired
+                .pointer(if source.get("request").is_some() {
+                    "/request/contents"
+                } else {
+                    "/contents"
+                })
+                .expect("contents should remain present");
+
+            assert_eq!(
+                repaired_contents[0]["parts"][0]["thoughtSignature"],
+                "skip_thought_signature_validator"
+            );
+            assert_eq!(
+                repaired_contents[0]["parts"][0]["thought_signature"],
+                "skip_thought_signature_validator"
+            );
+            assert_eq!(
+                repaired_contents[0]["parts"][0]["thought"],
+                "keep reasoning"
+            );
+            assert_eq!(
+                repaired_contents[0]["parts"][0]["functionCall"]["args"]["thoughtSignature"],
+                "tool-data"
+            );
+            assert!(repaired_contents[0]["parts"][1]
+                .get("thoughtSignature")
+                .is_none());
+            assert_eq!(
+                repaired_contents[1]["parts"][0]["thoughtSignature"],
+                "user-data"
+            );
+            assert_eq!(source, original);
+        }
+
+        assert!(repair_antigravity_thought_signatures(&json!({
+            "contents": [{
+                "role": "model",
+                "parts": [{"thoughtSignature": "skip_thought_signature_validator"}]
+            }]
+        }))
+        .is_none());
+        assert!(repair_antigravity_thought_signatures(&json!({
+            "contents": [{"role": "model", "parts": [{"text": "plain"}]}]
+        }))
+        .is_none());
     }
 
     /// 验证真实 Agent envelope 保留业务字段并应用最终工具 schema/搜索工具私有拼写。

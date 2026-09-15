@@ -22,6 +22,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Runtime Key Quota Block](../../aether-provider-pool/backend/runtime-quota-block-contract.md) | Request credential fingerprint fencing contract | Current |
 | [Codex HTTP Responses Relay](../../aether-ai-formats/backend/codex-http-responses-contract.md) | Native passthrough, credential isolation, SSE, and compact contract | Current |
 | [Antigravity Tool Schema](./antigravity-tool-schema-contract.md) | Private tool metadata adaptation without changing public Gemini or tool semantics | Current |
+| [Antigravity Signature Recovery](./antigravity-signature-recovery-contract.md) | Error-triggered same-account recovery, bounded retry and original/final capture | Current |
 
 ---
 

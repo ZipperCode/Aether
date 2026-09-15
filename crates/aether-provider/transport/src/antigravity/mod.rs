@@ -16,6 +16,7 @@ pub use policy::{
 };
 pub use request::{
     build_antigravity_safe_v1internal_request, classify_antigravity_safe_request_body,
+    is_antigravity_corrupted_thought_signature, repair_antigravity_thought_signatures,
     AntigravityEnvelopeRequestType, AntigravityRequestEnvelopeSupport,
     AntigravityRequestEnvelopeUnsupportedReason,
 };

@@ -1,0 +1,4 @@
+{"file":".trellis/spec/aether-provider-transport/backend/antigravity-tool-schema-contract.md","reason":"Check existing Antigravity boundary remains intact"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Check request/transport contract coverage"}
+{"file":".trellis/tasks/09-09-antigravity-thought-signature-fix/research/live-signatures.md","reason":"Verified incident provenance and final fallback capture limitations"}
+{"file":".trellis/spec/aether-gateway/backend/index.md","reason":"Runtime ownership and existing contracts"}

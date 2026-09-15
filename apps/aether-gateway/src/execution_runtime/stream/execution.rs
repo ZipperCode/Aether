@@ -1311,78 +1311,150 @@ async fn execute_in_process_stream(
     }
 }
 
+/// 提交响应前处理 OAuth 与 Antigravity 签名恢复；两种预算独立，同一候选仅修复一次。
 async fn execute_in_process_stream_with_oauth_retry(
     state: &AppState,
     plan: &mut ExecutionPlan,
     trace_id: &str,
-    report_context: Option<&Value>,
+    report_context: &mut Option<Value>,
+    mut cancellation_guard: Option<&mut AttemptCancellationGuard>,
 ) -> Result<DirectUpstreamStreamExecution, InProcessStreamExecutionError> {
-    let mut execution = execute_in_process_stream(state, plan, trace_id).await?;
-    apply_stream_summary_report_context(&mut execution, report_context);
-    let uses_oauth_credential = stream_plan_uses_oauth_credential(state, plan).await;
-    let embedded_oauth_credential = execution.status_code == 200
-        && plan
-            .provider_api_format
-            .eq_ignore_ascii_case("claude:messages")
-        && uses_oauth_credential;
-    let prefetched_failure = if embedded_oauth_credential {
-        prefetch_direct_anthropic_stream_failure(&mut execution, plan, report_context).await
-    } else {
-        None
-    };
-    let analyzed_prefetched_failure = match prefetched_failure {
-        Some(failure) => {
-            Some(analyze_prefetched_stream_failure(state, plan, report_context, failure).await)
+    use crate::execution_runtime::antigravity_signature::AntigravitySignatureRecovery;
+    let mut recovery = AntigravitySignatureRecovery::new(plan, report_context.as_ref());
+    let mut oauth_retry_attempted = false;
+    loop {
+        if recovery.has_prepared_retry() {
+            if let Err(error) = recovery.reduce_deadline(plan) {
+                recovery.apply_to_context(report_context);
+                if let Some(guard) = cancellation_guard.as_deref_mut() {
+                    guard.refresh_signature_recovery(report_context.as_ref());
+                }
+                recovery
+                    .record_diagnostic(state, plan, report_context.as_ref())
+                    .await;
+                return Err(error.into());
+            }
         }
-        None => None,
-    };
-    let response_text = if let Some(failure) = analyzed_prefetched_failure.as_ref() {
-        Some(failure.response_text.clone())
-    } else if execution.status_code == 403 && uses_oauth_credential {
-        prefetch_direct_stream_error_body(&mut execution).await
-    } else if execution.status_code == 401
-        && stream_plan_uses_codex_agent_identity(state, plan).await
-    {
-        prefetch_direct_stream_error_body(&mut execution).await
-    } else {
-        None
-    };
-    let retry_status_code = analyzed_prefetched_failure
-        .as_ref()
-        .map(|failure| failure.status_code)
-        .unwrap_or(execution.status_code);
-    let retry_requested =
-        analyzed_prefetched_failure
+        let mut execution = match execute_in_process_stream(state, plan, trace_id).await {
+            Ok(execution) => execution,
+            Err(error) => {
+                recovery.observe_transport_error();
+                recovery.apply_to_context(report_context);
+                if let Some(guard) = cancellation_guard.as_deref_mut() {
+                    guard.refresh_signature_recovery(report_context.as_ref());
+                }
+                recovery
+                    .record_diagnostic(state, plan, report_context.as_ref())
+                    .await;
+                return Err(error);
+            }
+        };
+        if execution.status_code == 400
+            && crate::execution_runtime::antigravity_signature::is_antigravity_signature_plan(
+                plan,
+                report_context.as_ref(),
+            )
+            && !execution.stream_precommit_committed
+        {
+            let error_body = prefetch_direct_stream_error_body(&mut execution)
+                .await
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+            let retry = recovery.prepare_retry(
+                plan,
+                report_context,
+                execution.status_code,
+                error_body.as_ref(),
+                Some(&execution.response_observation),
+            );
+            recovery.apply_to_context(report_context);
+            if let Some(guard) = cancellation_guard.as_deref_mut() {
+                guard.refresh_signature_recovery(report_context.as_ref());
+            }
+            recovery
+                .record_diagnostic(state, plan, report_context.as_ref())
+                .await;
+            if retry? {
+                drop(execution);
+                continue;
+            }
+        }
+        apply_stream_summary_report_context(&mut execution, report_context.as_ref());
+        let uses_oauth_credential = stream_plan_uses_oauth_credential(state, plan).await;
+        let embedded_oauth_credential = execution.status_code == 200
+            && plan
+                .provider_api_format
+                .eq_ignore_ascii_case("claude:messages")
+            && uses_oauth_credential;
+        let prefetched_failure = if embedded_oauth_credential {
+            prefetch_direct_anthropic_stream_failure(&mut execution, plan, report_context.as_ref())
+                .await
+        } else {
+            None
+        };
+        let analyzed_prefetched_failure = match prefetched_failure {
+            Some(failure) => Some(
+                analyze_prefetched_stream_failure(state, plan, report_context.as_ref(), failure)
+                    .await,
+            ),
+            None => None,
+        };
+        let response_text = if let Some(failure) = analyzed_prefetched_failure.as_ref() {
+            Some(failure.response_text.clone())
+        } else if execution.status_code == 403 && uses_oauth_credential {
+            prefetch_direct_stream_error_body(&mut execution).await
+        } else if execution.status_code == 401
+            && stream_plan_uses_codex_agent_identity(state, plan).await
+        {
+            prefetch_direct_stream_error_body(&mut execution).await
+        } else {
+            None
+        };
+        let retry_status_code = analyzed_prefetched_failure
             .as_ref()
-            .map_or(execution.status_code >= 400, |failure| {
-                matches!(
-                    failure.disposition.token_action,
-                    FailureTokenAction::ForceRefresh
-                )
-            });
-    if retry_requested
-        && uses_oauth_credential
-        && refresh_oauth_plan_auth_for_retry(
-            state,
-            plan,
-            retry_status_code,
-            response_text.as_deref(),
-            trace_id,
-            report_context,
-            Some(execution.response_observation.request_started_at_unix_ms),
-            Some(&execution.response_observation.request_order_id),
-        )
-        .await
-    {
-        let mut retry_report_context = report_context.cloned();
-        if let Some(retry_report_context) = retry_report_context.as_mut() {
-            refresh_oauth_retry_credential_fingerprint(state, plan, retry_report_context).await;
+            .map(|failure| failure.status_code)
+            .unwrap_or(execution.status_code);
+        let retry_requested =
+            analyzed_prefetched_failure
+                .as_ref()
+                .map_or(execution.status_code >= 400, |failure| {
+                    matches!(
+                        failure.disposition.token_action,
+                        FailureTokenAction::ForceRefresh
+                    )
+                });
+        if retry_requested
+            && !oauth_retry_attempted
+            && uses_oauth_credential
+            && refresh_oauth_plan_auth_for_retry(
+                state,
+                plan,
+                retry_status_code,
+                response_text.as_deref(),
+                trace_id,
+                report_context.as_ref(),
+                Some(execution.response_observation.request_started_at_unix_ms),
+                Some(&execution.response_observation.request_order_id),
+            )
+            .await
+        {
+            oauth_retry_attempted = true;
+            if let Some(retry_report_context) = report_context.as_mut() {
+                refresh_oauth_retry_credential_fingerprint(state, plan, retry_report_context).await;
+            }
+            drop(execution);
+            continue;
         }
-        drop(execution);
-        execution = execute_in_process_stream(state, plan, trace_id).await?;
-        apply_stream_summary_report_context(&mut execution, retry_report_context.as_ref());
+        recovery.observe(execution.status_code, Some(&execution.response_observation));
+        recovery.apply_to_context(report_context);
+        if let Some(guard) = cancellation_guard.as_deref_mut() {
+            guard.refresh_signature_recovery(report_context.as_ref());
+        }
+        recovery
+            .record_diagnostic(state, plan, report_context.as_ref())
+            .await;
+        apply_stream_summary_report_context(&mut execution, report_context.as_ref());
+        return Ok(execution);
     }
-    Ok(execution)
 }
 
 #[derive(Debug)]
@@ -4345,7 +4417,8 @@ async fn execute_execution_runtime_stream_inner(
             state,
             &mut plan,
             trace_id,
-            report_context.as_ref(),
+            &mut report_context,
+            Some(cancellation_guard),
         )
         .await
         {
@@ -4474,7 +4547,8 @@ async fn execute_execution_runtime_stream_inner(
                 state,
                 &mut plan,
                 trace_id,
-                report_context.as_ref(),
+                &mut report_context,
+                Some(cancellation_guard),
             )
             .await
             {
@@ -6536,7 +6610,12 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 status_code,
             );
             if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
-                *retry_scope = ai_attempt_retry_scope_from_failure_disposition(failure_disposition);
+                *retry_scope = if crate::execution_runtime::antigravity_signature::is_antigravity_signature_plan(&plan, report_context.as_ref())
+                    && provider_body_json.as_ref().is_some_and(|body| aether_provider_transport::antigravity::is_antigravity_corrupted_thought_signature(status_code, body)) {
+                    AiAttemptRetryScope::Provider
+                } else {
+                    ai_attempt_retry_scope_from_failure_disposition(failure_disposition)
+                };
             }
             if failure_disposition.preserve_upstream_error {
                 if let Some(retry_fallback) = retry_fallback_out.as_deref_mut() {
@@ -9094,25 +9173,28 @@ fn apply_stream_summary_report_context(
     }
 }
 
-/// 将执行时凭据指纹复制到报告上下文，供额度证据做凭据版本隔离。
+/// 复制执行时凭据、签名恢复诊断与实际发送正文，供后续捕获和终态结算读取。
 fn copy_stream_execution_credential_fingerprint(
     execution: &DirectUpstreamStreamExecution,
     report_context: &mut Option<Value>,
 ) {
-    let Some(fingerprint) = execution
-        .stream_summary_report_context
-        .get(PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD)
-        .cloned()
-    else {
-        return;
-    };
-    let Some(report_context) = report_context.as_mut().and_then(Value::as_object_mut) else {
-        return;
-    };
-    report_context.insert(
-        PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD.to_string(),
-        fingerprint,
-    );
+    for field in [
+        PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD,
+        crate::execution_runtime::antigravity_signature::RECOVERY_FIELD,
+        "provider_request_body",
+    ] {
+        if field == "provider_request_body"
+            && execution
+                .stream_summary_report_context
+                .get(crate::execution_runtime::antigravity_signature::RECOVERY_FIELD)
+                .is_none()
+        {
+            continue;
+        }
+        if let Some(value) = execution.stream_summary_report_context.get(field) {
+            report_context.get_or_insert_with(|| json!({}))[field] = value.clone();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -9120,7 +9202,7 @@ fn copy_stream_execution_credential_fingerprint(
 mod sse_body_tests;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::convert::Infallible;
     use std::sync::{
@@ -10259,7 +10341,244 @@ mod tests {
         }
     }
 
+    /// 真实直连流路径先发送原签名，收到精确 400 后用同一计划和凭据发送一次哨兵正文。
+    #[tokio::test]
+    async fn antigravity_signature_stream_retries_same_candidate_once() {
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let requests_for_server = Arc::clone(&requests);
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("address should resolve");
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/v1internal:streamGenerateContent",
+                any(move |Json(body): Json<Value>| {
+                    let requests = Arc::clone(&requests_for_server);
+                    async move {
+                        let mut requests = requests.lock().expect("request mutex should lock");
+                        requests.push(body);
+                        if requests.len() == 1 {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "error": {
+                                        "status": "INVALID_ARGUMENT",
+                                        "message": "Corrupted thought signature."
+                                    }
+                                })),
+                            )
+                                .into_response()
+                        } else {
+                            (
+                                StatusCode::OK,
+                                [(header::CONTENT_TYPE, "text/event-stream")],
+                                "data: {\"candidates\":[]}\n\n",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+            axum::serve(listener, app)
+                .await
+                .expect("server should start");
+        });
+        let mut plan = antigravity_gemini_stream_plan("antigravity-signature-stream");
+        plan.url = format!("http://{addr}/v1internal:streamGenerateContent");
+        plan.body = RequestBody::from_json(json!({
+            "request": {
+                "contents": [{
+                    "role": "model",
+                    "parts": [{
+                        "thought": "preserved",
+                        "thoughtSignature": "foreign-signature",
+                        "functionCall": {"name": "lookup", "args": {"q": "x"}}
+                    }]
+                }]
+            }
+        }));
+        let original_body = plan.body.clone();
+        let state = test_state();
+
+        let mut report_context = Some(json!({"envelope_name": "antigravity:v1internal"}));
+        let execution = execute_in_process_stream_with_oauth_retry(
+            &state,
+            &mut plan,
+            "trace-antigravity-signature-stream",
+            &mut report_context,
+            None,
+        )
+        .await
+        .expect("signature recovery should return the second response");
+
+        assert_eq!(execution.status_code, StatusCode::OK.as_u16());
+        assert_eq!(requests.lock().expect("request mutex should lock").len(), 2);
+        let observed = requests.lock().expect("request mutex should lock");
+        assert_eq!(
+            observed[0]["request"]["contents"][0]["parts"][0]["thoughtSignature"],
+            "foreign-signature"
+        );
+        assert_eq!(
+            observed[1]["request"]["contents"][0]["parts"][0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert_eq!(
+            observed[1]["request"]["contents"][0]["parts"][0]["thought"],
+            "preserved"
+        );
+        assert_ne!(plan.body, original_body);
+        assert_eq!(
+            execution.stream_summary_report_context["provider_request_body"],
+            plan.body
+                .json_body
+                .clone()
+                .expect("repaired body should exist")
+        );
+        server.abort();
+    }
+
     struct StreamDropFlag(Arc<AtomicBool>);
+
+    /// 非私有请求、无可改签名和普通成功不恢复；反复签名拒绝在两次实际发送后停止。
+    #[tokio::test]
+    async fn antigravity_signature_stream_gate_and_retry_limit() {
+        use crate::execution_runtime::antigravity_signature::tests::{
+            context, signature_plan, signature_server,
+        };
+        for (private, signed, statuses, expected) in [
+            (true, true, vec![400, 400], 2),
+            (true, true, vec![200], 1),
+            (false, true, vec![400], 1),
+            (true, false, vec![400], 1),
+        ] {
+            let server = signature_server(true, statuses.clone()).await;
+            let mut plan = signature_plan(true, &server.url);
+            if !signed {
+                plan.body.json_body.as_mut().unwrap()["request"]["contents"][0]["parts"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("thoughtSignature");
+            }
+            let original = plan.body.json_body.clone().unwrap();
+            let mut report_context = if private { context(&plan) } else { None };
+            let result = execute_in_process_stream_with_oauth_retry(
+                &test_state(),
+                &mut plan,
+                "signature-gates",
+                &mut report_context,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.status_code, *statuses.last().unwrap());
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.len(), expected);
+            assert_eq!(requests[0].1, original);
+            if expected == 2 {
+                assert_eq!(
+                    requests[0].0.get("authorization"),
+                    requests[1].0.get("authorization")
+                );
+            }
+        }
+    }
+
+    /// 流式完整候选在同签名再次拒绝后遵守 provider 范围与停止策略，成功只形成一个终态。
+    #[tokio::test]
+    async fn antigravity_signature_stream_terminal_and_stop_policy() {
+        use crate::execution_runtime::antigravity_signature::tests::{
+            context, signature_plan, signature_server,
+        };
+        use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
+        for (final_status, stop) in [(200, false), (400, false), (400, true)] {
+            let server = signature_server(true, vec![400, final_status]).await;
+            let plan = signature_plan(true, &server.url);
+            let request_id = plan.request_id.clone();
+            let report_context = context(&plan);
+            let candidates = Arc::new(InMemoryRequestCandidateRepository::default());
+            let usage = Arc::new(InMemoryUsageReadRepository::default());
+            let catalog = provider_catalog_for_plan(
+                &plan,
+                stop.then(|| json!({"failover_rules": {"stop_status_codes": [400]}})),
+            );
+            let state = AppState::new().unwrap().with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&candidates), Arc::clone(&usage),
+                ).with_provider_catalog_reader(Arc::new(catalog))
+                 .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ).with_usage_runtime_for_tests(UsageRuntimeConfig { enabled: true, ..Default::default() });
+            let outcome = super::execute_execution_runtime_stream_with_retry_scope(
+                &state,
+                plan,
+                &request_id,
+                &test_decision(),
+                "gemini_chat_stream",
+                None,
+                report_context,
+            )
+            .await
+            .unwrap();
+            match outcome {
+                AiAttemptExecutionOutcome::Responded(response) if final_status == 200 || stop => {
+                    assert_eq!(response.status().as_u16(), final_status);
+                    let _ = to_bytes(response.into_body(), 4096).await.unwrap();
+                }
+                AiAttemptExecutionOutcome::Retry { scope, .. } if !stop && final_status == 400 => {
+                    assert_eq!(scope, AiAttemptRetryScope::Provider)
+                }
+                _ => panic!("unexpected signature outcome"),
+            }
+            // 终态写入走独立的 ordered writer；等待目标状态后再断言，避免
+            // 读到初始 pending 行而把真实终态误报成 fixture 失败。
+            if final_status == 200 || stop {
+                let expected_status = if final_status == 200 {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                let usage = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Some(usage) = usage
+                            .find_by_request_id(&request_id)
+                            .await
+                            .expect("usage should read")
+                        {
+                            if usage.status == expected_status {
+                                break usage;
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("terminal usage should be written");
+                assert_eq!(
+                    usage.billing_status,
+                    if expected_status == "completed" {
+                        "pending"
+                    } else {
+                        "void"
+                    }
+                );
+            }
+            assert_eq!(server.requests.lock().unwrap().len(), 2);
+            let records = candidates.list_by_request_id(&request_id).await.unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].extra_data.as_ref().unwrap()["antigravity_signature_recovery"]
+                    ["final_status"],
+                final_status
+            );
+            assert_eq!(
+                state
+                    .usage_runtime
+                    .metrics_snapshot()
+                    .terminal_submission_rejected_total,
+                0
+            );
+        }
+    }
 
     impl Drop for StreamDropFlag {
         fn drop(&mut self) {
@@ -10899,6 +11218,7 @@ mod tests {
             &state,
             &mut plan,
             "trace-non-agent-401",
+            &mut None,
             None,
         )
         .await
@@ -10977,6 +11297,7 @@ mod tests {
             &state,
             &mut plan,
             "trace-agent-non-task-401",
+            &mut None,
             None,
         )
         .await
@@ -11108,6 +11429,7 @@ mod tests {
             &state,
             &mut plan,
             "trace-agent-invalid-task",
+            &mut None,
             None,
         )
         .await
@@ -11246,6 +11568,7 @@ mod tests {
             &state,
             &mut plan,
             "trace-anthropic-embedded-oauth-refresh",
+            &mut None,
             None,
         )
         .await
@@ -11358,6 +11681,7 @@ mod tests {
             &state,
             &mut plan,
             "trace-anthropic-http-oauth-permission",
+            &mut None,
             None,
         )
         .await
@@ -11544,6 +11868,7 @@ mod tests {
             &state,
             &mut plan,
             "trace-anthropic-embedded-api-key",
+            &mut None,
             None,
         )
         .await
@@ -12784,11 +13109,137 @@ mod tests {
         }
     }
 
-    const LOCAL_TUNNEL_TEST_PSK: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
-    const LOCAL_TUNNEL_TEST_GENERATION: &str = "stream-test-generation-1";
+    pub(crate) const LOCAL_TUNNEL_TEST_PSK: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
+    pub(crate) const LOCAL_TUNNEL_TEST_GENERATION: &str = "stream-test-generation-1";
+
+    /// 通过真实本地 tunnel 帧收发验证签名拒绝后的两次请求仍绑定同一节点、凭据和正文顺序。
+    #[tokio::test]
+    async fn antigravity_signature_local_tunnel_recovery() {
+        use crate::execution_runtime::antigravity_signature::tests::{
+            context, rejection, signature_plan,
+        };
+        let mut plan = signature_plan(true, "https://example.com/v1internal:streamGenerateContent");
+        plan.proxy = Some(tunnel_proxy_snapshot("http://127.0.0.1:1".to_string()));
+        let state = authenticated_local_tunnel_test_state(&plan).await;
+        let tunnel_app = state.tunnel.app_state();
+        let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(16);
+        let (close_tx, _) = watch::channel(false);
+        tunnel_app.hub.register_proxy(Arc::new(
+            TunnelProxyConn::new(
+                903,
+                "node-1".to_string(),
+                "signature-node".to_string(),
+                proxy_tx,
+                close_tx,
+                16,
+                2,
+            )
+            .with_tunnel_generation(LOCAL_TUNNEL_TEST_GENERATION.to_string())
+            .with_authenticated_key(LOCAL_TUNNEL_TEST_PSK.to_string()),
+        ));
+        let task = tokio::spawn(async move {
+            let mut report = context(&plan);
+            let response = execute_in_process_stream_with_oauth_retry(
+                &state,
+                &mut plan,
+                "tunnel-signature",
+                &mut report,
+                None,
+            )
+            .await
+            .unwrap();
+            (response.status_code, plan)
+        });
+        let mut auth = Vec::new();
+        for attempt in 0..2 {
+            let (header, bytes) = loop {
+                let Message::Binary(bytes) =
+                    recv_tunnel_test_frame(&mut proxy_rx, "signature request headers").await
+                else {
+                    panic!("expected tunnel binary")
+                };
+                let header = tunnel_protocol::FrameHeader::parse(&bytes).unwrap();
+                if header.msg_type == tunnel_protocol::REQUEST_HEADERS {
+                    break (header, bytes);
+                }
+            };
+            let meta: tunnel_protocol::RequestMeta =
+                serde_json::from_slice(&tunnel_protocol::decode_payload(&bytes, &header).unwrap())
+                    .unwrap();
+            auth.push(meta.headers.get("authorization").cloned());
+            let Message::Binary(bytes) =
+                recv_tunnel_test_frame(&mut proxy_rx, "signature request body").await
+            else {
+                panic!("expected body frame")
+            };
+            let body_header = tunnel_protocol::FrameHeader::parse(&bytes).unwrap();
+            assert_eq!(body_header.msg_type, tunnel_protocol::REQUEST_BODY);
+            let body: Value = serde_json::from_slice(
+                &tunnel_protocol::decode_payload(&bytes, &body_header).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                body["request"]["contents"][0]["parts"][0]["thoughtSignature"],
+                if attempt == 0 {
+                    "foreign-signature"
+                } else {
+                    "skip_thought_signature_validator"
+                }
+            );
+            let status = if attempt == 0 { 400 } else { 200 };
+            let response_meta = serde_json::to_vec(&tunnel_protocol::ResponseMeta {
+                status,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+            })
+            .unwrap();
+            let mut frame = tunnel_protocol::encode_frame(
+                header.stream_id,
+                tunnel_protocol::RESPONSE_HEADERS,
+                0,
+                &response_meta,
+            );
+            tunnel_app.hub.handle_proxy_frame(903, &mut frame).await;
+            let payload = if attempt == 0 {
+                rejection().to_string()
+            } else {
+                "{}".to_string()
+            };
+            let mut frame = tunnel_protocol::encode_frame(
+                header.stream_id,
+                tunnel_protocol::RESPONSE_BODY,
+                0,
+                payload.as_bytes(),
+            );
+            tunnel_app.hub.handle_proxy_frame(903, &mut frame).await;
+            let mut frame = tunnel_protocol::encode_frame(
+                header.stream_id,
+                tunnel_protocol::STREAM_END,
+                0,
+                &[],
+            );
+            tunnel_app.hub.handle_proxy_frame(903, &mut frame).await;
+        }
+        let (status, plan) = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(auth[0], auth[1]);
+        assert_eq!(plan.key_id, "signature-key");
+    }
 
     /// 一次装配节点认证和计划对应的强读 Key，避免替换数据状态时丢失隧道节点。
-    fn authenticated_local_tunnel_test_state(plan: &ExecutionPlan) -> AppState {
+    pub(crate) async fn authenticated_local_tunnel_test_state(plan: &ExecutionPlan) -> AppState {
+        // 生产隧道在建流前会重新解密并校验加密 PSK；fixture 也必须走同一
+        // 个 envelope，不能把明文放进已废弃的 `encryption_key` 字段，否则
+        // 测试只验证连接对象而没有覆盖真实的凭据重验证路径。
+        let encrypted_psk =
+            crate::handlers::shared::seal_runtime_secret_payload_with_encryption_key(
+                Some(DEVELOPMENT_ENCRYPTION_KEY),
+                "proxy-node-tunnel-psk",
+                LOCAL_TUNNEL_TEST_PSK,
+            )
+            .expect("test tunnel PSK should encrypt");
         let node = StoredProxyNode::new(
             "node-1".to_string(),
             "Node 1".to_string(),
@@ -12815,7 +13266,7 @@ mod tests {
             Some(json!({
                 "tunnel_security": {
                     "mode": TUNNEL_SECURITY_NON_TLS_REQUIRED,
-                    "encryption_key": LOCAL_TUNNEL_TEST_PSK,
+                    "encryption_key_encrypted": encrypted_psk,
                 }
             })),
             None,
@@ -12831,12 +13282,18 @@ mod tests {
         ))
         .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY)
         .with_provider_catalog_reader(Arc::new(provider_catalog_for_plan(plan, None)));
-        AppState::new()
+        let state = AppState::new()
             .expect("app state should build")
-            .with_data_state_for_tests(data)
+            .with_data_state_for_tests(data);
+        // 预先完成一次与生产启动后相同的 legacy→v2 迁移，让后续每次建流
+        // 只验证权威凭据重验证，不把 CAS 迁移竞态混入 tunnel 恢复测试。
+        crate::state::decrypt_or_migrate_proxy_tunnel_psk(&state.data, "node-1")
+            .await
+            .expect("test tunnel PSK should revalidate");
+        state
     }
 
-    async fn recv_tunnel_test_frame(
+    pub(crate) async fn recv_tunnel_test_frame(
         proxy_rx: &mut aether_runtime::BoundedQueueReceiver<Message>,
         description: &str,
     ) -> Message {
@@ -16793,7 +17250,7 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
-        let state = authenticated_local_tunnel_test_state(&plan);
+        let state = authenticated_local_tunnel_test_state(&plan).await;
         let tunnel_app = state.tunnel.app_state();
         let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
         let (proxy_close_tx, _) = watch::channel(false);
@@ -16926,7 +17383,7 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }),
         };
-        let state = authenticated_local_tunnel_test_state(&plan);
+        let state = authenticated_local_tunnel_test_state(&plan).await;
         let tunnel_app = state.tunnel.app_state();
         let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
         let (proxy_close_tx, _) = watch::channel(false);

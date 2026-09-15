@@ -946,6 +946,7 @@ pub fn sanitize_request_candidate_extra_data_for_persistence(
     (!sanitized.is_empty()).then_some(serde_json::Value::Object(sanitized))
 }
 
+/// 按既有候选诊断契约投影字段；恢复证据只保留固定状态、错误类型和请求发送序号。
 pub fn sanitize_request_candidate_extra_data(
     extra_data: Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
@@ -1076,8 +1077,64 @@ fn sanitize_candidate_extra_data_object(
     {
         sanitized.insert("pool_group_exhaustion".to_string(), exhaustion);
     }
+    if let Some(recovery) = object
+        .get("antigravity_signature_recovery")
+        .and_then(sanitize_candidate_signature_recovery)
+    {
+        sanitized.insert("antigravity_signature_recovery".to_string(), recovery);
+    }
 
     sanitized
+}
+
+/// 保留一次签名恢复的有界诊断，沿用候选记录的字段投影，不允许正文/凭据混入该对象。
+fn sanitize_candidate_signature_recovery(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let object = value.as_object()?;
+    let mut summary = serde_json::Map::new();
+    for field in ["original_status", "final_status"] {
+        if let Some(status) = object
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .filter(|status| *status <= u64::from(u16::MAX))
+        {
+            summary.insert(field.to_string(), status.into());
+        }
+    }
+    for (field, expected) in [
+        ("original_error_status", "INVALID_ARGUMENT"),
+        ("original_error_message", "Corrupted thought signature"),
+    ] {
+        if object.get(field).and_then(serde_json::Value::as_str) == Some(expected) {
+            summary.insert(field.to_string(), expected.into());
+        }
+    }
+    if let Some(outcome) = object
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            matches!(
+                *value,
+                "retrying"
+                    | "unchanged"
+                    | "recovered"
+                    | "rejected"
+                    | "transport_error"
+                    | "deadline_exhausted"
+            )
+        })
+    {
+        summary.insert("outcome".to_string(), outcome.into());
+    }
+    for field in ["original_request_order_id", "final_request_order_id"] {
+        if let Some(id) = object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        {
+            summary.insert(field.to_string(), id.into());
+        }
+    }
+    (!summary.is_empty()).then_some(serde_json::Value::Object(summary))
 }
 
 pub fn sanitize_request_candidate_required_capabilities(
@@ -1938,6 +1995,27 @@ pub fn request_candidate_lifecycle_would_regress(
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    /// 存储与读取均保留固定恢复证据，同时维持原有未知字段/凭据剔除规则。
+    #[test]
+    fn antigravity_signature_recovery_survives_candidate_projection() {
+        let expected = json!({"antigravity_signature_recovery": {
+            "original_status": 400, "final_status": 200,
+            "original_error_status": "INVALID_ARGUMENT", "original_error_message": "Corrupted thought signature",
+            "original_request_order_id": "9d378f2b-4026-4325-9f36-881a22662817",
+            "outcome": "recovered"
+        }});
+        let mut input = expected.clone();
+        input["antigravity_signature_recovery"]["thoughtSignature"] = json!("do-not-store");
+        input["antigravity_signature_recovery"]["final_request_order_id"] =
+            json!("Bearer do-not-store");
+        let persisted = super::sanitize_request_candidate_extra_data_for_persistence(Some(input));
+        assert_eq!(persisted, Some(expected.clone()));
+        assert_eq!(
+            super::sanitize_request_candidate_extra_data(persisted),
+            Some(expected)
+        );
+    }
 
     use super::{
         derive_request_candidate_final_status, request_candidate_lifecycle_would_regress,

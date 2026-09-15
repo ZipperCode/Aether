@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use aether_usage_runtime::{build_usage_event_data_seed, UsageEvent, UsageEventType};
@@ -26,6 +26,8 @@ pub(crate) struct StreamCandidateWatchdogProgress {
     terminal_started: AtomicBool,
     /// watchdog 已接管超时结算，取消 Guard 不得再写 Cancelled。
     abandoned: AtomicBool,
+    /// 恢复后的固定诊断，供 watchdog 超时分支读取同一候选上下文。
+    recovery_context: Mutex<Option<Value>>,
 }
 
 tokio::task_local! {
@@ -53,6 +55,31 @@ impl StreamCandidateWatchdogProgress {
     /// 取消路径读取接管事实，避免覆盖 watchdog 已经开始写入的超时终态。
     pub(crate) fn abandoned(&self) -> bool {
         self.abandoned.load(Ordering::Acquire)
+    }
+
+    /// 保存恢复后的候选报告上下文；仅在签名恢复发生后写入。
+    pub(crate) fn set_recovery_context(&self, context: Option<&Value>) {
+        let Some(context) = context else { return };
+        let mut compact = serde_json::Map::new();
+        for field in [
+            crate::execution_runtime::antigravity_signature::RECOVERY_FIELD,
+            "provider_request_body",
+        ] {
+            if let Some(value) = context.get(field) {
+                compact.insert(field.to_string(), value.clone());
+            }
+        }
+        if let Ok(mut slot) = self.recovery_context.lock() {
+            *slot = Some(Value::Object(compact));
+        }
+    }
+
+    /// 读取 watchdog 终态需要的恢复上下文快照。
+    pub(crate) fn recovery_context(&self) -> Option<Value> {
+        self.recovery_context
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// The watchdog watching the attempt on this task, if it runs under one.
