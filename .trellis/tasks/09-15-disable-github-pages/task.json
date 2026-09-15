@@ -1,0 +1,28 @@
+{
+  "id": "disable-github-pages",
+  "name": "disable-github-pages",
+  "title": "恢复停用 GitHub Pages",
+  "description": "Restore explicitly disabled GitHub Pages without changing the v0.7.34 release.",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": "github-pages",
+  "package": null,
+  "priority": "P2",
+  "creator": "zipper",
+  "assignee": "zipper",
+  "createdAt": "2026-09-15",
+  "completedAt": null,
+  "branch": "codex/disable-github-pages",
+  "base_branch": "master",
+  "worktree_path": "D:/Project/GitHub/Aether-disable-pages",
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    ".github/workflows/deploy-pages.yml"
+  ],
+  "notes": "",
+  "meta": {}
+}
