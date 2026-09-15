@@ -7,7 +7,8 @@ fn subscription(exhausted: bool) -> ProviderQuotaSnapshotContract {
             source_id: Some("subscription".into()),
             code: "cycle".into(),
             scope: "account".into(),
-            unit: "proportion".into(),
+            // 与实际解析器的比例单位一致，才能验证有效额度的调度转换。
+            unit: "percent".into(),
             reset_at: Some(4_102_444_800),
             is_exhausted: exhausted,
             ..Default::default()
