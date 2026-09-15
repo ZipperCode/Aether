@@ -1,11 +1,14 @@
 import type {
   ModelProbeStatusSnapshot,
   ProviderKeyStatusSnapshot,
+  QuotaBalanceSnapshot,
+  QuotaSourceSnapshot,
   QuotaStatusSnapshot,
   QuotaWindowSnapshot,
 } from '@/api/endpoints/types/statusSnapshot'
 import type { UpstreamMetadata } from '@/api/endpoints/types/provider'
 import { getCodexQuotaWindowPresentation } from '@/utils/codexQuotaWindow'
+import { isOfficialQuotaProviderType } from '@/features/providers/utils/providerTypeUtils'
 
 export interface ProviderKeyQuotaCarrier {
   account_quota?: string | null
@@ -28,15 +31,8 @@ function normalizeText(value: unknown): string | null {
   return text || null
 }
 
-function clampPercent(value: number): number {
-  if (!Number.isFinite(value)) return 0
-  if (value < 0) return 0
-  if (value > 100) return 100
-  return value
-}
-
 function formatPercent(value: number): string {
-  return `${clampPercent(value).toFixed(1)}%`
+  return `${Math.max(value, 0).toFixed(1)}%`
 }
 
 function getQuotaSnapshot(
@@ -66,38 +62,30 @@ export function isZhipuInformationalBalanceFallback(
   return status === 'query_failed' || status === 'business_error'
 }
 
-/** DeepSeek 额度刷新失败时，保留的旧余额不能继续作为当前可用余额展示。 */
-export function isDeepSeekQuotaUnavailable(
+/** 查询权限与模型调用权限不同；此标签只描述查询结果，不推断 Key 失效。 */
+export function getQuotaQueryStatusLabel(
   quota: QuotaStatusSnapshot | null | undefined,
   fallbackProviderType?: string | null,
-): boolean {
-  if (getQuotaProviderType(quota, fallbackProviderType) !== 'deepseek') return false
-  const freshness = normalizeText(quota?.freshness)?.toLowerCase()
-  if (freshness === 'stale' || freshness === 'error') return true
-  const code = normalizeText(quota?.code)?.toLowerCase()
-  return code !== 'ok' && normalizeText(quota?.refresh_state?.error) != null
-}
-
-/** 官方额度接口明确拒绝鉴权时，Key 的额度快照与保留余额都不再可信。 */
-export function isQuotaAuthenticationExpired(
-  quota: QuotaStatusSnapshot | null | undefined,
-): boolean {
-  const code = normalizeText(quota?.code)?.toLowerCase()
-  if (code === 'http_unauthorized') return true
-
-  const error = normalizeText(quota?.refresh_state?.error)?.toLowerCase()
-  return error?.startsWith('http_unauthorized:') === true
-    || error === 'http_unauthorized'
-    || error?.includes('quota upstream rejected authentication') === true
-}
-
-/** 通用额度区域应隐藏旧数据并展示账号级失效标记的场景。 */
-export function isGenericQuotaUnavailable(
-  quota: QuotaStatusSnapshot | null | undefined,
-  fallbackProviderType?: string | null,
-): boolean {
-  return isQuotaAuthenticationExpired(quota)
-    || isDeepSeekQuotaUnavailable(quota, fallbackProviderType)
+): string | null {
+  if (!isOfficialQuotaProviderType(getQuotaProviderType(quota, fallbackProviderType))) return null
+  const sources = quota?.sources ?? []
+  if (sources.length > 0) {
+    // 不适用和不支持是已完成的能力结论，不应让成功的套餐显示为部分失败。
+    const applicable = sources.filter(source => source.query_status !== 'not_applicable' && source.query_status !== 'unsupported')
+    const successful = applicable.filter(source => source.query_status === 'ok' && source.freshness === 'fresh')
+    if (applicable.length > 0 && successful.length === applicable.length) return null
+    if (successful.length > 0) return '额度部分更新'
+    const unresolved = applicable.length ? applicable : sources
+    const statuses = new Set(unresolved.map(source => source.query_status))
+    if (unresolved.every(source => source.freshness === 'stale')) return '额度已过期'
+    if (statuses.size === 1) return quotaQueryStatusText(unresolved[0].query_status)
+    if (applicable.length === 0) return '暂无可查询额度'
+    return '额度查询未完成'
+  }
+  if (quota?.refresh_state?.error) return '额度查询失败'
+  if (quota?.freshness === 'stale') return '额度已过期'
+  if (!quota || quota.code === 'unknown') return '额度未查询'
+  return null
 }
 
 function getQuotaWindows(
@@ -106,25 +94,20 @@ function getQuotaWindows(
   return Array.isArray(quota?.windows) ? quota.windows : []
 }
 
-function getQuotaWindowRemainingPercent(
+export function getQuotaWindowRemainingPercent(
   window: QuotaWindowSnapshot | null | undefined,
 ): number | null {
-  if (!window) return null
-  if (typeof window.remaining_ratio === 'number') {
-    return clampPercent(window.remaining_ratio * 100)
-  }
-  if (typeof window.used_ratio === 'number') {
-    return clampPercent((1 - window.used_ratio) * 100)
-  }
-  if (typeof window.limit_value === 'number' && window.limit_value > 0) {
-    if (typeof window.remaining_value === 'number') {
-      return clampPercent((window.remaining_value / window.limit_value) * 100)
-    }
-    if (typeof window.used_value === 'number') {
-      return clampPercent((1 - (window.used_value / window.limit_value)) * 100)
-    }
-  }
-  return null
+  if (!window || window.is_included === false || window.unlimited === true) return null
+  const remainingRatio = finiteNumber(window.remaining_ratio)
+  if (remainingRatio != null) return Math.max(remainingRatio * 100, 0)
+  const usedRatio = finiteNumber(window.used_ratio)
+  if (usedRatio != null) return Math.max((1 - usedRatio) * 100, 0)
+  const limit = finiteNumber(window.limit_value)
+  if (limit == null || limit <= 0) return null
+  const remaining = finiteNumber(window.remaining_value)
+  if (remaining != null) return Math.max(remaining / limit * 100, 0)
+  const used = finiteNumber(window.used_value)
+  return used == null ? null : Math.max((1 - used / limit) * 100, 0)
 }
 
 function getQuotaWindow(
@@ -135,7 +118,8 @@ function getQuotaWindow(
   return getQuotaWindows(quota).find(window => normalizeText(window.code)?.toLowerCase() === normalizedCode) ?? null
 }
 
-function finiteNumber(value: unknown): number | null {
+/** 仅为比例和阈值计算解析数字；精确金额文字不能经过 Number 转换。 */
+export function finiteNumber(value: unknown): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
   if (typeof value === 'string') {
     const text = value.trim()
@@ -202,11 +186,12 @@ export function formatDecimalDisplay(value: unknown): string | null {
   }
   if (typeof value !== 'string') return null
   const text = value.trim()
-  const match = /^([+-]?)(\d+)(?:\.(\d*))?$/.exec(text)
+  const match = /^([+-]?)(\d*)(?:\.(\d*))?$/.exec(text)
   if (!match) return null
   const [, sign, integer, fraction] = match
-  const grouped = integer.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
-  return `${sign}${grouped}${fraction === undefined ? '' : `.${fraction}`}`
+  if (!integer && !fraction) return null
+  const grouped = (integer || '0').replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return `${sign}${grouped}${fraction ? `.${fraction}` : ''}`
 }
 
 function firstFiniteNumber(...values: unknown[]): number | null {
@@ -250,116 +235,251 @@ function getQuotaWindowsByScope(
 }
 
 function formatQuotaValue(value: number | null | undefined): string {
-  const normalized = Number(value)
-  if (!Number.isFinite(normalized)) return '0'
-  const rounded = Math.round(normalized)
-  if (Math.abs(normalized - rounded) < 1e-6) {
-    return String(rounded)
-  }
-  return normalized.toFixed(1)
+  return formatDecimalDisplay(value) ?? '未知'
 }
 
 function formatBalanceValue(value: unknown, unit: string): string | null {
   const amount = formatDecimalDisplay(value)
   if (amount == null) return null
   const normalizedUnit = unit.trim().toUpperCase()
-  return normalizedUnit === 'USD' ? `$${amount}` : `${amount} ${normalizedUnit || '额度'}`
+  return normalizedUnit === 'USD' ? `$${amount}` : `${amount} ${normalizedUnit || '币种未注明'}`
 }
 
-/** Provider-neutral quota text. Structured snapshots take precedence over legacy labels. */
+export interface GenericQuotaBalanceDisplay {
+  key: string
+  label: string
+  available: string
+  parts: string[]
+  remainingPercent: number | null
+  insufficient: boolean
+  summary: string
+}
+
+export interface GenericQuotaWindowDisplay {
+  key: string
+  label: string
+  remainingPercent: number | null
+  meterText: string
+  detail: string | null
+  resetText: string | null
+  summary: string
+}
+
+export interface GenericQuotaSourceDisplay {
+  id: string
+  label: string
+  metadata: string[]
+  status: string | null
+  error: string | null
+  updatedText: string | null
+  stale: boolean
+  notes: string[]
+  balances: GenericQuotaBalanceDisplay[]
+  windows: GenericQuotaWindowDisplay[]
+}
+
+function quotaQueryStatusText(status: QuotaSourceSnapshot['query_status']): string {
+  const labels: Record<QuotaSourceSnapshot['query_status'], string> = {
+    not_queried: '未查询', ok: '查询成功', unsupported: '不支持查询',
+    permission_denied: '无查询权限', not_applicable: '不适用', error: '查询失败',
+  }
+  return labels[status] || '查询状态未知'
+}
+
+/** 只展示已知计量单位；未知额度既不冒充 Token，也不换算成货币。 */
+export function getQuotaUnitLabel(unit?: string | null): string {
+  const value = normalizeText(unit)?.toLowerCase()
+  const labels: Record<string, string> = {
+    percent: '%', count: '次', requests: '次', tokens: 'Token', token: 'Token',
+    credits: '积分', credit: '积分', points: '积分', point: '积分',
+    usd: 'USD', cny: 'CNY', rmb: 'CNY',
+    quota: '额度单位', opaque: '额度单位', units: '额度单位',
+  }
+  return value ? labels[value] || (unit || '').trim() : '单位未知'
+}
+
+export function getGenericQuotaTypeLabel(quota?: QuotaStatusSnapshot | null): string | null {
+  const products = new Set((quota?.sources ?? [])
+    .filter(source => source.query_status !== 'not_applicable' && source.query_status !== 'unsupported')
+    .map(source => source.product))
+  if (products.size > 1) return '多项额度'
+  if (products.has('key_spending_limit')) return 'Key 消费限额'
+  if (products.has('coding_plan')) return 'Coding Plan'
+  if (products.has('token_plan')) return 'Token Plan'
+  if (products.has('extra_usage')) return '额外用量'
+  if ((quota?.windows?.length ?? 0) > 0) return '套餐额度'
+  return quota?.balances?.[0]?.unit?.trim().toUpperCase() || null
+}
+
+export function formatQuotaDateTime(value: unknown): string | null {
+  if (value == null || value === '') return null
+  const date = typeof value === 'number' ? new Date(value * 1000) : new Date(String(value))
+  return Number.isNaN(date.getTime()) ? null : date.toLocaleString()
+}
+
+function getBalanceDisplay(
+  balance: QuotaBalanceSnapshot,
+  index: number,
+  spendingLimit: boolean,
+  unlimited: boolean,
+  informational: boolean,
+): GenericQuotaBalanceDisplay {
+  const available = formatBalanceValue(balance.available, balance.unit)
+  const availableNumber = finiteNumber(balance.available)
+  const totalNumber = finiteNumber(balance.total)
+  const label = spendingLimit ? 'Key 剩余消费额度' : informational ? '标准余额（参考）' : '可用余额'
+  const parts = [
+    [spendingLimit ? '消费上限' : '总额', balance.total],
+    ['赠送', balance.granted], ['充值', balance.topped_up], ['累计已用', balance.used],
+  ].flatMap(([partLabel, value]) => {
+    const formatted = formatBalanceValue(value, balance.unit)
+    return formatted == null ? [] : [`${partLabel} ${formatted}`]
+  })
+  const valueText = unlimited && spendingLimit ? '未设置消费上限' : available ?? '未知'
+  return {
+    key: `${balance.source_id || 'legacy'}-${balance.unit}-${index}`,
+    label,
+    available: valueText,
+    parts,
+    remainingPercent: spendingLimit && !unlimited && availableNumber != null && totalNumber != null && totalNumber > 0
+      ? Math.max(availableNumber / totalNumber * 100, 0) : null,
+    insufficient: !unlimited && availableNumber != null && availableNumber <= 0,
+    summary: [`${label} ${valueText}`, ...parts].join(' · '),
+  }
+}
+
+function getWindowDisplay(window: QuotaWindowSnapshot, index: number): GenericQuotaWindowDisplay {
+  const label = normalizeText(window.label) || normalizeText(window.code) || '套餐额度'
+  const percent = getQuotaWindowRemainingPercent(window)
+  const remaining = formatDecimalDisplay(window.remaining_value)
+  const used = formatDecimalDisplay(window.used_value)
+  const limit = formatDecimalDisplay(window.limit_value)
+  const unit = getQuotaUnitLabel(window.unit)
+  const valueDetail = window.unit === 'percent' ? null : remaining != null
+    ? `${remaining}${limit != null ? ` / ${limit}` : ''} ${unit}`
+    : used != null ? `已用 ${used}${limit != null ? ` / ${limit}` : ''} ${unit}`
+      : limit != null ? `上限 ${limit} ${unit}` : null
+  const meterText = window.is_included === false ? '套餐不包含'
+    : window.unlimited === true ? '不限额'
+      : percent != null ? `剩余 ${formatPercent(percent)}` : valueDetail ?? '额度未知'
+  const resetAt = formatQuotaDateTime(window.reset_at) || normalizeText(window.reset_at_text)
+  const resetSeconds = finiteNumber(window.reset_seconds)
+  const resetText = resetAt ? `重置 ${resetAt}`
+    : resetSeconds != null ? `${Math.ceil(Math.max(resetSeconds, 0) / 60)} 分钟后重置` : null
+  const detail = window.is_included === false || window.unlimited === true ? null
+    : percent != null ? valueDetail : null
+  return {
+    key: `${window.source_id || 'legacy'}-${window.code}-${index}`,
+    label,
+    remainingPercent: percent,
+    meterText,
+    detail,
+    resetText,
+    summary: [`${label} ${meterText}`, detail, resetText].filter(Boolean).join(' · '),
+  }
+}
+
+/** 从同一份快照投影来源分组，不复制额度数据或重算旧套餐金额。 */
+export function getGenericQuotaGroups(
+  quota: QuotaStatusSnapshot | null | undefined,
+  fallbackProviderType?: string | null,
+): GenericQuotaSourceDisplay[] {
+  if (!quota) return []
+  const providerType = getQuotaProviderType(quota, fallbackProviderType)
+  const sources = quota.sources ?? []
+  const groups: Array<QuotaSourceSnapshot | null> = sources.length ? [...sources] : [null]
+  const sourceIds = new Set(sources.map(source => source.id))
+  // 旧快照或未知来源字段仍可阅读，但不推断其属于哪个新套餐。
+  const hasUnassigned = [...(quota.balances ?? []), ...(quota.windows ?? [])]
+    .some(item => !item.source_id || !sourceIds.has(item.source_id))
+  if (sources.length && hasUnassigned) groups.push(null)
+
+  return groups.map((source) => {
+    const belongs = (item: { source_id?: string | null }) => source
+      ? item.source_id === source.id
+      : !item.source_id || !sourceIds.has(item.source_id)
+    const spendingLimit = source?.product === 'key_spending_limit' || (!source && providerType === 'openrouter')
+    const spendingUnlimited = spendingLimit && (quota.key_limit_unlimited ?? quota.unlimited) === true
+    const stale = (source?.freshness ?? quota.freshness) === 'stale'
+    const refreshState = source?.refresh_state ?? quota.refresh_state
+    const error = normalizeText(refreshState?.error)
+      || (!source ? normalizeText(quota.token_plan_error) : null)
+    const status = source ? quotaQueryStatusText(source.query_status)
+      : error ? '查询失败' : quota.code === 'unknown' ? '未查询' : null
+    const scopeLabels: Record<string, string> = { personal: '个人', team: '团队', account: '账户', key: '当前 Key' }
+    const regionLabels: Record<string, string> = { cn: '国内', global: '国际', international: '国际' }
+    const metadata = source ? [
+      source.plan_name, source.plan_tier, source.plan_id ? `套餐 ID ${source.plan_id}` : null,
+      source.scope ? scopeLabels[source.scope] || source.scope : null,
+      source.region ? regionLabels[source.region] || source.region : null,
+    ] : [quota.membership_level || quota.plan_type,
+      quota.token_plan_scope ? scopeLabels[quota.token_plan_scope] || quota.token_plan_scope : null]
+    const notes: string[] = []
+    if (stale) notes.push('数据已过期，显示上次成功结果')
+    if (providerType === 'siliconflow' && source?.region === 'cn' && source.query_status === 'unsupported') {
+      notes.push('官方国内余额接口已停用，暂无替代接口')
+    }
+    if (source && (source.product === 'coding_plan' || source.product === 'token_plan') && !normalizeText(source.plan_tier)) {
+      metadata.push('套餐档位未知')
+    }
+    if (source?.currency_source === 'region_mapping') notes.push('币种依据站点区域，接口未返回币种')
+    if (source?.currency_source === 'official_client_default') notes.push('币种使用官方客户端默认值 USD，接口未返回币种')
+    if (spendingLimit) {
+      if (spendingUnlimited) notes.push('未设置消费上限')
+      notes.push('账户余额未知')
+      if (quota.limit_reset != null) notes.push(`限额重置 ${formatQuotaDateTime(quota.limit_reset) || quota.limit_reset}`)
+      if (quota.expires_at != null) notes.push(`到期 ${formatQuotaDateTime(quota.expires_at) || quota.expires_at}`)
+      if (quota.include_byok_in_limit != null) notes.push(quota.include_byok_in_limit ? '消费上限包含 BYOK' : '消费上限不包含 BYOK')
+      for (const [label, value] of [
+        ['日消费', quota.usage_daily], ['周消费', quota.usage_weekly], ['月消费', quota.usage_monthly],
+        ['BYOK 累计消费', quota.byok_usage], ['BYOK 日消费', quota.byok_usage_daily],
+        ['BYOK 周消费', quota.byok_usage_weekly], ['BYOK 月消费', quota.byok_usage_monthly],
+      ]) {
+        const amount = formatBalanceValue(value, 'USD')
+        if (amount != null) notes.push(`${label} ${amount}`)
+      }
+    }
+    if (!source && quota.parallel_limit != null) metadata.push(`并发 ${formatDecimalDisplay(quota.parallel_limit) || '未知'}`)
+    if (!source && !spendingLimit && quota.expires_at != null) metadata.push(`到期 ${formatQuotaDateTime(quota.expires_at) || quota.expires_at}`)
+    return {
+      id: source?.id || 'legacy',
+      label: source?.label || (sources.length ? '原有额度' : spendingLimit ? 'Key 消费限额' : '账户额度'),
+      metadata: [...new Set(metadata.filter((value): value is string => Boolean(value)))],
+      status,
+      error,
+      updatedText: formatQuotaDateTime(refreshState?.last_success_at
+        ?? (!source ? quota.observed_at ?? quota.updated_at : null)),
+      stale,
+      notes,
+      balances: (quota.balances ?? []).filter(belongs).map((balance, index) => getBalanceDisplay(
+        balance, index, spendingLimit, spendingUnlimited,
+        !source && isZhipuInformationalBalanceFallback(quota, fallbackProviderType),
+      )),
+      windows: getQuotaWindows(quota).filter(belongs).map(getWindowDisplay),
+    }
+  })
+}
+
+/** 列表摘要与卡片使用相同的来源、精确数值和单位。 */
 export function getGenericQuotaSections(
   quota: QuotaStatusSnapshot | null | undefined,
   fallbackProviderType?: string | null,
-): {
-  balances: string[]
-  windows: string[]
-  rateLimits: string[]
-  status: string[]
-} {
-  if (!quota) return { balances: [], windows: [], rateLimits: [], status: [] }
-
-  if (isGenericQuotaUnavailable(quota, fallbackProviderType)) {
-    return { balances: [], windows: [], rateLimits: [], status: ['不可用'] }
+): { balances: string[]; windows: string[]; rateLimits: string[]; status: string[] } {
+  const groups = getGenericQuotaGroups(quota, fallbackProviderType)
+  const grouped = (quota?.sources?.length ?? 0) > 0
+  const prefix = (group: GenericQuotaSourceDisplay) => grouped ? `${group.label}：` : ''
+  return {
+    balances: groups.flatMap(group => group.balances.map(balance => `${prefix(group)}${balance.summary}`)),
+    windows: groups.flatMap(group => group.windows.map(window => `${prefix(group)}${window.summary}`)),
+    rateLimits: Object.entries(quota?.rate_limits ?? {}).flatMap(([key, value]) => {
+      const formatted = key === 'kind' ? null : formatDecimalDisplay(value)
+      return formatted == null ? [] : [`${key.toUpperCase()} ${formatted}`]
+    }),
+    status: groups.flatMap(group => [
+      group.status && group.status !== '查询成功' ? `${prefix(group)}${group.status}` : null,
+      ...group.notes.map(note => `${prefix(group)}${note}`),
+    ].filter((value): value is string => value != null)),
   }
-
-  const informationalZhipuBalance = isZhipuInformationalBalanceFallback(
-    quota,
-    fallbackProviderType,
-  )
-  const ambiguousZhipuQuota = isZhipuAmbiguousQuotaFallback(quota, fallbackProviderType)
-
-  const balances = (Array.isArray(quota.balances) ? quota.balances : []).flatMap((balance) => {
-    if (ambiguousZhipuQuota) return []
-    const available = formatBalanceValue(balance.available, balance.unit)
-    if (!available) return []
-    const total = formatBalanceValue(balance.total ?? balance.granted, balance.unit)
-    const availableNumber = finiteNumber(balance.available)
-    const insufficient = quota.balance_insufficient === true
-      || (availableNumber != null && availableNumber <= 0)
-    const label = insufficient
-      ? informationalZhipuBalance ? '标准余额不足' : '余额不足'
-      : informationalZhipuBalance ? '标准余额可用' : '可用'
-    return [`${label} ${available}${total ? ` / 总额 ${total}` : ''}`]
-  })
-  if (quota.unlimited === true && balances.length === 0) balances.push('无限制')
-  const windows = getQuotaWindows(quota).flatMap((window) => {
-    const label = normalizeText(window.label) || normalizeText(window.code) || '订阅窗口'
-    const remaining = getQuotaWindowRemainingPercent(window)
-    const value = getQuotaWindowValueText(window)
-    if (value) return [`${label} 剩余 ${value}`]
-    if (remaining != null) return [`${label} 剩余 ${formatPercent(remaining)}`]
-    return []
-  })
-  const rateLimits = Object.entries(quota.rate_limits ?? {}).flatMap(([key, value]) => {
-    if (key === 'kind') return []
-    const limit = finiteNumber(value)
-    return limit == null ? [] : [`${key.toUpperCase()} ${formatQuotaValue(limit)}`]
-  })
-  const status: string[] = []
-  const appendStatus = (value: string | null) => {
-    if (value && !status.includes(value)) status.push(value)
-  }
-  if (ambiguousZhipuQuota) {
-    appendStatus('额度查询失败，额度未知')
-    return { balances, windows, rateLimits, status }
-  }
-  if (quota.freshness === 'stale') appendStatus('数据已过期')
-  else if (quota.freshness === 'error') appendStatus('刷新失败')
-  else if (quota.freshness === 'unknown') appendStatus('更新时间未知')
-
-  const error = normalizeText(quota.refresh_state?.error)
-  const tokenPlanError = normalizeText(quota.token_plan_error) || error
-  const tokenPlanStatus = normalizeText(quota.token_plan_status)?.toLowerCase()
-  if (getQuotaProviderType(quota) === 'zhipu') {
-    if (tokenPlanStatus === 'expired') appendStatus('Coding Plan 已过期')
-    else if (tokenPlanStatus === 'not_permitted') appendStatus('无 Coding Plan 权限')
-    else if (tokenPlanStatus === 'product_mismatch') appendStatus('Coding Plan 类型不匹配')
-    else if (tokenPlanStatus === 'balance_insufficient') appendStatus('余额不足')
-    else if (tokenPlanStatus === 'query_failed' || tokenPlanStatus === 'business_error') {
-      appendStatus(tokenPlanError?.includes('business code 500')
-        ? 'Coding Plan 查询失败（上游 500）'
-        : 'Coding Plan 查询失败')
-    }
-    if (quota.balance_insufficient === true
-      || quota.balances?.some(balance => {
-        const available = finiteNumber(balance.available)
-        return available != null && available <= 0
-      })) {
-      appendStatus(informationalZhipuBalance
-        ? '标准余额不足（不阻断模型调用）'
-        : '余额不足')
-    }
-  }
-  if (error?.includes('business code 1113')) {
-    appendStatus(informationalZhipuBalance
-      ? '标准余额不足（不阻断模型调用）'
-      : '余额不足')
-  }
-  else if (getQuotaProviderType(quota) === 'zhipu' && error?.includes('business code 500')) {
-    appendStatus('Coding Plan 查询失败（上游 500）')
-  } else if (error && error !== tokenPlanError) appendStatus(error)
-  else if (error && !tokenPlanStatus) appendStatus(error)
-  return { balances, windows, rateLimits, status }
 }
 
 function getQuotaWindowValueText(window: QuotaWindowSnapshot | null | undefined): string | null {
@@ -695,12 +815,17 @@ export function getQuotaDisplayText(
   fallbackProviderType?: string | null,
 ): string | null {
   const quota = getQuotaSnapshot(input)
-  if (isGenericQuotaUnavailable(quota, fallbackProviderType)) return '不可用'
-  const availability = getZhipuModelAvailabilityDisplay(
+  const availability = (quota?.sources?.length ?? 0) > 0 ? null : getZhipuModelAvailabilityDisplay(
     quota,
     input.status_snapshot?.model_probe,
     fallbackProviderType,
   )
+  if (isOfficialQuotaProviderType(getQuotaProviderType(quota, fallbackProviderType))) {
+    const sections = getGenericQuotaSections(quota, fallbackProviderType)
+    const values = [availability?.text, ...sections.balances, ...sections.windows, ...sections.rateLimits, ...sections.status]
+      .filter((value): value is string => Boolean(value))
+    return values.length ? values.join(' | ') : getQuotaQueryStatusLabel(quota, fallbackProviderType) || '额度未知'
+  }
   if (availability) return availability.text
   if (quota && (quota.kind || (quota.balances?.length ?? 0) > 0)) {
     const sections = getGenericQuotaSections(quota, fallbackProviderType)

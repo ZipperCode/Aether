@@ -1,7 +1,27 @@
 use super::*;
 
 fn subscription(exhausted: bool) -> ProviderQuotaSnapshotContract {
-    let mut snapshot = ProviderQuotaSnapshotContract::subscription("kimi_coding", Vec::new(), 100);
+    let mut snapshot = ProviderQuotaSnapshotContract::subscription(
+        "kimi_coding",
+        vec![ProviderQuotaWindow {
+            source_id: Some("subscription".into()),
+            code: "cycle".into(),
+            scope: "account".into(),
+            unit: "proportion".into(),
+            reset_at: Some(4_102_444_800),
+            is_exhausted: exhausted,
+            ..Default::default()
+        }],
+        100,
+    );
+    snapshot.sources.push(ProviderQuotaSource {
+        id: "subscription".into(),
+        product: "coding_plan".into(),
+        scope: "account".into(),
+        query_status: ProviderQuotaQueryStatus::Ok,
+        freshness: "fresh".into(),
+        ..Default::default()
+    });
     snapshot.exhausted = exhausted;
     snapshot
 }
@@ -17,6 +37,7 @@ fn balance(available: &str, freshness: &str) -> ProviderQuotaSnapshotContract {
             granted: None,
             topped_up: None,
             used: None,
+            ..Default::default()
         }],
     );
     snapshot
@@ -164,7 +185,7 @@ fn subscription_cache_scope_tracks_only_active_exhausted_transitions() {
 }
 
 #[test]
-fn malformed_legacy_subscription_state_fails_safe_to_candidate_invalidation() {
+fn malformed_legacy_subscription_state_does_not_invent_an_eligibility_transition() {
     // Given
     let key = key(
         "key-1",
@@ -186,7 +207,7 @@ fn malformed_legacy_subscription_state_fails_safe_to_candidate_invalidation() {
     });
 
     // Then
-    assert_eq!(scope, QuotaCacheInvalidationScope::CandidateRouting);
+    assert_eq!(scope, QuotaCacheInvalidationScope::CatalogOnly);
 }
 
 #[test]
@@ -321,8 +342,10 @@ fn http_200_business_error_preserves_zhipu_reason_instead_of_parse_failed() {
     assert_eq!(*status_code, 200);
     assert_eq!(*class, StableErrorClass::HttpClient);
     assert_eq!(*upstream_code, Some(1315));
-    assert!(should_retry_zhipu_team_quota(&attempt));
-    assert!(should_fallback_to_zhipu_balance(&attempt));
+    assert_eq!(
+        attempt.query_status(),
+        ProviderQuotaQueryStatus::NotApplicable
+    );
     assert_eq!(
         detail,
         "upstream business code 1315: API key product type does not match the selected endpoint"
@@ -380,11 +403,14 @@ fn http_200_zhipu_business_auth_error_maps_to_unauthorized() {
         detail,
         "upstream business code 1001: authentication rejected"
     );
-    assert!(!should_fallback_to_zhipu_balance(&attempt));
+    assert_eq!(
+        attempt.query_status(),
+        ProviderQuotaQueryStatus::PermissionDenied
+    );
 }
 
 #[test]
-fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
+fn unavailable_zhipu_plan_keeps_query_status_separate_from_rate_limits() {
     for code in [1220, 1309, 1315] {
         let attempt = execution_result_to_attempt(
             ExecutionResult {
@@ -403,9 +429,13 @@ fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
             QuotaKind::Subscription,
             "zhipu",
         );
-        assert!(
-            should_fallback_to_zhipu_balance(&attempt),
-            "code {code} should use account balance"
+        assert_eq!(
+            attempt.query_status(),
+            if code == 1220 {
+                ProviderQuotaQueryStatus::PermissionDenied
+            } else {
+                ProviderQuotaQueryStatus::NotApplicable
+            }
         );
     }
 
@@ -426,7 +456,7 @@ fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
         QuotaKind::Subscription,
         "zhipu",
     );
-    assert!(!should_fallback_to_zhipu_balance(&limited));
+    assert_eq!(limited.query_status(), ProviderQuotaQueryStatus::Error);
 
     let empty_plan = execution_result_to_attempt(
         ExecutionResult {
@@ -446,7 +476,7 @@ fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
         "zhipu",
     );
     assert!(matches!(empty_plan, AttemptResult::ParseFailure { .. }));
-    assert!(should_fallback_to_zhipu_balance(&empty_plan));
+    assert_eq!(empty_plan.query_status(), ProviderQuotaQueryStatus::Error);
 
     let unknown_business_error = execution_result_to_attempt(
         ExecutionResult {
@@ -473,26 +503,14 @@ fn expired_or_unavailable_zhipu_token_plan_falls_back_but_rate_limits_do_not() {
             ..
         }
     ));
-    assert!(should_fallback_to_zhipu_balance(&unknown_business_error));
-
-    let decorated = apply_zhipu_token_plan_fallback_policy(
-        &unknown_business_error,
-        AttemptResult::Success {
-            snapshot: ProviderQuotaSnapshotContract::balance("zhipu", Vec::new()),
-            status_code: 200,
-            quota_kind: QuotaKind::Balance,
-        },
+    assert_eq!(
+        unknown_business_error.query_status(),
+        ProviderQuotaQueryStatus::Error
     );
-    let AttemptResult::Success { snapshot, .. } = decorated else {
-        panic!("expected decorated balance fallback");
-    };
-    assert!(!snapshot.exhausted);
-    assert_eq!(snapshot.extensions["token_plan_status"], "business_error");
-    assert_eq!(snapshot.extensions["token_plan_scheduling_blocked"], false);
 }
 
 #[test]
-fn zhipu_business_500_retries_team_quota_then_uses_informational_balance() {
+fn zhipu_business_500_is_persisted_as_an_independent_source_failure() {
     let primary = execution_result_to_attempt(
         ExecutionResult {
             request_id: "zhipu-personal-plan-500".into(),
@@ -510,34 +528,37 @@ fn zhipu_business_500_retries_team_quota_then_uses_informational_balance() {
         QuotaKind::Subscription,
         "zhipu",
     );
-    assert!(should_retry_zhipu_team_quota(&primary));
-    assert!(should_fallback_to_zhipu_balance(&primary));
-
-    let decorated = apply_zhipu_token_plan_fallback_policy(
-        &primary,
-        AttemptResult::Success {
-            snapshot: ProviderQuotaSnapshotContract::balance("zhipu", Vec::new()),
-            status_code: 200,
-            quota_kind: QuotaKind::Balance,
-        },
-    );
-    let AttemptResult::Success { snapshot, .. } = decorated else {
-        panic!("expected informational balance fallback");
+    let attempt = AttemptResult::Sources {
+        attempts: vec![zhipu_source_attempt("personal", primary)],
+        quota_kind: QuotaKind::Subscription,
     };
-    assert!(!snapshot.exhausted);
-    assert_eq!(snapshot.extensions["token_plan_status"], "query_failed");
-    assert_eq!(snapshot.extensions["token_plan_scheduling_blocked"], false);
+    let persisted = build_persisted_snapshot(SnapshotUpdate {
+        key: &key("key-1", "Zhipu", None),
+        provider_type: "zhipu",
+        attempt: &attempt,
+        now_unix_secs: 100,
+    })
+    .expect("source failure snapshot");
+    assert_eq!(persisted.snapshot["exhausted"], false);
+    assert_eq!(persisted.snapshot["sources"][0]["id"], "personal");
+    assert_eq!(persisted.snapshot["sources"][0]["query_status"], "error");
     assert_eq!(
-        snapshot.extensions["token_plan_error"],
-        "upstream business code 500: quota upstream returned a business error"
+        persisted.snapshot["sources"][0]["refresh_state"]["error"],
+        "http_server_error: upstream business code 500: quota upstream returned a business error"
     );
 }
 
 #[test]
 fn zhipu_team_quota_success_records_scope() {
+    let mut snapshot = ProviderQuotaSnapshotContract::subscription("zhipu", Vec::new(), 100);
+    snapshot.sources.push(ProviderQuotaSource {
+        id: "subscription".into(),
+        product: "coding_plan".into(),
+        ..Default::default()
+    });
     let attempt = apply_zhipu_plan_scope(
         AttemptResult::Success {
-            snapshot: ProviderQuotaSnapshotContract::subscription("zhipu", Vec::new(), 100),
+            snapshot,
             status_code: 200,
             quota_kind: QuotaKind::Subscription,
         },
@@ -546,7 +567,8 @@ fn zhipu_team_quota_success_records_scope() {
     let AttemptResult::Success { snapshot, .. } = attempt else {
         panic!("expected team quota success");
     };
-    assert_eq!(snapshot.extensions["token_plan_scope"], "team");
+    assert_eq!(snapshot.sources[0].id, "team");
+    assert_eq!(snapshot.sources[0].scope, "team");
 }
 
 #[test]
@@ -585,12 +607,11 @@ fn zhipu_balance_kind_uses_standard_account_parser() {
     assert_eq!(quota_kind, QuotaKind::Balance);
     assert_eq!(snapshot.kind, ProviderQuotaSnapshotKind::Balance);
     assert_eq!(snapshot.balances[0].available.as_deref(), Some("12.50"));
-    assert_eq!(snapshot.extensions["balance_source"], "standard_api");
-    assert_eq!(snapshot.extensions["balance_insufficient"], false);
+    assert_eq!(snapshot.sources[0].product, "account_balance");
 }
 
 #[test]
-fn zhipu_balance_business_1113_becomes_a_structured_insufficient_balance() {
+fn zhipu_balance_business_1113_does_not_synthesize_zero_balance() {
     let attempt = execution_result_to_attempt(
         ExecutionResult {
             request_id: "zhipu-balance-insufficient".into(),
@@ -609,16 +630,18 @@ fn zhipu_balance_business_1113_becomes_a_structured_insufficient_balance() {
         "zhipu",
     );
 
-    let AttemptResult::Success { snapshot, .. } = attempt else {
-        panic!("expected structured insufficient balance");
-    };
-    assert_eq!(snapshot.balances[0].available.as_deref(), Some("0"));
-    assert_eq!(snapshot.extensions["balance_insufficient"], true);
-    assert_eq!(snapshot.extensions["balance_status"], "insufficient");
+    assert!(matches!(
+        attempt,
+        AttemptResult::BusinessFailure {
+            upstream_code: Some(1113),
+            ..
+        }
+    ));
+    assert_eq!(attempt.query_status(), ProviderQuotaQueryStatus::Error);
 }
 
 #[test]
-fn zhipu_balance_fallback_keeps_balance_but_marks_missing_plan_as_exhausted() {
+fn zhipu_balance_success_and_missing_plan_are_kept_without_global_exhaustion() {
     let primary = execution_result_to_attempt(
         ExecutionResult {
             request_id: "zhipu-expired-plan".into(),
@@ -657,21 +680,28 @@ fn zhipu_balance_fallback_keeps_balance_but_marks_missing_plan_as_exhausted() {
         "zhipu",
     );
 
-    let attempt = apply_zhipu_token_plan_fallback_policy(&primary, fallback);
-    let AttemptResult::Success {
-        snapshot,
-        quota_kind,
-        ..
-    } = &attempt
-    else {
-        panic!("expected successful balance fallback");
+    let attempt = AttemptResult::Sources {
+        attempts: vec![
+            zhipu_source_attempt("personal", primary),
+            zhipu_source_attempt("balance", fallback),
+        ],
+        quota_kind: QuotaKind::Subscription,
     };
-    assert_eq!(*quota_kind, QuotaKind::Balance);
-    assert_eq!(snapshot.kind, ProviderQuotaSnapshotKind::Balance);
-    assert_eq!(snapshot.balances[0].available.as_deref(), Some("12.50"));
-    assert!(snapshot.exhausted);
-    assert_eq!(snapshot.extensions["token_plan_status"], "expired");
-    assert_eq!(snapshot.extensions["token_plan_scheduling_blocked"], true);
+    let persisted = build_persisted_snapshot(SnapshotUpdate {
+        key: &key("key-1", "Zhipu", None),
+        provider_type: "zhipu",
+        attempt: &attempt,
+        now_unix_secs: 100,
+    })
+    .expect("partial quota snapshot");
+    assert_eq!(persisted.snapshot["balances"][0]["available"], "12.50");
+    assert_eq!(persisted.snapshot["exhausted"], false);
+    assert_eq!(persisted.snapshot["code"], "ok");
+    assert_eq!(
+        persisted.snapshot["sources"][0]["query_status"],
+        "not_applicable"
+    );
+    assert_eq!(persisted.snapshot["sources"][1]["query_status"], "ok");
 
     let scope = quota_cache_invalidation_scope(&SnapshotUpdate {
         key: &key("key-1", "Zhipu expired", None),
@@ -679,27 +709,7 @@ fn zhipu_balance_fallback_keeps_balance_but_marks_missing_plan_as_exhausted() {
         attempt: &attempt,
         now_unix_secs: 100,
     });
-    assert_eq!(scope, QuotaCacheInvalidationScope::CandidateRouting);
-
-    let blocked_key = key(
-        "key-1",
-        "Zhipu expired",
-        Some(serde_json::to_value(snapshot).expect("blocked balance snapshot")),
-    );
-    let recovered = AttemptResult::Success {
-        snapshot: ProviderQuotaSnapshotContract::subscription("zhipu", Vec::new(), 100),
-        status_code: 200,
-        quota_kind: QuotaKind::Subscription,
-    };
-    assert_eq!(
-        quota_cache_invalidation_scope(&SnapshotUpdate {
-            key: &blocked_key,
-            provider_type: "zhipu",
-            attempt: &recovered,
-            now_unix_secs: 100,
-        }),
-        QuotaCacheInvalidationScope::CandidateRouting
-    );
+    assert_eq!(scope, QuotaCacheInvalidationScope::CatalogOnly);
 }
 
 #[test]
@@ -747,6 +757,7 @@ fn success_decoration_preserves_parser_exhaustion() {
             reset_at: Some(200),
             reset_at_text: None,
             is_exhausted: true,
+            ..Default::default()
         }],
         100,
     );

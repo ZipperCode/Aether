@@ -6,6 +6,7 @@ pub mod default;
 pub mod gemini_cli;
 pub mod grok;
 pub mod kiro;
+mod minimax;
 pub mod nous;
 pub mod official_api_key;
 mod official_balance;
@@ -56,7 +57,9 @@ pub use nous::{
 pub use official_api_key::{
     build_official_api_key_quota_request, build_zhipu_account_balance_request,
     build_zhipu_team_quota_request, is_official_api_key_quota_endpoint,
-    parse_official_api_key_quota, parse_zhipu_standard_balance, OfficialApiKeyQuotaProvider,
+    is_retired_official_api_key_quota_endpoint, official_api_key_quota_sources,
+    parse_official_api_key_quota, parse_official_api_key_quota_for_endpoint,
+    parse_zhipu_standard_balance, OfficialApiKeyQuotaProvider,
     OfficialApiKeyQuotaProviderPoolAdapter, ZHIPU_ACCOUNT_REPORT_URL, ZHIPU_TEAM_QUOTA_URL,
 };
 pub use official_balance::clamp_official_balance_execution_timeouts;

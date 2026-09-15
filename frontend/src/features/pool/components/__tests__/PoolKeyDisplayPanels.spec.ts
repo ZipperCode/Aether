@@ -118,7 +118,7 @@ describe('pool key display panels', () => {
     app.use(createI18n())
     app.mount(root)
 
-    expect(root.querySelector('[data-testid="pool-quota-balance"]')?.textContent).toContain('47.73 CNY')
+    expect(root.querySelector('[data-testid="provider-quota-available"]')?.textContent).toContain('47.73 CNY')
     expect(root.textContent).not.toContain('可用 47.73 CNY')
     app.unmount()
     root.remove()
@@ -141,13 +141,13 @@ describe('pool key display panels', () => {
     app.use(createI18n())
     app.mount(root)
 
-    const balances = [...root.querySelectorAll('[data-testid="pool-quota-balance"]')]
+    const balances = [...root.querySelectorAll('[data-testid="provider-quota-available"]')]
       .map(element => element.textContent)
     expect(balances).toHaveLength(2)
     expect(balances[0]).toContain('9,007,199,254,740,993.123456789 CNY')
     expect(balances[1]).toContain('$0.000000000000000001')
-    expect(root.querySelector('[data-testid="pool-quota-available"]')?.classList).toContain('break-all')
-    expect(root.querySelector('[data-testid="pool-quota-available"]')?.classList).not.toContain('whitespace-nowrap')
+    expect(root.querySelector('[data-testid="provider-quota-available"]')?.classList).toContain('break-all')
+    expect(root.querySelector('[data-testid="provider-quota-available"]')?.classList).not.toContain('whitespace-nowrap')
     app.unmount()
     root.remove()
   })
@@ -162,15 +162,15 @@ describe('pool key display panels', () => {
     app.use(createI18n())
     app.mount(root)
 
-    const available = root.querySelector('[data-testid="pool-quota-available"]')
-    expect(available?.classList).toContain('text-red-600')
-    expect(available?.classList).toContain('whitespace-nowrap')
-    expect(available?.classList).not.toContain('break-all')
+    const available = root.querySelector('[data-testid="provider-quota-available"]')
+    expect(available?.classList).toContain('text-amber-600')
+    expect(available?.classList).not.toContain('whitespace-nowrap')
+    expect(available?.classList).toContain('break-all')
     app.unmount()
     root.remove()
   })
 
-  it('shows DeepSeek quota failures as unavailable on desktop and mobile', () => {
+  it('shows stale DeepSeek balances with query failures on desktop and mobile', () => {
     for (const variant of ['desktop', 'mobile'] as const) {
       const root = document.createElement('div')
       document.body.appendChild(root)
@@ -187,17 +187,17 @@ describe('pool key display panels', () => {
       app.use(createI18n())
       app.mount(root)
 
-      const unavailable = root.querySelector('[data-testid="pool-quota-unavailable"]')
-      expect(unavailable?.textContent?.trim()).toBe('不可用')
-      expect(unavailable?.classList).toContain('text-red-700')
-      expect(root.querySelector('[data-testid="pool-quota-balance"]')).toBeNull()
-      expect(root.textContent).not.toContain('9.25')
+      expect(root.textContent).toContain('查询失败')
+      expect(root.textContent).toContain('数据已过期')
+      expect(root.textContent).not.toContain('不可用')
+      expect(root.querySelector('[data-testid="provider-quota-available"]')).toBeTruthy()
+      expect(root.textContent).toContain('9.25')
       app.unmount()
       root.remove()
     }
   })
 
-  it('hides retained balances after generic quota authentication rejection', () => {
+  it('preserves retained balances with query authentication errors', () => {
     for (const variant of ['desktop', 'mobile'] as const) {
       const root = document.createElement('div')
       document.body.appendChild(root)
@@ -214,17 +214,18 @@ describe('pool key display panels', () => {
       app.use(createI18n())
       app.mount(root)
 
-      expect(root.querySelector('[data-testid="pool-quota-unavailable"]')?.textContent?.trim())
-        .toBe('不可用')
-      expect(root.querySelector('[data-testid="pool-quota-balance"]')).toBeNull()
-      expect(root.textContent).not.toContain('http_unauthorized')
-      expect(root.textContent).not.toContain('18.50')
+      expect(root.textContent).toContain('查询失败')
+      expect(root.textContent).toContain('数据已过期')
+      expect(root.textContent).not.toContain('不可用')
+      expect(root.querySelector('[data-testid="provider-quota-available"]')).toBeTruthy()
+      expect(root.textContent).toContain('http_unauthorized')
+      expect(root.textContent).toContain('18.50')
       app.unmount()
       root.remove()
     }
   })
 
-  it('labels a zero Zhipu balance as insufficient', () => {
+  it('shows the observed zero Zhipu balance without fabricating a key status', () => {
     const root = document.createElement('div')
     document.body.appendChild(root)
     const app = createApp(PoolKeyQuotaPanel, {
@@ -237,13 +238,13 @@ describe('pool key display panels', () => {
     app.use(createI18n())
     app.mount(root)
 
-    expect(root.querySelector('[data-testid="pool-quota-balance"]')?.textContent).toContain('余额不足')
-    expect(root.querySelector('[data-testid="pool-quota-available"]')?.classList).toContain('text-red-600')
+    expect(root.querySelector('[data-testid="provider-quota-available"]')?.textContent).toContain('0 CNY')
+    expect(root.querySelector('[data-testid="provider-quota-available"]')?.classList).toContain('text-amber-600')
     app.unmount()
     root.remove()
   })
 
-  it('hides an ambiguous Zhipu zero balance when no model probe exists', () => {
+  it('labels an ambiguous Zhipu balance as informational when no model probe exists', () => {
     const root = document.createElement('div')
     document.body.appendChild(root)
     const app = createApp(PoolKeyQuotaPanel, {
@@ -257,10 +258,10 @@ describe('pool key display panels', () => {
     app.use(createI18n())
     app.mount(root)
 
-    expect(root.querySelector('[data-testid="pool-quota-balance"]')).toBeNull()
-    expect(root.querySelector('[data-testid="pool-model-availability"]')?.textContent)
+    expect(root.querySelector('[data-testid="provider-quota-available"]')).toBeTruthy()
+    expect(root.querySelector('[data-testid="provider-model-availability"]')?.textContent)
       .toContain('额度未知，继续参与模型调度')
-    expect(root.querySelector('[data-testid="pool-model-availability"]')?.classList).toContain('text-amber-700')
+    expect(root.querySelector('[data-testid="provider-model-availability"]')?.classList).toContain('text-amber-700')
     app.unmount()
     root.remove()
   })
@@ -323,7 +324,7 @@ describe('pool key display panels', () => {
     app.use(createI18n())
     app.mount(root)
 
-    const availability = root.querySelector('[data-testid="pool-model-availability"]')
+    const availability = root.querySelector('[data-testid="provider-model-availability"]')
     expect(availability?.textContent).toContain('模型调用已验证可用')
     expect(availability?.textContent).toContain('额度查询失败，额度未知')
     expect(availability?.classList).toContain('text-emerald-700')
@@ -345,7 +346,7 @@ describe('pool key display panels', () => {
     app.use(createI18n())
     app.mount(root)
 
-    expect(root.textContent).toContain('无限制')
+    expect(root.textContent).toContain('未设置消费上限')
     expect(root.textContent).not.toContain('100.0%')
     expect(root.querySelector('[style*="width: 100%"]')).toBeFalsy()
     app.unmount()
@@ -367,7 +368,8 @@ describe('pool key display panels', () => {
     app.mount(root)
 
     expect(root.textContent).toContain('周期配额')
-    expect(root.querySelector('[data-testid="pool-quota-meter-text"]')?.textContent).toBe('99 / 100')
+    expect(root.querySelector('[data-testid="provider-quota-progress-meter"]')?.textContent).toContain('99.0%')
+    expect(root.textContent).toContain('99 / 100 单位未知')
     app.unmount()
     root.remove()
   })
@@ -390,11 +392,11 @@ describe('pool key display panels', () => {
     app.use(createI18n())
     app.mount(root)
 
-    const meter = root.querySelector('[data-testid="pool-quota-meter-text"]')
+    const meter = root.querySelector('[data-testid="provider-quota-progress-reset"]')
     expect(meter?.textContent).toBe(
-      '9,007,199,254,740,993.123456789012345678 / 18,014,398,509,481,986.246913578024691356',
+      '9,007,199,254,740,993.123456789012345678 / 18,014,398,509,481,986.246913578024691356 单位未知',
     )
-    expect(meter?.classList).toContain('break-all')
+    expect(meter?.classList).toContain('break-words')
     app.unmount()
     root.remove()
   })
@@ -411,7 +413,7 @@ describe('pool key display panels', () => {
       app.use(createI18n())
       app.mount(root)
 
-      expect(root.textContent).toContain('待刷新')
+      expect(root.textContent).toContain('尚未查询额度')
       app.unmount()
       root.remove()
     })
@@ -433,7 +435,7 @@ describe('pool key display panels', () => {
       app.use(createI18n())
       app.mount(root)
 
-      expect(root.querySelector('[data-testid="pool-quota-balance"]')).toBeFalsy()
+      expect(root.querySelector('[data-testid="provider-quota-available"]')).toBeFalsy()
       expect(root.querySelector('[data-testid="pool-quota-meter-text"]')).toBeFalsy()
       expect(root.textContent).not.toContain('不应显示')
       expect(root.textContent?.trim()).toBe('-')

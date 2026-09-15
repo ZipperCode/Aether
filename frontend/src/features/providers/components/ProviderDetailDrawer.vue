@@ -1034,7 +1034,7 @@ import type {
   QuotaWindowSnapshot,
 } from '@/api/endpoints/types'
 import { formatApiFormatShort } from '@/api/endpoints/types/api-format'
-import { isOAuthAccountProviderType, isKeyManagedProviderType } from '../utils/providerTypeUtils'
+import { isOAuthAccountProviderType, isKeyManagedProviderType, isOfficialQuotaProviderType } from '../utils/providerTypeUtils'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 import { getOAuthRefreshFeedback } from '@/utils/oauthRefreshFeedback'
 import {
@@ -1060,7 +1060,10 @@ import {
 } from '@/utils/providerKeyStatus'
 import {
   getGeminiCliAccountCreditsText,
-  isGenericQuotaUnavailable,
+  getGenericQuotaTypeLabel as getQuotaTypeLabel,
+  getQuotaQueryStatusLabel,
+  getQuotaWindowRemainingPercent as getWindowRemainingPercent,
+  finiteNumber,
 } from '@/utils/providerKeyQuota'
 import { selectOpenProviderSnapshot } from '@/features/providers/utils/providerOpenState'
 import ProviderGenericQuotaCard from './ProviderGenericQuotaCard.vue'
@@ -1922,19 +1925,10 @@ function quotaSnapshotHasDisplayData(quota: QuotaStatusSnapshot | null | undefin
     || quota.usage_ratio != null
     || (Array.isArray(quota.windows) && quota.windows.length > 0)
     || (Array.isArray(quota.balances) && quota.balances.length > 0)
+    || (Array.isArray(quota.sources) && quota.sources.length > 0)
     || quota.credits,
   )
 }
-
-const GENERIC_QUOTA_PROVIDER_TYPES = new Set([
-    'deepseek',
-    'openrouter',
-    'moonshot',
-    'kimi_coding',
-    'siliconflow',
-    'zhipu',
-    'zai',
-])
 
 function getGenericQuotaProviderType(key: EndpointAPIKey): string {
   return key.status_snapshot?.quota?.provider_type?.trim().toLowerCase()
@@ -1943,23 +1937,21 @@ function getGenericQuotaProviderType(key: EndpointAPIKey): string {
 }
 
 function shouldShowGenericQuotaCard(key: EndpointAPIKey): boolean {
-  return GENERIC_QUOTA_PROVIDER_TYPES.has(getGenericQuotaProviderType(key))
+  return isOfficialQuotaProviderType(getGenericQuotaProviderType(key))
 }
 
 function getGenericQuotaTypeLabel(key: EndpointAPIKey): string | null {
   if (!shouldShowGenericQuotaCard(key)) return null
-  const quota = key.status_snapshot?.quota
-  if (quota?.kind === 'subscription' || (quota?.windows?.length ?? 0) > 0) return 'Token'
-  return quota?.balances?.[0]?.unit?.trim().toUpperCase() || null
+  return getQuotaTypeLabel(key.status_snapshot?.quota)
 }
 
 function getGenericQuotaStatusLabel(key: EndpointAPIKey): string | null {
   if (isQuotaSchedulingBlocked(key)) return '额度耗尽·需人工恢复'
   if (isQuotaSchedulingSuspected(key)) return '疑似额度不足'
-  return isGenericQuotaUnavailable(
+  return getQuotaQueryStatusLabel(
     key.status_snapshot?.quota,
     getGenericQuotaProviderType(key),
-  ) ? 'Expired' : null
+  )
 }
 
 function isQuotaSchedulingBlocked(key: EndpointAPIKey): boolean {
@@ -2017,25 +2009,14 @@ function getQuotaWindow(
 }
 
 function getQuotaWindowUsedPercent(window: QuotaWindowSnapshot | null | undefined): number | undefined {
-  if (!window) return undefined
-  if (typeof window.used_ratio === 'number') {
-    return Math.max(Math.min(window.used_ratio * 100, 100), 0)
-  }
-  if (typeof window.remaining_ratio === 'number') {
-    return Math.max(Math.min((1 - window.remaining_ratio) * 100, 100), 0)
-  }
-  return undefined
+  const used = finiteNumber(window?.used_ratio)
+  if (used != null) return Math.max(used * 100, 0)
+  const remaining = getWindowRemainingPercent(window)
+  return remaining == null ? undefined : Math.max(100 - remaining, 0)
 }
 
 function getQuotaWindowRemainingPercent(window: QuotaWindowSnapshot | null | undefined): number | undefined {
-  if (!window) return undefined
-  if (typeof window.remaining_ratio === 'number') {
-    return Math.max(Math.min(window.remaining_ratio * 100, 100), 0)
-  }
-  if (typeof window.used_ratio === 'number') {
-    return Math.max(Math.min((1 - window.used_ratio) * 100, 100), 0)
-  }
-  return undefined
+  return getWindowRemainingPercent(window) ?? undefined
 }
 
 function getQuotaWindowResetAt(window: QuotaWindowSnapshot | null | undefined): number | undefined {
@@ -2914,6 +2895,8 @@ function applyQuotaResults(
 
     if (r.quota_snapshot) {
       target.status_snapshot = {
+        // 额度刷新只替换自己的快照，保留人工阻断、OAuth、探测及后续新增状态。
+        ...target.status_snapshot,
         oauth: target.status_snapshot?.oauth ?? {
           code: 'none',
           label: null,
@@ -2934,7 +2917,6 @@ function applyQuotaResults(
         },
         quota: {
           ...defaultQuotaSnapshot(),
-          ...(target.status_snapshot?.quota ?? {}),
           ...r.quota_snapshot,
         },
         model_probe: target.status_snapshot?.model_probe ?? null,
@@ -2988,7 +2970,7 @@ async function autoRefreshQuotaInBackground(): Promise<boolean> {
   if (refreshingQuota.value) return false
 
   const providerType = provider.value?.provider_type
-  if (providerType !== 'codex' && providerType !== 'gemini_cli' && providerType !== 'antigravity' && providerType !== 'kiro' && providerType !== 'windsurf' && providerType !== 'chatgpt_web' && providerType !== 'grok' && providerType !== 'nous' && providerType !== 'deepseek' && providerType !== 'openrouter' && providerType !== 'moonshot' && providerType !== 'kimi_coding' && providerType !== 'siliconflow' && providerType !== 'zhipu' && providerType !== 'zai') return false
+  if (providerType !== 'codex' && providerType !== 'gemini_cli' && providerType !== 'antigravity' && providerType !== 'kiro' && providerType !== 'windsurf' && providerType !== 'chatgpt_web' && providerType !== 'grok' && providerType !== 'nous' && !isOfficialQuotaProviderType(providerType)) return false
 
   // 检查是否需要刷新
   let shouldRefresh = false
@@ -3012,7 +2994,7 @@ async function autoRefreshQuotaInBackground(): Promise<boolean> {
       const updatedAt = getQuotaSnapshotUpdatedAt(getNousQuotaDisplay(key))
       return updatedAt == null || Math.floor(Date.now() / 1000) - updatedAt >= AUTO_QUOTA_REFRESH_STALE_SECONDS
     })
-  } else if (['deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai'].includes(providerType)) {
+  } else if (isOfficialQuotaProviderType(providerType)) {
     shouldRefresh = allKeys.value.some(({ key }) => {
       if (!key.is_active) return false
       const updatedAt = getQuotaSnapshotUpdatedAt(key.status_snapshot?.quota)
@@ -3038,7 +3020,7 @@ async function autoRefreshQuotaInBackground(): Promise<boolean> {
     hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && hasChatGPTWebQuotaDisplayData(key))
   } else if (providerType === 'nous') {
     hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && quotaSnapshotHasDisplayData(getNousQuotaDisplay(key)))
-  } else if (['deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai'].includes(providerType)) {
+  } else if (isOfficialQuotaProviderType(providerType)) {
     hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && quotaSnapshotHasDisplayData(key.status_snapshot?.quota))
   }
 
@@ -3055,13 +3037,13 @@ async function autoRefreshQuotaInBackground(): Promise<boolean> {
     const applied = applyQuotaResults(result.results)
     if (result.success <= 0 && applied === 0 && !hadCachedQuota && providerType === 'antigravity') {
       showWarning(legacyT('配额暂未就绪，请稍后刷新'), legacyT('提示'))
-    } else if (result.success <= 0 && applied === 0 && !hadCachedQuota && ['deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai'].includes(providerType)) {
+    } else if (result.success <= 0 && applied === 0 && !hadCachedQuota && isOfficialQuotaProviderType(providerType)) {
       const detail = result.results?.find(item => item.message)?.message || '没有获取到额度信息，请检查 Key 和官方 Endpoint'
       showError(legacyT(detail), legacyT('额度刷新失败'))
     }
     return applied > 0
   } catch (err: unknown) {
-    if (isCurrent() && !hadCachedQuota && (providerType === 'antigravity' || ['deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai'].includes(providerType))) {
+    if (isCurrent() && !hadCachedQuota && (providerType === 'antigravity' || isOfficialQuotaProviderType(providerType))) {
       showError(localizedApiError(err, '后台刷新配额失败'), legacyT('错误'))
     }
     return false

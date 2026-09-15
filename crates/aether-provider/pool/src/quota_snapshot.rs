@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 pub const PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
-pub const ZHIPU_TOKEN_PLAN_STATUS_FIELD: &str = "token_plan_status";
-pub const ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD: &str = "token_plan_scheduling_blocked";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -11,8 +9,11 @@ pub enum ProviderQuotaSnapshotKind {
     Subscription,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProviderQuotaBalance {
+    /// 关联查询来源，避免将独立账户余额与 Key 消费上限混为一谈。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     pub unit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available: Option<String>,
@@ -33,8 +34,10 @@ pub enum ProviderQuotaValue {
     Number(serde_json::Number),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProviderQuotaWindow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     pub code: String,
     pub label: String,
     pub scope: String,
@@ -55,6 +58,11 @@ pub struct ProviderQuotaWindow {
     pub reset_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_at_text: Option<String>,
+    /// 上游明确声明不限额或套餐不包含该额度池时，不能从零值推断耗尽。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlimited: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_included: Option<bool>,
     pub is_exhausted: bool,
 }
 
@@ -72,11 +80,51 @@ pub struct ProviderQuotaRefreshState {
     pub failure_count: Option<u32>,
 }
 
+/// 查询结果只描述额度接口能力，不代表推理凭据或模型调用状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderQuotaQueryStatus {
+    #[default]
+    NotQueried,
+    Ok,
+    Unsupported,
+    PermissionDenied,
+    NotApplicable,
+    Error,
+}
+
+/// 来源仅保存身份与查询状态；额度值仍由顶层 balances/windows 唯一持有。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ProviderQuotaSource {
+    pub id: String,
+    pub label: String,
+    pub product: String,
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency_source: Option<String>,
+    #[serde(default)]
+    pub query_status: ProviderQuotaQueryStatus,
+    #[serde(default)]
+    pub freshness: String,
+    #[serde(default)]
+    pub refresh_state: ProviderQuotaRefreshState,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderQuotaSnapshotContract {
     pub schema_version: u32,
     pub kind: ProviderQuotaSnapshotKind,
     pub provider_type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<ProviderQuotaSource>,
     #[serde(default)]
     pub exhausted: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -97,6 +145,7 @@ impl ProviderQuotaSnapshotContract {
             schema_version: PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
             kind: ProviderQuotaSnapshotKind::Balance,
             provider_type: provider_type.into(),
+            sources: Vec::new(),
             exhausted: false,
             balances,
             windows: Vec::new(),
@@ -112,7 +161,11 @@ impl ProviderQuotaSnapshotContract {
         now_unix_secs: u64,
     ) -> Self {
         let exhausted = windows.iter().any(|window| {
-            window.is_exhausted
+            // 工具或模型专属额度不能投影成整个账号耗尽。
+            matches!(window.scope.as_str(), "account" | "key")
+                && window.unlimited != Some(true)
+                && window.is_included != Some(false)
+                && window.is_exhausted
                 && window
                     .reset_at
                     .is_some_and(|reset_at| reset_at > now_unix_secs)
@@ -121,6 +174,7 @@ impl ProviderQuotaSnapshotContract {
             schema_version: PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
             kind: ProviderQuotaSnapshotKind::Subscription,
             provider_type: provider_type.into(),
+            sources: Vec::new(),
             exhausted,
             balances: Vec::new(),
             windows,

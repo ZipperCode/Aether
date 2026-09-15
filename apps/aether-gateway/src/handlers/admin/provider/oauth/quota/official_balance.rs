@@ -4,9 +4,11 @@ mod persistence;
 mod response;
 mod routing;
 
-use self::domain::{FlightScope, OfficialQuotaItem, StableErrorClass};
+use self::domain::{
+    AttemptResult, FlightScope, OfficialQuotaItem, QuotaKind, SourceAttempt, StableErrorClass,
+};
 use self::execution::{execute_prepared, prepare_attempt, PrepareInput, PreparedAttempt};
-use self::persistence::{latest_refresh_state, persist_attempt, SnapshotUpdate};
+use self::persistence::{latest_refresh_state, latest_snapshot, persist_attempt, SnapshotUpdate};
 use self::response::{backoff_item, management_response, persisted_item, rejected_item};
 use self::routing::{singleflight_identity, validate_selected_endpoint};
 use super::dispatch::QuotaRefreshSource;
@@ -15,7 +17,9 @@ use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
-use aether_provider_pool::{AsyncSingleflight, OfficialProviderBackgroundLimiter};
+use aether_provider_pool::{
+    official_api_key_quota_sources, AsyncSingleflight, OfficialProviderBackgroundLimiter,
+};
 use serde_json::Value;
 use std::{
     sync::LazyLock,
@@ -74,7 +78,46 @@ pub(crate) async fn refresh_official_balance_provider_quota_locally(
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(failure) => {
-                items.push(rejected_item(&key, failure.class, observed_at));
+                if failure.class == StableErrorClass::QueryUnsupported {
+                    // 已退役的官方余额接口首次刷新也记录能力状态，无需旧快照或伪造数值。
+                    let quota_kind = QuotaKind::Balance;
+                    let attempt = AttemptResult::Sources {
+                        attempts: vec![SourceAttempt {
+                            sources: official_api_key_quota_sources(
+                                &provider_type,
+                                endpoint,
+                                quota_kind.as_str(),
+                            ),
+                            result: AttemptResult::TransportFailure {
+                                class: failure.class,
+                                quota_kind: Some(quota_kind),
+                            },
+                        }],
+                        quota_kind,
+                    };
+                    items.push(
+                        persist_one(state, &key, &provider_type, &attempt, observed_at).await,
+                    );
+                    continue;
+                }
+                let retained_kind = latest_snapshot(&key).and_then(|snapshot| {
+                    snapshot
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(|kind| QuotaKind::from_spec(kind).ok())
+                });
+                if let Some(quota_kind) = retained_kind {
+                    // 本地传输准备失败也应让旧证据过期，不能继续按旧低余额阻断。
+                    let attempt = AttemptResult::TransportFailure {
+                        class: failure.class,
+                        quota_kind: Some(quota_kind),
+                    };
+                    items.push(
+                        persist_one(state, &key, &provider_type, &attempt, observed_at).await,
+                    );
+                } else {
+                    items.push(rejected_item(&key, failure.class, observed_at));
+                }
                 continue;
             }
         };
@@ -104,18 +147,28 @@ async fn refresh_and_persist_one(
     observed_at: u64,
 ) -> OfficialQuotaItem {
     let attempt = execute_prepared(state, prepared).await;
+    persist_one(state, key, provider_type, &attempt, observed_at).await
+}
+
+async fn persist_one(
+    state: &AdminAppState<'_>,
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    attempt: &AttemptResult,
+    observed_at: u64,
+) -> OfficialQuotaItem {
     match persist_attempt(
         state,
         SnapshotUpdate {
             key,
             provider_type,
-            attempt: &attempt,
+            attempt,
             now_unix_secs: observed_at,
         },
     )
     .await
     {
-        Ok(persisted) => persisted_item(key, &attempt, persisted),
+        Ok(persisted) => persisted_item(key, attempt, persisted),
         Err(_) => rejected_item(key, StableErrorClass::PersistenceFailed, observed_at),
     }
 }

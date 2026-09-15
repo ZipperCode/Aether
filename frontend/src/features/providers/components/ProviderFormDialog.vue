@@ -48,11 +48,24 @@
                   <SelectItem value="openrouter">
                     OpenRouter
                   </SelectItem>
-                  <SelectItem value="moonshot">Moonshot 国内</SelectItem>
-                  <SelectItem value="kimi_coding">Kimi Coding Plan</SelectItem>
-                  <SelectItem value="siliconflow">SiliconFlow</SelectItem>
-                  <SelectItem value="zhipu">智谱 GLM</SelectItem>
-                  <SelectItem value="zai">Z.ai</SelectItem>
+                  <SelectItem value="moonshot">
+                    Moonshot
+                  </SelectItem>
+                  <SelectItem value="kimi_coding">
+                    Kimi Coding Plan
+                  </SelectItem>
+                  <SelectItem value="siliconflow">
+                    SiliconFlow
+                  </SelectItem>
+                  <SelectItem value="zhipu">
+                    智谱 GLM
+                  </SelectItem>
+                  <SelectItem value="zai">
+                    Z.ai
+                  </SelectItem>
+                  <SelectItem value="minimax">
+                    MiniMax
+                  </SelectItem>
                   <SelectItem value="vertex_ai">
                     Vertex AI
                   </SelectItem>
@@ -95,11 +108,24 @@
                   <SelectItem value="openrouter">
                     OpenRouter
                   </SelectItem>
-                  <SelectItem value="moonshot">Moonshot 国内</SelectItem>
-                  <SelectItem value="kimi_coding">Kimi Coding Plan</SelectItem>
-                  <SelectItem value="siliconflow">SiliconFlow</SelectItem>
-                  <SelectItem value="zhipu">智谱 GLM</SelectItem>
-                  <SelectItem value="zai">Z.ai</SelectItem>
+                  <SelectItem value="moonshot">
+                    Moonshot
+                  </SelectItem>
+                  <SelectItem value="kimi_coding">
+                    Kimi Coding Plan
+                  </SelectItem>
+                  <SelectItem value="siliconflow">
+                    SiliconFlow
+                  </SelectItem>
+                  <SelectItem value="zhipu">
+                    智谱 GLM
+                  </SelectItem>
+                  <SelectItem value="zai">
+                    Z.ai
+                  </SelectItem>
+                  <SelectItem value="minimax">
+                    MiniMax
+                  </SelectItem>
                   <SelectItem value="vertex_ai">
                     Vertex AI
                   </SelectItem>
@@ -469,11 +495,12 @@ const providerTypeLabels: Readonly<Record<ProviderType, string>> = {
   vertex_ai: 'Vertex AI',
   deepseek: 'DeepSeek',
   openrouter: 'OpenRouter',
-  moonshot: 'Moonshot 国内',
+  moonshot: 'Moonshot',
   kimi_coding: 'Kimi Coding Plan',
   siliconflow: 'SiliconFlow',
   zhipu: '智谱 GLM',
   zai: 'Z.ai',
+  minimax: 'MiniMax',
 }
 
 // 重置表单

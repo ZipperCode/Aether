@@ -1240,6 +1240,8 @@ import {
   getQuotaDisplayText,
 } from '@/utils/providerKeyQuota'
 
+import { isOfficialQuotaProviderType } from '@/features/providers/utils/providerTypeUtils'
+
 const loadProviderDetailDrawer = () => import('@/features/providers/components/ProviderDetailDrawer.vue')
 const ProviderDetailDrawer = defineAsyncComponent(loadProviderDetailDrawer)
 
@@ -1757,13 +1759,7 @@ const showAccountQuotaColumn = computed(() => {
     || selectedProviderType.value === 'grok'
     || selectedProviderType.value === 'nous'
     || selectedProviderType.value === 'chatgpt_web'
-    || selectedProviderType.value === 'deepseek'
-    || selectedProviderType.value === 'openrouter'
-    || selectedProviderType.value === 'moonshot'
-    || selectedProviderType.value === 'kimi_coding'
-    || selectedProviderType.value === 'siliconflow'
-    || selectedProviderType.value === 'zhipu'
-    || selectedProviderType.value === 'zai'
+    || isOfficialQuotaProviderType(selectedProviderType.value)
 })
 
 const desktopColumnWidths = computed(() => {
@@ -2320,13 +2316,7 @@ const quotaRefreshSupported = computed(() => {
     || selectedProviderType.value === 'grok'
     || selectedProviderType.value === 'chatgpt_web'
     || selectedProviderType.value === 'nous'
-    || selectedProviderType.value === 'deepseek'
-    || selectedProviderType.value === 'openrouter'
-    || selectedProviderType.value === 'moonshot'
-    || selectedProviderType.value === 'kimi_coding'
-    || selectedProviderType.value === 'siliconflow'
-    || selectedProviderType.value === 'zhipu'
-    || selectedProviderType.value === 'zai'
+    || isOfficialQuotaProviderType(selectedProviderType.value)
 })
 
 function canResetCycleStats(_key: PoolKeyDetail): boolean {

@@ -11,10 +11,13 @@
         :class="meterClass"
         data-testid="provider-quota-progress-meter"
       >
-        {{ meterText || `${normalizedRemainingPercent.toFixed(1)}%` }}
+        {{ meterText || (displayRemainingPercent == null ? legacyT('未知') : `${displayRemainingPercent.toFixed(1)}%`) }}
       </span>
     </div>
-    <div class="relative w-full h-1.5 bg-border rounded-full overflow-hidden">
+    <div
+      v-if="displayRemainingPercent != null"
+      class="relative w-full h-1.5 bg-border rounded-full overflow-hidden"
+    >
       <div
         class="absolute left-0 top-0 h-full transition-all duration-300"
         :class="barClass"
@@ -37,6 +40,8 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useI18n } from '@/i18n'
+import { finiteNumber } from '@/utils/providerKeyQuota'
 
 const props = withDefaults(defineProps<{
   label: string
@@ -60,19 +65,17 @@ const props = withDefaults(defineProps<{
   meterText: null,
 })
 
-function normalizePercent(value: number | null | undefined): number | null {
-  const numeric = Number(value)
-  if (!Number.isFinite(numeric)) return null
-  return Math.min(Math.max(numeric, 0), 100)
-}
+const { legacyT } = useI18n()
 
-const normalizedRemainingPercent = computed(() => {
-  const remaining = normalizePercent(props.remainingPercent)
+// 加成允许展示超过 100%，仅进度条宽度做截断；缺失比例不能变成 0%。
+const displayRemainingPercent = computed(() => {
+  const remaining = finiteNumber(props.remainingPercent)
   if (remaining !== null) return remaining
 
-  const used = normalizePercent(props.usedPercent)
+  const used = finiteNumber(props.usedPercent)
   if (used !== null) return Math.max(100 - used, 0)
 
-  return 0
+  return null
 })
+const normalizedRemainingPercent = computed(() => Math.min(Math.max(displayRemainingPercent.value ?? 0, 0), 100))
 </script>

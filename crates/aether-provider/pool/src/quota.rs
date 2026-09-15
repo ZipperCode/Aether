@@ -4,7 +4,7 @@ use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKe
 use serde_json::{json, Map, Value};
 
 use crate::provider::ProviderPoolMemberInput;
-use crate::quota_snapshot::ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD;
+use crate::quota_sources::{source_account_exhausted, source_balance_below_minimum};
 use crate::service::ProviderPoolService;
 
 /// 标准余额快照的固定内部调度下限；各币种独立比较，不做汇率换算。
@@ -35,6 +35,19 @@ pub fn provider_pool_key_balance_below_minimum(
     let Some(quota_snapshot) = provider_pool_member_quota_snapshot(key, provider_type) else {
         return false;
     };
+    if let Some(below_minimum) =
+        source_balance_below_minimum(quota_snapshot, PROVIDER_POOL_MINIMUM_SCHEDULABLE_BALANCE)
+    {
+        return below_minimum;
+    }
+    // 旧 OpenRouter 剩余额度可能由累计消费反推，旧智谱余额可能来自错误码补零。
+    // 在正常刷新提供新来源证据前，这两类旧金额不参与自动阻断。
+    if matches!(
+        provider_type.trim().to_ascii_lowercase().as_str(),
+        "openrouter" | "zhipu" | "minimax"
+    ) {
+        return false;
+    }
     if !quota_snapshot
         .get("kind")
         .and_then(Value::as_str)
@@ -158,6 +171,21 @@ pub(crate) fn provider_pool_model_quota_exhausted(
     provider_type: &str,
     provider_model_name: &str,
 ) -> Option<bool> {
+    // 官方来源已经包含套餐归属，不能再由旧扁平模型/通用窗口覆盖保守的账号判断。
+    if let Some(snapshot) = provider_pool_member_quota_snapshot(key, provider_type) {
+        if let Some(exhausted) = source_account_exhausted(
+            snapshot,
+            provider_pool_current_unix_secs().unwrap_or_default(),
+        ) {
+            return Some(exhausted);
+        }
+        if matches!(
+            provider_type.trim().to_ascii_lowercase().as_str(),
+            "zhipu" | "zai" | "kimi_coding" | "minimax"
+        ) {
+            return Some(false);
+        }
+    }
     let requested = provider_pool_identifier_tokens(provider_model_name);
     if requested.is_empty() {
         return None;
@@ -827,12 +855,18 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
     if !provider_pool_quota_snapshot_matches_provider(quota_snapshot, provider_type) {
         return None;
     }
-    if provider_type.trim().eq_ignore_ascii_case("zhipu")
-        && provider_pool_json_bool(quota_snapshot.get(ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD))
-            == Some(true)
-        && provider_pool_json_bool(quota_snapshot.get("exhausted")) == Some(true)
-    {
-        return Some(true);
+    if let Some(exhausted) = source_account_exhausted(
+        quota_snapshot,
+        provider_pool_current_unix_secs().unwrap_or_default(),
+    ) {
+        return Some(exhausted);
+    }
+    // 旧官方快照无法证明单位及套餐归属；等待正常刷新，不沿用旧查询错误形成的阻断。
+    if matches!(
+        provider_type.trim().to_ascii_lowercase().as_str(),
+        "zhipu" | "zai" | "kimi_coding" | "minimax"
+    ) {
+        return Some(false);
     }
     if quota_snapshot
         .get("kind")

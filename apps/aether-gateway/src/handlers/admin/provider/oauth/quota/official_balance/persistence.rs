@@ -1,11 +1,12 @@
-use super::domain::{AttemptResult, PersistedSnapshot, QuotaKind, StableErrorClass};
+use super::domain::{AttemptResult, PersistedSnapshot, QuotaKind, SourceAttempt, StableErrorClass};
 use super::routing::retry_after_eligibility;
 use crate::{handlers::admin::request::AdminAppState, GatewayError};
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_provider_pool::{
-    official_balance_backoff_with_jitter_secs, provider_pool_key_balance_below_minimum,
-    ProviderQuotaRefreshState, ProviderQuotaSnapshotContract, ProviderQuotaSnapshotKind,
-    PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION, ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD,
+    official_balance_backoff_with_jitter_secs, provider_pool_key_account_quota_exhausted,
+    provider_pool_key_balance_below_minimum, provider_quota_snapshot_exhausted,
+    ProviderQuotaQueryStatus, ProviderQuotaRefreshState, ProviderQuotaSnapshotContract,
+    ProviderQuotaSource, PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -20,23 +21,6 @@ pub(super) struct SnapshotUpdate<'a> {
 pub(super) enum QuotaCacheInvalidationScope {
     CatalogOnly,
     CandidateRouting,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubscriptionRoutingState {
-    Unknown,
-    Active,
-    Exhausted,
-}
-
-impl SubscriptionRoutingState {
-    const fn from_exhausted(exhausted: bool) -> Self {
-        if exhausted {
-            Self::Exhausted
-        } else {
-            Self::Active
-        }
-    }
 }
 
 /// 持久化额度尝试，并仅在调度 eligibility 发生变化时失效候选缓存。
@@ -88,120 +72,146 @@ pub(super) fn quota_cache_invalidation_scope(
     quota_cache_invalidation_scope_for_snapshot(update, &persisted.snapshot)
 }
 
-/// 比较写入前后的调度事实；余额 low/active/stale 只要跨越 eligibility 就失效路由缓存。
+/// 同时比较余额和套餐调度事实，包含失败后变旧、独立来源恢复及混合资金来源变化。
 fn quota_cache_invalidation_scope_for_snapshot(
     update: &SnapshotUpdate<'_>,
     next_snapshot: &Value,
 ) -> QuotaCacheInvalidationScope {
-    let Some(quota_kind) = update.attempt.quota_kind() else {
-        return QuotaCacheInvalidationScope::CatalogOnly;
-    };
-    match quota_kind {
-        QuotaKind::Balance => {
-            let balance_eligibility_changed =
-                provider_pool_key_balance_below_minimum(update.key, update.provider_type)
-                    != balance_below_minimum_for_snapshot(
-                        update.key,
-                        update.provider_type,
-                        next_snapshot,
-                    );
-            let previous = subscription_routing_state(typed_snapshot(update.key).as_ref());
-            let next = subscription_routing_state_for_attempt(update.attempt, previous);
-            if balance_eligibility_changed
-                || (next == SubscriptionRoutingState::Exhausted && previous != next)
-            {
-                QuotaCacheInvalidationScope::CandidateRouting
-            } else {
-                QuotaCacheInvalidationScope::CatalogOnly
-            }
-        }
-        QuotaKind::Subscription => {
-            let previous = subscription_routing_state(typed_snapshot(update.key).as_ref());
-            let next = subscription_routing_state_for_attempt(update.attempt, previous);
-            if previous == next {
-                QuotaCacheInvalidationScope::CatalogOnly
-            } else {
-                QuotaCacheInvalidationScope::CandidateRouting
-            }
-        }
-    }
-}
-
-/// 将待写入 quota 快照放入临时 Key，通过共享 helper 计算下一状态，避免复制余额解析规则。
-fn balance_below_minimum_for_snapshot(
-    key: &StoredProviderCatalogKey,
-    provider_type: &str,
-    quota_snapshot: &Value,
-) -> bool {
-    let mut next_key = key.clone();
-    next_key.status_snapshot = Some(json!({"quota": quota_snapshot}));
-    provider_pool_key_balance_below_minimum(&next_key, provider_type)
-}
-
-fn subscription_routing_state(
-    snapshot: Option<&ProviderQuotaSnapshotContract>,
-) -> SubscriptionRoutingState {
-    if snapshot.is_some_and(|snapshot| {
-        snapshot.provider_type.eq_ignore_ascii_case("zhipu")
-            && snapshot.exhausted
-            && snapshot
-                .extensions
-                .get(ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD)
-                .and_then(Value::as_bool)
-                == Some(true)
-    }) {
-        return SubscriptionRoutingState::Exhausted;
-    }
-    match snapshot.map(|snapshot| (snapshot.kind, snapshot.exhausted)) {
-        Some((ProviderQuotaSnapshotKind::Subscription, exhausted)) => {
-            SubscriptionRoutingState::from_exhausted(exhausted)
-        }
-        Some((ProviderQuotaSnapshotKind::Balance, _)) | None => SubscriptionRoutingState::Unknown,
-    }
-}
-
-fn subscription_routing_state_for_attempt(
-    attempt: &AttemptResult,
-    previous: SubscriptionRoutingState,
-) -> SubscriptionRoutingState {
-    match attempt {
-        AttemptResult::Success { snapshot, .. } => subscription_routing_state(Some(snapshot)),
-        AttemptResult::HttpFailure { .. }
-        | AttemptResult::ParseFailure { .. }
-        | AttemptResult::BusinessFailure { .. }
-        | AttemptResult::TransportFailure { .. } => match previous {
-            SubscriptionRoutingState::Unknown => SubscriptionRoutingState::Active,
-            SubscriptionRoutingState::Active => SubscriptionRoutingState::Active,
-            SubscriptionRoutingState::Exhausted => SubscriptionRoutingState::Exhausted,
-        },
+    let mut next_key = update.key.clone();
+    let mut status = next_key
+        .status_snapshot
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    status.insert("quota".into(), next_snapshot.clone());
+    next_key.status_snapshot = Some(Value::Object(status));
+    let balance_changed = provider_pool_key_balance_below_minimum(update.key, update.provider_type)
+        != provider_pool_key_balance_below_minimum(&next_key, update.provider_type);
+    let previous_exhausted =
+        provider_pool_key_account_quota_exhausted(update.key, update.provider_type);
+    let next_exhausted = provider_pool_key_account_quota_exhausted(&next_key, update.provider_type);
+    if balance_changed || previous_exhausted != next_exhausted {
+        QuotaCacheInvalidationScope::CandidateRouting
+    } else {
+        QuotaCacheInvalidationScope::CatalogOnly
     }
 }
 
 pub(super) fn build_persisted_snapshot(
     update: SnapshotUpdate<'_>,
 ) -> Result<PersistedSnapshot, StableErrorClass> {
-    let refresh_state = refresh_state_for_attempt(update.key, update.attempt, update.now_unix_secs);
     let (mut snapshot, code, freshness) = match update.attempt {
-        AttemptResult::Success { snapshot, .. } => (snapshot.clone(), "ok", "fresh"),
-        AttemptResult::HttpFailure { class, .. }
-        | AttemptResult::ParseFailure { class, .. }
-        | AttemptResult::BusinessFailure { class, .. }
-        | AttemptResult::TransportFailure { class, .. } => {
+        AttemptResult::Sources {
+            attempts,
+            quota_kind,
+        } => {
+            let snapshot = merge_source_attempts(&update, attempts, *quota_kind)?;
+            let successful = snapshot.sources.iter().any(|source| {
+                source.query_status == ProviderQuotaQueryStatus::Ok && source.freshness == "fresh"
+            });
+            let failed = snapshot
+                .sources
+                .iter()
+                .any(|source| source.refresh_state.error.is_some());
+            let code =
+                if successful {
+                    if failed {
+                        "partial"
+                    } else {
+                        "ok"
+                    }
+                } else if !failed {
+                    if snapshot.sources.iter().any(|source| {
+                        source.query_status == ProviderQuotaQueryStatus::NotApplicable
+                    }) {
+                        StableErrorClass::QueryNotApplicable.code()
+                    } else {
+                        StableErrorClass::QueryUnsupported.code()
+                    }
+                } else {
+                    update
+                        .attempt
+                        .failure_class()
+                        .unwrap_or(StableErrorClass::ParseFailed)
+                        .code()
+                };
+            let freshness = if !failed {
+                "fresh"
+            } else if successful {
+                "partial"
+            } else if snapshot
+                .sources
+                .iter()
+                .any(|source| source.freshness == "stale")
+            {
+                "stale"
+            } else {
+                "unknown"
+            };
+            (snapshot, code, freshness)
+        }
+        AttemptResult::Success { snapshot, .. } => {
+            let mut snapshot = snapshot.clone();
+            snapshot.refresh_state = success_refresh_state(update.now_unix_secs);
+            (snapshot, "ok", "fresh")
+        }
+        _ => {
             let quota_kind = update
                 .attempt
                 .quota_kind()
                 .ok_or(StableErrorClass::RequestInvalid)?;
-            let retained = typed_snapshot(update.key)
+            let mut retained = typed_snapshot(update.key)
                 .filter(|snapshot| snapshot.kind == quota_kind.snapshot_kind())
                 .unwrap_or_else(|| {
                     quota_kind.empty_snapshot(update.provider_type, update.now_unix_secs)
                 });
+            let class = update
+                .attempt
+                .failure_class()
+                .unwrap_or(StableErrorClass::ParseFailed);
+            retained.refresh_state = failure_state_for_attempt(
+                &update.key.id,
+                &latest_refresh_state(update.key),
+                update.attempt,
+                class,
+                update.attempt.failure_message(),
+                update.now_unix_secs,
+            );
+            // 旧的无来源快照仍可读取，但失败不能把其历史值重新标记为有效证据。
+            for source in &mut retained.sources {
+                source.query_status = update.attempt.query_status();
+                source.freshness = if source.refresh_state.last_success_at.is_some() {
+                    "stale"
+                } else {
+                    "unknown"
+                }
+                .into();
+                source.refresh_state = failure_state_for_attempt(
+                    &format!("{}:{}", update.key.id, source.id),
+                    &source.refresh_state,
+                    update.attempt,
+                    class,
+                    update.attempt.failure_message(),
+                    update.now_unix_secs,
+                );
+            }
+            if !retained.sources.is_empty() {
+                retained.refresh_state.next_eligible_at = retained
+                    .sources
+                    .iter()
+                    .filter_map(|source| source.refresh_state.next_eligible_at)
+                    .max();
+                retained.refresh_state.failure_count = retained
+                    .sources
+                    .iter()
+                    .filter_map(|source| source.refresh_state.failure_count)
+                    .max();
+            }
             (retained, class.code(), "stale")
         }
     };
     snapshot.schema_version = PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION;
     snapshot.provider_type = update.provider_type.to_owned();
-    snapshot.refresh_state = refresh_state.clone();
     snapshot.extensions.insert("code".into(), json!(code));
     snapshot
         .extensions
@@ -213,12 +223,230 @@ pub(super) fn build_persisted_snapshot(
     snapshot
         .extensions
         .insert("updated_at".into(), json!(update.now_unix_secs));
-    let snapshot =
+    // 套餐查询失败已由来源状态表达，清除旧的错误码到全 Key 阻断投影。
+    for field in [
+        "token_plan_status",
+        "token_plan_scheduling_blocked",
+        "token_plan_error",
+        "token_plan_scope",
+        "scheduling_block_reason",
+    ] {
+        snapshot.extensions.remove(field);
+    }
+    let refresh_state = snapshot.refresh_state.clone();
+    let mut snapshot =
         serde_json::to_value(snapshot).map_err(|_| StableErrorClass::PersistenceFailed)?;
+    snapshot["exhausted"] = json!(provider_quota_snapshot_exhausted(
+        &snapshot,
+        update.now_unix_secs
+    ));
     Ok(PersistedSnapshot {
         snapshot,
         refresh_state,
     })
+}
+
+/// 只把匹配来源的旧值保留为过期数据；不同产品或区域之间不迁移余额和套餐。
+fn merge_source_attempts(
+    update: &SnapshotUpdate<'_>,
+    attempts: &[SourceAttempt],
+    quota_kind: QuotaKind,
+) -> Result<ProviderQuotaSnapshotContract, StableErrorClass> {
+    let previous = typed_snapshot(update.key).filter(|snapshot| {
+        snapshot
+            .provider_type
+            .eq_ignore_ascii_case(update.provider_type)
+    });
+    let mut snapshot = quota_kind.empty_snapshot(update.provider_type, update.now_unix_secs);
+    for attempt in attempts {
+        let parsed = match &attempt.result {
+            AttemptResult::Success { snapshot, .. } => Some(snapshot),
+            _ => None,
+        };
+        let mut sources = attempt.sources.clone();
+        if let Some(parsed) = parsed {
+            for source in &parsed.sources {
+                if let Some(expected) = sources.iter_mut().find(|expected| expected.id == source.id)
+                {
+                    *expected = source.clone();
+                } else {
+                    sources.push(source.clone());
+                }
+            }
+            for (name, value) in &parsed.extensions {
+                snapshot
+                    .extensions
+                    .entry(name.clone())
+                    .or_insert_with(|| value.clone());
+            }
+            if snapshot.rate_limit.is_none() {
+                snapshot.rate_limit = parsed.rate_limit.clone();
+            }
+        }
+        for mut source in sources {
+            let current =
+                parsed.and_then(|parsed| parsed.sources.iter().find(|item| item.id == source.id));
+            let historical = previous.as_ref().and_then(|previous| {
+                previous
+                    .sources
+                    .iter()
+                    .find(|item| same_source(item, &source))
+            });
+            source.query_status = if parsed.is_some() {
+                current
+                    .map(|item| item.query_status)
+                    .unwrap_or(ProviderQuotaQueryStatus::Error)
+            } else {
+                attempt.result.query_status()
+            };
+            let confirmed_absent = matches!(
+                source.query_status,
+                ProviderQuotaQueryStatus::NotApplicable | ProviderQuotaQueryStatus::Unsupported
+            );
+            if source.query_status == ProviderQuotaQueryStatus::Ok || confirmed_absent {
+                // 明确不支持或不适用的来源不计失败；清除旧值，避免把历史钱包当成当前资金。
+                source.freshness = "fresh".into();
+                source.refresh_state = success_refresh_state(update.now_unix_secs);
+                if let Some(parsed) = parsed.filter(|_| !confirmed_absent) {
+                    append_source_values(&mut snapshot, parsed, &source.id);
+                }
+            } else {
+                let previous_refresh = historical
+                    .map(|source| source.refresh_state.clone())
+                    .unwrap_or_default();
+                let class = attempt
+                    .result
+                    .failure_class()
+                    .unwrap_or_else(|| StableErrorClass::from_query_status(source.query_status));
+                let detail = current
+                    .and_then(|source| source.refresh_state.error.as_deref())
+                    .or_else(|| attempt.result.failure_message());
+                source.refresh_state = failure_state_for_attempt(
+                    &format!("{}:{}", update.key.id, source.id),
+                    &previous_refresh,
+                    &attempt.result,
+                    class,
+                    detail,
+                    update.now_unix_secs,
+                );
+                source.freshness = if historical
+                    .is_some_and(|source| source.refresh_state.last_success_at.is_some())
+                {
+                    "stale"
+                } else {
+                    "unknown"
+                }
+                .into();
+                if let (Some(previous), Some(historical)) = (previous.as_ref(), historical) {
+                    source.plan_id = source.plan_id.or_else(|| historical.plan_id.clone());
+                    source.plan_name = source.plan_name.or_else(|| historical.plan_name.clone());
+                    source.plan_tier = source.plan_tier.or_else(|| historical.plan_tier.clone());
+                    source.currency_source = source
+                        .currency_source
+                        .or_else(|| historical.currency_source.clone());
+                    append_source_values(&mut snapshot, previous, &source.id);
+                }
+            }
+            snapshot.sources.push(source);
+        }
+    }
+    if snapshot.sources.is_empty() {
+        return Err(StableErrorClass::RequestInvalid);
+    }
+    if snapshot
+        .sources
+        .iter()
+        .filter(|source| {
+            matches!(source.product.as_str(), "coding_plan" | "token_plan")
+                && !matches!(
+                    source.query_status,
+                    ProviderQuotaQueryStatus::NotApplicable | ProviderQuotaQueryStatus::Unsupported
+                )
+        })
+        .take(2)
+        .count()
+        > 1
+    {
+        // 多套餐并存时，单个来源的档位不能代表整个 Key；身份由各来源独立展示。
+        for field in [
+            "plan_type",
+            "pool_tier",
+            "membership_level",
+            "subscription_type",
+        ] {
+            snapshot.extensions.remove(field);
+        }
+    }
+    let successful = snapshot
+        .sources
+        .iter()
+        .any(|source| source.query_status == ProviderQuotaQueryStatus::Ok);
+    let failed_sources = snapshot
+        .sources
+        .iter()
+        .filter(|source| source.refresh_state.error.is_some());
+    let first_error = failed_sources.clone().find_map(|source| {
+        source
+            .refresh_state
+            .error
+            .as_ref()
+            .map(|error| format!("{}: {error}", source.id))
+    });
+    // 部分成功也保留失败来源的退避期限，后台刷新不会立即重复打失败接口。
+    snapshot.refresh_state = ProviderQuotaRefreshState {
+        last_attempt_at: Some(update.now_unix_secs),
+        last_success_at: if successful {
+            Some(update.now_unix_secs)
+        } else {
+            previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.refresh_state.last_success_at)
+        },
+        error: first_error,
+        next_eligible_at: failed_sources
+            .clone()
+            .filter_map(|source| source.refresh_state.next_eligible_at)
+            .max(),
+        failure_count: Some(
+            failed_sources
+                .filter_map(|source| source.refresh_state.failure_count)
+                .max()
+                .unwrap_or(0),
+        ),
+    };
+    Ok(snapshot)
+}
+
+fn same_source(previous: &ProviderQuotaSource, next: &ProviderQuotaSource) -> bool {
+    previous.id == next.id
+        && previous.product == next.product
+        && previous.scope == next.scope
+        && previous.region == next.region
+        && next
+            .plan_id
+            .as_ref()
+            .is_none_or(|plan_id| previous.plan_id.as_ref() == Some(plan_id))
+}
+
+fn append_source_values(
+    target: &mut ProviderQuotaSnapshotContract,
+    source: &ProviderQuotaSnapshotContract,
+    source_id: &str,
+) {
+    target.balances.extend(
+        source
+            .balances
+            .iter()
+            .filter(|balance| balance.source_id.as_deref() == Some(source_id))
+            .cloned(),
+    );
+    target.windows.extend(
+        source
+            .windows
+            .iter()
+            .filter(|window| window.source_id.as_deref() == Some(source_id))
+            .cloned(),
+    );
 }
 
 pub(super) fn latest_snapshot(key: &StoredProviderCatalogKey) -> Option<Value> {
@@ -240,50 +468,53 @@ pub(super) fn failure_refresh_state(
     class: StableErrorClass,
     now_unix_secs: u64,
 ) -> ProviderQuotaRefreshState {
-    build_failure_refresh_state(key, class, None, None, now_unix_secs)
+    build_failure_refresh_state(
+        &key.id,
+        &latest_refresh_state(key),
+        class,
+        None,
+        None,
+        now_unix_secs,
+    )
 }
 
-fn refresh_state_for_attempt(
-    key: &StoredProviderCatalogKey,
-    attempt: &AttemptResult,
-    now_unix_secs: u64,
-) -> ProviderQuotaRefreshState {
-    match attempt {
-        AttemptResult::Success { .. } => ProviderQuotaRefreshState {
-            last_attempt_at: Some(now_unix_secs),
-            last_success_at: Some(now_unix_secs),
-            error: None,
-            next_eligible_at: None,
-            failure_count: Some(0),
-        },
-        AttemptResult::HttpFailure { headers, class, .. } => build_failure_refresh_state(
-            key,
-            *class,
-            None,
-            retry_after_eligibility(headers, now_unix_secs),
-            now_unix_secs,
-        ),
-        AttemptResult::BusinessFailure { class, detail, .. } => {
-            build_failure_refresh_state(key, *class, Some(detail.as_str()), None, now_unix_secs)
-        }
-        AttemptResult::ParseFailure { class, .. }
-        | AttemptResult::TransportFailure { class, .. } => {
-            build_failure_refresh_state(key, *class, None, None, now_unix_secs)
-        }
+fn success_refresh_state(now_unix_secs: u64) -> ProviderQuotaRefreshState {
+    ProviderQuotaRefreshState {
+        last_attempt_at: Some(now_unix_secs),
+        last_success_at: Some(now_unix_secs),
+        error: None,
+        next_eligible_at: None,
+        failure_count: Some(0),
     }
 }
 
+fn failure_state_for_attempt(
+    seed_id: &str,
+    previous: &ProviderQuotaRefreshState,
+    attempt: &AttemptResult,
+    class: StableErrorClass,
+    detail: Option<&str>,
+    now_unix_secs: u64,
+) -> ProviderQuotaRefreshState {
+    let retry_at = match attempt {
+        AttemptResult::HttpFailure { headers, .. } => {
+            retry_after_eligibility(headers, now_unix_secs)
+        }
+        _ => None,
+    };
+    build_failure_refresh_state(seed_id, previous, class, detail, retry_at, now_unix_secs)
+}
+
 fn build_failure_refresh_state(
-    key: &StoredProviderCatalogKey,
+    seed_id: &str,
+    previous: &ProviderQuotaRefreshState,
     class: StableErrorClass,
     detail: Option<&str>,
     retry_at: Option<u64>,
     now_unix_secs: u64,
 ) -> ProviderQuotaRefreshState {
-    let previous = latest_refresh_state(key);
     let failure_count = previous.failure_count.unwrap_or(0).saturating_add(1);
-    let seed = key
-        .id
+    let seed = seed_id
         .bytes()
         .fold(u64::from(failure_count), |value, byte| {
             value

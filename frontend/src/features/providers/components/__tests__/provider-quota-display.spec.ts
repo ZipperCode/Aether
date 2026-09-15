@@ -37,10 +37,10 @@ describe('provider quota display components', () => {
     })
 
     expect(root.querySelector('[data-testid="provider-balance-panel"]')?.textContent).toContain('可用余额$9.25')
-    expect(root.querySelector('[data-testid="provider-subscription-panel"]')?.textContent).toContain('Monthly75.0%')
+    expect(root.querySelector('[data-testid="provider-subscription-panel"]')?.textContent).toContain('Monthly剩余 75.0%')
     expect(root.querySelector('[data-testid="provider-quota-kind-badge"]')).toBeNull()
     expect(root.textContent).toContain('RPM 20')
-    expect(root.querySelector('[data-testid="provider-generic-quota-status"]')?.textContent).toContain('数据已过期')
+    expect(root.textContent).toContain('数据已过期')
     expect(root.textContent).toContain('sanitized upstream error')
     expect(root.querySelector('[data-testid="provider-quota-header-loading"]')).toBeTruthy()
     unmount()
@@ -76,13 +76,13 @@ describe('provider quota display components', () => {
       },
     })
 
-    expect(root.querySelector('[data-testid="provider-balance-panel"]')).toBeNull()
+    expect(root.querySelector('[data-testid="provider-balance-panel"]')?.textContent).toContain('CNY')
     expect(root.querySelector('[data-testid="provider-model-availability"]')?.textContent)
       .toContain('额度未知，继续参与模型调度')
     expect(root.querySelector('[data-testid="provider-model-availability"]')?.classList).toContain('text-amber-700')
     expect(root.querySelector('[data-testid="provider-generic-quota-status"]')?.textContent)
-      .toContain('额度查询失败，额度未知')
-    expect(root.textContent).toContain('套餐类型 团队版')
+      .toContain('upstream business code 500')
+    expect(root.textContent).toContain('团队')
     unmount()
   })
 
@@ -101,7 +101,7 @@ describe('provider quota display components', () => {
     expect(availability?.textContent).toContain('模型调用已验证可用')
     expect(availability?.textContent).toContain('额度查询失败，额度未知')
     expect(availability?.classList).toContain('text-emerald-700')
-    expect(root.querySelector('[data-testid="provider-balance-panel"]')).toBeNull()
+    expect(root.querySelector('[data-testid="provider-balance-panel"]')?.textContent).toContain('CNY')
     unmount()
   })
 
@@ -166,7 +166,7 @@ describe('provider quota display components', () => {
     unmount()
   })
 
-  it('hides a retained DeepSeek balance after a refresh failure', () => {
+  it('retains the previous DeepSeek balance and marks it stale after a refresh failure', () => {
     const { root, unmount } = mount(ProviderGenericQuotaCard, {
       providerType: 'deepseek',
       quota: {
@@ -177,10 +177,10 @@ describe('provider quota display components', () => {
     })
 
     expect(root.querySelector('[data-testid="provider-quota-header-status"]')).toBeNull()
-    expect(root.querySelector('[data-testid="provider-generic-quota-status"]')).toBeNull()
-    expect(root.textContent).not.toContain('47.730000000000000001 CNY')
-    expect(root.textContent).not.toContain('temporary upstream failure')
-    expect(root.textContent).not.toContain('数据已过期')
+    expect(root.querySelector('[data-testid="provider-generic-quota-status"]')).toBeTruthy()
+    expect(root.textContent).toContain('47.730000000000000001 CNY')
+    expect(root.textContent).toContain('temporary upstream failure')
+    expect(root.textContent).toContain('数据已过期')
     unmount()
   })
 
@@ -220,8 +220,8 @@ describe('provider quota display components', () => {
 
     expect(root.textContent).toContain('ADVANCED')
     expect(root.textContent).toContain('并发 30')
-    expect(root.textContent).toContain('周期配额99.0%')
-    expect(root.textContent).toContain('5小时配额99.0%')
+    expect(root.textContent).toContain('周期配额剩余 99.0%')
+    expect(root.textContent).toContain('5小时配额剩余 99.0%')
     expect(root.querySelectorAll('[data-testid="provider-quota-progress-row"]')).toHaveLength(2)
     unmount()
   })
@@ -242,7 +242,7 @@ describe('provider quota display components', () => {
     unmount()
   })
 
-  it('renders DeepSeek as unavailable without a retained balance after quota failure', () => {
+  it('renders the DeepSeek balance with query failure and stale metadata', () => {
     const { root, unmount } = mount(ProviderGenericQuotaCard, {
       providerType: 'deepseek',
       quota: {
@@ -253,15 +253,15 @@ describe('provider quota display components', () => {
       },
     })
 
-    expect(root.querySelector('[data-testid="provider-balance-panel"]')).toBeNull()
+    expect(root.querySelector('[data-testid="provider-balance-panel"]')?.textContent).toContain('$9.25')
     expect(root.querySelector('[data-testid="provider-quota-header-status"]')).toBeNull()
-    expect(root.querySelector('[data-testid="provider-generic-quota-status"]')).toBeNull()
-    expect(root.textContent).not.toContain('数据已过期')
-    expect(root.textContent).not.toContain('$9.25')
+    expect(root.querySelector('[data-testid="provider-generic-quota-status"]')).toBeTruthy()
+    expect(root.textContent).toContain('数据已过期')
+    expect(root.textContent).toContain('$9.25')
     unmount()
   })
 
-  it('hides retained balances and raw authentication errors for generic providers', () => {
+  it('shows retained balances and query authentication errors without expiring keys', () => {
     for (const providerType of ['openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai']) {
       const { root, unmount } = mount(ProviderGenericQuotaCard, {
         providerType,
@@ -273,11 +273,11 @@ describe('provider quota display components', () => {
         },
       })
 
-      expect(root.querySelector('[data-testid="provider-balance-panel"]')).toBeNull()
-      expect(root.querySelector('[data-testid="provider-generic-quota-status"]')).toBeNull()
-      expect(root.textContent).not.toContain('数据已过期')
-      expect(root.textContent).not.toContain('http_unauthorized')
-      expect(root.textContent).not.toContain('88.5 CNY')
+      expect(root.querySelector('[data-testid="provider-balance-panel"]')?.textContent).toContain('CNY')
+      expect(root.querySelector('[data-testid="provider-generic-quota-status"]')).toBeTruthy()
+      expect(root.textContent).toContain('数据已过期')
+      expect(root.textContent).toContain('http_unauthorized')
+      expect(root.textContent).toContain('88.5 CNY')
       unmount()
     }
   })
@@ -328,7 +328,7 @@ describe('provider quota display components', () => {
     expect(root.textContent).toContain('$5')
     expect(root.textContent).toContain('$20')
     expect(root.textContent).toContain('$15')
-    expect(root.textContent).toContain('过期')
+    expect(root.textContent).toContain('到期')
     unmount()
   })
 
@@ -344,7 +344,7 @@ describe('provider quota display components', () => {
     expect(root.querySelector('[data-testid="provider-generic-quota"]')).toBeTruthy()
     expect(root.querySelector('[data-testid="provider-quota-progress-row"]')).toBeFalsy()
     expect(root.textContent).not.toContain('Free')
-    expect(root.textContent).toContain('无限制')
+    expect(root.textContent).toContain('未设置消费上限')
     unmount()
   })
 
@@ -357,7 +357,7 @@ describe('provider quota display components', () => {
       },
     })
 
-    expect(root.textContent).toContain('无限制')
+    expect(root.textContent).toContain('未设置消费上限')
     expect(root.textContent).toContain('累计已用 $45.23')
     expect(root.querySelector('[data-testid="provider-quota-progress-bar"]')).toBeFalsy()
     unmount()
@@ -378,7 +378,7 @@ describe('provider quota display components', () => {
     unmount()
   })
 
-  it('normalizes quota progress and renders fallback footer text', () => {
+  it('clamps the progress bar while preserving boosted percentage text and reset footer', () => {
     const { root, unmount } = mount(ProviderQuotaProgressRow, {
       label: 'Daily',
       remainingPercent: 120,
@@ -387,7 +387,7 @@ describe('provider quota display components', () => {
       resetText: '2h reset',
     })
 
-    expect(root.querySelector('[data-testid="provider-quota-progress-meter"]')?.textContent?.trim()).toBe('100.0%')
+    expect(root.querySelector('[data-testid="provider-quota-progress-meter"]')?.textContent?.trim()).toBe('120.0%')
     expect((root.querySelector('[data-testid="provider-quota-progress-bar"]') as HTMLElement).style.width).toBe('100%')
     expect(root.querySelector('[data-testid="provider-quota-progress-reset"]')?.textContent).toBe('2h reset')
 

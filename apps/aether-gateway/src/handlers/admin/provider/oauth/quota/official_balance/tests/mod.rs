@@ -1,13 +1,9 @@
 use super::{
     domain::{
         AttemptResult, ExecutionRoute, FlightScope, ItemStatus, OfficialQuotaItem, QuotaKind,
-        RouteSource, StableErrorClass,
+        RouteSource, SourceAttempt, StableErrorClass,
     },
-    execution::{
-        apply_zhipu_plan_scope, apply_zhipu_token_plan_fallback_policy,
-        execution_result_to_attempt, should_fallback_to_zhipu_balance,
-        should_retry_zhipu_team_quota,
-    },
+    execution::{apply_zhipu_plan_scope, execution_result_to_attempt as parse_execution_result},
     persisted_backoff_applies,
     persistence::{
         build_persisted_snapshot, quota_cache_invalidation_scope, QuotaCacheInvalidationScope,
@@ -25,8 +21,8 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
 use aether_provider_pool::{
-    ProviderQuotaRefreshState, ProviderQuotaSnapshotContract, ProviderQuotaSnapshotKind,
-    ProviderQuotaValue, ProviderQuotaWindow,
+    ProviderQuotaQueryStatus, ProviderQuotaRefreshState, ProviderQuotaSnapshotContract,
+    ProviderQuotaSnapshotKind, ProviderQuotaSource, ProviderQuotaValue, ProviderQuotaWindow,
 };
 use serde_json::{json, Value};
 use std::{
@@ -69,6 +65,49 @@ fn endpoint(fixture: EndpointFixture<'_>) -> StoredProviderCatalogEndpoint {
         None,
     )
     .expect("endpoint transport fixture")
+}
+
+// 现有响应样例明确使用国内站点，传给新的区域化解析入口。
+fn execution_result_to_attempt(
+    result: ExecutionResult,
+    quota_kind: QuotaKind,
+    provider_type: &str,
+) -> AttemptResult {
+    let base_url = match provider_type {
+        "deepseek" => "https://api.deepseek.com",
+        "zhipu" => "https://open.bigmodel.cn",
+        _ => panic!("missing fixture endpoint for {provider_type}"),
+    };
+    parse_execution_result(
+        result,
+        quota_kind,
+        provider_type,
+        &endpoint(EndpointFixture {
+            id: "endpoint-1",
+            provider_id: "provider-1",
+            base_url,
+            active: true,
+        }),
+    )
+}
+
+fn zhipu_source_attempt(scope: &str, result: AttemptResult) -> SourceAttempt {
+    SourceAttempt {
+        sources: vec![ProviderQuotaSource {
+            id: scope.into(),
+            label: scope.into(),
+            product: if scope == "balance" {
+                "account_balance"
+            } else {
+                "coding_plan"
+            }
+            .into(),
+            scope: if scope == "balance" { "account" } else { scope }.into(),
+            region: Some("cn".into()),
+            ..Default::default()
+        }],
+        result,
+    }
 }
 
 fn key(id: &str, name: &str, quota: Option<Value>) -> StoredProviderCatalogKey {

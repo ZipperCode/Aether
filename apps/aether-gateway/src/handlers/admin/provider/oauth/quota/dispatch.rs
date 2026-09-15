@@ -81,7 +81,14 @@ pub(crate) async fn refresh_provider_pool_quota_locally(
     let normalized_provider_type = provider_type.trim().to_ascii_lowercase();
     if matches!(
         normalized_provider_type.as_str(),
-        "deepseek" | "openrouter" | "moonshot" | "kimi_coding" | "siliconflow" | "zhipu" | "zai"
+        "deepseek"
+            | "openrouter"
+            | "moonshot"
+            | "kimi_coding"
+            | "siliconflow"
+            | "zhipu"
+            | "zai"
+            | "minimax"
     ) {
         return refresh_official_balance_provider_quota_locally(
             state,

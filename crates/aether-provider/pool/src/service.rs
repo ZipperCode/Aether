@@ -73,6 +73,9 @@ impl ProviderPoolService {
             .with_adapter(Arc::new(OfficialApiKeyQuotaProviderPoolAdapter(
                 OfficialApiKeyQuotaProvider::Zai,
             )))
+            .with_adapter(Arc::new(OfficialApiKeyQuotaProviderPoolAdapter(
+                OfficialApiKeyQuotaProvider::MiniMax,
+            )))
             .with_adapter(Arc::new(ChatGptWebProviderPoolAdapter))
             .with_adapter(Arc::new(WindsurfProviderPoolAdapter))
             .with_adapter(Arc::new(VERTEX_AI_PROVIDER_POOL_ADAPTER))

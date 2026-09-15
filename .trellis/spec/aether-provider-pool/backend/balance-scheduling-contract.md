@@ -34,7 +34,8 @@ The corresponding internal skip reasons are
 
 ## 3. Contracts
 
-- A Key is below the minimum only when the snapshot is `fresh`, has
+- For legacy snapshots without query sources (subject to the official-provider
+  exceptions below), a Key is below the minimum only when the snapshot is `fresh`, has
   `kind = "balance"`, is explicitly finite (`unlimited` is missing or
   `false`), contains a non-empty `balances` array, and every entry has a
   non-empty `unit` plus a finite parseable `available` value `<= 1.0`.
@@ -57,7 +58,46 @@ The corresponding internal skip reasons are
   resolved candidate caches. An unchanged boolean keeps catalog-only
   invalidation.
 
-No database, HTTP, frontend, or user-configuration contract is introduced.
+The fixed monetary threshold does not introduce a user-configurable policy.
+
+### Official query sources
+
+Official quota snapshots may add `sources[]`; balances and windows associate
+with their metadata using `source_id`, without duplicating the numeric arrays.
+For these snapshots the source product and per-source status take precedence
+over the legacy top-level `kind`/freshness compatibility fields.
+
+- Only `ok` + `fresh` sources with product `account_balance` or
+  `key_spending_limit`, known currency units, and valid amounts participate in
+  the existing 1.0 monetary threshold. An eligible source with missing values,
+  a failed/unknown source, or applicable coding/extra-usage funding makes that
+  monetary inference unknown. `unsupported` and `not_applicable` sources are
+  not applicable constraints.
+- Independent applicable plan sources must all be proven exhausted before
+  projecting account-wide exhaustion. A plan is constrained by any of its
+  account/key windows with an explicit exhausted state and a future reset.
+  Tool/MCP/model-specific, excluded and unlimited windows do not establish
+  that fact. Reset deadlines are reevaluated when scheduling.
+- Mixed account balance, plan and extra-usage sources do not prove an upstream
+  funding order; keep the account-wide decision unknown rather than allowing
+  one exhausted component to poison every alternative. MiniMax remains
+  observation-only, including its monetary query results.
+- Legacy OpenRouter derived remaining amounts and Zhipu error-derived amounts
+  are not trusted for the monetary threshold until a normal refresh creates
+  source evidence. Legacy Zhipu/Z.ai/Kimi Coding subscription snapshots also
+  lack the required product/source evidence and do not establish new blocks.
+- Query failures must not be presented as OAuth/inference authentication
+  expiration. Refresh writes and frontend application preserve all
+  `status_snapshot` siblings, particularly the independent manual-recovery
+  `scheduling` block.
+- The subscription refresh worker must not duplicate official source evidence
+  into a persistent account `QuotaExhausted` score. Such a duplicate outlives
+  source staleness and window resets. Normal refresh results clear only scores
+  tagged as old `quota_refresh_health` exhaustion; runtime manual blocks remain
+  protected by the existing projection lock and strong scheduling-state check.
+
+The additive source API and upstream evidence are documented in
+`docs/api/official-provider-quota.md`. No database migration is required.
 
 ## 4. Validation & Error Matrix
 
@@ -115,4 +155,3 @@ let balance_below_minimum =
     provider_pool_key_balance_below_minimum(key, provider_type);
 let scheduled = schedule_pool_page_candidates(singleton_candidate, context);
 ```
-

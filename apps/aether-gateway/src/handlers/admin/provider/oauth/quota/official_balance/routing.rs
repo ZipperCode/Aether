@@ -24,7 +24,7 @@ pub(super) fn validate_selected_endpoint(
     let official = match provider_type.trim().to_ascii_lowercase().as_str() {
         "deepseek" => is_official_deepseek_endpoint(endpoint),
         "openrouter" => is_official_openrouter_endpoint(endpoint),
-        provider @ ("moonshot" | "kimi_coding" | "siliconflow" | "zhipu" | "zai") => {
+        provider @ ("moonshot" | "kimi_coding" | "siliconflow" | "zhipu" | "zai" | "minimax") => {
             is_official_api_key_quota_endpoint(provider, endpoint)
         }
         _ => false,

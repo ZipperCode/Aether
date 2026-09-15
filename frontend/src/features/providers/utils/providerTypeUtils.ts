@@ -21,3 +21,11 @@ export const isOAuthAccountProviderType = (providerType?: string | null): boolea
 
 export const isKeyManagedProviderType = (providerType?: string | null): boolean =>
   !isOAuthAccountProviderType(providerType)
+
+/** 官方 API Key 额度查询的统一入口，供抽屉、列表和号池共同判断。 */
+const officialQuotaProviderTypes = new Set([
+  'deepseek', 'openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai', 'minimax',
+])
+
+export const isOfficialQuotaProviderType = (providerType?: string | null): boolean =>
+  officialQuotaProviderTypes.has((providerType || '').trim().toLowerCase())

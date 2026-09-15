@@ -156,6 +156,21 @@
                       :disabled="isFixedProvider"
                       @update:model-value="(v) => updateEndpointField(endpoint.id, 'url', v)"
                     />
+                    <div
+                      v-if="!isFixedProvider"
+                      class="flex flex-wrap gap-1"
+                    >
+                      <button
+                        v-for="preset in getOfficialEndpointPresets(provider?.provider_type, endpoint.api_format)"
+                        :key="preset.url"
+                        type="button"
+                        class="rounded border border-border/50 px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                        :title="preset.url"
+                        @click="updateEndpointField(endpoint.id, 'url', preset.url)"
+                      >
+                        {{ preset.label }}
+                      </button>
+                    </div>
                   </div>
                   <div class="space-y-1.5">
                     <Label class="text-xs text-muted-foreground">自定义路径</Label>
@@ -998,6 +1013,18 @@
                   size="sm"
                   :placeholder="newEndpointBaseUrlPlaceholder"
                 />
+                <div class="flex flex-wrap gap-1">
+                  <button
+                    v-for="preset in getOfficialEndpointPresets(provider?.provider_type, newEndpoint.api_format)"
+                    :key="preset.url"
+                    type="button"
+                    class="rounded border border-border/50 px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                    :title="preset.url"
+                    @click="newEndpoint.base_url = preset.url"
+                  >
+                    {{ preset.label }}
+                  </button>
+                </div>
               </div>
               <div class="space-y-1.5">
                 <Label class="text-xs text-muted-foreground">自定义路径</Label>
@@ -1096,7 +1123,7 @@ import EndpointConditionEditor from './EndpointConditionEditor.vue'
 import EndpointRulesRevealDialog from './EndpointRulesRevealDialog.vue'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
 import ClaudeEndpointOperationSupport from './ClaudeEndpointOperationSupport.vue'
-import { getDefaultEndpointPath, resolveNewEndpointBaseUrl } from './endpoint-default-paths'
+import { getDefaultEndpointPath, getOfficialEndpointPresets, resolveNewEndpointBaseUrl } from './endpoint-default-paths'
 import {
   fixedEndpointUpstreamStreamPolicy,
   isWebSocketEndpointApiFormat,

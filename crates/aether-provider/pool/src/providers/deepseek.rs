@@ -8,7 +8,9 @@ use crate::provider::{provider_pool_matching_endpoint, ProviderPoolAdapter};
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
 use crate::quota_snapshot::{ProviderQuotaBalance, ProviderQuotaSnapshotContract};
 
-use super::official_balance::{decimal_string, endpoint_has_official_origin};
+use super::official_balance::{
+    decimal_string, endpoint_has_official_origin, official_quota_source,
+};
 
 pub const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 const DEEPSEEK_HOST: &str = "api.deepseek.com";
@@ -88,20 +90,31 @@ pub fn parse_deepseek_balance(
             if unit.is_empty() {
                 return None;
             }
-            Some(ProviderQuotaBalance {
+            let balance = ProviderQuotaBalance {
+                source_id: Some("balance".into()),
                 unit: unit.to_string(),
                 available: record.get("total_balance").and_then(decimal_string),
                 total: record.get("total_balance").and_then(decimal_string),
                 granted: record.get("granted_balance").and_then(decimal_string),
                 topped_up: record.get("topped_up_balance").and_then(decimal_string),
                 used: None,
-            })
+            };
+            if balance.available.is_none()
+                && balance.granted.is_none()
+                && balance.topped_up.is_none()
+            {
+                return None;
+            }
+            Some(balance)
         })
         .collect::<Vec<_>>();
     if balances.is_empty() {
         return Err("no valid balance records");
     }
     let mut snapshot = ProviderQuotaSnapshotContract::balance("deepseek", balances);
+    let mut source = official_quota_source("balance", "账户余额", "account_balance", "account");
+    source.currency_source = Some("upstream".into());
+    snapshot.sources.push(source);
     if let Some(available) = value.get("is_available").and_then(Value::as_bool) {
         snapshot
             .extensions

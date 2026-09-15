@@ -38,7 +38,13 @@ pub(super) fn persisted_item(
             Some(class),
             attempt.failure_message().map(str::to_owned),
         ),
-        None => (ItemStatus::Success, None, None),
+        // 接口仍按 Key 统计；部分来源失败不会吞掉同一 Key 的成功结果。
+        None => (
+            ItemStatus::Success,
+            None,
+            (persisted.snapshot.get("code").and_then(Value::as_str) == Some("partial"))
+                .then(|| "some quota sources could not be refreshed".to_owned()),
+        ),
     };
     OfficialQuotaItem {
         key_id: key.id.clone(),

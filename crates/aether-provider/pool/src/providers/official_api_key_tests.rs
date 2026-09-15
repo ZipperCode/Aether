@@ -135,11 +135,15 @@ fn parses_zhipu_standard_account_balance_without_subscription_limits() {
 }
 
 #[test]
-fn parses_zhipu_zero_and_business_1113_as_insufficient_balance() {
+fn parses_zhipu_zero_without_turning_business_errors_into_balance() {
     for fixture in [
         json!({"success": true, "data": {"availableBalance": "0.00"}}),
         json!({"success": false, "code": 1113, "msg": "余额不足"}),
     ] {
+        if fixture["success"] == false {
+            assert!(parse_zhipu_standard_balance(&fixture).is_err());
+            continue;
+        }
         let parsed = parse_zhipu_standard_balance(&fixture).unwrap();
         assert_eq!(parsed.kind, ProviderQuotaSnapshotKind::Balance);
         assert!(matches!(
@@ -167,10 +171,7 @@ fn balance_and_subscription_are_not_conflated() {
         "type":"TOKENS_LIMIT","currentValue":120,"usage":500,"percentage":24,"resetAt":"2030-01-01T00:00:00Z"
     }]}})).unwrap();
     assert!(glm.balances.is_empty());
-    assert_eq!(
-        serde_json::to_value(&glm.windows[0]).unwrap()["remaining_value"],
-        380.0
-    );
+    assert_eq!(glm.windows[0].remaining_value, None);
 }
 
 #[test]
@@ -261,8 +262,8 @@ fn kimi_subscription_boundaries_do_not_infer_exhaustion_from_invalid_values() {
     );
     assert!(!parsed.windows[0].is_exhausted);
     assert!(!parsed.windows[1].is_exhausted);
-    assert!(!parsed.windows[2].is_exhausted);
-    assert!(!parsed.exhausted);
+    assert!(parsed.windows[2].is_exhausted);
+    assert!(parsed.exhausted);
 }
 
 #[test]

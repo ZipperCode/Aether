@@ -21,16 +21,16 @@ describe('providerKeyQuota', () => {
     } satisfies QuotaStatusSnapshot
 
     expect(getGenericQuotaSections(quota)).toEqual({
-      balances: ['可用 $12.50 / 总额 $20'],
-      windows: ['月度 剩余 800/1000'],
-      rateLimits: ['RPM 60', 'TPM 100000'],
-      status: ['数据已过期', '上游暂时不可用'],
+      balances: ['可用余额 $12.50 · 总额 $20'],
+      windows: ['月度 剩余 80.0% · 800 / 1,000 单位未知'],
+      rateLimits: ['RPM 60', 'TPM 100,000'],
+      status: ['查询失败', '数据已过期，显示上次成功结果'],
     })
     expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'siliconflow'))
-      .toBe('可用 $12.50 / 总额 $20 | 月度 剩余 800/1000 | RPM 60 | TPM 100000')
+      .toBe('可用余额 $12.50 · 总额 $20 | 月度 剩余 80.0% · 800 / 1,000 单位未知 | RPM 60 | TPM 100,000 | 查询失败 | 数据已过期，显示上次成功结果')
   })
 
-  it('shows DeepSeek as unavailable without retained balance when quota refresh fails', () => {
+  it('keeps the previous DeepSeek balance with a stale query status after refresh failure', () => {
     const quota = {
       provider_type: 'deepseek',
       kind: 'balance',
@@ -46,16 +46,16 @@ describe('providerKeyQuota', () => {
     } satisfies QuotaStatusSnapshot
 
     expect(getGenericQuotaSections(quota)).toEqual({
-      balances: [],
+      balances: ['可用余额 88.5 CNY · 总额 88.5 CNY'],
       windows: [],
       rateLimits: [],
-      status: ['不可用'],
+      status: ['查询失败', '数据已过期，显示上次成功结果'],
     })
     expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'deepseek'))
-      .toBe('不可用')
+      .toBe('可用余额 88.5 CNY · 总额 88.5 CNY | 查询失败 | 数据已过期，显示上次成功结果')
   })
 
-  it('treats quota authentication rejection as expired for every generic provider', () => {
+  it('keeps query authentication rejection separate from key validity', () => {
     for (const providerType of ['openrouter', 'moonshot', 'kimi_coding', 'siliconflow', 'zhipu', 'zai']) {
       const quota = {
         provider_type: providerType,
@@ -69,14 +69,14 @@ describe('providerKeyQuota', () => {
         },
       } satisfies QuotaStatusSnapshot
 
-      expect(getGenericQuotaSections(quota, providerType)).toEqual({
-        balances: [],
-        windows: [],
-        rateLimits: [],
-        status: ['不可用'],
-      })
-      expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, providerType))
-        .toBe('不可用')
+      const sections = getGenericQuotaSections(quota, providerType)
+      expect(sections.balances[0]).toContain('88.5 CNY')
+      expect(sections.status).toContain('查询失败')
+      expect(sections.status).toContain('数据已过期，显示上次成功结果')
+      const text = getQuotaDisplayText({ status_snapshot: { quota } } as never, providerType)
+      expect(text).toContain('查询失败')
+      expect(text).not.toContain('不可用')
+      expect(text).not.toContain('Expired')
     }
   })
 
@@ -92,7 +92,7 @@ describe('providerKeyQuota', () => {
     } satisfies QuotaStatusSnapshot
 
     expect(getGenericQuotaSections(quota).balances).toEqual([
-      '可用 9,007,199,254,740,993.123456789012345678 CNY / 总额 9,007,199,254,740,994.000000000000000001 CNY',
+      '可用余额 9,007,199,254,740,993.123456789012345678 CNY · 总额 9,007,199,254,740,994.000000000000000001 CNY',
     ])
   })
 
@@ -110,13 +110,13 @@ describe('providerKeyQuota', () => {
     } satisfies QuotaStatusSnapshot
 
     expect(getGenericQuotaSections(quota)).toEqual({
-      balances: [],
+      balances: ['标准余额（参考） 0 CNY'],
       windows: [],
       rateLimits: [],
-      status: ['额度查询失败，额度未知'],
+      status: ['查询失败'],
     })
     expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'zhipu'))
-      .toBe('额度未知，继续参与模型调度')
+      .toBe('额度未知，继续参与模型调度 | 标准余额（参考） 0 CNY | 查询失败')
   })
 
   it('uses a successful model probe to distinguish a callable Zhipu key', () => {
@@ -135,7 +135,7 @@ describe('providerKeyQuota', () => {
           status_code: 200, source: 'admin_model_test',
         },
       },
-    } as never, 'zhipu')).toBe('模型调用已验证可用 · 额度查询失败，额度未知')
+    } as never, 'zhipu')).toBe('模型调用已验证可用 · 额度查询失败，额度未知 | 标准余额（参考） 0 CNY')
   })
 
   it('uses a failed model probe to distinguish a truly unavailable Zhipu key', () => {
@@ -154,10 +154,10 @@ describe('providerKeyQuota', () => {
           status_code: 429, error: '余额不足或无可用资源包', source: 'admin_model_test',
         },
       },
-    } as never, 'zhipu')).toBe('模型调用验证失败：余额不足或无可用资源包')
+    } as never, 'zhipu')).toBe('模型调用验证失败：余额不足或无可用资源包 | 标准余额（参考） 0 CNY')
   })
 
-  it('translates a stale Zhipu 1113 error into an actionable balance status', () => {
+  it('keeps a stale Zhipu query error separate from a balance fact', () => {
     const quota = {
       provider_type: 'zhipu',
       code: 'http_client_error',
@@ -168,7 +168,7 @@ describe('providerKeyQuota', () => {
       },
     } satisfies QuotaStatusSnapshot
 
-    expect(getGenericQuotaSections(quota).status).toEqual(['数据已过期', '余额不足'])
+    expect(getGenericQuotaSections(quota).status).toEqual(['查询失败', '数据已过期，显示上次成功结果'])
   })
 
   it('includes Codex Spark quota windows in display text', () => {

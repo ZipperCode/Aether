@@ -6,6 +6,7 @@ mod provider;
 mod quota;
 mod quota_refresh;
 mod quota_snapshot;
+mod quota_sources;
 mod service;
 
 pub mod providers;
@@ -50,7 +51,9 @@ pub use providers::{
 pub use providers::{
     build_official_api_key_quota_request, build_zhipu_account_balance_request,
     build_zhipu_team_quota_request, is_official_api_key_quota_endpoint,
-    parse_official_api_key_quota, parse_zhipu_standard_balance, OfficialApiKeyQuotaProvider,
+    is_retired_official_api_key_quota_endpoint, official_api_key_quota_sources,
+    parse_official_api_key_quota, parse_official_api_key_quota_for_endpoint,
+    parse_zhipu_standard_balance, OfficialApiKeyQuotaProvider,
     OfficialApiKeyQuotaProviderPoolAdapter, ZHIPU_ACCOUNT_REPORT_URL, ZHIPU_TEAM_QUOTA_URL,
 };
 pub use quota::{
@@ -67,11 +70,11 @@ pub use quota_refresh::{
     OFFICIAL_BALANCE_MIN_BACKOFF_SECS,
 };
 pub use quota_snapshot::{
-    ProviderQuotaBalance, ProviderQuotaRefreshState, ProviderQuotaSnapshotContract,
-    ProviderQuotaSnapshotKind, ProviderQuotaValue, ProviderQuotaWindow,
-    PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION, ZHIPU_TOKEN_PLAN_SCHEDULING_BLOCKED_FIELD,
-    ZHIPU_TOKEN_PLAN_STATUS_FIELD,
+    ProviderQuotaBalance, ProviderQuotaQueryStatus, ProviderQuotaRefreshState,
+    ProviderQuotaSnapshotContract, ProviderQuotaSnapshotKind, ProviderQuotaSource,
+    ProviderQuotaValue, ProviderQuotaWindow, PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
 };
+pub use quota_sources::provider_quota_snapshot_exhausted;
 pub use service::ProviderPoolService;
 
 #[cfg(test)]
@@ -244,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn zhipu_balance_fallback_with_missing_token_plan_blocks_scheduling() {
+    fn legacy_zhipu_balance_fallback_does_not_block_scheduling() {
         let blocked = sample_key_with_quota(json!({
             "schema_version": PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
             "provider_type": "zhipu",
@@ -255,7 +258,9 @@ mod tests {
             "token_plan_scheduling_blocked": true,
             "updated_at": 1_700_000_000u64
         }));
-        assert!(provider_pool_key_account_quota_exhausted(&blocked, "zhipu"));
+        assert!(!provider_pool_key_account_quota_exhausted(
+            &blocked, "zhipu"
+        ));
 
         let informational = sample_key_with_quota(json!({
             "schema_version": PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
@@ -287,6 +292,7 @@ mod tests {
                 "grok",
                 "kimi_coding",
                 "kiro",
+                "minimax",
                 "moonshot",
                 "nous",
                 "openrouter",
@@ -319,6 +325,7 @@ mod tests {
                 "grok",
                 "kimi_coding",
                 "kiro",
+                "minimax",
                 "moonshot",
                 "nous",
                 "openrouter",
@@ -336,6 +343,7 @@ mod tests {
         assert!(service.supports_quota_refresh("deepseek"));
         assert!(service.supports_quota_refresh("openrouter"));
         assert!(service.supports_quota_refresh("moonshot"));
+        assert!(service.supports_quota_refresh("minimax"));
         assert!(service.supports_quota_refresh("kimi_coding"));
         assert!(service.supports_quota_refresh("siliconflow"));
         assert!(service.supports_quota_refresh("zhipu"));
@@ -354,7 +362,13 @@ mod tests {
     fn official_quota_providers_expose_typed_serving_policy() {
         let service = ProviderPoolService::with_builtin_adapters();
 
-        for provider_type in ["deepseek", "openrouter", "moonshot", "siliconflow"] {
+        for provider_type in [
+            "deepseek",
+            "openrouter",
+            "moonshot",
+            "siliconflow",
+            "minimax",
+        ] {
             assert_eq!(
                 service.quota_serving_policy(provider_type),
                 Some(ProviderQuotaServingPolicy::ObservationOnly)

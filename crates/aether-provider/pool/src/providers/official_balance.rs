@@ -3,6 +3,8 @@ use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogEn
 use std::net::IpAddr;
 use url::Url;
 
+use crate::quota_snapshot::{ProviderQuotaQueryStatus, ProviderQuotaSource};
+
 pub const OFFICIAL_BALANCE_DIRECT_TIMEOUT_CAP_MS: u64 = 30_000;
 pub const OFFICIAL_BALANCE_PROXY_TIMEOUT_CAP_MS: u64 = 60_000;
 
@@ -44,12 +46,15 @@ pub(crate) fn endpoint_has_official_origin(
 
 pub(crate) fn decimal_string(value: &serde_json::Value) -> Option<String> {
     let raw = match value {
-        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::String(value) => value.trim().to_owned(),
         serde_json::Value::Number(value) => value.to_string(),
         _ => return None,
     };
-    let unsigned = raw.strip_prefix('+').unwrap_or(&raw);
-    let unsigned = unsigned.strip_prefix('-').unwrap_or(unsigned);
+    let (mantissa, exponent) = match raw.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
+        None => (raw.as_str(), 0),
+    };
+    let unsigned = mantissa.strip_prefix(['+', '-']).unwrap_or(mantissa);
     let mut parts = unsigned.split('.');
     let whole = parts.next()?;
     let fraction = parts.next();
@@ -60,37 +65,113 @@ pub(crate) fn decimal_string(value: &serde_json::Value) -> Option<String> {
     {
         return None;
     }
-    Some(raw)
+    if exponent == 0 {
+        return Some(mantissa.to_owned());
+    }
+    // JSON 数字可能使用科学计数法；仅移动小数点，绝不先经过浮点数。
+    if exponent.unsigned_abs() > 10_000 {
+        return None;
+    }
+    let digits = format!("{whole}{}", fraction.unwrap_or_default());
+    let point = i64::try_from(whole.len()).ok()? + i64::from(exponent);
+    let expanded = if point <= 0 {
+        format!("0.{}{digits}", "0".repeat(usize::try_from(-point).ok()?))
+    } else if usize::try_from(point).ok()? >= digits.len() {
+        format!(
+            "{digits}{}",
+            "0".repeat(usize::try_from(point).ok()? - digits.len())
+        )
+    } else {
+        let point = usize::try_from(point).ok()?;
+        format!("{}.{}", &digits[..point], &digits[point..])
+    };
+    Some(if mantissa.starts_with('-') {
+        format!("-{expanded}")
+    } else {
+        expanded
+    })
+}
+
+/// 将上游固定小数位金额精确换算为主单位，不限制有效数字为 u128 或 f64。
+pub(crate) fn scale_decimal(value: &serde_json::Value, places: usize) -> Option<String> {
+    let raw = decimal_string(value)?;
+    let unsigned = raw.strip_prefix(['+', '-']).unwrap_or(&raw);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let digits = format!("{whole}{fraction}");
+    let scale = fraction.len().checked_add(places)?;
+    let padded = format!(
+        "{}{digits}",
+        "0".repeat(scale.saturating_add(1).saturating_sub(digits.len()))
+    );
+    let point = padded.len().checked_sub(scale)?;
+    let whole = padded[..point].trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let fraction = padded[point..].trim_end_matches('0');
+    let sign = if raw.starts_with('-') && (whole != "0" || !fraction.is_empty()) {
+        "-"
+    } else {
+        ""
+    };
+    Some(if fraction.is_empty() {
+        format!("{sign}{whole}")
+    } else {
+        format!("{sign}{whole}.{fraction}")
+    })
 }
 
 pub(crate) fn subtract_decimal_clamped(total: &str, used: &str) -> Option<String> {
-    fn parts(value: &str) -> Option<(u128, usize)> {
+    fn parts(value: &str) -> Option<(String, usize)> {
+        let value = decimal_string(&serde_json::Value::String(value.into()))?;
         if value.starts_with('-') {
             return None;
         }
+        let value = value.strip_prefix('+').unwrap_or(&value);
         let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
-        let scale = fraction.len();
-        let digits = format!("{whole}{fraction}").parse().ok()?;
-        Some((digits, scale))
+        Some((format!("{whole}{fraction}"), fraction.len()))
     }
     let (mut total, total_scale) = parts(total)?;
     let (mut used, used_scale) = parts(used)?;
     let scale = total_scale.max(used_scale);
-    total = total.checked_mul(10u128.checked_pow((scale - total_scale) as u32)?)?;
-    used = used.checked_mul(10u128.checked_pow((scale - used_scale) as u32)?)?;
-    let remaining = total.saturating_sub(used);
-    if scale == 0 {
-        return Some(remaining.to_string());
+    total.push_str(&"0".repeat(scale - total_scale));
+    used.push_str(&"0".repeat(scale - used_scale));
+    let total = total.trim_start_matches('0');
+    let used = used.trim_start_matches('0');
+    if (total.len(), total) <= (used.len(), used) {
+        return Some("0".into());
     }
-    let factor = 10u128.checked_pow(scale as u32)?;
-    let mut fraction = format!("{:0width$}", remaining % factor, width = scale);
-    while fraction.ends_with('0') {
-        fraction.pop();
+    let mut used_digits = used.bytes().rev();
+    let mut borrow = 0i16;
+    let mut remaining = Vec::with_capacity(total.len());
+    // 按十进制逐位相减，保留超过浮点及固定宽度整数范围的额度。
+    for digit in total.bytes().rev() {
+        let other = used_digits
+            .next()
+            .map_or(0, |digit| i16::from(digit - b'0'));
+        let value = i16::from(digit - b'0') - other - borrow;
+        borrow = i16::from(value < 0);
+        remaining.push(b'0' + value.rem_euclid(10) as u8);
     }
-    if fraction.is_empty() {
-        Some((remaining / factor).to_string())
-    } else {
-        Some(format!("{}.{}", remaining / factor, fraction))
+    remaining.reverse();
+    scale_decimal(
+        &serde_json::Value::String(String::from_utf8(remaining).ok()?),
+        scale,
+    )
+}
+
+pub(crate) fn official_quota_source(
+    id: &str,
+    label: &str,
+    product: &str,
+    scope: &str,
+) -> ProviderQuotaSource {
+    ProviderQuotaSource {
+        id: id.into(),
+        label: label.into(),
+        product: product.into(),
+        scope: scope.into(),
+        query_status: ProviderQuotaQueryStatus::Ok,
+        freshness: "fresh".into(),
+        ..Default::default()
     }
 }
 

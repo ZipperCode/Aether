@@ -29,6 +29,7 @@ export type DecimalJsonValue = number | string | null
 
 export interface QuotaWindowSnapshot {
   code: string
+  source_id?: string | null
   label?: string | null
   scope?: 'account' | 'workspace' | 'model' | string
   unit?: 'percent' | 'count' | 'usd' | 'tokens' | string
@@ -49,6 +50,8 @@ export interface QuotaWindowSnapshot {
   window_minutes?: number | null
   usage_reset_at?: number | null
   is_exhausted?: boolean | null
+  unlimited?: boolean | null
+  is_included?: boolean | null
   usage?: QuotaWindowUsageSnapshot | null
 }
 
@@ -88,6 +91,7 @@ export interface QuotaResetCreditsSnapshot {
 
 export interface QuotaBalanceSnapshot {
   unit: string
+  source_id?: string | null
   available?: DecimalJsonValue
   total?: DecimalJsonValue
   granted?: DecimalJsonValue
@@ -103,11 +107,28 @@ export interface QuotaRefreshStateSnapshot {
   failure_count?: number | null
 }
 
+/** 查询来源独立保存状态，额度数值仍由 balances/windows 通过 source_id 关联。 */
+export interface QuotaSourceSnapshot {
+  id: string
+  label: string
+  product: 'account_balance' | 'key_spending_limit' | 'coding_plan' | 'token_plan' | 'extra_usage' | string
+  scope: string
+  region?: string | null
+  plan_id?: string | null
+  plan_name?: string | null
+  plan_tier?: string | null
+  currency_source?: string | null
+  query_status: 'not_queried' | 'ok' | 'unsupported' | 'permission_denied' | 'not_applicable' | 'error'
+  freshness: string
+  refresh_state: QuotaRefreshStateSnapshot
+}
+
 export interface QuotaStatusSnapshot {
   schema_version?: number | null
   kind?: 'balance' | 'subscription' | string | null
   version?: number | null
   provider_type?: string | null
+  sources?: QuotaSourceSnapshot[] | null
   code: 'unknown' | 'ok' | 'exhausted' | 'cooldown' | 'forbidden' | 'banned' | string
   label?: string | null
   reason?: string | null
@@ -118,6 +139,16 @@ export interface QuotaStatusSnapshot {
   /** Nous 等额度查询返回的耗尽原因；仅作为展示证据，不替代调度阻断状态。 */
   exhausted_reason?: string | null
   unlimited?: boolean | null
+  /** OpenRouter 的 Key 消费上限状态，不代表账户余额无限。 */
+  key_limit_unlimited?: boolean | null
+  include_byok_in_limit?: boolean | null
+  usage_daily?: DecimalJsonValue
+  usage_weekly?: DecimalJsonValue
+  usage_monthly?: DecimalJsonValue
+  byok_usage?: DecimalJsonValue
+  byok_usage_daily?: DecimalJsonValue
+  byok_usage_weekly?: DecimalJsonValue
+  byok_usage_monthly?: DecimalJsonValue
   is_free_tier?: boolean | null
   is_management_key?: boolean | null
   is_provisioning_key?: boolean | null

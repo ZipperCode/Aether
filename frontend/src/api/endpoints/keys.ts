@@ -1,6 +1,6 @@
 import client from '../client'
 import type { EndpointAPIKey, AllowedModels } from './types'
-import type { QuotaStatusSnapshot } from './types'
+import type { QuotaRefreshStateSnapshot, QuotaStatusSnapshot } from './types'
 
 // Re-export types for convenience
 export type { EndpointAPIKey, AllowedModels }
@@ -302,6 +302,7 @@ export interface RefreshQuotaResult {
   success: number
   failed: number
   total: number
+  skipped?: number
   results: Array<{
     key_id: string
     key_name: string
@@ -314,9 +315,12 @@ export interface RefreshQuotaResult {
       | 'forbidden'
       | 'banned'
       | 'error'
+      | 'backoff'
     // provider 级 bucket 数据；前端应按当前 provider_type 包装回 upstream_metadata.<provider_type>
     metadata?: Record<string, unknown>
     quota_snapshot?: QuotaStatusSnapshot
+    refresh_state?: QuotaRefreshStateSnapshot
+    error_class?: string
     message?: string
     status_code?: number
   }>

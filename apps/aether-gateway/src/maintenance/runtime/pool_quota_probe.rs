@@ -1563,6 +1563,17 @@ fn subscription_refresh_hard_state(
     score: Option<&StoredPoolMemberScore>,
     item: &Value,
 ) -> Option<PoolMemberHardState> {
+    if matches!(
+        item.pointer("/quota_snapshot/provider_type")
+            .and_then(Value::as_str),
+        Some("zhipu" | "zai" | "kimi_coding")
+    ) {
+        // 官方订阅由来源快照在调度时判断有效性与重置时间，不再复制成持久账号阻断。
+        // 仅清理由旧额度刷新产生的状态；运行时人工阻断仍由写入侧的强校验保护。
+        return score
+            .filter(|score| quota_refresh_derived_exhaustion(score))
+            .map(|_| PoolMemberHardState::Available);
+    }
     if !probe_result_succeeded(item) {
         return None;
     }

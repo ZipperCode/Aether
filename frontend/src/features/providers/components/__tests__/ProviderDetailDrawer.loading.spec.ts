@@ -86,7 +86,7 @@ describe('ProviderDetailDrawer loading priorities', () => {
       .split('function getGenericQuotaStatusLabel(key: EndpointAPIKey): string | null {')[1]
       ?.split('function getQuotaSnapshotForProvider')[0]
     expect(helper).toBeTruthy()
-    expect(helper).toContain('isGenericQuotaUnavailable(')
-    expect(helper).toContain("? 'Expired' : null")
+    expect(helper).toContain('getQuotaQueryStatusLabel(')
+    expect(helper).not.toContain("? 'Expired' : null")
   })
 })

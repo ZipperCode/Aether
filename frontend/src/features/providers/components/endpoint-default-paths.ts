@@ -11,6 +11,32 @@ const OFFICIAL_PROVIDER_ENDPOINT_BASE_URLS: Readonly<Record<string, string>> = {
   siliconflow: 'https://api.siliconflow.cn/v1',
   zhipu: 'https://open.bigmodel.cn/api/paas/v4',
   zai: 'https://api.z.ai/api/paas/v4',
+  minimax: 'https://api.minimaxi.com/v1',
+}
+
+/** 区域选择只填写现有 Endpoint URL，查询始终由已配置域名决定。 */
+export function getOfficialEndpointPresets(providerType?: string | null, apiFormat?: string): Array<{ label: string; url: string }> {
+  const provider = (providerType || '').trim().toLowerCase()
+  const minimaxPath = apiFormat === 'claude:messages' ? '/anthropic/v1' : '/v1'
+  const presets: Record<string, Array<{ label: string; url: string }>> = {
+    moonshot: [
+      { label: '国内', url: 'https://api.moonshot.cn/v1' },
+      { label: '国际', url: 'https://api.moonshot.ai/v1' },
+    ],
+    kimi_coding: [
+      { label: 'kimi.com', url: 'https://api.kimi.com/coding/v1' },
+      { label: 'kimi.ai', url: 'https://api.kimi.ai/coding/v1' },
+    ],
+    siliconflow: [
+      { label: '国内', url: 'https://api.siliconflow.cn/v1' },
+      { label: '国际', url: 'https://api.siliconflow.com/v1' },
+    ],
+    minimax: [
+      { label: '国内', url: `https://api.minimaxi.com${minimaxPath}` },
+      { label: '国际', url: `https://api.minimax.io${minimaxPath}` },
+    ],
+  }
+  return presets[provider] ?? []
 }
 
 export function normalizeEndpointApiFormat(apiFormat: string): string {
@@ -188,7 +214,8 @@ export function resolveNewEndpointBaseUrl(params: {
   const explicitBaseUrl = (params.explicitBaseUrl || '').trim()
   if (explicitBaseUrl) return explicitBaseUrl
   const providerType = (params.providerType || '').trim().toLowerCase()
-  const seedBaseUrl = OFFICIAL_PROVIDER_ENDPOINT_BASE_URLS[providerType]
+  const seedBaseUrl = (providerType === 'minimax' ? getOfficialEndpointPresets(providerType, params.apiFormat)[0]?.url : null)
+    || OFFICIAL_PROVIDER_ENDPOINT_BASE_URLS[providerType]
     || (params.website || '').trim()
   return getDefaultEndpointBaseUrl({ apiFormat: params.apiFormat, baseUrl: seedBaseUrl })
 }
