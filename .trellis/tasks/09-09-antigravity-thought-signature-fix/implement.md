@@ -8,6 +8,7 @@
 - The successful final sync tunnel route evidence in `research/route-receipt.md` supersedes the earlier fixture failure checkpoints below. An independent release check reviews the complete current diff.
 - The historical Docker builder image is no longer present locally. Current compilation, Clippy and runtime regression results will come from the exact-SHA GitHub Rust CI before creating the tag; historical local test counts alone are not current verification.
 - Independent source review and scoped Rust formatting passed after correcting cancellation capture ownership, ordinary-stream copies, admin error capture and sync terminal diagnostics. See `research/release-check-receipt.md`; current runtime verification remains pending GitHub CI.
+- Release completed: source `52df0e6243683f0d85eb84a32b03048f480c4bec`, Rust CI **18/18**, then annotated `v0.7.35`, Release **8/8**, all six downloaded assets plus signed provenance and both GHCR architectures verified. This final result supersedes the pending verification statement above; see `research/release-v0.7.35.md`.
 
 ## Baseline
 User approved reactive recovery and requested implementation. master HEAD 0c901cc90; product diff empty; only task directory untracked. Initial blanket worker errored before edits; old gate is superseded by approved degradation, not permission to blanket-rewrite.
@@ -48,10 +49,10 @@ Include changed files, exact commands and Docker context/image/nonzero test coun
 ## Progress
 - [x] Public solutions researched and user accepted tradeoff/full plan.
 - [x] Revised artifacts reviewed against confirmed plan.
-- [ ] Implementation.
-- [ ] Focused Docker verification.
-- [ ] Independent check/spec.
-- [ ] Handoff without remote deployment.
+- [x] Implementation.
+- [x] Focused verification: historical Docker checks and current exact-SHA GitHub CI.
+- [x] Independent check/spec.
+- [x] Handoff without remote deployment; release evidence is in `research/release-v0.7.35.md`.
 
 ## Recovery checkpoint
 

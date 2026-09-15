@@ -13,12 +13,12 @@ Implement approved error-triggered recovery for Antigravity Gemini instead of re
 - No public API/schema/frontend changes, production mutations/deployment/restarts/live inference.
 
 ## Acceptance
-- [ ] Gate exclusions, scope-only rewrite, aliases, native/public body, immutability and no-op covered.
-- [ ] Original first send / compatible same-account second send / one retry on real sync/stream direct/tunnel and admin paths.
-- [ ] Repeated rejection skips provider only for current request; stop and unrelated errors unchanged.
-- [ ] Actual sent-body capture, initial error/recovery trace, shared deadline and unique terminal accounting verified.
-- [ ] Relevant existing Antigravity schema/Gemini signature tests and scoped Rust checks pass in Docker with nonzero selected counts.
-- [ ] Independent check and honest local-vs-live handoff.
+- [x] Gate exclusions, scope-only rewrite, aliases, native/public body, immutability and no-op covered.
+- [x] Original first send / compatible same-account second send / one retry on real sync/stream direct/tunnel and admin paths.
+- [x] Repeated rejection skips provider only for current request; stop and unrelated errors unchanged.
+- [x] Actual sent-body capture, initial error/recovery trace, shared deadline and unique terminal accounting verified.
+- [x] Relevant existing Antigravity schema/Gemini signature tests and scoped Rust checks pass with nonzero selected counts: Docker during implementation and exact-SHA GitHub CI for the release (see `research/release-v0.7.35.md`).
+- [x] Independent check and honest local-vs-live handoff.
 
 ## Confirmed tradeoff
 User selected error-triggered compatibility recovery and explicitly requested the complete plan. Rejected historical reasoning state is not reused; visible chat/tools remain and further reasoning may consume more tokens. Normal successful requests never degrade. This supersedes the earlier lossless-only research gate, not the rejection of unconditional signature deletion.
