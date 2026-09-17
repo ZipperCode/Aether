@@ -1100,13 +1100,27 @@ fn sanitize_candidate_signature_recovery(value: &serde_json::Value) -> Option<se
             summary.insert(field.to_string(), status.into());
         }
     }
-    for (field, expected) in [
-        ("original_error_status", "INVALID_ARGUMENT"),
-        ("original_error_message", "Corrupted thought signature"),
-    ] {
-        if object.get(field).and_then(serde_json::Value::as_str) == Some(expected) {
-            summary.insert(field.to_string(), expected.into());
-        }
+    if object
+        .get("original_error_status")
+        .and_then(serde_json::Value::as_str)
+        == Some("INVALID_ARGUMENT")
+    {
+        summary.insert(
+            "original_error_status".to_string(),
+            "INVALID_ARGUMENT".into(),
+        );
+    }
+    if let Some(message) = object
+        .get("original_error_message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|message| {
+            matches!(
+                *message,
+                "Corrupted thought signature" | "Base64 decoding failed"
+            )
+        })
+    {
+        summary.insert("original_error_message".to_string(), message.into());
     }
     if let Some(outcome) = object
         .get("outcome")
@@ -2014,6 +2028,16 @@ mod tests {
         assert_eq!(
             super::sanitize_request_candidate_extra_data(persisted),
             Some(expected)
+        );
+
+        let base64 = json!({"antigravity_signature_recovery": {
+            "original_status": 400, "final_status": 200,
+            "original_error_status": "INVALID_ARGUMENT", "original_error_message": "Base64 decoding failed",
+            "outcome": "recovered"
+        }});
+        assert_eq!(
+            super::sanitize_request_candidate_extra_data_for_persistence(Some(base64.clone())),
+            Some(base64)
         );
     }
 

@@ -14,15 +14,95 @@ pub fn is_antigravity_corrupted_thought_signature(status_code: u16, body: &Value
             })
 }
 
+/// 上游明确拒绝的历史签名类型；Base64 路径只允许修复被指明的 model part。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntigravityThoughtSignatureRejection {
+    Corrupted,
+    Base64DecodeFailure {
+        content_index: usize,
+        part_index: usize,
+    },
+}
+
+/// 识别 Google 指明字段的 Base64 拒绝；结构化 fieldViolations 出现时不退回宽松文案匹配。
+pub fn classify_antigravity_thought_signature_rejection(
+    status_code: u16,
+    body: &Value,
+) -> Option<AntigravityThoughtSignatureRejection> {
+    if is_antigravity_corrupted_thought_signature(status_code, body) {
+        return Some(AntigravityThoughtSignatureRejection::Corrupted);
+    }
+    if status_code != 400
+        || body.pointer("/error/status").and_then(Value::as_str) != Some("INVALID_ARGUMENT")
+    {
+        return None;
+    }
+
+    let error = body.get("error")?;
+    if let Some(details) = error.get("details").and_then(Value::as_array) {
+        let mut has_field_violations = false;
+        for detail in details {
+            let Some(violations) = detail.get("fieldViolations") else {
+                continue;
+            };
+            has_field_violations = true;
+            let violations = violations.as_array()?;
+            for violation in violations {
+                let Some(field) = violation.get("field").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(description) = violation.get("description").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some((content_index, part_index)) =
+                    base64_thought_signature_location(field, description)
+                {
+                    return Some(AntigravityThoughtSignatureRejection::Base64DecodeFailure {
+                        content_index,
+                        part_index,
+                    });
+                }
+            }
+        }
+        if has_field_violations {
+            return None;
+        }
+    }
+
+    let message = error.get("message").and_then(Value::as_str)?;
+    let (field, _) = message.split_once("' (TYPE_BYTES)")?;
+    let field = field.strip_prefix("Invalid value at '")?;
+    base64_thought_signature_location(field, message).map(|(content_index, part_index)| {
+        AntigravityThoughtSignatureRejection::Base64DecodeFailure {
+            content_index,
+            part_index,
+        }
+    })
+}
+
+/// 只接受 Gemini proto 回显的精确 part-root 字段，避免修改其他 bytes 或嵌套工具数据。
+fn base64_thought_signature_location(field: &str, description: &str) -> Option<(usize, usize)> {
+    if !description.contains("TYPE_BYTES") || !description.contains("Base64 decoding failed") {
+        return None;
+    }
+    let field = field.strip_prefix("request.contents[")?;
+    let (content_index, field) = field.split_once("].parts[")?;
+    let (part_index, suffix) = field.split_once("].thought_signature")?;
+    // proto 数组下标只允许无符号十进制数字，不能把宽松整数解析当成字段路径校验。
+    if !suffix.is_empty()
+        || [content_index, part_index]
+            .iter()
+            .any(|index| index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some((content_index.parse().ok()?, part_index.parse().ok()?))
+}
+
 /// 上游明确拒绝后克隆历史请求，仅替换 model 消息 part 自身已有的签名；无变化时不重试。
 pub fn repair_antigravity_thought_signatures(body: &Value) -> Option<Value> {
     let mut repaired = body.clone();
-    let request = if body.pointer("/request/contents").is_some() {
-        repaired.get_mut("request")?
-    } else {
-        &mut repaired
-    };
-    let contents = request.get_mut("contents")?.as_array_mut()?;
+    let contents = antigravity_request_contents_mut(body, &mut repaired)?;
     let mut changed = false;
     for content in contents {
         if content.get("role").and_then(Value::as_str) != Some("model") {
@@ -32,17 +112,60 @@ pub fn repair_antigravity_thought_signatures(body: &Value) -> Option<Value> {
             continue;
         };
         for part in parts {
-            for alias in ["thoughtSignature", "thought_signature"] {
-                if let Some(signature) = part.get_mut(alias) {
-                    if signature.as_str() != Some("skip_thought_signature_validator") {
-                        *signature = Value::String("skip_thought_signature_validator".to_string());
-                        changed = true;
-                    }
-                }
-            }
+            changed |= replace_thought_signature(part);
         }
     }
     changed.then_some(repaired)
+}
+
+/// 按拒绝类型修复；旧错误保留全量历史降级，新 Base64 错误只替换命中的一个 part。
+pub fn repair_antigravity_thought_signature_rejection(
+    body: &Value,
+    rejection: AntigravityThoughtSignatureRejection,
+) -> Option<Value> {
+    let AntigravityThoughtSignatureRejection::Base64DecodeFailure {
+        content_index,
+        part_index,
+    } = rejection
+    else {
+        return repair_antigravity_thought_signatures(body);
+    };
+    let mut repaired = body.clone();
+    let contents = antigravity_request_contents_mut(body, &mut repaired)?;
+    let content = contents.get_mut(content_index)?;
+    if content.get("role").and_then(Value::as_str) != Some("model") {
+        return None;
+    }
+    let part = content
+        .get_mut("parts")
+        .and_then(Value::as_array_mut)?
+        .get_mut(part_index)?;
+    replace_thought_signature(part).then_some(repaired)
+}
+
+fn antigravity_request_contents_mut<'a>(
+    body: &Value,
+    repaired: &'a mut Value,
+) -> Option<&'a mut Vec<Value>> {
+    let request = if body.pointer("/request/contents").is_some() {
+        repaired.get_mut("request")?
+    } else {
+        repaired
+    };
+    request.get_mut("contents")?.as_array_mut()
+}
+
+fn replace_thought_signature(part: &mut Value) -> bool {
+    let mut changed = false;
+    for alias in ["thoughtSignature", "thought_signature"] {
+        if let Some(signature) = part.get_mut(alias) {
+            if signature.as_str() != Some("skip_thought_signature_validator") {
+                *signature = Value::String("skip_thought_signature_validator".to_string());
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,8 +416,11 @@ mod tests {
 
     use super::{
         build_antigravity_safe_v1internal_request, classify_antigravity_safe_request_body,
-        is_antigravity_corrupted_thought_signature, repair_antigravity_thought_signatures,
-        AntigravityEnvelopeRequestType, AntigravityRequestAuth, AntigravityRequestEnvelopeSupport,
+        classify_antigravity_thought_signature_rejection,
+        is_antigravity_corrupted_thought_signature, repair_antigravity_thought_signature_rejection,
+        repair_antigravity_thought_signatures, AntigravityEnvelopeRequestType,
+        AntigravityRequestAuth, AntigravityRequestEnvelopeSupport,
+        AntigravityThoughtSignatureRejection,
     };
     use crate::antigravity::ANTIGRAVITY_REQUEST_USER_AGENT;
     use crate::same_format_provider::{
@@ -330,6 +456,196 @@ mod tests {
             400,
             &json!({"error": {"status": "INVALID_ARGUMENT", "message": "Invalid thought signature."}}),
         ));
+    }
+
+    /// Base64 拒绝必须同时指定 Gemini 历史字段和 TYPE_BYTES 解码事实，不能从普通 bytes 错误推断。
+    #[test]
+    fn base64_thought_signature_rejection_requires_exact_field_contract() {
+        let message = "Invalid value at 'request.contents[2].parts[1].thought_signature' (TYPE_BYTES), Base64 decoding failed";
+        let matching = json!({"error": {"status": "INVALID_ARGUMENT", "message": message}});
+        assert_eq!(
+            classify_antigravity_thought_signature_rejection(400, &matching),
+            Some(AntigravityThoughtSignatureRejection::Base64DecodeFailure {
+                content_index: 2,
+                part_index: 1,
+            })
+        );
+        assert_eq!(
+            classify_antigravity_thought_signature_rejection(
+                400,
+                &json!({"error": {
+                    "status": "INVALID_ARGUMENT",
+                    "message": message,
+                    "details": [{"fieldViolations": [{
+                        "field": "request.contents[2].parts[1].inline_data",
+                        "description": "TYPE_BYTES Base64 decoding failed",
+                    }]}],
+                }}),
+            ),
+            None,
+            "出现结构化 fieldViolations 后不得回退到宽松 message 匹配"
+        );
+        for (status, field, description) in [
+            (
+                200,
+                "request.contents[2].parts[1].thought_signature",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+            (
+                400,
+                "request.contents[2].parts[1].inline_data",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+            (
+                400,
+                "request.contents[2].parts[1].thoughtSignature",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+            (
+                400,
+                "request.contents[2].parts[1].thought_signature",
+                "TYPE_BYTES invalid bytes",
+            ),
+            (
+                400,
+                "request.contents[+2].parts[1].thought_signature",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+            (
+                400,
+                "request.contents[ 2].parts[1].thought_signature",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+            (
+                400,
+                "request.contents[2].parts[-1].thought_signature",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+            (
+                400,
+                "request.contents[2].parts[1 ].thought_signature",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+            (
+                400,
+                "request.contents[].parts[1].thought_signature",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+            (
+                400,
+                "request.contents[999999999999999999999999999999].parts[1].thought_signature",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+            (
+                400,
+                "request.contents[2].parts[1].functionCall.args.thought_signature",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+            (
+                400,
+                "request.contents[2].parts[1].thought_signature.extra",
+                "TYPE_BYTES Base64 decoding failed",
+            ),
+        ] {
+            assert_eq!(
+                classify_antigravity_thought_signature_rejection(
+                    status,
+                    &json!({"error": {
+                        "status": "INVALID_ARGUMENT",
+                        "details": [{"fieldViolations": [{"field": field, "description": description}]}],
+                    }}),
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            classify_antigravity_thought_signature_rejection(
+                400,
+                &json!({"error": {"status": "FAILED_PRECONDITION", "message": message}}),
+            ),
+            None
+        );
+    }
+
+    /// Base64 位置只替换目标 model part 的根签名，用户、工具和嵌套业务字段必须保持原样。
+    #[test]
+    fn base64_thought_signature_repair_is_targeted_and_immutable() {
+        let source = json!({"request": {"contents": [
+            {"role": "model", "parts": [{
+                "thoughtSignature": "unrelated-model-signature",
+                "functionCall": {"name": "lookup", "args": {"thoughtSignature": "tool-data"}},
+            }]},
+            {"role": "model", "parts": [{
+                "thoughtSignature": "rejected-signature",
+                "thought_signature": "rejected-snake-signature",
+                "text": "keep historical text",
+            }]},
+            {"role": "user", "parts": [{"thoughtSignature": "user-signature"}]},
+            {"role": "tool", "parts": [{"thoughtSignature": "tool-signature"}]},
+        ]}});
+        let original = source.clone();
+        let rejection = AntigravityThoughtSignatureRejection::Base64DecodeFailure {
+            content_index: 1,
+            part_index: 0,
+        };
+        let repaired = repair_antigravity_thought_signature_rejection(&source, rejection)
+            .expect("target model signature should be replaceable");
+        let contents = repaired.pointer("/request/contents").unwrap();
+        assert_eq!(
+            contents[0]["parts"][0]["thoughtSignature"],
+            "unrelated-model-signature"
+        );
+        assert_eq!(
+            contents[0]["parts"][0]["functionCall"]["args"]["thoughtSignature"],
+            "tool-data"
+        );
+        assert_eq!(
+            contents[1]["parts"][0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert_eq!(
+            contents[1]["parts"][0]["thought_signature"],
+            "skip_thought_signature_validator"
+        );
+        assert_eq!(contents[1]["parts"][0]["text"], "keep historical text");
+        assert_eq!(
+            contents[2]["parts"][0]["thoughtSignature"],
+            "user-signature"
+        );
+        assert_eq!(
+            contents[3]["parts"][0]["thoughtSignature"],
+            "tool-signature"
+        );
+        assert_eq!(source, original);
+        for rejection in [
+            AntigravityThoughtSignatureRejection::Base64DecodeFailure {
+                content_index: 2,
+                part_index: 0,
+            },
+            AntigravityThoughtSignatureRejection::Base64DecodeFailure {
+                content_index: 99,
+                part_index: 0,
+            },
+            AntigravityThoughtSignatureRejection::Base64DecodeFailure {
+                content_index: 3,
+                part_index: 0,
+            },
+            AntigravityThoughtSignatureRejection::Base64DecodeFailure {
+                content_index: 1,
+                part_index: 99,
+            },
+        ] {
+            assert!(repair_antigravity_thought_signature_rejection(&source, rejection).is_none());
+            assert_eq!(source, original);
+        }
+        assert!(repair_antigravity_thought_signature_rejection(
+            &json!({"contents": [{"role": "model", "parts": [{"text": "unsigned"}]}]}),
+            AntigravityThoughtSignatureRejection::Base64DecodeFailure {
+                content_index: 0,
+                part_index: 0,
+            },
+        )
+        .is_none());
     }
 
     /// 定点替换公开与私有正文中的历史 model 签名，同时保留用户/工具数据及原始输入。

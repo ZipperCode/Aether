@@ -1356,9 +1356,12 @@ async fn execute_in_process_stream_with_oauth_retry(
             )
             && !execution.stream_precommit_committed
         {
-            let error_body = prefetch_direct_stream_error_body(&mut execution)
-                .await
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+            let error_body = prefetch_direct_stream_error_body_with_limit(
+                &mut execution,
+                ANTIGRAVITY_SIGNATURE_ERROR_BODY_BYTES,
+            )
+            .await
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
             let retry = recovery.prepare_retry(
                 plan,
                 report_context,
@@ -1690,10 +1693,20 @@ async fn next_direct_upstream_response_chunk(
 async fn prefetch_direct_stream_error_body(
     execution: &mut DirectUpstreamStreamExecution,
 ) -> Option<String> {
+    prefetch_direct_stream_error_body_with_limit(execution, MAX_ERROR_BODY_BYTES).await
+}
+
+// ponytail: 64 KiB 覆盖已确认的 16,766 字节签名回显；只有观测到更大协议错误时才提高上限。
+const ANTIGRAVITY_SIGNATURE_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+async fn prefetch_direct_stream_error_body_with_limit(
+    execution: &mut DirectUpstreamStreamExecution,
+    max_error_body_bytes: usize,
+) -> Option<String> {
     let prefetch_started_at = Instant::now();
-    let mut inspected = Vec::with_capacity(MAX_ERROR_BODY_BYTES);
+    let mut inspected = Vec::with_capacity(max_error_body_bytes);
     let mut fully_buffered = false;
-    while inspected.len() < MAX_ERROR_BODY_BYTES {
+    while inspected.len() < max_error_body_bytes {
         let remaining = OAUTH_ERROR_PREFETCH_MAX_WAIT.saturating_sub(prefetch_started_at.elapsed());
         if remaining.is_zero() {
             break;
@@ -1738,7 +1751,7 @@ async fn prefetch_direct_stream_error_body(
             continue;
         }
 
-        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(inspected.len());
+        let remaining = max_error_body_bytes.saturating_sub(inspected.len());
         inspected.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
         execution.prefetched_body.push_back(Ok(chunk));
 
@@ -6357,7 +6370,17 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         resolve_core_stream_error_finalize_report_kind(plan_kind, status_code);
 
     if !(200..300).contains(&status_code) {
-        let provider_error_body = collect_error_body(&mut lines).await?;
+        // 最终失败分类也需要完整的签名错误，否则 16 KiB 截断会把同一坏历史重试到其他密钥。
+        let error_body_limit = if status_code == 400
+            && crate::execution_runtime::antigravity_signature::is_antigravity_signature_plan(
+                &plan,
+                report_context.as_ref(),
+            ) {
+            ANTIGRAVITY_SIGNATURE_ERROR_BODY_BYTES
+        } else {
+            MAX_ERROR_BODY_BYTES
+        };
+        let provider_error_body = collect_error_body(&mut lines, error_body_limit).await?;
         let private_error_body_json = extract_provider_private_stream_error_body(
             report_context.as_ref(),
             &provider_error_body,
@@ -6611,7 +6634,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             );
             if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
                 *retry_scope = if crate::execution_runtime::antigravity_signature::is_antigravity_signature_plan(&plan, report_context.as_ref())
-                    && provider_body_json.as_ref().is_some_and(|body| aether_provider_transport::antigravity::is_antigravity_corrupted_thought_signature(status_code, body)) {
+                    && provider_body_json.as_ref().is_some_and(|body| aether_provider_transport::antigravity::classify_antigravity_thought_signature_rejection(status_code, body).is_some()) {
                     AiAttemptRetryScope::Provider
                 } else {
                     ai_attempt_retry_scope_from_failure_disposition(failure_disposition)
@@ -10344,60 +10367,19 @@ pub(crate) mod tests {
     /// 真实直连流路径先发送原签名，收到精确 400 后用同一计划和凭据发送一次哨兵正文。
     #[tokio::test]
     async fn antigravity_signature_stream_retries_same_candidate_once() {
-        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let requests_for_server = Arc::clone(&requests);
-        let listener = crate::test_support::bind_loopback_listener()
-            .await
-            .expect("listener should bind");
-        let addr = listener.local_addr().expect("address should resolve");
-        let server = tokio::spawn(async move {
-            let app = Router::new().route(
-                "/v1internal:streamGenerateContent",
-                any(move |Json(body): Json<Value>| {
-                    let requests = Arc::clone(&requests_for_server);
-                    async move {
-                        let mut requests = requests.lock().expect("request mutex should lock");
-                        requests.push(body);
-                        if requests.len() == 1 {
-                            (
-                                StatusCode::BAD_REQUEST,
-                                Json(json!({
-                                    "error": {
-                                        "status": "INVALID_ARGUMENT",
-                                        "message": "Corrupted thought signature."
-                                    }
-                                })),
-                            )
-                                .into_response()
-                        } else {
-                            (
-                                StatusCode::OK,
-                                [(header::CONTENT_TYPE, "text/event-stream")],
-                                "data: {\"candidates\":[]}\n\n",
-                            )
-                                .into_response()
-                        }
-                    }
-                }),
-            );
-            axum::serve(listener, app)
-                .await
-                .expect("server should start");
-        });
-        let mut plan = antigravity_gemini_stream_plan("antigravity-signature-stream");
-        plan.url = format!("http://{addr}/v1internal:streamGenerateContent");
-        plan.body = RequestBody::from_json(json!({
-            "request": {
-                "contents": [{
-                    "role": "model",
-                    "parts": [{
-                        "thought": "preserved",
-                        "thoughtSignature": "foreign-signature",
-                        "functionCall": {"name": "lookup", "args": {"q": "x"}}
-                    }]
-                }]
-            }
-        }));
+        use crate::execution_runtime::antigravity_signature::tests::{
+            base64_thought_signature_rejection, signature_plan_with_base64_history,
+            signature_server_with_rejection, synthetic_invalid_base64_thought_signature,
+            BASE64_SIGNATURE_CONTENT_INDEX, BASE64_SIGNATURE_PART_INDEX,
+        };
+
+        let server = signature_server_with_rejection(
+            true,
+            vec![400, 200],
+            base64_thought_signature_rejection(),
+        )
+        .await;
+        let mut plan = signature_plan_with_base64_history(true, &server.url);
         let original_body = plan.body.clone();
         let state = test_state();
 
@@ -10413,19 +10395,37 @@ pub(crate) mod tests {
         .expect("signature recovery should return the second response");
 
         assert_eq!(execution.status_code, StatusCode::OK.as_u16());
-        assert_eq!(requests.lock().expect("request mutex should lock").len(), 2);
-        let observed = requests.lock().expect("request mutex should lock");
+        let observed = server.requests.lock().expect("request mutex should lock");
+        assert_eq!(observed.len(), 2);
         assert_eq!(
-            observed[0]["request"]["contents"][0]["parts"][0]["thoughtSignature"],
-            "foreign-signature"
+            observed[0].0.get("authorization"),
+            observed[1].0.get("authorization")
+        );
+        assert_eq!(observed[0].1, *original_body.json_body.as_ref().unwrap());
+        assert_eq!(
+            synthetic_invalid_base64_thought_signature().len(),
+            16_766,
+            "合成响应必须超过原有 16 KiB capture 阈值"
+        );
+        let error_bytes = serde_json::to_vec(&base64_thought_signature_rejection())
+            .unwrap()
+            .len();
+        assert!(
+            error_bytes > 32 * 1024 && error_bytes < super::ANTIGRAVITY_SIGNATURE_ERROR_BODY_BYTES
         );
         assert_eq!(
-            observed[1]["request"]["contents"][0]["parts"][0]["thoughtSignature"],
+            observed[0].1["request"]["contents"][BASE64_SIGNATURE_CONTENT_INDEX]["parts"]
+                [BASE64_SIGNATURE_PART_INDEX]["thoughtSignature"],
+            synthetic_invalid_base64_thought_signature()
+        );
+        assert_eq!(
+            observed[1].1["request"]["contents"][BASE64_SIGNATURE_CONTENT_INDEX]["parts"]
+                [BASE64_SIGNATURE_PART_INDEX]["thoughtSignature"],
             "skip_thought_signature_validator"
         );
         assert_eq!(
-            observed[1]["request"]["contents"][0]["parts"][0]["thought"],
-            "preserved"
+            observed[1].1["request"]["contents"][0]["parts"][0]["thoughtSignature"],
+            "foreign-signature"
         );
         assert_ne!(plan.body, original_body);
         assert_eq!(
@@ -10435,7 +10435,6 @@ pub(crate) mod tests {
                 .clone()
                 .expect("repaired body should exist")
         );
-        server.abort();
     }
 
     struct StreamDropFlag(Arc<AtomicBool>);
@@ -10488,12 +10487,33 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn antigravity_signature_stream_terminal_and_stop_policy() {
         use crate::execution_runtime::antigravity_signature::tests::{
-            context, signature_plan, signature_server,
+            base64_thought_signature_rejection, context, rejection, signature_plan,
+            signature_plan_with_base64_history, signature_server_with_rejection,
         };
         use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
-        for (final_status, stop) in [(200, false), (400, false), (400, true)] {
-            let server = signature_server(true, vec![400, final_status]).await;
-            let plan = signature_plan(true, &server.url);
+        for (base64, final_status, stop) in [
+            (false, 200, false),
+            (false, 400, false),
+            (false, 400, true),
+            (true, 200, false),
+            (true, 400, false),
+            (true, 400, true),
+        ] {
+            let server = signature_server_with_rejection(
+                true,
+                vec![400, final_status],
+                if base64 {
+                    base64_thought_signature_rejection()
+                } else {
+                    rejection()
+                },
+            )
+            .await;
+            let plan = if base64 {
+                signature_plan_with_base64_history(true, &server.url)
+            } else {
+                signature_plan(true, &server.url)
+            };
             let request_id = plan.request_id.clone();
             let report_context = context(&plan);
             let candidates = Arc::new(InMemoryRequestCandidateRepository::default());
@@ -10522,7 +10542,12 @@ pub(crate) mod tests {
             match outcome {
                 AiAttemptExecutionOutcome::Responded(response) if final_status == 200 || stop => {
                     assert_eq!(response.status().as_u16(), final_status);
-                    let _ = to_bytes(response.into_body(), 4096).await.unwrap();
+                    let _ = to_bytes(
+                        response.into_body(),
+                        super::ANTIGRAVITY_SIGNATURE_ERROR_BODY_BYTES,
+                    )
+                    .await
+                    .unwrap();
                 }
                 AiAttemptExecutionOutcome::Retry { scope, .. } if !stop && final_status == 400 => {
                     assert_eq!(scope, AiAttemptRetryScope::Provider)

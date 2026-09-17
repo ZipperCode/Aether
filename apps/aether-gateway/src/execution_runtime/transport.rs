@@ -9366,7 +9366,7 @@ mod tests {
         // Given
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder
-            .write_all(&vec![b'x'; 65])
+            .write_all(&[b'x'; 65])
             .expect("gzip source should write");
         let compressed = encoder.finish().expect("gzip should finish");
         assert!(compressed.len() < 64, "fixture must prove expansion bound");

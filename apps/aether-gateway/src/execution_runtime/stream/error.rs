@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::execution_runtime::ndjson::decode_stream_frame_ndjson;
 use crate::execution_runtime::submission::{has_nested_error, strip_utf8_bom_and_ws};
 use crate::GatewayError;
-use crate::{MAX_ERROR_BODY_BYTES, MAX_STREAM_PREFETCH_FRAMES};
+use crate::MAX_STREAM_PREFETCH_FRAMES;
 
 #[derive(Debug)]
 pub(super) enum StreamPrefetchInspection {
@@ -222,17 +222,15 @@ fn append_error_frame_payload(
     body: &mut Vec<u8>,
     chunk_b64: Option<&str>,
     text: Option<&str>,
+    max_error_body_bytes: usize,
 ) -> Result<bool, GatewayError> {
-    let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+    let remaining = max_error_body_bytes.saturating_sub(body.len());
     if remaining == 0 {
         return Ok(false);
     }
 
     if let Some(chunk_b64) = chunk_b64 {
-        // Do not decode an attacker-controlled megabyte-scale base64 value
-        // merely to retain the first 16 KiB of an error body. A standard
-        // base64 value representing at most `remaining` bytes cannot exceed
-        // this length.
+        // 解码前限制外部帧的大小；普通错误和私有签名错误沿用各自的有界采集预算。
         let max_encoded_len = remaining
             .saturating_add(2)
             .checked_div(3)
@@ -255,11 +253,12 @@ fn append_error_frame_payload(
         body.extend_from_slice(&text_bytes[..text_bytes.len().min(remaining)]);
     }
 
-    Ok(body.len() < MAX_ERROR_BODY_BYTES)
+    Ok(body.len() < max_error_body_bytes)
 }
 
 pub(super) async fn collect_error_body<R>(
     lines: &mut FramedRead<R, LinesCodec>,
+    max_error_body_bytes: usize,
 ) -> Result<Vec<u8>, GatewayError>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -268,7 +267,12 @@ where
     while let Some(frame) = read_next_frame(lines).await? {
         match frame.payload {
             StreamFramePayload::Data { chunk_b64, text } => {
-                if !append_error_frame_payload(&mut body, chunk_b64.as_deref(), text.as_deref())? {
+                if !append_error_frame_payload(
+                    &mut body,
+                    chunk_b64.as_deref(),
+                    text.as_deref(),
+                    max_error_body_bytes,
+                )? {
                     break;
                 }
             }
@@ -310,8 +314,8 @@ where
 mod tests {
     use super::{
         append_error_frame_payload, inspect_prefetched_stream_body, StreamPrefetchInspection,
-        MAX_ERROR_BODY_BYTES,
     };
+    use crate::MAX_ERROR_BODY_BYTES;
     use std::collections::BTreeMap;
 
     /// 控制记录不能触发提交，多行 data 错误在 LF、CRLF、CR 三种合法行尾下均须识别。
@@ -381,8 +385,9 @@ mod tests {
         let mut body = Vec::new();
         let encoded = "x".repeat((MAX_ERROR_BODY_BYTES + 2) / 3 * 4 + 1);
 
-        let keep_reading = append_error_frame_payload(&mut body, Some(&encoded), None)
-            .expect("oversized frame should be handled without a decode error");
+        let keep_reading =
+            append_error_frame_payload(&mut body, Some(&encoded), None, MAX_ERROR_BODY_BYTES)
+                .expect("oversized frame should be handled without a decode error");
 
         assert!(!keep_reading);
         assert!(body.is_empty());
@@ -392,8 +397,9 @@ mod tests {
     fn error_frame_payload_is_capped_to_remaining_capture_budget() {
         let mut body = vec![b'a'; MAX_ERROR_BODY_BYTES - 2];
 
-        let keep_reading = append_error_frame_payload(&mut body, None, Some("hello"))
-            .expect("text payload should append");
+        let keep_reading =
+            append_error_frame_payload(&mut body, None, Some("hello"), MAX_ERROR_BODY_BYTES)
+                .expect("text payload should append");
 
         assert!(!keep_reading);
         assert_eq!(body.len(), MAX_ERROR_BODY_BYTES);

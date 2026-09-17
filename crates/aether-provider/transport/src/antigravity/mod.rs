@@ -16,9 +16,10 @@ pub use policy::{
 };
 pub use request::{
     build_antigravity_safe_v1internal_request, classify_antigravity_safe_request_body,
-    is_antigravity_corrupted_thought_signature, repair_antigravity_thought_signatures,
+    classify_antigravity_thought_signature_rejection, is_antigravity_corrupted_thought_signature,
+    repair_antigravity_thought_signature_rejection, repair_antigravity_thought_signatures,
     AntigravityEnvelopeRequestType, AntigravityRequestEnvelopeSupport,
-    AntigravityRequestEnvelopeUnsupportedReason,
+    AntigravityRequestEnvelopeUnsupportedReason, AntigravityThoughtSignatureRejection,
 };
 pub use url::{
     build_antigravity_v1internal_url, AntigravityRequestUrlAction,

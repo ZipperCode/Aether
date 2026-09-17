@@ -7,11 +7,18 @@ use serde_json::json;
 #[tokio::test]
 async fn antigravity_signature_admin_fixed_plan_recovery() {
     use crate::execution_runtime::antigravity_signature::tests::{
-        signature_plan, signature_server,
+        base64_thought_signature_rejection, signature_plan_with_base64_history,
+        signature_server_with_rejection, BASE64_SIGNATURE_CONTENT_INDEX,
+        BASE64_SIGNATURE_PART_INDEX,
     };
     for statuses in [vec![400, 200], vec![400, 400], vec![200]] {
-        let server = signature_server(false, statuses.clone()).await;
-        let mut plan = signature_plan(false, &server.url);
+        let server = signature_server_with_rejection(
+            false,
+            statuses.clone(),
+            base64_thought_signature_rejection(),
+        )
+        .await;
+        let mut plan = signature_plan_with_base64_history(false, &server.url);
         let original = plan.body.clone();
         let state = AppState::new().unwrap();
         let (result, diagnostic) = provider_query_execute_antigravity_plan(
@@ -33,6 +40,16 @@ async fn antigravity_signature_admin_fixed_plan_recovery() {
             );
             assert_eq!(diagnostic.as_ref().unwrap()["original_status"], 400);
             assert_eq!(diagnostic.unwrap()["final_status"], result.status_code);
+            assert_eq!(
+                requests.last().unwrap().1["request"]["contents"][BASE64_SIGNATURE_CONTENT_INDEX]
+                    ["parts"][BASE64_SIGNATURE_PART_INDEX]["thoughtSignature"],
+                "skip_thought_signature_validator"
+            );
+            assert_eq!(
+                requests.last().unwrap().1["request"]["contents"][0]["parts"][0]
+                    ["thoughtSignature"],
+                "foreign-signature"
+            );
         } else {
             assert!(diagnostic.is_none());
         }

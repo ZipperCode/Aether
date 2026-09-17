@@ -2,7 +2,8 @@ use std::time::{Duration, Instant};
 
 use aether_contracts::{ExecutionPlan, ExecutionResponseObservation, RequestBody};
 use aether_provider_transport::antigravity::{
-    is_antigravity_corrupted_thought_signature, repair_antigravity_thought_signatures,
+    classify_antigravity_thought_signature_rejection,
+    repair_antigravity_thought_signature_rejection, AntigravityThoughtSignatureRejection,
 };
 use serde_json::{json, Value};
 
@@ -70,8 +71,19 @@ impl AntigravitySignatureRecovery {
 
     /// 只用真实响应状态与已解码 JSON 判定，不能把 HTTP 200 内嵌错误当作触发条件。
     pub(crate) fn recognizes(&self, status: u16, body: Option<&Value>) -> bool {
+        self.rejection(status, body).is_some()
+    }
+
+    fn rejection(
+        &self,
+        status: u16,
+        body: Option<&Value>,
+    ) -> Option<AntigravityThoughtSignatureRejection> {
         self.enabled
-            && body.is_some_and(|body| is_antigravity_corrupted_thought_signature(status, body))
+            .then(|| {
+                body.and_then(|body| classify_antigravity_thought_signature_rejection(status, body))
+            })
+            .flatten()
     }
 
     /// 消费一次修复预算并更新实际发送正文及其 capture；无可改字段则保持原计划。
@@ -83,7 +95,10 @@ impl AntigravitySignatureRecovery {
         body: Option<&Value>,
         observation: Option<&ExecutionResponseObservation>,
     ) -> Result<bool, GatewayError> {
-        if !self.recognizes(status, body) || self.attempted {
+        let Some(rejection) = self.rejection(status, body) else {
+            return Ok(false);
+        };
+        if self.attempted {
             return Ok(false);
         }
         // 私有适配计划使用 JSON；不得改写与实际发送字节不一致的旁路表示。
@@ -91,14 +106,17 @@ impl AntigravitySignatureRecovery {
             plan.body
                 .json_body
                 .as_ref()
-                .and_then(repair_antigravity_thought_signatures)
+                .and_then(|body| repair_antigravity_thought_signature_rejection(body, rejection))
         } else {
             None
         };
         self.diagnostic = Some(json!({
             "original_status": 400,
             "original_error_status": "INVALID_ARGUMENT",
-            "original_error_message": "Corrupted thought signature",
+            "original_error_message": match rejection {
+                AntigravityThoughtSignatureRejection::Corrupted => "Corrupted thought signature",
+                AntigravityThoughtSignatureRejection::Base64DecodeFailure { .. } => "Base64 decoding failed",
+            },
             "original_request_order_id": observation.map(|value| &value.request_order_id),
             "outcome": if repaired.is_some() { "retrying" } else { "unchanged" },
         }));
@@ -230,6 +248,15 @@ pub(crate) mod tests {
 
     /// 按给定状态序列回应，超过序列时继续最后一个状态，以便检测意外多次重试。
     pub(crate) async fn signature_server(stream: bool, statuses: Vec<u16>) -> SignatureServer {
+        signature_server_with_rejection(stream, statuses, rejection()).await
+    }
+
+    /// 与生产一致地返回可注入错误正文，覆盖超长 JSON 仍能在终态 capture 前参与恢复的路径。
+    pub(crate) async fn signature_server_with_rejection(
+        stream: bool,
+        statuses: Vec<u16>,
+        rejection: Value,
+    ) -> SignatureServer {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&requests);
         let listener = crate::test_support::bind_loopback_listener().await.unwrap();
@@ -238,6 +265,7 @@ pub(crate) mod tests {
             let app = Router::new().route("/", post(move |headers: HeaderMap, Json(body): Json<Value>| {
                 let observed = Arc::clone(&observed);
                 let statuses = statuses.clone();
+                let rejection = rejection.clone();
                 async move {
                     let index = {
                         let mut requests = observed.lock().unwrap();
@@ -247,7 +275,7 @@ pub(crate) mod tests {
                     let status = statuses[index.min(statuses.len() - 1)];
                     let body = if status == 200 {
                         json!({"response": {"candidates": [{"content": {"role": "model", "parts": [{"text": "OK"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}}})
-                    } else { rejection() };
+                    } else { rejection };
                     if stream && status == 200 {
                         (StatusCode::OK, [("content-type", "text/event-stream")], Body::from(format!("data: {body}\n\n"))).into_response()
                     } else { (StatusCode::from_u16(status).unwrap(), Json(body)).into_response() }
@@ -272,6 +300,54 @@ pub(crate) mod tests {
             "client_api_format": "gemini:generate_content", "provider_api_format": "gemini:generate_content",
             "model_name": "gemini-test", "body": {"json_body": {"request": {"contents": [{"role": "model", "parts": [{"functionCall": {"name": "lookup", "args": {"thoughtSignature": "business-data"}}, "thoughtSignature": "foreign-signature"}]}]}}}
         })).unwrap()
+    }
+
+    /// 生产事故的字段位置与长度；末尾 AB 保持 Base64 字符集但制造非规范尾部位。
+    pub(crate) const BASE64_SIGNATURE_CONTENT_INDEX: usize = 151;
+    pub(crate) const BASE64_SIGNATURE_PART_INDEX: usize = 0;
+
+    pub(crate) fn synthetic_invalid_base64_thought_signature() -> String {
+        format!("{}AB", "A".repeat(16_764))
+    }
+
+    /// 构造完整的 Google 400 回显，避免只在截断后的字符串上验证探测逻辑。
+    pub(crate) fn base64_thought_signature_rejection() -> Value {
+        let signature = synthetic_invalid_base64_thought_signature();
+        let field = format!(
+            "request.contents[{BASE64_SIGNATURE_CONTENT_INDEX}].parts[{BASE64_SIGNATURE_PART_INDEX}].thought_signature"
+        );
+        let message = format!(
+            "Invalid value at '{field}' (TYPE_BYTES), Base64 decoding failed for \"{signature}\""
+        );
+        json!({"error": {
+            "code": 400,
+            "status": "INVALID_ARGUMENT",
+            "message": message,
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.BadRequest",
+                "fieldViolations": [{"field": field, "description": message}],
+            }],
+        }})
+    }
+
+    /// 在已存在的普通历史后追加事故位置，保留无关 model 签名用于定点替换断言。
+    pub(crate) fn signature_plan_with_base64_history(stream: bool, url: &str) -> ExecutionPlan {
+        let mut plan = signature_plan(stream, url);
+        let contents = plan
+            .body
+            .json_body
+            .as_mut()
+            .and_then(|body| body.pointer_mut("/request/contents"))
+            .and_then(Value::as_array_mut)
+            .expect("synthetic signature plan has private contents");
+        while contents.len() < BASE64_SIGNATURE_CONTENT_INDEX {
+            contents.push(json!({"role": "user", "parts": [{"text": "context"}]}));
+        }
+        contents.push(json!({"role": "model", "parts": [{
+            "thoughtSignature": synthetic_invalid_base64_thought_signature(),
+            "text": "rejected historical thought",
+        }]}));
+        plan
     }
 
     /// 生产报错的最小合成响应。

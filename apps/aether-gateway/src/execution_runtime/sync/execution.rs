@@ -4080,11 +4080,18 @@ mod tests {
     #[tokio::test]
     async fn antigravity_signature_sync_recovery_and_provider_scope() {
         use crate::execution_runtime::antigravity_signature::tests::{
-            context, signature_plan, signature_server,
+            base64_thought_signature_rejection, context, signature_plan_with_base64_history,
+            signature_server_with_rejection, synthetic_invalid_base64_thought_signature,
+            BASE64_SIGNATURE_CONTENT_INDEX, BASE64_SIGNATURE_PART_INDEX,
         };
         for final_status in [200, 400] {
-            let server = signature_server(false, vec![400, final_status]).await;
-            let plan = signature_plan(false, &server.url);
+            let server = signature_server_with_rejection(
+                false,
+                vec![400, final_status],
+                base64_thought_signature_rejection(),
+            )
+            .await;
+            let plan = signature_plan_with_base64_history(false, &server.url);
             let original = plan.body.json_body.clone().unwrap();
             let request_id = plan.request_id.clone();
             let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
@@ -4118,18 +4125,30 @@ mod tests {
                 }
                 _ => panic!("unexpected signature recovery outcome for {final_status}"),
             }
-            let requests = server.requests.lock().unwrap();
-            assert_eq!(requests.len(), 2);
-            assert_eq!(requests[0].1, original);
-            assert_eq!(
-                requests[0].0.get("authorization"),
-                requests[1].0.get("authorization")
-            );
-            assert_eq!(
-                requests[1].1["request"]["contents"][0]["parts"][0]["thoughtSignature"],
-                "skip_thought_signature_validator"
-            );
-            drop(requests);
+            // 断言完成即结束同步锁作用域，后续异步仓储查询不持有测试服务器锁。
+            {
+                let requests = server.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0].1, original);
+                assert_eq!(
+                    requests[0].0.get("authorization"),
+                    requests[1].0.get("authorization")
+                );
+                assert_eq!(
+                    requests[0].1["request"]["contents"][BASE64_SIGNATURE_CONTENT_INDEX]["parts"]
+                        [BASE64_SIGNATURE_PART_INDEX]["thoughtSignature"],
+                    synthetic_invalid_base64_thought_signature()
+                );
+                assert_eq!(
+                    requests[1].1["request"]["contents"][BASE64_SIGNATURE_CONTENT_INDEX]["parts"]
+                        [BASE64_SIGNATURE_PART_INDEX]["thoughtSignature"],
+                    "skip_thought_signature_validator"
+                );
+                assert_eq!(
+                    requests[1].1["request"]["contents"][0]["parts"][0]["thoughtSignature"],
+                    "foreign-signature"
+                );
+            }
             let candidates = candidate_repository
                 .list_by_request_id(&request_id)
                 .await
@@ -4144,6 +4163,11 @@ mod tests {
                 candidates[0].extra_data.as_ref().unwrap()["antigravity_signature_recovery"]
                     ["final_status"],
                 final_status
+            );
+            assert_eq!(
+                candidates[0].extra_data.as_ref().unwrap()["antigravity_signature_recovery"]
+                    ["original_error_message"],
+                "Base64 decoding failed"
             );
             assert_eq!(
                 state
