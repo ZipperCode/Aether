@@ -104,6 +104,14 @@ impl UsageQueue {
 
     pub async fn enqueue(&self, event: &UsageEvent) -> Result<String, DataLayerError> {
         let encoded = self.encode_event(event)?;
+        self.enqueue_encoded(encoded).await
+    }
+
+    /// 复用已检查的有界消息，避免直写不可用时重复编码或累计降级计数。
+    pub(crate) async fn enqueue_encoded(
+        &self,
+        encoded: EncodedUsageEvent,
+    ) -> Result<String, DataLayerError> {
         self.runner
             .append_fields_with_maxlen(
                 &self.stream,
@@ -117,7 +125,10 @@ impl UsageQueue {
         self.encode_event(event).map(|_| ())
     }
 
-    fn encode_event(&self, event: &UsageEvent) -> Result<EncodedUsageEvent, DataLayerError> {
+    pub(crate) fn encode_event(
+        &self,
+        event: &UsageEvent,
+    ) -> Result<EncodedUsageEvent, DataLayerError> {
         let encoded = match event.to_bounded_stream_fields(self.config.queue_payload_max_bytes) {
             Ok(encoded) => encoded,
             Err(error) => {
