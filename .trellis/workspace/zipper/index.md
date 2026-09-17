@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 33
-- **Last Active**: 2026-09-15
+- **Total Sessions**: 34
+- **Last Active**: 2026-09-17
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~839 | Active |
+| `journal-1.md` | ~862 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 34 | 2026-09-17 | 修复 Gemini Base64 签名恢复和完整日志保留 | `abe0965f5`, `8e9e1836c` | `master` |
 | 33 | 2026-09-15 | Official provider quota sources and live verification | `6fc2fdd3c` | `codex/official-quota-ci` |
 | 32 | 2026-09-15 | Antigravity 签名恢复与 v0.7.35 发布 | `52df0e624`, `c29615c2a` | `master` |
 | 31 | 2026-09-15 | 恢复停用 GitHub Pages | `74d7670f6`, `73dcdc219` | `master` |

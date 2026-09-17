@@ -837,3 +837,26 @@ Implemented independent quota sources, official plan recognition, regional query
 ### Status
 
 [OK] **Completed**
+
+
+## Session 34: 修复 Gemini Base64 签名恢复和完整日志保留
+
+**Date**: 2026-09-17
+**Task**: 修复 Gemini Base64 签名恢复和完整日志保留
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+补齐 Antigravity 定点签名恢复及长错误解析，移植上游 #830。49 项后端、13 项前端回归通过；类型、格式、ESLint 与五个受影响包 Clippy 通过。仅本地提交，未推送或部署。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `abe0965f5` | (see git log) |
+| `8e9e1836c` | (see git log) |
+
+### Status
+
+[OK] **Completed**
