@@ -1,4 +1,4 @@
 {"file":".trellis/spec/aether-usage-runtime/backend/index.md","reason":"Owning package guidelines"}
 {"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Cross-layer lifecycle and persistence ownership"}
-{"file":".trellis/tasks/09-17-gemini-signature-diagnostics/research/evidence.md","reason":"Verified incident, upstream provenance and test constraints"}
+{"file":".trellis/tasks/archive/2026-09/09-17-gemini-signature-diagnostics/research/evidence.md","reason":"Verified incident, upstream provenance and test constraints"}
 {"file":".trellis/spec/aether-data-postgres/backend/index.md","reason":"Persistence query projection ownership"}

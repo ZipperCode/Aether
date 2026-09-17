@@ -1,6 +1,6 @@
 {"file": ".trellis/spec/aether-provider-transport/backend/index.md", "reason": "Owning package guidelines"}
 {"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Cross-layer lifecycle and persistence ownership"}
-{"file": ".trellis/tasks/09-17-gemini-signature-diagnostics/research/evidence.md", "reason": "Verified incident, upstream provenance and test constraints"}
+{"file": ".trellis/tasks/archive/2026-09/09-17-gemini-signature-diagnostics/research/evidence.md", "reason": "Verified incident, upstream provenance and test constraints"}
 {"file": ".trellis/spec/aether-provider-transport/backend/antigravity-signature-recovery-contract.md", "reason": "Existing contract, new approved trigger extends only the recorded restriction"}
 {"file": ".trellis/spec/aether-gateway/backend/index.md", "reason": "Stream sync and fixed-target execution ownership"}
 {"file": ".trellis/spec/aether-data-contracts/backend/index.md", "reason": "Candidate recovery diagnostic projection"}

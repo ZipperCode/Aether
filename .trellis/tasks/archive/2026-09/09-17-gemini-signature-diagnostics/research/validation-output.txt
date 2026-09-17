@@ -1,0 +1,55 @@
+usage-tests.log
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 42s
+     Running unittests src/lib.rs (/target/debug/deps/aether_usage_runtime-fc1660bb473fae61)
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 367 filtered out; finished in 0.42s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.59s
+     Running unittests src/lib.rs (/target/debug/deps/aether_usage_runtime-fc1660bb473fae61)
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 367 filtered out; finished in 0.01s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.50s
+     Running unittests src/lib.rs (/target/debug/deps/aether_usage_runtime-fc1660bb473fae61)
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 369 filtered out; finished in 0.00s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 13s
+     Running unittests src/lib.rs (/target/debug/deps/aether_data_postgres-e26a4d98465b3dc1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 265 filtered out; finished in 0.00s
+
+signature-tests.log
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.04s
+     Running unittests src/lib.rs (/target/debug/deps/aether_usage_runtime-fc1660bb473fae61)
+running 16 tests
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 353 filtered out; finished in 0.45s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 50.50s
+     Running unittests src/lib.rs (/target/debug/deps/aether_provider_transport-4ffabe3f7fec6885)
+running 10 tests
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 490 filtered out; finished in 0.01s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.42s
+     Running unittests src/lib.rs (/target/debug/deps/aether_provider_transport-4ffabe3f7fec6885)
+running 5 tests
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 495 filtered out; finished in 0.00s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.53s
+     Running unittests src/lib.rs (/target/debug/deps/aether_data_contracts-1990305364c0f82d)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 235 filtered out; finished in 0.00s
+
+gateway-tests.log
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16m 25s
+     Running unittests src/lib.rs (/target/debug/deps/aether_gateway-860012414b105e9c)
+running 10 tests
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 5534 filtered out; finished in 1.27s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.91s
+     Running unittests src/lib.rs (/target/debug/deps/aether_gateway-860012414b105e9c)
+running 4 tests
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 5540 filtered out; finished in 0.00s
+
+final-clippy.log
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.44s
+     Running unittests src/lib.rs (/target/debug/deps/aether_provider_transport-4ffabe3f7fec6885)
+running 10 tests
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 490 filtered out; finished in 0.01s
+error: this `MutexGuard` is held across an await point
+error: useless use of `vec!`
+error: could not compile `aether-gateway` (lib test) due to 2 previous errors
+
+verified-clippy.log
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10m 01s

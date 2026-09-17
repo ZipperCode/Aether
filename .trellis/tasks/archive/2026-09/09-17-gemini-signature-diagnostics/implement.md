@@ -5,4 +5,4 @@
 - [x] R2 upstream integration and regression review.
 - [x] Run targeted Docker tests/checks and frontend regression.
 - [x] Independent Trellis check; resolve findings.
-- [ ] Update executable contracts, commit scoped work, archive children/parent and journal.
+- [x] Update executable contracts and commit scoped work: abe0965f5 (signature), 8e9e1836c (usage retention). Archive and journal are completed by the finish-work metadata batch.
