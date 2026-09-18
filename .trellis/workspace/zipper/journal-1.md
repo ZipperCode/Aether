@@ -860,3 +860,39 @@ Implemented independent quota sources, official plan recognition, regional query
 ### Status
 
 [OK] **Completed**
+
+
+## Session 35: 修复 SSE 预读交接的数据缺失
+
+**Date**: 2026-09-18
+**Task**: 修复 SSE 预读交接的数据缺失
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+完整保存预读已消费的分片，保留检查与审计预算；真实网关先复现缺失 3616 字节，再通过 53 项定向测试。未推送、未部署。
+
+### Main Changes
+
+- 预读恢复改用完整分片，移除截断标记，并更新 Responses 流交接规范。
+- 新增 4 组 29 场景，覆盖长事件、边界分片、UTF-8、私有标准化和透传完整性。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f18dad7ab957e72dd971489c4c3093d42230e85f` | (see git log) |
+
+### Testing
+
+- [OK] 旧实现真实回归失败：20241 字节变为 16625 字节，缺失 3616 字节。
+- [OK] 新增 4 项与既有 49 项定向测试全部通过；Clippy 零警告、格式与 API 字段矩阵检查通过。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 线上归因仍需核对部署版本和具体请求路径，本任务不包含发布或部署。
