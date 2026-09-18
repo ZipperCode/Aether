@@ -19,7 +19,7 @@ Preserve every byte consumed by gateway prefetch when handing an upstream SSE re
 - [x] Complete event plus partial next event, split UTF-8, and normal termination retain content/order exactly with no duplication.
 - [x] Private-normalizer and passthrough coverage pass; precommit failover, first-byte accounting and capture-budget regressions remain green.
 - [x] Relevant Rust checks, formatting and scoped review complete with an evidence receipt.
-- [ ] Local Chinese-message work commit complete.
+- [x] Local Chinese-message work commit complete: `f18dad7ab957e72dd971489c4c3093d42230e85f`.
 
 ## Notes
 
