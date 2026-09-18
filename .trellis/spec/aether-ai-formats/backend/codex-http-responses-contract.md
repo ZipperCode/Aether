@@ -76,6 +76,17 @@ complete structured errors are classified before success regex matching. On
 handoff preserve buffered original bytes/order, and never switch providers
 after visible text, reasoning, tools or a delivered normal terminal.
 
+`execute_stream_from_frame_stream_with_retry_scope` must retain every byte
+already fed into the prefetch normalization/rewrite chain. The 16 KiB
+`MAX_STREAM_PREFETCH_BYTES` budget limits inspection and further prefetch
+reads; it must not truncate the last consumed fragment used to restore
+normalizer, rewriter, usage-observer or error-inspector state. Keep
+`provider_prefetched_body` complete and `prefetched_inspection_body` bounded.
+Replay restores state without re-emitting its output; previously produced
+client chunks are delivered exactly once. Audit capture remains independently
+budgeted, and provider/client prefetch buffers are released after restoration. Existing
+native terminal truncation and frame/parser limits remain unchanged.
+
 For cross-format Gemini streams, the first non-empty `thought` is visible
 reasoning output and commits the candidate. Signature-only control parts remain
 non-visible. If a tool-call terminal error arrives after visible reasoning or a
@@ -99,6 +110,8 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 | Final native candidate JSON equals the captured request and no encoding/gzip is active | Use the existing exact `body_bytes_b64` representation; do not also carry `json_body`. |
 | Final candidate JSON changed, formats differ, payload capture is absent, or encoding/gzip is active or unknown | Fall back to `json_body`; never reuse stale source bytes. |
 | Native Responses unknown SSE event/field | Preserve the emitted bytes and ordering. |
+| A prefetch fragment crosses 16 KiB inside an SSE record | Restore from the complete consumed prefix and then continue with unread fragments; no byte gap or duplicate event. |
+| Audit capture is disabled or exhausted | Forwarding and parser restoration still preserve the complete semantic stream. |
 | Cross-format material semantic cannot be represented | Return a structured conversion/terminal error; never silently drop it. |
 | Upstream HTTP 4xx/5xx | Preserve status and error body through the generic HTTP boundary. |
 | Upstream HTTP 2xx + first native Responses body is an embedded error | Detect before committing downstream 2xx; preserve the error or retry an eligible next candidate. |
@@ -115,10 +128,12 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 
 - Good: Codex sends the current full create payload plus a future field to a native Responses provider; the future field and opaque SSE event survive unchanged.
 - Good: a native request remains byte-equivalent after every candidate edit; the planner reuses its normalized exact bytes, including whitespace and object-key order.
+- Good: 5,000-byte fragments cross the prefetch budget at 20,000 bytes; restoration retains all 20,000 consumed bytes before reading the next fragment.
 - Base: Codex sends a compact payload to a native provider; Aether returns the provider `output` array without local state.
 - Base: the selected provider model or stream policy changes the candidate JSON; the planner serializes the final JSON instead of reusing the source bytes.
 - Bad: a cross-format provider cannot represent a new input/tool item, and Aether silently removes it to keep the request running.
 - Bad: exact source bytes are selected before model/body/redaction rules finish, undoing the final candidate request.
+- Bad: rebuilding a stream parser from a 16,384-byte diagnostic prefix after consuming 20,000 bytes; the missing 3,616 bytes can corrupt JSON or silently shorten a still-valid string.
 - Bad: downstream credentials or `x-aether-*` identity headers reach provider egress.
 - Bad: a provider returns HTTP 200 plus a bare Responses error body, and Aether commits 200 before classifying it, causing clients to deserialize the error as a successful Response without `id`.
 - Bad: a general OpenAI resource endpoint is added solely because it exists in the official reference, without a downstream product requirement and provider-affinity design.
@@ -136,6 +151,7 @@ Keep focused regressions on the shared paths:
 - `prefetched_codex_cyber_policy_violation_stops_failover_by_default`: opaque SSE and terminal error bytes remain ordered and unchanged.
 - `prefetched_codex_cyber_policy_violation_retries_when_system_setting_is_enabled`: the no-extra-output retry boundary remains intact.
 - `same_format_responses_prefetch_retries_bare_error_before_committing_success`: a first bare Responses error is classified before HTTP commit and returns the existing candidate-retry signal.
+- Prefetch handoff regressions must exercise the actual gateway body path with Responses compatibility rewriting enabled, private normalization, and passthrough. Cover approximately 18/20/75 KB events, 5,000/6,000/16,384-byte fragments and boundary offsets, complete-plus-partial records, split UTF-8, unknown fields, and terminal usage. Assert exact content/order and no duplicates as well as JSON parseability; the main regression must fail with the truncating append restored.
 - Gemini-to-Responses regressions must cover immediate thought emission,
   signature-only non-commit, every supported tool-call terminal reason, complete
   in-band failure shape, usage retention, and no post-visibility failover.
@@ -182,4 +198,12 @@ finish all per-candidate request edits
 -> compare final JSON with the captured parsed request
 -> unchanged native request with no re-encoding: reuse exact normalized bytes
 -> otherwise: serialize the final JSON
+```
+
+For stream prefetch restoration:
+
+```text
+Wrong: consume a full fragment -> keep only its budgeted prefix -> rebuild parser.
+Correct: consume a full fragment -> retain all consumed bytes -> stop prefetch at
+the existing budget -> restore state without sending replay output twice.
 ```

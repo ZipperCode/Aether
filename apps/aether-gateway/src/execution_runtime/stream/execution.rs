@@ -6990,7 +6990,6 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     }
     let mut prefetched_chunks: Vec<Bytes> = Vec::new();
     let mut provider_prefetched_body = Vec::new();
-    let mut provider_prefetched_body_truncated = false;
     let mut prefetched_body = Vec::new();
     let mut prefetched_inspection_body = Vec::new();
     let mut prefetched_inspection_body_truncated = false;
@@ -7239,12 +7238,8 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                         }
                     }
 
-                    append_stream_capture_bytes(
-                        &mut provider_prefetched_body,
-                        &chunk,
-                        MAX_STREAM_PREFETCH_BYTES,
-                        &mut provider_prefetched_body_truncated,
-                    );
+                    // 恢复解析状态必须包含已消费的完整分片；16 KiB 预算只限制检查和继续预读。
+                    provider_prefetched_body.extend_from_slice(&chunk);
                     append_stream_capture_bytes(
                         &mut prefetched_inspection_body,
                         &chunk,
@@ -9225,6 +9220,10 @@ fn copy_stream_execution_credential_fingerprint(
 mod sse_body_tests;
 
 #[cfg(test)]
+#[path = "execution_prefetch_handoff_tests.rs"]
+mod prefetch_handoff_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::convert::Infallible;
@@ -9329,7 +9328,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn provider_catalog_for_plan(
+    pub(super) fn provider_catalog_for_plan(
         plan: &ExecutionPlan,
         provider_config: Option<Value>,
     ) -> InMemoryProviderCatalogReadRepository {
@@ -10301,7 +10300,7 @@ pub(crate) mod tests {
     }
 
     /// 构造测试用原生 Anthropic SSE 计划，验证其语义门不受 Gemini 分支影响。
-    fn native_anthropic_stream_plan(request_id: &str) -> ExecutionPlan {
+    pub(super) fn native_anthropic_stream_plan(request_id: &str) -> ExecutionPlan {
         ExecutionPlan {
             request_id: request_id.to_string(),
             candidate_id: Some(format!("candidate-{request_id}")),
@@ -11144,7 +11143,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn test_decision() -> GatewayControlDecision {
+    pub(super) fn test_decision() -> GatewayControlDecision {
         GatewayControlDecision::synthetic(
             "/v1/chat/completions",
             Some("ai_public".to_string()),
@@ -13336,7 +13335,7 @@ pub(crate) mod tests {
         out
     }
 
-    fn ndjson_frame(frame: StreamFrame) -> Bytes {
+    pub(super) fn ndjson_frame(frame: StreamFrame) -> Bytes {
         let mut bytes = serde_json::to_vec(&frame).expect("stream frame should serialize");
         bytes.push(b'\n');
         Bytes::from(bytes)
