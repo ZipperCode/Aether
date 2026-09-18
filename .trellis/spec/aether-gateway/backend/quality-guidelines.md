@@ -69,6 +69,7 @@ Questions to answer:
 - `direct_sync_rejects_gzip_expansion_crossing_limit`: rejects decoded expansion above the public cap.
 - Scoped parsing/injection tests must assert clamping, invalid fallback, global-cap precedence, and case-insensitive replacement.
 - Request-header materialization tests must assert that neither execution-only header reaches the provider.
+- Sibling test files under runtime source directories must also use explicit body collection limits. The architecture source scanner does not infer a parent module's `#[cfg(test)]`; run `gateway_production_body_collection_stays_bounded` when adding such fixtures rather than weakening its scanner or using `usize::MAX`.
 
 ### 7. Wrong vs Correct
 

@@ -95,7 +95,8 @@ async fn forward_prefetch_fragments(chunks: Vec<Vec<u8>>, mut context: Value) ->
     .expect("valid upstream SSE should execute")
     .expect("valid upstream SSE should commit");
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
+    // 最大夹具约 75 KB，显式上限为 SSE 封装与兼容字段留出余量。
+    let body = to_bytes(response.into_body(), 128 * 1024)
         .await
         .expect("client body should finish");
     let usage = tokio::time::timeout(Duration::from_secs(5), async {
