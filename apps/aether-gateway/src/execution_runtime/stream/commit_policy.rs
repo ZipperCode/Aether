@@ -402,6 +402,23 @@ fn classify_generic_sse_record(record: &[u8]) -> SemanticSseObservation {
     {
         return SemanticSseObservation::Pending;
     }
+    // 只延迟已知 Responses 文本增量中的空白；工具参数、未知事件与终止事件仍按原边界提交。
+    if matches!(
+        payload_type,
+        Some(
+            "response.output_text.delta"
+                | "response.reasoning_text.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.refusal.delta"
+        )
+    ) && body_json
+        .get("delta")
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.trim().is_empty())
+    {
+        return SemanticSseObservation::Pending;
+    }
+    // 开场文本片段采用相同空白判断，非字符串值保留现有分类，避免扩大共享语义规则。
     if matches!(
         payload_type,
         Some("response.content_part.added" | "response.reasoning_summary_part.added")
@@ -410,9 +427,11 @@ fn classify_generic_sse_record(record: &[u8]) -> SemanticSseObservation {
         Some("output_text" | "summary_text" | "refusal")
     ) && !body_json
         .pointer("/part/text")
+        .filter(|value| value.as_str().is_none_or(|text| !text.trim().is_empty()))
         .is_some_and(value_has_semantic_content)
         && !body_json
             .pointer("/part/refusal")
+            .filter(|value| value.as_str().is_none_or(|text| !text.trim().is_empty()))
             .is_some_and(value_has_semantic_content)
     {
         return SemanticSseObservation::Pending;
@@ -778,6 +797,76 @@ pub(super) fn anthropic_error_status_code(body_json: &Value) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    /// 空白文本记录在任意 HTTP 分片处都保持未提交，后续 503 仍交给现有故障转移路径。
+    #[test]
+    fn responses_whitespace_text_records_keep_fragmented_preamble_uncommitted() {
+        let mut records = Vec::new();
+        for event_type in [
+            "response.output_text.delta",
+            "response.reasoning_text.delta",
+            "response.reasoning_summary_text.delta",
+            "response.refusal.delta",
+        ] {
+            for text in ["", " ", "\t\r\n", "\u{2003}"] {
+                records.push(serde_json::json!({"type": event_type, "delta": text}));
+            }
+        }
+        records.extend([
+            serde_json::json!({"type":"response.content_part.added","part":{"type":"output_text","text":" \t"}}),
+            serde_json::json!({"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":" \n"}}),
+            serde_json::json!({"type":"response.content_part.added","part":{"type":"refusal","refusal":" "}}),
+        ]);
+        for record in records {
+            let event = format!("data: {record}\n\n");
+            for split in 1..event.len() {
+                let mut gate = StreamCommitGate::new(StreamCommitPolicy::FirstSseSemanticEvent {
+                    max_bytes: 4096,
+                    max_wait: Duration::from_secs(1),
+                });
+                for chunk in [&event.as_bytes()[..split], &event.as_bytes()[split..]] {
+                    assert_eq!(
+                        gate.observe_provider_bytes(chunk),
+                        StreamPrecommitObservation::Pending,
+                        "empty/whitespace record committed at split {split}: {record}"
+                    );
+                }
+                assert!(matches!(
+                    gate.observe_provider_bytes(b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"code\":503,\"message\":\"capacity exhausted\"}}}\n\n"),
+                    StreamPrecommitObservation::UpstreamError { status_code: 503, .. }
+                ));
+            }
+        }
+    }
+
+    /// 仅文本空白延迟提交；真实文本、工具参数、未知事件及合法终止仍保留原有边界。
+    #[test]
+    fn responses_whitespace_rule_preserves_content_tool_and_terminal_commit_boundaries() {
+        for record in [
+            serde_json::json!({"type":"response.output_text.delta","delta":" answer"}),
+            serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":""}}),
+            serde_json::json!({"type":"response.function_call_arguments.delta","delta":" \t"}),
+            serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+            serde_json::json!({"type":"response.incomplete","response":{"status":"incomplete","output":[]}}),
+            serde_json::json!({"type":"response.custom.delta","delta":" "}),
+        ] {
+            let mut gate = StreamCommitGate::new(StreamCommitPolicy::FirstSseSemanticEvent {
+                max_bytes: 4096,
+                max_wait: Duration::from_secs(1),
+            });
+            assert_eq!(
+                gate.observe_provider_bytes(format!("data: {record}\n\n").as_bytes()),
+                StreamPrecommitObservation::Commit,
+                "semantic record must still commit: {record}"
+            );
+            assert_eq!(
+                gate.observe_provider_bytes(
+                    b"data: {\"error\":{\"type\":\"server_error\",\"code\":503}}\n\n"
+                ),
+                StreamPrecommitObservation::Commit
+            );
+        }
+    }
+
     /// 通用语义门延续本地完整记录合同：控制记录不提交，多行错误在不同换行与任意分片后才分类。
     #[test]
     fn generic_sse_preserves_multiline_record_boundaries_and_control_only_records() {

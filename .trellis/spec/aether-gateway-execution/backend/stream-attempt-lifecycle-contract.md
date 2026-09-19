@@ -50,6 +50,18 @@ schedules the cancelled settlement path unless the watchdog already owns it.
   parser. Comments, `id`, `retry`, and other control-only records do not commit
   a response. Join a record's `data` fields before JSON classification; a split
   error record remains pending. Keep LF, CRLF and CR record boundaries working.
+- Within the existing precommit budget, leading empty or whitespace-only
+  Responses text deltas stay pending. A provider's synthetic space is not a
+  reason to close the failover window before its actual response arrives.
+  Preserve those original bytes if the candidate later succeeds; do not trim
+  the forwarded stream or apply a text rule to tool-call arguments/identifiers.
+  Meaningful content, tool events, legitimate terminals and existing buffer
+  limits retain their commitment boundary.
+  Apply the text-delta rule only to `response.output_text.delta`,
+  `response.reasoning_text.delta`, `response.reasoning_summary_text.delta` and
+  `response.refusal.delta`; known opening `part.text`/`part.refusal` fields
+  follow the same string-whitespace rule. Unknown events and non-string values
+  keep their existing classification; do not broaden the shared semantic helper.
 - Inspection must not rewrite successful upstream bytes or unknown fields.
   Preserve the existing prefetch limits, first-byte budget and terminal owner.
 - First-upstream-event accounting is independent of HTTP commitment. The first
@@ -100,6 +112,8 @@ schedules the cancelled settlement path unless the watchdog already owns it.
 | Provider fails after visible output | Emit the protocol failure terminal in the same stream. |
 | Chat first event is an error, including fragmented/multiline SSE | Honor failover and reach the next eligible provider before handing off a response. |
 | Only SSE comments, id or retry records arrive | Keep waiting within the existing prefetch budget. |
+| Responses opening events and leading blank text precede a retryable error | Keep the response uncommitted and attempt the next eligible candidate. |
+| Responses leading blank text precedes successful content | Emit the original preamble and content exactly once, preserving whitespace. |
 | First Data arrives before any visible text | Persist first-byte/streaming while HTTP response remains uncommitted. |
 | Provider explicitly stops on the first error status | Return that error without contacting the next provider. |
 | Client closes after a complete terminal event | Preserve completed/failed terminal state, not cancellation. |
@@ -110,6 +124,9 @@ schedules the cancelled settlement path unless the watchdog already owns it.
   its own full budget after admission rather than failing immediately.
 - Base: a candidate reaches its normal terminal write and disarms the guard;
   dropping the completed future performs no second write.
+- Good: `response.created` / empty message opening / `output_text.delta` with
+  `delta: " "` / error reaches the next provider; a real text or tool event
+  before that error keeps the failure in the original stream.
 - Good: provider A fails twice under sticky retry, B returns HTTP 200 with a
   first-event error, and C is actually called and completes; usage belongs to C.
 - Bad: assuming `fixed_order` guarantees HTTP call order in a Chat simulation.
@@ -136,6 +153,11 @@ schedules the cancelled settlement path unless the watchdog already owns it.
 - `execution_runtime::stream::error::tests` covers complete-record boundaries,
   control-only records, multiline data, incomplete errors and a normal first
   event preceding a later error. Keep same-format Responses regressions green.
+- Responses leading-whitespace regression: use actual local HTTP providers,
+  assert downstream status/body and per-provider call counts, settle failed and
+  successful candidates, and attribute usage to the provider that answered.
+  Cover fragmented blank events, successful byte preservation, and real text
+  or tool output forbidding failover. The failure case must fail on old logic.
 - `execute_execution_runtime_stream_records_first_stream_event_before_visible_text`
   drives response execution concurrently, asserts first-byte/streaming before
   releasing visible data, and asserts that the HTTP task is not yet complete.
