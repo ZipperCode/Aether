@@ -896,3 +896,38 @@ Implemented independent quota sources, official plan recognition, regional query
 ### Next Steps
 
 - 线上归因仍需核对部署版本和具体请求路径，本任务不包含发布或部署。
+
+
+## Session 36: Responses 开场空白与故障转移修复
+
+**Date**: 2026-09-20
+**Task**: Responses 开场空白与故障转移修复
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+修复 Responses 文本空白误提交，保留失败后转移与成功流原始字节；完成红绿验证和独立审查。
+
+### Main Changes
+
+- 仅调整已知 Responses 文本事件，保持共享分类、工具调用、限额和重试流程。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `970eab84ee09536237e743c146017f1b8567286b` | (see git log) |
+
+### Testing
+
+- [OK] Docker 旧代码复现只调用第一家；修复后 48 项相关测试全部通过。
+- [OK] Gateway Clippy -D warnings、rustfmt、diff 检查及独立审查通过。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 本地已提交；推送、发布及线上部署需单独执行。

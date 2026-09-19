@@ -54,3 +54,9 @@ cargo test -p aether-gateway --lib --locked -- responses_whitespace chat_stream_
 ```
 
 No full-workspace, frontend, real PostgreSQL, CI/release or live-deployment validation is claimed. Those surfaces are outside this classifier-only repair.
+
+## Delivery
+
+- Local work commit: `970eab84ee09536237e743c146017f1b8567286b`.
+- Task archived and recorded in zipper journal session 36.
+- No push, release, deployment, or production setting/data changes.
