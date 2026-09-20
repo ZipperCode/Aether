@@ -931,3 +931,39 @@ Implemented independent quota sources, official plan recognition, regional query
 ### Next Steps
 
 - 本地已提交；推送、发布及线上部署需单独执行。
+
+
+## Session 37: 上游与候选跳过诊断合并
+
+**Date**: 2026-09-20
+**Task**: 上游与候选跳过诊断合并
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+合并上游 main 与 PR #833，修复号池代表 Key 误挡、补齐普通用户筛选和跳过原因持久化；定向回归、架构、前端和 Clippy 验证完成。
+
+### Main Changes
+
+- 同步上游 ba7c9f8 与 PR #833 0486435，保留本地协议、额度与日志契约
+- 实际 Key 检查先于热池回退与候选窗口截断，避免健康成员被代表 Key 连带淘汰
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `377ca367f` | (see git log) |
+
+### Testing
+
+- [OK] 相关 Rust 包测试 2150 项通过；网关 636 项通过，修正三项架构断言后架构模块 209 项全部通过；调度核心 96 项通过
+- [OK] 前端定向测试、类型检查和生产构建通过；受影响 Rust 包 Clippy lib/tests -D warnings 通过
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 未推送、未发布、未部署；真实线上故障仍需对应请求记录验证
