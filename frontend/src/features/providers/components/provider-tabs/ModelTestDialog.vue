@@ -1387,6 +1387,7 @@ function formatAuthType(authType: string): string {
   if (lowered === 'kiro') return 'Kiro OAuth'
   if (lowered === 'grok') return 'Grok OAuth'
   if (lowered === 'nous') return 'Nous OAuth'
+  if (lowered === 'xai') return 'xAI OAuth'
   return authType
 }
 

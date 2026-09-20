@@ -189,10 +189,11 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
         ));
     };
     let provider_type = provider.provider_type.trim().to_ascii_lowercase();
-    if provider_type != "kiro" && provider_type != "windsurf" && provider_type != "nous" {
+    // 设备授权共享管理员会话绑定，各 Provider 保留自己的授权流程。
+    if !matches!(provider_type.as_str(), "kiro" | "windsurf" | "nous" | "xai") {
         return Ok(build_internal_control_error_response(
             http::StatusCode::BAD_REQUEST,
-            "设备授权仅支持 Kiro / Windsurf / Nous provider",
+            "设备授权仅支持 Kiro / Windsurf / Nous / xAI provider",
         ));
     }
     let Some(principal) = request_context
@@ -306,6 +307,19 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
             "interval": authorization.interval,
         }))
         .into_response());
+    }
+
+    if provider_type == "xai" {
+        return super::xai::handle_admin_provider_oauth_xai_device_authorize(
+            state,
+            &provider_id,
+            &provider,
+            principal,
+            runtime_endpoint.as_ref(),
+            request_proxy,
+            payload.proxy_node_id.as_deref(),
+        )
+        .await;
     }
 
     if provider_type == "windsurf" {

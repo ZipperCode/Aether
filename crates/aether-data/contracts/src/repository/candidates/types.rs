@@ -33,21 +33,26 @@ define_candidate_diagnostic_categories!(
         "format_conversion_disabled",
         "gemini_file_mapping_mismatch",
         "key_api_format_disabled",
+        "key_balance_below_minimum",
         "key_circuit_open",
         "key_health_score_zero",
         "key_inactive",
         "key_model_disabled",
         "key_model_not_allowed",
+        "key_quota_exhausted",
         "key_rpm_exhausted",
         "mapped_model_missing",
         "oauth_invalid",
         "pool_account_blocked",
         "pool_account_exhausted",
         "pool_active_probe_sealed",
+        "pool_balance_below_minimum",
         "pool_cooldown",
         "pool_cost_limit_reached",
         "pool_group_exhausted",
         "pool_key_lease_busy",
+        "pool_key_quota_exhausted",
+        "pool_key_state_unavailable",
         "pool_score_member_missing",
         "provider_concurrency_limit_reached",
         "provider_inactive",
@@ -2563,6 +2568,35 @@ mod tests {
                 sanitize_request_candidate_error_type(Some((*alias).to_string())).as_deref(),
                 Some(*canonical)
             );
+        }
+    }
+
+    #[test]
+    fn scheduling_skip_reasons_survive_persistence_and_count_projection() {
+        // 固定调度原因及其次数必须保留，避免额度停用、低余额与读取失败被合并为未知原因。
+        for reason in [
+            "key_quota_exhausted",
+            "key_balance_below_minimum",
+            "pool_key_quota_exhausted",
+            "pool_balance_below_minimum",
+            "pool_key_state_unavailable",
+        ] {
+            let mut record = candidate("candidate-1", RequestCandidateStatus::Skipped, None);
+            record.skip_reason = Some(reason.to_string());
+            record.extra_data = Some(json!({
+                "pool_group_exhaustion": {
+                    "skip_reason_counts": {(reason): 2, "unknown-sensitive-reason": 1}
+                }
+            }));
+            record.sanitize_for_persistence();
+            assert_eq!(record.skip_reason.as_deref(), Some(reason));
+            record.sanitize_sensitive_diagnostics();
+            assert_eq!(record.skip_reason.as_deref(), Some(reason));
+            let counts = &record.extra_data.as_ref().expect("exhaustion diagnostics")
+                ["pool_group_exhaustion"]["skip_reason_counts"];
+            assert_eq!(counts[reason], 2);
+            assert_eq!(counts["unclassified_skip"], 1);
+            assert_eq!(counts.as_object().expect("reason counts").len(), 2);
         }
     }
 

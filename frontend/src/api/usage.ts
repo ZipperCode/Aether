@@ -162,6 +162,7 @@ export interface UsageByApiFormat {
 
 export interface UsageFilters {
   user_id?: string // UUID
+  user_group_id?: string // UUID
   provider_id?: string // UUID
   model?: string
   search?: string
@@ -194,6 +195,7 @@ export type UsageRecordStatusFilter =
   | 'cancelled'
   | 'has_fallback'
   | 'has_retry'
+  | 'has_skipped_candidate'
 
 type UsageListResponse = {
   records?: unknown
@@ -256,6 +258,8 @@ type ActiveUsageRequestsResponse = {
     client_is_stream?: boolean | null
     has_format_conversion?: boolean | null
     has_fallback?: boolean | null
+    has_skipped_candidate?: boolean | null
+    skipped_candidate_reasons?: string[]
     target_model?: string | null
     request_type?: string | null
     requested_reasoning_effort?: string | null

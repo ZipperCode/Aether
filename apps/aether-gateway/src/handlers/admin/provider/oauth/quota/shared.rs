@@ -1727,6 +1727,7 @@ fn provider_quota_url_has_allowed_origin(provider_name: &str, value: &str) -> bo
         "gemini_cli" => host == "cloudcode-pa.googleapis.com",
         "chatgpt_web" | "codex" => host == "chatgpt.com",
         "grok" => host == "grok.com",
+        "xai" => host == "cli-chat-proxy.grok.com",
         "windsurf" => host == "server.codeium.com",
         "kiro" => kiro_quota_host_is_allowed(host),
         _ => false,
@@ -1827,6 +1828,14 @@ mod tests {
             ("codex", "https://chatgpt.com/backend-api/wham/usage"),
             ("grok", "https://grok.com/rest/rate-limits"),
             (
+                "xai",
+                "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+            ),
+            (
+                "xai",
+                "https://cli-chat-proxy.grok.com/v1/user",
+            ),
+            (
                 "windsurf",
                 "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus",
             ),
@@ -1859,6 +1868,11 @@ mod tests {
                 "https://chatgpt.com.attacker.test/backend-api/wham/usage",
             ),
             ("grok", "https://grok.com.attacker.test/rest/rate-limits"),
+            (
+                "xai",
+                "https://cli-chat-proxy.grok.com.attacker.test/v1/billing",
+            ),
+            ("xai", "https://api.x.ai/v1/billing?format=credits"),
             ("windsurf", "https://server.codeium.com.attacker.test/quota"),
             (
                 "gemini_cli",

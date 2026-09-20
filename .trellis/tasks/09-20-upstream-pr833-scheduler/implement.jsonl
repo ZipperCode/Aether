@@ -1,0 +1,5 @@
+{"file":".trellis/spec/guides/index.md","reason":"Cross-layer and reuse guidance"}
+{"file":".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md","reason":"Quota source and freshness semantics"}
+{"file":".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md","reason":"Manual recovery and strong key admission"}
+{"file":".trellis/spec/aether-provider-transport/backend/antigravity-signature-recovery-contract.md","reason":"Preserve fork signature recovery"}
+{"file":".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md","reason":"Same-format fidelity and SSE prefetch"}

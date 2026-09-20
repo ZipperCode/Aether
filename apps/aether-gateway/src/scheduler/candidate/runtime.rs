@@ -11,8 +11,8 @@ use aether_provider_pool::{
 };
 use aether_scheduler_core::{
     auth_api_key_concurrency_limit_reached, build_provider_concurrent_limit_map,
-    candidate_is_selectable_with_runtime_state, candidate_runtime_skip_reason_with_state,
-    effective_provider_key_rpm_limit, CandidateRuntimeSelectabilityInput,
+    candidate_runtime_skip_reason_with_state, effective_provider_key_rpm_limit,
+    CandidateRuntimeSelectabilityInput,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
@@ -212,61 +212,13 @@ where
     }
 }
 
-/// 判断普通候选当前是否可调度；PoolGroup 代表候选不继承其占位 Key 的余额事实。
+/// 准入布尔值与诊断共享同一判定，避免 PoolGroup 的代表 Key 过滤发生分歧。
 pub(super) fn is_candidate_selectable(
     candidate: &SchedulerMinimalCandidateSelectionCandidate,
     snapshot: &CandidateRuntimeSelectionSnapshot,
     now_unix_secs: u64,
 ) -> bool {
-    let pool_group = snapshot
-        .pool_provider_ids
-        .contains(candidate.provider_id.as_str());
-    candidate_is_selectable_with_runtime_state(CandidateRuntimeSelectabilityInput {
-        candidate,
-        recent_candidates: &snapshot.recent_candidates,
-        provider_concurrent_limits: &snapshot.provider_concurrent_limits,
-        provider_key_rpm_states: &snapshot.provider_key_rpm_states,
-        now_unix_secs,
-        provider_quota_blocks_requests: snapshot
-            .provider_quota_blocks_requests
-            .get(candidate.provider_id.as_str())
-            .copied()
-            .unwrap_or(false),
-        quota_hard_blocked: !pool_group
-            && snapshot
-                .key_quota_hard_blocked
-                .get(candidate.key_id.as_str())
-                .copied()
-                .unwrap_or(false),
-        account_quota_exhausted: !pool_group
-            && snapshot
-                .key_account_quota_exhausted
-                .get(candidate.key_id.as_str())
-                .copied()
-                .unwrap_or(false),
-        balance_below_minimum: !pool_group
-            && snapshot
-                .key_balance_below_minimum
-                .get(candidate.key_id.as_str())
-                .copied()
-                .unwrap_or(false),
-        oauth_invalid: !pool_group
-            && snapshot
-                .key_oauth_invalid
-                .get(candidate.key_id.as_str())
-                .copied()
-                .unwrap_or(false),
-        enforce_key_circuit_breaker: !pool_group,
-        rpm_reset_at: (!pool_group)
-            .then(|| {
-                snapshot
-                    .provider_key_rpm_reset_ats
-                    .get(candidate.key_id.as_str())
-                    .copied()
-                    .flatten()
-            })
-            .flatten(),
-    })
+    current_candidate_runtime_skip_reason(candidate, snapshot, now_unix_secs).is_none()
 }
 
 /// 返回与准入判断一致的诊断原因，PoolGroup 的真实 Key 留在 Pool 展开阶段过滤。
@@ -292,12 +244,18 @@ pub(super) fn current_candidate_runtime_skip_reason(
                 .flatten()
         })
         .flatten();
+    let empty_key_runtime_states = BTreeMap::new();
 
     candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {
         candidate,
         recent_candidates: &snapshot.recent_candidates,
         provider_concurrent_limits: &snapshot.provider_concurrent_limits,
-        provider_key_rpm_states: &snapshot.provider_key_rpm_states,
+        // 代表 Key 的并发、健康和 RPM 不能淘汰整组；展开后对真实 Key 执行相同检查。
+        provider_key_rpm_states: if pool_group {
+            &empty_key_runtime_states
+        } else {
+            &snapshot.provider_key_rpm_states
+        },
         now_unix_secs,
         provider_quota_blocks_requests,
         quota_hard_blocked: !pool_group
@@ -731,5 +689,93 @@ mod tests {
             current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
             None
         );
+    }
+
+    #[test]
+    fn runtime_key_guards_do_not_block_pool_group_representative() {
+        // 代表 Key 的三种限制只约束真实 Key，Provider 级限制仍必须约束整个组。
+        let candidate = sample_candidate();
+        let active_request = StoredRequestCandidate::new(
+            "candidate-1".to_string(),
+            "request-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            Some(candidate.provider_id.clone()),
+            Some(candidate.endpoint_id.clone()),
+            Some(candidate.key_id.clone()),
+            aether_data_contracts::repository::candidates::RequestCandidateStatus::Streaming,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            95_000,
+            Some(95_000),
+            None,
+        )
+        .expect("active request should build");
+        for (health, concurrent_limit, rpm_limit, reason) in [
+            (0.0, None, None, "key_health_score_zero"),
+            (1.0, Some(1), None, "provider_key_concurrency_limit_reached"),
+            (1.0, None, Some(1), "key_rpm_exhausted"),
+        ] {
+            let mut key = low_balance_key();
+            key.status_snapshot = None;
+            key.health_by_format = Some(json!({"openai:chat": {"health_score": health}}));
+            key.concurrent_limit = concurrent_limit;
+            key.rpm_limit = rpm_limit;
+            let mut snapshot = CandidateRuntimeSelectionSnapshot {
+                recent_candidates: vec![active_request.clone()],
+                provider_concurrent_limits: BTreeMap::new(),
+                provider_key_rpm_states: BTreeMap::from([(key.id.clone(), key)]),
+                pool_provider_ids: BTreeSet::new(),
+                provider_quota_blocks_requests: BTreeMap::new(),
+                key_quota_hard_blocked: BTreeMap::new(),
+                key_account_quota_exhausted: BTreeMap::new(),
+                key_balance_below_minimum: BTreeMap::new(),
+                key_oauth_invalid: BTreeMap::new(),
+                provider_key_rpm_reset_ats: BTreeMap::new(),
+            };
+            assert_eq!(
+                current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+                Some(reason)
+            );
+            assert!(!is_candidate_selectable(&candidate, &snapshot, 100));
+
+            snapshot
+                .pool_provider_ids
+                .insert(candidate.provider_id.clone());
+            assert_eq!(
+                current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+                None
+            );
+            assert!(is_candidate_selectable(&candidate, &snapshot, 100));
+
+            snapshot
+                .provider_concurrent_limits
+                .insert(candidate.provider_id.clone(), 1);
+            assert_eq!(
+                current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+                Some("provider_concurrency_limit_reached")
+            );
+            assert!(!is_candidate_selectable(&candidate, &snapshot, 100));
+            snapshot.provider_concurrent_limits.clear();
+            snapshot
+                .provider_quota_blocks_requests
+                .insert(candidate.provider_id.clone(), true);
+            assert_eq!(
+                current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+                Some("provider_quota_blocked")
+            );
+            assert!(!is_candidate_selectable(&candidate, &snapshot, 100));
+        }
     }
 }

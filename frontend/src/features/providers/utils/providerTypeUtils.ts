@@ -13,6 +13,7 @@ const oauthAccountProviderTypes = new Set([
   'kiro',
   'grok',
   'nous',
+  'xai',
   'windsurf',
 ])
 

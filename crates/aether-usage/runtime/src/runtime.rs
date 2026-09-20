@@ -6663,7 +6663,7 @@ mod tests {
     }
 
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -7389,7 +7389,25 @@ mod tests {
         queue: Arc<dyn RuntimeQueueStore>,
         policy_started: Arc<tokio::sync::Notify>,
         release_policy: Arc<tokio::sync::Notify>,
+        policy_released: Arc<AtomicBool>,
         policy_reads: Arc<AtomicUsize>,
+    }
+
+    impl BlockingPolicyQueueConfiguredUsageStore {
+        fn new(queue: Arc<dyn RuntimeQueueStore>) -> Self {
+            Self {
+                queue,
+                policy_started: Arc::new(tokio::sync::Notify::new()),
+                release_policy: Arc::new(tokio::sync::Notify::new()),
+                policy_released: Arc::new(AtomicBool::new(false)),
+                policy_reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn release_blocked_policy(&self) {
+            self.policy_released.store(true, Ordering::Release);
+            self.release_policy.notify_waiters();
+        }
     }
 
     #[derive(Default)]
@@ -8485,12 +8503,21 @@ mod tests {
             Some(Arc::clone(&self.queue))
         }
 
-        /// 先建立释放等待器，再发布开始信号，避免另一运行时的释放广播先于等待器创建。
+        /// 释放状态保留到后续读取，避免开始通知触发的提前释放丢失。
         async fn body_capture_policy(&self) -> Result<UsageBodyCapturePolicy, DataLayerError> {
-            let released = self.release_policy.notified();
             self.policy_reads.fetch_add(1, Ordering::AcqRel);
             self.policy_started.notify_one();
-            released.await;
+            // 先注册等待再复查释放状态，覆盖通知前后发生的并发释放。
+            loop {
+                if self.policy_released.load(Ordering::Acquire) {
+                    break;
+                }
+                let notified = self.release_policy.notified();
+                if self.policy_released.load(Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
+            }
             Ok(UsageBodyCapturePolicy::default())
         }
     }
@@ -9124,15 +9151,39 @@ mod tests {
         .await
         .expect("a duplicate first-byte marker must release the terminal barrier");
 
-        let records = store.records.lock().expect("records lock");
-        assert_eq!(
-            records.len(),
-            2,
-            "the duplicate first byte must be coalesced"
-        );
-        assert_eq!(records[0].status, "streaming");
-        assert_eq!(records[1].status, "completed");
-        drop(records);
+        {
+            let records = store.records.lock().expect("records lock");
+            assert_eq!(
+                records.len(),
+                2,
+                "the duplicate first byte must be coalesced"
+            );
+            assert_eq!(records[0].status, "streaming");
+            assert_eq!(records[1].status, "completed");
+        }
+
+        // The terminal persistence notification can arrive before the submission
+        // dispatcher accounts for its completed task and releases admission.
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = runtime.metrics_snapshot();
+                if snapshot.lifecycle_submission_pending == 0
+                    && snapshot.first_byte_persistence_pending == 0
+                    && snapshot.ordered_lifecycle_pending == 0
+                    && runtime
+                        .lifecycle_submission
+                        .state
+                        .admission
+                        .available_permits()
+                        == CAPACITY
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("duplicate first-byte submission accounting should drain");
 
         let snapshot = runtime.metrics_snapshot();
         assert_eq!(snapshot.lifecycle_submission_pending, 0);
@@ -12406,12 +12457,9 @@ mod tests {
     async fn event_capture_budget_bounds_blocked_policy_waiters_and_releases_on_cancel_or_basic() {
         for limit in [0, 64 * 1024] {
             let runtime = UsageRuntime::new(UsageRuntimeConfig::default()).expect("runtime");
-            let store = BlockingPolicyQueueConfiguredUsageStore {
-                queue: Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default())),
-                policy_started: Arc::new(tokio::sync::Notify::new()),
-                release_policy: Arc::new(tokio::sync::Notify::new()),
-                policy_reads: Arc::new(AtomicUsize::new(0)),
-            };
+            let store = BlockingPolicyQueueConfiguredUsageStore::new(Arc::new(
+                RuntimeState::memory(MemoryRuntimeStateConfig::default()),
+            ));
             let budget = Arc::new(crate::event_capture_budget::EventCaptureMemoryBudget::new(
                 limit,
             ));
@@ -12472,7 +12520,7 @@ mod tests {
                 .await
                 .expect("replacement policy read starts");
             assert_eq!(budget.retained_bytes(), retained);
-            store.release_policy.notify_one();
+            store.release_blocked_policy();
             let event = timeout(Duration::from_secs(2), completing)
                 .await
                 .expect("Basic policy completes")
@@ -13626,25 +13674,22 @@ mod tests {
 
         /// 在策略开始通知唤醒测试时立即释放策略，模拟另一个运行时抢先执行。
         struct ReleasePolicyOnWake {
-            /// 与策略读取共享的释放通知，不另行保留通知许可。
-            release_policy: Arc<tokio::sync::Notify>,
+            /// 复用夹具释放入口，同时发布持久释放状态与等待通知。
+            store: BlockingPolicyQueueConfiguredUsageStore,
         }
 
         impl Wake for ReleasePolicyOnWake {
             /// 同步发出释放广播，将竞争窗口变成可重复的执行顺序。
             fn wake(self: Arc<Self>) {
-                self.release_policy.notify_waiters();
+                self.store.release_blocked_policy();
             }
         }
 
-        let store = BlockingPolicyQueueConfiguredUsageStore {
-            queue: Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default())),
-            policy_started: Arc::new(tokio::sync::Notify::new()),
-            release_policy: Arc::new(tokio::sync::Notify::new()),
-            policy_reads: Arc::new(AtomicUsize::new(0)),
-        };
+        let store = BlockingPolicyQueueConfiguredUsageStore::new(Arc::new(RuntimeState::memory(
+            MemoryRuntimeStateConfig::default(),
+        )));
         let waker = Waker::from(Arc::new(ReleasePolicyOnWake {
-            release_policy: Arc::clone(&store.release_policy),
+            store: store.clone(),
         }));
         let mut context = Context::from_waker(&waker);
         let policy_started = store.policy_started.notified();
@@ -13657,6 +13702,13 @@ mod tests {
             "policy release during start notification must not be lost"
         );
         assert_eq!(store.policy_reads.load(Ordering::Acquire), 1);
+        // 后续读取同样观察到已释放状态，不依赖新一轮广播。
+        assert!(store
+            .body_capture_policy()
+            .as_mut()
+            .poll(&mut context)
+            .is_ready());
+        assert_eq!(store.policy_reads.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test]
@@ -13674,12 +13726,7 @@ mod tests {
             Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
         let tracked_queue = Arc::new(FlakyAppendQueueStore::new(inner_queue, 0));
         let queue: Arc<dyn RuntimeQueueStore> = tracked_queue.clone();
-        let store = BlockingPolicyQueueConfiguredUsageStore {
-            queue,
-            policy_started: Arc::new(tokio::sync::Notify::new()),
-            release_policy: Arc::new(tokio::sync::Notify::new()),
-            policy_reads: Arc::new(AtomicUsize::new(0)),
-        };
+        let store = BlockingPolicyQueueConfiguredUsageStore::new(queue);
         let runtime = UsageRuntime::new(config).expect("usage runtime should build");
         let request_id = "req-terminal-seed-waits-for-turn";
         let plan = terminal_test_plan(request_id);
@@ -13701,9 +13748,10 @@ mod tests {
         assert_eq!(blocked_snapshot.terminal_submission_in_flight, 0);
         assert!(blocked_snapshot.lifecycle_submission_pending >= 2);
 
-        store.release_policy.notify_waiters();
+        store.release_blocked_policy();
         timeout(Duration::from_secs(2), async {
             loop {
+                store.release_blocked_policy();
                 let snapshot = runtime.metrics_snapshot();
                 if tracked_queue.successful_appends.load(Ordering::Acquire) == 1
                     && snapshot.lifecycle_submission_pending == 0
@@ -13711,7 +13759,7 @@ mod tests {
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -13744,12 +13792,7 @@ mod tests {
             Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
         let tracked_queue = Arc::new(FlakyAppendQueueStore::new(inner_queue, 0));
         let queue: Arc<dyn RuntimeQueueStore> = tracked_queue.clone();
-        let store = BlockingPolicyQueueConfiguredUsageStore {
-            queue,
-            policy_started: Arc::new(tokio::sync::Notify::new()),
-            release_policy: Arc::new(tokio::sync::Notify::new()),
-            policy_reads: Arc::new(AtomicUsize::new(0)),
-        };
+        let store = BlockingPolicyQueueConfiguredUsageStore::new(queue);
         let runtime = UsageRuntime::new(config).expect("usage runtime should build");
         let policy_started = store.policy_started.notified();
 
@@ -13796,9 +13839,10 @@ mod tests {
         assert_eq!(blocked_snapshot.terminal_submission_in_flight, 1);
         assert!(blocked_snapshot.lifecycle_submission_pending <= BACKLOG + 1);
 
-        store.release_policy.notify_waiters();
+        store.release_blocked_policy();
         timeout(Duration::from_secs(5), async {
             loop {
+                store.release_blocked_policy();
                 let snapshot = runtime.metrics_snapshot();
                 if tracked_queue.successful_appends.load(Ordering::Acquire) == BACKLOG + 1
                     && snapshot.lifecycle_submission_pending == 0
@@ -13806,7 +13850,7 @@ mod tests {
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -13977,7 +14021,7 @@ mod tests {
             .iter()
             .any(|record| record.request_id == blocked_request_id));
 
-        release_build.notify_waiters();
+        release_build.notify_one();
         timeout(Duration::from_secs(2), async {
             loop {
                 let snapshot = runtime.metrics_snapshot();
@@ -14104,12 +14148,7 @@ mod tests {
             Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
         let tracked_queue = Arc::new(FlakyAppendQueueStore::new(inner_queue, 0));
         let queue: Arc<dyn RuntimeQueueStore> = tracked_queue.clone();
-        let store = BlockingPolicyQueueConfiguredUsageStore {
-            queue,
-            policy_started: Arc::new(tokio::sync::Notify::new()),
-            release_policy: Arc::new(tokio::sync::Notify::new()),
-            policy_reads: Arc::new(AtomicUsize::new(0)),
-        };
+        let store = BlockingPolicyQueueConfiguredUsageStore::new(queue);
         let runtime = UsageRuntime::new(config).expect("usage runtime should build");
         let policy_started = store.policy_started.notified();
         runtime
@@ -14168,10 +14207,10 @@ mod tests {
         .expect("terminal submissions should reach the execution backlog");
         let saturated_snapshot = runtime.metrics_snapshot();
 
-        store.release_policy.notify_waiters();
+        store.release_blocked_policy();
         let all_completed = timeout(Duration::from_secs(2), async {
             loop {
-                store.release_policy.notify_waiters();
+                store.release_blocked_policy();
                 if tracked_queue.successful_appends.load(Ordering::Acquire)
                     == EXCESS_SUBMISSIONS + 1
                     && runtime.metrics_snapshot().terminal_submission_in_flight == 0

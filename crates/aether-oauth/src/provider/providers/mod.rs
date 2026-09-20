@@ -5,6 +5,7 @@ mod generic;
 mod kiro;
 mod nous;
 mod windsurf;
+mod xai;
 
 pub use antigravity::{AntigravityProviderOAuthAdapter, ANTIGRAVITY_USER_INFO_URL};
 pub use claude_code::{
@@ -28,4 +29,8 @@ pub use nous::{NousProviderOAuthAdapter, NOUS_CLIENT_ID, NOUS_PROVIDER_TYPE};
 pub use windsurf::{
     WindsurfProviderOAuthAdapter, WINDSURF_CLIENT_ID, WINDSURF_PROVIDER_TYPE,
     WINDSURF_SHOW_AUTH_TOKEN_REDIRECT, WINDSURF_SIGNIN_URL,
+};
+pub use xai::{
+    XaiDevicePollOutcome, XaiProviderOAuthAdapter, XAI_CLIENT_ID, XAI_DEVICE_CODE_GRANT_TYPE,
+    XAI_DEVICE_CODE_URL, XAI_OAUTH_SCOPES, XAI_PROVIDER_TYPE, XAI_TOKEN_URL,
 };

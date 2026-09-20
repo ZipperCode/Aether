@@ -160,6 +160,7 @@ import {
   mergeUsageRecordFirstByteTimeMs,
   mergeUsageRecordLifecycleSnapshot,
   mergeUsageRecordResponseTiming,
+  mergeUsageRecordSkippedCandidates,
   parseUsageTimestampMs,
 } from '@/features/usage/utils/recordSync'
 import {
@@ -441,6 +442,8 @@ const filteredRecords = computed(() => {
         records = records.filter(record => hasUsageFallback(record))
       } else if (filterStatus.value === 'has_retry') {
         records = records.filter(record => record.has_retry === true)
+      } else if (filterStatus.value === 'has_skipped_candidate') {
+        records = records.filter(record => record.has_skipped_candidate === true)
       }
     }
 
@@ -627,6 +630,7 @@ async function pollActiveRequests() {
         if (typeof update.has_fallback === 'boolean') {
           record.has_fallback = record.has_fallback === true || update.has_fallback
         }
+        Object.assign(record, mergeUsageRecordSkippedCandidates(record, update))
         // Active responses are complete final-provider snapshots. Absence clears facts left by
         // a previous candidate, while requested reasoning remains tied to the client request.
         record.target_model = typeof update.target_model === 'string' && update.target_model.trim()

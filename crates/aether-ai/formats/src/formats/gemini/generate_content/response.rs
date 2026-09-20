@@ -2,6 +2,10 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     formats::context::FormatContext,
+    formats::shared::citations::{
+        canonical_citation, canonical_citations_to_claude_citations,
+        canonical_citations_to_openai_annotations,
+    },
     protocol::canonical::{
         canonical_extension_object_mut, canonical_usage_total_input_tokens,
         canonical_usage_total_tokens_for_inclusive_input,
@@ -9,9 +13,198 @@ use crate::{
         gemini_part_to_canonical_block, gemini_stop_reason_to_canonical, gemini_usage_to_canonical,
         namespace_extension_object, CanonicalContentBlock, CanonicalResponse,
         CanonicalResponseOutput, CanonicalRole, CanonicalStopReason, CanonicalUsage,
-        OPENAI_RESPONSES_EXTENSION_NAMESPACE,
+        CLAUDE_EXTENSION_NAMESPACE, OPENAI_RESPONSES_EXTENSION_NAMESPACE,
     },
 };
+
+/// Project Gemini grounding metadata onto the answer text as structured
+/// citations.
+///
+/// Native `googleSearch` grounding runs inside Google, so there is no
+/// client-visible tool call and the evidence only exists in
+/// `candidates[].groundingMetadata`. Cross-format targets used to drop that
+/// wholesale, leaving callers with prose that names its sources but nothing a
+/// client can render or verify. Every grounded span is therefore emitted twice,
+/// each time in the target family's own standard shape: OpenAI `url_citation`
+/// annotations and Claude `web_search_result_location` citations. Both ride
+/// extension namespaces the respective emitters already merge onto the text
+/// block, so no target has to learn anything Gemini-specific.
+fn attach_gemini_grounding_citations(
+    candidate: &Map<String, Value>,
+    content: &mut [(usize, CanonicalContentBlock)],
+) {
+    let Some(grounding) = gemini_candidate_grounding(candidate) else {
+        return;
+    };
+    // 保留原始 part 索引，避免引用被附到思考块后的第一个可见文本上。
+    for (part_index, block) in content {
+        let CanonicalContentBlock::Text { text, extensions } = block else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        let citations = gemini_grounding_citations(grounding, text, *part_index);
+        if citations.is_empty() {
+            continue;
+        }
+        let unanchored = citations
+            .iter()
+            .all(|citation| citation.get("start_index").is_none());
+        let annotations = canonical_citations_to_openai_annotations(&citations);
+        let claude_citations = canonical_citations_to_claude_citations(&citations);
+        canonical_extension_object_mut(extensions, OPENAI_RESPONSES_EXTENSION_NAMESPACE)
+            .entry("annotations".to_string())
+            .or_insert_with(|| Value::Array(annotations));
+        canonical_extension_object_mut(extensions, CLAUDE_EXTENSION_NAMESPACE)
+            .entry("citations".to_string())
+            .or_insert_with(|| Value::Array(claude_citations));
+        if unanchored {
+            break;
+        }
+    }
+}
+
+pub(crate) fn gemini_candidate_grounding(candidate: &Map<String, Value>) -> Option<&Value> {
+    candidate
+        .get("groundingMetadata")
+        .or_else(|| candidate.get("grounding_metadata"))
+}
+
+/// Normalise `groundingMetadata` into neutral citations against `text`.
+///
+/// Gemini reports segment bounds as UTF-8 byte offsets while every target
+/// counts characters, so the bounds are converted rather than copied.
+pub(crate) fn gemini_grounding_citations(
+    grounding: &Value,
+    text: &str,
+    part_index: usize,
+) -> Vec<Value> {
+    let chunks = grounding
+        .get("groundingChunks")
+        .or_else(|| grounding.get("grounding_chunks"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+
+    let supports = grounding
+        .get("groundingSupports")
+        .or_else(|| grounding.get("grounding_supports"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    let mut citations = Vec::new();
+    for support in supports {
+        let segment = support.get("segment");
+        // protobuf 省略的 partIndex 表示 0；其他文本块的区间不能挪到当前块。
+        if segment
+            .and_then(|segment| {
+                segment
+                    .get("partIndex")
+                    .or_else(|| segment.get("part_index"))
+            })
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            != part_index as u64
+        {
+            continue;
+        }
+        let start = segment
+            .and_then(|segment| {
+                segment
+                    .get("startIndex")
+                    .or_else(|| segment.get("start_index"))
+            })
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let end = segment
+            .and_then(|segment| segment.get("endIndex").or_else(|| segment.get("end_index")))
+            .and_then(Value::as_u64);
+        let start_byte = gemini_clamped_byte_offset(text, start);
+        let end_byte = end
+            .map(|end| gemini_clamped_byte_offset(text, end))
+            .filter(|end| *end >= start_byte);
+        let cited_text = segment
+            .and_then(|segment| segment.get("text"))
+            .and_then(Value::as_str)
+            .or_else(|| end_byte.map(|end| &text[start_byte..end]))
+            .map(str::trim)
+            .filter(|cited_text| !cited_text.is_empty());
+        let indices = support
+            .get("groundingChunkIndices")
+            .or_else(|| support.get("grounding_chunk_indices"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for index in indices {
+            let Some(chunk) = index
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| chunks.get(index))
+            else {
+                continue;
+            };
+            let Some((uri, title)) = gemini_grounding_chunk_source(chunk) else {
+                continue;
+            };
+            citations.push(canonical_citation(
+                uri,
+                title,
+                Some(text[..start_byte].chars().count()),
+                end_byte.map(|end| text[..end].chars().count()),
+                cited_text,
+            ));
+        }
+    }
+
+    // `groundingSupports` is optional; without it the chunks are still the
+    // evidence, just unanchored.
+    if supports.is_empty() {
+        for chunk in chunks {
+            let Some((uri, title)) = gemini_grounding_chunk_source(chunk) else {
+                continue;
+            };
+            citations.push(canonical_citation(uri, title, None, None, None));
+        }
+    }
+    citations
+}
+
+fn gemini_grounding_chunk_source(chunk: &Value) -> Option<(&str, Option<&str>)> {
+    let source = chunk
+        .get("web")
+        .or_else(|| chunk.get("retrievedContext"))
+        .or_else(|| chunk.get("retrieved_context"))?;
+    let uri = source
+        .get("uri")
+        .or_else(|| source.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|uri| !uri.is_empty())?;
+    let title = source
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    Some((uri, title))
+}
+
+/// Gemini offsets are byte counts into the UTF-8 answer. A truncated or stale
+/// offset must not panic the conversion, so snap it into range and back onto a
+/// character boundary.
+fn gemini_clamped_byte_offset(text: &str, byte_offset: u64) -> usize {
+    let mut offset = usize::try_from(byte_offset)
+        .unwrap_or(text.len())
+        .min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
 
 pub fn from(body: &Value, _ctx: &FormatContext) -> Option<CanonicalResponse> {
     from_raw(body)
@@ -60,6 +253,7 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalResponse> {
                     .insert("annotations".to_string(), Value::Array(annotations));
             }
         }
+        attach_gemini_grounding_citations(candidate_object, &mut indexed_content);
         let content = indexed_content
             .into_iter()
             .map(|(_, block)| block)
@@ -579,6 +773,112 @@ fn canonical_usage_to_gemini_usage_metadata(usage: &CanonicalUsage) -> Value {
 mod tests {
     use super::*;
     use crate::CanonicalContentBlock;
+
+    /// 引用属于原始文本 part；签名控制块被过滤后仍保持目标与字符偏移，不生成重复引用。
+    #[test]
+    fn grounding_preserves_original_part_indices_and_snake_case_fields() {
+        let body = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"thoughtSignature": "opaque-control"},
+                    {"text": "前言"},
+                    {"text": "今天是 2026 年"}
+                ]},
+                "finishReason": "STOP",
+                "grounding_metadata": {
+                    "webSearchQueries": ["current date"],
+                    "grounding_chunks": [{"web": {"uri": "https://time.gov/", "title": "time.gov"}}],
+                    "grounding_supports": [{
+                        "segment": {"part_index": 2, "start_index": 0, "end_index": 15},
+                        "grounding_chunk_indices": [0]
+                    }]
+                }
+            }]
+        });
+        let canonical = from_raw(&body).expect("canonical");
+        let blocks = &canonical.outputs[0].content;
+        let first = blocks
+            .iter()
+            .find_map(|block| match block {
+                CanonicalContentBlock::Text { text, extensions } if text == "前言" => {
+                    Some(extensions)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(!first.contains_key(OPENAI_RESPONSES_EXTENSION_NAMESPACE));
+        let cited = blocks
+            .iter()
+            .find_map(|block| match block {
+                CanonicalContentBlock::Text { text, extensions } if text == "今天是 2026 年" => {
+                    Some(extensions)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let annotations = cited[OPENAI_RESPONSES_EXTENSION_NAMESPACE]["annotations"]
+            .as_array()
+            .unwrap();
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0]["end_index"], 9);
+        assert_eq!(
+            cited[CLAUDE_EXTENSION_NAMESPACE]["citations"][0]["cited_text"],
+            "今天是 2026"
+        );
+        let responses =
+            crate::formats::openai::responses::response::to_raw(&canonical, &json!({}), false);
+        let text = responses["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .unwrap();
+        assert_eq!(text["content"][0]["annotations"][0]["start_index"], 2);
+        assert_eq!(text["content"][0]["annotations"][0]["end_index"], 11);
+    }
+
+    /// Gemini omits `groundingSupports` when it cannot anchor the answer to a
+    /// span. The sources are still real, so they must survive unanchored
+    /// rather than be dropped for lacking offsets.
+    #[test]
+    fn grounding_without_supports_still_yields_unanchored_citations() {
+        let body = json!({
+            "responseId": "resp-unanchored",
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Rust 1.95 is current."}]},
+                "finishReason": "STOP",
+                "groundingMetadata": {
+                    "groundingChunks": [
+                        {"web": {"uri": "https://blog.rust-lang.org/", "title": "Rust Blog"}},
+                        {"web": {"title": "no uri here"}}
+                    ]
+                }
+            }]
+        });
+
+        let canonical = from_raw(&body).expect("canonical");
+        let CanonicalContentBlock::Text { extensions, .. } = &canonical.outputs[0].content[0]
+        else {
+            panic!("expected a text block");
+        };
+
+        assert_eq!(
+            extensions["claude"]["citations"],
+            json!([{
+                "type": "web_search_result_location",
+                "url": "https://blog.rust-lang.org/",
+                "title": "Rust Blog",
+            }])
+        );
+        assert_eq!(
+            extensions["openai_responses"]["annotations"],
+            json!([{
+                "type": "url_citation",
+                "url": "https://blog.rust-lang.org/",
+                "title": "Rust Blog",
+            }])
+        );
+    }
 
     #[test]
     fn gemini_response_without_visible_parts_is_not_success() {

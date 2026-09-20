@@ -11,6 +11,20 @@ export type UsageRecordResponseTiming = Pick<
   'response_time_ms' | 'response_time_updated_at'
 >
 
+/** 已观察到的跳过事实不可被稀疏轮询或较旧列表抹掉，原因按首次出现顺序去重。 */
+export function mergeUsageRecordSkippedCandidates(
+  existing: Pick<UsageRecord, 'has_skipped_candidate' | 'skipped_candidate_reasons'>,
+  next: { has_skipped_candidate?: boolean | null; skipped_candidate_reasons?: string[] | null },
+): Pick<UsageRecord, 'has_skipped_candidate' | 'skipped_candidate_reasons'> {
+  return {
+    has_skipped_candidate: existing.has_skipped_candidate === true || next.has_skipped_candidate === true,
+    skipped_candidate_reasons: [...new Set([
+      ...(existing.skipped_candidate_reasons ?? []),
+      ...(next.skipped_candidate_reasons ?? []),
+    ])],
+  }
+}
+
 function finiteNonNegativeDurationMs(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
 }

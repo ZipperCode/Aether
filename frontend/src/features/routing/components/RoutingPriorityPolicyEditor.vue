@@ -123,7 +123,7 @@
             v-if="providerRows.length === 0"
             class="rounded-lg border border-dashed border-border/70 px-4 py-8 text-center text-sm text-muted-foreground"
           >
-            {{ isPerModelProviderOrdering
+            {{ isPerModelProviderOrdering && providerModelIds === undefined
               ? (resolvedGlobalModelId ? '当前模型暂无可排序 Provider' : '未找到当前模型对应的全局模型')
               : '暂无 Provider' }}
           </div>
@@ -372,6 +372,8 @@ const props = defineProps<{
   model?: string
   /** 当前按模型排序对应的启用全局模型 ID；空值表示当前模型无法从目录解析。 */
   globalModelId?: string
+  /** 多模型调度配置使用关联 Provider 的并集；空数组表示没有解析完成的模型。 */
+  providerModelIds?: string[]
   priorityMode?: RoutingPriorityMode
   schedulingMode?: RoutingSchedulingMode
   showPriorityMode?: boolean
@@ -408,8 +410,10 @@ let providerLoadRequestId = 0
 
 const config = computed(() => normalizeRoutingGroupConfig(props.config))
 const targetModel = computed(() => props.model?.trim() || DEFAULT_ROUTING_POLICY_MODEL)
-/** 非默认模型才启用 Provider 资格筛选，统一排序继续展示全量 Provider。 */
-const isPerModelProviderOrdering = computed(() => targetModel.value !== DEFAULT_ROUTING_POLICY_MODEL)
+/** 单模型和多模型配置均保留资格筛选及隐藏项排序，统一排序继续展示全量 Provider。 */
+const isPerModelProviderOrdering = computed(() => (
+  targetModel.value !== DEFAULT_ROUTING_POLICY_MODEL || props.providerModelIds !== undefined
+))
 /** 规范化父级解析结果，空字符串明确代表没有有效全局模型 ID。 */
 const resolvedGlobalModelId = computed(() => props.globalModelId?.trim() || '')
 const targetModelPolicy = computed(() => targetModel.value === DEFAULT_ROUTING_POLICY_MODEL
@@ -451,13 +455,16 @@ const poolProviderIds = computed(() => {
   return set
 })
 
-/** 按模型仅投影具备当前模型关联、已启用且至少有一个启用 Key 的 Provider。 */
+/** 按模型仅投影具备所选模型关联、已启用且至少有一个启用 Key 的 Provider。 */
 const providerRows = computed<ProviderPriorityRow[]>(() => {
   const overrides = targetModelPolicy.value.provider_priority_overrides
+  // 多选模型取提供商并集；空数组表示模型尚未解析，不能回退到全部提供商。
+  const modelIds = isPerModelProviderOrdering.value
+    ? new Set(props.providerModelIds ?? [resolvedGlobalModelId.value].filter(Boolean))
+    : null
   return providers.value
-    .filter(provider => !isPerModelProviderOrdering.value || (
-      resolvedGlobalModelId.value !== ''
-      && provider.global_model_ids.includes(resolvedGlobalModelId.value)
+    .filter(provider => !modelIds || (
+      provider.global_model_ids?.some(id => modelIds.has(id))
       && provider.is_active
       && provider.active_keys > 0
     ))

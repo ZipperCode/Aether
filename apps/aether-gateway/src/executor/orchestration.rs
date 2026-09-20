@@ -1540,6 +1540,22 @@ pub(crate) async fn maybe_execute_sync_via_local_video_decision(
     .await
 }
 
+fn supports_local_video_get(
+    parts: &http::request::Parts,
+    decision: &GatewayControlDecision,
+) -> bool {
+    parts.method == http::Method::GET
+        && decision.route_kind.as_deref() == Some("video")
+        && (crate::video_tasks::resolve_video_task_read_lookup_key(
+            decision.route_family.as_deref(),
+            parts.uri.path(),
+        )
+        .is_some()
+            || (decision.route_family.as_deref() == Some("openai")
+                && crate::video_tasks::extract_openai_task_id_from_content_path(parts.uri.path())
+                    .is_some()))
+}
+
 pub(crate) fn maybe_execute_sync_request<'a>(
     state: &'a AppState,
     parts: &'a http::request::Parts,
@@ -1553,7 +1569,7 @@ pub(crate) fn maybe_execute_sync_request<'a>(
         };
         #[cfg(not(test))]
         {
-            if parts.method != http::Method::POST {
+            if parts.method != http::Method::POST && !supports_local_video_get(parts, decision) {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
             return maybe_execute_sync_local_path(state, parts, body_bytes, trace_id, decision)
@@ -1566,6 +1582,7 @@ pub(crate) fn maybe_execute_sync_request<'a>(
                 .unwrap_or_default()
                 .is_empty()
                 && parts.method != http::Method::POST
+                && !supports_local_video_get(parts, decision)
             {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
@@ -1587,7 +1604,7 @@ pub(crate) fn maybe_execute_stream_request<'a>(
         };
         #[cfg(not(test))]
         {
-            if parts.method != http::Method::POST {
+            if parts.method != http::Method::POST && !supports_local_video_get(parts, decision) {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
             return maybe_execute_stream_local_path(state, parts, body_bytes, trace_id, decision)
@@ -1600,6 +1617,7 @@ pub(crate) fn maybe_execute_stream_request<'a>(
                 .unwrap_or_default()
                 .is_empty()
                 && parts.method != http::Method::POST
+                && !supports_local_video_get(parts, decision)
             {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }

@@ -63,6 +63,21 @@ must use `models`.
 - Pool selection still applies balance, resettable quota, confirmed runtime
   quota, OAuth, health, active-probe, and exact Endpoint filters. Concurrency
   admission is not a replacement for those facts.
+- A PoolGroup is an expansion entry, not its representative Key. Preselection
+  must omit that Key's concurrency, zero-health and RPM facts while retaining
+  Provider quota/concurrency and request authorization gates. Boolean admission
+  and diagnostic admission share `current_candidate_runtime_skip_reason`.
+- After strong catalog reads, `schedule_pool_page_candidates` applies the
+  existing scheduler-core runtime checks to actual Keys, using current time,
+  the existing recent-candidate window and Key RPM reset watermark. Run Pool
+  quota/auth/balance/cooldown checks first to preserve their diagnostic priority.
+  Filter actual-Key runtime denials before hot-pool fallback and window
+  truncation, including sticky singleton candidates. Required counter-read
+  failures retain `pool_key_state_unavailable`; do not invent quota exhaustion.
+- An empty materialized score page must fall through to the catalog cursor.
+  Inactive-Key score cleanup does not replace this fallback: prior stale scores
+  or failed cleanup must not hide active unscored Keys. Keep bounded scan and
+  ordering policies intact.
 - Cache-affinity sticky hits remain first. On a miss, mode `single_account`
   concentrates work using reverse-LRU behavior; mode `lru` rotates to the
   least-recently-used Key. Unknown/missing mode uses `single_account`.
@@ -103,6 +118,9 @@ must use `models`.
 | Limit missing, zero, or negative | No Key semaphore; existing Provider accounting may still apply. |
 | All candidates saturated | Final 429 with capacity diagnostics. |
 | Saturation plus any non-capacity skip | Final 503. |
+| Representative Key has zero health, saturated concurrency or exhausted RPM | Keep its PoolGroup available for actual-Key expansion. |
+| Actual hot/sticky Key fails a runtime guard | Record the exact reason and continue eligible cold/catalog Keys. |
+| Only score rows are stale/inactive | Continue catalog scan instead of reporting premature exhaustion. |
 | Cache-affinity hit is eligible | Use the sticky Key before secondary ordering. |
 | Cache-affinity miss, mode `single_account` | Concentrate on the most recently used eligible account. |
 | Cache-affinity miss, mode `lru` | Select the least recently used eligible account. |
@@ -128,6 +146,15 @@ must use `models`.
   implementing three independent Antigravity account-window projections.
 
 ## 6. Tests Required
+
+- Gateway `runtime_key_guards_do_not_block_pool_group_representative` checks
+  ordinary-Key denial, representative isolation and retained Provider gates.
+- `pool_key_cursor_filters_real_key_runtime_guards_before_window_truncation`
+  checks normal/sticky paths with denied Keys before an eligible Key beyond
+  the frozen window and RPM-reset recovery.
+- `pool_runtime_guards_preserve_hot_pool_fallback_and_quota_reasons` checks
+  hot-to-cold fallback, all-denied outcome and exact quota/infrastructure reasons.
+- Retain #824 stale inactive score regressions and fixed-order stream tests.
 
 - Runtime-state: keyed resources isolate capacity and permits release correctly.
 - Gateway: sync, stream, Responses WS, and Live admission/release; saturation

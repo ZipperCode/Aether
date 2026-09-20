@@ -177,7 +177,10 @@ pub(super) fn read_workspace_file(path: &str) -> String {
         .join("../..")
         .canonicalize()
         .expect("workspace root should resolve");
-    fs::read_to_string(workspace_root.join(path)).expect("source file should be readable")
+    // 源码结构检查统一换行，避免 Windows 检出让相同调用链产生不同断言结果。
+    fs::read_to_string(workspace_root.join(path))
+        .expect("source file should be readable")
+        .replace("\r\n", "\n")
 }
 
 pub(super) fn read_workspace_module_tree(path: &str) -> String {
@@ -208,7 +211,8 @@ pub(super) fn read_workspace_module_tree(path: &str) -> String {
         }
     }
 
-    contents.join("\n")
+    // 模块树与单文件读取遵循相同的源码换行约定。
+    contents.join("\n").replace("\r\n", "\n")
 }
 
 mod admin_billing;

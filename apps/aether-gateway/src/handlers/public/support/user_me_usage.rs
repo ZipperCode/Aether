@@ -104,6 +104,7 @@ struct UsersMeUsageRecordFilter {
     is_stream: Option<bool>,
     is_websocket: Option<bool>,
     error_only: bool,
+    has_skipped_candidate: bool,
 }
 
 fn parse_users_me_usage_record_filter(query: Option<&str>) -> UsersMeUsageRecordFilter {
@@ -137,6 +138,7 @@ fn parse_users_me_usage_record_filter(query: Option<&str>) -> UsersMeUsageRecord
         "pending" | "streaming" | "completed" | "cancelled" => {
             filter.statuses = Some(vec![status]);
         }
+        "has_skipped_candidate" => filter.has_skipped_candidate = true,
         _ => {}
     }
     filter
@@ -594,6 +596,7 @@ fn build_users_me_usage_record_payload(
         "request_path_and_query": users_me_usage_metadata_string(item, "request_path_and_query"),
         "status": item.status,
         "has_fallback": item.has_fallback(),
+        "has_skipped_candidate": false,
         "created_at": unix_secs_to_rfc3339(item.created_at_unix_ms),
         "cache_creation_input_tokens": cache_creation_input_tokens,
         "cache_creation_ephemeral_5m_input_tokens": item.cache_creation_ephemeral_5m_input_tokens,
@@ -682,6 +685,7 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "user_agent": users_me_usage_metadata_string(item, "user_agent"),
         "target_model": item.target_model,
         "has_fallback": item.has_fallback(),
+        "has_skipped_candidate": false,
     });
     payload["end_to_end_time_ms"] = json!(users_me_usage_metadata_u64(item, "end_to_end_time_ms"));
     payload["end_to_end_first_byte_time_ms"] = json!(users_me_usage_metadata_u64(
@@ -803,7 +807,7 @@ fn users_me_usage_terminal_candidate_state_override(
     Some(payload)
 }
 
-async fn resolve_users_me_usage_active_state_overrides_by_request_id(
+async fn resolve_users_me_usage_candidate_state_by_request_id(
     state: &AppState,
     items: &[StoredRequestUsageAudit],
 ) -> Result<BTreeMap<String, Value>, GatewayError> {
@@ -811,21 +815,26 @@ async fn resolve_users_me_usage_active_state_overrides_by_request_id(
         return Ok(BTreeMap::new());
     }
 
-    let active_request_ids = items
+    let request_ids = items
         .iter()
-        .filter(|item| matches!(item.status.as_str(), "pending" | "streaming"))
-        .map(|item| item.request_id.clone())
-        .collect::<BTreeSet<_>>();
+        .map(|item| (item.request_id.clone(), item))
+        .collect::<BTreeMap<_, _>>();
     let mut overrides = BTreeMap::new();
-    for request_id in active_request_ids {
+    // 调用方先按当前用户隔离用量；普通用户只接收跳过标记，不接收提供商及原因诊断。
+    for (request_id, item) in request_ids {
         let candidates = state
             .read_request_candidates_by_request_id(&request_id)
             .await?;
-        if let Some(override_payload) =
+        let mut payload = if matches!(item.status.as_str(), "pending" | "streaming") {
             users_me_usage_terminal_candidate_state_override(&candidates)
-        {
-            overrides.insert(request_id, override_payload);
+        } else {
+            None
         }
+        .unwrap_or_else(|| json!({}));
+        payload["has_skipped_candidate"] = json!(candidates
+            .iter()
+            .any(|candidate| candidate.status == RequestCandidateStatus::Skipped));
+        overrides.insert(request_id, payload);
     }
     Ok(overrides)
 }
@@ -1054,6 +1063,9 @@ pub(super) async fn handle_users_me_usage_get(
         Err(detail) => return admin_stats_bad_request_response(detail),
     };
     let record_filter = parse_users_me_usage_record_filter(query);
+    // 派生标记必须先筛选再分页，否则后续页的跳过记录永远不会出现。
+    let record_limit = (!record_filter.has_skipped_candidate).then_some(limit);
+    let record_offset = (!record_filter.has_skipped_candidate).then_some(offset);
 
     // When no time range is specified, default to 7 days to avoid full-table scans.
     let effective_time_range = time_range.or_else(|| {
@@ -1225,8 +1237,8 @@ pub(super) async fn handle_users_me_usage_get(
             };
             record_items = match state
                 .list_usage_audits_by_keyword_search(&UsageAuditKeywordSearchQuery {
-                    limit: Some(limit),
-                    offset: Some(offset),
+                    limit: record_limit,
+                    offset: record_offset,
                     ..keyword_query
                 })
                 .await
@@ -1286,8 +1298,8 @@ pub(super) async fn handle_users_me_usage_get(
                     is_stream: record_filter.is_stream,
                     is_websocket: record_filter.is_websocket,
                     error_only: record_filter.error_only,
-                    limit: Some(limit),
-                    offset: Some(offset),
+                    limit: record_limit,
+                    offset: record_offset,
                     newest_first: true,
                 })
                 .await
@@ -1314,6 +1326,28 @@ pub(super) async fn handle_users_me_usage_get(
         }
     }
 
+    let candidate_state =
+        match resolve_users_me_usage_candidate_state_by_request_id(state, &record_items).await {
+            Ok(value) => value,
+            Err(err) => {
+                return build_auth_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("user usage candidate lookup failed: {err:?}"),
+                    false,
+                );
+            }
+        };
+    if record_filter.has_skipped_candidate {
+        // ponytail: 沿用管理员的时间范围内派生筛选；大规模查询变慢时再增加索引投影。
+        record_items.retain(|item| {
+            candidate_state
+                .get(&item.request_id)
+                .is_some_and(|fields| fields["has_skipped_candidate"] == true)
+        });
+        total_record_count = record_items.len();
+        record_items = record_items.into_iter().skip(offset).take(limit).collect();
+    }
+
     let total_requests = usage_summary.total_requests;
     let total_input_tokens = usage_summary.input_tokens;
     let total_output_tokens = usage_summary.output_tokens;
@@ -1334,12 +1368,16 @@ pub(super) async fn handle_users_me_usage_get(
     let records = record_items
         .into_iter()
         .map(|item| {
-            build_users_me_usage_record_payload(
+            let mut payload = build_users_me_usage_record_payload(
                 &item,
                 include_actual_cost,
                 &api_key_names,
                 auth_api_key_reader_available,
-            )
+            );
+            if let Some(fields) = candidate_state.get(&item.request_id) {
+                payload["has_skipped_candidate"] = fields["has_skipped_candidate"].clone();
+            }
+            payload
         })
         .collect::<Vec<_>>();
 
@@ -1457,7 +1495,7 @@ pub(super) async fn handle_users_me_usage_active_get(
             .collect::<Vec<_>>()
     };
     let active_state_overrides =
-        match resolve_users_me_usage_active_state_overrides_by_request_id(state, &items).await {
+        match resolve_users_me_usage_candidate_state_by_request_id(state, &items).await {
             Ok(value) => value,
             Err(err) => {
                 return build_auth_error_response(

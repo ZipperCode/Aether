@@ -532,8 +532,19 @@ fn scheduler_candidate_runtime_paths_depend_on_scheduler_core_and_state_trait() 
         "candidate/runtime.rs should depend on SchedulerRuntimeState"
     );
     assert!(
-        runtime.contains("candidate_is_selectable_with_runtime_state"),
-        "candidate/runtime.rs should depend on core selectable predicate helper"
+        runtime.contains("use aether_scheduler_core::{")
+            && runtime.contains(
+                "candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {",
+            )
+            && !runtime.contains("fn candidate_runtime_skip_reason_with_state("),
+        "candidate/runtime.rs should delegate runtime eligibility to scheduler-core"
+    );
+    // 准入布尔值必须复用诊断结论，避免代表 Key 的过滤边界在两个入口间分叉。
+    assert!(
+        runtime.contains(
+            "current_candidate_runtime_skip_reason(candidate, snapshot, now_unix_secs).is_none()",
+        ),
+        "candidate/runtime.rs should derive selectable state from the same diagnostic helper"
     );
     assert!(
         !runtime.contains("SchedulerAffinityTarget"),

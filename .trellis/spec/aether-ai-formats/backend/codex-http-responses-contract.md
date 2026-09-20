@@ -66,6 +66,12 @@ Forward only headers allowed by the existing provider transport policy. Strip do
 
 ### HTTP SSE and errors
 
+Cross-format Responses output places raw reasoning in `content` entries of type
+`reasoning_text`, emitting `response.reasoning_text.delta` / `.done` once. Do not
+mirror raw reasoning into summary entries/events; preserve genuinely supplied
+provider summaries separately. The 2026-09-20 integration imports upstream #835.
+This does not authorize rewriting native same-format provider SSE.
+
 Native same-format SSE preserves event names, event order, JSON fields, and unknown future events. Usage and error observers may inspect bytes but must not rewrite them. Preserve upstream HTTP error status/body and request identifiers through the existing HTTP response boundary.
 
 For native `openai:responses` SSE, classify the first complete body/event before committing downstream HTTP 2xx. If that first body is an embedded error and no output is client-visible, preserve the real error status or use the existing candidate-failover path. Do not expose a bare `{ "error": ... }` object as a successful Response: successful Responses require an `id`, while a post-commit `response.failed` event requires a complete Response object.

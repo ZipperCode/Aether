@@ -2616,6 +2616,8 @@ fn usage_sql_preserves_nonzero_lifecycle_updated_revision() {
         super::LIST_USAGE_AUDITS_PREFIX,
         super::LIST_RECENT_USAGE_AUDITS_PREFIX,
     ] {
+        // SQL 契约与检出的换行格式无关，统一后再验证表达式结构。
+        let sql = sql.replace("\r\n", "\n");
         assert!(sql
             .contains("COALESCE(\n    NULLIF(\"usage\".updated_at_unix_secs, 0),\n    GREATEST("));
         assert!(
@@ -3251,13 +3253,15 @@ fn usage_sql_canonical_openai_cache_case_preserves_effective_and_total_tokens() 
         aggregate_audit_summary
             .matches("WHEN effective_input_tokens = 0 AND total_input_context = 0")
             .count(),
-        2
+        1,
+        "the shared daily aggregate query should define the legacy token fallback once"
     );
     assert_eq!(
         aggregate_audit_summary
             .matches("+ output_tokens + cache_creation_tokens + cache_read_tokens")
             .count(),
-        2
+        1,
+        "the shared daily aggregate query should define canonical total tokens once"
     );
     assert!(!aggregate_audit_summary.contains("SUM(input_tokens + output_tokens)"));
 
@@ -3485,6 +3489,8 @@ fn usage_sql_reads_http_audits_for_single_record_fetches() {
 #[test]
 fn usage_sql_single_record_fetches_preserve_full_request_metadata() {
     for sql in [super::FIND_BY_REQUEST_ID_SQL, super::FIND_BY_ID_SQL] {
+        // Windows 检出可以使用 CRLF，不应被误报为详情投影缺失。
+        let sql = sql.replace("\r\n", "\n");
         assert!(
             sql.contains("\n  \"usage\".request_metadata,\n"),
             "single-record usage detail queries must preserve the full request metadata, \

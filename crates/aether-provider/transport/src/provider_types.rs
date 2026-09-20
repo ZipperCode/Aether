@@ -286,6 +286,17 @@ const NOUS_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     ..STANDARD_RUNTIME_POLICY
 };
 
+const XAI_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    fixed_provider: true,
+    api_format_inheritance: ProviderApiFormatInheritance::OAuthOrBearer,
+    enable_format_conversion_by_default: true,
+    oauth_is_bearer_like: true,
+    supports_model_fetch: false,
+    supports_local_openai_chat_transport: false,
+    supports_local_same_format_transport: true,
+    ..STANDARD_RUNTIME_POLICY
+};
+
 const CLAUDE_CODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "claude_code",
     version: 2,
@@ -477,6 +488,39 @@ const NOUS_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplat
     runtime_policy: NOUS_RUNTIME_POLICY,
 };
 
+const XAI_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: "xai",
+    version: 2,
+    base_url: crate::xai::XAI_CHAT_PROXY_BASE_URL,
+    endpoints: &[
+        FixedProviderEndpointTemplate {
+            item_key: "openai:responses",
+            api_format: "openai:responses",
+            custom_path: None,
+            config_defaults: FORCE_STREAM_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "openai:responses:compact",
+            api_format: "openai:responses:compact",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "openai:image",
+            api_format: "openai:image",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "openai:video",
+            api_format: "openai:video",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+    ],
+    runtime_policy: XAI_RUNTIME_POLICY,
+};
+
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
 }
@@ -530,6 +574,7 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "antigravity" => Some(&ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE),
         "windsurf" => Some(&WINDSURF_FIXED_PROVIDER_TEMPLATE),
         "nous" => Some(&NOUS_FIXED_PROVIDER_TEMPLATE),
+        "xai" => Some(&XAI_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }
@@ -652,6 +697,16 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             token_url: "https://portal.nousresearch.com/api/oauth/token",
             client_id: "hermes-cli",
             scopes: &["inference:invoke"],
+            redirect_uri: "",
+            use_pkce: false,
+        }),
+        "xai" => Some(ProviderOAuthTemplate {
+            provider_type: "xai",
+            display_name: "xAI",
+            authorize_url: aether_oauth::provider::providers::XAI_DEVICE_CODE_URL,
+            token_url: aether_oauth::provider::providers::XAI_TOKEN_URL,
+            client_id: aether_oauth::provider::providers::XAI_CLIENT_ID,
+            scopes: aether_oauth::provider::providers::XAI_OAUTH_SCOPES,
             redirect_uri: "",
             use_pkce: false,
         }),
@@ -900,6 +955,50 @@ mod tests {
         assert_eq!(template.client_id, "hermes-cli");
         assert_eq!(template.scopes, &["inference:invoke"]);
         assert!(ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"nous"));
+    }
+
+    #[test]
+    fn xai_fixed_provider_template_exposes_responses_media_endpoints() {
+        let template = fixed_provider_template("xai").expect("xai template should exist");
+        assert_eq!(template.provider_type, "xai");
+        assert_eq!(template.base_url, crate::xai::XAI_CHAT_PROXY_BASE_URL);
+        assert_eq!(template.version, 2);
+        assert_eq!(
+            template
+                .endpoints
+                .iter()
+                .map(|item| item.api_format)
+                .collect::<Vec<_>>(),
+            vec![
+                "openai:responses",
+                "openai:responses:compact",
+                "openai:image",
+                "openai:video"
+            ]
+        );
+
+        let policy = provider_runtime_policy("xai");
+        assert!(policy.fixed_provider);
+        assert!(policy.enable_format_conversion_by_default);
+        assert!(policy.oauth_is_bearer_like);
+        assert!(!policy.supports_model_fetch);
+        assert!(policy.supports_local_same_format_transport);
+        assert!(!policy.supports_local_openai_chat_transport);
+        assert!(fixed_provider_key_inherits_api_formats(
+            "xai", "oauth", None
+        ));
+        assert!(fixed_provider_key_inherits_api_formats(
+            "xai", "bearer", None
+        ));
+
+        let template = provider_type_admin_oauth_template("xai").expect("xai oauth template");
+        assert_eq!(template.provider_type, "xai");
+        assert_eq!(template.display_name, "xAI");
+        assert_eq!(
+            template.token_url,
+            aether_oauth::provider::providers::XAI_TOKEN_URL
+        );
+        assert!(!ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"xai"));
     }
 
     #[test]

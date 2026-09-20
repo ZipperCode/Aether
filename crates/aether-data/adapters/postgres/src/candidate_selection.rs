@@ -164,6 +164,11 @@ INNER JOIN LATERAL (
         AND LOWER($3) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
       )
       OR (
+        LOWER(BTRIM(p.provider_type)) = 'xai'
+        AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
+        AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
+      )
+      OR (
         LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
         AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
         AND LOWER($3) = 'gemini:generate_content'
@@ -188,7 +193,8 @@ INNER JOIN LATERAL (
           'vertex_ai',
           'antigravity',
           'kiro',
-          'windsurf'
+          'windsurf',
+          'xai'
         )
         AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
       )
@@ -253,6 +259,11 @@ WHERE p.is_active = TRUE
       AND LOWER($3) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
     )
     OR (
+      LOWER(BTRIM(p.provider_type)) = 'xai'
+      AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
+      AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
+    )
+    OR (
       LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
       AND LOWER($3) = 'gemini:generate_content'
@@ -277,7 +288,8 @@ WHERE p.is_active = TRUE
         'vertex_ai',
         'antigravity',
         'kiro',
-        'windsurf'
+        'windsurf',
+        'xai'
       )
       AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
     )
@@ -504,6 +516,11 @@ INNER JOIN LATERAL (
         AND LOWER($4) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
       )
       OR (
+        LOWER(BTRIM(p.provider_type)) = 'xai'
+        AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
+        AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
+      )
+      OR (
         LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
         AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
         AND LOWER($4) = 'gemini:generate_content'
@@ -528,7 +545,8 @@ INNER JOIN LATERAL (
           'vertex_ai',
           'antigravity',
           'kiro',
-          'windsurf'
+          'windsurf',
+          'xai'
         )
         AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
       )
@@ -594,6 +612,11 @@ WHERE p.is_active = TRUE
       AND LOWER($4) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
     )
     OR (
+      LOWER(BTRIM(p.provider_type)) = 'xai'
+      AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
+      AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
+    )
+    OR (
       LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
       AND LOWER($4) = 'gemini:generate_content'
@@ -618,7 +641,8 @@ WHERE p.is_active = TRUE
         'vertex_ai',
         'antigravity',
         'kiro',
-        'windsurf'
+        'windsurf',
+        'xai'
       )
       AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
     )
@@ -852,11 +876,16 @@ WHERE p.is_active = TRUE
         )
       )
     )
-    OR (
-      LOWER(BTRIM(p.provider_type)) = 'grok'
-      AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-      AND LOWER($6) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
-    )
+      OR (
+        LOWER(BTRIM(p.provider_type)) = 'grok'
+        AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
+        AND LOWER($6) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
+      )
+      OR (
+        LOWER(BTRIM(p.provider_type)) = 'xai'
+        AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
+        AND LOWER($6) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
+      )
     OR (
       LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
@@ -882,7 +911,8 @@ WHERE p.is_active = TRUE
         'vertex_ai',
         'antigravity',
         'kiro',
-        'windsurf'
+        'windsurf',
+        'xai'
       )
       AND LOWER(BTRIM(pak.auth_type)) <> 'oauth'
     )
@@ -2002,6 +2032,24 @@ mod tests {
             assert!(sql
                 .contains("'openai:chat', 'openai:responses', 'claude:messages', 'openai:image'"));
             assert!(sql.contains("'grok',"));
+        }
+    }
+
+    #[test]
+    fn candidate_selection_sql_allows_xai_oauth_responses_auth() {
+        let requested_model_sql = requested_model_selection_sql();
+        for sql in [
+            LIST_FOR_EXACT_API_FORMAT_SQL,
+            LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL,
+            LIST_POOL_KEYS_FOR_GROUP_SQL,
+            requested_model_sql.as_str(),
+        ] {
+            assert!(sql.contains("LOWER(BTRIM(p.provider_type)) = 'xai'"));
+            assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')"));
+            assert!(sql.contains(
+                "'openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video'"
+            ));
+            assert!(sql.contains("'xai'"));
         }
     }
 

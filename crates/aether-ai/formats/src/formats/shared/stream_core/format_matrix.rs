@@ -887,6 +887,138 @@ mod tests {
         format!("event: {event}\n").into_bytes()
     }
 
+    /// Gemini runs `googleSearch` inside Google, so a grounded streaming answer
+    /// carries its evidence as `groundingMetadata` on the final chunk and never
+    /// as a tool call. Each client family has to receive it in its own citation
+    /// shape, or the answer streams out unverifiable.
+    #[test]
+    fn streams_gemini_grounding_to_every_client_as_native_citations() {
+        let text = "今天是 2026 年";
+        let first = json!({
+            "responseId": "resp_grounded",
+            "modelVersion": "gemini-3.8-flash",
+            "candidates": [{
+                "index": 0,
+                "content": {"role": "model", "parts": [{"text": text}]}
+            }]
+        });
+        let last = json!({
+            "responseId": "resp_grounded",
+            "modelVersion": "gemini-3.8-flash",
+            "candidates": [{
+                "index": 0,
+                "finishReason": "STOP",
+                "content": {"role": "model", "parts": [{"text": text}]},
+                "groundingMetadata": {
+                    "webSearchQueries": ["current UTC date"],
+                    "groundingChunks": [{
+                        "web": {"uri": "https://time.gov/", "title": "time.gov"}
+                    }],
+                    "groundingSupports": [{
+                        "segment": {"startIndex": 0, "endIndex": 15},
+                        "groundingChunkIndices": [0]
+                    }]
+                }
+            }]
+        });
+
+        for (client_api_format, marker) in [
+            ("openai:chat", "\"annotations\":[{\"type\":\"url_citation\""),
+            (
+                "openai:responses",
+                "event: response.output_text.annotation.added\n",
+            ),
+            ("claude:messages", "\"type\":\"citations_delta\""),
+        ] {
+            let context = report_context("gemini:generate_content", client_api_format);
+            let mut matrix = StreamingStandardFormatMatrix::default();
+            let mut output = matrix
+                .transform_line(&context, data_line(first.clone()))
+                .expect("text chunk");
+            output.extend(
+                matrix
+                    .transform_line(&context, data_line(last.clone()))
+                    .expect("grounded chunk"),
+            );
+            output.extend(matrix.finish(&context).expect("finish"));
+            let sse = String::from_utf8(output).expect("valid SSE");
+
+            assert!(
+                sse.contains(marker),
+                "{client_api_format} missing citations: {sse}"
+            );
+            assert!(
+                sse.contains("https://time.gov/"),
+                "{client_api_format} missing source url: {sse}"
+            );
+            assert!(!sse.contains("unsupported_stream_event"), "{sse}");
+        }
+    }
+
+    /// 最后一帧可以只带引用；合并多个文本 part 后仍只输出一次正确的字符区间。
+    #[test]
+    fn streams_gemini_grounding_from_metadata_only_terminal_with_part_offsets() {
+        let context = report_context("gemini:generate_content", "openai:responses");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = Vec::new();
+        for candidate in [
+            json!({"content": {"parts": [{"text": "前言"}, {"text": "今天是 2026 年"}]}}),
+            json!({
+                "finishReason": "STOP",
+                "grounding_metadata": {
+                    "grounding_chunks": [{"web": {"uri": "https://time.gov/", "title": "time.gov"}}],
+                    "grounding_supports": [{
+                        "segment": {"part_index": 1, "start_index": 0, "end_index": 15},
+                        "grounding_chunk_indices": [0]
+                    }]
+                }
+            }),
+        ] {
+            output.extend(matrix.transform_line(&context, data_line(json!({
+                "responseId": "resp_parts", "modelVersion": "gemini-test", "candidates": [candidate]
+            }))).unwrap());
+        }
+        output.extend(matrix.finish(&context).unwrap());
+        let annotations = json_data_events(&output)
+            .into_iter()
+            .filter(|event| event["type"] == "response.output_text.annotation.added")
+            .collect::<Vec<_>>();
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0]["annotation"]["start_index"], 2);
+        assert_eq!(annotations[0]["annotation"]["end_index"], 11);
+    }
+
+    /// The citation frame is emitted once the answer is whole, so a provider
+    /// that closes the stream without a `finishReason` must still deliver it.
+    #[test]
+    fn streams_gemini_grounding_even_when_the_provider_never_sends_a_finish_reason() {
+        let context = report_context("gemini:generate_content", "openai:chat");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = matrix
+            .transform_line(
+                &context,
+                data_line(json!({
+                    "responseId": "resp_grounded",
+                    "modelVersion": "gemini-3.8-flash",
+                    "candidates": [{
+                        "index": 0,
+                        "content": {"role": "model", "parts": [{"text": "grounded"}]},
+                        "groundingMetadata": {
+                            "groundingChunks": [{"web": {"uri": "https://time.gov/"}}]
+                        }
+                    }]
+                })),
+            )
+            .expect("grounded chunk");
+        output.extend(matrix.finish(&context).expect("finish"));
+        let sse = String::from_utf8(output).expect("valid SSE");
+
+        assert!(
+            sse.contains("url_citation") && sse.contains("https://time.gov/"),
+            "{sse}"
+        );
+    }
+
     /// 验证 Gemini 畸形函数调用进入失败摘要，并从完整失败帧保留 usage。
     #[test]
     fn terminal_observer_marks_malformed_gemini_function_call_as_failure() {
@@ -965,7 +1097,11 @@ mod tests {
         let sse = String::from_utf8(output).expect("reasoning SSE should be utf8");
 
         assert!(
-            sse.contains("event: response.reasoning_summary_text.delta\n"),
+            sse.contains("event: response.reasoning_text.delta\n"),
+            "{sse}"
+        );
+        assert!(
+            !sse.contains("event: response.reasoning_summary_text.delta\n"),
             "{sse}"
         );
         assert!(sse.contains("\"delta\":\"checking\""), "{sse}");

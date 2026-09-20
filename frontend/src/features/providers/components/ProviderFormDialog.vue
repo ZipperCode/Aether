@@ -87,6 +87,9 @@
                   <SelectItem value="nous">
                     Nous
                   </SelectItem>
+                  <SelectItem value="xai">
+                    xAI
+                  </SelectItem>
                   <SelectItem value="kiro">
                     Kiro
                   </SelectItem>
@@ -146,6 +149,9 @@
                   </SelectItem>
                   <SelectItem value="nous">
                     Nous
+                  </SelectItem>
+                  <SelectItem value="xai">
+                    xAI
                   </SelectItem>
                   <SelectItem value="kiro">
                     Kiro
@@ -490,6 +496,7 @@ const providerTypeLabels: Readonly<Record<ProviderType, string>> = {
   antigravity: 'Antigravity',
   kiro: 'Kiro',
   grok: 'Grok',
+  xai: 'xAI',
   nous: 'Nous',
   windsurf: 'Windsurf',
   vertex_ai: 'Vertex AI',

@@ -26,6 +26,10 @@ use aether_pool_core::{
 };
 use aether_provider_pool::ProviderPoolService;
 use aether_routing_core::{RankingOverlay, ResolvedRoutingPolicy};
+use aether_scheduler_core::{
+    candidate_runtime_skip_reason_with_state, effective_provider_key_rpm_limit,
+    CandidateRuntimeSelectabilityInput,
+};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
@@ -138,8 +142,53 @@ async fn schedule_pool_page_candidates(
         entry.1.insert(candidate.candidate.key_id.clone());
     }
 
-    let key_context_by_id =
+    let (key_context_by_id, keys_by_id) =
         read_pool_catalog_key_contexts_by_id(state, &candidates, provider_model_name).await;
+    let now_unix_secs = crate::clock::current_unix_secs();
+    // 复用普通 Key 的计数窗口和 RPM 重置水位；实际执行仍由原子并发准入兜住竞争。
+    let recent_candidates = if keys_by_id.values().any(|key| {
+        key.concurrent_limit.is_some_and(|limit| limit > 0)
+            || effective_provider_key_rpm_limit(key, now_unix_secs).is_some()
+    }) {
+        state.app().read_recent_request_candidates(128).await
+    } else {
+        Ok(Vec::new())
+    };
+    if let Err(err) = &recent_candidates {
+        warn!(
+            error = ?err,
+            key_count = keys_by_id.len(),
+            "gateway pool scheduler: failed to read key runtime counters"
+        );
+    }
+    let key_runtime_skip_reasons = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let reason = match &recent_candidates {
+                Ok(recent_candidates) => {
+                    candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {
+                        candidate: &candidate.candidate,
+                        recent_candidates,
+                        provider_concurrent_limits: &BTreeMap::new(),
+                        provider_key_rpm_states: &keys_by_id,
+                        now_unix_secs,
+                        // Provider 准入已完成；Pool 自己保留额度、认证、冷却的判定及原因优先级。
+                        provider_quota_blocks_requests: false,
+                        quota_hard_blocked: false,
+                        account_quota_exhausted: false,
+                        balance_below_minimum: false,
+                        oauth_invalid: false,
+                        enforce_key_circuit_breaker: false,
+                        rpm_reset_at: state
+                            .app()
+                            .provider_key_rpm_reset_at(&candidate.candidate.key_id, now_unix_secs),
+                    })
+                }
+                Err(_) => Some(POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON),
+            }?;
+            Some((candidate.candidate.key_id.clone(), reason))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let mut runtime_by_provider = BTreeMap::new();
     let mut pool_config_by_provider = BTreeMap::new();
@@ -195,6 +244,7 @@ async fn schedule_pool_page_candidates(
         &runtime_by_provider,
         &key_context_by_id,
         &effective_pool_config_by_provider,
+        &key_runtime_skip_reasons,
     );
     let scheduled = outcome.candidates;
     let skipped = outcome.skipped;
@@ -653,7 +703,9 @@ impl<'a> PoolKeyCursor<'a> {
 
         if !self.score_phase_exhausted {
             if let Some(score_candidates) = self.next_score_candidates().await {
-                return Some(score_candidates);
+                if !score_candidates.is_empty() {
+                    return Some(score_candidates);
+                }
             }
         }
 
@@ -1508,7 +1560,10 @@ async fn read_pool_catalog_key_contexts_by_id(
     state: PlannerAppState<'_>,
     candidates: &[EligibleLocalExecutionCandidate],
     provider_model_name: Option<&str>,
-) -> BTreeMap<String, PoolCatalogKeyContext> {
+) -> (
+    BTreeMap<String, PoolCatalogKeyContext>,
+    BTreeMap<String, StoredProviderCatalogKey>,
+) {
     let mut key_ids = Vec::new();
     let mut provider_type_by_key_id = BTreeMap::<String, String>::new();
 
@@ -1524,7 +1579,7 @@ async fn read_pool_catalog_key_contexts_by_id(
     }
 
     if key_ids.is_empty() {
-        return BTreeMap::new();
+        return (BTreeMap::new(), BTreeMap::new());
     }
 
     let keys = match state
@@ -1542,7 +1597,7 @@ async fn read_pool_catalog_key_contexts_by_id(
             // Do not fail open when the persistent scheduling fact cannot be
             // read. Keep this distinct from a confirmed quota block so
             // diagnostics do not instruct administrators to recover the Key.
-            return key_ids
+            let contexts = key_ids
                 .into_iter()
                 .map(|key_id| {
                     (
@@ -1554,6 +1609,7 @@ async fn read_pool_catalog_key_contexts_by_id(
                     )
                 })
                 .collect();
+            return (contexts, BTreeMap::new());
         }
     };
 
@@ -1570,7 +1626,11 @@ async fn read_pool_catalog_key_contexts_by_id(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    for key in keys {
+    let keys_by_id = keys
+        .into_iter()
+        .map(|key| (key.id.clone(), key))
+        .collect::<BTreeMap<_, _>>();
+    for key in keys_by_id.values() {
         let Some(provider_type) = provider_type_by_key_id.get(&key.id) else {
             continue;
         };
@@ -1579,13 +1639,13 @@ async fn read_pool_catalog_key_contexts_by_id(
             build_pool_catalog_key_context(
                 state,
                 &provider_pool_service,
-                &key,
+                key,
                 provider_type.as_str(),
                 provider_model_name,
             ),
         );
     }
-    contexts
+    (contexts, keys_by_id)
 }
 
 /// 将单个持久化 Key 投影为 Pool 调度信号，并保持余额、永久阻断和模型额度的边界。
@@ -1713,6 +1773,7 @@ fn apply_local_execution_pool_scheduler_with_runtime_map_outcome(
         runtime_by_provider,
         key_context_by_id,
         &BTreeMap::new(),
+        &BTreeMap::new(),
     )
 }
 
@@ -1721,12 +1782,14 @@ fn apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs(
     runtime_by_provider: &BTreeMap<String, AdminProviderPoolRuntimeState>,
     key_context_by_id: &BTreeMap<String, PoolCatalogKeyContext>,
     effective_pool_config_by_provider: &BTreeMap<String, AdminProviderPoolConfig>,
+    key_runtime_skip_reasons: &BTreeMap<String, &'static str>,
 ) -> PoolSchedulerApplyOutcome {
     let (scheduled, skipped) = run_local_execution_pool_scheduler_with_runtime_map(
         candidates.clone(),
         runtime_by_provider,
         key_context_by_id,
         effective_pool_config_by_provider,
+        key_runtime_skip_reasons,
         true,
     );
     let mut active_probe_evicted_members_by_provider =
@@ -1755,6 +1818,7 @@ fn apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs(
         runtime_by_provider,
         key_context_by_id,
         effective_pool_config_by_provider,
+        key_runtime_skip_reasons,
         false,
     );
     merge_active_probe_evictions(
@@ -1822,6 +1886,7 @@ fn run_local_execution_pool_scheduler_with_runtime_map(
     runtime_by_provider: &BTreeMap<String, AdminProviderPoolRuntimeState>,
     key_context_by_id: &BTreeMap<String, PoolCatalogKeyContext>,
     effective_pool_config_by_provider: &BTreeMap<String, AdminProviderPoolConfig>,
+    key_runtime_skip_reasons: &BTreeMap<String, &'static str>,
     enforce_active_probe_seal: bool,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
@@ -1897,7 +1962,28 @@ fn run_local_execution_pool_scheduler_with_runtime_map(
     let candidates = outcome
         .candidates
         .into_iter()
-        .map(|scheduled| apply_pool_orchestration(scheduled.candidate, scheduled.orchestration))
+        .filter_map(|scheduled| {
+            let candidate = scheduled.candidate;
+            // 在冻结窗口和热池回退判定之前过滤真实 Key，同时保留前面 Pool 硬过滤的原因。
+            if let Some(&skip_reason) = key_runtime_skip_reasons.get(&candidate.candidate.key_id) {
+                debug!(
+                    event_name = "pool_candidate_runtime_skipped",
+                    provider_id = %candidate.candidate.provider_id,
+                    key_id = %candidate.candidate.key_id,
+                    skip_reason,
+                    "gateway pool scheduler skipped key during runtime selectability resolution"
+                );
+                skipped_candidates.push(SkippedLocalExecutionCandidate {
+                    candidate: candidate.candidate,
+                    skip_reason,
+                    transport: Some(candidate.transport),
+                    ranking: candidate.ranking,
+                    extra_data: None,
+                });
+                return None;
+            }
+            Some(apply_pool_orchestration(candidate, scheduled.orchestration))
+        })
         .collect::<Vec<_>>();
     skipped_candidates.extend(outcome.skipped_candidates.into_iter().map(|skipped| {
         SkippedLocalExecutionCandidate {
@@ -3561,6 +3647,7 @@ mod tests {
             &BTreeMap::new(),
             &key_context_by_id,
             &effective_configs,
+            &BTreeMap::new(),
         );
 
         assert!(outcome.skipped.is_empty());
@@ -4190,6 +4277,257 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pool_runtime_guards_preserve_hot_pool_fallback_and_quota_reasons() {
+        // 热成员仅因请求级限制不可用时，沿用既有冷池回退且不误写持久化额度原因。
+        let candidates = ["key-hot", "key-cold"].map(|key_id| {
+            sample_eligible_candidate(
+                "provider-pool",
+                "endpoint-1",
+                key_id,
+                10,
+                Some(json!({"pool_advanced": {"probing_enabled": true}})),
+            )
+        });
+        let runtime = BTreeMap::from([(
+            "provider-pool".to_string(),
+            AdminProviderPoolRuntimeState {
+                active_probe_member_ids: BTreeSet::from(["key-hot".to_string()]),
+                provider_desired_hot: 1,
+                ..Default::default()
+            },
+        )]);
+        let mut reasons = BTreeMap::from([("key-hot".to_string(), "key_rpm_exhausted")]);
+        let outcome = apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs(
+            candidates.to_vec(),
+            &runtime,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &reasons,
+        );
+        assert_eq!(outcome.candidates.len(), 1);
+        assert_eq!(outcome.candidates[0].candidate.key_id, "key-cold");
+        assert_eq!(outcome.skipped[0].skip_reason, "key_rpm_exhausted");
+        assert!(outcome
+            .active_probe_seal_fallback_provider_ids
+            .contains("provider-pool"));
+        assert!(outcome.active_probe_evicted_members_by_provider.is_empty());
+
+        reasons.insert("key-cold".to_string(), "key_health_score_zero");
+        let outcome = apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs(
+            candidates.to_vec(),
+            &runtime,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &reasons,
+        );
+        assert!(outcome.candidates.is_empty());
+        assert_eq!(outcome.skipped.len(), 2);
+        let contexts = BTreeMap::from([
+            (
+                "key-hot".to_string(),
+                PoolCatalogKeyContext {
+                    runtime_quota_hard_blocked: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "key-cold".to_string(),
+                PoolCatalogKeyContext {
+                    catalog_state_unavailable: true,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let outcome = apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs(
+            candidates.to_vec(),
+            &runtime,
+            &contexts,
+            &BTreeMap::new(),
+            &reasons,
+        );
+        assert!(outcome.candidates.is_empty());
+        assert!(outcome
+            .skipped
+            .iter()
+            .any(|item| item.candidate.key_id == "key-hot"
+                && item.skip_reason == "pool_key_quota_exhausted"));
+        assert!(outcome
+            .skipped
+            .iter()
+            .any(|item| item.candidate.key_id == "key-cold"
+                && item.skip_reason == "pool_key_state_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_filters_real_key_runtime_guards_before_window_truncation() {
+        use crate::scheduler::candidate::{
+            list_selectable_candidates_with_skip_reasons, CandidateSchedulingContext,
+        };
+        use crate::scheduler::config::SchedulerOrderingConfig;
+        use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+        use aether_data::repository::quota::InMemoryProviderQuotaRepository;
+        use aether_data_contracts::repository::candidates::{
+            RequestCandidateStatus, StoredRequestCandidate,
+        };
+
+        // 唯一可用 Key 位于冻结窗口之后；代表与 sticky Key 均受限时仍须先过滤再截断。
+        for (health, concurrent_limit, rpm_limit, reason) in [
+            (0.0, None, None, "key_health_score_zero"),
+            (1.0, Some(1), None, "provider_key_concurrency_limit_reached"),
+            (1.0, None, Some(1), "key_rpm_exhausted"),
+        ] {
+            let provider_config = Some(json!({
+                "pool_advanced": {
+                    "scheduling_presets": [{"preset": "cache_affinity", "enabled": true}],
+                    "score_top_n": 64,
+                    "score_fallback_scan_limit": 64
+                }
+            }));
+            let (provider, endpoint, mut keys, rows) =
+                large_pool_fixture(18, provider_config.clone());
+            let representative_rows =
+                GatewayDataState::with_minimal_candidate_selection_reader_for_tests(Arc::new(
+                    InMemoryMinimalCandidateSelectionReadRepository::seed(vec![rows[0].clone()]),
+                ));
+            let now_unix_secs = crate::clock::current_unix_secs();
+            let observed_at_ms = (now_unix_secs.saturating_sub(1) * 1000) as i64;
+            let mut recent_requests = Vec::new();
+            for key in keys.iter_mut().take(17) {
+                key.health_by_format = Some(json!({"openai:chat": {"health_score": health}}));
+                key.concurrent_limit = concurrent_limit;
+                key.rpm_limit = rpm_limit;
+                recent_requests.push(
+                    StoredRequestCandidate::new(
+                        format!("candidate-{}", key.id),
+                        format!("request-{}", key.id),
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                        0,
+                        Some(key.provider_id.clone()),
+                        Some("endpoint-1".to_string()),
+                        Some(key.id.clone()),
+                        RequestCandidateStatus::Streaming,
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        observed_at_ms,
+                        Some(observed_at_ms),
+                        None,
+                    )
+                    .expect("active request should build"),
+                );
+            }
+            let data_state = GatewayDataState::with_candidate_selection_provider_catalog_quota_and_request_candidates_for_tests(
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(vec![provider], vec![endpoint], keys)),
+                Arc::new(InMemoryProviderQuotaRepository::seed(Vec::new())),
+                Arc::new(InMemoryRequestCandidateRepository::seed(recent_requests)),
+            ).with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+            let app = AppState::new()
+                .expect("state should build")
+                .with_data_state_for_tests(data_state);
+            let (selected, skipped) = list_selectable_candidates_with_skip_reasons(
+                &representative_rows,
+                &app,
+                "openai:chat",
+                "gpt-5",
+                false,
+                None,
+                None,
+                None,
+                CandidateSchedulingContext {
+                    now_unix_secs,
+                    load_balance_seed: 17,
+                },
+                false,
+                SchedulerOrderingConfig::default(),
+            )
+            .await
+            .expect("representative selection should succeed");
+            assert_eq!(
+                selected.len(),
+                1,
+                "representative must not block siblings: {reason}"
+            );
+            assert!(skipped.is_empty());
+            let mut group = sample_eligible_candidate(
+                "provider-pool",
+                "endpoint-1",
+                "key-00000",
+                0,
+                provider_config,
+            );
+            group.kind = LocalExecutionCandidateKind::PoolGroup;
+            group.candidate = selected[0].clone();
+            let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+            record_admin_provider_pool_success(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                "key-00000",
+                &pool_config,
+                Some("session-runtime-guards"),
+                0,
+                None,
+            )
+            .await;
+
+            // 普通分页与 sticky singleton 都必须拒绝真实受限 Key，且不会重新返回已拒绝项。
+            for session in [None, Some("session-runtime-guards")] {
+                let mut cursor = PoolKeyCursor::new(
+                    PlannerAppState::new(&app),
+                    group.clone(),
+                    session,
+                    None,
+                    None,
+                );
+                let candidate = cursor
+                    .next_key()
+                    .await
+                    .expect("healthy sibling should survive runtime filtering");
+                assert_eq!(candidate.candidate.key_id, "key-00017", "{reason}");
+                assert_eq!(candidate.orchestration.pool_key_index, Some(0));
+                assert!(cursor.next_key().await.is_none());
+                let rejected = cursor.take_skipped_candidates();
+                assert_eq!(rejected.len(), 17, "{reason}");
+                assert!(rejected.iter().all(|item| item.skip_reason == reason));
+                assert!(rejected
+                    .iter()
+                    .any(|item| item.candidate.key_id == "key-00000"));
+            }
+
+            // 真实 RPM 重置后旧窗口不再阻断，仍复用同一共享检查。
+            if rpm_limit.is_some() {
+                app.mark_provider_key_rpm_reset("key-00000", now_unix_secs);
+                let mut cursor = PoolKeyCursor::new(
+                    PlannerAppState::new(&app),
+                    group,
+                    Some("session-runtime-guards"),
+                    None,
+                    None,
+                );
+                assert_eq!(
+                    cursor
+                        .next_key()
+                        .await
+                        .expect("reset Key should recover")
+                        .candidate
+                        .key_id,
+                    "key-00000"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn pool_key_cursor_continues_after_exhausted_window() {
         let provider_config = Some(json!({
@@ -4466,6 +4804,115 @@ mod tests {
             cursor.skip_reason_counts.get("pool_score_member_missing"),
             Some(&128)
         );
+    }
+
+    #[tokio::test]
+    async fn inactive_pool_key_with_stale_score_does_not_exhaust_pool() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "score_top_n": 128,
+                "scheduling_presets": [
+                    {"preset": "single_account", "enabled": true},
+                    {"preset": "priority_first", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, mut keys, mut rows) =
+            large_pool_fixture(2, provider_config.clone());
+        keys[1].is_active = false;
+        rows.retain(|row| row.key_id != "key-00001");
+        let scores = vec![
+            sample_provider_key_pool_score("provider-pool", "key-00000", 5.0),
+            sample_provider_key_pool_score("provider-pool", "key-00001", 20.0),
+        ];
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    keys,
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_pool_score_repository_for_tests(Arc::new(
+                InMemoryPoolMemberScoreRepository::seed(scores),
+            ))
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config,
+        );
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("active key must stay schedulable beside a stale inactive score");
+
+        assert_eq!(candidate.candidate.key_id, "key-00000");
+        assert_eq!(
+            cursor.skip_reason_counts.get("pool_score_member_missing"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_inactive_score_only_does_not_exhaust_pool() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "score_top_n": 128,
+                "scheduling_presets": [
+                    {"preset": "single_account", "enabled": true},
+                    {"preset": "priority_first", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, mut keys, mut rows) =
+            large_pool_fixture(2, provider_config.clone());
+        keys[1].is_active = false;
+        rows.retain(|row| row.key_id != "key-00001");
+        let scores = vec![sample_provider_key_pool_score(
+            "provider-pool",
+            "key-00001",
+            20.0,
+        )];
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    keys,
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_pool_score_repository_for_tests(Arc::new(
+                InMemoryPoolMemberScoreRepository::seed(scores),
+            ))
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config,
+        );
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("catalog rows must remain schedulable when the only score is stale");
+
+        assert_eq!(candidate.candidate.key_id, "key-00000");
     }
 
     #[tokio::test]

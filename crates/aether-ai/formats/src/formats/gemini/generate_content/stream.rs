@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
+use crate::formats::gemini::generate_content::response::{
+    gemini_candidate_grounding, gemini_grounding_citations,
+};
 use crate::formats::shared::response::{build_generated_tool_call_id, canonicalize_tool_arguments};
 use crate::formats::shared::sse::encode_json_sse;
 use crate::formats::shared::stream_core::common::*;
@@ -39,6 +42,10 @@ pub struct GeminiProviderState {
     content_parts: BTreeMap<usize, CanonicalContentPart>,
     tool_calls: BTreeMap<usize, GeminiProviderToolState>,
     tool_results: BTreeMap<usize, GeminiProviderToolResultState>,
+    /// Last `groundingMetadata` seen. Gemini resends it cumulatively, so the
+    /// newest copy is the complete one; citations are emitted once at finish,
+    /// when the answer text they index into is whole.
+    grounding: Option<Value>,
 }
 
 impl GeminiProviderState {
@@ -69,6 +76,47 @@ impl GeminiProviderState {
             event: CanonicalStreamEvent::Start,
         });
         self.started = true;
+    }
+
+    /// Turn the grounding metadata collected over the stream into citations.
+    ///
+    /// The offsets Gemini reports index into the finished answer, so this can
+    /// only run once the text is complete — hence a single frame just ahead of
+    /// `Finish` rather than a delta per chunk.
+    fn push_citations_frame(&mut self, id: &str, model: &str, out: &mut Vec<CanonicalStreamFrame>) {
+        let Some(grounding) = self.grounding.take() else {
+            return;
+        };
+        // 流式客户端合并文本输出，因此将各 part 的字符区间平移到完整答案。
+        let mut citations = Vec::new();
+        let mut text_offset = 0;
+        for (part_index, text) in &self.text_parts {
+            let mut part_citations = gemini_grounding_citations(&grounding, text, *part_index);
+            let unanchored = !part_citations.is_empty()
+                && part_citations
+                    .iter()
+                    .all(|citation| citation.get("start_index").is_none());
+            for citation in &mut part_citations {
+                for key in ["start_index", "end_index"] {
+                    if let Some(index) = citation.get(key).and_then(Value::as_u64) {
+                        citation[key] = Value::from(index + text_offset);
+                    }
+                }
+            }
+            citations.extend(part_citations);
+            if unanchored {
+                break;
+            }
+            text_offset += text.chars().count() as u64;
+        }
+        if citations.is_empty() {
+            return;
+        }
+        out.push(CanonicalStreamFrame {
+            id: id.to_string(),
+            model: model.to_string(),
+            event: CanonicalStreamEvent::Citations(citations),
+        });
     }
 
     fn unknown_frame(&self, report_context: &Value, payload: Value) -> CanonicalStreamFrame {
@@ -181,6 +229,9 @@ impl GeminiProviderState {
                             // Gemini 会随异常终止原因附带说明；它是已知元数据，不应触发未知字段拒绝。
                             | "finishMessage"
                             | "finish_message"
+                            // 联网搜索来源已映射为各客户端的引用事件。
+                            | "groundingMetadata"
+                            | "grounding_metadata"
                     )
                 })
             {
@@ -194,6 +245,11 @@ impl GeminiProviderState {
                 response_model.as_str(),
                 event_object.get("usageMetadata"),
             );
+            if !self.terminal_observation_only {
+                if let Some(grounding) = gemini_candidate_grounding(candidate_object) {
+                    self.grounding = Some(grounding.clone());
+                }
+            }
             let empty_content = Map::new();
             let content = match candidate_object.get("content") {
                 Some(content) => {
@@ -479,6 +535,7 @@ impl GeminiProviderState {
                 if has_tool_calls && finish_reason.as_deref().is_none_or(|value| value == "stop") {
                     finish_reason = Some("tool_calls".to_string());
                 }
+                self.push_citations_frame(&id, &model, &mut out);
                 out.push(CanonicalStreamFrame {
                     id,
                     model,
@@ -503,14 +560,17 @@ impl GeminiProviderState {
         }
         self.finished = true;
         let (id, model) = self.identity(report_context);
-        Ok(vec![CanonicalStreamFrame {
+        let mut out = Vec::new();
+        self.push_citations_frame(&id, &model, &mut out);
+        out.push(CanonicalStreamFrame {
             id,
             model,
             event: CanonicalStreamEvent::Finish {
                 finish_reason: None,
                 usage: None,
             },
-        }])
+        });
+        Ok(out)
     }
 }
 
@@ -859,6 +919,9 @@ impl GeminiClientEmitter {
                 None,
                 None,
             ),
+            // Only Gemini produces citations today, and a Gemini-to-Gemini
+            // stream keeps its own `groundingMetadata` on the passthrough path.
+            CanonicalStreamEvent::Citations(_) => Ok(Vec::new()),
             CanonicalStreamEvent::UnknownEvent(_) => Ok(Vec::new()),
             CanonicalStreamEvent::Finish {
                 finish_reason,

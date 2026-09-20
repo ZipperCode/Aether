@@ -6492,6 +6492,242 @@ async fn gateway_handles_users_me_usage_search_with_model_and_api_key_keywords()
 }
 
 #[tokio::test]
+async fn gateway_users_me_usage_skipped_candidates_are_private_and_filtered_before_pagination() {
+    let now = Utc::now();
+    let user = sample_auth_user(now);
+    let session_id = "session-users-me-skipped";
+    let device_id = "device-users-me-skipped";
+    let access_token = build_test_auth_token(
+        "access",
+        serde_json::Map::from_iter([
+            ("user_id".to_string(), json!(user.id)),
+            ("role".to_string(), json!(user.role)),
+            (
+                "created_at".to_string(),
+                json!(user.created_at.map(|value| value.to_rfc3339())),
+            ),
+            ("session_id".to_string(), json!(session_id)),
+        ]),
+        now + chrono::Duration::hours(1),
+    );
+    let mut usage_rows = Vec::new();
+    let mut candidates = Vec::new();
+    // 非跳过记录位于两个匹配记录之间，另一用户的最新记录不得参与计数或轮询。
+    for (id, user_id, model, status, minutes_ago, skipped, reason) in [
+        (
+            "old-skip",
+            "user-auth-1",
+            "gpt-5",
+            "completed",
+            5,
+            true,
+            Some("key_rpm_exhausted"),
+        ),
+        (
+            "no-skip",
+            "user-auth-1",
+            "gpt-5",
+            "completed",
+            4,
+            false,
+            None,
+        ),
+        (
+            "other-format",
+            "user-auth-1",
+            "claude",
+            "completed",
+            3,
+            true,
+            Some("provider_inactive"),
+        ),
+        (
+            "reasonless",
+            "user-auth-1",
+            "gpt-5",
+            "streaming",
+            2,
+            true,
+            None,
+        ),
+        (
+            "other-user",
+            "user-auth-2",
+            "gpt-5",
+            "streaming",
+            1,
+            true,
+            Some("pool_cooldown"),
+        ),
+    ] {
+        let request_id = format!("req-{id}");
+        let mut usage = sample_user_usage_audit(
+            id,
+            &request_id,
+            user_id,
+            model,
+            "private-provider",
+            status,
+            now - chrono::Duration::minutes(minutes_ago),
+        );
+        if id == "other-format" {
+            usage.api_format = Some("claude:messages".to_string());
+        }
+        usage_rows.push(usage);
+        let mut candidate = sample_request_candidate(
+            &format!("candidate-{id}"),
+            &request_id,
+            "private-endpoint",
+            if skipped {
+                RequestCandidateStatus::Skipped
+            } else {
+                RequestCandidateStatus::Success
+            },
+            now.timestamp() - minutes_ago * 60,
+            None,
+        );
+        candidate.user_id = Some(user_id.to_string());
+        candidate.skip_reason = reason.map(str::to_string);
+        candidate.started_at_unix_ms = (!skipped).then_some(candidate.created_at_unix_ms);
+        candidates.push(candidate);
+    }
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder(|| {
+            let data_state = GatewayDataState::with_user_wallet_and_usage_for_tests(
+                Arc::new(InMemoryUserReadRepository::seed_auth_users(vec![user])),
+                Arc::new(InMemoryWalletRepository::seed(vec![sample_auth_wallet(
+                    "user-auth-1",
+                    now,
+                )])),
+                Arc::new(InMemoryUsageReadRepository::seed(usage_rows)),
+            )
+            .with_request_candidate_reader(Arc::new(
+                InMemoryRequestCandidateRepository::seed(candidates),
+            ));
+            AppState::new()
+                .expect("gateway should build")
+                .with_data_state_for_tests(data_state)
+                .with_auth_sessions_for_tests([sample_auth_session(
+                    "user-auth-1",
+                    session_id,
+                    device_id,
+                    "refresh-token-placeholder",
+                    now,
+                )])
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    for (query, total, expected_ids) in [
+        (
+            "limit=10",
+            4,
+            vec!["reasonless", "other-format", "no-skip", "old-skip"],
+        ),
+        (
+            "status=has_skipped_candidate&limit=1&offset=1",
+            3,
+            vec!["other-format"],
+        ),
+        (
+            "status=has_skipped_candidate&api_format=openai%3Achat&limit=1&offset=1",
+            2,
+            vec!["old-skip"],
+        ),
+        (
+            "status=has_skipped_candidate&search=gpt&api_format=openai%3Achat&limit=1&offset=1",
+            2,
+            vec!["old-skip"],
+        ),
+        (
+            "status=has_skipped_candidate&search=missing&limit=1",
+            0,
+            vec![],
+        ),
+        ("status=has_skipped_candidate&limit=1&offset=3", 3, vec![]),
+    ] {
+        let response = client
+            .get(format!("{gateway_url}/api/users/me/usage?{query}"))
+            .header("authorization", format!("Bearer {access_token}"))
+            .header("x-client-device-id", device_id)
+            .header("user-agent", "AetherTest/1.0")
+            .send()
+            .await
+            .expect("usage request should succeed");
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        let payload: serde_json::Value = response.json().await.expect("usage JSON should parse");
+        assert_eq!(payload["pagination"]["total"], total, "{query}");
+        let records = payload["records"].as_array().expect("records array");
+        assert_eq!(
+            records
+                .iter()
+                .map(|row| row["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_ids,
+            "{query}"
+        );
+        for record in records {
+            assert_eq!(record["has_skipped_candidate"], record["id"] != "no-skip");
+            for field in [
+                "provider",
+                "provider_key_name",
+                "skipped_candidate_reasons",
+                "skip_reason",
+            ] {
+                assert!(
+                    record.get(field).is_none(),
+                    "{field} must remain administrator-only"
+                );
+            }
+        }
+    }
+    for (suffix, expected_ids) in [
+        ("", vec!["reasonless"]),
+        (
+            "?ids=reasonless,no-skip,old-skip,other-user",
+            vec!["reasonless", "no-skip", "old-skip"],
+        ),
+        ("?ids=other-user", vec![]),
+    ] {
+        let response = client
+            .get(format!("{gateway_url}/api/users/me/usage/active{suffix}"))
+            .header("authorization", format!("Bearer {access_token}"))
+            .header("x-client-device-id", device_id)
+            .header("user-agent", "AetherTest/1.0")
+            .send()
+            .await
+            .expect("active request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = response.json().await.expect("active JSON should parse");
+        let records = payload["requests"].as_array().expect("requests array");
+        assert_eq!(
+            records
+                .iter()
+                .map(|row| row["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        for record in records {
+            assert_eq!(record["has_skipped_candidate"], record["id"] != "no-skip");
+            for field in [
+                "provider",
+                "provider_key_name",
+                "skipped_candidate_reasons",
+                "skip_reason",
+            ] {
+                assert!(
+                    record.get(field).is_none(),
+                    "{field} must remain administrator-only"
+                );
+            }
+        }
+    }
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_handles_users_me_usage_active_locally_without_proxying_upstream() {
     let now = Utc::now();
     let user = sample_auth_user(now);

@@ -1,0 +1,5 @@
+{"file":".trellis/spec/guides/index.md","reason":"Cross-layer integration"}
+{"file":".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md","reason":"Authorization and eligibility safeguards"}
+{"file":".trellis/spec/aether-provider-pool/backend/balance-scheduling-contract.md","reason":"Quota refresh and scheduling"}
+{"file":".trellis/spec/aether-provider-transport/backend/antigravity-signature-recovery-contract.md","reason":"Retain signature recovery"}
+{"file":".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md","reason":"Retain recent stream regressions"}

@@ -15,8 +15,8 @@ use crate::providers::{
     DeepSeekProviderPoolAdapter, DefaultProviderPoolAdapter, GeminiCliProviderPoolAdapter,
     GrokProviderPoolAdapter, KiroProviderPoolAdapter, NousProviderPoolAdapter,
     OfficialApiKeyQuotaProvider, OfficialApiKeyQuotaProviderPoolAdapter,
-    OpenRouterProviderPoolAdapter, WindsurfProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,
-    VERTEX_AI_PROVIDER_POOL_ADAPTER,
+    OpenRouterProviderPoolAdapter, WindsurfProviderPoolAdapter, XaiProviderPoolAdapter,
+    CLAUDE_CODE_PROVIDER_POOL_ADAPTER, VERTEX_AI_PROVIDER_POOL_ADAPTER,
 };
 
 #[derive(Clone)]
@@ -78,6 +78,7 @@ impl ProviderPoolService {
             )))
             .with_adapter(Arc::new(ChatGptWebProviderPoolAdapter))
             .with_adapter(Arc::new(WindsurfProviderPoolAdapter))
+            .with_adapter(Arc::new(XaiProviderPoolAdapter))
             .with_adapter(Arc::new(VERTEX_AI_PROVIDER_POOL_ADAPTER))
     }
 

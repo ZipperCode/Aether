@@ -174,6 +174,7 @@ fn provider_uses_bearer_oauth_runtime(provider_type: &str) -> bool {
             | "kiro"
             | "windsurf"
             | "nous"
+            | "xai"
     )
 }
 
@@ -398,6 +399,22 @@ mod tests {
 
         assert!(semantics.oauth_managed());
         assert!(!semantics.can_refresh_oauth());
+        assert_eq!(
+            semantics.credential_kind(),
+            ProviderKeyCredentialKind::OAuthSession
+        );
+        assert_eq!(
+            semantics.runtime_auth_kind(),
+            ProviderKeyRuntimeAuthKind::Bearer
+        );
+    }
+
+    #[test]
+    fn recognizes_xai_oauth_as_bearer_runtime() {
+        let semantics = provider_key_auth_semantics(&sample_key("oauth"), "xai");
+
+        assert!(semantics.oauth_managed());
+        assert!(semantics.can_refresh_oauth());
         assert_eq!(
             semantics.credential_kind(),
             ProviderKeyCredentialKind::OAuthSession

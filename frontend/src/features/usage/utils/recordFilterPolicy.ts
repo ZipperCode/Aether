@@ -1,6 +1,7 @@
 import type { FilterStatusValue } from '../types'
 
 export function isUserLocalOnlyRecordStatus(status: FilterStatusValue): boolean {
+  // 跳过候选已由用户接口先筛选再分页，重试和转移保持现有的本地筛选。
   return status === 'has_retry' || status === 'has_fallback'
 }
 

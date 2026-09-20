@@ -6,6 +6,7 @@ import {
   mergeUsageRecordFirstByteTimeMs,
   mergeUsageRecordLifecycleSnapshot,
   mergeUsageRecordResponseTiming,
+  mergeUsageRecordSkippedCandidates,
   syncUsageRecordStreamResolution,
 } from '../recordSync'
 
@@ -25,6 +26,23 @@ function buildUsageRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
     ...overrides,
   }
 }
+
+describe('mergeUsageRecordSkippedCandidates', () => {
+  it('retains skip facts across sparse polling and deduplicates newly observed reasons', () => {
+    const observed = { has_skipped_candidate: true, skipped_candidate_reasons: ['key_rpm_exhausted'] }
+    expect(mergeUsageRecordSkippedCandidates({}, { has_skipped_candidate: true })).toEqual({
+      has_skipped_candidate: true,
+      skipped_candidate_reasons: [],
+    })
+    expect(mergeUsageRecordSkippedCandidates(observed, { has_skipped_candidate: false })).toEqual(observed)
+    expect(mergeUsageRecordSkippedCandidates(observed, {
+      skipped_candidate_reasons: ['key_rpm_exhausted', 'provider_inactive'],
+    })).toEqual({
+      has_skipped_candidate: true,
+      skipped_candidate_reasons: ['key_rpm_exhausted', 'provider_inactive'],
+    })
+  })
+})
 
 describe('syncUsageRecordStreamResolution', () => {
   it('updates the matching row with resolved client and upstream stream modes', () => {

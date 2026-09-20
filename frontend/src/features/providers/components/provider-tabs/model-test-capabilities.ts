@@ -47,10 +47,12 @@ const MODEL_TEST_OAUTH_INHERITS_PROVIDER_FORMATS = new Set([
   'vertex_ai',
   'antigravity',
   'kiro',
+  'xai',
 ])
 
 const MODEL_TEST_BEARER_INHERITS_PROVIDER_FORMATS = new Set([
   'chatgpt_web',
+  'xai',
 ])
 
 const MODEL_CAPABILITY_TEXT_API_FORMATS = new Set([

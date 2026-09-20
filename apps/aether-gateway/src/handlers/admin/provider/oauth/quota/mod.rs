@@ -9,3 +9,4 @@ pub(crate) mod nous;
 pub(crate) mod official_balance;
 pub(crate) mod shared;
 pub(crate) mod windsurf;
+pub(crate) mod xai;

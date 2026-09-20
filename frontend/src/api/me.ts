@@ -101,6 +101,7 @@ export interface UsageRecordDetail {
   cache_read_price_per_1m?: number
   price_per_request?: number  // 按次计费价格
   has_fallback?: boolean
+  has_skipped_candidate?: boolean
   api_key?: {
     id: string
     name: string
@@ -391,6 +392,7 @@ export const meApi = {
       client_is_stream?: boolean | null
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
+      has_skipped_candidate?: boolean | null
       target_model?: string | null
       request_type?: string | null
       requested_reasoning_effort?: string | null
@@ -437,6 +439,7 @@ export const meApi = {
       client_is_stream?: boolean | null
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
+      has_skipped_candidate?: boolean | null
       target_model?: string | null
       request_type?: string | null
       requested_reasoning_effort?: string | null

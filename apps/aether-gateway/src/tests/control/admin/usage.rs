@@ -1444,7 +1444,16 @@ async fn gateway_handles_admin_usage_active_locally_with_trusted_admin_principal
             .with_data_state_for_tests(
                 GatewayDataState::with_usage_reader_for_tests(usage_repository)
                     .with_provider_catalog_reader(provider_catalog_repository)
-                    .with_auth_api_key_reader(auth_repository),
+                    .with_auth_api_key_reader(auth_repository)
+                    .with_request_candidate_reader(Arc::new(
+                        InMemoryRequestCandidateRepository::seed([sample_request_candidate(
+                            "candidate-pending-skipped",
+                            "req-pending",
+                            0,
+                            0,
+                            RequestCandidateStatus::Skipped,
+                        )]),
+                    )),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -1465,6 +1474,23 @@ async fn gateway_handles_admin_usage_active_locally_with_trusted_admin_principal
     assert_eq!(payload["requests"][0]["provider"], "OpenAI");
     assert_eq!(payload["requests"][0]["api_key_name"], "fresh-primary");
     assert_eq!(payload["requests"][0]["has_fallback"], true);
+    assert_eq!(payload["requests"][0]["has_skipped_candidate"], true);
+    assert_eq!(
+        payload["requests"][0]["skipped_candidate_reasons"],
+        json!([])
+    );
+    let list_response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/records?start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0&status=has_skipped_candidate&limit=10&offset=0"
+    )))
+    .send()
+    .await
+    .expect("filtered list request should succeed");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list: serde_json::Value = list_response.json().await.expect("list JSON should parse");
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["records"][0]["id"], "usage-pending");
+    assert_eq!(list["records"][0]["has_skipped_candidate"], true);
+    assert_eq!(list["records"][0]["skipped_candidate_reasons"], json!([]));
     assert_eq!(
         payload["requests"][0]["provider_key_name"],
         "upstream-primary"
