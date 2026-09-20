@@ -38,6 +38,10 @@
 
 PASS: affected-package `cargo clippy --locked --offline --lib --tests --no-deps -- -D warnings` completed with exit 0 in 8m43s on the final source. It covers gateway, formats, data contracts/runtime/PostgreSQL, admin, usage runtime, provider Pool/transport, OAuth, video-task core, model-fetch and testkit. `research/rust-clippy-final.log` is the local raw log. All identified integration failures are fixed; no required code or validation work remains before committing and integrating the verified tree.
 
+## Delivery
+
+Product merge commit `377ca367f362577688974918f9fc6470e4bc33cb` has the original master and exact upstream main as parents. Original `D:/Project/GitHub/Aether` was fast-forwarded to this commit after verifying its baseline and clean worktree; both original local commits and upstream ancestry are retained. Subsequent commits only archive this task and record the session. No remote push or deployment occurred.
+
 ## Corrected validation findings
 
 - A new grounding test initially omitted the `compact` argument to Responses `to_raw`; supplied `false`.
