@@ -569,6 +569,9 @@ const ADMIN_POOL_KEY_SETTING_FIELDS: &[&str] = &[
     "is_active",
     "note",
     "proxy_node_id",
+    "auto_fetch_models",
+    "model_include_patterns",
+    "model_exclude_patterns",
 ];
 
 fn admin_pool_settings_object(payload: &Value) -> Result<&Map<String, Value>, String> {
@@ -638,7 +641,51 @@ pub fn validate_admin_pool_key_settings_payload(payload: &Value) -> Result<(), S
     {
         return Err("proxy_node_id must be a string or null".to_string());
     }
+    if settings
+        .get("auto_fetch_models")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("auto_fetch_models must be a boolean".to_string());
+    }
+    for field in ["model_include_patterns", "model_exclude_patterns"] {
+        if settings
+            .get(field)
+            .is_some_and(|value| !admin_pool_setting_patterns_valid(value))
+        {
+            return Err(format!("{field} must be an array of strings or null"));
+        }
+    }
     Ok(())
+}
+
+fn admin_pool_setting_patterns_valid(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(items) => items.iter().all(Value::is_string),
+        _ => false,
+    }
+}
+
+fn apply_admin_pool_key_pattern_setting(
+    slot: &mut Option<Value>,
+    settings: &Map<String, Value>,
+    field: &str,
+) {
+    match settings.get(field) {
+        None => {}
+        Some(Value::Null) => *slot = None,
+        Some(Value::Array(items)) => {
+            let mut seen = std::collections::BTreeSet::new();
+            let normalized = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && seen.insert((*value).to_string()))
+                .collect::<Vec<_>>();
+            *slot = (!normalized.is_empty()).then(|| json!(normalized));
+        }
+        Some(_) => {}
+    }
 }
 
 pub fn apply_admin_pool_key_settings(
@@ -688,6 +735,19 @@ pub fn apply_admin_pool_key_settings(
             admin_pool_key_proxy_value(value.as_str())
         };
     }
+    if let Some(value) = settings.get("auto_fetch_models").and_then(Value::as_bool) {
+        key.auto_fetch_models = value;
+    }
+    apply_admin_pool_key_pattern_setting(
+        &mut key.model_include_patterns,
+        settings,
+        "model_include_patterns",
+    );
+    apply_admin_pool_key_pattern_setting(
+        &mut key.model_exclude_patterns,
+        settings,
+        "model_exclude_patterns",
+    );
     Ok(())
 }
 
@@ -1158,6 +1218,75 @@ mod tests {
     }
 
     #[test]
+    fn validates_and_applies_auto_fetch_models_settings() {
+        let settings = json!({
+            "auto_fetch_models": true,
+            "model_include_patterns": [" gpt-* ", "gpt-*", ""],
+            "model_exclude_patterns": ["*-beta"]
+        });
+        let mut key = sample_key(None);
+        assert!(!key.auto_fetch_models);
+
+        validate_admin_pool_key_settings_payload(&settings).expect("settings should validate");
+        apply_admin_pool_key_settings(&mut key, &settings).expect("settings should apply");
+
+        assert!(key.auto_fetch_models);
+        assert_eq!(key.model_include_patterns, Some(json!(["gpt-*"])));
+        assert_eq!(key.model_exclude_patterns, Some(json!(["*-beta"])));
+
+        // null 清空规则；关闭开关后仍可保留字段语义
+        apply_admin_pool_key_settings(
+            &mut key,
+            &json!({
+                "auto_fetch_models": false,
+                "model_include_patterns": null
+            }),
+        )
+        .expect("settings should apply");
+        assert!(!key.auto_fetch_models);
+        assert_eq!(key.model_include_patterns, None);
+        // 未提供的排除规则保持不变
+        assert_eq!(key.model_exclude_patterns, Some(json!(["*-beta"])));
+
+        assert!(validate_admin_pool_key_settings_payload(&json!({
+            "auto_fetch_models": "yes"
+        }))
+        .is_err());
+        assert!(validate_admin_pool_key_settings_payload(&json!({
+            "model_include_patterns": ["gpt-*", 1]
+        }))
+        .is_err());
+        assert!(validate_admin_pool_key_settings_payload(&json!({
+            "model_exclude_patterns": "gpt-*"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn batch_import_key_record_persists_auto_fetch_models_settings() {
+        let record = build_admin_pool_batch_import_key_record(
+            "key-import-1".to_string(),
+            "provider-1".to_string(),
+            "batch key".to_string(),
+            "api_key".to_string(),
+            vec!["openai:chat".to_string()],
+            "encrypted-secret".to_string(),
+            None,
+            Some(&json!({
+                "auto_fetch_models": true,
+                "model_include_patterns": ["gpt-*"],
+                "model_exclude_patterns": ["*-beta"]
+            })),
+            100,
+        )
+        .expect("record should build");
+
+        assert!(record.auto_fetch_models);
+        assert_eq!(record.model_include_patterns, Some(json!(["gpt-*"])));
+        assert_eq!(record.model_exclude_patterns, Some(json!(["*-beta"])));
+    }
+
+    #[test]
     fn builds_update_settings_action_plan() {
         let settings = json!({ "rpm_limit": null, "proxy_node_id": "proxy-1" });
         let plan = build_admin_pool_batch_action_plan(AdminPoolBatchActionRequest {
@@ -1434,11 +1563,13 @@ pub fn build_admin_pool_batch_import_result_payload(
     imported: usize,
     skipped: usize,
     errors: Vec<Value>,
+    model_sync: Value,
 ) -> Value {
     json!({
         "imported": imported,
         "skipped": skipped,
         "errors": errors,
+        "model_sync": model_sync,
     })
 }
 

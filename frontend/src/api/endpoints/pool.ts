@@ -447,6 +447,11 @@ export interface PoolKeyBatchUpdateResponse {
 
 export interface PoolKeySettingsPatch extends PoolKeySharedSettingsPatch {
   proxy_node_id?: string | null
+  /** 自动获取上游可用模型；导入时写入每个新 Key。 */
+  auto_fetch_models?: boolean
+  /** 自动获取的包含/排除规则（通配符）；null 表示清空。 */
+  model_include_patterns?: string[] | null
+  model_exclude_patterns?: string[] | null
 }
 
 export interface PoolBatchImportRequest {
@@ -465,6 +470,8 @@ export interface PoolBatchImportResult {
   imported: number
   skipped: number
   errors: Array<{ index: number; reason: string }>
+  /** 开启自动获取模型的 Key 导入后的同步抓取摘要；未触发时为 null。 */
+  model_sync?: PoolKeyBatchModelSyncResult | null
 }
 
 interface PoolReadOptions {

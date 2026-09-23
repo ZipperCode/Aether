@@ -697,9 +697,14 @@ fn preserves_client_context_headers_and_enforces_codex_provider_identity() {
         headers.get("x-client-request-id"),
         Some(&"kept-by-rule-request".to_string())
     );
+    // 显式写入的 User-Agent（header rules / auth-config 覆盖）优先于来路值，
+    // 不再被内置 codex_cli_rs 标识覆盖；originator 仍强制为 codex 身份。
     assert_eq!(
-        headers.get("user-agent").map(String::as_str),
-        Some(aether_ai_formats::CODEX_CLIENT_USER_AGENT)
+        headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, value)| value.as_str()),
+        Some("AsyncOpenAI/Python 2.44.0")
     );
     assert_eq!(headers.get("originator"), Some(&"codex_cli_rs".to_string()));
     assert_eq!(

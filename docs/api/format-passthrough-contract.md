@@ -1,6 +1,6 @@
 # Format Passthrough Contract
 
-Last audited: 2026-08-28
+Last audited: 2026-09-23
 
 This document defines the boundary between runtime passthrough, canonical roundtrip tests, and cross-format conversion.
 
@@ -54,6 +54,20 @@ Required behavior:
 - Fail closed with `FormatError::UnauditedField`, `FormatError::LossyConversionBlocked`, `FormatError::UnsupportedField`, `FormatError::InvalidEnumValue`, or `FormatError::InvalidTargetField` when no lossless mapping exists.
 - Do not use `None` or silent omission to represent conversion failure.
 - Newly added provider fields follow the same rule as other unknown fields: preserve same-format, fail closed cross-format with `UnauditedField`. A code change is required only when Aether intentionally supports a new cross-format semantic mapping.
+
+### 运行时转换与纯转换的一致性
+
+`convert_request` 和 `convert_request_pure_with_context` 共用 `validate_cross_format_request_contract`。运行时先执行已有历史展开，再审计规范化后的请求；模型映射、传输流策略与明确的内部投影标记不应被误判为未知业务字段。embedding/rerank 保持各自校验分支，同格式不进入跨格式字段审计。
+
+- Responses 的 `moderation`、`context_management` 等字段没有目标映射时，运行时同样必须返回明确的转换错误，不能成功后删字段。
+- Anthropic 原生服务端工具必须有明确的跨格式实现；不能仅因为带有 `name` 就降级为普通函数。`web_fetch_20250910` 即使没有 `max_uses`，也必须拒绝无损转换；普通自定义函数和已实现的工具映射不受影响。
+- Provider 的签名、加密推理状态不可仅凭同为字符串就互换；不以放宽安全门的方式让旧有损转换测试通过。
+
+### Gemini 流式函数调用
+
+跨格式回写 Gemini 时，canonical parser 保留实际函数名，不补造 `unknown`。函数名或参数分片尚未到齐可缓冲；终态仍缺失/空白函数名，或非空参数不是完整 JSON 对象时，返回 `AiSurfaceFinalizeError`。错误信息仅包含索引和原因，不包含原始工具参数。
+
+明确结束的合法无参数调用可输出 `args: {}`；截断参数不能伪造成 `{}`。发生转换错误后不得继续补发调用或正常 `STOP`。原生同格式流仍执行原有透传合同。
 
 ## Pure Conversion Interface
 

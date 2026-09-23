@@ -432,6 +432,7 @@ impl OpenAIChatProviderState {
                 if let Some(usage) = Self::finish_usage(chunk_object.get("usage")) {
                     self.ensure_started(report_context, &mut out);
                     let (id, model) = self.identity(report_context);
+                    self.flush_unstarted_tool_calls(&id, &model, &mut out);
                     out.push(CanonicalStreamFrame {
                         id,
                         model,
@@ -453,6 +454,45 @@ impl OpenAIChatProviderState {
         Ok(out)
     }
 
+    /// 终态仍未取得函数名的调用：canonical 保留空名补发 start 与已累积参数，
+    /// 不再静默丢弃；由目标客户端 emitter 在终态统一决定拒绝或透传。
+    fn flush_unstarted_tool_calls(
+        &mut self,
+        id: &str,
+        model: &str,
+        out: &mut Vec<CanonicalStreamFrame>,
+    ) {
+        for (index, state) in &mut self.tool_calls {
+            if state.started_emitted {
+                continue;
+            }
+            out.push(CanonicalStreamFrame {
+                id: id.to_string(),
+                model: model.to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: *index,
+                    call_id: state
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| build_generated_tool_call_id(*index)),
+                    name: state.name.clone().unwrap_or_default(),
+                },
+            });
+            state.started_emitted = true;
+            let pending = std::mem::take(&mut state.pending_arguments);
+            if !pending.is_empty() {
+                out.push(CanonicalStreamFrame {
+                    id: id.to_string(),
+                    model: model.to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: *index,
+                        arguments: pending,
+                    },
+                });
+            }
+        }
+    }
+
     pub fn finish(
         &mut self,
         report_context: &Value,
@@ -462,14 +502,17 @@ impl OpenAIChatProviderState {
         }
         self.finished = true;
         let (id, model) = self.identity(report_context);
-        Ok(vec![CanonicalStreamFrame {
+        let mut out = Vec::new();
+        self.flush_unstarted_tool_calls(&id, &model, &mut out);
+        out.push(CanonicalStreamFrame {
             id,
             model,
             event: CanonicalStreamEvent::Finish {
                 finish_reason: self.pending_finish_reason.take(),
                 usage: None,
             },
-        }])
+        });
+        Ok(out)
     }
 }
 
@@ -2191,6 +2234,7 @@ impl OpenAIResponsesProviderState {
                 self.emit_response_output_items(report_context, &mut out, response);
                 self.emit_agent_bridge_reasoning_fallbacks(report_context, &mut out, value);
 
+                self.flush_unstarted_tool_calls(&id, &model, &mut out);
                 out.push(CanonicalStreamFrame {
                     id,
                     model,
@@ -2247,6 +2291,7 @@ impl OpenAIResponsesProviderState {
                 } else {
                     Some("tool_calls".to_string())
                 };
+                self.flush_unstarted_tool_calls(&id, &model, &mut out);
                 out.push(CanonicalStreamFrame {
                     id,
                     model,
@@ -2265,6 +2310,58 @@ impl OpenAIResponsesProviderState {
         Ok(out)
     }
 
+    /// 终态仍未取得函数名的调用：canonical 保留空名补发 start 与剩余参数，
+    /// 不再静默丢弃；由目标客户端 emitter 在终态统一决定拒绝或透传。
+    fn flush_unstarted_tool_calls(
+        &mut self,
+        id: &str,
+        model: &str,
+        out: &mut Vec<CanonicalStreamFrame>,
+    ) {
+        if self.terminal_only {
+            return;
+        }
+        for (index, state) in &mut self.tool_calls {
+            if state.started_emitted {
+                continue;
+            }
+            out.push(CanonicalStreamFrame {
+                id: id.to_string(),
+                model: model.to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: *index,
+                    call_id: if state.call_id.is_empty() {
+                        build_generated_tool_call_id(*index)
+                    } else {
+                        state.call_id.clone()
+                    },
+                    name: state.name.clone(),
+                },
+            });
+            state.started_emitted = true;
+            if state.emitted_arguments_len > state.arguments.len() {
+                state.emitted_arguments_len = 0;
+            }
+            let pending = state
+                .arguments
+                .get(state.emitted_arguments_len..)
+                .unwrap_or_default()
+                .to_string();
+            if pending.is_empty() {
+                continue;
+            }
+            state.emitted_arguments_len = state.arguments.len();
+            out.push(CanonicalStreamFrame {
+                id: id.to_string(),
+                model: model.to_string(),
+                event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: *index,
+                    arguments: pending,
+                },
+            });
+        }
+    }
+
     pub fn finish(
         &mut self,
         report_context: &Value,
@@ -2279,14 +2376,17 @@ impl OpenAIResponsesProviderState {
         } else {
             Some("tool_calls".to_string())
         };
-        Ok(vec![CanonicalStreamFrame {
+        let mut out = Vec::new();
+        self.flush_unstarted_tool_calls(&id, &model, &mut out);
+        out.push(CanonicalStreamFrame {
             id,
             model,
             event: CanonicalStreamEvent::Finish {
                 finish_reason,
                 usage: None,
             },
-        }])
+        });
+        Ok(out)
     }
 }
 
@@ -4384,10 +4484,22 @@ mod tests {
             assert_no_responses_observation_content(&observed);
         }
         assert_eq!(unknowns, 4);
-        assert_eq!(
-            observed.finish(&context).unwrap(),
-            full.finish(&context).unwrap()
-        );
+        let observed_finish = observed.finish(&context).unwrap();
+        let full_finish = full.finish(&context).unwrap();
+        // 新契约：完整态在终态补发从未 start 的调用（canonical 保留身份与参数，
+        // 不再静默丢弃）；观察态保持零内容帧，仅产出终态帧。
+        assert_eq!(full_finish.len(), 3);
+        assert!(matches!(
+            &full_finish[0].event,
+            CanonicalStreamEvent::ToolCallStart { index, call_id, name }
+                if *index == 7 && call_id == "call_auto_7" && name == "ordinary"
+        ));
+        assert!(matches!(
+            &full_finish[1].event,
+            CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments }
+                if *index == 7 && arguments == "{}"
+        ));
+        assert_eq!(observed_finish, vec![full_finish[2].clone()]);
     }
 
     #[test]

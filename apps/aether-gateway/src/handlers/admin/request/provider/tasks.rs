@@ -210,6 +210,7 @@ impl<'a> AdminAppState<'a> {
         let mut imported = 0usize;
         let skipped = 0usize;
         let mut errors = Vec::new();
+        let mut model_fetch_key_ids = BTreeSet::new();
         let now_unix_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -330,7 +331,7 @@ impl<'a> AdminAppState<'a> {
                     continue;
                 }
             };
-            let Some(_) = self.create_provider_catalog_key(&record).await? else {
+            let Some(created) = self.create_provider_catalog_key(&record).await? else {
                 return Ok((
                     http::StatusCode::SERVICE_UNAVAILABLE,
                     Json(
@@ -339,14 +340,41 @@ impl<'a> AdminAppState<'a> {
                 )
                     .into_response());
             };
+            if created.auto_fetch_models {
+                model_fetch_key_ids.insert(created.id.clone());
+            }
             known_names.insert(name.to_string());
             known_api_keys.insert(api_key.to_string());
             imported += 1;
         }
 
+        // 与单 Key 创建和批量设置更新保持一致：导入完成后立即抓取开启了
+        // 自动获取模型的 Key。抓取失败不回滚导入，由后台定时任务重试。
+        let model_sync = if model_fetch_key_ids.is_empty() {
+            serde_json::Value::Null
+        } else {
+            let requested = model_fetch_key_ids.len();
+            match crate::model_fetch::perform_model_fetch_for_keys(
+                self.as_ref(),
+                &provider.id,
+                &model_fetch_key_ids,
+            )
+            .await
+            {
+                Ok(summary) => json!({
+                    "requested": requested,
+                    "attempted": summary.attempted,
+                    "succeeded": summary.succeeded,
+                    "failed": summary.failed,
+                    "skipped": summary.skipped,
+                }),
+                Err(_) => build_model_sync_failure_payload(requested),
+            }
+        };
+
         Ok(Json(
             admin_provider_pool_pure::build_admin_pool_batch_import_result_payload(
-                imported, skipped, errors,
+                imported, skipped, errors, model_sync,
             ),
         )
         .into_response())

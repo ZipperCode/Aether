@@ -36,8 +36,8 @@ const CODEX_OPENAI_RESPONSES_COMPACT_BODY_FIELDS: &[&str] = &[
     "prompt_cache_key",
     "text",
 ];
-pub const CODEX_CLIENT_VERSION: &str = "0.153.4";
-pub const CODEX_CLIENT_USER_AGENT: &str = "codex_cli_rs/0.153.4";
+pub const CODEX_CLIENT_VERSION: &str = "0.154.0";
+pub const CODEX_CLIENT_USER_AGENT: &str = "codex_cli_rs/0.154.0";
 pub const CODEX_CLIENT_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_OPENAI_IMAGE_INTERNAL_MODEL: &str = "gpt-5.4-mini";
 pub const CODEX_OPENAI_IMAGE_DEFAULT_MODEL: &str = "gpt-image-2";
@@ -2117,6 +2117,7 @@ pub fn apply_codex_openai_responses_lite_header_for_request_body_with_capabiliti
 }
 
 /// 应用 Codex 专用非凭据请求头；账号身份只从已解密 auth-config 投影，禁止信任客户端伪造值。
+/// User-Agent 透传来路客户端值（经透传收集或显式规则写入），仅在缺失时回退内置标识。
 pub fn apply_codex_openai_special_headers(
     provider_request_headers: &mut BTreeMap<String, String>,
     provider_request_body: &Value,
@@ -2142,11 +2143,21 @@ pub fn apply_codex_openai_special_headers(
         provider_request_headers.insert("x-openai-fedramp".to_string(), "true".to_string());
     }
 
-    set_codex_client_header(
-        provider_request_headers,
-        "user-agent",
-        CODEX_CLIENT_USER_AGENT,
-    );
+    // 透传来路 User-Agent：来路请求头经透传收集、管理员 header rules set 或
+    // auth-config overrides 写入的非空值优先保留；仅在没有非空值时回退到内置
+    // Codex CLI 标识。该身份层运行于 header rules 之后且无规则上下文，无法
+    // 区分"未提供"与"被 drop 规则显式删除"，与原先无条件覆盖一致，被移除
+    // 后仍会得到回退值（remove 语义维持既有行为，不在本次扩展）。
+    let has_existing_user_agent = provider_request_headers.iter().any(|(name, value)| {
+        name.trim().eq_ignore_ascii_case("user-agent") && !value.trim().is_empty()
+    });
+    if !has_existing_user_agent {
+        set_codex_client_header(
+            provider_request_headers,
+            "user-agent",
+            CODEX_CLIENT_USER_AGENT,
+        );
+    }
     set_codex_client_header(
         provider_request_headers,
         "originator",
@@ -2219,6 +2230,90 @@ mod tests {
         assert_eq!(
             CODEX_CLIENT_USER_AGENT,
             format!("{CODEX_CLIENT_ORIGINATOR}/{CODEX_CLIENT_VERSION}")
+        );
+    }
+
+    #[test]
+    fn codex_user_agent_keeps_incoming_client_version() {
+        // 真实链路里来路请求头先经透传收集写入 provider_request_headers，
+        // 这里直接预置来路副本验证 Codex 身份层不再覆盖较新的客户端版本。
+        let mut headers = std::collections::BTreeMap::from([(
+            "user-agent".to_string(),
+            "codex_cli_rs/0.250.0".to_string(),
+        )]);
+
+        apply_codex_openai_special_headers(
+            &mut headers,
+            &json!({"model": "gpt-5.6-sol", "input": []}),
+            &http::HeaderMap::new(),
+            "codex",
+            "openai:responses",
+            Some("trace-user-agent-passthrough"),
+            None,
+        );
+
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("codex_cli_rs/0.250.0")
+        );
+        assert_eq!(
+            headers.get("originator").map(String::as_str),
+            Some(CODEX_CLIENT_ORIGINATOR)
+        );
+    }
+
+    #[test]
+    fn codex_user_agent_keeps_explicit_value_over_passthrough_copy() {
+        // 管理员 header rules set / auth-config overrides 写入的值（含大小写
+        // 不同的键）优先于一切，且不得产生重复 user-agent 头。
+        let mut headers = std::collections::BTreeMap::from([(
+            "User-Agent".to_string(),
+            "configured-agent/1.0".to_string(),
+        )]);
+
+        apply_codex_openai_special_headers(
+            &mut headers,
+            &json!({"model": "gpt-5.6-sol", "input": []}),
+            &http::HeaderMap::new(),
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                .map(|(_, value)| value.as_str()),
+            Some("configured-agent/1.0")
+        );
+        assert_eq!(
+            headers
+                .keys()
+                .filter(|name| name.eq_ignore_ascii_case("user-agent"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn codex_user_agent_falls_back_to_bundled_client_when_missing() {
+        let mut headers = std::collections::BTreeMap::new();
+
+        apply_codex_openai_special_headers(
+            &mut headers,
+            &json!({"model": "gpt-5.6-sol", "input": []}),
+            &http::HeaderMap::new(),
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some(CODEX_CLIENT_USER_AGENT)
         );
     }
 

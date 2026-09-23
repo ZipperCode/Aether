@@ -10,6 +10,7 @@ use crate::formats::{
     jina,
     openai::{self, chat as openai_chat, responses as openai_responses},
 };
+use crate::protocol::canonical::AETHER_AGENT_BRIDGE_PROMPT_CACHE_BREAKPOINT_FIELD;
 use crate::protocol::canonical::{
     audit_gemini_cross_format_response_part, claude_text_citations_to_openai_annotations,
     gemini_candidate_to_openai_url_annotations, CanonicalContentBlock, CanonicalEmbeddingInput,
@@ -262,6 +263,9 @@ fn is_openai_responses_additional_tools_item(value: &Value) -> bool {
 }
 
 /// 校验运行时转换的格式、模型和扩展边界；任何不可表达的实质语义均 fail closed。
+/// 跨格式部分与 pure 共用同一套审计核心：本函数只在运行时独有的
+/// previous_response 历史展开与模型映射边界之后，对已规范化的 body 执行
+/// 与 pure 完全一致的拒绝规则，避免 runtime 静默丢弃 pure 会拒绝的字段。
 fn validate_runtime_request_conversion(
     source: FormatId,
     target: FormatId,
@@ -270,138 +274,19 @@ fn validate_runtime_request_conversion(
     mapped_model: Option<&str>,
 ) -> Result<(), FormatError> {
     validate_gemini_mixed_tool_model(source, target, request, mapped_model)?;
-    validate_openai_cross_format_store(source, target, body)?;
     validate_openai_prompt_cache_contract(source, body, mapped_model)?;
     validate_openai_reasoning_effort(source, target, body, mapped_model)?;
-    validate_openai_responses_cross_format_input(source, target, body)?;
     validate_openai_responses_runtime_reasoning(source, target, body)?;
-    if source != target {
-        match source {
-            FormatId::ClaudeMessages => {
-                validate_runtime_claude_latest_cross_format_fields(body, target)?
-            }
-            FormatId::GeminiGenerateContent => {
-                validate_runtime_gemini_latest_cross_format_fields(body, target)?
-            }
-            _ => {}
-        }
+    if source == target {
+        return Ok(());
     }
-    validate_openai_responses_namespace_tools_to_chat(source, target, request)?;
-    if matches!(source, FormatId::OpenAiChat)
-        && matches!(
-            target,
-            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
-        )
-        && body
-            .as_object()
-            .is_some_and(openai_chat_request_has_unsupported_responses_cache_breakpoint)
-    {
-        return Err(FormatError::LossyConversionBlocked {
-            source_format: source.as_str().to_string(),
-            target_format: target.as_str().to_string(),
-            field: "messages[].content[].prompt_cache_breakpoint".to_string(),
-            reason: "OpenAI Responses supports prompt cache breakpoints only on input_text, input_image, and input_file blocks".to_string(),
-        });
+    if is_embedding_format(source) || is_embedding_format(target) {
+        return validate_embedding_request_conversion(source, target, request);
     }
-    if source == FormatId::ClaudeMessages {
-        match target {
-            FormatId::OpenAiChat
-                if claude_request_contains_unrepresentable_tool_result_content_for_openai_chat(
-                    body,
-                ) =>
-            {
-                return Err(FormatError::LossyConversionBlocked {
-                    source_format: source.as_str().to_string(),
-                    target_format: target.as_str().to_string(),
-                    field: "messages[].content[].tool_result.content".to_string(),
-                    reason: "OpenAI Chat tool messages cannot represent one or more Claude tool_result content blocks".to_string(),
-                });
-            }
-            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
-                if claude_request_contains_unrepresentable_tool_result_content_for_openai_responses(
-                    body,
-                ) =>
-            {
-                return Err(FormatError::LossyConversionBlocked {
-                    source_format: source.as_str().to_string(),
-                    target_format: target.as_str().to_string(),
-                    field: "messages[].content[].tool_result.content".to_string(),
-                    reason: "OpenAI Responses function_call_output cannot represent one or more Claude tool_result content blocks".to_string(),
-                });
-            }
-            _ => {}
-        }
+    if is_rerank_format(source) || is_rerank_format(target) {
+        return validate_rerank_request_conversion(source, target, request);
     }
-    Ok(())
-}
-
-fn validate_runtime_claude_latest_cross_format_fields(
-    body: &Value,
-    target: FormatId,
-) -> Result<(), FormatError> {
-    if let Some(output_effort) = body
-        .get("output_config")
-        .and_then(Value::as_object)
-        .and_then(|output_config| output_config.get("effort"))
-    {
-        validate_claude_output_effort_value(output_effort)?;
-    }
-    validate_claude_output_config_cross_format(body, target)?;
-    if body
-        .get("thinking")
-        .and_then(Value::as_object)
-        .and_then(|thinking| thinking.get("type"))
-        .and_then(Value::as_str)
-        .is_some_and(|value| value.eq_ignore_ascii_case("adaptive"))
-        && body
-            .get("output_config")
-            .and_then(Value::as_object)
-            .and_then(|output_config| output_config.get("effort"))
-            .filter(|value| !value.is_null())
-            .is_none()
-    {
-        return Err(FormatError::LossyConversionBlocked {
-            source_format: FormatId::ClaudeMessages.as_str().to_string(),
-            target_format: target.as_str().to_string(),
-            field: "thinking.type".to_string(),
-            reason: "adaptive Claude thinking has no lossless cross-format effort without output_config.effort".to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn validate_runtime_gemini_latest_cross_format_fields(
-    body: &Value,
-    target: FormatId,
-) -> Result<(), FormatError> {
-    validate_gemini_extended_function_responses(body, target)?;
-    if let Some(thinking_config) = body
-        .as_object()
-        .and_then(|object| object_by_case(object, "generationConfig", "generation_config"))
-        .and_then(|generation_config| {
-            object_by_case(generation_config, "thinkingConfig", "thinking_config")
-        })
-    {
-        validate_gemini_cross_format_thinking_config(thinking_config, target)?;
-    }
-    for (camel, snake) in [
-        ("computerUse", "computer_use"),
-        ("fileSearch", "file_search"),
-        ("googleMaps", "google_maps"),
-        ("mcpServers", "mcp_servers"),
-    ] {
-        if gemini_request_contains_builtin_tool(body, camel, snake) {
-            return Err(FormatError::LossyConversionBlocked {
-                source_format: FormatId::GeminiGenerateContent.as_str().to_string(),
-                target_format: target.as_str().to_string(),
-                field: format!("tools[].{camel}"),
-                reason: format!(
-                    "target format has no audited lossless equivalent for Gemini {camel}"
-                ),
-            });
-        }
-    }
-    Ok(())
+    validate_cross_format_request_contract(source, target, body, request)
 }
 
 fn validate_openai_responses_target_contract(
@@ -651,6 +536,21 @@ fn validate_request_conversion(
     if is_rerank_format(source) || is_rerank_format(target) {
         return validate_rerank_request_conversion(source, target, request);
     }
+    validate_cross_format_request_contract(source, target, body, request)
+}
+
+/// 跨格式请求的共享审计核心：pure 与 runtime 在各自完成
+/// （pure 的默认上下文 / runtime 的 previous_response 展开与规范化之后）
+/// 都必须在已规范化的 body 与 canonical 边界执行同一套字段与扩展白名单，
+/// 保证两条路径对未映射语义给出相同的 fail-closed 拒绝，
+/// 避免 runtime 静默丢弃 pure 会拒绝的实质语义。
+fn validate_cross_format_request_contract(
+    source: FormatId,
+    target: FormatId,
+    body: &Value,
+    request: &CanonicalRequest,
+) -> Result<(), FormatError> {
+    validate_cross_format_tool_use_names(source, target, request)?;
     validate_known_standard_request_root_fields(source, target, body)?;
     validate_openai_responses_cross_format_input(source, target, body)?;
     validate_cross_format_generation_target(source, target, request)?;
@@ -699,6 +599,33 @@ fn validate_gemini_mixed_tool_model(
         reason: format!(
             "model {target_model:?} does not support combining built-in tools with custom function declarations; use a Gemini 3 model"
         ),
+    })
+}
+
+/// 跨格式发往 Gemini 时拒绝空函数名：Gemini functionCall 的 name 必填，
+/// 发射侧不会为无名调用合成伪名，也不得发出 `name: ""` 的非法 part。
+fn validate_cross_format_tool_use_names(
+    source: FormatId,
+    target: FormatId,
+    request: &CanonicalRequest,
+) -> Result<(), FormatError> {
+    if target != FormatId::GeminiGenerateContent
+        || !request.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    CanonicalContentBlock::ToolUse { name, .. } if name.trim().is_empty()
+                )
+            })
+        })
+    {
+        return Ok(());
+    }
+    Err(FormatError::LossyConversionBlocked {
+        source_format: source.as_str().to_string(),
+        target_format: target.as_str().to_string(),
+        field: "messages[].tool_use.name".to_string(),
+        reason: "Gemini functionCall requires a non-empty function name".to_string(),
     })
 }
 
@@ -2300,11 +2227,31 @@ fn validate_request_extension_namespace(
             });
         };
         for key in object.keys() {
-            if openai_responses_custom_tool_key_is_cross_format_safe(
-                source, target, location, namespace, object, key,
-            ) || request_extension_key_is_cross_format_safe(
-                source, target, location, namespace, key,
-            ) {
+            if openai_stream_options_are_transport_only(source, location, namespace, object, key)
+                || (location == "request"
+                    && matches!(
+                        source,
+                        FormatId::OpenAiChat
+                            | FormatId::OpenAiResponses
+                            | FormatId::OpenAiResponsesCompact
+                    )
+                    && matches!(
+                        target,
+                        FormatId::ClaudeMessages | FormatId::GeminiGenerateContent
+                    )
+                    && matches!(
+                        namespace.as_str(),
+                        "openai" | "openai_responses" | "openai_cli"
+                    )
+                    && key == "store"
+                    && object.get(key).and_then(Value::as_bool) == Some(false))
+                || openai_responses_custom_tool_key_is_cross_format_safe(
+                    source, target, location, namespace, object, key,
+                )
+                || request_extension_key_is_cross_format_safe(
+                    source, target, location, namespace, key,
+                )
+            {
                 continue;
             }
             return Err(FormatError::LossyConversionBlocked {
@@ -2317,6 +2264,41 @@ fn validate_request_extension_namespace(
         }
     }
     Ok(())
+}
+
+/// stream_options 是值容器：仅当其内容恰为已知的传输标志（include_usage 且
+/// 类型为 bool）时才可作为传输侧车跨格式放行——该形态由 Chat 发射器在
+/// upstream 流式时自行合成（force_stream_options）。其余键（如未来的
+/// include_obfuscation 等）可能携带真实语义，一律 fail closed；
+/// Chat→Responses 目标另有 validate_openai_chat_to_responses 的 body 级拒绝。
+fn openai_stream_options_are_transport_only(
+    source: FormatId,
+    location: &str,
+    namespace: &str,
+    extension: &Map<String, Value>,
+    key: &str,
+) -> bool {
+    if location != "request"
+        || key != "stream_options"
+        || !matches!(
+            source,
+            FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+        )
+        || !matches!(namespace, "openai" | "openai_responses" | "openai_cli")
+    {
+        return false;
+    }
+    extension
+        .get("stream_options")
+        .and_then(Value::as_object)
+        .is_some_and(|stream_options| {
+            stream_options
+                .keys()
+                .all(|stream_option_key| stream_option_key == "include_usage")
+                && stream_options
+                    .get("include_usage")
+                    .is_none_or(Value::is_boolean)
+        })
 }
 
 /// 判断 Responses custom 工具扩展字段是否可被 Chat 的 custom 工具结构完整承载。
@@ -2351,6 +2333,42 @@ fn request_extension_key_is_cross_format_safe(
     namespace: &str,
     key: &str,
 ) -> bool {
+    // stream 是传输层标志：跨格式转换后由 stream policy 层
+    // （enforce_request_body_stream_field）按 upstream_is_stream 统一收口，
+    // 各目标发射器均从传输上下文而非该扩展推导最终值，不携带需审计的语义
+    // 负载。stream_options 是值容器，不在此按键放行——仅在
+    // validate_request_extension_namespace 中对内容恰为已知传输标志
+    // （include_usage: bool）的对象做值级放行（见
+    // openai_stream_options_are_transport_only），其余键维持 fail closed。
+    if location == "request"
+        && matches!(
+            source,
+            FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+        )
+        && matches!(namespace, "openai" | "openai_responses" | "openai_cli")
+        && key == "stream"
+    {
+        return true;
+    }
+    // 解析器在合成 Thinking 块上写入的内部标记（canonical 侧设置，
+    // 客户端不可注入），响应侧审计同样跳过；Chat 发射器消费它们决定
+    // 是否保留 reasoning_parts / reasoning_content。
+    if location == "messages[].content[]"
+        && namespace == "openai"
+        && matches!(key, "omit_reasoning_parts" | "omit_reasoning_content")
+    {
+        return true;
+    }
+    // Chat 的 reasoning_parts / reasoning_content 是 hop1 发射器自产的中间
+    // 表示（同族回发侧车）：跨格式语义由 canonical Thinking 块完整承载，
+    // Chat 解析器会把 reasoning_content 重建为 Thinking 块。
+    if location == "messages[]"
+        && source == FormatId::OpenAiChat
+        && namespace == "openai"
+        && matches!(key, "reasoning_parts" | "reasoning_content")
+    {
+        return true;
+    }
     if matches!(
         source,
         FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
@@ -2387,6 +2405,22 @@ fn request_extension_key_is_cross_format_safe(
             key,
             "item_id" | "item_type" | "execution" | "status" | "created_by"
         )
+    {
+        return true;
+    }
+    // 仅放行两个确证的内部/provenance 标记到 Gemini：
+    // item_id 由 mapped_namespace_tool_use_extensions 在 Chat 与 Gemini 目标上
+    // 显式剥离（既有合法映射）；item_type 由解析器写入 reasoning Thinking 块
+    // （canonical.rs openai_responses_reasoning_block_from_item），emitter 侧
+    // 丢弃。execution/status/created_by 可能来自客户端原始字段，维持 Chat-only。
+    if location == "messages[].content[]"
+        && matches!(
+            source,
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+        )
+        && target == FormatId::GeminiGenerateContent
+        && matches!(namespace, "openai_responses" | "openai_cli")
+        && matches!(key, "item_id" | "item_type")
     {
         return true;
     }
@@ -2435,6 +2469,13 @@ fn request_extension_key_is_cross_format_safe(
                 | "user"
                 | "verbosity",
         ) | (
+            // Responses ↔ Responses 同族发射器把 verbosity 原样回发到 text.verbosity
+            // （canonical_text_config_to_responses），与 Chat 目标的既有白名单同一映射。
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+            "openai_responses" | "openai_cli",
+            "verbosity",
+        ) | (
             FormatId::OpenAiChat,
             FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
             "openai_responses",
@@ -2462,6 +2503,14 @@ fn request_extension_key_is_cross_format_safe(
             _,
             "claude",
             "context_management" | "output_config",
+        ) | (
+            // agent bridge 把 ephemeral cache_control 投影为显式 prompt cache
+            // breakpoint 标记后，Responses 发射器（insert_prompt_cache_breakpoint）
+            // 消费并转成 prompt_cache_breakpoint 字段；这是已审计的显式转换。
+            FormatId::ClaudeMessages,
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+            "claude",
+            AETHER_AGENT_BRIDGE_PROMPT_CACHE_BREAKPOINT_FIELD,
         ) | (
             FormatId::ClaudeMessages,
             FormatId::OpenAiChat | FormatId::GeminiGenerateContent,
@@ -2528,6 +2577,13 @@ fn thinking_extension_key_is_cross_format_safe(
             "openai",
             "reasoning_effort",
         ) | (
+            // Responses ↔ Responses 同族：effort/summary 原生字段由同一发射器
+            // （to_raw/to_compact 共用）回发，与根字段白名单同一映射。
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+            "openai_responses" | "openai_cli",
+            "effort" | "summary",
+        ) | (
             FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
             FormatId::OpenAiChat | FormatId::ClaudeMessages | FormatId::GeminiGenerateContent,
             "openai_responses" | "openai_cli",
@@ -2543,8 +2599,13 @@ fn thinking_extension_key_is_cross_format_safe(
             "claude",
             "type" | "budget_tokens" | "display" | "output_config",
         ) | (
+            // effort↔budget_tokens 双向映射已由 validate_openai_reasoning_effort 与
+            // canonical thinking 承载；Claude↔Gemini 补齐与 Chat/Responses 相同的对称面。
             FormatId::ClaudeMessages,
-            FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+            FormatId::OpenAiChat
+                | FormatId::OpenAiResponses
+                | FormatId::OpenAiResponsesCompact
+                | FormatId::GeminiGenerateContent,
             "openai",
             "reasoning_effort",
         ) | (
@@ -2558,7 +2619,10 @@ fn thinking_extension_key_is_cross_format_safe(
                 | "schema_field",
         ) | (
             FormatId::GeminiGenerateContent,
-            FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+            FormatId::OpenAiChat
+                | FormatId::OpenAiResponses
+                | FormatId::OpenAiResponsesCompact
+                | FormatId::ClaudeMessages,
             "openai",
             "reasoning_effort",
         )
@@ -2745,11 +2809,27 @@ fn validate_gemini_response_finish_reasons(
             continue;
         }
         if gemini_finish_reason_is_known(normalized.as_str()) {
+            // 终止原因附带的 finishMessage 是 MALFORMED_FUNCTION_CALL 等上游故障的原文诊断，
+            // 与流式路径的 response.failed 透传保持一致，同步错误也保留原文。
+            let reason = match candidate
+                .get("finishMessage")
+                .or_else(|| candidate.get("finish_message"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+            {
+                Some(message) => format!(
+                    "Gemini finishReason {raw:?} has no lossless target finish reason: {message}"
+                ),
+                None => {
+                    format!("Gemini finishReason {raw:?} has no lossless target finish reason")
+                }
+            };
             return Err(FormatError::LossyConversionBlocked {
                 source_format: FormatId::GeminiGenerateContent.as_str().to_string(),
                 target_format: target.as_str().to_string(),
                 field: "candidates[].finishReason".to_string(),
-                reason: format!("Gemini finishReason {raw:?} has no lossless target finish reason"),
+                reason,
             });
         }
         return Err(FormatError::InvalidEnumValue {
@@ -3502,6 +3582,7 @@ fn validate_claude_cross_format_request(body: &Value, target: FormatId) -> Resul
         });
     }
 
+    validate_claude_cross_format_server_tools(body, target)?;
     if let Some(output_effort) = body
         .as_object()
         .and_then(|object| object.get("output_config"))
@@ -3533,7 +3614,13 @@ fn validate_claude_cross_format_request(body: &Value, target: FormatId) -> Resul
     }
 
     match target {
-        FormatId::OpenAiChat if claude_request_contains_tool_result_content_array(body) => {
+        // 纯/运行时统一：与 Responses 分支一致，只拒绝 Chat 真正无法承载的
+        // tool_result 内容块，可完整映射的多文本块不再被旧规则误拒。
+        FormatId::OpenAiChat
+            if claude_request_contains_unrepresentable_tool_result_content_for_openai_chat(
+                body,
+            ) =>
+        {
             return Err(FormatError::LossyConversionBlocked {
                 source_format: FormatId::ClaudeMessages.as_str().to_string(),
                 target_format: target.as_str().to_string(),
@@ -3986,28 +4073,44 @@ fn claude_request_contains_block_type(body: &Value, expected_type: &str) -> bool
     })
 }
 
-fn claude_request_contains_tool_result_content_array(body: &Value) -> bool {
-    let Some(messages) = body
-        .as_object()
-        .and_then(|object| object.get("messages"))
-        .and_then(Value::as_array)
-    else {
-        return false;
+/// Claude 原生服务端工具（web_fetch/code_execution/computer 等）没有跨格式的
+/// function 等价物：除已审计的 web_search 映射与显式 custom 工具外，
+/// 任何 tools[].type（含未知类型）一律 fail closed，不得被误降级为
+/// 空 input_schema 的 function；同格式转换不经过本校验，原生透传保持不变。
+fn validate_claude_cross_format_server_tools(
+    body: &Value,
+    target: FormatId,
+) -> Result<(), FormatError> {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return Ok(());
     };
-    messages.iter().any(|message| {
-        message
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|blocks| {
-                blocks.iter().any(|block| {
-                    block
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|block_type| block_type.eq_ignore_ascii_case("tool_result"))
-                        && block.get("content").is_some_and(Value::is_array)
-                })
-            })
-    })
+    for tool in tools {
+        // type 缺省或空白视为普通自定义工具；空白与大小写语义跟随
+        // claude_tools_to_canonical 的既有协议约定，不在此扩大解释。
+        let Some(tool_type) = tool
+            .as_object()
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|tool_type| !tool_type.is_empty())
+        else {
+            continue;
+        };
+        let normalized = tool_type.to_ascii_lowercase();
+        // web_search* 已有跨格式映射（web_search_options），custom 即普通函数工具。
+        if normalized.starts_with("web_search") || normalized == "custom" {
+            continue;
+        }
+        return Err(FormatError::LossyConversionBlocked {
+            source_format: FormatId::ClaudeMessages.as_str().to_string(),
+            target_format: target.as_str().to_string(),
+            field: "tools[].type".to_string(),
+            reason: format!(
+                "Claude native server tool type {tool_type:?} has no lossless cross-format function mapping"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn claude_request_contains_unrepresentable_tool_result_content_for_openai_chat(
@@ -5407,7 +5510,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_claude_to_openai_chat_blocks_structured_tool_result_loss() {
+    fn pure_claude_to_openai_chat_converts_representable_tool_result_text_array() {
         let body = json!({
             "model": "claude-sonnet",
             "messages": [{
@@ -5427,8 +5530,44 @@ mod tests {
             "max_tokens": 64
         });
 
+        // 纯/运行时统一：可完整映射的多文本块不再被旧的“任何数组即拒绝”规则误拒，
+        // 只有 Chat 真正无法承载的内容块才 fail closed。
+        let converted = convert_request_pure("claude:messages", "openai:chat", &body)
+            .expect("representable Claude tool_result text arrays should convert for Chat")
+            .value;
+
+        let tool_message = converted["messages"]
+            .as_array()
+            .expect("converted messages")
+            .iter()
+            .find(|message| message["role"] == json!("tool"))
+            .expect("tool message");
+        assert_eq!(tool_message["tool_call_id"], "toolu_123");
+        assert!(tool_message["content"].to_string().contains("first"));
+        assert!(tool_message["content"].to_string().contains("second"));
+    }
+
+    #[test]
+    fn pure_claude_to_openai_chat_blocks_unrepresentable_tool_result_loss() {
+        let body = json!({
+            "model": "claude-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_123",
+                    "content": [{
+                        "type": "server_tool_use",
+                        "name": "web_fetch",
+                        "input": {"url": "https://example.com"}
+                    }]
+                }]
+            }],
+            "max_tokens": 64
+        });
+
         let error = convert_request_pure("claude:messages", "openai:chat", &body)
-            .expect_err("Claude tool_result block arrays should fail closed for Chat");
+            .expect_err("unrepresentable Claude tool_result blocks must fail closed for Chat");
 
         assert!(matches!(
             error,
@@ -6981,6 +7120,31 @@ mod tests {
     }
 
     #[test]
+    fn stateless_openai_requests_keep_cross_provider_conversion_without_enabling_storage() {
+        for target in ["claude:messages", "gemini:generate_content"] {
+            for source in ["openai:chat", "openai:responses"] {
+                let mut body = if source == "openai:chat" {
+                    json!({"model":"test-model","messages":[{"role":"user","content":"hello"}],"store":false})
+                } else {
+                    json!({"model":"test-model","input":"hello","store":false})
+                };
+                for runtime in [false, true] {
+                    let converted = if runtime {
+                        convert_request(source, target, &body, &FormatContext::default())
+                    } else {
+                        convert_request_pure(source, target, &body).map(|result| result.value)
+                    }
+                    .expect("无状态请求应可转换");
+                    assert!(converted.get("store").is_none());
+                }
+                body["store"] = json!(true);
+                assert!(convert_request(source, target, &body, &FormatContext::default()).is_err());
+                assert!(convert_request_pure(source, target, &body).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn openai_chat_store_is_validated_then_omitted_for_compact() {
         for store in [true, false] {
             let converted = convert_request_pure(
@@ -7188,6 +7352,236 @@ mod tests {
             super::FormatError::LossyConversionBlocked { ref field, .. }
                 if field == "openai_responses.context_management"
         ));
+    }
+
+    #[test]
+    fn runtime_openai_responses_to_chat_blocks_unmapped_context_management() {
+        let body = json!({
+            "model": "gpt-source",
+            "input": [{"role": "user", "content": "hello"}],
+            "context_management": []
+        });
+
+        // 运行时与 pure 共用跨格式审计核心：pure 拒绝的 context_management
+        // 不得在 runtime 被静默丢弃。
+        let error = convert_request(
+            "openai:responses",
+            "openai:chat",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect_err("runtime conversion must reject unmapped Responses context_management");
+
+        assert!(matches!(
+            error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "openai_responses.context_management"
+        ));
+    }
+
+    #[test]
+    fn pure_and_runtime_openai_responses_to_chat_reject_unaudited_moderation() {
+        let body = json!({
+            "model": "gpt-source",
+            "input": [{"role": "user", "content": "hello"}],
+            "moderation": []
+        });
+
+        let pure_error = convert_request_pure("openai:responses", "openai:chat", &body)
+            .expect_err("pure conversion should reject the unaudited moderation field");
+        assert!(matches!(
+            pure_error,
+            super::FormatError::UnauditedField { ref field, .. } if field == "moderation"
+        ));
+
+        let runtime_error = convert_request(
+            "openai:responses",
+            "openai:chat",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect_err("runtime conversion must reject the same unaudited moderation field");
+        assert!(matches!(
+            runtime_error,
+            super::FormatError::UnauditedField { ref field, .. } if field == "moderation"
+        ));
+    }
+
+    #[test]
+    fn pure_and_runtime_claude_web_fetch_server_tool_with_max_uses_fails_closed() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "fetch the docs"}],
+            "max_tokens": 64,
+            "tools": [{
+                "type": "web_fetch_20250910",
+                "name": "web_fetch",
+                "max_uses": 5
+            }]
+        });
+
+        let pure_error = convert_request_pure("claude:messages", "openai:chat", &body)
+            .expect_err("pure conversion must not degrade the Claude web_fetch server tool");
+        assert!(matches!(
+            pure_error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "tools[].type"
+        ));
+
+        let runtime_error = convert_request(
+            "claude:messages",
+            "openai:chat",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect_err("runtime conversion must not degrade the Claude web_fetch server tool");
+        assert!(matches!(
+            runtime_error,
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "tools[].type"
+        ));
+    }
+
+    #[test]
+    fn pure_and_runtime_claude_server_tool_type_without_extras_fails_closed() {
+        // 没有任何附加字段（无 max_uses 等）时也必须拒绝：
+        // 此前 pure 依赖扩展审计间接拦截，type-only 形态会被误降级为空 function。
+        let type_only = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "fetch"}],
+            "max_tokens": 64,
+            "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]
+        });
+        for error in [
+            convert_request_pure("claude:messages", "openai:chat", &type_only)
+                .expect_err("pure conversion must reject a type-only Claude web_fetch server tool"),
+            convert_request(
+                "claude:messages",
+                "openai:chat",
+                &type_only,
+                &FormatContext::default(),
+            )
+            .expect_err("runtime conversion must reject a type-only Claude web_fetch server tool"),
+        ] {
+            assert!(matches!(
+                error,
+                super::FormatError::LossyConversionBlocked { ref field, .. }
+                    if field == "tools[].type"
+            ));
+        }
+
+        // 未知原生 type 同样拒绝，不得包装成 function。
+        let unknown_type = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "fetch"}],
+            "max_tokens": 64,
+            "tools": [{"type": "banana_20990101", "name": "banana"}]
+        });
+        assert!(matches!(
+            convert_request_pure("claude:messages", "gemini:generate_content", &unknown_type)
+                .expect_err("unknown Claude server tool types must fail closed"),
+            super::FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "tools[].type"
+        ));
+    }
+
+    #[test]
+    fn claude_same_format_conversion_keeps_native_server_tools_unrejected() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "fetch the docs"}],
+            "max_tokens": 64,
+            "tools": [{
+                "type": "web_fetch_20250910",
+                "name": "web_fetch",
+                "max_uses": 5
+            }]
+        });
+
+        // 原生同格式不经过跨格式审计：服务端工具不得被拒绝，透传语义保持不变。
+        let converted = convert_request_pure("claude:messages", "claude:messages", &body)
+            .expect("same-format Claude conversion must keep native server tools allowed")
+            .value;
+        assert_eq!(converted["tools"][0]["name"], "web_fetch");
+        assert_eq!(converted["tools"][0]["max_uses"], 5);
+    }
+
+    #[test]
+    fn claude_custom_and_plain_function_tools_still_convert_to_openai_chat() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "lookup"}],
+            "max_tokens": 64,
+            "tools": [
+                {
+                    "name": "lookup",
+                    "description": "Lookup",
+                    "input_schema": {"type": "object"}
+                },
+                {
+                    "type": "custom",
+                    "name": "shell_hint",
+                    "input_schema": {"type": "object"}
+                }
+            ]
+        });
+
+        let pure = convert_request_pure("claude:messages", "openai:chat", &body)
+            .expect("plain and custom Claude tools must keep converting for pure")
+            .value;
+        assert_eq!(pure["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(pure["tools"][1]["function"]["name"], "shell_hint");
+
+        let runtime = convert_request(
+            "claude:messages",
+            "openai:chat",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect("plain and custom Claude tools must keep converting at runtime");
+        assert_eq!(runtime["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(runtime["tools"][1]["function"]["name"], "shell_hint");
+    }
+
+    #[test]
+    fn runtime_claude_to_openai_chat_converts_representable_tool_result_text_array() {
+        let body = json!({
+            "model": "claude-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_123",
+                    "content": [{
+                        "type": "text",
+                        "text": "first"
+                    }, {
+                        "type": "text",
+                        "text": "second"
+                    }]
+                }]
+            }],
+            "max_tokens": 64
+        });
+
+        // 运行时与 pure 保持一致：可表示的多文本块继续转换，不被新审计误拒。
+        let converted = convert_request(
+            "claude:messages",
+            "openai:chat",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect("representable tool_result text arrays must keep converting at runtime");
+
+        let tool_message = converted["messages"]
+            .as_array()
+            .expect("converted messages")
+            .iter()
+            .find(|message| message["role"] == json!("tool"))
+            .expect("tool message");
+        assert_eq!(tool_message["tool_call_id"], "toolu_123");
+        assert!(tool_message["content"].to_string().contains("first"));
+        assert!(tool_message["content"].to_string().contains("second"));
     }
 
     #[test]
@@ -7652,6 +8046,156 @@ mod tests {
                     if field == "candidates[].finishReason"
             ));
         }
+    }
+
+    #[test]
+    fn pure_gemini_terminal_finish_error_keeps_upstream_finish_message() {
+        let message = "Malformed function call: Failed to parse function call: Function call is empty - no input to parse";
+        let body = json!({
+            "responseId": "resp_malformed_call",
+            "modelVersion": "gemini-3-pro",
+            "candidates": [{
+                "index": 0,
+                "content": {"role": "model", "parts": [{"text": "partial"}]},
+                "finishReason": "MALFORMED_FUNCTION_CALL",
+                "finishMessage": message
+            }]
+        });
+
+        let error = convert_response_pure("gemini:generate_content", "openai:chat", &body)
+            .expect_err("terminal Gemini failure must fail closed cross-format");
+
+        match error {
+            FormatError::LossyConversionBlocked { reason, .. } => {
+                assert!(
+                    reason.contains("MALFORMED_FUNCTION_CALL"),
+                    "reason should name the upstream finish reason: {reason}"
+                );
+                assert!(
+                    reason.contains(message),
+                    "reason should preserve the upstream finish message: {reason}"
+                );
+            }
+            other => panic!("expected LossyConversionBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_conversion_to_gemini_rejects_empty_function_call_names() {
+        let ctx = FormatContext::default().with_mapped_model("gemini-3-pro");
+        let empty_name = json!({
+            "model": "gpt-5.5",
+            "messages": [{
+                "role": "assistant",
+                "content": "calling a tool",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "", "arguments": "{\"q\":\"rust\"}"}
+                }]
+            }]
+        });
+
+        let error = convert_request("openai:chat", "gemini:generate_content", &empty_name, &ctx)
+            .expect_err("empty tool name must not reach the Gemini emitter");
+        match error {
+            FormatError::LossyConversionBlocked {
+                source_format,
+                target_format,
+                field,
+                reason,
+            } => {
+                assert_eq!(source_format, "openai:chat");
+                assert_eq!(target_format, "gemini:generate_content");
+                assert_eq!(field, "messages[].tool_use.name");
+                assert_eq!(
+                    reason,
+                    "Gemini functionCall requires a non-empty function name"
+                );
+            }
+            other => panic!("expected LossyConversionBlocked, got {other:?}"),
+        }
+
+        // 缺失 name 字段与纯空白 name 同样在解析后成为空名，必须同样 fail closed。
+        for function in [
+            json!({"arguments": "{\"q\":\"rust\"}"}),
+            json!({"name": "   ", "arguments": "{\"q\":\"rust\"}"}),
+        ] {
+            let mut missing_name = empty_name.clone();
+            missing_name["messages"][0]["tool_calls"][0]["function"] = function;
+            let error = convert_request(
+                "openai:chat",
+                "gemini:generate_content",
+                &missing_name,
+                &ctx,
+            )
+            .expect_err("missing or whitespace-only tool name must fail closed");
+            assert!(
+                matches!(
+                    error,
+                    FormatError::LossyConversionBlocked { ref field, .. }
+                        if field == "messages[].tool_use.name"
+                ),
+                "expected the empty-name gate for this variant"
+            );
+        }
+
+        // 对照：同名请求带合法函数名时成功，且上游 functionCall 携带该名称与参数。
+        let named = json!({
+            "model": "gpt-5.5",
+            "messages": [{
+                "role": "assistant",
+                "content": "calling a tool",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"rust\"}"}
+                }]
+            }]
+        });
+        let converted = convert_request("openai:chat", "gemini:generate_content", &named, &ctx)
+            .expect("named tool call should convert");
+        // 文本 part 在前，functionCall part 在后。
+        assert_eq!(
+            converted["contents"][0]["parts"][1]["functionCall"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            converted["contents"][0]["parts"][1]["functionCall"]["args"]["q"],
+            "rust"
+        );
+
+        // 纯转换入口执行同一契约。
+        let error = convert_request_pure(
+            "claude:messages",
+            "gemini:generate_content",
+            &json!({
+                "model": "claude-opus-4-7",
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "   ",
+                        "input": {"q": "rust"}
+                    }]
+                }]
+            }),
+        )
+        .expect_err("whitespace-only tool name must fail closed");
+        assert!(matches!(
+            error,
+            FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "messages[].tool_use.name"
+        ));
+
+        // 同格式原生请求不受影响：空名在 openai:chat 自身往返中原样保留。
+        let same_format = convert_request("openai:chat", "openai:chat", &empty_name, &ctx)
+            .expect("same-format roundtrip keeps the request untouched by the Gemini gate");
+        assert_eq!(
+            same_format["messages"][0]["tool_calls"][0]["function"]["name"],
+            ""
+        );
     }
 
     #[test]

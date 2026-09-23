@@ -375,7 +375,7 @@ import { useToast } from '@/composables/useToast'
 import { useFormDialog } from '@/composables/useFormDialog'
 import { useI18n } from '@/i18n'
 import { parseApiError } from '@/utils/errorParser'
-import { parseNumberInput, parseNullableNumberInput } from '@/utils/form'
+import { parseNumberInput, parseNullableNumberInput, parsePatternText } from '@/utils/form'
 import JsonImportInput from '@/components/common/JsonImportInput.vue'
 import {
   addProviderKey,
@@ -885,16 +885,6 @@ function createFieldNonce(): string {
   return Math.random().toString(36).slice(2, 10)
 }
 
-// 将逗号分隔的文本解析为数组（去空、去重）
-// 返回空数组而非 undefined，以便后端能正确清除已有规则
-function parsePatternText(text: string): string[] {
-  if (!text.trim()) return []
-  const patterns = text
-    .split(',')
-    .map(s => s.trim())
-    .filter(s => s.length > 0)
-  return [...new Set(patterns)]
-}
 
 // 解析 Service Account JSON 文本
 function parseAuthConfig(): Record<string, unknown> | null {

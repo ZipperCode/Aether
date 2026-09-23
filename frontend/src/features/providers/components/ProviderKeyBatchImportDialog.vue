@@ -160,6 +160,12 @@
         >
           {{ reviewErrorItemCount }} 个 Key 需要修正后才能导入
         </div>
+        <div
+          v-else-if="importFailedCount > 0"
+          class="border-b border-destructive/15 bg-destructive/5 px-4 py-2 text-xs text-destructive"
+        >
+          上次导入有 {{ importFailedCount }} 个 Key 失败，修正后点击「重试导入」仅会重新提交失败项
+        </div>
 
         <div class="max-h-[min(52vh,520px)] divide-y divide-border/50 overflow-y-auto overscroll-contain">
           <article
@@ -184,6 +190,13 @@
                 </div>
                 <div class="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
                   {{ maskSecret(entry.item.apiKey) }}
+                </div>
+                <div
+                  v-if="entry.item.importError"
+                  class="mt-0.5 truncate text-[10px] text-destructive"
+                  :title="entry.item.importError"
+                >
+                  导入失败：{{ entry.item.importError }}
                 </div>
               </div>
               <div class="hidden shrink-0 items-center gap-1.5 sm:flex">
@@ -213,17 +226,19 @@
                 <div class="space-y-1.5">
                   <Label class="text-xs">名称</Label>
                   <Input
-                    v-model="entry.item.name"
+                    :model-value="entry.item.name"
                     class="h-10"
                     placeholder="必填"
+                    @update:model-value="updateItemField(entry.item, 'name', String($event))"
                   />
                 </div>
                 <div class="space-y-1.5">
                   <Label class="text-xs">Key</Label>
                   <Input
-                    v-model="entry.item.apiKey"
+                    :model-value="entry.item.apiKey"
                     class="h-10 font-mono text-xs"
                     placeholder="必填"
+                    @update:model-value="updateItemField(entry.item, 'apiKey', String($event))"
                   />
                 </div>
               </div>
@@ -358,16 +373,21 @@ import {
 } from '@/components/ui'
 import ProviderKeyImportSettingsFields from './ProviderKeyImportSettingsFields.vue'
 import { batchImportPoolKeys, type PoolKeySettingsPatch } from '@/api/endpoints/pool'
+import { parsePatternText } from '@/utils/form'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
 import { parseProviderKeyBatchImport } from '@/features/providers/utils/providerKeyBatchImport'
 
-type WizardStep = 1 | 2 | 3
 type AuthType = 'api_key' | 'bearer'
+type WizardStep = 1 | 2 | 3
 type ImportSettings = Required<Pick<PoolKeySettingsPatch,
   'internal_priority' | 'rpm_limit' | 'concurrent_limit' | 'cache_ttl_minutes'
   | 'max_probe_interval_minutes' | 'is_active' | 'note' | 'proxy_node_id'
->>
+  | 'auto_fetch_models'
+>> & {
+  model_include_patterns_text: string
+  model_exclude_patterns_text: string
+}
 
 interface ReviewImportItem {
   lineNumber: number
@@ -377,6 +397,8 @@ interface ReviewImportItem {
   authType: AuthType
   apiFormats: string[]
   settings: ImportSettings
+  /** 上次批量导入失败时后端返回的原因；修正名称或 Key 后清除。 */
+  importError: string | null
 }
 
 const props = defineProps<{
@@ -448,6 +470,9 @@ const reviewErrorItemCount = computed(() => reviewErrorsByIndex.value.size)
 const customizedItemCount = computed(() => (
   reviewItems.value.filter(item => item.customized).length
 ))
+const importFailedCount = computed(() => (
+  reviewItems.value.filter(item => item.importError !== null).length
+))
 const reviewPageCount = computed(() => (
   Math.max(1, Math.ceil(reviewItems.value.length / REVIEW_PAGE_SIZE))
 ))
@@ -473,7 +498,8 @@ const primaryActionLabel = computed(() => {
   if (importing.value) return '正在导入...'
   if (currentStep.value === 1) return '下一步：统一配置'
   if (currentStep.value === 2) return '下一步：逐项确认'
-  return `导入 ${reviewItems.value.length} 个 Key`
+  const prefix = importFailedCount.value > 0 ? '重试导入' : '导入'
+  return `${prefix} ${reviewItems.value.length} 个 Key`
 })
 const settingsSummaryItems = computed(() => {
   const rpm = settings.rpm_limit == null ? 'RPM 自适应' : `RPM ${settings.rpm_limit}`
@@ -481,7 +507,8 @@ const settingsSummaryItems = computed(() => {
     ? '不限并发'
     : `并发 ${settings.concurrent_limit}`
   const proxy = settings.proxy_node_id ? '独立代理' : '沿用 Provider 代理'
-  return [authType.value === 'bearer' ? 'Bearer' : 'API Key', rpm, concurrent, proxy]
+  const models = settings.auto_fetch_models ? '自动获取模型' : '不自动获取模型'
+  return [authType.value === 'bearer' ? 'Bearer' : 'API Key', rpm, concurrent, proxy, models]
 })
 
 watch(
@@ -517,6 +544,9 @@ function createDefaultSettings(): ImportSettings {
     is_active: true,
     note: '',
     proxy_node_id: '',
+    auto_fetch_models: false,
+    model_include_patterns_text: '',
+    model_exclude_patterns_text: '',
   }
 }
 
@@ -539,6 +569,9 @@ function buildSettingsPayload(
     ...((source.proxy_node_id || includeEmptyProxy)
       ? { proxy_node_id: source.proxy_node_id || null }
       : {}),
+    auto_fetch_models: source.auto_fetch_models,
+    model_include_patterns: parsePatternText(source.model_include_patterns_text),
+    model_exclude_patterns: parsePatternText(source.model_exclude_patterns_text),
   }
 }
 
@@ -586,6 +619,7 @@ function prepareReviewItems(): void {
     authType: authType.value,
     apiFormats: [...selectedApiFormats.value],
     settings: copySettings(settings),
+    importError: null,
   }))
   reviewPage.value = 1
   editingItemIndex.value = null
@@ -601,6 +635,12 @@ function setItemCustomized(item: ReviewImportItem, customized: boolean): void {
   item.authType = authType.value
   item.apiFormats = [...selectedApiFormats.value]
   item.settings = copySettings(settings)
+}
+
+function updateItemField(item: ReviewImportItem, field: 'name' | 'apiKey', value: string): void {
+  item[field] = value
+  // 名称或 Key 已被修正，上次失败原因不再适用
+  if (item.importError !== null) item.importError = null
 }
 
 function changeReviewPage(page: number): void {
@@ -625,9 +665,10 @@ function maskSecret(secret: string): string {
   if (secret.length <= 10) return `${secret.slice(0, 3)}•••`
   return `${secret.slice(0, 6)}••••${secret.slice(-4)}`
 }
-
 async function submitImport(): Promise<void> {
   if (!canImport.value) return
+  // 部分失败后 reviewItems 已收敛为失败项，直接重发即只提交失败 Key；
+  // 成功项在结果处理时移除，不会重复入库
   importing.value = true
   try {
     const result = await batchImportPoolKeys(props.providerId, {
@@ -645,17 +686,30 @@ async function submitImport(): Promise<void> {
       api_formats: selectedApiFormats.value,
       settings: buildSettingsPayload(settings),
     })
+    const reasonsByIndex = new Map(result.errors.map(error => [error.index, error.reason]))
+    const failedItems: ReviewImportItem[] = []
+    reviewItems.value.forEach((item, index) => {
+      const reason = reasonsByIndex.get(index)
+      if (reason === undefined) return
+      item.importError = reason
+      failedItems.push(item)
+    })
+    reviewItems.value = failedItems
+
     if (result.imported > 0) emit('saved')
-    if (result.errors.length > 0) {
-      warning(`已导入 ${result.imported} 个，${result.errors.length} 个失败`)
+    if (failedItems.length > 0) {
+      warning(`已导入 ${result.imported} 个，${failedItems.length} 个失败，可修正后重试`)
       return
     }
     success(`已导入 ${result.imported} 个 Key`)
+    // 先关闭再通知刷新：弹窗关闭不依赖 saved 处理链的任何副作用
     emit('close')
   } catch (error) {
     showError(parseApiError(error, '批量导入 Key 失败'))
   } finally {
     importing.value = false
+    reviewPage.value = Math.min(reviewPage.value, reviewPageCount.value)
+    editingItemIndex.value = null
   }
 }
 </script>

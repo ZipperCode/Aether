@@ -153,11 +153,9 @@ impl ClaudeProviderState {
                                     } else {
                                         tool_state.call_id.clone()
                                     },
-                                    name: if tool_state.name.is_empty() {
-                                        "unknown".to_string()
-                                    } else {
-                                        tool_state.name.clone()
-                                    },
+                                    // canonical 保留空名：缺名不伪造 "unknown"，
+                                    // 由目标客户端 emitter 在终态统一 fail-closed。
+                                    name: tool_state.name.clone(),
                                 },
                             });
                             tool_state.started_emitted = true;
@@ -303,11 +301,9 @@ impl ClaudeProviderState {
                             } else {
                                 tool_state.call_id.clone()
                             },
-                            name: if tool_state.name.is_empty() {
-                                "unknown".to_string()
-                            } else {
-                                tool_state.name.clone()
-                            },
+                            // canonical 保留空名：缺名不伪造 "unknown"，
+                            // 由目标客户端 emitter 在终态统一 fail-closed。
+                            name: tool_state.name.clone(),
                         },
                     });
                     tool_state.started_emitted = true;

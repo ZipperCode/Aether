@@ -490,11 +490,9 @@ impl GeminiProviderState {
                             } else {
                                 tool_state.call_id.clone()
                             },
-                            name: if tool_state.name.is_empty() {
-                                "unknown".to_string()
-                            } else {
-                                tool_state.name.clone()
-                            },
+                            // canonical 保留空名：缺名不再伪造 "unknown"，
+                            // 由目标客户端 emitter 在终态统一 fail-closed。
+                            name: tool_state.name.clone(),
                         },
                     });
                     tool_state.started_emitted = true;
@@ -668,6 +666,9 @@ pub struct GeminiClientEmitter {
     wire_mode: GeminiStreamWireMode,
     json_array_started: bool,
     json_array_closed: bool,
+    /// 终态校验失败后的毒化标记；一旦置位，后续 emit/finish 持续返回同一错误，
+    /// 确保失败后绝不再输出正常 STOP 或补发工具调用。
+    failure: Option<String>,
 }
 
 impl GeminiClientEmitter {
@@ -780,16 +781,83 @@ impl GeminiClientEmitter {
         Ok(output)
     }
 
-    /// 刷新尚未输出的工具调用，并把已缓存签名附在对应 Gemini part 根节点。
+    /// 记录终态校验失败并毒化后续输出；重复调用持续返回同一错误，
+    /// 保证失败之后不会再输出正常 STOP 或补发任何工具调用。
+    fn fail_closed(&mut self, message: String) -> AiSurfaceFinalizeError {
+        self.failure = Some(message.clone());
+        AiSurfaceFinalizeError::new(message)
+    }
+
+    /// 流式累积参数已成完整 JSON 对象时才允许提前发射；
+    /// 标量（数字续写如 1→123）、数组、未闭合 JSON 一律继续缓冲到终态，
+    /// 避免把可延续的值过早定型后又被增量改写。
+    fn complete_object_arguments(arguments: &str) -> Option<Value> {
+        let trimmed = arguments.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        match parse_json_arguments_value(trimmed) {
+            Some(value @ Value::Object(_)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// name 与完整对象参数齐备时构造待发射 part；任一不满足则继续缓冲。
+    /// name 未到时缓冲而非报错，直到终态确认缺失才拒绝（分片次序无关）。
+    fn ready_tool_call_part(index: usize, state: &GeminiClientToolState) -> Option<Value> {
+        if state.emitted || state.name.trim().is_empty() {
+            return None;
+        }
+        let args_value = Self::complete_object_arguments(&state.arguments)?;
+        let mut part = json!({
+            "functionCall": {
+                "id": if state.call_id.is_empty() {
+                    build_generated_tool_call_id(index)
+                } else {
+                    state.call_id.clone()
+                },
+                "name": state.name.clone(),
+                "args": args_value,
+            }
+        });
+        if !state.thought_signature.is_empty() {
+            part["thoughtSignature"] = Value::String(state.thought_signature.clone());
+        }
+        Some(part)
+    }
+
+    /// 终态校验并刷新尚未输出的工具调用；签名附在对应 Gemini part 根节点。
+    /// 缺名或参数非法（截断/非对象 JSON）时 fail-closed，绝不伪造 "unknown" 或 {}。
     fn flush_pending_tool_calls(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
-        let mut out = Vec::new();
         let mut pending = Vec::new();
+        let mut failure = None;
         for (index, tool_call) in &mut self.tool_calls {
             if tool_call.emitted {
                 continue;
             }
-            let args_value = parse_json_arguments_value(&tool_call.arguments)
-                .unwrap_or_else(|| Value::Object(Map::new()));
+            // 终态仍缺失函数名：不得伪造身份，交由既有错误机制传给客户端。
+            if tool_call.name.trim().is_empty() {
+                failure = Some(format!(
+                    "Gemini 流式工具调用（索引 {index}）在终态仍未获得函数名"
+                ));
+                break;
+            }
+            // 空白参数 = 合法无参调用输出 {}；非空参数必须是完整 JSON 对象
+            // （Gemini functionCall.args 为 Struct），截断/标量/数组一律拒绝。
+            let args_value = if tool_call.arguments.trim().is_empty() {
+                Value::Object(Map::new())
+            } else {
+                match Self::complete_object_arguments(&tool_call.arguments) {
+                    Some(value) => value,
+                    None => {
+                        // 错误消息不携带原始参数内容，仅定位 index 与原因。
+                        failure = Some(format!(
+                            "Gemini 流式工具调用（索引 {index}）终态参数不是完整 JSON 对象或已被截断"
+                        ));
+                        break;
+                    }
+                }
+            };
             tool_call.emitted = true;
             let mut part = json!({
                 "functionCall": {
@@ -798,11 +866,7 @@ impl GeminiClientEmitter {
                     } else {
                         tool_call.call_id.clone()
                     },
-                    "name": if tool_call.name.is_empty() {
-                        "unknown".to_string()
-                    } else {
-                        tool_call.name.clone()
-                    },
+                    "name": tool_call.name.clone(),
                     "args": args_value,
                 }
             });
@@ -811,6 +875,10 @@ impl GeminiClientEmitter {
             }
             pending.push(part);
         }
+        if let Some(message) = failure {
+            return Err(self.fail_closed(message));
+        }
+        let mut out = Vec::new();
         for part in pending {
             out.extend(self.emit_candidate(vec![part], None, None)?);
         }
@@ -819,6 +887,12 @@ impl GeminiClientEmitter {
 
     /// 将规范流帧写为 Gemini 客户端事件；工具签名仅更新同索引调用状态。
     pub fn emit(&mut self, frame: CanonicalStreamFrame) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        // 已 fail-closed 的流不再处理任何帧，持续返回同一错误，杜绝错误后正常 STOP。
+        if self.failure.is_some() {
+            return Err(AiSurfaceFinalizeError::new(
+                self.failure.clone().unwrap_or_default(),
+            ));
+        }
         self.update_identity(&frame);
         match frame.event {
             CanonicalStreamEvent::Start => Ok(Vec::new()),
@@ -862,48 +936,56 @@ impl GeminiClientEmitter {
                 call_id,
                 name,
             } => {
-                let state = self.tool_calls.entry(index).or_default();
-                state.call_id = call_id;
-                state.name = name;
-                Ok(Vec::new())
+                let emitted_part = {
+                    let state = self.tool_calls.entry(index).or_default();
+                    state.call_id = call_id;
+                    state.name = name;
+                    // name 可能晚于参数分片到达：若参数已成完整对象则此刻补发。
+                    let part = Self::ready_tool_call_part(index, state);
+                    if part.is_some() {
+                        state.emitted = true;
+                    }
+                    part
+                };
+                let Some(part) = emitted_part else {
+                    return Ok(Vec::new());
+                };
+                self.emit_candidate(vec![part], None, None)
             }
             CanonicalStreamEvent::ToolCallSignature { index, signature } => {
                 self.tool_calls.entry(index).or_default().thought_signature = signature;
                 Ok(Vec::new())
             }
             CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments } => {
-                let emitted_part = {
+                let finished_before = self.finished;
+                let (emitted_part, trailing_failure) = {
                     let state = self.tool_calls.entry(index).or_default();
                     state.arguments.push_str(&arguments);
                     if state.emitted {
-                        None
+                        // 早发射完整 JSON 对象后又出现增量：完整对象无法被合法延续，
+                        // 重新校验累积串；解析失败说明存在将被静默丢弃的尾随内容，
+                        // 中途 fail-closed。已发正常 STOP 后不再报错。
+                        let trailing = !finished_before
+                            && Self::complete_object_arguments(&state.arguments).is_none();
+                        (
+                            Option::<Value>::None,
+                            trailing.then(|| {
+                                format!(
+                                    "Gemini 流式工具调用（索引 {index}）在已发射完整 JSON 对象后收到尾随增量参数"
+                                )
+                            }),
+                        )
                     } else {
-                        let args_value = parse_json_arguments_value(&state.arguments);
-                        args_value.map(|args_value| {
+                        let part = Self::ready_tool_call_part(index, state);
+                        if part.is_some() {
                             state.emitted = true;
-                            let mut part = json!({
-                                "functionCall": {
-                                    "id": if state.call_id.is_empty() {
-                                        build_generated_tool_call_id(index)
-                                    } else {
-                                        state.call_id.clone()
-                                    },
-                                    "name": if state.name.is_empty() {
-                                        "unknown".to_string()
-                                    } else {
-                                        state.name.clone()
-                                    },
-                                    "args": args_value,
-                                }
-                            });
-                            if !state.thought_signature.is_empty() {
-                                part["thoughtSignature"] =
-                                    Value::String(state.thought_signature.clone());
-                            }
-                            part
-                        })
+                        }
+                        (part, None)
                     }
                 };
+                if let Some(message) = trailing_failure {
+                    return Err(self.fail_closed(message));
+                }
                 let Some(part) = emitted_part else {
                     return Ok(Vec::new());
                 };
@@ -940,6 +1022,12 @@ impl GeminiClientEmitter {
     }
 
     pub fn finish(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        // 已 fail-closed 的流不再补发内容；持续返回同一错误。
+        if self.failure.is_some() {
+            return Err(AiSurfaceFinalizeError::new(
+                self.failure.clone().unwrap_or_default(),
+            ));
+        }
         let mut out = Vec::new();
         if !self.finished {
             out.extend(self.flush_pending_tool_calls()?);
@@ -1898,5 +1986,575 @@ mod tests {
         assert!(sse.contains("\"id\":\"call_123\""));
         assert!(sse.contains("\"name\":\"lookup\""));
         assert!(sse.contains("\"response\":{\"ok\":true}"));
+    }
+
+    #[test]
+    fn gemini_client_emitter_fails_closed_on_blank_function_name() {
+        let mut emitter = GeminiClientEmitter::default();
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_blank_name".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_blank".to_string(),
+                    name: " ".to_string(),
+                },
+            })
+            .expect("blank-name start should buffer without emitting");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_blank_name".to_string(),
+                    model: "gemini-2.5-pro".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: "{\"q\":1}".to_string(),
+                    },
+                })
+                .expect("complete arguments stay buffered while name is blank"),
+        );
+        let sse = String::from_utf8(bytes).expect("utf8");
+        assert!(!sse.contains("unknown"));
+        assert!(!sse.contains("functionCall"));
+
+        let error = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_blank_name".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::Finish {
+                    finish_reason: Some("tool_calls".to_string()),
+                    usage: None,
+                },
+            })
+            .expect_err("terminal state confirms missing name and must fail closed");
+        assert!(error.0.contains("仍未获得函数名"));
+
+        // 失败后毒化：finish 不得再输出正常 STOP 或补发调用。
+        let poisoned = emitter
+            .finish()
+            .expect_err("finish after failure must keep failing");
+        assert!(poisoned.0.contains("仍未获得函数名"));
+    }
+
+    #[test]
+    fn gemini_client_emitter_fails_closed_on_truncated_arguments() {
+        let mut emitter = GeminiClientEmitter::default();
+        emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_truncated".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_truncated".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("start should buffer");
+        let bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_truncated".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments: "{\"q\":".to_string(),
+                },
+            })
+            .expect("truncated arguments stay buffered");
+        let sse = String::from_utf8(bytes).expect("utf8");
+        assert!(!sse.contains("functionCall"));
+        assert!(!sse.contains("\"args\":{}"));
+
+        let error = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_truncated".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::Finish {
+                    finish_reason: Some("tool_calls".to_string()),
+                    usage: None,
+                },
+            })
+            .expect_err("truncated non-empty arguments must not be fabricated as {}");
+        assert!(error.0.contains("不是完整 JSON 对象"));
+        // 错误消息不得回显原始参数内容。
+        assert!(!error.0.contains("{\"q\":"));
+
+        let poisoned = emitter
+            .finish()
+            .expect_err("finish after failure must keep failing");
+        assert!(poisoned.0.contains("不是完整 JSON 对象"));
+    }
+
+    #[test]
+    fn gemini_client_emitter_fails_closed_on_non_object_arguments() {
+        let mut emitter = GeminiClientEmitter::default();
+        emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_scalar_args".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_scalar".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("start should buffer");
+        emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_scalar_args".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments: "123".to_string(),
+                },
+            })
+            .expect("scalar arguments stay buffered");
+        let error = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_scalar_args".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::Finish {
+                    finish_reason: Some("tool_calls".to_string()),
+                    usage: None,
+                },
+            })
+            .expect_err("Gemini functionCall.args must be a JSON object");
+        assert!(error.0.contains("不是完整 JSON 对象"));
+    }
+
+    #[test]
+    fn gemini_client_emitter_outputs_empty_object_for_legal_no_argument_call() {
+        let mut emitter = GeminiClientEmitter::default();
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_no_args".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_noop".to_string(),
+                    name: "noop".to_string(),
+                },
+            })
+            .expect("start should buffer");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_no_args".to_string(),
+                    model: "gemini-2.5-pro".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 1,
+                        arguments: "{}".to_string(),
+                    },
+                })
+                .expect("explicit empty object arguments should buffer without a name"),
+        );
+        let explicit_object = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_no_args".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 1,
+                    call_id: "call_explicit".to_string(),
+                    name: "explicit_empty".to_string(),
+                },
+            })
+            .expect("late name should flush the buffered empty-object call");
+        let explicit_sse = String::from_utf8(explicit_object).expect("utf8");
+        assert!(explicit_sse.contains("\"name\":\"explicit_empty\""));
+        assert!(explicit_sse.contains("\"args\":{}"));
+
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_no_args".to_string(),
+                    model: "gemini-2.5-pro".to_string(),
+                    event: CanonicalStreamEvent::Finish {
+                        finish_reason: Some("tool_calls".to_string()),
+                        usage: None,
+                    },
+                })
+                .expect("legal no-argument call should finish normally"),
+        );
+        let sse = String::from_utf8(bytes).expect("utf8");
+        assert!(sse.contains("\"name\":\"noop\""));
+        assert!(sse.contains("\"args\":{}"));
+        assert!(sse.contains("\"finishReason\":\"STOP\""));
+        assert!(!sse.contains("unknown"));
+    }
+
+    #[test]
+    fn gemini_client_emitter_buffers_arguments_until_name_arrives() {
+        let mut emitter = GeminiClientEmitter::default();
+        // 参数先到、name 后到：缓冲而非报错，也绝不提前伪造身份。
+        let first = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_reordered".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments: "{\"q\":".to_string(),
+                },
+            })
+            .expect("args-first fragment should buffer");
+        let second = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_reordered".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments: "1}".to_string(),
+                },
+            })
+            .expect("complete args without name should still buffer");
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+
+        let flushed = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_reordered".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_late_name".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("late name should flush the buffered call");
+        let sse = String::from_utf8(flushed).expect("utf8");
+        assert!(sse.contains("\"name\":\"lookup\""));
+        assert!(sse.contains("\"args\":{\"q\":1}"));
+        assert!(sse.contains("\"id\":\"call_late_name\""));
+        assert!(!sse.contains("unknown"));
+
+        let finish = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_reordered".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::Finish {
+                    finish_reason: Some("tool_calls".to_string()),
+                    usage: None,
+                },
+            })
+            .expect("finish should succeed after the late name");
+        let finish_sse = String::from_utf8(finish).expect("utf8");
+        assert!(finish_sse.contains("\"finishReason\":\"STOP\""));
+    }
+
+    #[test]
+    fn gemini_client_emitter_preserves_object_arguments_and_signature() {
+        let mut emitter = GeminiClientEmitter::default();
+        emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_signature".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_sig".to_string(),
+                    name: "search".to_string(),
+                },
+            })
+            .expect("start should buffer");
+        emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_signature".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallSignature {
+                    index: 0,
+                    signature: "sig_abc".to_string(),
+                },
+            })
+            .expect("signature should cache on the call state");
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_signature".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments: "{\"q\":".to_string(),
+                },
+            })
+            .expect("incomplete fragment should buffer");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_signature".to_string(),
+                    model: "gemini-2.5-pro".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: "\"gpu\"}".to_string(),
+                    },
+                })
+                .expect("complete object should emit with signature"),
+        );
+        // 早发射后的纯空白增量不构成新内容，不应报错也不应重复发射。
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_signature".to_string(),
+                    model: "gemini-2.5-pro".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: "  ".to_string(),
+                    },
+                })
+                .expect("whitespace-only trailing increment is tolerated"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_signature".to_string(),
+                    model: "gemini-2.5-pro".to_string(),
+                    event: CanonicalStreamEvent::Finish {
+                        finish_reason: Some("tool_calls".to_string()),
+                        usage: None,
+                    },
+                })
+                .expect("legal call should finish normally"),
+        );
+        let sse = String::from_utf8(bytes).expect("utf8");
+        assert!(sse.contains("\"name\":\"search\""));
+        assert!(sse.contains("\"args\":{\"q\":\"gpu\"}"));
+        assert!(sse.contains("\"thoughtSignature\":\"sig_abc\""));
+        assert!(sse.contains("\"finishReason\":\"STOP\""));
+        assert_eq!(sse.matches("\"functionCall\"").count(), 1);
+    }
+
+    #[test]
+    fn gemini_client_emitter_fails_closed_on_trailing_increment_after_complete_arguments() {
+        let mut emitter = GeminiClientEmitter::default();
+        emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_trailing".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_trailing".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("start should buffer");
+        emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_trailing".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments: "{\"q\":1}".to_string(),
+                },
+            })
+            .expect("complete object should emit");
+        let error = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_trailing".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments: "junk".to_string(),
+                },
+            })
+            .expect_err("trailing garbage after a complete object must not be dropped silently");
+        assert!(error.0.contains("尾随增量参数"));
+
+        let poisoned = emitter
+            .finish()
+            .expect_err("finish after failure must keep failing");
+        assert!(poisoned.0.contains("尾随增量参数"));
+    }
+
+    #[test]
+    fn gemini_client_emitter_ignores_post_finish_argument_deltas() {
+        let mut emitter = GeminiClientEmitter::default();
+        emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_post_stop".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_post".to_string(),
+                    name: "noop".to_string(),
+                },
+            })
+            .expect("start should buffer");
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_post_stop".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::Finish {
+                    finish_reason: Some("tool_calls".to_string()),
+                    usage: None,
+                },
+            })
+            .expect("finish should succeed");
+        let sse = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(sse.contains("\"finishReason\":\"STOP\""));
+        // 正常 STOP 已发出后，迟到的参数增量不得再追加错误事件。
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_post_stop".to_string(),
+                    model: "gemini-2.5-pro".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: "junk".to_string(),
+                    },
+                })
+                .expect("post-finish deltas are ignored after a normal STOP"),
+        );
+        let after = String::from_utf8(bytes).expect("utf8");
+        assert_eq!(after, sse);
+    }
+
+    #[test]
+    fn gemini_provider_state_preserves_blank_function_call_name() {
+        let mut state = GeminiProviderState::default();
+        let report_context = json!({});
+        let frames = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "responseId": "resp_nameless",
+                    "modelVersion": "gemini-2.5-pro",
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [{ "functionCall": { "args": { "q": 1 } } }]
+                        }
+                    }]
+                })),
+            )
+            .expect("chunk should parse");
+        let start = frames
+            .iter()
+            .find_map(|frame| match &frame.event {
+                CanonicalStreamEvent::ToolCallStart { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .expect("tool call start should be emitted");
+        // canonical 保留空名，不伪造 "unknown"；由目标 emitter 终态拒绝。
+        assert_eq!(start, "");
+    }
+
+    #[test]
+    fn openai_chat_to_gemini_stream_fails_closed_on_missing_tool_name() {
+        use crate::formats::shared::stream_core::StreamingStandardFormatMatrix;
+
+        let context = json!({
+            "provider_api_format": "openai:chat",
+            "client_api_format": "gemini:generate_content",
+            "mapped_model": "test-model",
+        });
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let chunks = [
+            json!({"id": "chatcmpl_1", "object": "chat.completion.chunk", "model": "test-model",
+            "choices": [{"index": 0, "delta": {
+                "role": "assistant",
+                "tool_calls": [{"index": 0, "id": "call_nameless", "function": {"arguments": ""}}]
+            }}]}),
+            json!({"id": "chatcmpl_1", "object": "chat.completion.chunk", "model": "test-model",
+            "choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": 0, "function": {"arguments": "{\"q\":1}"}}]
+            }}]}),
+            json!({"id": "chatcmpl_1", "object": "chat.completion.chunk", "model": "test-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        ];
+        let mut bytes = Vec::new();
+        for chunk in chunks {
+            bytes.extend(
+                matrix
+                    .transform_line(&context, data_line(chunk))
+                    .expect("interim chunks convert without a tool name error"),
+            );
+        }
+        let interim = String::from_utf8(bytes).expect("utf8");
+        assert!(!interim.contains("functionCall"));
+        assert!(!interim.contains("unknown"));
+        // 终态确认缺名：源 parser 保留空名补发，Gemini emitter fail-closed。
+        let error = matrix
+            .finish(&context)
+            .expect_err("nameless tool call must fail closed at the Gemini surface");
+        assert!(error.0.contains("仍未获得函数名"));
+    }
+
+    #[test]
+    fn openai_chat_to_gemini_stream_emits_named_tool_call() {
+        use crate::formats::shared::stream_core::StreamingStandardFormatMatrix;
+
+        let context = json!({
+            "provider_api_format": "openai:chat",
+            "client_api_format": "gemini:generate_content",
+            "mapped_model": "test-model",
+        });
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let chunks = [
+            json!({"id": "chatcmpl_2", "object": "chat.completion.chunk", "model": "test-model",
+            "choices": [{"index": 0, "delta": {
+                "role": "assistant",
+                "tool_calls": [{"index": 0, "id": "call_lookup", "function": {"name": "lookup", "arguments": ""}}]
+            }}]}),
+            json!({"id": "chatcmpl_2", "object": "chat.completion.chunk", "model": "test-model",
+            "choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": 0, "function": {"arguments": "{\"q\":"}}]
+            }}]}),
+            json!({"id": "chatcmpl_2", "object": "chat.completion.chunk", "model": "test-model",
+            "choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": 0, "function": {"arguments": "\"gpu\"}"}}]
+            }}]}),
+            json!({"id": "chatcmpl_2", "object": "chat.completion.chunk", "model": "test-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        ];
+        let mut bytes = Vec::new();
+        for chunk in chunks {
+            bytes.extend(
+                matrix
+                    .transform_line(&context, data_line(chunk))
+                    .expect("chunks should convert"),
+            );
+        }
+        bytes.extend(matrix.finish(&context).expect("finish should succeed"));
+        let sse = String::from_utf8(bytes).expect("utf8");
+        assert!(sse.contains("\"functionCall\""));
+        assert!(sse.contains("\"id\":\"call_lookup\""));
+        assert!(sse.contains("\"name\":\"lookup\""));
+        assert!(sse.contains("\"args\":{\"q\":\"gpu\"}"));
+        assert!(sse.contains("\"finishReason\":\"STOP\""));
+    }
+
+    #[test]
+    fn claude_to_gemini_stream_fails_closed_on_missing_tool_name() {
+        use crate::formats::shared::stream_core::StreamingStandardFormatMatrix;
+
+        let context = json!({
+            "provider_api_format": "claude:messages",
+            "client_api_format": "gemini:generate_content",
+            "mapped_model": "test-model",
+        });
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let events = [
+            json!({"type": "message_start", "message": {"id": "msg_1", "model": "test-model", "role": "assistant"}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {
+                "type": "tool_use", "id": "toolu_nameless", "input": {}
+            }}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {
+                "type": "input_json_delta", "partial_json": "{\"q\":1}"
+            }}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+        ];
+        let mut bytes = Vec::new();
+        for event in &events[..4] {
+            bytes.extend(
+                matrix
+                    .transform_line(&context, data_line(event.clone()))
+                    .expect("interim events convert without a tool name error"),
+            );
+        }
+        let interim = String::from_utf8(bytes).expect("utf8");
+        assert!(!interim.contains("functionCall"));
+        assert!(!interim.contains("unknown"));
+        // claude message_delta 立即产生终态帧，Gemini emitter 在该行就 fail-closed。
+        let error = matrix
+            .transform_line(&context, data_line(events[4].clone()))
+            .expect_err("nameless tool call must fail closed at the Gemini surface");
+        assert!(error.0.contains("仍未获得函数名"));
     }
 }

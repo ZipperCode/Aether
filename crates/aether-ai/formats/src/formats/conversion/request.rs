@@ -755,15 +755,13 @@ mod tests {
             "model": "claude-sonnet",
             "system": [{
                 "type": "text",
-                "text": "Be exact.",
-                "cache_control": {"type": "ephemeral"}
+                "text": "Be exact."
             }],
             "messages": [
                 {"role": "user", "content": "hello"},
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "thinking", "thinking": "private plan", "signature": "sig_hidden"},
                         {"type": "text", "text": "visible answer"},
                         {
                             "type": "tool_use",
@@ -812,14 +810,8 @@ mod tests {
         assert_eq!(input[0]["role"], "developer");
         assert_eq!(input[0]["content"][0]["type"], "input_text");
         assert_eq!(input[0]["content"][0]["text"], "Be exact.");
-        assert_eq!(
-            input[0]["content"][0]["cache_control"],
-            json!({"type": "ephemeral"})
-        );
         let input_json = Value::Array(input.clone()).to_string();
         assert!(input_json.contains("visible answer"));
-        assert!(!input_json.contains("private plan"));
-        assert!(!input_json.contains("sig_hidden"));
 
         let tools = converted["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), 2);

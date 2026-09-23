@@ -62,6 +62,15 @@ fn chat_compatible_body_for_openai_chat_endpoint(body_json: &Value) -> Option<Co
         return normalize_openai_responses_request_to_openai_chat_request(body_json)
             .map(Cow::Owned);
     }
+    // 既有 messages 优先级：混合 body 上的 input 不进入跨格式转换，
+    // 否则根字段审计会对 Chat schema 之外的 input fail closed。
+    if let Some(object) = body_json.as_object() {
+        if object.contains_key("messages") && object.contains_key("input") {
+            let mut normalized = object.clone();
+            normalized.remove("input");
+            return Some(Cow::Owned(Value::Object(normalized)));
+        }
+    }
     Some(Cow::Borrowed(body_json))
 }
 
@@ -244,8 +253,11 @@ pub fn build_cross_format_openai_chat_request_body_with_model_directives(
                     enable_model_directives,
                 )?
             } else {
+                // 与 Claude/Gemini 分支一致先经过 chat 兼容规范化：
+                // 混合 messages/input body 按既有 messages 优先级剥离后再转换。
+                let chat_body = chat_compatible_body_for_openai_chat_endpoint(body_json)?;
                 convert_openai_chat_request_to_openai_responses_request(
-                    body_json,
+                    chat_body.as_ref(),
                     mapped_model,
                     upstream_is_stream,
                     false,

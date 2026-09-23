@@ -21,6 +21,7 @@ const endpointMocks = vi.hoisted(() => ({
   refreshProviderQuota: vi.fn(),
   resetProviderKeyCycleStats: vi.fn(),
   refreshProviderOAuth: vi.fn(),
+  recoverKeyHealth: vi.fn(),
 }))
 
 const routeMocks = vi.hoisted(() => ({
@@ -60,7 +61,9 @@ vi.mock('@/api/endpoints/keys', () => ({
 vi.mock('@/api/endpoints/provider_oauth', () => ({
   refreshProviderOAuth: endpointMocks.refreshProviderOAuth,
 }))
-
+vi.mock('@/api/endpoints/health', () => ({
+  recoverKeyHealth: endpointMocks.recoverKeyHealth,
+}))
 vi.mock('@/api/endpoints', () => ({
   getProvider: endpointMocks.getProvider,
   updateProvider: endpointMocks.updateProvider,
@@ -620,6 +623,7 @@ beforeEach(() => {
   endpointMocks.refreshProviderQuota.mockReset()
   endpointMocks.resetProviderKeyCycleStats.mockReset()
   endpointMocks.refreshProviderOAuth.mockReset()
+  endpointMocks.recoverKeyHealth.mockReset()
 
   endpointMocks.getPoolSchedulingPresets.mockResolvedValue([])
   endpointMocks.clearPoolCooldown.mockResolvedValue({ message: 'ok' })
@@ -1399,5 +1403,58 @@ describe('PoolManagement Codex cycle stats mode', () => {
     await settle()
 
     expect(disabledRoot.querySelector('[data-testid="pool-demand-metrics-button"]')).toBeNull()
+  })
+
+  it('offers per-key health refresh on any key, blocks duplicate in-flight clicks, and refreshes list health after success', async () => {
+    const degradedPage = createKeyPage(createPoolKey('codex', {
+      health_score: 0.7,
+      circuit_breaker_open: false,
+    }))
+    let recovered = false
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockImplementation(async () => (
+      recovered
+        ? createKeyPage({ ...degradedPage.keys[0], health_score: 1 })
+        : degradedPage
+    ))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+
+    let resolveRecover: (value: {
+      message: string
+      details: { health_score: number, circuit_breaker_open: boolean, is_active: boolean }
+    }) => void = () => {}
+    endpointMocks.recoverKeyHealth.mockImplementation(
+      () => new Promise((resolve) => {
+        resolveRecover = resolve
+      }),
+    )
+
+    const root = mountPoolManagement()
+    await settle()
+
+    // 健康度 0.7（未低于阈值）也必须出现入口：桌面行与移动卡片各一个。
+    const recoverButtons = [...root.querySelectorAll('button')]
+      .filter(button => button.title === '刷新健康度（管理恢复，不发起上游探测）')
+    expect(recoverButtons.length).toBe(2)
+    expect(root.querySelector('[data-testid="pool-key-health"]')?.textContent).toContain('70%')
+
+    recoverButtons[0].click()
+    await settle()
+    // 请求进行中再次点击不得重复发起恢复。
+    recoverButtons[0].click()
+    await settle()
+    expect(endpointMocks.recoverKeyHealth).toHaveBeenCalledTimes(1)
+    expect(endpointMocks.recoverKeyHealth).toHaveBeenCalledWith('codex-key-1')
+
+    recovered = true
+    resolveRecover({
+      message: 'Key 已恢复',
+      details: { health_score: 1, circuit_breaker_open: false, is_active: true },
+    })
+    await settle()
+
+    // 成功后当前列表健康数据反映恢复结果，并触发列表静默重载。
+    expect(root.querySelector('[data-testid="pool-key-health"]')?.textContent).toContain('100%')
+    expect(endpointMocks.listPoolKeys.mock.calls.length).toBeGreaterThan(1)
   })
 })

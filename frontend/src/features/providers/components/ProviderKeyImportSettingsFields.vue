@@ -114,6 +114,67 @@
       </div>
     </div>
 
+    <div class="space-y-2 rounded-lg bg-background px-3 py-3 shadow-[0_0_0_1px_rgb(0_0_0/0.06),0_1px_2px_rgb(0_0_0/0.04)] dark:shadow-[0_0_0_1px_rgb(255_255_255/0.08)]">
+      <div class="flex min-h-12 items-center justify-between gap-3">
+        <div class="min-w-0">
+          <Label
+            class="text-xs font-medium"
+            :for="autoFetchSwitchId"
+          >
+            自动获取上游可用模型
+          </Label>
+          <div class="text-[11px] text-muted-foreground">
+            导入后立即获取一次，之后定时更新上游模型，配合模型映射使用
+          </div>
+        </div>
+        <Switch
+          :id="autoFetchSwitchId"
+          :model-value="settings.auto_fetch_models"
+          @update:model-value="updateSetting('auto_fetch_models', $event)"
+        />
+      </div>
+      <div
+        v-if="settings.auto_fetch_models"
+        class="space-y-2 border-t border-border/40 pt-2"
+      >
+        <div class="grid gap-3 sm:grid-cols-2">
+          <div class="space-y-1.5">
+            <Label
+              class="text-xs"
+              :for="modelIncludePatternsId"
+            >
+              包含规则
+            </Label>
+            <Input
+              :id="modelIncludePatternsId"
+              :model-value="settings.model_include_patterns_text"
+              placeholder="gpt-*, claude-*, 留空包含全部"
+              class="h-10"
+              @update:model-value="updateSetting('model_include_patterns_text', String($event))"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <Label
+              class="text-xs"
+              :for="modelExcludePatternsId"
+            >
+              排除规则
+            </Label>
+            <Input
+              :id="modelExcludePatternsId"
+              :model-value="settings.model_exclude_patterns_text"
+              placeholder="*-preview, *-beta"
+              class="h-10"
+              @update:model-value="updateSetting('model_exclude_patterns_text', String($event))"
+            />
+          </div>
+        </div>
+        <p class="text-[11px] text-muted-foreground">
+          逗号分隔，支持 * ? 通配符，不区分大小写
+        </p>
+      </div>
+    </div>
+
     <div class="flex min-h-12 items-center justify-between gap-3 rounded-lg bg-background px-3 shadow-[0_0_0_1px_rgb(0_0_0/0.06),0_1px_2px_rgb(0_0_0/0.04)] dark:shadow-[0_0_0_1px_rgb(255_255_255/0.08)]">
       <div>
         <div class="text-xs font-medium">
@@ -153,7 +214,11 @@ type AuthType = 'api_key' | 'bearer'
 type ImportSettings = Required<Pick<PoolKeySettingsPatch,
   'internal_priority' | 'rpm_limit' | 'concurrent_limit' | 'cache_ttl_minutes'
   | 'max_probe_interval_minutes' | 'is_active' | 'note' | 'proxy_node_id'
->>
+  | 'auto_fetch_models'
+>> & {
+  model_include_patterns_text: string
+  model_exclude_patterns_text: string
+}
 
 const props = defineProps<{
   authType: AuthType
@@ -167,6 +232,12 @@ const emit = defineEmits<{
   'update:apiFormats': [value: string[]]
   'update:settings': [value: ImportSettings]
 }>()
+
+// 每个实例唯一的字段 id，供 label[for] 关联（统一配置与逐项编辑会同时存在多个实例）
+const fieldNonce = Math.random().toString(36).slice(2, 10)
+const autoFetchSwitchId = `provider-key-import-auto-fetch-${fieldNonce}`
+const modelIncludePatternsId = `provider-key-import-include-patterns-${fieldNonce}`
+const modelExcludePatternsId = `provider-key-import-exclude-patterns-${fieldNonce}`
 
 const authTypeModel = computed<AuthType>({
   get: () => props.authType,

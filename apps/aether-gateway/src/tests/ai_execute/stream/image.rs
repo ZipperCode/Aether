@@ -354,6 +354,10 @@ async fn gateway_executes_codex_image_stream_via_local_decision_gate_after_oauth
             format!("Bearer {client_api_key}"),
         )
         .header(TRACE_ID_HEADER, "trace-codex-image-stream-local-123")
+        .header(
+            http::header::USER_AGENT,
+            "codex_cli_rs/0.250.0",
+        )
         .body(
             "{\"model\":\"gpt-image-2\",\"prompt\":\"生成一张水墨视觉海报\",\"background\":\"auto\",\"quality\":\"auto\",\"size\":\"auto\",\"stream\":true,\"response_format\":\"b64_json\"}",
         )
@@ -420,9 +424,10 @@ async fn gateway_executes_codex_image_stream_via_local_decision_gate_after_oauth
             "size": "auto"
         })
     );
+    // 来路 codex_cli_rs 新版本经透传保留到上游计划，不再被内置回退版本覆盖。
     assert_eq!(
         seen_execution_runtime_request.headers["user-agent"],
-        aether_ai_formats::CODEX_CLIENT_USER_AGENT
+        "codex_cli_rs/0.250.0"
     );
     assert_eq!(
         seen_execution_runtime_request.headers["originator"],

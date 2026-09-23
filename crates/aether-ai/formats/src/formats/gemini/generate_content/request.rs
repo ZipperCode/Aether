@@ -554,6 +554,10 @@ fn canonical_block_to_gemini_part(
             extensions,
         } => {
             tool_name_by_id.insert(id.clone(), name.clone());
+            if name.trim().is_empty() {
+                // Gemini functionCall 的 name 必填；空名中止整次转换而不是发出非法 part。
+                return None;
+            }
             let mut part = json!({
                 "functionCall": {
                     "id": id,
@@ -1463,6 +1467,40 @@ mod tests {
 
         assert!(to_raw(&canonical, "gemini-2.5-pro", false).is_none());
         assert!(to_raw(&canonical, "gemini-3-flash-preview", false).is_some());
+    }
+
+    /// 空函数名的工具调用不得变成 `name: ""` 的非法 functionCall；发射整体失败。
+    #[test]
+    fn empty_tool_use_name_fails_gemini_request_emission() {
+        let tool_use = |name: &str| CanonicalRequest {
+            model: "gemini-3-pro".to_string(),
+            messages: vec![CanonicalMessage {
+                role: CanonicalRole::Assistant,
+                content: vec![CanonicalContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: name.to_string(),
+                    input: json!({"q": "rust"}),
+                    extensions: BTreeMap::new(),
+                }],
+                extensions: BTreeMap::new(),
+            }],
+            ..CanonicalRequest::default()
+        };
+
+        assert!(
+            to_raw(&tool_use(""), "gemini-3-pro", false).is_none(),
+            "empty function name must abort emission instead of emitting an illegal functionCall"
+        );
+        assert!(
+            to_raw(&tool_use("   "), "gemini-3-pro", false).is_none(),
+            "whitespace-only function name must abort emission"
+        );
+
+        let body = to_raw(&tool_use("lookup"), "gemini-3-pro", false)
+            .expect("named tool use should still emit");
+        let function_call = &body["contents"][0]["parts"][0]["functionCall"];
+        assert_eq!(function_call["name"], "lookup");
+        assert_eq!(function_call["args"]["q"], "rust");
     }
 
     #[test]

@@ -140,6 +140,19 @@ export function createNumberInputHandler<T extends Record<string, unknown>>(
 }
 
 /**
+ * 将逗号分隔的模型规则文本解析为数组（去空、去重）
+ * 返回空数组而非 undefined，以便后端能正确清除已有规则
+ */
+export function parsePatternText(text: string): string[] {
+  if (!text.trim()) return []
+  const patterns = text
+    .split(',')
+    .map(s => s.trim())
+    .filter(s => s.length > 0)
+  return [...new Set(patterns)]
+}
+
+/**
  * 获取分辨率的排序权重（用于从低到高排序）
  * 支持的格式：
  * - NNNp 格式：480p, 720p, 1080p, 2160p

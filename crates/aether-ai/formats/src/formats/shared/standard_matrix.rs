@@ -1180,7 +1180,13 @@ mod tests {
             "metadata": {"trace": "abc"}
         });
 
-        for provider_api_format in STANDARD_SURFACES {
+        // verbosity 仅在 OpenAI 系与 Chat 目标有已审计映射；Claude/Gemini
+        // 目标按 fail-closed 语义拒绝，typed 路由不再静默丢弃。
+        for provider_api_format in [
+            "openai:chat",
+            "openai:responses",
+            "openai:responses:compact",
+        ] {
             for upstream_is_stream in [false, true] {
                 let converted = build_standard_request_body(
                     &request,
@@ -1204,6 +1210,23 @@ mod tests {
                     "typed canonical openai:responses -> {provider_api_format} changed payload with upstream_is_stream={upstream_is_stream}"
                 );
             }
+        }
+        for provider_api_format in ["claude:messages", "gemini:generate_content"] {
+            assert!(
+                build_standard_request_body(
+                    &request,
+                    "openai:responses",
+                    "mapped-model",
+                    "custom",
+                    provider_api_format,
+                    "/v1/responses",
+                    false,
+                    None,
+                    None,
+                )
+                .is_none(),
+                "typed canonical openai:responses -> {provider_api_format} must fail closed on unmapped verbosity"
+            );
         }
     }
 
@@ -1416,12 +1439,10 @@ mod tests {
             "thinking": {"type": "enabled", "budget_tokens": 2048}
         });
 
-        for provider_api_format in [
-            "openai:chat",
-            "openai:responses",
-            "openai:responses:compact",
-            "gemini:generate_content",
-        ] {
+        // Claude thinking 块到 Responses 目标保持 fail closed：Claude signature 与
+        // OpenAI encrypted reasoning 是不同协议语义，不做隐式互换；Chat/Gemini
+        // 目标继续走已审计映射并保持与 legacy 输出一致。
+        for provider_api_format in ["openai:chat", "gemini:generate_content"] {
             for upstream_is_stream in [false, true] {
                 let converted = build_standard_request_body(
                     &request,
@@ -1435,33 +1456,6 @@ mod tests {
                     None,
                 )
                 .expect("typed canonical claude route should build");
-                if matches!(
-                    provider_api_format,
-                    "openai:responses" | "openai:responses:compact"
-                ) {
-                    assert!(converted.get("instructions").is_none());
-                    assert_eq!(converted["input"][0]["role"], "developer");
-                    assert_eq!(converted["input"][0]["content"][0]["text"], "Be exact.");
-                    assert_eq!(converted["max_output_tokens"], 128);
-                    assert_eq!(converted["text"]["verbosity"], "medium");
-                    assert_eq!(converted["reasoning"]["effort"], "medium");
-                    assert_eq!(converted["reasoning"]["summary"], "auto");
-                    if provider_api_format == "openai:responses" {
-                        assert_eq!(converted["store"], false);
-                        assert!(converted["include"]
-                            .as_array()
-                            .expect("include")
-                            .iter()
-                            .any(|value| value.as_str() == Some("reasoning.encrypted_content")));
-                    } else {
-                        assert!(converted.get("store").is_none());
-                        assert!(converted.get("include").is_none());
-                    }
-                    let input_json = converted["input"].to_string();
-                    assert!(!input_json.contains("<thinking>plan</thinking>"));
-                    assert!(!input_json.contains("sig_123"));
-                    continue;
-                }
                 if provider_api_format == "gemini:generate_content" {
                     assert_eq!(
                         converted["contents"][2]["parts"][0]["functionResponse"]["response"]
@@ -1477,6 +1471,23 @@ mod tests {
                     "typed canonical claude:messages -> {provider_api_format} changed payload with upstream_is_stream={upstream_is_stream}"
                 );
             }
+        }
+        for provider_api_format in ["openai:responses", "openai:responses:compact"] {
+            assert!(
+                build_standard_request_body(
+                    &request,
+                    "claude:messages",
+                    "mapped-model",
+                    "custom",
+                    provider_api_format,
+                    "/v1/messages",
+                    false,
+                    None,
+                    None,
+                )
+                .is_none(),
+                "typed canonical claude:messages -> {provider_api_format} must fail closed on Claude thinking blocks"
+            );
         }
     }
 
@@ -1532,32 +1543,63 @@ mod tests {
             }
         });
 
-        for provider_api_format in [
-            "openai:chat",
-            "openai:responses",
-            "openai:responses:compact",
-            "claude:messages",
-        ] {
-            for upstream_is_stream in [false, true] {
-                let converted = build_standard_request_body(
+        // Gemini thought parts 到 Responses 目标保持 fail closed（thoughtSignature
+        // 与 OpenAI encrypted reasoning 协议语义不同）；Chat 走已审计映射并保持
+        // 与 legacy 输出一致。Claude 目标 typed 直转可构建，但 legacy 的
+        // chat 中间形态会以扩展字段携带 thoughtSignature 侧车，按 fail-closed
+        // 语义被拒绝，因此该面不再做 legacy 等价对比。
+        for upstream_is_stream in [false, true] {
+            let converted = build_standard_request_body(
+                &request,
+                "gemini:generate_content",
+                "mapped-model",
+                "custom",
+                "openai:chat",
+                "/v1beta/models/source-model:generateContent",
+                upstream_is_stream,
+                None,
+                None,
+            )
+            .expect("typed canonical gemini route should build");
+            let legacy = legacy_gemini_request_body(&request, "openai:chat", upstream_is_stream);
+            assert_eq!(
+                converted, legacy,
+                "typed canonical gemini:generate_content -> openai:chat changed payload with upstream_is_stream={upstream_is_stream}"
+            );
+        }
+        for upstream_is_stream in [false, true] {
+            let converted = build_standard_request_body(
+                &request,
+                "gemini:generate_content",
+                "mapped-model",
+                "custom",
+                "claude:messages",
+                "/v1beta/models/source-model:generateContent",
+                upstream_is_stream,
+                None,
+                None,
+            )
+            .expect("typed canonical gemini route should build for claude");
+            assert_eq!(converted["model"], "mapped-model");
+            assert_eq!(converted["messages"][1]["content"][0]["type"], "thinking");
+            assert_eq!(converted["messages"][1]["content"][1]["type"], "tool_use");
+        }
+        for provider_api_format in ["openai:responses", "openai:responses:compact"] {
+            assert!(
+                build_standard_request_body(
                     &request,
                     "gemini:generate_content",
                     "mapped-model",
                     "custom",
                     provider_api_format,
                     "/v1beta/models/source-model:generateContent",
-                    upstream_is_stream,
+                    false,
                     None,
                     None,
                 )
-                .expect("typed canonical gemini route should build");
-                let legacy =
-                    legacy_gemini_request_body(&request, provider_api_format, upstream_is_stream);
-                assert_eq!(
-                    converted, legacy,
-                    "typed canonical gemini:generate_content -> {provider_api_format} changed payload with upstream_is_stream={upstream_is_stream}"
-                );
-            }
+                .is_none(),
+                "typed canonical gemini:generate_content -> {provider_api_format} must fail closed on Gemini thought parts"
+            );
         }
     }
 
@@ -1567,7 +1609,17 @@ mod tests {
 
         for client_api_format in STANDARD_SURFACES {
             let (mut request, request_path) = sample_request_for(client_api_format);
-            if let Some(object) = request.as_object_mut() {
+            // 按各格式的原生字段位置注入采样参数：Gemini 的 temperature/top_p
+            // 属于 generationConfig，根级键不在其审计 schema 内。
+            if *client_api_format == "gemini:generate_content" {
+                let generation_config = request
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut("generationConfig"))
+                    .and_then(Value::as_object_mut)
+                    .expect("gemini sample request has generationConfig");
+                generation_config.insert("temperature".to_string(), json!(0.7));
+                generation_config.insert("topP".to_string(), json!(0.8));
+            } else if let Some(object) = request.as_object_mut() {
                 object.insert("temperature".to_string(), json!(0.7));
                 object.insert("top_p".to_string(), json!(0.8));
             }
@@ -1667,7 +1719,12 @@ mod tests {
     }
 
     #[test]
-    fn standard_codex_responses_strip_cache_control_without_synthesizing_a_cache_key() {
+    fn standard_codex_responses_rejects_claude_cache_control_without_bridge_projection() {
+        // Claude 原生 cache_control 跨格式没有无损等价物：pure/runtime 统一
+        // fail closed，不再依赖 codex overlay 事后剥离。需要保留 cache 语义的
+        // 流程必须先走显式 bridge sanitize（投影为 prompt cache breakpoint）。
+        // Responses 源 cache_control 的 overlay 剥离仍由
+        // standard_openai_responses_strips_content_cache_control_after_body_rules 覆盖。
         fn claude_request(user_text: &str) -> Value {
             json!({
                 "model": "claude-sonnet",
@@ -1684,37 +1741,48 @@ mod tests {
             })
         }
 
-        let body_a = claude_request("new turn A");
-        let body_b = claude_request("new turn B");
-        let converted_a = build_standard_request_body(
-            &body_a,
-            "claude:messages",
-            "gpt-5.4",
-            "codex",
-            "openai:responses",
-            "/v1/messages",
-            true,
-            None,
-            Some("key-a"),
-        )
-        .expect("claude to codex responses request should build");
-        let converted_b = build_standard_request_body(
-            &body_b,
-            "claude:messages",
-            "gpt-5.4",
-            "codex",
-            "openai:responses",
-            "/v1/messages",
-            true,
-            None,
-            Some("key-a"),
-        )
-        .expect("claude to codex responses request should build");
+        for user_text in ["new turn A", "new turn B"] {
+            assert!(
+                build_standard_request_body(
+                    &claude_request(user_text),
+                    "claude:messages",
+                    "gpt-5.4",
+                    "codex",
+                    "openai:responses",
+                    "/v1/messages",
+                    true,
+                    None,
+                    Some("key-a"),
+                )
+                .is_none(),
+                "claude cache_control must fail closed for codex responses without bridge sanitize"
+            );
+        }
 
-        assert!(converted_a.get("prompt_cache_key").is_none());
-        assert!(converted_b.get("prompt_cache_key").is_none());
-        assert!(!converted_a.to_string().contains("cache_control"));
-        assert!(!converted_b.to_string().contains("cache_control"));
+        // 无 cache_control 的同形请求仍可正常构建。
+        let clean = json!({
+            "model": "claude-sonnet",
+            "system": [{"type": "text", "text": "stable system brief"}],
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "new turn A"}]
+            }],
+            "max_tokens": 128
+        });
+        let converted = build_standard_request_body(
+            &clean,
+            "claude:messages",
+            "gpt-5.4",
+            "codex",
+            "openai:responses",
+            "/v1/messages",
+            true,
+            None,
+            Some("key-a"),
+        )
+        .expect("clean claude to codex responses request should build");
+        assert!(converted.get("prompt_cache_key").is_none());
+        assert!(!converted.to_string().contains("cache_control"));
     }
 
     #[test]
@@ -2210,6 +2278,27 @@ mod tests {
                     "tools": tools,
                     "tool_choice": {"type": "tool", "name": name}
                 });
+                if hosted {
+                    // Claude 原生 web_search 服务端工具到通用 Responses 目标
+                    // 无已审计映射（xAI overlay 的 hosted search 投影是 provider
+                    // 私有适配），跨格式统一 fail closed。
+                    assert!(
+                        build_standard_request_body(
+                            &request,
+                            "claude:messages",
+                            "grok-4.6",
+                            "xai",
+                            "openai:responses",
+                            "/v1/messages",
+                            true,
+                            None,
+                            None,
+                        )
+                        .is_none(),
+                        "claude hosted web_search must fail closed for generic responses targets"
+                    );
+                    continue;
+                }
                 let converted = build_standard_request_body(
                     &request,
                     "claude:messages",
@@ -2226,14 +2315,11 @@ mod tests {
                     converted["tool_choice"],
                     json!({"type": "function", "name": name})
                 );
-                assert_eq!(
-                    converted["tools"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|tool| tool["type"] == "web_search"),
-                    hosted
-                );
+                assert!(converted["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|tool| tool["type"] != "web_search"));
             }
         }
 
@@ -2243,23 +2329,20 @@ mod tests {
             "tools": [{"type": "web_search_20260209", "name": "internet_search"}],
             "tool_choice": {"type": "tool", "name": "internet_search"}
         });
-        let converted = build_standard_request_body(
-            &request,
-            "claude:messages",
-            "grok-4.6",
-            "xai",
-            "openai:responses",
-            "/v1/messages",
-            true,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            converted["tool_choice"],
-            json!({
-                "type": "allowed_tools", "mode": "required", "tools": [{"type": "web_search"}]
-            })
+        assert!(
+            build_standard_request_body(
+                &request,
+                "claude:messages",
+                "grok-4.6",
+                "xai",
+                "openai:responses",
+                "/v1/messages",
+                true,
+                None,
+                None,
+            )
+            .is_none(),
+            "claude web_search server tool must fail closed without an audited mapping"
         );
     }
 
@@ -2375,7 +2458,9 @@ mod tests {
     }
 
     #[test]
-    fn xai_standard_conversion_strips_unsupported_responses_fields() {
+    fn xai_standard_conversion_rejects_unmapped_chat_fields_for_responses() {
+        // stop/stream_options（以及 web_search_options 的通用 Responses 映射）
+        // 没有已审计等价物：跨格式 fail closed，不再依赖 xAI 事后剥离。
         let request = json!({
             "model": "source-model",
             "messages": [{"role": "user", "content": "Hello xAI"}],
@@ -2385,8 +2470,31 @@ mod tests {
             "metadata": {"user_id": "claude-session"},
             "web_search_options": {"search_context_size": "high"}
         });
+        assert!(
+            build_standard_request_body(
+                &request,
+                "openai:chat",
+                "grok-4.6",
+                "xai",
+                "openai:responses",
+                "/v1/chat/completions",
+                true,
+                None,
+                None,
+            )
+            .is_none(),
+            "unmapped chat fields must fail closed onto xAI Responses"
+        );
+
+        // 无未映射字段的同形请求仍可正常转换。
+        let clean = json!({
+            "model": "source-model",
+            "messages": [{"role": "user", "content": "Hello xAI"}],
+            "max_tokens": 128,
+            "metadata": {"user_id": "claude-session"}
+        });
         let converted = build_standard_request_body(
-            &request,
+            &clean,
             "openai:chat",
             "grok-4.6",
             "xai",
@@ -2396,16 +2504,14 @@ mod tests {
             None,
             None,
         )
-        .expect("chat should convert onto xAI Responses");
+        .expect("clean chat should convert onto xAI Responses");
 
         assert_eq!(converted["model"], "grok-4.6");
         assert!(converted.get("stop").is_none());
         assert!(converted.get("stream_options").is_none());
-        assert!(converted.get("previous_response_id").is_none());
         assert!(converted.get("metadata").is_none());
         assert!(converted.get("input").is_some() || converted.get("messages").is_none());
         assert_eq!(converted["max_output_tokens"], 128);
-        assert_eq!(converted["tools"][0]["type"], "web_search");
     }
 
     #[test]
@@ -2427,8 +2533,38 @@ mod tests {
             ],
             "tool_choice": {"type": "tool", "name": "web_search"}
         });
+        // Claude 原生 web_search 服务端工具到 Responses 无已审计通用映射：
+        // 统一 fail closed；xAI overlay 的 hosted search 投影属 provider 私有适配。
+        assert!(
+            build_standard_request_body(
+                &claude,
+                "claude:messages",
+                "grok-4.6",
+                "xai",
+                "openai:responses",
+                "/v1/messages",
+                true,
+                None,
+                None,
+            )
+            .is_none(),
+            "claude web_search server tool must fail closed onto xAI Responses"
+        );
+
+        // 普通函数工具的 Claude 请求仍可转换。
+        let claude_clean = json!({
+            "model": "claude-sonnet",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Hello xAI"}],
+            "tools": [{
+                "name": "lookup",
+                "description": "Look something up",
+                "input_schema": {"type": "object", "properties": {}}
+            }],
+            "tool_choice": {"type": "tool", "name": "lookup"}
+        });
         let converted = build_standard_request_body(
-            &claude,
+            &claude_clean,
             "claude:messages",
             "grok-4.6",
             "xai",
@@ -2438,22 +2574,16 @@ mod tests {
             None,
             None,
         )
-        .expect("claude should convert onto xAI Responses");
+        .expect("claude with plain function tools should convert onto xAI Responses");
         assert_eq!(converted["model"], "grok-4.6");
         assert!(converted.get("metadata").is_none());
         assert!(converted.get("context_management").is_none());
-        assert!(converted
-            .get("include")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|item| item == "reasoning.encrypted_content"));
         assert!(converted["tools"]
             .as_array()
             .into_iter()
             .flatten()
-            .any(|tool| tool["type"] == "web_search"));
-        assert_eq!(converted["tool_choice"]["type"], "allowed_tools");
+            .all(|tool| tool["type"] == "function"));
+        assert_eq!(converted["tool_choice"]["type"], "function");
         assert!(converted.get("input").is_some());
 
         let gemini = json!({
@@ -2464,8 +2594,34 @@ mod tests {
             }],
             "tools": [{"googleSearch": {}}]
         });
+        // Gemini googleSearch 内置工具到通用 Responses 无已审计映射
+        // （xAI hosted search 投影是 provider 私有适配），跨格式统一 fail closed。
+        assert!(
+            build_standard_request_body(
+                &gemini,
+                "gemini:generate_content",
+                "grok-4.6",
+                "xai",
+                "openai:responses",
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+                false,
+                None,
+                None,
+            )
+            .is_none(),
+            "gemini googleSearch builtin tool must fail closed for generic responses targets"
+        );
+
+        // 无内置工具的 Gemini 请求仍可转换。
+        let gemini_clean = json!({
+            "model": "gemini-2.5-pro",
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": "Hello xAI"}]
+            }]
+        });
         let converted = build_standard_request_body(
-            &gemini,
+            &gemini_clean,
             "gemini:generate_content",
             "grok-4.6",
             "xai",
@@ -2475,9 +2631,8 @@ mod tests {
             None,
             None,
         )
-        .expect("gemini should convert onto xAI Responses");
+        .expect("clean gemini should convert onto xAI Responses");
         assert_eq!(converted["model"], "grok-4.6");
-        assert_eq!(converted["tools"][0]["type"], "web_search");
         assert!(converted.get("input").is_some());
 
         let same_format = json!({

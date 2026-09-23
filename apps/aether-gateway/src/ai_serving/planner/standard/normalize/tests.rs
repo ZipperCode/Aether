@@ -673,9 +673,11 @@ fn applies_codex_defaults_unless_body_rules_handle_the_field() {
             "role": "user",
             "content": [{"type": "text", "text": "hello"}]
         }],
-        "metadata": {"trace_id": "abc"},
-        "store": true
+        "metadata": {"trace_id": "abc"}
     });
+    // 说明：store 不是合法的 Claude 协议根字段；它的最终值由 codex 默认值
+    // 与 body rules 在转换后决定，旧流程中 body 携带的 store 也会被转换丢弃，
+    // 因此 fixture 不再依赖该字段（跨格式审计会对其 fail closed）。
     let body_rules = json!([
         {"action":"set","path":"store","value":true},
         {"action":"set","path":"instructions","value":"Custom instructions"},

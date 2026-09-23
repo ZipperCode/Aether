@@ -481,6 +481,20 @@
                     <Button
                       variant="ghost"
                       size="icon"
+                      class="h-7 w-7 text-green-600 hover:text-green-700"
+                      :disabled="refreshingHealthKeyId === key.key_id"
+                      :title="getPoolKeyRecoverHealthTitle(key)"
+                      :aria-label="getPoolKeyRecoverHealthTitle(key)"
+                      @click="handleRecoverKeyHealth(key)"
+                    >
+                      <RefreshCw
+                        class="w-3.5 h-3.5"
+                        :class="{ 'animate-spin': refreshingHealthKeyId === key.key_id }"
+                      />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
                       class="h-7 w-7"
                       title="模型权限"
                       @click="handleKeyPermissions(key)"
@@ -825,6 +839,21 @@
                     />
                   </Button>
                   <Button
+                    v-else-if="actionId === 'recover_health'"
+                    variant="ghost"
+                    size="icon"
+                    class="h-7 w-7 shrink-0 text-green-600 hover:text-green-700"
+                    :disabled="refreshingHealthKeyId === key.key_id"
+                    :title="getPoolKeyRecoverHealthTitle(key)"
+                    :aria-label="getPoolKeyRecoverHealthTitle(key)"
+                    @click="handleRecoverKeyHealth(key)"
+                  >
+                    <RefreshCw
+                      class="w-3.5 h-3.5"
+                      :class="{ 'animate-spin': refreshingHealthKeyId === key.key_id }"
+                    />
+                  </Button>
+                  <Button
                     v-else-if="actionId === 'permissions'"
                     variant="ghost"
                     size="icon"
@@ -1142,6 +1171,7 @@ import {
   clearQuotaExhausted,
 } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
+import { recoverKeyHealth } from '@/api/endpoints/health'
 import type {
   PoolOverviewItem,
   PoolKeyDetail,
@@ -2012,6 +2042,8 @@ const refreshingOAuthKeyId = ref<string | null>(null)
 const consumingCodexResetCreditKeyId = ref<string | null>(null)
 const resettingCycleKeyId = ref<string | null>(null)
 const restoringQuotaKeyId = ref<string | null>(null)
+/** 当前正在刷新健康度的 Key；同一时刻只允许一个恢复请求，防止重复触发。 */
+const refreshingHealthKeyId = ref<string | null>(null)
 const savingProxyKeyId = ref<string | null>(null)
 const proxyDesktopPopoverOpenKeyId = ref<string | null>(null)
 const proxyMobilePopoverOpenKeyId = ref<string | null>(null)
@@ -2253,6 +2285,7 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
         canResetCycleStats: canResetCycleStats(key),
         canClearCooldown: Boolean(key.cooldown_reason),
         canRestoreQuota: isQuotaSchedulingBlocked(key),
+        canRecoverHealth: true,
         hasProxy: true,
       }).primary,
       ...getModelFetchDisplay(key),
@@ -3145,6 +3178,32 @@ async function clearCooldown(keyId: string) {
     await Promise.all([loadKeys({ silent: true }), loadOverview({ silent: true })])
   } catch (err) {
     showError(parseApiError(err))
+  }
+}
+
+/**
+ * 单 Key 刷新健康度入口文案。复用 Provider 详情页的健康恢复语义：
+ * 这是管理侧恢复（重置健康度 + 关闭熔断器），不会向上游发起真实探测请求。
+ */
+function getPoolKeyRecoverHealthTitle(key: PoolKeyDetail): string {
+  const action = key.circuit_breaker_open ? '重置熔断器并刷新健康度' : '刷新健康度'
+  return `${action}（管理恢复，不发起上游探测）`
+}
+
+async function handleRecoverKeyHealth(key: PoolKeyDetail) {
+  if (refreshingHealthKeyId.value) return
+  refreshingHealthKeyId.value = key.key_id
+  try {
+    const result = await recoverKeyHealth(key.key_id)
+    // 先就地更新当前行的健康数据让列表立即反映恢复结果，再静默同步列表与概览拿到权威状态。
+    key.health_score = result.details.health_score
+    key.circuit_breaker_open = result.details.circuit_breaker_open
+    success(result.message || '健康状态已恢复')
+    await Promise.all([loadKeys({ silent: true }), loadOverview({ silent: true })])
+  } catch (err) {
+    showError(parseApiError(err, '刷新健康度失败'))
+  } finally {
+    refreshingHealthKeyId.value = null
   }
 }
 

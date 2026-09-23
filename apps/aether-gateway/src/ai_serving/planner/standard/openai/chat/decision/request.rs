@@ -2623,10 +2623,12 @@ mod tests {
             .body(())
             .expect("request should build");
         let (parts, _) = request.into_parts();
+        // 说明：generationConfig 不是合法的 OpenAI Chat 根字段（旧流程会静默
+        // 丢弃其中的 temperature）；采样参数应放在 Chat 原生位置。
         let body_json = json!({
             "model": "gemini-2.5-pro",
             "messages": [{"role": "user", "content": "hello"}],
-            "generationConfig": {"temperature": 0.2},
+            "temperature": 0.2,
             "stream": true
         });
 

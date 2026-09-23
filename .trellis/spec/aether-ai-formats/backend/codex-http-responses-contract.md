@@ -64,6 +64,12 @@ Preserve `model`, `input`, `instructions`, `tools`, `parallel_tool_calls`, `reas
 
 Forward only headers allowed by the existing provider transport policy. Strip downstream `Authorization`, API-key variants, `Cookie`, `Proxy-Authorization`, hop-by-hop headers, and Aether-owned internal headers. Inject the selected provider credential at provider egress.
 
+Codex 的 `apply_codex_openai_special_headers` 必须保留最终请求头集合中已有的非空 `User-Agent`（名称大小写不敏感），包括客户端透传值和管理员显式覆盖值。只有缺失或空白时才使用内置 `CODEX_CLIENT_USER_AGENT`；不得用固定 CLI 版本覆盖客户端版本。`originator` 的既有身份契约不变。该阶段在 header rules 之后运行，既有显式删除后补回默认 UA 的行为未改变。
+
+回归边界：`codex_user_agent_keeps_incoming_client_version`、`codex_user_agent_keeps_explicit_value_over_passthrough_copy`、`codex_user_agent_falls_back_to_bundled_client_when_missing`；错误做法是通过升级固定版本代替透传，正确做法是保留最终已有值、仅缺失时回退。
+
+2026-09-23 通过本机 `codex --version` 核实 `codex-cli 0.154.0`，内置版本及 UA 回退同步为 `0.154.0` / `codex_cli_rs/0.154.0`。共享常量同时用于缺省模型目录 `client_version` 和 Agent Identity 版本；客户端自带值仍优先。版本标识不是协议能力声明，不能据此省略请求、工具与流事件的兼容性验证。
+
 ### HTTP SSE and errors
 
 Cross-format Responses output places raw reasoning in `content` entries of type

@@ -203,7 +203,7 @@ import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { useFormDialog } from '@/composables/useFormDialog'
 import { parseApiError } from '@/utils/errorParser'
-import { parseNumberInput, parseNullableNumberInput } from '@/utils/form'
+import { parseNumberInput, parseNullableNumberInput, parsePatternText } from '@/utils/form'
 import {
   updateProviderKey,
   type EndpointAPIKey,
@@ -358,15 +358,6 @@ async function handleCancel() {
   _baseHandleCancel()
 }
 
-// 将逗号分隔的文本解析为数组（去空、去重）
-function parsePatternText(text: string): string[] {
-  if (!text.trim()) return []
-  const patterns = text
-    .split(',')
-    .map(s => s.trim())
-    .filter(s => s.length > 0)
-  return [...new Set(patterns)]
-}
 
 /** 保存 OAuth Key，并向父组件回传服务端最终快照。 */
 async function handleSave() {
