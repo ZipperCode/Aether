@@ -125,6 +125,11 @@ pub(crate) fn source_balance_below_minimum(
         if source_not_applicable(source) {
             continue;
         }
+        // 免费模型请求数不是资金来源：不参与金额阈值，也不能把金额推断降级为未知，
+        // 否则 Key 消费限额的低余额事实会被并存的免费来源意外取消。
+        if source.get("product").and_then(Value::as_str) == Some("model_requests") {
+            continue;
+        }
         if !source_is_fresh(source)
             || !matches!(
                 source.get("product").and_then(Value::as_str),

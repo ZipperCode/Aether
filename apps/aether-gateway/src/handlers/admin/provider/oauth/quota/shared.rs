@@ -22,7 +22,9 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogKey,
 };
 use aether_provider_pool::{
-    ProviderPoolQuotaRequestSpec, ProviderPoolService, ProviderQuotaServingPolicy,
+    deepseek_quota_url_host_is_allowed, official_api_key_quota_url_host_is_allowed,
+    openrouter_quota_url_host_is_allowed, ProviderPoolQuotaRequestSpec, ProviderPoolService,
+    ProviderQuotaServingPolicy,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -1730,6 +1732,11 @@ fn provider_quota_url_has_allowed_origin(provider_name: &str, value: &str) -> bo
         "xai" => host == "cli-chat-proxy.grok.com",
         "windsurf" => host == "server.codeium.com",
         "kiro" => kiro_quota_host_is_allowed(host),
+        "deepseek" => deepseek_quota_url_host_is_allowed(host),
+        "openrouter" => openrouter_quota_url_host_is_allowed(host),
+        provider @ ("moonshot" | "kimi_coding" | "siliconflow" | "zhipu" | "zai" | "minimax") => {
+            official_api_key_quota_url_host_is_allowed(provider, host)
+        }
         _ => false,
     }
 }
@@ -1843,6 +1850,39 @@ mod tests {
                 "kiro",
                 "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR",
             ),
+            // 官方 API Key 供商的真实额度出站 URL 不再被公共 origin 策略拦截。
+            ("deepseek", "https://api.deepseek.com/user/balance"),
+            ("openrouter", "https://openrouter.ai/api/v1/key"),
+            ("moonshot", "https://api.moonshot.cn/v1/users/me/balance"),
+            ("moonshot", "https://api.moonshot.ai/v1/users/me/balance"),
+            ("kimi_coding", "https://api.kimi.com/coding/v1/usages"),
+            ("kimi_coding", "https://api.kimi.ai/coding/v1/usages"),
+            ("siliconflow", "https://api.siliconflow.com/v1/user/info"),
+            (
+                "zhipu",
+                "https://open.bigmodel.cn/api/monitor/usage/quota/limit?type=2",
+            ),
+            (
+                "zhipu",
+                "https://open.bigmodel.cn/api/biz/account/query-customer-account-report",
+            ),
+            ("zai", "https://api.z.ai/api/monitor/usage/quota/limit"),
+            (
+                "minimax",
+                "https://api.minimaxi.com/account/query_balance",
+            ),
+            (
+                "minimax",
+                "https://api.minimaxi.com/v1/token_plan/remains",
+            ),
+            (
+                "minimax",
+                "https://api.minimax.io/account/query_balance",
+            ),
+            (
+                "minimax",
+                "https://api.minimax.io/v1/token_plan/remains",
+            ),
         ] {
             assert!(
                 provider_quota_url_has_allowed_origin(provider_name, url),
@@ -1892,6 +1932,33 @@ mod tests {
                 "https://q.us-east-1.amazonaws.com.attacker.test/getUsageLimits",
             ),
             ("unknown", "https://chatgpt.com/backend-api/wham/usage"),
+            // 伪造 host、非 443 端口、URL 凭据与未知供商一律拒绝。
+            (
+                "deepseek",
+                "https://api.deepseek.com.attacker.test/user/balance",
+            ),
+            ("deepseek", "http://api.deepseek.com/user/balance"),
+            (
+                "deepseek",
+                "https://user:secret@api.deepseek.com/user/balance",
+            ),
+            (
+                "openrouter",
+                "https://openrouter.ai.attacker.test/api/v1/key",
+            ),
+            (
+                "minimax",
+                "https://api.minimaxi.com:8443/account/query_balance",
+            ),
+            (
+                "minimax",
+                "https://api.minimaxi.com.attacker.test/v1/token_plan/remains",
+            ),
+            (
+                "zhipu",
+                "https://open.bigmodel.cn.attacker.test/api/monitor/usage/quota/limit",
+            ),
+            ("custom", "https://api.minimaxi.com/account/query_balance"),
         ] {
             assert!(
                 !provider_quota_url_has_allowed_origin(provider_name, url),

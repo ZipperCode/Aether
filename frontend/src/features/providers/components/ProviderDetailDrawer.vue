@@ -49,6 +49,33 @@
             />
 
             <div class="space-y-6 p-4 sm:p-6">
+              <!-- 历史站点 custom 官方域名提示 -->
+              <div
+                v-if="officialProviderSuggestion"
+                class="rounded-lg border border-blue-500/30 bg-blue-500/5 p-3.5 text-xs"
+                data-testid="provider-custom-official-suggestion"
+              >
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
+                  <div class="space-y-1">
+                    <div class="font-medium text-blue-900 dark:text-blue-100 flex items-center gap-1.5">
+                      <Info class="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                      <span>{{ legacyT('可启用官方额度查询') }}</span>
+                    </div>
+                    <div class="text-blue-700 dark:text-blue-300 text-[11px] leading-relaxed">
+                      {{ legacyT(`当前端点使用官方域名（${officialProviderSuggestion.officialHost}），尚未启用官方额度类型。建议切换为【${officialProviderSuggestion.label}】以支持额度查询与状态监控。`) }}
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    class="shrink-0 h-8 border-blue-500/30 text-blue-700 dark:text-blue-300 hover:bg-blue-500/10 self-start sm:self-center"
+                    @click="$emit('edit', provider, officialProviderSuggestion.suggestedType)"
+                  >
+                    {{ legacyT('前往确认切换类型') }}
+                  </Button>
+                </div>
+              </div>
+
               <!-- 配额使用情况 -->
               <ProviderMonthlyQuotaCard
                 v-if="provider.billing_type === 'monthly_quota' && provider.monthly_quota_usd"
@@ -136,7 +163,7 @@
                           :kiro-subscription-class="shouldShowKiroSubscriptionBadge(key) ? getOAuthPlanTypeClass(getKiroSubscriptionBadgeLabel(key)) : ''"
                           :quota-type-label="getGenericQuotaTypeLabel(key)"
                           :quota-status-label="getGenericQuotaStatusLabel(key)"
-                          :quota-status-title="getQuotaSchedulingTitle(key)"
+                          :quota-status-title="getGenericQuotaTooltip(key)"
                           :can-export-credential="canExportOAuthCredential(key)"
                           :show-o-auth-refresh-control="shouldShowOAuthRefreshControl(key, provider.provider_type)"
                           :account-level-block="isAccountLevelBlock(key)"
@@ -1018,6 +1045,7 @@ import {
   Loader2,
   GripVertical,
   ShieldX,
+  Info,
 } from 'lucide-vue-next'
 import { parseApiError } from '@/utils/errorParser'
 import { useEscapeKey } from '@/composables/useEscapeKey'
@@ -1036,6 +1064,7 @@ import {
   getProviderMappingPreview,
   type ProviderMappingPreviewResponse,
   type ProviderWithEndpointsSummary,
+  type ProviderType,
 } from '@/api/endpoints'
 import { adminApi } from '@/api/admin'
 import {
@@ -1095,6 +1124,7 @@ import type {
 } from '@/api/endpoints/types'
 import { formatApiFormatShort } from '@/api/endpoints/types/api-format'
 import { isOAuthAccountProviderType, isKeyManagedProviderType, isOfficialQuotaProviderType } from '../utils/providerTypeUtils'
+import { selectOpenProviderSnapshot } from '../utils/providerOpenState'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 import { getOAuthRefreshFeedback } from '@/utils/oauthRefreshFeedback'
 import {
@@ -1121,11 +1151,12 @@ import {
 import {
   getGeminiCliAccountCreditsText,
   getGenericQuotaTypeLabel as getQuotaTypeLabel,
+  getGenericQuotaStatusTitle,
   getQuotaQueryStatusLabel,
   getQuotaWindowRemainingPercent as getWindowRemainingPercent,
   finiteNumber,
 } from '@/utils/providerKeyQuota'
-import { selectOpenProviderSnapshot } from '@/features/providers/utils/providerOpenState'
+import { detectOfficialProviderFromEndpoints } from '@/features/providers/utils/officialEndpointDetection'
 import ProviderGenericQuotaCard from './ProviderGenericQuotaCard.vue'
 import {
   clearPendingCodexResetCreditIdempotencyKey,
@@ -1156,7 +1187,7 @@ interface Props {
 const props = defineProps<Props>()
 const emit = defineEmits<{
   (e: 'update:open', value: boolean): void
-  (e: 'edit', provider: ProviderWithEndpointsSummary): void
+  (e: 'edit', provider: ProviderWithEndpointsSummary, suggestedType?: ProviderType): void
   (e: 'toggleStatus', provider: ProviderWithEndpointsSummary): void
   (e: 'refresh'): void
 }>()
@@ -2024,16 +2055,17 @@ function isQuotaSchedulingSuspected(key: EndpointAPIKey): boolean {
   return scheduling?.code === 'quota_suspected' && scheduling.blocked !== true
 }
 
-function getQuotaSchedulingTitle(key: EndpointAPIKey): string {
-  const scheduling = key.status_snapshot?.scheduling
-  if (!scheduling) return ''
-  const parts = [isQuotaSchedulingBlocked(key) ? '额度耗尽·需人工恢复' : '疑似额度不足']
-  if (scheduling.reason) parts.push(scheduling.reason)
-  if (typeof scheduling.last_observed_at === 'number') {
-    parts.push(new Date(scheduling.last_observed_at * 1000).toLocaleString(locale.value))
-  }
-  return parts.join(' · ')
+function getGenericQuotaTooltip(key: EndpointAPIKey): string {
+  return getGenericQuotaStatusTitle({
+    quota: key.status_snapshot?.quota,
+    scheduling: key.status_snapshot?.scheduling,
+    providerType: getGenericQuotaProviderType(key),
+    locale: locale.value,
+  })
 }
+const officialProviderSuggestion = computed(() => {
+  return detectOfficialProviderFromEndpoints(provider.value?.provider_type, endpoints.value)
+})
 
 function getQuotaSnapshotForProvider(
   key: EndpointAPIKey,

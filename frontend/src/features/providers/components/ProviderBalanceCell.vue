@@ -95,9 +95,9 @@
       </div>
     </div>
   </div>
-  <!-- 余额查询失败时显示错误 -->
+  <!-- 余额查询真正失败时显示红色错误 -->
   <div
-    v-else-if="provider.ops_configured && getProviderBalanceError(provider.id)"
+    v-else-if="provider.ops_configured && getProviderBalanceError(provider.id) && !getProviderBalanceError(provider.id)?.isNeutral"
     class="text-xs text-destructive/80"
     :title="getProviderBalanceError(provider.id)?.message"
   >
@@ -108,18 +108,29 @@
     v-else-if="provider.billing_type === 'monthly_quota'"
     class="space-y-0.5 text-xs"
   >
-    <Badge
-      variant="outline"
-      class="text-[10px] font-normal border-border/50"
-    >
-      {{ formatBillingType(provider.billing_type) }}
-    </Badge>
+    <div class="flex items-center gap-1">
+      <Badge
+        variant="outline"
+        class="text-[10px] font-normal border-border/50"
+      >
+        {{ formatBillingType(provider.billing_type) }}
+      </Badge>
+      <span class="text-[9px] text-muted-foreground/60">{{ legacyT('本地配置') }}</span>
+    </div>
     <div class="text-muted-foreground/70 pt-0.5">
       <span
         class="font-semibold"
         :class="getQuotaUsedColorClass(provider)"
       >${{ (provider.monthly_used_usd ?? 0).toFixed(2) }}</span> / <span class="font-medium">${{ (provider.monthly_quota_usd ?? 0).toFixed(2) }}</span>
     </div>
+  </div>
+  <!-- 中性状态（未配置/不支持余额查询）：在无本地月度配额时展示中性灰色提示，不吞真正错误 -->
+  <div
+    v-else-if="provider.ops_configured && getProviderBalanceError(provider.id)?.isNeutral"
+    class="text-xs text-muted-foreground/70"
+    :title="getProviderBalanceError(provider.id)?.message"
+  >
+    {{ getProviderBalanceError(provider.id)?.message }}
   </div>
   <span
     v-else
@@ -140,7 +151,7 @@ defineProps<{
   isBalanceLoading: (providerId: string) => boolean
   getProviderBalance: (providerId: string) => { available: number | null; currency: string } | null
   getProviderBalanceBreakdown: (providerId: string) => { balance: number; points: number; currency: string } | null
-  getProviderBalanceError: (providerId: string) => { status: string; message: string } | null
+  getProviderBalanceError: (providerId: string) => { status: string; message: string; isNeutral?: boolean } | null
   getProviderCheckin: (providerId: string) => { success: boolean | null; message: string } | null
   getProviderCookieExpired: (providerId: string) => { expired: boolean; message: string } | null
   getProviderBalanceExtra: (providerId: string, architectureId?: string) => BalanceExtraItem[]

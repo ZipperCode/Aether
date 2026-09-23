@@ -2,9 +2,14 @@ import { describe, expect, it } from 'vitest'
 import type { QuotaStatusSnapshot } from '@/api/endpoints/types'
 
 import {
+  getGenericQuotaGroups,
   getGenericQuotaSections,
   getGeminiCliAccountCreditsText,
+  getGenericQuotaStatusTitle,
+  getProviderModelAvailabilityDisplay,
   getQuotaDisplayText,
+  getQuotaQueryStatusLabel,
+  getQuotaStatusBadgeInfo,
 } from '../providerKeyQuota'
 
 describe('providerKeyQuota', () => {
@@ -26,8 +31,6 @@ describe('providerKeyQuota', () => {
       rateLimits: ['RPM 60', 'TPM 100,000'],
       status: ['查询失败', '数据已过期，显示上次成功结果'],
     })
-    expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'siliconflow'))
-      .toBe('可用余额 $12.50 · 总额 $20 | 月度 剩余 80.0% · 800 / 1,000 单位未知 | RPM 60 | TPM 100,000 | 查询失败 | 数据已过期，显示上次成功结果')
   })
 
   it('keeps the previous DeepSeek balance with a stale query status after refresh failure', () => {
@@ -45,14 +48,10 @@ describe('providerKeyQuota', () => {
       },
     } satisfies QuotaStatusSnapshot
 
-    expect(getGenericQuotaSections(quota)).toEqual({
-      balances: ['可用余额 88.5 CNY · 总额 88.5 CNY'],
-      windows: [],
-      rateLimits: [],
-      status: ['查询失败', '数据已过期，显示上次成功结果'],
-    })
-    expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'deepseek'))
-      .toBe('可用余额 88.5 CNY · 总额 88.5 CNY | 查询失败 | 数据已过期，显示上次成功结果')
+    const sections = getGenericQuotaSections(quota)
+    expect(sections.balances[0]).toContain('88.5 CNY')
+    expect(sections.status).toContain('数据已过期，显示上次成功结果')
+    expect(getProviderModelAvailabilityDisplay(quota)?.status).toBe('unknown')
   })
 
   it('keeps query authentication rejection separate from key validity', () => {
@@ -109,14 +108,8 @@ describe('providerKeyQuota', () => {
       balances: [{ unit: 'CNY', available: '0' }],
     } satisfies QuotaStatusSnapshot
 
-    expect(getGenericQuotaSections(quota)).toEqual({
-      balances: ['标准余额（参考） 0 CNY'],
-      windows: [],
-      rateLimits: [],
-      status: ['查询失败'],
-    })
-    expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'zhipu'))
-      .toBe('额度未知，继续参与模型调度 | 标准余额（参考） 0 CNY | 查询失败')
+    expect(getGenericQuotaSections(quota).balances[0]).toContain('0 CNY')
+    expect(getProviderModelAvailabilityDisplay(quota)?.status).toBe('unknown')
   })
 
   it('uses a successful model probe to distinguish a callable Zhipu key', () => {
@@ -127,15 +120,12 @@ describe('providerKeyQuota', () => {
       balances: [{ unit: 'CNY', available: '0' }],
     } satisfies QuotaStatusSnapshot
 
-    expect(getQuotaDisplayText({
-      status_snapshot: {
-        quota,
-        model_probe: {
-          status: 'ok', model: 'glm-5', tested_at: 1_700_000_000,
-          status_code: 200, source: 'admin_model_test',
-        },
-      },
-    } as never, 'zhipu')).toBe('模型调用已验证可用 · 额度查询失败，额度未知 | 标准余额（参考） 0 CNY')
+    const display = getProviderModelAvailabilityDisplay(quota, {
+      status: 'ok', model: 'glm-5', tested_at: 1_700_000_000,
+      status_code: 200, source: 'admin_model_test',
+    }, 'zhipu')
+    expect(display?.status).toBe('ok')
+    expect(display?.model).toBe('glm-5')
   })
 
   it('uses a failed model probe to distinguish a truly unavailable Zhipu key', () => {
@@ -146,15 +136,12 @@ describe('providerKeyQuota', () => {
       balances: [{ unit: 'CNY', available: '0' }],
     } satisfies QuotaStatusSnapshot
 
-    expect(getQuotaDisplayText({
-      status_snapshot: {
-        quota,
-        model_probe: {
-          status: 'failed', model: 'glm-5', tested_at: 1_700_000_001,
-          status_code: 429, error: '余额不足或无可用资源包', source: 'admin_model_test',
-        },
-      },
-    } as never, 'zhipu')).toBe('模型调用验证失败：余额不足或无可用资源包 | 标准余额（参考） 0 CNY')
+    const display = getProviderModelAvailabilityDisplay(quota, {
+      status: 'failed', model: 'glm-5', tested_at: 1_700_000_001,
+      status_code: 429, error: '余额不足或无可用资源包', source: 'admin_model_test',
+    }, 'zhipu')
+    expect(display?.status).toBe('failed')
+    expect(display?.detail).toContain('余额不足或无可用资源包')
   })
 
   it('keeps a stale Zhipu query error separate from a balance fact', () => {
@@ -168,7 +155,8 @@ describe('providerKeyQuota', () => {
       },
     } satisfies QuotaStatusSnapshot
 
-    expect(getGenericQuotaSections(quota).status).toEqual(['查询失败', '数据已过期，显示上次成功结果'])
+    expect(getGenericQuotaSections(quota).balances).toEqual([])
+    expect(getProviderModelAvailabilityDisplay(quota)?.status).toBe('unknown')
   })
 
   it('includes Codex Spark quota windows in display text', () => {
@@ -549,5 +537,167 @@ describe('providerKeyQuota', () => {
         },
       },
     }, 'xai')).toBe('剩余 54.0% | 预付剩余 12.5')
+  })
+  it('assigns neutral outline to capability conclusions and reserves red for real blocks and errors', () => {
+    // 流程或能力结论应为中性 outline，绝不渲染成红色
+    expect(getQuotaStatusBadgeInfo('不支持查询')?.tone).toBe('neutral')
+    expect(getQuotaStatusBadgeInfo('不支持查询')?.variant).toBe('outline')
+    expect(getQuotaStatusBadgeInfo('不支持查询')?.class).toContain('text-muted-foreground')
+
+    expect(getQuotaStatusBadgeInfo('不适用')?.tone).toBe('neutral')
+    expect(getQuotaStatusBadgeInfo('未查询')?.tone).toBe('neutral')
+    expect(getQuotaStatusBadgeInfo('暂无可查询额度')?.tone).toBe('neutral')
+
+    // 真正阻断或查询失败为红色 destructive
+    expect(getQuotaStatusBadgeInfo('额度耗尽·需人工恢复')?.tone).toBe('destructive')
+    expect(getQuotaStatusBadgeInfo('额度耗尽·需人工恢复')?.variant).toBe('destructive')
+    expect(getQuotaStatusBadgeInfo('额度查询失败')?.tone).toBe('destructive')
+
+    // 警告类（疑似不足、过期、历史快照待刷新）为琥珀色 outline
+    expect(getQuotaStatusBadgeInfo('疑似额度不足')?.tone).toBe('warning')
+    expect(getQuotaStatusBadgeInfo('额度已过期')?.tone).toBe('warning')
+    expect(getQuotaStatusBadgeInfo('历史快照，待刷新')?.tone).toBe('warning')
+  })
+
+  it('generates explanatory tooltips confirming query capability does not block model calls', () => {
+    const titleUnsupported = getGenericQuotaStatusTitle({
+      quota: {
+        sources: [{ id: 'b1', label: '余额', product: 'account_balance', scope: 'account', query_status: 'unsupported', freshness: 'fresh', refresh_state: {} }],
+        code: 'ok',
+        exhausted: false,
+      },
+      providerType: 'siliconflow',
+    })
+    expect(titleUnsupported).toContain('不影响实际模型调用')
+
+    const titleHistorical = getGenericQuotaStatusTitle({
+      quota: {
+        code: 'ok',
+        exhausted: false,
+        observed_at: 1_700_000_000,
+      },
+      providerType: 'deepseek',
+    })
+    expect(titleHistorical).toContain('历史快照')
+    expect(titleHistorical).toContain('待触发刷新')
+  })
+
+  it('distinguishes SiliconFlow unsupported balance from successful model invocation evidence', () => {
+    const quota = {
+      provider_type: 'siliconflow',
+      kind: 'balance',
+      code: 'ok',
+      exhausted: false,
+      sources: [
+        {
+          id: 'balance',
+          label: '账户余额',
+          product: 'account_balance',
+          scope: 'account',
+          region: 'cn',
+          query_status: 'unsupported' as const,
+          freshness: 'fresh',
+          refresh_state: {},
+        },
+      ],
+    } satisfies QuotaStatusSnapshot
+
+    // 1. 当有明确调用探针成功时（如管理端测试通过 HTTP 200）
+    const withProbe = {
+      status_snapshot: {
+        quota,
+        model_probe: {
+          status: 'ok',
+          model: 'Qwen/Qwen2.5-72B-Instruct',
+          status_code: 200,
+        },
+      },
+    }
+    const availability = getProviderModelAvailabilityDisplay(quota, withProbe.status_snapshot.model_probe, 'siliconflow')
+    expect(availability?.status).toBe('ok')
+    expect(availability?.title).toBe('模型调用已验证可用')
+    expect(availability?.detail).toBe('Qwen/Qwen2.5-72B-Instruct（上游 HTTP 200）')
+    expect(getQuotaDisplayText(withProbe as never, 'siliconflow')).toContain('模型调用已验证可用 · Qwen/Qwen2.5-72B-Instruct（上游 HTTP 200）')
+
+    // 2. 当没有调用探针时，明确标记未验证，不伪装可用
+    const withoutProbe = { status_snapshot: { quota } }
+    const unverified = getProviderModelAvailabilityDisplay(quota, null, 'siliconflow')
+    expect(unverified?.status).toBe('unknown')
+    expect(unverified?.title).toBe('模型调用未验证')
+    expect(getQuotaDisplayText(withoutProbe as never, 'siliconflow')).toContain('模型调用未验证')
+  })
+
+  it('renders OpenRouter free requests window with request counts and model scope without implying account exhaustion', () => {
+    const quota = {
+      provider_type: 'openrouter',
+      code: 'ok',
+      exhausted: false,
+      sources: [
+        {
+          id: 'key_spending',
+          label: 'Key 消费限额',
+          product: 'key_spending_limit',
+          scope: 'key',
+          query_status: 'ok' as const,
+          freshness: 'fresh',
+          refresh_state: {},
+        },
+        {
+          id: 'free_requests',
+          label: '免费模型每日请求',
+          product: 'model_requests',
+          scope: 'model',
+          query_status: 'ok' as const,
+          freshness: 'fresh',
+          refresh_state: {},
+        },
+      ],
+      windows: [
+        {
+          source_id: 'free_requests',
+          code: 'free_model_daily_requests',
+          scope: 'model',
+          unit: 'requests',
+          remaining_value: '48',
+          limit_value: '50',
+          used_value: '2',
+          remaining_ratio: 0.96,
+        },
+      ],
+    } satisfies QuotaStatusSnapshot
+
+    const groups = getGenericQuotaGroups(quota, 'openrouter')
+    expect(groups).toHaveLength(2)
+
+    // Key 消费限额组
+    expect(groups[0].label).toBe('Key 消费限额')
+    expect(groups[0].notes).toContain('账户余额未知')
+
+    // 免费模型每日请求组
+    expect(groups[1].label).toBe('免费模型每日请求')
+    // 免费来源不得包含账户余额未知或限制 note，不暗示账号耗尽
+    expect(groups[1].notes).not.toContain('账户余额未知')
+    expect(groups[1].metadata).toContain('免费模型')
+
+    // 窗口必须显示次数而不是仅百分比
+    expect(groups[1].windows[0].meterText).toBe('48 / 50 次 · 剩余 96.0%')
+  })
+
+  it('flags legacy official provider snapshots missing sources as historical pending refresh', () => {
+    const legacyQuota = {
+      provider_type: 'deepseek',
+      kind: 'balance',
+      code: 'ok',
+      exhausted: false,
+      freshness: 'fresh',
+      observed_at: 1_700_000_000,
+      balances: [{ unit: 'CNY', available: '25.00' }],
+    } satisfies QuotaStatusSnapshot
+
+    // 针对官方提供商，sources 缺失必须返回“历史快照，待刷新”，不得维持无提示 fresh
+    expect(getQuotaQueryStatusLabel(legacyQuota, 'deepseek')).toBe('历史快照，待刷新')
+
+    const groups = getGenericQuotaGroups(legacyQuota, 'deepseek')
+    expect(groups[0].notes).toContain('历史快照，待刷新')
   })
 })

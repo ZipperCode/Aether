@@ -9,7 +9,8 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_provider_pool::{
-    build_deepseek_balance_request, build_official_api_key_quota_request,
+    build_deepseek_balance_request, build_minimax_balance_request,
+    build_minimax_token_plan_request, build_official_api_key_quota_request,
     build_openrouter_credits_request, build_zhipu_account_balance_request,
     build_zhipu_team_quota_request, is_retired_official_api_key_quota_endpoint,
     official_api_key_quota_sources, parse_deepseek_balance,
@@ -77,41 +78,60 @@ pub(super) async fn prepare_attempt(
     let request_failure = |_| PreparationFailure {
         class: StableErrorClass::RequestInvalid,
     };
-    let spec = match provider_type.as_str() {
-        "deepseek" => {
-            build_deepseek_balance_request(&input.key.id, input.endpoint, || secret.into())
-        }
-        "openrouter" => {
-            build_openrouter_credits_request(&input.key.id, input.endpoint, || secret.into())
-        }
-        "moonshot" | "kimi_coding" | "siliconflow" | "zhipu" | "zai" | "minimax" => {
-            build_official_api_key_quota_request(
-                &provider_type,
-                &input.key.id,
-                input.endpoint,
-                || secret.into(),
-            )
-        }
-        _ => Err("unsupported official balance provider"),
-    }
-    .map_err(request_failure)?;
-    let quota_kind =
-        QuotaKind::from_spec(&spec.quota_kind).map_err(|class| PreparationFailure { class })?;
-    let personal_scope = matches!(provider_type.as_str(), "zhipu" | "zai").then_some("personal");
-    let mut specs = vec![(spec, personal_scope)];
-    if provider_type == "zhipu" {
-        // 三个接口分别反映个人套餐、团队套餐和账户余额，不能用成功结果提前终止其他查询。
+    let mut specs = Vec::new();
+    if provider_type == "minimax" {
+        // 同一区域内账户余额与 Token Plan 是两个独立来源；官方 Key 前缀不能排他选择单一接口。
         specs.push((
-            build_zhipu_team_quota_request(&input.key.id, input.endpoint, || secret.into())
-                .map_err(request_failure)?,
-            Some("team"),
-        ));
-        specs.push((
-            build_zhipu_account_balance_request(&input.key.id, input.endpoint, || secret.into())
+            build_minimax_balance_request(&input.key.id, input.endpoint, || secret.into())
                 .map_err(request_failure)?,
             None,
         ));
+        specs.push((
+            build_minimax_token_plan_request(&input.key.id, input.endpoint, || secret.into())
+                .map_err(request_failure)?,
+            None,
+        ));
+    } else {
+        let spec = match provider_type.as_str() {
+            "deepseek" => {
+                build_deepseek_balance_request(&input.key.id, input.endpoint, || secret.into())
+            }
+            "openrouter" => {
+                build_openrouter_credits_request(&input.key.id, input.endpoint, || secret.into())
+            }
+            "moonshot" | "kimi_coding" | "siliconflow" | "zhipu" | "zai" => {
+                build_official_api_key_quota_request(
+                    &provider_type,
+                    &input.key.id,
+                    input.endpoint,
+                    || secret.into(),
+                )
+            }
+            _ => Err("unsupported official balance provider"),
+        }
+        .map_err(request_failure)?;
+        let personal_scope =
+            matches!(provider_type.as_str(), "zhipu" | "zai").then_some("personal");
+        specs.push((spec, personal_scope));
+        if provider_type == "zhipu" {
+            // 三个接口分别反映个人套餐、团队套餐和账户余额，不能用成功结果提前终止其他查询。
+            specs.push((
+                build_zhipu_team_quota_request(&input.key.id, input.endpoint, || secret.into())
+                    .map_err(request_failure)?,
+                Some("team"),
+            ));
+            specs.push((
+                build_zhipu_account_balance_request(&input.key.id, input.endpoint, || {
+                    secret.into()
+                })
+                .map_err(request_failure)?,
+                None,
+            ));
+        }
     }
+    // 主查询类型跟随首个请求；MiniMax 以余额为主，套餐结果由来源独立表达。
+    let quota_kind = QuotaKind::from_spec(&specs[0].0.quota_kind)
+        .map_err(|class| PreparationFailure { class })?;
     let route = resolve_execution_route(input.proxy_override, || async {
         let proxy = input
             .state
@@ -290,24 +310,39 @@ pub(super) fn execution_result_to_attempt(
             };
         }
     }
-    if provider_type == "minimax"
-        && body
+    if provider_type == "minimax" {
+        if let Some(code) = body
             .pointer("/base_resp/status_code")
             .and_then(|code| match code {
                 serde_json::Value::Number(code) => code.as_u64(),
                 serde_json::Value::String(code) => code.trim().parse().ok(),
                 _ => None,
             })
-            == Some(2049)
-    {
-        // 已确认的业务认证失败使用固定诊断；不复制上游任意消息，也不推断其他业务码。
-        return AttemptResult::BusinessFailure {
-            status_code: result.status_code,
-            class: StableErrorClass::HttpUnauthorized,
-            quota_kind,
-            upstream_code: Some(2049),
-            detail: "MiniMax quota upstream rejected authentication".into(),
-        };
+        {
+            match code {
+                // 已确认的业务认证失败使用固定诊断；不复制上游任意消息，也不推断其他业务码。
+                2049 => {
+                    return AttemptResult::BusinessFailure {
+                        status_code: result.status_code,
+                        class: StableErrorClass::HttpUnauthorized,
+                        quota_kind,
+                        upstream_code: Some(2049),
+                        detail: "MiniMax quota upstream rejected authentication".into(),
+                    };
+                }
+                // 现场证实 2062 表示该 Key 无适用 Token Plan；仅套餐来源记不适用，余额来源互不影响。
+                2062 if quota_kind == QuotaKind::Subscription => {
+                    return AttemptResult::BusinessFailure {
+                        status_code: result.status_code,
+                        class: StableErrorClass::QueryNotApplicable,
+                        quota_kind,
+                        upstream_code: Some(2062),
+                        detail: "MiniMax account has no applicable Token Plan".into(),
+                    };
+                }
+                _ => {}
+            }
+        }
     }
     let parsed = match provider_type {
         "deepseek" => parse_deepseek_balance(&body),

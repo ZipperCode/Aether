@@ -714,6 +714,146 @@ fn zhipu_balance_success_and_missing_plan_are_kept_without_global_exhaustion() {
 }
 
 #[test]
+fn minimax_business_codes_keep_2049_denied_and_2062_plan_not_applicable() {
+    let denied = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "minimax-2049".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            response_observation: None,
+            body: Some(ResponseBody {
+                json_body: Some(json!({"base_resp": {"status_code": 2049}})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Subscription,
+        "minimax",
+    );
+    assert_eq!(
+        denied.query_status(),
+        ProviderQuotaQueryStatus::PermissionDenied
+    );
+
+    let no_plan = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "minimax-2062".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            response_observation: None,
+            body: Some(ResponseBody {
+                json_body: Some(json!({"base_resp": {"status_code": 2062}})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Subscription,
+        "minimax",
+    );
+    assert_eq!(
+        no_plan.query_status(),
+        ProviderQuotaQueryStatus::NotApplicable
+    );
+
+    // 2062 只对套餐查询声明不适用；同一码到达余额查询时不能被猜测为不适用。
+    let balance_channel = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "minimax-2062-balance".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            response_observation: None,
+            body: Some(ResponseBody {
+                json_body: Some(json!({"base_resp": {"status_code": 2062}})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Balance,
+        "minimax",
+    );
+    assert_eq!(
+        balance_channel.query_status(),
+        ProviderQuotaQueryStatus::Error
+    );
+}
+
+#[test]
+fn minimax_balance_success_and_missing_token_plan_merge_independently() {
+    // 旧格式 Key 套餐 2062 而余额成功：两来源独立保留，互不覆盖。
+    let balance = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "minimax-balance".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            response_observation: None,
+            body: Some(ResponseBody {
+                json_body: Some(json!({
+                    "available_amount": "12.34",
+                    "cash_balance": "10.00",
+                    "voucher_balance": "2.34",
+                    "currency": "CNY"
+                })),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Balance,
+        "minimax",
+    );
+    let no_plan = execution_result_to_attempt(
+        ExecutionResult {
+            request_id: "minimax-token-plan-2062".into(),
+            candidate_id: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            response_observation: None,
+            body: Some(ResponseBody {
+                json_body: Some(json!({"base_resp": {"status_code": 2062}})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        },
+        QuotaKind::Subscription,
+        "minimax",
+    );
+    let attempt = AttemptResult::Sources {
+        attempts: vec![
+            minimax_source_attempt("balance", balance),
+            minimax_source_attempt("subscription", no_plan),
+        ],
+        quota_kind: QuotaKind::Balance,
+    };
+    let persisted = build_persisted_snapshot(SnapshotUpdate {
+        key: &key("key-1", "MiniMax", None),
+        provider_type: "minimax",
+        attempt: &attempt,
+        now_unix_secs: 100,
+    })
+    .expect("minimax dual source snapshot");
+
+    assert_eq!(persisted.snapshot["code"], "ok");
+    assert_eq!(persisted.snapshot["exhausted"], false);
+    assert_eq!(persisted.snapshot["balances"][0]["available"], "12.34");
+    assert_eq!(persisted.snapshot["sources"][0]["id"], "balance");
+    assert_eq!(persisted.snapshot["sources"][0]["query_status"], "ok");
+    assert_eq!(persisted.snapshot["sources"][1]["id"], "subscription");
+    assert_eq!(
+        persisted.snapshot["sources"][1]["query_status"],
+        "not_applicable"
+    );
+    assert_eq!(persisted.snapshot["sources"][1]["freshness"], "fresh");
+}
+
+#[test]
 fn first_subscription_failure_builds_schema_v1_subscription_snapshot() {
     // Given
     let key = key("key-1", "Subscription", None);
@@ -864,4 +1004,148 @@ fn persisted_backoff_is_enforced_for_background_and_bypassed_for_manual() {
     // Then
     assert!(background);
     assert!(!manual);
+}
+
+fn openrouter_endpoint() -> StoredProviderCatalogEndpoint {
+    endpoint(EndpointFixture {
+        id: "endpoint-1",
+        provider_id: "provider-1",
+        base_url: "https://openrouter.ai/api/v1",
+        active: true,
+    })
+}
+
+fn openrouter_history_snapshot() -> Value {
+    json!({
+        "schema_version": 1,
+        "provider_type": "openrouter",
+        "kind": "balance",
+        "sources": [
+            {
+                "id": "key_limit",
+                "label": "Key 消费限额",
+                "product": "key_spending_limit",
+                "scope": "key",
+                "region": "global",
+                "query_status": "ok",
+                "freshness": "fresh",
+                "refresh_state": {"last_attempt_at": 90, "last_success_at": 90}
+            },
+            {
+                "id": "free_requests",
+                "label": "免费模型每日请求",
+                "product": "model_requests",
+                "scope": "model",
+                "region": "global",
+                "query_status": "ok",
+                "freshness": "fresh",
+                "refresh_state": {"last_attempt_at": 90, "last_success_at": 90}
+            }
+        ],
+        "balances": [
+            {"source_id": "key_limit", "unit": "USD", "available": "5"}
+        ],
+        "windows": [{
+            "source_id": "free_requests",
+            "code": "free_model_daily_requests",
+            "label": "免费模型每日请求",
+            "scope": "model",
+            "unit": "requests",
+            "limit_value": "50",
+            "used_value": "12",
+            "remaining_value": "38",
+            "is_exhausted": false
+        }],
+        "exhausted": false
+    })
+}
+
+#[test]
+fn openrouter_query_failure_retains_free_requests_history_as_stale() {
+    // 免费来源已在请求前声明身份；查询失败时旧来源与窗口保留为过期数据。
+    let key = key("key-1", "OpenRouter", Some(openrouter_history_snapshot()));
+    let attempt = AttemptResult::Sources {
+        attempts: vec![SourceAttempt {
+            sources: official_api_key_quota_sources(
+                "openrouter",
+                &openrouter_endpoint(),
+                "balance",
+            ),
+            result: AttemptResult::HttpFailure {
+                status_code: 503,
+                headers: BTreeMap::new(),
+                class: StableErrorClass::HttpServer,
+                quota_kind: QuotaKind::Balance,
+            },
+        }],
+        quota_kind: QuotaKind::Balance,
+    };
+    let persisted = build_persisted_snapshot(SnapshotUpdate {
+        key: &key,
+        provider_type: "openrouter",
+        attempt: &attempt,
+        now_unix_secs: 200,
+    })
+    .expect("openrouter failure snapshot");
+
+    let sources = persisted.snapshot["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 2);
+    let free = sources
+        .iter()
+        .find(|source| source["id"] == "free_requests")
+        .expect("free source retained");
+    assert_eq!(free["freshness"], "stale");
+    assert_eq!(free["query_status"], "error");
+    assert_eq!(
+        persisted.snapshot["windows"][0]["source_id"],
+        "free_requests"
+    );
+    assert_eq!(persisted.snapshot["windows"][0]["remaining_value"], "38");
+    let key_limit = sources
+        .iter()
+        .find(|source| source["id"] == "key_limit")
+        .expect("key limit source retained");
+    assert_eq!(key_limit["freshness"], "stale");
+    assert_eq!(persisted.snapshot["balances"][0]["available"], "5");
+}
+
+#[test]
+fn openrouter_success_without_free_field_expires_free_requests_history() {
+    // 成功响应未携带免费字段：不是失败，来源与旧窗口随之过期消失，也不计错误退避。
+    let key = key("key-1", "OpenRouter", Some(openrouter_history_snapshot()));
+    let parsed = parse_openrouter_credits(&json!({
+        "data": {"limit": 10, "limit_remaining": 5}
+    }))
+    .unwrap();
+    let attempt = AttemptResult::Sources {
+        attempts: vec![SourceAttempt {
+            sources: official_api_key_quota_sources(
+                "openrouter",
+                &openrouter_endpoint(),
+                "balance",
+            ),
+            result: AttemptResult::Success {
+                snapshot: parsed,
+                status_code: 200,
+                quota_kind: QuotaKind::Balance,
+            },
+        }],
+        quota_kind: QuotaKind::Balance,
+    };
+    let persisted = build_persisted_snapshot(SnapshotUpdate {
+        key: &key,
+        provider_type: "openrouter",
+        attempt: &attempt,
+        now_unix_secs: 200,
+    })
+    .expect("openrouter success snapshot");
+
+    let sources = persisted.snapshot["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["id"], "key_limit");
+    assert_eq!(sources[0]["query_status"], "ok");
+    assert_eq!(sources[0]["freshness"], "fresh");
+    assert!(persisted.snapshot.get("windows").is_none());
+    assert_eq!(persisted.snapshot["balances"][0]["available"], "5");
+    assert_eq!(persisted.snapshot["code"], "ok");
 }

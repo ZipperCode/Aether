@@ -21,8 +21,9 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
 use aether_provider_pool::{
-    ProviderQuotaQueryStatus, ProviderQuotaRefreshState, ProviderQuotaSnapshotContract,
-    ProviderQuotaSnapshotKind, ProviderQuotaSource, ProviderQuotaValue, ProviderQuotaWindow,
+    official_api_key_quota_sources, parse_openrouter_credits, ProviderQuotaQueryStatus,
+    ProviderQuotaRefreshState, ProviderQuotaSnapshotContract, ProviderQuotaSnapshotKind,
+    ProviderQuotaSource, ProviderQuotaValue, ProviderQuotaWindow,
 };
 use serde_json::{json, Value};
 use std::{
@@ -76,6 +77,7 @@ fn execution_result_to_attempt(
     let base_url = match provider_type {
         "deepseek" => "https://api.deepseek.com",
         "zhipu" => "https://open.bigmodel.cn",
+        "minimax" => "https://api.minimaxi.com",
         _ => panic!("missing fixture endpoint for {provider_type}"),
     };
     parse_execution_result(
@@ -103,6 +105,34 @@ fn zhipu_source_attempt(scope: &str, result: AttemptResult) -> SourceAttempt {
             }
             .into(),
             scope: if scope == "balance" { "account" } else { scope }.into(),
+            region: Some("cn".into()),
+            ..Default::default()
+        }],
+        result,
+    }
+}
+
+fn minimax_source_attempt(product: &str, result: AttemptResult) -> SourceAttempt {
+    SourceAttempt {
+        sources: vec![ProviderQuotaSource {
+            id: if product == "balance" {
+                "balance".into()
+            } else {
+                "subscription".into()
+            },
+            label: if product == "balance" {
+                "账户余额"
+            } else {
+                "Token Plan"
+            }
+            .into(),
+            product: if product == "balance" {
+                "account_balance"
+            } else {
+                "token_plan"
+            }
+            .into(),
+            scope: "account".into(),
             region: Some("cn".into()),
             ..Default::default()
         }],

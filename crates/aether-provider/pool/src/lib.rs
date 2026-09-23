@@ -33,10 +33,11 @@ pub use providers::{
     build_windsurf_pool_quota_request_with_base_url, build_windsurf_pool_rate_limit_request,
     build_windsurf_pool_rate_limit_request_with_base_url, build_xai_pool_billing_request,
     build_xai_pool_user_request, clamp_official_balance_execution_timeouts,
-    enrich_chatgpt_web_quota_metadata, grok_mode_id_for_model, grok_pool_tier_from_quota_bucket,
-    grok_quota_window_key_for_model, grok_supported_quota_windows_for_tier,
-    is_official_deepseek_endpoint, is_official_openrouter_endpoint,
-    normalize_chatgpt_web_image_quota_limit, parse_deepseek_balance, parse_openrouter_credits,
+    deepseek_quota_url_host_is_allowed, enrich_chatgpt_web_quota_metadata, grok_mode_id_for_model,
+    grok_pool_tier_from_quota_bucket, grok_quota_window_key_for_model,
+    grok_supported_quota_windows_for_tier, is_official_deepseek_endpoint,
+    is_official_openrouter_endpoint, normalize_chatgpt_web_image_quota_limit,
+    openrouter_quota_url_host_is_allowed, parse_deepseek_balance, parse_openrouter_credits,
     AntigravityProviderPoolAdapter, ChatGptWebProviderPoolAdapter, CodexProviderPoolAdapter,
     DeepSeekProviderPoolAdapter, DefaultProviderPoolAdapter, GeminiCliProviderPoolAdapter,
     GrokProviderPoolAdapter, KiroPoolQuotaAuthInput, KiroProviderPoolAdapter,
@@ -50,12 +51,14 @@ pub use providers::{
     WINDSURF_RATE_LIMIT_PATH, WINDSURF_USER_STATUS_PATH, XAI_BILLING_PATH, XAI_USER_PATH,
 };
 pub use providers::{
+    build_minimax_balance_request, build_minimax_token_plan_request,
     build_official_api_key_quota_request, build_zhipu_account_balance_request,
     build_zhipu_team_quota_request, is_official_api_key_quota_endpoint,
     is_retired_official_api_key_quota_endpoint, official_api_key_quota_sources,
-    parse_official_api_key_quota, parse_official_api_key_quota_for_endpoint,
-    parse_zhipu_standard_balance, OfficialApiKeyQuotaProvider,
-    OfficialApiKeyQuotaProviderPoolAdapter, ZHIPU_ACCOUNT_REPORT_URL, ZHIPU_TEAM_QUOTA_URL,
+    official_api_key_quota_url_host_is_allowed, parse_official_api_key_quota,
+    parse_official_api_key_quota_for_endpoint, parse_zhipu_standard_balance,
+    OfficialApiKeyQuotaProvider, OfficialApiKeyQuotaProviderPoolAdapter, ZHIPU_ACCOUNT_REPORT_URL,
+    ZHIPU_TEAM_QUOTA_URL,
 };
 pub use quota::{
     provider_pool_key_account_quota_exhausted, provider_pool_key_balance_below_minimum,
@@ -104,6 +107,92 @@ mod tests {
         let mut key = sample_key(None);
         key.status_snapshot = Some(json!({ "quota": quota }));
         key
+    }
+
+    fn openrouter_snapshot(available: &str, free_window: Value) -> Value {
+        json!({
+            "schema_version": PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
+            "provider_type": "openrouter",
+            "kind": "balance",
+            "sources": [
+                {
+                    "id": "key_limit",
+                    "label": "Key 消费限额",
+                    "product": "key_spending_limit",
+                    "scope": "key",
+                    "query_status": "ok",
+                    "freshness": "fresh"
+                },
+                {
+                    "id": "free_requests",
+                    "label": "免费模型每日请求",
+                    "product": "model_requests",
+                    "scope": "model",
+                    "query_status": "ok",
+                    "freshness": "fresh"
+                }
+            ],
+            "balances": [
+                {"source_id": "key_limit", "unit": "USD", "available": available}
+            ],
+            "windows": [free_window]
+        })
+    }
+
+    #[test]
+    fn openrouter_free_requests_source_does_not_cancel_key_limit_threshold() {
+        // 免费模型请求数与 Key 消费限额并存时，金额阈值事实必须独立成立。
+        let low = sample_key_with_quota(openrouter_snapshot(
+            "0.5",
+            json!({
+                "source_id": "free_requests",
+                "code": "free_model_daily_requests",
+                "scope": "model",
+                "unit": "requests",
+                "is_exhausted": false
+            }),
+        ));
+        assert!(provider_pool_key_balance_below_minimum(&low, "openrouter"));
+
+        let healthy = sample_key_with_quota(openrouter_snapshot(
+            "100",
+            json!({
+                "source_id": "free_requests",
+                "code": "free_model_daily_requests",
+                "scope": "model",
+                "unit": "requests",
+                "is_exhausted": false
+            }),
+        ));
+        assert!(!provider_pool_key_balance_below_minimum(
+            &healthy,
+            "openrouter"
+        ));
+    }
+
+    #[test]
+    fn exhausted_free_requests_window_never_blocks_paid_account_scheduling() {
+        // 免费次数耗尽是模型级观察事实，不能形成账号级耗尽或金额阻断。
+        let key = sample_key_with_quota(openrouter_snapshot(
+            "100",
+            json!({
+                "source_id": "free_requests",
+                "code": "free_model_daily_requests",
+                "scope": "model",
+                "unit": "requests",
+                "is_exhausted": true,
+                "reset_at": 4_102_444_800u64
+            }),
+        ));
+        assert!(!provider_pool_key_balance_below_minimum(&key, "openrouter"));
+        assert!(!provider_pool_key_account_quota_exhausted(
+            &key,
+            "openrouter"
+        ));
+        assert_eq!(
+            provider_pool_quota_snapshot_exhausted_decision(&key, "openrouter"),
+            Some(false)
+        );
     }
 
     #[test]

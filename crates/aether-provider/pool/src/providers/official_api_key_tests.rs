@@ -327,3 +327,84 @@ fn subscription_parsing_does_not_retain_previous_exhaustion_state() {
     assert!(active.exhausted);
     assert!(!reset.exhausted);
 }
+
+#[test]
+fn minimax_requests_cover_balance_and_token_plan_per_region() {
+    // 旧格式（非 sk-api-）Key 也必须同时查询余额与 Token Plan，不能凭前缀排他选择。
+    for (base_url, balance_host) in [
+        ("https://api.minimaxi.com/v1", "api.minimaxi.com"),
+        ("https://api.minimax.io/v1", "api.minimax.io"),
+    ] {
+        for secret in ["eyJleHBlY3RlZC1vbGQtZm9ybWF0LWtleX0", "sk-api-new-format"] {
+            let balance =
+                build_minimax_balance_request("key", &endpoint(base_url), || secret.into())
+                    .unwrap();
+            assert_eq!(
+                balance.url,
+                format!("https://{balance_host}/account/query_balance")
+            );
+            assert_eq!(balance.quota_kind, "balance");
+            assert_eq!(balance.headers["authorization"], format!("Bearer {secret}"));
+
+            let plan =
+                build_minimax_token_plan_request("key", &endpoint(base_url), || secret.into())
+                    .unwrap();
+            assert_eq!(
+                plan.url,
+                format!("https://{balance_host}/v1/token_plan/remains")
+            );
+            assert_eq!(plan.quota_kind, "subscription");
+            assert_eq!(plan.headers["authorization"], format!("Bearer {secret}"));
+        }
+    }
+    assert!(build_minimax_balance_request(
+        "key",
+        &endpoint("https://api.minimaxi.com.evil.test/v1"),
+        || "secret".into()
+    )
+    .is_err());
+    // 通用单请求构造器不再为 MiniMax 做前缀排他选择。
+    assert!(build_official_api_key_quota_request(
+        "minimax",
+        "key",
+        &endpoint("https://api.minimaxi.com/v1"),
+        || "sk-api-new-format".into()
+    )
+    .is_err());
+}
+
+#[test]
+fn official_api_key_quota_url_hosts_mirror_endpoint_allowlist() {
+    for (provider_type, host, allowed) in [
+        ("moonshot", "api.moonshot.cn", true),
+        ("moonshot", "api.moonshot.ai", true),
+        ("moonshot", "API.MOONSHOT.CN", true),
+        ("kimi_coding", "api.kimi.com", true),
+        ("kimi_coding", "api.kimi.ai", true),
+        ("siliconflow", "api.siliconflow.cn", true),
+        ("siliconflow", "api.siliconflow.com", true),
+        ("zhipu", "open.bigmodel.cn", true),
+        ("zhipu", "bigmodel.cn", true),
+        ("zai", "api.z.ai", true),
+        ("minimax", "api.minimaxi.com", true),
+        ("minimax", "api.minimax.io", true),
+        ("minimax", "api.minimaxi.com.evil.test", false),
+        ("zhipu", "open.bigmodel.cn.evil.test", false),
+        ("deepseek", "api.deepseek.com", false),
+        ("unknown", "api.moonshot.cn", false),
+    ] {
+        assert_eq!(
+            official_api_key_quota_url_host_is_allowed(provider_type, host),
+            allowed,
+            "{provider_type} host {host}"
+        );
+        assert_eq!(
+            is_official_api_key_quota_endpoint(
+                provider_type,
+                &endpoint(&format!("https://{host}"))
+            ),
+            allowed,
+            "{provider_type} endpoint host {host}"
+        );
+    }
+}

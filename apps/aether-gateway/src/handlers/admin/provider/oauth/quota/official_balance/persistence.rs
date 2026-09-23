@@ -286,6 +286,11 @@ fn merge_source_attempts(
         for mut source in sources {
             let current =
                 parsed.and_then(|parsed| parsed.sources.iter().find(|item| item.id == source.id));
+            if parsed.is_some() && current.is_none() {
+                // 成功响应未携带该已准备来源的任何数据：这是本次未返回，不是查询失败；
+                // 旧值随成功响应过期且来源不再出现，待上游重新返回时重建，也不计错误退避。
+                continue;
+            }
             let historical = previous.as_ref().and_then(|previous| {
                 previous
                     .sources

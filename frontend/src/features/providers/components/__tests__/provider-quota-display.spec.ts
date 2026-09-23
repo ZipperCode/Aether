@@ -78,7 +78,7 @@ describe('provider quota display components', () => {
 
     expect(root.querySelector('[data-testid="provider-balance-panel"]')?.textContent).toContain('CNY')
     expect(root.querySelector('[data-testid="provider-model-availability"]')?.textContent)
-      .toContain('额度未知，继续参与模型调度')
+      .toContain('模型调用未验证')
     expect(root.querySelector('[data-testid="provider-model-availability"]')?.classList).toContain('text-amber-700')
     expect(root.querySelector('[data-testid="provider-generic-quota-status"]')?.textContent)
       .toContain('upstream business code 500')
@@ -99,7 +99,7 @@ describe('provider quota display components', () => {
 
     const availability = root.querySelector('[data-testid="provider-model-availability"]')
     expect(availability?.textContent).toContain('模型调用已验证可用')
-    expect(availability?.textContent).toContain('额度查询失败，额度未知')
+    expect(availability?.textContent).toContain('glm-5')
     expect(availability?.classList).toContain('text-emerald-700')
     expect(root.querySelector('[data-testid="provider-balance-panel"]')?.textContent).toContain('CNY')
     unmount()
@@ -120,9 +120,45 @@ describe('provider quota display components', () => {
     })
 
     const availability = root.querySelector('[data-testid="provider-model-availability"]')
-    expect(availability?.textContent).toContain('模型调用验证失败')
     expect(availability?.textContent).toContain('余额不足或无可用资源包')
     expect(availability?.classList).toContain('text-red-700')
+    unmount()
+  })
+  it('renders call success evidence for SiliconFlow unsupported quota when model probe is ok', () => {
+    const { root, unmount } = mount(ProviderGenericQuotaCard, {
+      providerType: 'siliconflow',
+      modelProbe: {
+        status: 'ok',
+        model: 'Qwen/Qwen2.5-72B-Instruct',
+        status_code: 200,
+      },
+      quota: {
+        provider_type: 'siliconflow',
+        code: 'ok',
+        exhausted: false,
+        sources: [
+          {
+            id: 'balance',
+            label: '账户余额',
+            product: 'account_balance',
+            scope: 'account',
+            region: 'cn',
+            query_status: 'unsupported',
+            freshness: 'fresh',
+            refresh_state: {},
+          },
+        ],
+      },
+    })
+
+    const availability = root.querySelector('[data-testid="provider-model-availability"]')
+    expect(availability).not.toBeNull()
+    expect(availability?.textContent).toContain('模型调用已验证可用')
+    expect(availability?.textContent).toContain('Qwen/Qwen2.5-72B-Instruct')
+    expect(availability?.textContent).toContain('HTTP 200')
+    expect(availability?.classList).toContain('text-emerald-700')
+    expect(root.textContent).toContain('不支持查询')
+    expect(root.textContent).toContain('官方国内余额接口已停用')
     unmount()
   })
 

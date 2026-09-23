@@ -297,6 +297,7 @@
     v-model="providerDialogOpen"
     :provider="providerToEdit"
     :max-priority="maxProviderPriority"
+    :suggested-type="suggestedProviderType"
     @provider-created="handleProviderAdded"
     @provider-updated="handleProviderUpdated"
   />
@@ -329,6 +330,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
 import { useLocalStorage } from '@vueuse/core'
+import type { ProviderType } from '@/api/endpoints'
 import Card from '@/components/ui/card.vue'
 import Table from '@/components/ui/table.vue'
 import TableHeader from '@/components/ui/table-header.vue'
@@ -398,6 +400,7 @@ let providersRequestId = 0
 const providerDialogOpen = ref(false)
 const providerBatchDialogOpen = ref(false)
 const providerToEdit = ref<ProviderWithEndpointsSummary | null>(null)
+const suggestedProviderType = ref<ProviderType | null>(null)
 const providerDrawerOpen = ref(false)
 const providerDrawerMounted = ref(false)
 const selectedProviderId = ref<string | null>(null)
@@ -701,6 +704,7 @@ function handleRowClick(event: MouseEvent, providerId: string) {
 // 打开添加提供商对话框
 function openAddProviderDialog() {
   providerToEdit.value = null
+  suggestedProviderType.value = null
   providerDialogOpen.value = true
 }
 
@@ -742,9 +746,10 @@ async function refreshProviderSnapshot(
 }
 
 // 打开编辑提供商对话框
-async function openEditProviderDialog(provider: ProviderWithEndpointsSummary) {
+async function openEditProviderDialog(provider: ProviderWithEndpointsSummary, suggestedType?: ProviderType) {
   const latest = await refreshProviderSnapshot(provider.id, '刷新提供商状态失败')
   providerToEdit.value = latest ?? provider
+  suggestedProviderType.value = suggestedType ?? null
   providerDialogOpen.value = true
 }
 

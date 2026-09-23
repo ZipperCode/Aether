@@ -7,7 +7,7 @@
   >
     <ProviderQuotaSectionHeader
       v-if="!compact || refreshable"
-      :title="legacyT('账户额度')"
+      :title="legacyT('额度')"
       :loading="loading"
       :updated-text="updatedText"
       :refreshable="refreshable"
@@ -176,7 +176,7 @@ import {
   formatQuotaDateTime,
   getGenericQuotaGroups,
   getGenericQuotaSections,
-  getZhipuModelAvailabilityDisplay,
+  getProviderModelAvailabilityDisplay,
 } from '@/utils/providerKeyQuota'
 import ProviderQuotaProgressRow from './ProviderQuotaProgressRow.vue'
 import ProviderQuotaSectionHeader from './ProviderQuotaSectionHeader.vue'
@@ -205,7 +205,7 @@ defineEmits<{ (e: 'refresh'): void }>()
 const { legacyT } = useI18n()
 const groups = computed(() => getGenericQuotaGroups(props.quota, props.providerType))
 const sections = computed(() => getGenericQuotaSections(props.quota, props.providerType))
-const modelAvailability = computed(() => (props.quota?.sources?.length ?? 0) > 0 ? null : getZhipuModelAvailabilityDisplay(
+const modelAvailability = computed(() => getProviderModelAvailabilityDisplay(
   props.quota, props.modelProbe, props.providerType,
 ))
 const updatedText = computed(() => formatQuotaDateTime(

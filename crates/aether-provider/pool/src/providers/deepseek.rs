@@ -18,6 +18,11 @@ pub fn is_official_deepseek_endpoint(endpoint: &StoredProviderCatalogEndpoint) -
     endpoint_has_official_origin(endpoint, DEEPSEEK_HOST)
 }
 
+/// 额度请求出站 URL 的 origin 校验复用官方端点同一域名，不另建白名单。
+pub fn deepseek_quota_url_host_is_allowed(host: &str) -> bool {
+    host.eq_ignore_ascii_case(DEEPSEEK_HOST)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DeepSeekProviderPoolAdapter;
 

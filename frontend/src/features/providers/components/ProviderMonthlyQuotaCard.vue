@@ -6,9 +6,18 @@
   >
     <div class="space-y-3">
       <div class="flex items-center justify-between">
-        <h3 class="text-sm font-semibold">
-          {{ legacyT('订阅配额') }}
-        </h3>
+        <div class="flex items-center gap-2">
+          <h3 class="text-sm font-semibold">
+            {{ legacyT('本地月度预算') }}
+          </h3>
+          <Badge
+            variant="outline"
+            class="text-[10px] px-1.5 py-0 border-border/60 text-muted-foreground bg-muted/20"
+            data-testid="provider-monthly-quota-local-badge"
+          >
+            {{ legacyT('本地配置') }}
+          </Badge>
+        </div>
         <Badge
           variant="secondary"
           class="text-xs"

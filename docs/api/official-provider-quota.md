@@ -10,12 +10,14 @@
 | Moonshot 国内/国际 | 对应 `api.moonshot.cn` / `api.moonshot.ai` 的 `GET /v1/users/me/balance`，Bearer | 国内 CNY、国际 USD；原值就是货币主单位。使用 `available_balance`；现金可以为负，不能自行求和现金和代金券 | 无套餐档位；两站凭据独立 |
 | SiliconFlow 国内 | 官方已于 2026-08-14 停用 `GET https://api.siliconflow.cn/v1/user/info`；刷新直接记录不支持，不再发送 Key | 2026-09-15 实测 HTTP 410、业务码 `20092`，与官方停用公告一致；未找到已公布的替代接口 | 不将停用解释为 Key 失效，不保留旧余额作为有效额度 |
 | SiliconFlow 国际 | `GET https://api.siliconflow.com/v1/user/info`，Bearer；当前国际文档仍列出此接口，未使用国际 Key 实测 | `totalBalance`、`balance`、`chargeBalance` 不缩放，校验业务成功字段。USD 来源是国际定价，不是响应自报字段 | `role`、账户状态或管理员标志不是套餐 |
-| OpenRouter | `GET https://openrouter.ai/api/v1/key`，Bearer | USD 的 **Key 消费限额**。只信任 `limit_remaining`；`usage` 是累计消费，不能从周期上限中减去它 | `limit=null` 只表示 Key 没设上限；账户余额未知。免费状态与重置周期不等于 Coding Plan |
+| OpenRouter | `GET https://openrouter.ai/api/v1/key`，Bearer | USD 的 **Key 消费限额**。只信任 `limit_remaining`；`usage` 是累计消费，不能从周期上限中减去它。可选 `free_model_daily_requests` 独立显示每日免费请求次数 | `limit=null` 只表示 Key 没设上限；账户余额未知。免费请求耗尽不扩大为整个账户的调用阻断 |
 | 智谱 / Z.ai | 对应 `open.bigmodel.cn` / `api.z.ai` 的 `GET /api/monitor/usage/quota/limit`，`Authorization: <API Key>` | 旧 `TOKENS_LIMIT` 只显示比例；`CREDIT_LIMIT` 为积分；`TIME_LIMIT` 为独立 MCP 用量。5 小时与周窗口不相加 | 只读取实际返回的 `level` 等身份字段，不能按额度大小猜档位 |
 | 智谱兼容来源 | 团队 `GET /api/monitor/usage/quota/limit?type=2`；余额 `GET /api/biz/account/query-customer-account-report` | 保留既有官方端点查询为独立来源；无权限、不适用或失败各自报告，不再失败后补零 | 这两项没有足够公开证据保证每把推理 Key 均可查询；成功仅代表当前 Key 返回的范围 |
 | Kimi Coding | 对应 `api.kimi.com` / `api.kimi.ai` 的 `GET /coding/v1/usages`，Bearer | 基础 `usage` 是周额度，`limits[]` 是短窗口，默认显示比例。实际返回的 `usages` 可提供更精确的比例及额外月度窗口；钱包与月度限额金额使用不同缩放，见下表 | 仅展示实际返回的 membership/subscription/plan 字段，不按配额猜会员档位 |
-| MiniMax 按量 | 对应 `api.minimaxi.com` / `api.minimax.io` 的 `GET /account/query_balance`，Bearer；官方 CLI 对 `sk-api-*` 选择此接口 | 金额字符串按原值保留；没有已确认币种字段时明确显示币种未知，不将 credit_balance 当作套餐积分 | 无套餐档位字段；未知币种不能用于货币阈值判断 |
+| MiniMax 账户余额 | 对应 `api.minimaxi.com` / `api.minimax.io` 的 `GET /account/query_balance`，Bearer；与套餐接口独立查询，不按 Key 前缀排他选择 | 金额字符串按原值保留；没有已确认币种字段时明确显示币种未知，不将 credit_balance 当作套餐积分 | 无套餐档位字段；未知币种不能用于货币阈值判断 |
 | MiniMax Token Plan | 对应官方区域的 `GET /v1/token_plan/remains`，Bearer | 独立额度池、短窗口/周窗口、百分比、加成、是否包含及不限额状态。含义变化的 `usage_count` 需要显式百分比辅助解析 | `model_remains` 是额度池列表，不是套餐档位列表；没有 Plus/Max/Ultra 字段时显示未知 |
+
+2026-09-23 修复：官方查询执行层与端点校验复用同一域名规则，保持 HTTPS、443、无 URL 凭据的限制。MiniMax 同区域分别查询余额与套餐；仅套餐接口业务码 `2062` 视为套餐不适用，`2049` 仍为查询认证拒绝，均不推断模型调用状态。OpenRouter 免费次数仅接受非负整数，缺失或非法值保持未知；刷新失败保留该来源的历史数值并标记过期，成功响应不再返回该字段时清除旧来源。
 
 ## 容易算错的字段
 
@@ -45,6 +47,9 @@
 - Kimi 额外用量及 MiniMax 已购积分可能补充基础套餐；信息不足时不能据套餐耗尽阻断整个 Key。MiniMax 首轮仅作观察。
 - 额度刷新不清除 `status_snapshot.scheduling` 中的人工恢复阻断，也不修改人工启停、OAuth、模型探测和其他兄弟状态。
 - 官方订阅不再把快照耗尽复制为号池的持久账号耗尽状态；调度直接检查来源、有效性和重置时间。正常刷新只清理历史额度查询产生的号池阻断标记，人工阻断仍受原有强校验保护。
+- UI 将查询能力、查询结果与模型调用验证独立展示；不支持、不适用、未查询不使用 Key 失效语义。没有调用证据时显示未验证，不把额度成功等同于模型可调用。
+- 官方类型缺少来源的旧快照显示“历史快照，待刷新”，展示真实采样/最后成功时间；本次不引入新的调度 TTL。
+- 历史 `custom` 提供商仅在启用端点精确匹配唯一官方类型时提示转换，通过现有编辑表单由管理员确认。不会自动迁移生产配置。本地月度预算明确标记“本地配置”。
 
 ## 只读联调范围
 
@@ -56,6 +61,8 @@
 - Moonshot 国内返回 HTTP 401；MiniMax 国内返回 HTTP 200 但业务码 `2049` 表示认证拒绝。两者归入无查询权限，不生成零额度、不标记调用失效。尚未验证其他区域，也未获取这把 MiniMax Key 的实际额度池数据。
 
 金额、账户标识和原始响应未收录到能力文档；样例与真实响应分别标明验证来源。
+
+2026-09-23 排查补充：在用户授权实例内存中使用代表 Key 查询，确认公共 origin 策略曾在出站前阻断官方请求；确认硅基流动国内额度接口返回 410 但同一 Key 可以生成；确认 MiniMax 四个旧格式 Key 套餐返回 2062 而同区域余额查询成功。模型调用另有 401、402、1113 等真实失败，不能从查询失败统一推断。修复验证采用本地 Rust 查询/持久化回归与实际 Vue 组件交互，不部署线上，不把原始响应或凭据写入仓库。
 
 ## 未作为普通推理 Key 能力接入的接口
 

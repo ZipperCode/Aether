@@ -171,7 +171,10 @@
             >
               {{ legacyT('反代使用固定端点且不可修改') }}
             </p>
-            <p v-else-if="canConvertProvider" class="text-xs text-amber-600 dark:text-amber-400">
+            <p
+              v-else-if="canConvertProvider"
+              class="text-xs text-amber-600 dark:text-amber-400"
+            >
               {{ legacyT('转换会保留现有端点和密钥，保存前需要再次确认') }}
             </p>
           </div>
@@ -415,6 +418,7 @@ const props = defineProps<{
   modelValue: boolean
   provider?: ProviderWithEndpointsSummary | null  // 编辑模式时传入
   maxPriority?: number  // 当前已有的最大优先级值
+  suggestedType?: ProviderType | null  // 推荐的目标类型（如官方域名检测提示）
 }>()
 
 const emit = defineEmits<{
@@ -546,7 +550,9 @@ function loadProviderData() {
 
   form.value = {
     name: props.provider.name,
-    provider_type: props.provider.provider_type || 'custom',
+    provider_type: (props.suggestedType && props.provider.provider_type === 'custom'
+      ? props.suggestedType
+      : props.provider.provider_type || 'custom') as ProviderType,
     description: props.provider.description || '',
     website: props.provider.website || '',
     provider_priority: props.provider.provider_priority || 999,

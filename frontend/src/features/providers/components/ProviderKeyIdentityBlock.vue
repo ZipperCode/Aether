@@ -52,9 +52,9 @@
 
       <Badge
         v-if="quotaStatusLabel"
-        :variant="quotaStatusLabel === '疑似额度不足' ? 'outline' : 'destructive'"
+        :variant="effectiveQuotaStatusVariant"
         class="h-4 shrink-0 px-1.5 py-0 text-[9px] font-semibold"
-        :class="quotaStatusLabel === '疑似额度不足' ? 'border-amber-500/40 text-amber-600 dark:text-amber-400' : ''"
+        :class="effectiveQuotaStatusClass"
         data-testid="provider-key-quota-status"
         :title="quotaStatusTitle"
       >
@@ -168,7 +168,7 @@ import Badge from '@/components/ui/badge.vue'
 import { useI18n } from '@/i18n'
 import type { EndpointAPIKey } from '@/api/endpoints'
 import type { OAuthStatusInfo } from '@/composables/useCountdownTimer'
-
+import { getQuotaStatusBadgeInfo } from '@/utils/providerKeyQuota'
 interface OAuthOrgBadgeDisplay {
   label: string
   title: string
@@ -185,13 +185,15 @@ const props = withDefaults(defineProps<{
   quotaTypeLabel?: string | null
   quotaStatusLabel?: string | null
   quotaStatusTitle?: string
-  canExportCredential?: boolean
+  quotaStatusVariant?: 'default' | 'secondary' | 'destructive' | 'outline' | 'warning' | null
+  quotaStatusClass?: string
   showOAuthRefreshControl?: boolean
   accountLevelBlock?: boolean
   oauthStatus?: OAuthStatusInfo | null
   oauthStatusTitle?: string
   oauthRefreshButtonTitle?: string
   canRefreshCredential?: boolean
+  canExportCredential?: boolean
   clearingOAuthInvalid?: boolean
   refreshingOAuth?: boolean
   antigravityInactive?: boolean
@@ -204,13 +206,15 @@ const props = withDefaults(defineProps<{
   quotaTypeLabel: null,
   quotaStatusLabel: null,
   quotaStatusTitle: '',
-  canExportCredential: false,
+  quotaStatusVariant: null,
+  quotaStatusClass: '',
   showOAuthRefreshControl: false,
   accountLevelBlock: false,
   oauthStatus: null,
   oauthStatusTitle: '',
   oauthRefreshButtonTitle: '',
   canRefreshCredential: false,
+  canExportCredential: false,
   clearingOAuthInvalid: false,
   refreshingOAuth: false,
   antigravityInactive: false,
@@ -225,6 +229,9 @@ defineEmits<{
 }>()
 
 const { legacyT } = useI18n()
+const quotaBadgeSemantic = computed(() => getQuotaStatusBadgeInfo(props.quotaStatusLabel))
+const effectiveQuotaStatusVariant = computed(() => props.quotaStatusVariant || quotaBadgeSemantic.value?.variant || 'outline')
+const effectiveQuotaStatusClass = computed(() => props.quotaStatusClass || quotaBadgeSemantic.value?.class || '')
 
 const oauthStatusClass = computed(() => {
   const status = props.oauthStatus

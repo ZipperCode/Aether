@@ -6,7 +6,9 @@ use serde_json::Value;
 use crate::capability::{ProviderPoolCapabilities, ProviderQuotaServingPolicy};
 use crate::provider::{provider_pool_matching_endpoint, ProviderPoolAdapter};
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
-use crate::quota_snapshot::{ProviderQuotaBalance, ProviderQuotaSnapshotContract};
+use crate::quota_snapshot::{
+    ProviderQuotaBalance, ProviderQuotaSnapshotContract, ProviderQuotaValue, ProviderQuotaWindow,
+};
 
 use super::official_balance::{
     decimal_string, endpoint_has_official_origin, official_quota_source,
@@ -16,6 +18,11 @@ pub const OPENROUTER_CREDITS_URL: &str = "https://openrouter.ai/api/v1/key";
 const OPENROUTER_HOST: &str = "openrouter.ai";
 pub fn is_official_openrouter_endpoint(endpoint: &StoredProviderCatalogEndpoint) -> bool {
     endpoint_has_official_origin(endpoint, OPENROUTER_HOST)
+}
+
+/// 额度请求出站 URL 的 origin 校验复用官方端点同一域名，不另建白名单。
+pub fn openrouter_quota_url_host_is_allowed(host: &str) -> bool {
+    host.eq_ignore_ascii_case(OPENROUTER_HOST)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -77,6 +84,20 @@ where
     })
 }
 
+/// 免费请求数是非负整数计数：仅接受全数字十进制整数字符串，
+/// 小数、负数与科学计数法展开后的小数一律视为未知，不经浮点换算。
+fn free_request_count(value: &Value) -> Option<String> {
+    let text = decimal_string(value)?;
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then_some(text)
+}
+
+/// 精确判断归一化后的计数是否为零，避免 f64 下溢把微小正数误判为耗尽。
+fn free_request_count_is_zero(text: &str) -> bool {
+    text.bytes().all(|byte| byte == b'0')
+}
+
 fn normalize_bearer_secret(secret: &str) -> &str {
     let trimmed = secret.trim();
     trimmed
@@ -123,6 +144,38 @@ pub fn parse_openrouter_credits(
     source.region = Some("global".into());
     source.currency_source = Some("official_documentation".into());
     snapshot.sources.push(source);
+    // 免费模型每日请求数是独立计数来源；仅透传上游字段，不参与金额事实，也不推断重置时间。
+    if let Some(free) = data
+        .get("free_model_daily_requests")
+        .filter(|free| free.is_object())
+    {
+        let limit = free.get("limit").and_then(free_request_count);
+        let used = free.get("used").and_then(free_request_count);
+        let remaining = free.get("remaining").and_then(free_request_count);
+        if limit.is_some() || used.is_some() || remaining.is_some() {
+            snapshot.windows.push(ProviderQuotaWindow {
+                source_id: Some("free_requests".into()),
+                code: "free_model_daily_requests".into(),
+                label: "免费模型每日请求".into(),
+                scope: "model".into(),
+                unit: "requests".into(),
+                used_value: used.map(ProviderQuotaValue::Decimal),
+                remaining_value: remaining.clone().map(ProviderQuotaValue::Decimal),
+                limit_value: limit.map(ProviderQuotaValue::Decimal),
+                // 仅归一化整数零值视为当日耗尽；缺失、小数、负数或非有限输入保持未知。
+                is_exhausted: remaining.as_deref().is_some_and(free_request_count_is_zero),
+                ..Default::default()
+            });
+            let mut free_source = official_quota_source(
+                "free_requests",
+                "免费模型每日请求",
+                "model_requests",
+                "model",
+            );
+            free_source.region = Some("global".into());
+            snapshot.sources.push(free_source);
+        }
+    }
     if unlimited {
         snapshot
             .extensions
@@ -292,5 +345,89 @@ mod tests {
         assert_eq!(partial.balances[0].used, None);
 
         assert!(parse_openrouter_credits(&json!({"data":{"label":"key"}})).is_err());
+    }
+
+    #[test]
+    fn parses_free_model_daily_requests_as_independent_source() {
+        let parsed = parse_openrouter_credits(&json!({"data":{
+            "limit": 10,
+            "usage": 3,
+            "limit_remaining": 7.5,
+            "free_model_daily_requests": {"limit": 50, "used": 12, "remaining": 38}
+        }}))
+        .unwrap();
+        assert_eq!(parsed.sources.len(), 2);
+        assert_eq!(parsed.sources[1].id, "free_requests");
+        assert_eq!(parsed.sources[1].product, "model_requests");
+        assert_eq!(parsed.sources[1].scope, "model");
+        assert_eq!(parsed.sources[1].region.as_deref(), Some("global"));
+        let window = &parsed.windows[0];
+        assert_eq!(window.source_id.as_deref(), Some("free_requests"));
+        assert_eq!(window.code, "free_model_daily_requests");
+        assert_eq!(window.scope, "model");
+        assert_eq!(window.unit, "requests");
+        let ProviderQuotaValue::Decimal(limit) = window.limit_value.as_ref().unwrap() else {
+            panic!("free window limit should stay a decimal string");
+        };
+        assert_eq!(limit, "50");
+        assert!(window.used_value.is_some());
+        assert_eq!(window.reset_at, None);
+        assert!(!window.is_exhausted);
+        // Key 消费限额金额逻辑不受免费来源影响。
+        assert_eq!(parsed.balances.len(), 1);
+        assert_eq!(parsed.balances[0].source_id.as_deref(), Some("key_limit"));
+        assert_eq!(parsed.balances[0].available.as_deref(), Some("7.5"));
+    }
+
+    #[test]
+    fn free_model_daily_requests_zero_remaining_marks_exhausted_window() {
+        for remaining in [json!(0), json!("0"), json!("00")] {
+            let parsed = parse_openrouter_credits(&json!({"data":{
+                "limit_remaining": 5,
+                "free_model_daily_requests": {"limit": 50, "used": 50, "remaining": remaining}
+            }}))
+            .unwrap();
+            assert!(parsed.windows[0].is_exhausted, "remaining {remaining}");
+        }
+
+        // 巨大整数计数不经浮点换算，非零不得误判耗尽。
+        let huge = parse_openrouter_credits(&json!({"data":{
+            "limit_remaining": 5,
+            "free_model_daily_requests": {"limit": "9007199254740993", "remaining": "9007199254740993"}
+        }}))
+        .unwrap();
+        assert!(!huge.windows[0].is_exhausted);
+    }
+
+    #[test]
+    fn missing_or_invalid_free_request_fields_stay_unknown() {
+        let absent = parse_openrouter_credits(&json!({"data":{"limit_remaining": 5}})).unwrap();
+        assert!(absent.windows.is_empty());
+        let invalid = parse_openrouter_credits(&json!({"data":{
+            "limit_remaining": 5,
+            "free_model_daily_requests": {"limit": "many", "remaining": null}
+        }}))
+        .unwrap();
+        assert!(invalid.windows.is_empty());
+        assert_eq!(invalid.sources.len(), 1);
+
+        // 负数、小数与科学计数法小数都不是合法请求计数，全部保持未知。
+        let non_integer = parse_openrouter_credits(&json!({"data":{
+            "limit_remaining": 5,
+            "free_model_daily_requests": {"limit": -1, "used": 1.5, "remaining": "1e-400"}
+        }}))
+        .unwrap();
+        assert!(non_integer.windows.is_empty());
+        assert_eq!(non_integer.sources.len(), 1);
+
+        // 仅部分字段非法时，合法字段保留原值，非法字段不参与零值耗尽判断。
+        let partial = parse_openrouter_credits(&json!({"data":{
+            "limit_remaining": 5,
+            "free_model_daily_requests": {"limit": 50, "remaining": "0.5"}
+        }}))
+        .unwrap();
+        assert_eq!(partial.windows.len(), 1);
+        assert!(partial.windows[0].remaining_value.is_none());
+        assert!(!partial.windows[0].is_exhausted);
     }
 }

@@ -187,8 +187,8 @@ export function useProviderBalance() {
     }
   }
 
-  // 获取 provider 余额查询的错误状态
-  function getProviderBalanceError(providerId: string): { status: string; message: string } | null {
+  // 获取 provider 余额查询的错误状态（中性能力状态与真正错误分开标记）
+  function getProviderBalanceError(providerId: string): { status: string; message: string; isNeutral?: boolean } | null {
     const result = balanceCache.value[providerId]
     if (!result) {
       return null
@@ -197,18 +197,28 @@ export function useProviderBalance() {
     if (result.status === 'pending') {
       return null
     }
+    // not_supported 与 not_configured 属于中性能力/配置状态，非运行时错误
+    if (result.status === 'not_supported' || result.status === 'not_configured') {
+      return {
+        status: result.status,
+        message: result.message || (result.status === 'not_supported' ? '不支持余额查询' : '未配置余额查询'),
+        isNeutral: true,
+      }
+    }
     // 认证失败或过期
     if (result.status === 'auth_failed' || result.status === 'auth_expired') {
       return {
         status: result.status,
         message: result.message || '认证失败',
+        isNeutral: false,
       }
     }
-    // 其他错误
+    // 其他运行时错误
     if (result.status !== 'success') {
       return {
         status: result.status,
         message: result.message || '查询失败',
+        isNeutral: false,
       }
     }
     return null

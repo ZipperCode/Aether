@@ -34,8 +34,9 @@ pub use codex::{
     CODEX_WHAM_RESET_CREDITS_URL, CODEX_WHAM_USAGE_URL,
 };
 pub use deepseek::{
-    build_deepseek_balance_request, is_official_deepseek_endpoint, parse_deepseek_balance,
-    DeepSeekProviderPoolAdapter, DEEPSEEK_BALANCE_URL,
+    build_deepseek_balance_request, deepseek_quota_url_host_is_allowed,
+    is_official_deepseek_endpoint, parse_deepseek_balance, DeepSeekProviderPoolAdapter,
+    DEEPSEEK_BALANCE_URL,
 };
 pub use default::DefaultProviderPoolAdapter;
 pub use gemini_cli::GeminiCliProviderPoolAdapter;
@@ -56,17 +57,20 @@ pub use nous::{
     NOUS_ACCOUNT_PATH, NOUS_BILLING_PATH, NOUS_PORTAL_BASE_URL,
 };
 pub use official_api_key::{
+    build_minimax_balance_request, build_minimax_token_plan_request,
     build_official_api_key_quota_request, build_zhipu_account_balance_request,
     build_zhipu_team_quota_request, is_official_api_key_quota_endpoint,
     is_retired_official_api_key_quota_endpoint, official_api_key_quota_sources,
-    parse_official_api_key_quota, parse_official_api_key_quota_for_endpoint,
-    parse_zhipu_standard_balance, OfficialApiKeyQuotaProvider,
-    OfficialApiKeyQuotaProviderPoolAdapter, ZHIPU_ACCOUNT_REPORT_URL, ZHIPU_TEAM_QUOTA_URL,
+    official_api_key_quota_url_host_is_allowed, parse_official_api_key_quota,
+    parse_official_api_key_quota_for_endpoint, parse_zhipu_standard_balance,
+    OfficialApiKeyQuotaProvider, OfficialApiKeyQuotaProviderPoolAdapter, ZHIPU_ACCOUNT_REPORT_URL,
+    ZHIPU_TEAM_QUOTA_URL,
 };
 pub use official_balance::clamp_official_balance_execution_timeouts;
 pub use openrouter::{
-    build_openrouter_credits_request, is_official_openrouter_endpoint, parse_openrouter_credits,
-    OpenRouterProviderPoolAdapter, OPENROUTER_CREDITS_URL,
+    build_openrouter_credits_request, is_official_openrouter_endpoint,
+    openrouter_quota_url_host_is_allowed, parse_openrouter_credits, OpenRouterProviderPoolAdapter,
+    OPENROUTER_CREDITS_URL,
 };
 pub use unsupported::{
     UnsupportedQuotaProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,

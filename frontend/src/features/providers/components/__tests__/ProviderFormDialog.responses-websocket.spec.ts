@@ -1,22 +1,43 @@
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
+import { createApp, nextTick, type App } from 'vue'
+import { createPinia } from 'pinia'
+import { createI18n } from '@/i18n'
+import ProviderFormDialog from '../ProviderFormDialog.vue'
 
-function readSource(path: string): string {
-  return readFileSync(resolve(process.cwd(), path), 'utf8')
-}
+let app: App | undefined
+let root: HTMLDivElement | undefined
 
-describe('ProviderFormDialog Responses WebSocket switch', () => {
-  it('displays and submits the switch for every provider type', () => {
-    const source = readSource('src/features/providers/components/ProviderFormDialog.vue')
+afterEach(() => {
+  app?.unmount()
+  root?.remove()
+  app = undefined
+  root = undefined
+})
 
-    expect(source).toContain('Responses WebSocket 模式')
-    expect(source).toContain('responses_websocket_enabled')
-    expect(source).toContain('responses_websocket_enabled: form.value.responses_websocket_enabled')
-    expect(source).toMatch(
-      /<div(?=[^>]*data-testid="responses-websocket-setting")(?![^>]*\bv-if=)[^>]*>[\s\S]{0,500}Responses WebSocket 模式/,
-    )
-    expect(source).toContain('id="responses-websocket-enabled"')
-    expect(source).toContain(':aria-label="legacyT(\'Responses WebSocket 模式\')"')
+describe('提供商编辑表单', () => {
+  it('立即打开推荐类型时保留名称，并允许取消而不保存', async () => {
+    root = document.createElement('div')
+    document.body.appendChild(root)
+    let closed = false
+    app = createApp(ProviderFormDialog, {
+      modelValue: true,
+      suggestedType: 'moonshot',
+      provider: {
+        id: 'form-regression', name: '测试站点', provider_type: 'custom',
+        description: '原有描述', is_active: true, provider_priority: 10,
+      },
+      'onUpdate:modelValue': (value: boolean) => { closed = !value },
+    })
+    app.use(createPinia()).use(createI18n()).mount(root)
+    await nextTick()
+    const dialog = document.querySelector('[role="dialog"]')
+    expect(dialog?.querySelector('input')?.value).toBe('测试站点')
+    expect(dialog?.querySelector('[role="combobox"]')?.textContent).toContain('Moonshot')
+    expect(dialog?.querySelector('[role="switch"][aria-label="Responses WebSocket 模式"]')).not.toBeNull()
+    const cancel = Array.from(dialog?.querySelectorAll('button') ?? [])
+      .find(button => button.textContent?.trim() === '取消')
+    cancel?.click()
+    await nextTick()
+    expect(closed).toBe(true)
   })
 })
