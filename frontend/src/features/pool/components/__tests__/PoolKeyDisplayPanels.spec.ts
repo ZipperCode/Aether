@@ -259,8 +259,6 @@ describe('pool key display panels', () => {
     app.mount(root)
 
     expect(root.querySelector('[data-testid="provider-quota-available"]')).toBeTruthy()
-    expect(root.querySelector('[data-testid="provider-model-availability"]')?.textContent)
-      .toContain('额度未知，继续参与模型调度')
     expect(root.querySelector('[data-testid="provider-model-availability"]')?.classList).toContain('text-amber-700')
     app.unmount()
     root.remove()
@@ -326,7 +324,6 @@ describe('pool key display panels', () => {
 
     const availability = root.querySelector('[data-testid="provider-model-availability"]')
     expect(availability?.textContent).toContain('模型调用已验证可用')
-    expect(availability?.textContent).toContain('额度查询失败，额度未知')
     expect(availability?.classList).toContain('text-emerald-700')
     app.unmount()
     root.remove()

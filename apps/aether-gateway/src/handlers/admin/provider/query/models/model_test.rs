@@ -3233,7 +3233,7 @@ async fn provider_query_execute_standard_test_candidate(
 
     let incoming_request_headers = provider_query_extract_request_headers(payload);
     let mut request_body = original_request_body.clone();
-    if aether_ai_formats::api_format_uses_body_stream_field(client_api_format) {
+    if crate::ai_serving::api_format_uses_body_stream_field(client_api_format) {
         if let Some(object) = request_body.as_object_mut() {
             object.insert("stream".to_string(), Value::Bool(false));
         }

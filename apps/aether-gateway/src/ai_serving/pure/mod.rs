@@ -180,7 +180,7 @@ pub(crate) use aether_ai_formats::api::{
 pub(crate) use aether_ai_formats::{
     agent_bridge_prompt_cache_identity, api_format_defaults_to_client_error_failover,
     api_format_defaults_to_non_stream, api_format_permission_covers,
-    apply_agent_bridge_codex_overlay_with_report,
+    api_format_uses_body_stream_field, apply_agent_bridge_codex_overlay_with_report,
     apply_agent_bridge_response_carriers_from_report_context,
     codex_responses_lite_tool_is_client_executed, infer_agent_bridge_message_phase,
     intersect_api_format_allowed_lists, is_embedding_api_format, is_rerank_api_format,
