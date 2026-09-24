@@ -273,10 +273,10 @@ function formatQuotaValue(value: number | null | undefined): string {
   return formatDecimalDisplay(value) ?? '未知'
 }
 
-function formatBalanceValue(value: unknown, unit: string): string | null {
+function formatBalanceValue(value: unknown, unit?: string | null): string | null {
   const amount = formatDecimalDisplay(value)
   if (amount == null) return null
-  const normalizedUnit = unit.trim().toUpperCase()
+  const normalizedUnit = normalizeText(unit)?.toUpperCase()
   return normalizedUnit === 'USD' ? `$${amount}` : `${amount} ${normalizedUnit || '币种未注明'}`
 }
 

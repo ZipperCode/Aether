@@ -90,7 +90,8 @@ export interface QuotaResetCreditsSnapshot {
 }
 
 export interface QuotaBalanceSnapshot {
-  unit: string
+  /** 管理端投影可能省略未知单位或保留 null，不据此推断币种。 */
+  unit?: string | null
   source_id?: string | null
   available?: DecimalJsonValue
   total?: DecimalJsonValue

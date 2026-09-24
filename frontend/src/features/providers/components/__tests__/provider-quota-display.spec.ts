@@ -62,6 +62,32 @@ describe('provider quota display components', () => {
     unmount()
   })
 
+  it('余额单位缺失时保留数值且不推断币种', () => {
+    const { root, unmount } = mount(ProviderGenericQuotaCard, {
+      providerType: 'deepseek',
+      quota: {
+        kind: 'balance', code: 'ok', exhausted: false,
+        balances: [
+          { available: '12.50', total: '20' },
+          { unit: null, available: '8.25', granted: '1' },
+          { unit: '  ', available: '3', topped_up: '4', used: '1' },
+          { unit: ' usd ', available: '6' },
+        ],
+      },
+    })
+
+    try {
+      const amounts = Array.from(root.querySelectorAll('[data-testid="provider-quota-available"]'), node => node.textContent)
+      expect(amounts).toEqual(['12.50 币种未注明', '8.25 币种未注明', '3 币种未注明', '$6'])
+      expect(root.textContent).toContain('总额 20 币种未注明')
+      expect(root.textContent).toContain('赠送 1 币种未注明')
+      expect(root.textContent).toContain('充值 4 币种未注明')
+      expect(root.textContent).toContain('累计已用 1 币种未注明')
+    } finally {
+      unmount()
+    }
+  })
+
   it('renders a Zhipu query fallback without probe evidence as unknown', () => {
     const { root, unmount } = mount(ProviderGenericQuotaCard, {
       providerType: 'zhipu',
