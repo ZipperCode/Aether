@@ -211,7 +211,6 @@
                     <ProviderGenericQuotaCard
                       v-if="shouldShowGenericQuotaCard(key)"
                       :quota="key.status_snapshot?.quota"
-                      :model-probe="key.status_snapshot?.model_probe"
                       :loading="isQuotaRefreshingForKey(key)"
                       :provider-type="getGenericQuotaProviderType(key)"
                       :refreshable="key.is_active"

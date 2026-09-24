@@ -37,8 +37,7 @@
     <div v-if="quota.exhausted" class="mt-1 text-[10px] font-medium text-red-600">
       {{ quota.exhausted_reason === 'no_usable_credits' ? '无可用推理 Credits' : '账号额度不可用' }}
     </div>
-    <div v-if="quota.billing_stale" class="mt-1 text-[10px] text-amber-600">账单数据已过期，当前显示上次成功结果</div>
-    <div v-else-if="quota.billing_available === false" class="mt-1 text-[10px] text-muted-foreground">账单信息暂不可用</div>
+    <div v-if="quota.billing_available === false && !quota.billing_stale" class="mt-1 text-[10px] text-muted-foreground">账单信息暂不可用</div>
     <div v-if="rateLimitRecovery" class="mt-1 text-[10px] text-amber-600">临时限流，{{ rateLimitRecovery }}</div>
   </div>
 </template>

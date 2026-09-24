@@ -1,5 +1,4 @@
 import type {
-  ModelProbeStatusSnapshot,
   ProviderKeyStatusSnapshot,
   QuotaBalanceSnapshot,
   QuotaSourceSnapshot,
@@ -14,15 +13,6 @@ export interface ProviderKeyQuotaCarrier {
   account_quota?: string | null
   status_snapshot?: ProviderKeyStatusSnapshot | null
   upstream_metadata?: UpstreamMetadata | null
-}
-
-export interface ProviderModelAvailabilityDisplay {
-  status: 'ok' | 'failed' | 'unknown'
-  title: string
-  detail: string | null
-  text: string
-  model: string | null
-  testedAt: number | null
 }
 
 function normalizeText(value: unknown): string | null {
@@ -73,21 +63,18 @@ export function getQuotaQueryStatusLabel(
   if (sources.length > 0) {
     // 不适用和不支持是已完成的能力结论，不应让成功的套餐显示为部分失败。
     const applicable = sources.filter(source => source.query_status !== 'not_applicable' && source.query_status !== 'unsupported')
-    const successful = applicable.filter(source => source.query_status === 'ok' && source.freshness === 'fresh')
+    const successful = applicable.filter(source => source.query_status === 'ok')
     if (applicable.length > 0 && successful.length === applicable.length) return null
     if (successful.length > 0) return '额度部分更新'
     const unresolved = applicable.length ? applicable : sources
     const statuses = new Set(unresolved.map(source => source.query_status))
-    if (unresolved.every(source => source.freshness === 'stale')) return '额度已过期'
     if (statuses.size === 1) return quotaQueryStatusText(unresolved[0].query_status)
     if (applicable.length === 0) return '暂无可查询额度'
     return '额度查询未完成'
   }
   if (quota?.refresh_state?.error) return '额度查询失败'
-  if (quota?.freshness === 'stale') return '额度已过期'
   if (!quota || quota.code === 'unknown') return '额度未查询'
-  // 针对官方额度类型：旧快照若缺失 sources 结构，显式标明历史快照，不伪装成当前 fresh
-  return '历史快照，待刷新'
+  return null
 }
 
 export interface QuotaStatusBadgeInfo {
@@ -112,13 +99,11 @@ export function getQuotaStatusBadgeInfo(label?: string | null): QuotaStatusBadge
     }
   }
 
-  // 警告与时效类（疑似不足、过期、部分更新、无查询权限、历史快照待刷新） -> 琥珀色 outline
+  // 警告类（疑似不足、部分更新、无查询权限） -> 琥珀色 outline
   if (
     normalized === '疑似额度不足'
-    || normalized === '额度已过期'
     || normalized === '额度部分更新'
     || normalized === '无查询权限'
-    || normalized === '历史快照，待刷新'
   ) {
     return {
       label: normalized,
@@ -179,11 +164,6 @@ export function getGenericQuotaStatusTitle(params: {
   if (label === '暂无可查询额度') {
     return '当前端点下暂无可查询的官方额度接口'
   }
-  if (label === '历史快照，待刷新') {
-    const time = quota?.observed_at ?? quota?.updated_at
-    const formatted = time ? new Date(typeof time === 'number' ? time * 1000 : String(time)).toLocaleString(locale) : null
-    return formatted ? `历史快照（采样于 ${formatted}），待触发刷新以获取最新分组额度` : '历史快照，待触发刷新以获取最新分组额度'
-  }
   if (label === '额度查询失败' || label === '查询失败') {
     const error = quota?.refresh_state?.error || quota?.token_plan_error
     return error ? `额度查询失败：${error}` : '额度查询失败，请检查网络或官方端点设置'
@@ -231,110 +211,6 @@ export function finiteNumber(value: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null
   }
   return null
-}
-
-/** Plan 查询失败且没有正标准余额时，额度接口无法判断智谱 Key 是否可调用。 */
-export function isZhipuAmbiguousQuotaFallback(
-  quota: QuotaStatusSnapshot | null | undefined,
-  fallbackProviderType?: string | null,
-): boolean {
-  if (!isZhipuInformationalBalanceFallback(quota, fallbackProviderType)) return false
-  if (quota?.balance_insufficient === true) return true
-  if (normalizeText(quota?.balance_status)?.toLowerCase() === 'insufficient') return true
-  const availableBalances = (quota?.balances ?? [])
-    .map(balance => finiteNumber(balance.available))
-    .filter((value): value is number => value != null)
-  return !availableBalances.some(value => value > 0)
-}
-
-/**
- * 查询状态不等于调用失效：综合额度快照与独立模型调用探针，输出模型可用性展示。
- * 无调用证据时明确提示未验证，不伪装可用；有调用证据时独立呈现。
- */
-export function getProviderModelAvailabilityDisplay(
-  quota: QuotaStatusSnapshot | null | undefined,
-  modelProbe?: ModelProbeStatusSnapshot | null,
-  fallbackProviderType?: string | null,
-): ProviderModelAvailabilityDisplay | null {
-  const probeStatus = normalizeText(modelProbe?.status)?.toLowerCase()
-  const model = normalizeText(modelProbe?.model)
-  const testedAt = finiteNumber(modelProbe?.tested_at)
-  const statusCode = finiteNumber(modelProbe?.status_code)
-
-  // 1. 模型调用已验证可用（如管理端测试通过 HTTP 200）
-  if (probeStatus === 'ok') {
-    const title = '模型调用已验证可用'
-    const detail = model && statusCode != null
-      ? `${model}（上游 HTTP ${statusCode}）`
-      : model
-        ? `${model} 调用可用`
-        : statusCode != null
-          ? `上游 HTTP ${statusCode}`
-          : '额度查询状态独立于模型调用'
-    return {
-      status: 'ok',
-      title,
-      detail,
-      text: `${title} · ${detail}`,
-      model,
-      testedAt,
-    }
-  }
-
-  // 2. 模型调用验证失败
-  if (probeStatus === 'failed') {
-    const title = model ? `${model} 调用验证失败` : '模型调用验证失败'
-    const detail = normalizeText(modelProbe?.error)
-      || (statusCode != null ? `上游 HTTP ${statusCode}` : '模型调用失败')
-    return {
-      status: 'failed',
-      title,
-      detail,
-      text: detail ? `${title}：${detail}` : title,
-      model,
-      testedAt,
-    }
-  }
-
-  // 3. 无模型调用探针证据时：
-  // 额度查询未决/不支持/失败/智谱兜底时，明确显示未验证，不伪装可用
-  const providerType = getQuotaProviderType(quota, fallbackProviderType)
-  const isOfficial = isOfficialQuotaProviderType(providerType)
-  const sources = quota?.sources ?? []
-  const hasSuccessfulSources = sources.some(s => s.query_status === 'ok')
-  const isAmbiguousZhipu = isZhipuAmbiguousQuotaFallback(quota, fallbackProviderType)
-
-  const isQueryUnresolved = !quota
-    || quota.code === 'unknown'
-    || Boolean(quota.refresh_state?.error)
-    || Boolean(quota.token_plan_error)
-    || isAmbiguousZhipu
-    || (sources.length > 0 && !hasSuccessfulSources)
-    || (isOfficial && sources.length === 0)
-
-  if (isQueryUnresolved) {
-    const title = '模型调用未验证'
-    const detail = '额度查询结果仅反映额度接口，尚未检测模型实际可用性'
-    return {
-      status: 'unknown',
-      title,
-      detail,
-      text: `${title} · ${detail}`,
-      model: null,
-      testedAt: null,
-    }
-  }
-
-  return null
-}
-
-/** 保持对既有智谱调用方签名的兼容性转发。 */
-export function getZhipuModelAvailabilityDisplay(
-  quota: QuotaStatusSnapshot | null | undefined,
-  modelProbe?: ModelProbeStatusSnapshot | null,
-  fallbackProviderType?: string | null,
-): ProviderModelAvailabilityDisplay | null {
-  return getProviderModelAvailabilityDisplay(quota, modelProbe, fallbackProviderType)
 }
 
 export function formatDecimalDisplay(value: unknown): string | null {
@@ -590,7 +466,6 @@ export function getGenericQuotaGroups(
     ] : [quota.membership_level || quota.plan_type,
       quota.token_plan_scope ? scopeLabels[quota.token_plan_scope] || quota.token_plan_scope : null]
     const notes: string[] = []
-    if (stale) notes.push('数据已过期，显示上次成功结果')
     if (providerType === 'siliconflow' && source?.region === 'cn' && source.query_status === 'unsupported') {
       notes.push('官方国内余额接口已停用，暂无替代接口')
     }
@@ -616,9 +491,6 @@ export function getGenericQuotaGroups(
     }
     if (!source && quota.parallel_limit != null) metadata.push(`并发 ${formatDecimalDisplay(quota.parallel_limit) || '未知'}`)
     if (!source && !spendingLimit && quota.expires_at != null) metadata.push(`到期 ${formatQuotaDateTime(quota.expires_at) || quota.expires_at}`)
-    if (isOfficialQuotaProviderType(providerType) && !source) {
-      notes.push('历史快照，待刷新')
-    }
     let defaultLabel = '账户额度'
     if (source?.product === 'account_balance') {
       defaultLabel = '账户余额'
@@ -1031,18 +903,12 @@ export function getQuotaDisplayText(
   fallbackProviderType?: string | null,
 ): string | null {
   const quota = getQuotaSnapshot(input)
-  const availability = getProviderModelAvailabilityDisplay(
-    quota,
-    input.status_snapshot?.model_probe,
-    fallbackProviderType,
-  )
   if (isOfficialQuotaProviderType(getQuotaProviderType(quota, fallbackProviderType))) {
     const sections = getGenericQuotaSections(quota, fallbackProviderType)
-    const values = [availability?.text, ...sections.balances, ...sections.windows, ...sections.rateLimits, ...sections.status]
+    const values = [...sections.balances, ...sections.windows, ...sections.rateLimits, ...sections.status]
       .filter((value): value is string => Boolean(value))
     return values.length ? values.join(' | ') : getQuotaQueryStatusLabel(quota, fallbackProviderType) || '额度未知'
   }
-  if (availability) return availability.text
   if (quota && (quota.kind || (quota.balances?.length ?? 0) > 0)) {
     const sections = getGenericQuotaSections(quota, fallbackProviderType)
     const structured = [...sections.balances, ...sections.windows, ...sections.rateLimits]

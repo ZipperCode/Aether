@@ -338,7 +338,6 @@
                   <PoolKeyQuotaPanel
                     :items="quotaProgressDisplayMap[key.key_id] || []"
                     :quota="getQuotaSnapshot(key)"
-                    :model-probe="key.status_snapshot?.model_probe"
                     :provider-type="selectedProviderType"
                     :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
                     :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
@@ -347,7 +346,11 @@
                     :reset-credit-items="getCodexResetCreditItemTexts(key)"
                     :can-consume-reset-credit="canConsumeCodexResetCredit(key)"
                     :consuming-reset-credit="consumingCodexResetCreditKeyId === key.key_id"
+                    :refreshable="canRefreshPoolKeyQuota(key)"
+                    :refresh-loading="refreshingQuotaKeyId === key.key_id"
+                    :refresh-disabled="isPoolKeyQuotaRefreshDisabled(key)"
                     @consume-reset-credit="handleConsumeCodexResetCredit(key)"
+                    @refresh="handleRefreshPoolKeyQuota(key)"
                   />
                 </TableCell>
                 <TableCell class="py-3 px-2 align-top">
@@ -761,7 +764,6 @@
                 v-if="showAccountQuotaColumn"
                 :items="quotaProgressDisplayMap[key.key_id] || []"
                 :quota="getQuotaSnapshot(key)"
-                :model-probe="key.status_snapshot?.model_probe"
                 :provider-type="selectedProviderType"
                 :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
                 :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
@@ -770,8 +772,12 @@
                 :reset-credit-items="getCodexResetCreditItemTexts(key)"
                 :can-consume-reset-credit="canConsumeCodexResetCredit(key)"
                 :consuming-reset-credit="consumingCodexResetCreditKeyId === key.key_id"
+                :refreshable="canRefreshPoolKeyQuota(key)"
+                :refresh-loading="refreshingQuotaKeyId === key.key_id"
+                :refresh-disabled="isPoolKeyQuotaRefreshDisabled(key)"
                 variant="mobile"
                 @consume-reset-credit="handleConsumeCodexResetCredit(key)"
+                @refresh="handleRefreshPoolKeyQuota(key)"
               />
 
               <div class="flex items-center gap-0.5">
@@ -2038,6 +2044,8 @@ const sortOrder = ref<PoolManagementSortOrder>(restoredViewState.sortOrder)
 const hasPoolKeyFilters = computed(() => searchQuery.value.trim().length > 0 || statusFilter.value !== 'all')
 const MANUAL_QUOTA_REFRESH_COOLDOWN_SECONDS = 5 * 60
 const refreshingOAuthKeyId = ref<string | null>(null)
+/** 当前正在单独刷新额度的 Key；与页级额度刷新互斥，避免并发合并互相覆盖。 */
+const refreshingQuotaKeyId = ref<string | null>(null)
 /** 当前正在消耗重置机会的 Codex Key；全页同一时刻只允许一个请求。 */
 const consumingCodexResetCreditKeyId = ref<string | null>(null)
 const resettingCycleKeyId = ref<string | null>(null)
@@ -2441,6 +2449,67 @@ function applyQuotaRefreshResultToCurrentPage(result: Awaited<ReturnType<typeof 
   keyPage.value.keys = mergePoolKeyQuotaSnapshots(keyPage.value.keys, result.results)
 }
 
+/**
+ * 单 Key 额度刷新入口是否可见：仅对支持额度查询的 Provider 且实际有额度展示/来源的 Key 开放。
+ * 结构化官方额度的“尚未查询额度”空态本身就是可查询入口，不能因暂无数据而隐藏。
+ */
+function canRefreshPoolKeyQuota(key: PoolKeyDetail): boolean {
+  if (!quotaRefreshSupported.value) return false
+  const quota = getQuotaSnapshot(key)
+  if (quota) return true
+  // 无快照时结构化官方额度的“尚未查询额度”空态本身就是可查询入口，不能因暂无数据而禁用。
+  if (isOfficialQuotaProviderType(selectedProviderType.value)) return true
+  const uiState = keyUiStateMap.value[key.key_id]
+  return (quotaProgressDisplayMap.value[key.key_id]?.length ?? 0) > 0
+    || Boolean(uiState?.accountQuotaText || uiState?.quotaFallbackText)
+}
+
+/** 与页级额度刷新、其他 Key 的单独刷新互斥，进行中时禁用入口防重复提交。 */
+function isPoolKeyQuotaRefreshDisabled(key: PoolKeyDetail): boolean {
+  const keyId = String(key.key_id || '').trim()
+  if (!keyId) return true
+  return refreshingCurrentPageQuota.value
+    || (refreshingQuotaKeyId.value !== null && refreshingQuotaKeyId.value !== keyId)
+}
+
+/**
+ * 只刷新目标 Key 的额度并就地合并结果，不做全页强刷。
+ * Provider 已切换时丢弃旧响应，避免把旧 Provider 的快照写回新页。
+ */
+async function handleRefreshPoolKeyQuota(key: PoolKeyDetail): Promise<void> {
+  const providerId = selectedProviderId.value
+  const keyId = String(key.key_id || '').trim()
+  if (!providerId || !keyId) return
+  if (!canRefreshPoolKeyQuota(key)) return
+  if (refreshingQuotaKeyId.value !== null || refreshingCurrentPageQuota.value) return
+
+  const cooldownRemainingSeconds = getPoolKeyQuotaCooldownRemainingSeconds(key)
+  if (cooldownRemainingSeconds > 0) {
+    showWarning(`该 Key 额度冷却中，请 ${formatTTL(cooldownRemainingSeconds)} 后再试`)
+    return
+  }
+
+  refreshingQuotaKeyId.value = keyId
+  try {
+    const result = await refreshProviderQuota(providerId, [keyId])
+    // Provider 已切换时直接丢弃旧响应：既不写回新页，也不弹出过期的成功/失败提示。
+    if (selectedProviderId.value !== providerId) return
+    applyQuotaRefreshResultToCurrentPage(result)
+    if (result.success > 0) {
+      success('额度已刷新')
+      return
+    }
+    const detail = result.results.find(item => item.key_id === keyId)?.message?.trim()
+    showError(detail ? `额度刷新失败：${detail}` : '额度刷新失败，没有获取到额度信息')
+  } catch (err: unknown) {
+    if (selectedProviderId.value === providerId) {
+      showError(parseApiError(err, '额度刷新失败'))
+    }
+  } finally {
+    refreshingQuotaKeyId.value = null
+  }
+}
+
 /** 合并 Codex 快照与较新的 metadata 重置机会；其他 Provider 的同名字段不参与。 */
 function getCodexResetCredits(key: PoolKeyDetail) {
   if (getQuotaSnapshotProviderType(key) !== 'codex') return null
@@ -2569,6 +2638,16 @@ function normalizeQuotaUpdatedAt(raw: number | null | undefined): number | null 
   return Math.floor(value)
 }
 
+/** 单 Key 手动额度刷新的冷却剩余秒数；从未查询过（无更新时间）时立即可刷新。 */
+function getPoolKeyQuotaCooldownRemainingSeconds(
+  key: PoolKeyDetail,
+  nowSeconds: number = Math.floor(Date.now() / 1000),
+): number {
+  const updatedAt = normalizeQuotaUpdatedAt(key.quota_updated_at ?? null)
+  if (updatedAt == null) return 0
+  return Math.max(0, MANUAL_QUOTA_REFRESH_COOLDOWN_SECONDS - (nowSeconds - updatedAt))
+}
+
 const currentPageQuotaRefreshStats = computed(() => {
   void countdownTick.value
   const seen = new Set<string>()
@@ -2580,12 +2659,7 @@ const currentPageQuotaRefreshStats = computed(() => {
     const id = String(key.key_id || '').trim()
     if (!id || seen.has(id)) continue
     seen.add(id)
-    const updatedAt = normalizeQuotaUpdatedAt(key.quota_updated_at ?? null)
-    if (updatedAt == null) {
-      eligibleIds.push(id)
-      continue
-    }
-    const remaining = MANUAL_QUOTA_REFRESH_COOLDOWN_SECONDS - (nowSeconds - updatedAt)
+    const remaining = getPoolKeyQuotaCooldownRemainingSeconds(key, nowSeconds)
     if (remaining > 0) {
       cooledDownCount += 1
       if (minRemainingSeconds <= 0 || remaining < minRemainingSeconds) {
@@ -2620,7 +2694,7 @@ async function refreshCurrentPageQuotaInBackground(
     return false
   }
 
-  if (refreshingCurrentPageQuota.value) {
+  if (refreshingCurrentPageQuota.value || refreshingQuotaKeyId.value !== null) {
     return false
   }
 

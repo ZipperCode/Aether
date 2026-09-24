@@ -40,7 +40,6 @@ describe('NousQuotaCard', () => {
     expect(root.textContent).toContain('购买 Credits 0.025')
     expect(root.textContent).toContain('账户余额 $12.5')
     expect(root.textContent).toContain('RPM 50')
-    expect(root.textContent).toContain('账单数据已过期')
     expect(root.textContent).toContain('42 秒后恢复')
 
     app.unmount()

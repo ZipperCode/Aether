@@ -2,16 +2,20 @@
   <ProviderGenericQuotaCard
     v-if="supportsStructuredQuota"
     :quota="quota"
-    :model-probe="modelProbe"
     :provider-type="providerType"
+    :loading="refreshLoading"
+    :refreshable="refreshable"
+    :refresh-disabled="refreshDisabled"
     compact
+    @refresh="emit('refresh')"
   />
   <div
     v-else-if="variant === 'mobile'"
     class="rounded-xl border border-border/50 bg-muted/30 px-3 py-2 text-xs"
   >
-    <div class="text-muted-foreground mb-1">
-      {{ legacyT('配额') }}
+    <div class="text-muted-foreground mb-1 flex items-center justify-between gap-2">
+      <span>{{ legacyT('配额') }}</span>
+      <QuotaRefreshButton v-if="refreshable" />
     </div>
     <div
       v-if="items.length"
@@ -45,24 +49,33 @@
   <template v-else>
     <div
       v-if="items.length"
-      class="w-full max-w-[208px]"
-      :class="hasNumericOnlyItems ? '' : 'space-y-2'"
+      class="flex w-full max-w-[208px] items-start gap-1"
     >
-      <QuotaProgressRows :items="items" />
       <div
-        v-if="accountQuotaText"
-        class="text-[10px] leading-none text-muted-foreground tabular-nums"
+        class="min-w-0 flex-1"
+        :class="hasNumericOnlyItems ? '' : 'space-y-2'"
       >
-        {{ accountQuotaText }}
+        <QuotaProgressRows :items="items" />
+        <div
+          v-if="accountQuotaText"
+          class="text-[10px] leading-none text-muted-foreground tabular-nums"
+        >
+          {{ accountQuotaText }}
+        </div>
+        <ResetCredits />
       </div>
-      <ResetCredits />
+      <QuotaRefreshButton v-if="refreshable" />
     </div>
-    <span
+    <div
       v-else-if="accountQuotaText || fallbackText"
-      :class="textClass"
+      class="flex w-full items-start gap-1"
     >
-      {{ accountQuotaText || fallbackText }}
-    </span>
+      <span
+        class="min-w-0 flex-1"
+        :class="textClass"
+      >{{ accountQuotaText || fallbackText }}</span>
+      <QuotaRefreshButton v-if="refreshable" />
+    </div>
     <span
       v-else
       class="text-xs text-muted-foreground"
@@ -72,8 +85,9 @@
 
 <script setup lang="ts">
 import { computed, defineComponent, h, type PropType } from 'vue'
+import { RefreshCw } from 'lucide-vue-next'
 import { useI18n } from '@/i18n'
-import type { ModelProbeStatusSnapshot, QuotaStatusSnapshot } from '@/api/endpoints/types'
+import type { QuotaStatusSnapshot } from '@/api/endpoints/types'
 import ProviderGenericQuotaCard from '@/features/providers/components/ProviderGenericQuotaCard.vue'
 import { isOfficialQuotaProviderType } from '@/features/providers/utils/providerTypeUtils'
 
@@ -93,7 +107,6 @@ export interface PoolQuotaProgressDisplayItem {
 const props = withDefaults(defineProps<{
   items: PoolQuotaProgressDisplayItem[]
   quota?: QuotaStatusSnapshot | null
-  modelProbe?: ModelProbeStatusSnapshot | null
   providerType?: string | null
   accountQuotaText?: string | null
   fallbackText?: string | null
@@ -107,10 +120,15 @@ const props = withDefaults(defineProps<{
   canConsumeResetCredit?: boolean
   /** 当前 Key 是否正在消耗重置机会，用于禁止重复提交。 */
   consumingResetCredit?: boolean
+  /** 是否提供单 Key 额度刷新入口；冷却与互斥判断由页面统一处理。 */
+  refreshable?: boolean
+  /** 该 Key 额度刷新请求进行中，图标旋转并阻止重复点击。 */
+  refreshLoading?: boolean
+  /** 其他 Key 或页级额度刷新进行中时的互斥禁用。 */
+  refreshDisabled?: boolean
 }>(), {
   accountQuotaText: null,
   quota: null,
-  modelProbe: null,
   providerType: null,
   fallbackText: null,
   textClass: '',
@@ -119,11 +137,15 @@ const props = withDefaults(defineProps<{
   resetCreditItems: () => [],
   canConsumeResetCredit: false,
   consumingResetCredit: false,
+  refreshable: false,
+  refreshLoading: false,
+  refreshDisabled: false,
 })
 
-/** 将重置动作交给页面级幂等流程处理，展示组件不直接访问接口。 */
+/** 将重置与额度刷新动作交给页面级流程处理，展示组件不直接访问接口。 */
 const emit = defineEmits<{
   'consume-reset-credit': []
+  'refresh': []
 }>()
 
 
@@ -135,6 +157,28 @@ const supportsStructuredQuota = computed(() => isOfficialQuotaProviderType(
 const hasNumericOnlyItems = computed(() => (
   props.items.length > 0 && props.items.every(item => item.numericOnly)
 ))
+
+/** 单 Key 额度刷新入口；视觉与官方额度卡头部刷新一致，加载时图标旋转。 */
+const QuotaRefreshButton = defineComponent({
+  name: 'PoolQuotaRefreshButton',
+  /** 返回依赖当前 props 的轻量渲染函数；请求与冷却判断全部由页面完成。 */
+  setup() {
+    return () => h('button', {
+      type: 'button',
+      disabled: props.refreshDisabled || props.refreshLoading,
+      class: 'inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60',
+      title: legacyT('刷新额度'),
+      'aria-label': legacyT('刷新额度'),
+      'data-testid': 'pool-quota-refresh',
+      onClick: () => emit('refresh'),
+    }, [
+      h(RefreshCw, {
+        class: ['h-3 w-3', props.refreshLoading ? 'animate-spin' : ''],
+        'data-testid': props.refreshLoading ? 'pool-quota-refresh-loading' : 'pool-quota-refresh-icon',
+      }),
+    ])
+  },
+})
 
 /** 渲染 Codex 重置机会摘要与单一消费入口。 */
 const ResetCredits = defineComponent({

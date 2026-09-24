@@ -37,6 +37,12 @@ const routeMocks = vi.hoisted(() => ({
   }),
 }))
 
+const toastMocks = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+  warning: vi.fn(),
+}))
+
 const proxyStoreMocks = vi.hoisted(() => ({
   ensureLoaded: vi.fn(),
 }))
@@ -83,23 +89,32 @@ vi.mock('@/stores/proxy-nodes', () => ({
   }),
 }))
 
+// 共享 toast mock 实例，供单 Key 额度刷新的提示断言复用。
 vi.mock('@/composables/useToast', () => ({
-  useToast: () => ({
-    success: vi.fn(),
-    error: vi.fn(),
-    warning: vi.fn(),
+  useToast: () => toastMocks,
+}))
+
+vi.mock('@/composables/useRouteQuery', async () => {
+  const { reactive } = await import('vue')
+  // 响应式 query 让页面 watch(providerId) 可被测试直接驱动，用于验证 Provider 切换边界；
+  // vitest 的 vi.mock 工厂先于静态 import 求值，只能在此处动态引入 vue。
+  routeMocks.query = reactive(routeMocks.query)
+  return {
+    useRouteQuery: () => ({
+      getQueryValue: (key: string) => routeMocks.query[key],
+      patchQuery: routeMocks.patchQuery,
+    }),
+  }
+})
+vi.mock('@/composables/useClipboard', () => ({
+  useClipboard: () => ({
+    copyToClipboard: vi.fn().mockResolvedValue(undefined),
   }),
 }))
 
 vi.mock('@/composables/useConfirm', () => ({
   useConfirm: () => ({
     confirm: vi.fn().mockResolvedValue(true),
-  }),
-}))
-
-vi.mock('@/composables/useClipboard', () => ({
-  useClipboard: () => ({
-    copyToClipboard: vi.fn().mockResolvedValue(undefined),
   }),
 }))
 
@@ -624,6 +639,9 @@ beforeEach(() => {
   endpointMocks.resetProviderKeyCycleStats.mockReset()
   endpointMocks.refreshProviderOAuth.mockReset()
   endpointMocks.recoverKeyHealth.mockReset()
+  toastMocks.success.mockClear()
+  toastMocks.error.mockClear()
+  toastMocks.warning.mockClear()
 
   endpointMocks.getPoolSchedulingPresets.mockResolvedValue([])
   endpointMocks.clearPoolCooldown.mockResolvedValue({ message: 'ok' })
@@ -1456,5 +1474,326 @@ describe('PoolManagement Codex cycle stats mode', () => {
     // 成功后当前列表健康数据反映恢复结果，并触发列表静默重载。
     expect(root.querySelector('[data-testid="pool-key-health"]')?.textContent).toContain('100%')
     expect(endpointMocks.listPoolKeys.mock.calls.length).toBeGreaterThan(1)
+  })
+})
+
+describe('PoolManagement per-key quota refresh', () => {
+  /** 定位包含指定账号名的桌面表格行。 */
+  function desktopRowForKey(root: HTMLElement, keyName: string): HTMLTableRowElement | null {
+    return Array.from(root.querySelectorAll('tr'))
+      .find(row => row.textContent?.includes(keyName)) ?? null
+  }
+
+  it('refreshes only the targeted key and merges the quota result in place', async () => {
+    const keyQuotaWindows = [
+      { code: '5h', remaining_ratio: 0.8, window_minutes: 300 },
+      { code: 'weekly', remaining_ratio: 0.5, window_minutes: 10_080 },
+    ]
+    const keyA = createPoolKey('codex', {
+      key_id: 'codex-key-a',
+      key_name: 'Account A',
+      status_snapshot: {
+        oauth: { code: 'valid' },
+        account: { code: 'ok', blocked: false },
+        quota: { code: 'ok', exhausted: false, provider_type: 'codex', windows: keyQuotaWindows },
+      },
+    })
+    const keyB = createPoolKey('codex', {
+      key_id: 'codex-key-b',
+      key_name: 'Account B',
+      status_snapshot: {
+        oauth: { code: 'valid' },
+        account: { code: 'ok', blocked: false },
+        quota: { code: 'ok', exhausted: false, provider_type: 'codex', windows: keyQuotaWindows },
+      },
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue({ total: 2, page: 1, page_size: 50, keys: [keyA, keyB] })
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+    endpointMocks.refreshProviderQuota.mockResolvedValue({
+      success: 1,
+      failed: 0,
+      total: 1,
+      results: [{
+        key_id: 'codex-key-a',
+        key_name: 'Account A',
+        status: 'success',
+        quota_snapshot: {
+          code: 'ok',
+          exhausted: false,
+          provider_type: 'codex',
+          updated_at: Math.floor(Date.now() / 1000),
+          windows: [{ code: '5h', remaining_ratio: 0.2, window_minutes: 300 }],
+        },
+      }],
+    })
+
+    const root = mountPoolManagement()
+    await settle()
+    const listCallsBeforeRefresh = endpointMocks.listPoolKeys.mock.calls.length
+
+    const rowA = desktopRowForKey(root, 'Account A')
+    const rowB = desktopRowForKey(root, 'Account B')
+    const refreshButton = rowA?.querySelector<HTMLButtonElement>('[data-testid="pool-quota-refresh"]')
+    expect(refreshButton).not.toBeNull()
+    refreshButton?.click()
+    await settle()
+
+    expect(endpointMocks.refreshProviderQuota).toHaveBeenCalledTimes(1)
+    expect(endpointMocks.refreshProviderQuota).toHaveBeenCalledWith('codex-provider', ['codex-key-a'])
+    // 结果就地合并：仅目标 Key 的额度更新，兄弟 Key 保持原值，且不触发全页强刷。
+    const metersA = Array.from(rowA?.querySelectorAll('[data-testid="pool-quota-meter-text"]') ?? [])
+      .map(element => element.textContent?.trim())
+    const metersB = Array.from(rowB?.querySelectorAll('[data-testid="pool-quota-meter-text"]') ?? [])
+      .map(element => element.textContent?.trim())
+    expect(metersA).toEqual(['20.0%'])
+    expect(metersB).toEqual(expect.arrayContaining(['80.0%', '50.0%']))
+    expect(metersB).toHaveLength(2)
+    expect(endpointMocks.listPoolKeys.mock.calls.length).toBe(listCallsBeforeRefresh)
+    expect(toastMocks.success).toHaveBeenCalledWith('额度已刷新')
+  })
+
+  it('blocks duplicate and sibling refreshes while one per-key quota refresh is in flight', async () => {
+    const keyA = createPoolKey('codex', { key_id: 'codex-key-a', key_name: 'Account A' })
+    const keyB = createPoolKey('codex', { key_id: 'codex-key-b', key_name: 'Account B' })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue({ total: 2, page: 1, page_size: 50, keys: [keyA, keyB] })
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+
+    let resolveRefresh: (value: {
+      success: number
+      failed: number
+      total: number
+      results: Array<{ key_id: string, key_name: string, status: string, quota_snapshot?: Record<string, unknown> }>
+    }) => void = () => {}
+    endpointMocks.refreshProviderQuota.mockImplementation(
+      () => new Promise((resolve) => {
+        resolveRefresh = resolve
+      }),
+    )
+
+    const root = mountPoolManagement()
+    await settle()
+    const listCallsBeforeRefresh = endpointMocks.listPoolKeys.mock.calls.length
+
+    const buttonA = desktopRowForKey(root, 'Account A')
+      ?.querySelector<HTMLButtonElement>('[data-testid="pool-quota-refresh"]')
+    const buttonB = desktopRowForKey(root, 'Account B')
+      ?.querySelector<HTMLButtonElement>('[data-testid="pool-quota-refresh"]')
+    expect(buttonA).not.toBeNull()
+    expect(buttonB).not.toBeNull()
+
+    buttonA?.click()
+    await settle()
+    // 加载中的 Key 与兄弟 Key 的入口都进入互斥禁用，重复点击不再发起请求。
+    expect(buttonA?.disabled).toBe(true)
+    expect(buttonB?.disabled).toBe(true)
+    buttonA?.click()
+    buttonB?.click()
+    await settle()
+    expect(endpointMocks.refreshProviderQuota).toHaveBeenCalledTimes(1)
+
+    // 返回带真实窗口的快照，避免额度行退化为空态导致刷新入口被卸载。
+    resolveRefresh({
+      success: 1,
+      failed: 0,
+      total: 1,
+      results: [{
+        key_id: 'codex-key-a',
+        key_name: 'Account A',
+        status: 'success',
+        quota_snapshot: {
+          code: 'ok',
+          exhausted: false,
+          provider_type: 'codex',
+          windows: [{ code: '5h', remaining_ratio: 0.2, window_minutes: 300 }],
+        },
+      }],
+    })
+    await settle()
+
+    // 就地合并会重建行内容，重新定位按钮再断言互斥解除。
+    const reenabledButtonA = desktopRowForKey(root, 'Account A')
+      ?.querySelector<HTMLButtonElement>('[data-testid="pool-quota-refresh"]')
+    const reenabledButtonB = desktopRowForKey(root, 'Account B')
+      ?.querySelector<HTMLButtonElement>('[data-testid="pool-quota-refresh"]')
+    expect(reenabledButtonA?.disabled).toBe(false)
+    expect(reenabledButtonB?.disabled).toBe(false)
+    expect(endpointMocks.listPoolKeys.mock.calls.length).toBe(listCallsBeforeRefresh)
+  })
+
+  it('warns instead of calling the API while the key quota is still cooling down', async () => {
+    const coolingKey = createPoolKey('codex', {
+      key_id: 'codex-cooling-key',
+      key_name: 'Cooling account',
+      quota_updated_at: Math.floor(Date.now() / 1000),
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(coolingKey))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    const refreshButton = desktopRowForKey(root, 'Cooling account')
+      ?.querySelector<HTMLButtonElement>('[data-testid="pool-quota-refresh"]')
+    expect(refreshButton).not.toBeNull()
+    refreshButton?.click()
+    await settle()
+
+    expect(endpointMocks.refreshProviderQuota).not.toHaveBeenCalled()
+    expect(toastMocks.warning).toHaveBeenCalledWith(expect.stringContaining('冷却'))
+  })
+
+  it('keeps the page-level quota refresh from racing an in-flight per-key refresh', async () => {
+    const key = createPoolKey('codex', { key_id: 'codex-key-a', key_name: 'Account A' })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(key))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+    let resolveRefresh: (value: unknown) => void = () => {}
+    endpointMocks.refreshProviderQuota.mockImplementation(
+      () => new Promise((resolve) => {
+        resolveRefresh = resolve
+      }),
+    )
+
+    const root = mountPoolManagement()
+    await settle()
+
+    desktopRowForKey(root, 'Account A')
+      ?.querySelector<HTMLButtonElement>('[data-testid="pool-quota-refresh"]')
+      ?.click()
+    await settle()
+
+    const pageRefreshButton = root.querySelector<HTMLButtonElement>('button[title="刷新数据和额度"]')
+    pageRefreshButton?.click()
+    await settle()
+
+    // 页级刷新不得与单 Key 刷新并发第二个额度请求。
+    expect(endpointMocks.refreshProviderQuota).toHaveBeenCalledTimes(1)
+
+    resolveRefresh({ success: 1, failed: 0, total: 1, results: [] })
+    await settle()
+  })
+  it('drops a per-key quota response that lands after switching providers', async () => {
+    const codexKey = createPoolKey('codex', { key_id: 'shared-pool-key', key_name: 'Codex account' })
+    const geminiKey = createPoolKey('gemini_cli', {
+      key_id: 'shared-pool-key',
+      key_name: 'Gemini account',
+      status_snapshot: {
+        oauth: { code: 'valid' },
+        account: { code: 'ok', blocked: false },
+        quota: {
+          code: 'ok',
+          exhausted: false,
+          provider_type: 'gemini_cli',
+          windows: [{
+            code: 'weekly',
+            label: '周',
+            scope: 'model',
+            model: 'gemini-2.5-pro',
+            remaining_ratio: 0.5,
+            window_minutes: 10_080,
+          }],
+        },
+      },
+    })
+    routeMocks.query.providerId = 'codex-provider'
+    endpointMocks.getPoolOverview.mockResolvedValue({
+      items: [createOverview('codex'), createOverview('gemini_cli')],
+    })
+    endpointMocks.listPoolKeys.mockImplementation(async (providerId: string) => (
+      providerId === 'gemini_cli-provider' ? createKeyPage(geminiKey) : createKeyPage(codexKey)
+    ))
+    endpointMocks.getProvider.mockImplementation(async (id: string) => createProvider(
+      id === 'gemini_cli-provider' ? 'gemini_cli' : 'codex',
+    ))
+
+    let resolveRefresh: (value: unknown) => void = () => {}
+    endpointMocks.refreshProviderQuota.mockImplementation(
+      () => new Promise((resolve) => {
+        resolveRefresh = resolve
+      }),
+    )
+
+    const root = mountPoolManagement()
+    await settle()
+
+    const codexButtons = root.querySelectorAll<HTMLButtonElement>('[data-testid="pool-quota-refresh"]')
+    expect(codexButtons.length).toBe(2)
+    codexButtons[0]?.click()
+    await settle()
+    expect(endpointMocks.refreshProviderQuota).toHaveBeenCalledWith('codex-provider', ['shared-pool-key'])
+
+    routeMocks.query.providerId = 'gemini_cli-provider'
+    await settle()
+    expect(root.textContent).toContain('Gemini account')
+
+    resolveRefresh({
+      success: 1,
+      failed: 0,
+      total: 1,
+      results: [{
+        key_id: 'shared-pool-key',
+        key_name: 'Codex account',
+        status: 'success',
+        quota_snapshot: {
+          code: 'ok',
+          exhausted: false,
+          provider_type: 'codex',
+          windows: [{ code: 'weekly', remaining_ratio: 0.2, window_minutes: 10_080 }],
+        },
+      }],
+    })
+    await settle()
+
+    // 旧 Provider 的迟到响应不得写回当前页：Gemini 额度保持原值，Codex 快照不出现。
+    const meters = Array.from(root.querySelectorAll('[data-testid="pool-quota-meter-text"]'))
+      .map(element => element.textContent?.trim())
+    expect(meters).toContain('50.0%')
+    expect(meters).not.toContain('20.0%')
+    expect(root.textContent).not.toContain('Codex account')
+  })
+
+  it('keeps the generic quota header refresh available for official keys without a snapshot', async () => {
+    const officialKey = createPoolKey('deepseek', {
+      key_id: 'deepseek-key-1',
+      key_name: 'DeepSeek account',
+      status_snapshot: undefined,
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('deepseek')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(officialKey))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('deepseek'))
+    endpointMocks.refreshProviderQuota.mockResolvedValue({
+      success: 1,
+      failed: 0,
+      total: 1,
+      results: [{
+        key_id: 'deepseek-key-1',
+        key_name: 'DeepSeek account',
+        status: 'success',
+        quota_snapshot: {
+          provider_type: 'deepseek',
+          kind: 'balance',
+          code: 'ok',
+          exhausted: false,
+          balances: [{ unit: 'CNY', available: '12.5' }],
+        },
+      }],
+    })
+
+    const root = mountPoolManagement()
+    await settle()
+
+    // 空额度（尚未查询）也是可查询入口：官方结构化路径复用额度卡头部刷新，不额外渲染第二个图标。
+    const headerButtons = root.querySelectorAll<HTMLButtonElement>('[data-testid="provider-quota-header-refresh"]')
+    expect(headerButtons.length).toBe(2)
+    expect(root.querySelector('[data-testid="pool-quota-refresh"]')).toBeNull()
+    expect(root.textContent).toContain('尚未查询额度')
+    headerButtons[0]?.click()
+    await settle()
+
+    expect(endpointMocks.refreshProviderQuota).toHaveBeenCalledWith('deepseek-provider', ['deepseek-key-1'])
+    expect(root.textContent).toContain('12.5')
   })
 })

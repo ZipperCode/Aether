@@ -104,6 +104,129 @@ describe('pool key display panels', () => {
     root.remove()
   })
 
+  it('emits refresh from the per-key quota icon on desktop and mobile legacy rows', () => {
+    for (const variant of ['desktop', 'mobile'] as const) {
+      let refreshCount = 0
+      const root = document.createElement('div')
+      document.body.appendChild(root)
+      const app = createApp(PoolKeyQuotaPanel, {
+        items: [{
+          label: '5H',
+          remainingPercent: 42,
+          resetText: '1h 后重置',
+          meterText: '42.0%',
+          barClass: 'bg-amber-500',
+          meterClass: 'text-amber-600',
+        }],
+        variant,
+        refreshable: true,
+        onRefresh: () => {
+          refreshCount += 1
+        },
+      })
+      app.use(createI18n())
+      app.mount(root)
+
+      const button = root.querySelector<HTMLButtonElement>('[data-testid="pool-quota-refresh"]')
+      expect(button).not.toBeNull()
+      expect(button?.disabled).toBe(false)
+      expect(root.querySelector('[data-testid="pool-quota-refresh-icon"]')).not.toBeNull()
+      button?.click()
+      expect(refreshCount).toBe(1)
+
+      app.unmount()
+      root.remove()
+    }
+  })
+
+  it('spins and blocks clicks for the refreshing key and stays idle for others', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(defineComponent({
+      setup() {
+        return () => h('div', [
+          h(PoolKeyQuotaPanel, {
+            items: [{ label: '5H', remainingPercent: 42, resetText: '', meterText: '42.0%', barClass: 'bg-amber-500', meterClass: 'text-amber-600' }],
+            refreshable: true,
+            refreshLoading: true,
+          }),
+          h(PoolKeyQuotaPanel, {
+            items: [{ label: '5H', remainingPercent: 42, resetText: '', meterText: '42.0%', barClass: 'bg-amber-500', meterClass: 'text-amber-600' }],
+            refreshable: true,
+            refreshDisabled: true,
+          }),
+        ])
+      },
+    }))
+    app.use(createI18n())
+    app.mount(root)
+
+    const [loadingButton, disabledButton] = Array.from(
+      root.querySelectorAll<HTMLButtonElement>('[data-testid="pool-quota-refresh"]'),
+    )
+    expect(loadingButton?.disabled).toBe(true)
+    expect(loadingButton?.querySelector('[data-testid="pool-quota-refresh-loading"]')).not.toBeNull()
+    expect(loadingButton?.querySelector('[data-testid="pool-quota-refresh-icon"]')).toBeNull()
+    expect(disabledButton?.disabled).toBe(true)
+    expect(disabledButton?.querySelector('[data-testid="pool-quota-refresh-icon"]')).not.toBeNull()
+
+    loadingButton?.click()
+    disabledButton?.click()
+
+    app.unmount()
+    root.remove()
+  })
+
+  it('omits the refresh entry when refreshable is not requested', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [{ label: '5H', remainingPercent: 42, resetText: '', meterText: '42.0%', barClass: 'bg-amber-500', meterClass: 'text-amber-600' }],
+      providerType: 'deepseek',
+      quota: {
+        code: 'ok', exhausted: false, kind: 'balance',
+        balances: [{ unit: 'CNY', available: '47.73' }],
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    expect(root.querySelector('[data-testid="pool-quota-refresh"]')).toBeNull()
+    expect(root.querySelector('[data-testid="provider-quota-header-refresh"]')).toBeNull()
+    app.unmount()
+    root.remove()
+  })
+
+  it('reuses the generic quota header refresh for structured providers without a second icon', () => {
+    let refreshCount = 0
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [],
+      providerType: 'deepseek',
+      quota: {
+        code: 'ok', exhausted: false, kind: 'balance',
+        balances: [{ unit: 'CNY', available: '47.73' }],
+      },
+      refreshable: true,
+      onRefresh: () => {
+        refreshCount += 1
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    const headerButton = root.querySelector<HTMLButtonElement>('[data-testid="provider-quota-header-refresh"]')
+    expect(headerButton).not.toBeNull()
+    // 结构化路径只保留官方额度卡头部一个刷新入口，避免重复图标。
+    expect(root.querySelector('[data-testid="pool-quota-refresh"]')).toBeNull()
+    headerButton?.click()
+    expect(refreshCount).toBe(1)
+
+    app.unmount()
+    root.remove()
+  })
+
   it('renders structured provider balances instead of plain fallback text', () => {
     const root = document.createElement('div')
     document.body.appendChild(root)
@@ -170,7 +293,7 @@ describe('pool key display panels', () => {
     root.remove()
   })
 
-  it('shows stale DeepSeek balances with query failures on desktop and mobile', () => {
+  it('shows DeepSeek balances with query failures on desktop and mobile', () => {
     for (const variant of ['desktop', 'mobile'] as const) {
       const root = document.createElement('div')
       document.body.appendChild(root)
@@ -188,7 +311,6 @@ describe('pool key display panels', () => {
       app.mount(root)
 
       expect(root.textContent).toContain('查询失败')
-      expect(root.textContent).toContain('数据已过期')
       expect(root.textContent).not.toContain('不可用')
       expect(root.querySelector('[data-testid="provider-quota-available"]')).toBeTruthy()
       expect(root.textContent).toContain('9.25')
@@ -215,7 +337,6 @@ describe('pool key display panels', () => {
       app.mount(root)
 
       expect(root.textContent).toContain('查询失败')
-      expect(root.textContent).toContain('数据已过期')
       expect(root.textContent).not.toContain('不可用')
       expect(root.querySelector('[data-testid="provider-quota-available"]')).toBeTruthy()
       expect(root.textContent).toContain('http_unauthorized')
@@ -244,7 +365,7 @@ describe('pool key display panels', () => {
     root.remove()
   })
 
-  it('labels an ambiguous Zhipu balance as informational when no model probe exists', () => {
+  it('keeps an ambiguous Zhipu balance visible when the token plan query fails', () => {
     const root = document.createElement('div')
     document.body.appendChild(root)
     const app = createApp(PoolKeyQuotaPanel, {
@@ -258,8 +379,8 @@ describe('pool key display panels', () => {
     app.use(createI18n())
     app.mount(root)
 
-    expect(root.querySelector('[data-testid="provider-quota-available"]')).toBeTruthy()
-    expect(root.querySelector('[data-testid="provider-model-availability"]')?.classList).toContain('text-amber-700')
+    expect(root.querySelector('[data-testid="provider-quota-available"]')?.textContent).toContain('0 CNY')
+    expect(root.querySelector('[data-testid="provider-model-availability"]')).toBeNull()
     app.unmount()
     root.remove()
   })
@@ -307,27 +428,6 @@ describe('pool key display panels', () => {
     root.remove()
   })
 
-  it('shows successful model-probe evidence for an ambiguous Zhipu quota', () => {
-    const root = document.createElement('div')
-    document.body.appendChild(root)
-    const app = createApp(PoolKeyQuotaPanel, {
-      items: [], providerType: 'zhipu',
-      modelProbe: { status: 'ok', model: 'glm-5', status_code: 200 },
-      quota: {
-        kind: 'balance', code: 'ok', exhausted: false, balance_insufficient: true,
-        token_plan_status: 'query_failed', token_plan_scheduling_blocked: false,
-        balances: [{ unit: 'CNY', available: '0' }],
-      },
-    })
-    app.use(createI18n())
-    app.mount(root)
-
-    const availability = root.querySelector('[data-testid="provider-model-availability"]')
-    expect(availability?.textContent).toContain('模型调用已验证可用')
-    expect(availability?.classList).toContain('text-emerald-700')
-    app.unmount()
-    root.remove()
-  })
 
   it('does not render a percentage meter for unlimited balances', () => {
     const root = document.createElement('div')

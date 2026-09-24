@@ -16,33 +16,13 @@
       @refresh="$emit('refresh')"
     />
     <div
-      v-if="modelAvailability"
-      class="mt-1.5 rounded border px-2 py-1.5 text-[10px]"
-      :class="modelAvailability.status === 'ok'
-        ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300'
-        : modelAvailability.status === 'failed'
-          ? 'border-red-500/30 bg-red-500/5 text-red-700 dark:text-red-300'
-          : 'border-amber-500/30 bg-amber-500/5 text-amber-700 dark:text-amber-300'"
-      data-testid="provider-model-availability"
-    >
-      <div class="font-medium">
-        {{ legacyT(modelAvailability.title) }}
-      </div>
-      <div
-        v-if="modelAvailability.detail"
-        class="mt-0.5"
-      >
-        {{ legacyT(modelAvailability.detail) }}
-      </div>
-    </div>
-    <div
       class="space-y-2"
       :class="compact ? '' : 'mt-1.5'"
     >
       <section
         v-for="group in groups"
         :key="group.id"
-        class="min-w-0 rounded border border-border/50 bg-background/45 p-2"
+        class="min-w-0 rounded bg-background/45 p-2"
         :data-quota-source="group.id"
       >
         <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[10px]">
@@ -169,21 +149,19 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { ModelProbeStatusSnapshot, QuotaStatusSnapshot } from '@/api/endpoints/types'
+import type { QuotaStatusSnapshot } from '@/api/endpoints/types'
 import Badge from '@/components/ui/badge.vue'
 import { useI18n } from '@/i18n'
 import {
   formatQuotaDateTime,
   getGenericQuotaGroups,
   getGenericQuotaSections,
-  getProviderModelAvailabilityDisplay,
 } from '@/utils/providerKeyQuota'
 import ProviderQuotaProgressRow from './ProviderQuotaProgressRow.vue'
 import ProviderQuotaSectionHeader from './ProviderQuotaSectionHeader.vue'
 
 const props = withDefaults(defineProps<{
   quota?: QuotaStatusSnapshot | null
-  modelProbe?: ModelProbeStatusSnapshot | null
   loading?: boolean
   providerType?: string | null
   refreshable?: boolean
@@ -192,7 +170,6 @@ const props = withDefaults(defineProps<{
   compact?: boolean
 }>(), {
   quota: null,
-  modelProbe: null,
   loading: false,
   providerType: null,
   refreshable: false,
@@ -205,9 +182,6 @@ defineEmits<{ (e: 'refresh'): void }>()
 const { legacyT } = useI18n()
 const groups = computed(() => getGenericQuotaGroups(props.quota, props.providerType))
 const sections = computed(() => getGenericQuotaSections(props.quota, props.providerType))
-const modelAvailability = computed(() => getProviderModelAvailabilityDisplay(
-  props.quota, props.modelProbe, props.providerType,
-))
 const updatedText = computed(() => formatQuotaDateTime(
   props.quota?.refresh_state?.last_success_at ?? props.quota?.observed_at ?? props.quota?.updated_at,
 ))
