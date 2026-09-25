@@ -1,0 +1,95 @@
+{
+  "release_url": "https://github.com/ZipperCode/Aether/releases/tag/v0.7.40",
+  "version": "v0.7.40",
+  "assets": [
+    {
+      "name": "aether-v0.7.40-linux-amd64.tar.gz",
+      "size": 46096748,
+      "sha256": "8db6818d9e4fbfdf7ab7a42fd1f4f3380313884b12fa15bfeaa08d7772420856",
+      "github_digest_verified": true,
+      "sha256sums_verified": true,
+      "archive_entries": 256,
+      "required_layout_verified": true,
+      "attestation_verified": true
+    },
+    {
+      "name": "aether-v0.7.40-linux-arm64.tar.gz",
+      "size": 42432440,
+      "sha256": "e0c4a420ef58c2633b30df0044b2431a61f3a71caf99c15fa54e77ed4c6d9941",
+      "github_digest_verified": true,
+      "sha256sums_verified": true,
+      "archive_entries": 256,
+      "required_layout_verified": true,
+      "attestation_verified": true
+    },
+    {
+      "name": "aether-vscodex-0.4.0.vsix",
+      "size": 328733,
+      "sha256": "e2bf0915b2311a5ce085b39e287cf8bb4c7eb4880b52e453a4b931ac0298ba08",
+      "github_digest_verified": true,
+      "extension_version": "0.4.0",
+      "zip_integrity_verified": true,
+      "attestation_verified": false
+    },
+    {
+      "name": "AETHER_RELEASE_PROVENANCE.sigstore.json",
+      "size": 10961,
+      "sha256": "533e47a26cfd94af7c93a4d3b059609bb1a7867c2324a31e6c101c146a015148",
+      "github_digest_verified": true,
+      "attestation_verified": false
+    },
+    {
+      "name": "install.sh",
+      "size": 92886,
+      "sha256": "d5a48fe5f461e008f7d580a42abc3bd9ffee99c3dccb228566a092d3e60bc390",
+      "github_digest_verified": true,
+      "attestation_verified": true
+    },
+    {
+      "name": "SHA256SUMS",
+      "size": 200,
+      "sha256": "240b5372958cf9be3e29eeacddbd6d0e308b423753833e27ea72cbe3db3a1eb8",
+      "github_digest_verified": true,
+      "attestation_verified": true
+    }
+  ],
+  "source_sha": "ec4d8d1da8b8a23e6074c4195e8dee4965f8cb14",
+  "ci_run_id": 36101864221,
+  "ci_jobs_success": 18,
+  "release_run_id": 36103449902,
+  "release_jobs_success": 8,
+  "tag_object": "b55458562810f78c3a30677f6053bd978ff59907",
+  "tag_created_at": "2026-09-25T14:33:48+08:00",
+  "deployed": false,
+  "ghcr": {
+    "image": "ghcr.io/zippercode/aether:0.7.40",
+    "digest": "sha256:600132c8604ed497c82a68e99b0e3bfa972ec50f6457ac4fce7bf6147a684ad8",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "manifests": {
+      "linux/amd64": "sha256:588cf68dc09e1bb66a2142d96903928aa327e032bb60cbebc13203d95344a93d",
+      "linux/arm64": "sha256:374539760ef6a585898e830b765aedec29295128c2e2792bdfb08b8821fb827a"
+    },
+    "attestation_verified": true
+  },
+  "package_provenance": {
+    "verified": true,
+    "signer_workflow": "ZipperCode/Aether/.github/workflows/release.yml",
+    "source_ref": "refs/tags/v0.7.40",
+    "source_sha": "ec4d8d1da8b8a23e6074c4195e8dee4965f8cb14",
+    "signed_subjects": [
+      "SHA256SUMS",
+      "aether-v0.7.40-linux-amd64.tar.gz",
+      "aether-v0.7.40-linux-arm64.tar.gz",
+      "install.sh"
+    ]
+  },
+  "pages": {
+    "api_status": 404,
+    "public_site_status": 404,
+    "frontend_base": "/",
+    "deploy_workflow_present": false
+  }
+}

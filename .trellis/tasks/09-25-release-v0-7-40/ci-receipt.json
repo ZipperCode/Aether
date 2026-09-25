@@ -1,0 +1,157 @@
+{
+  "conclusion": "success",
+  "createdAt": "2026-09-25T06:12:55Z",
+  "databaseId": 36101864221,
+  "event": "push",
+  "headBranch": "master",
+  "headSha": "ec4d8d1da8b8a23e6074c4195e8dee4965f8cb14",
+  "jobs": [
+    {
+      "name": "Frontend",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:16:38Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880088"
+    },
+    {
+      "name": "Format",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:13:31Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880252"
+    },
+    {
+      "name": "Clippy (Workspace Rest)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:13:34Z",
+      "completedAt": "2026-09-25T06:18:04Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880272"
+    },
+    {
+      "name": "Test (Data Adapter - aether-data-postgres)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:14:04Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880276"
+    },
+    {
+      "name": "Test (Workspace Rest)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:19:29Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880283"
+    },
+    {
+      "name": "Shell security fixtures",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:13:09Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880300"
+    },
+    {
+      "name": "Clippy (Gateway)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:16:59Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880332"
+    },
+    {
+      "name": "Test (Integration Scenarios)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:18:27Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880348"
+    },
+    {
+      "name": "Clippy (Data)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:14:00Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880386"
+    },
+    {
+      "name": "Test (Data)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:14:22Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880429"
+    },
+    {
+      "name": "Data DB Smoke (Postgres)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:14:49Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880434"
+    },
+    {
+      "name": "Test (Gateway)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:13:33Z",
+      "completedAt": "2026-09-25T06:32:53Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880464"
+    },
+    {
+      "name": "Check (Data Feature - postgres)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:13:57Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965880508"
+    },
+    {
+      "name": "Check (Data Feature - all-drivers)",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:12:58Z",
+      "completedAt": "2026-09-25T06:13:58Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107965881138"
+    },
+    {
+      "name": "Data DB Smoke",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:14:51Z",
+      "completedAt": "2026-09-25T06:14:54Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107966299744"
+    },
+    {
+      "name": "Clippy",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:18:06Z",
+      "completedAt": "2026-09-25T06:18:08Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107967034739"
+    },
+    {
+      "name": "Test",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:32:55Z",
+      "completedAt": "2026-09-25T06:32:58Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107970420155"
+    },
+    {
+      "name": "check",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:33:00Z",
+      "completedAt": "2026-09-25T06:33:02Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221/job/107970439039"
+    }
+  ],
+  "status": "completed",
+  "updatedAt": "2026-09-25T06:33:03Z",
+  "url": "https://github.com/ZipperCode/Aether/actions/runs/36101864221"
+}

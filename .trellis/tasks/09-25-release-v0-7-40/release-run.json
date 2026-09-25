@@ -1,0 +1,77 @@
+{
+  "conclusion": "success",
+  "createdAt": "2026-09-25T06:34:10Z",
+  "databaseId": 36103449902,
+  "event": "push",
+  "headBranch": "v0.7.40",
+  "headSha": "ec4d8d1da8b8a23e6074c4195e8dee4965f8cb14",
+  "jobs": [
+    {
+      "name": "Release preflight",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:34:12Z",
+      "completedAt": "2026-09-25T06:34:15Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36103449902/job/107970720185"
+    },
+    {
+      "name": "Build linux-arm64",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:34:17Z",
+      "completedAt": "2026-09-25T06:51:45Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36103449902/job/107970737995"
+    },
+    {
+      "name": "Build VS Code Codex extension",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:34:53Z",
+      "completedAt": "2026-09-25T06:35:39Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36103449902/job/107970738026"
+    },
+    {
+      "name": "Build frontend",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:34:17Z",
+      "completedAt": "2026-09-25T06:35:07Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36103449902/job/107970738042"
+    },
+    {
+      "name": "Build linux-amd64",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:34:17Z",
+      "completedAt": "2026-09-25T06:50:39Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36103449902/job/107970738116"
+    },
+    {
+      "name": "Release tarballs",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:51:47Z",
+      "completedAt": "2026-09-25T06:52:11Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36103449902/job/107974853013"
+    },
+    {
+      "name": "Docker multi-arch",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:51:48Z",
+      "completedAt": "2026-09-25T06:52:48Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36103449902/job/107974853122"
+    },
+    {
+      "name": "GitHub Release assets",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-09-25T06:52:50Z",
+      "completedAt": "2026-09-25T06:53:02Z",
+      "url": "https://github.com/ZipperCode/Aether/actions/runs/36103449902/job/107975102238"
+    }
+  ],
+  "status": "completed",
+  "updatedAt": "2026-09-25T06:53:03Z",
+  "url": "https://github.com/ZipperCode/Aether/actions/runs/36103449902"
+}
