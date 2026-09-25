@@ -1040,3 +1040,25 @@ Implemented independent quota sources, official plan recognition, regional query
 ### Next Steps
 
 - 未部署154；后续部署与真实账号验收需单独执行。
+
+
+## Session 40: 修复 Codex 图片字段与失败记账
+
+**Date**: 2026-09-25
+**Task**: 修复 Codex 图片字段与失败记账
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+只读核查154，确认output_format=png被Codex投影拒绝、空候选心跳漏记账及模型信息缺失；修复共享构造/记账/诊断投影，120项相关测试与Clippy/fmt/字段矩阵通过，未部署，进入v0.7.40发布。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c601d38e9` | (see git log) |
+
+### Status
+
+[OK] **Completed**
