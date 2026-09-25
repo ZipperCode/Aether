@@ -8,6 +8,7 @@ use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadReposi
 use aether_data::repository::proxy_nodes::InMemoryProxyNodeRepository;
 use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, GlobalModelReadRepository,
+    GlobalModelWriteRepository, StoredModelEndpointBinding,
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -21,8 +22,8 @@ use tokio::sync::oneshot;
 
 use super::super::super::{
     build_router_with_state, build_state_with_execution_runtime_override,
-    sample_admin_global_model, sample_bound_auth_config, sample_bound_key, sample_endpoint,
-    sample_key, sample_proxy_node, start_server, AppState,
+    sample_admin_global_model, sample_admin_provider_model, sample_bound_auth_config,
+    sample_bound_key, sample_endpoint, sample_key, sample_proxy_node, start_server, AppState,
 };
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
@@ -2375,7 +2376,7 @@ async fn gateway_reports_codex_quota_runtime_failures_locally_without_falling_ba
     upstream_handle.abort();
 }
 
-/// 验证 Antigravity 额度刷新走本地执行并把可路由模型同步到当前 Endpoint。
+/// 验证 Antigravity 额度刷新走本地执行，且只更新额度/发现元数据、不创建模型目录记录。
 #[test]
 fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_admin_principal() {
     run_provider_quota_test(
@@ -2384,7 +2385,7 @@ fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_a
     );
 }
 
-/// 执行完整额度刷新，检查 quota 持久化、模型过滤与精确 Endpoint binding。
+/// 执行完整额度刷新，检查 quota 持久化与发现元数据保留；手动模型配置不被创建、改写或恢复。
 async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_admin_principal_inner(
 ) {
     #[derive(Debug, Clone)]
@@ -2569,10 +2570,29 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         "claude-sonnet-4",
         "Claude Sonnet 4",
     );
+    // 预置一条手动导入的 Provider Model 与 manual Endpoint binding：刷新既不能改写它，
+    // 也不能在它被删除后借发现元数据恢复。
+    let manual_provider_model = sample_admin_provider_model(
+        "model-antigravity-manual",
+        "provider-antigravity",
+        "global-claude-sonnet-4",
+        "claude-sonnet-4",
+    );
+    let manual_model_binding = StoredModelEndpointBinding::new(
+        "model-antigravity-manual".to_string(),
+        "endpoint-antigravity-chat".to_string(),
+        "manual".to_string(),
+        true,
+        None,
+        None,
+    )
+    .expect("manual model endpoint binding should build");
     let global_model_repository = Arc::new(
         InMemoryGlobalModelReadRepository::default()
             .with_admin_global_models(vec![existing_global_model.clone()])
-            // 模型存储同时持有准确的 Endpoint 归属，避免额度发现退回推断。
+            .with_admin_provider_models(vec![manual_provider_model.clone()])
+            .with_model_endpoint_bindings(vec![manual_model_binding.clone()])
+            // Endpoint 归属表只服务手动导入校验；额度刷新本身不得写模型目录。
             .with_endpoint_provider_ids([("endpoint-antigravity-chat", "provider-antigravity")]),
     );
 
@@ -2686,6 +2706,28 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             .and_then(|value| value.get("remaining_fraction")),
         Some(&json!(0.25))
     );
+    // 刷新只更新额度/发现元数据：上游发现的模型（含内部模型）完整保留在 metadata 中，
+    // 供手动导入使用，但不落任何模型目录记录。
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("antigravity"))
+            .and_then(|value| value.get("quota_by_model"))
+            .and_then(serde_json::Value::as_object)
+            .map(|models| {
+                models
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>()
+            }),
+        Some(std::collections::BTreeSet::from([
+            "claude-sonnet-4",
+            "gemini-2.5-pro",
+            "gemini-3.7-flash-tiered",
+            "chat_23310",
+        ]))
+    );
     let global_models = global_model_repository
         .list_admin_global_models(&AdminGlobalModelListQuery {
             limit: 100,
@@ -2693,24 +2735,15 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         })
         .await
         .expect("global models should read after quota refresh");
-    // 额度发现会导入三个可路由模型；原有全局模型复用不改写，内部模型不入库。
-    assert_eq!(global_models.total, 3);
-    // 列表动态补充关联计数；除此之外原记录（包括定价和手动配置）必须保持不变。
-    let mut existing_global_model = existing_global_model;
-    existing_global_model.provider_count = 1;
-    existing_global_model.active_provider_count = 1;
-    assert!(global_models.items.contains(&existing_global_model));
+    // 额度刷新不得创建全局模型：仍只有预置的 claude-sonnet-4。
+    assert_eq!(global_models.total, 1);
+    // 关联计数只来自预置的手动 Provider Model；除此之外原记录（包括定价和手动配置）必须保持不变。
+    let mut existing_global_model_after_refresh = existing_global_model.clone();
+    existing_global_model_after_refresh.provider_count = 1;
+    existing_global_model_after_refresh.active_provider_count = 1;
     assert_eq!(
-        global_models
-            .items
-            .iter()
-            .map(|model| model.name.as_str())
-            .collect::<std::collections::BTreeSet<_>>(),
-        std::collections::BTreeSet::from([
-            "claude-sonnet-4",
-            "gemini-2.5-pro",
-            "gemini-3.7-flash-tiered",
-        ])
+        global_models.items,
+        vec![existing_global_model_after_refresh]
     );
     assert_eq!(
         reloaded[0]
@@ -2781,7 +2814,8 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         Some(&json!(0.25))
     );
 
-    let imported_provider_models = global_model_repository
+    // 额度刷新不得创建或改写 Provider Model：目录里仍只有手动预置的一条，逐字段未动。
+    let provider_models = global_model_repository
         .list_admin_provider_models(&AdminProviderModelListQuery {
             provider_id: "provider-antigravity".to_string(),
             is_active: None,
@@ -2789,31 +2823,69 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             limit: 100,
         })
         .await
-        .expect("imported Antigravity provider models should read");
-    let imported_model_names = imported_provider_models
-        .iter()
-        .map(|model| model.provider_model_name.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(imported_provider_models.len(), 3);
-    assert!(imported_model_names.contains("claude-sonnet-4"));
-    assert!(imported_model_names.contains("gemini-2.5-pro"));
-    assert!(imported_model_names.contains("gemini-3.7-flash-tiered"));
-    assert!(!imported_model_names.contains("chat_23310"));
+        .expect("Antigravity provider models should read");
+    assert_eq!(provider_models, vec![manual_provider_model.clone()]);
 
-    let imported_model_ids = imported_provider_models
-        .iter()
-        .map(|model| model.id.clone())
-        .collect::<Vec<_>>();
-    let bindings = global_model_repository
-        .list_model_endpoint_bindings(&imported_model_ids)
+    // 手动 Endpoint binding 原样保留；刷新不得新增 discovered binding。
+    let manual_bindings = global_model_repository
+        .list_model_endpoint_bindings(&["model-antigravity-manual".to_string()])
         .await
-        .expect("imported model endpoint bindings should read");
-    assert_eq!(bindings.len(), imported_provider_models.len());
-    assert!(bindings.iter().all(|binding| {
-        binding.endpoint_id == "endpoint-antigravity-chat"
-            && binding.source == "discovered"
-            && binding.is_active
-    }));
+        .expect("manual model endpoint bindings should read");
+    assert_eq!(manual_bindings, vec![manual_model_binding.clone()]);
+
+    // 删除全局模型后再次刷新：不得恢复全局模型及其提供商模型、Endpoint 绑定。
+    assert!(global_model_repository
+        .delete_admin_global_model("global-claude-sonnet-4")
+        .await
+        .expect("全局模型应删除成功"));
+    let second_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-antigravity/refresh-quota"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("second request should succeed");
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_payload: serde_json::Value = second_response
+        .json()
+        .await
+        .expect("json body should parse");
+    assert_eq!(second_payload["success"], 1);
+    assert_eq!(second_payload["results"][0]["status"], "success");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    let provider_models_after_second_refresh = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-antigravity".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("Antigravity provider models should read after second refresh");
+    assert!(
+        provider_models_after_second_refresh.is_empty(),
+        "额度刷新不得恢复已删除的提供商模型: {provider_models_after_second_refresh:?}"
+    );
+    let bindings_after_second_refresh = global_model_repository
+        .list_model_endpoint_bindings(&["model-antigravity-manual".to_string()])
+        .await
+        .expect("model endpoint bindings should read after second refresh");
+    assert!(bindings_after_second_refresh.is_empty());
+
+    let global_models_after_second_refresh = global_model_repository
+        .list_admin_global_models(&AdminGlobalModelListQuery {
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .expect("global models should read after second refresh");
+    assert_eq!(global_models_after_second_refresh.total, 0);
+    assert!(global_models_after_second_refresh.items.is_empty());
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

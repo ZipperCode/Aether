@@ -5,9 +5,6 @@ use super::shared::{
     quota_key_auto_removed, quota_refresh_success_invalid_state,
     resolve_provider_quota_execution_timeouts, ProviderQuotaExecutionOutcome,
 };
-use crate::handlers::admin::provider::shared::payloads::{
-    AdminImportProviderModelSource, AdminImportProviderModelsRequest,
-};
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::GatewayError;
 use aether_admin::provider::quota::{
@@ -25,86 +22,6 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
-
-/// 从本地 `models` 或上游 `quota_by_model` metadata 提取可路由模型 ID，并复用统一黑名单。
-fn antigravity_discovered_model_ids(metadata_update: Option<&serde_json::Value>) -> Vec<String> {
-    metadata_update
-        .and_then(|value| value.get("antigravity"))
-        .and_then(|antigravity| {
-            antigravity
-                .get("models")
-                .and_then(serde_json::Value::as_object)
-                .or_else(|| {
-                    antigravity
-                        .get("quota_by_model")
-                        .and_then(serde_json::Value::as_object)
-                })
-        })
-        .into_iter()
-        .flat_map(|models| models.keys())
-        .map(String::as_str)
-        .filter(|model_id| aether_model_fetch::antigravity_model_id_is_routable(model_id))
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-/// 把成功额度刷新发现的模型导入目录，并把每个模型精确绑定到本次请求的 Endpoint。
-async fn sync_antigravity_discovered_models(
-    state: &AdminAppState<'_>,
-    provider_id: &str,
-    endpoint: &StoredProviderCatalogEndpoint,
-    metadata_update: Option<&serde_json::Value>,
-) {
-    if !state.has_global_model_data_reader() || !state.has_global_model_data_writer() {
-        return;
-    }
-    let models = antigravity_discovered_model_ids(metadata_update)
-        .into_iter()
-        .map(|id| AdminImportProviderModelSource {
-            id,
-            api_formats: vec![endpoint.api_format.clone()],
-            endpoint_ids: vec![endpoint.id.clone()],
-        })
-        .collect::<Vec<_>>();
-    if models.is_empty() {
-        return;
-    }
-
-    let result = state
-        .build_admin_import_provider_models_payload(
-            provider_id,
-            AdminImportProviderModelsRequest {
-                model_ids: Vec::new(),
-                models,
-                tiered_pricing: None,
-                price_per_request: None,
-            },
-        )
-        .await;
-    match result {
-        Ok(payload) => {
-            let errors = payload
-                .get("errors")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            if errors > 0 {
-                warn!(
-                    provider_id,
-                    endpoint_id = %endpoint.id,
-                    errors,
-                    "Antigravity discovered-model catalog sync completed with item errors"
-                );
-            }
-        }
-        Err(error) => warn!(
-            provider_id,
-            endpoint_id = %endpoint.id,
-            error = %error,
-            "Antigravity discovered-model catalog sync failed"
-        ),
-    }
-}
 
 async fn execute_antigravity_quota_plan(
     state: &AdminAppState<'_>,
@@ -217,7 +134,7 @@ async fn fetch_antigravity_quota_summary_best_effort(
     }
 }
 
-/// 刷新 Antigravity Key 额度；状态成功持久化后，再以当前 Endpoint 证据非阻塞同步模型目录。
+/// 刷新 Antigravity Key 额度与上游模型元数据；模型目录仅由显式导入操作写入。
 pub(crate) async fn refresh_antigravity_provider_quota_locally(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
@@ -404,16 +321,6 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
                 "message": "Key 状态写入失败",
             }));
             continue;
-        }
-
-        if status == "success" {
-            sync_antigravity_discovered_models(
-                state,
-                &provider.id,
-                endpoint,
-                metadata_update.as_ref(),
-            )
-            .await;
         }
 
         if status == "success" {

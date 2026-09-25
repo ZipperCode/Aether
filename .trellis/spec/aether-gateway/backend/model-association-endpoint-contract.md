@@ -2,7 +2,7 @@
 
 ## 1. Scope / Trigger
 
-This contract applies whenever an admin UI or a trusted admin refresh creates a Provider Model for a Provider that may own multiple Endpoints. Every automatic path must carry authoritative upstream model and Endpoint evidence before it relies on backend inference.
+本契约约束管理员显式创建或导入 Provider Model 时的 Endpoint 证据。Antigravity 额度刷新只更新额度与发现元数据，不负责写入模型目录。
 
 ## 2. Signatures
 
@@ -17,8 +17,8 @@ This contract applies whenever an admin UI or a trusted admin refresh creates a 
 - The Provider detail association dialog loads aggregate upstream models without requiring an extra Key-selection action.
 - Exact, case-insensitive Global Model name matches may be selected automatically. Different names require an explicit user selection; prefixes and fuzzy guesses are forbidden.
 - Exact creation uses the upstream `id` as `provider_model_name` and forwards its de-duplicated `endpoint_ids`.
-- A quota-driven discovery path constructs the complete admin import source and binds each discovered model to the exact Endpoint that produced the quota snapshot. It must not call Provider-level Endpoint inference.
-- Internal/non-routable model IDs are filtered through one shared, case-insensitive predicate before any catalog write. Quota success remains successful if the best-effort catalog synchronization fails.
+- Antigravity 额度刷新（包含 OAuth 更新后、后台探测和手动刷新）只持久化 Key 额度与上游模型元数据，不创建或改写 GlobalModel、ProviderModel 及 Endpoint 绑定；删除的模型不得在下次刷新时恢复。
+- 用户显式导入发现模型时，继续传递完整的 `id`、`api_formats`、`endpoint_ids`；发现列表沿用共享的大小写不敏感内部模型过滤，不从额度响应自动发起目录导入。
 - Saving is unavailable while the initial aggregate query is pending. Async results may update state only when Provider ID, open state, and dialog session still match.
 - If discovery returns no usable model, the existing batch inference path remains available for single-Endpoint Providers, explicit metadata, and Providers that do not publish a model list.
 
@@ -32,13 +32,13 @@ This contract applies whenever an admin UI or a trusted admin refresh creates a 
 | Aggregate query empty or failed | Keep the compatibility fallback |
 | Response belongs to an old dialog session | Discard it without changing current state |
 | Endpoint ID is empty, duplicated, or foreign | Normalize duplicates in the UI; backend validation rejects empty or foreign IDs |
-| Quota refresh discovers a routable model | Import with the refresh Endpoint ID as authoritative evidence |
-| Quota refresh discovers an internal model | Exclude it before catalog import, case-insensitively |
-| Quota succeeds but catalog import fails | Keep quota success and report only a warning |
+| 额度刷新发现可路由或内部模型 | 保留上游额度元数据，不写模型目录 |
+| 删除全局模型后再次刷新额度 | 不恢复全局模型、提供商模型或 Endpoint 绑定 |
+| 用户显式导入模型 | 按原导入流程创建目录记录，保留准确 Endpoint 证据 |
 
 ## 5. Good / Base / Bad Cases
 
-- Good: `gemini-3.7-flash -> gemini-3.7-flash` automatically creates the Provider Model with the discovered Endpoint IDs.
+- Good：用户确认导入 `gemini-3.7-flash` 后，以发现的 Endpoint IDs 创建 Provider Model；仅刷新额度时不创建。
 - Base: a Provider with no published upstream list continues through existing backend inference.
 - Bad: `gemini-3.8` must not silently choose `gemini-3.8-flash-high`; the user selects that mapping explicitly.
 
@@ -49,7 +49,7 @@ This contract applies whenever an admin UI or a trusted admin refresh creates a 
 - Race path: keep discovery pending and assert save is disabled and guarded.
 - Session path: resolve an older request after reopening and assert that only current-session models are rendered.
 - Contract path: frontend type-checking must include `endpoint_ids` on the provider-query response type.
-- Admin quota path: assert the complete import source, exact Endpoint ID, internal-model exclusion, and non-fatal repository failure behavior.
+- 管理端额度路径：通过真实刷新接口验证额度与发现元数据正常持久化、既有模型及手动绑定不变；删除全局模型后再次刷新仍无目录记录。另保留显式导入成功与失败清理的行为测试。
 
 ## 7. Wrong vs Correct
 

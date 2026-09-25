@@ -87,15 +87,8 @@ must use `models`.
 - Antigravity refresh must preserve refresh credentials and project each model
   window with reset aliases (`reset_at`, `next_reset_at`, `reset_time`,
   `next_reset_time`), accepting Unix and RFC3339 sources.
-- A successful Antigravity admin quota refresh extracts routable model IDs from
-  `antigravity.models` (or the legacy `quota_by_model` fallback), applies the
-  shared case-insensitive internal-model exclusion predicate, and imports them
-  through the normal admin model catalog path. Every imported Provider Model
-  carries the exact source `endpoint.id`; never re-infer an Endpoint from the
-  Provider after discovery.
-- Catalog synchronization is a best-effort side effect of a successful quota
-  refresh. Item or repository failures are warnings and must not turn valid
-  quota data into a failed refresh.
+- Antigravity 额度刷新仅保存额度与上游模型发现元数据，不调用模型目录导入，不创建或修改 GlobalModel、ProviderModel 和 Endpoint 绑定。该边界适用于 OAuth 更新后、后台探测与手动刷新，避免已删除模型被自动恢复。
+- 模型目录由管理员显式导入；导入仍使用发现结果中的准确 `endpoint_ids`，不以额度刷新代替用户确认。
 - Antigravity OAuth exchange resolves Google userinfo through the same selected
   network context as token exchange and persists the returned email in both the
   normalized auth configuration and raw payload.
@@ -127,9 +120,9 @@ must use `models`.
 | Matching model quota exhausted | Skip only that requested provider model. |
 | Different model window exhausted | Keep the requested model eligible. |
 | Reset timestamp malformed | Keep the quota fact, omit the countdown; do not invent a timestamp. |
-| Antigravity quota refresh discovers a routable model | Import it with the exact refresh Endpoint ID. |
-| Discovered model is internal or differs only by case from an excluded ID | Do not add it to the catalog. |
-| Catalog synchronization fails after valid quota data arrives | Return quota success and emit a warning. |
+| Antigravity 额度刷新发现模型 | 保留发现元数据，不写模型目录。 |
+| 用户删除全局模型后再次刷新额度 | 不恢复该模型及关联记录。 |
+| 用户显式导入模型 | 使用准确的发现 Endpoint 证据，沿用现有导入校验。 |
 | Codex reset consumption wins its reservation/generation fence | Decrement the projected count once. |
 | Codex detail refresh fails | Preserve the previous count/items and mark detail failure. |
 
@@ -166,10 +159,7 @@ must use `models`.
   and runtime-quota fallbacks, and strong-read Pool behavior.
 - Provider Pool: model A exhaustion does not block model B for Antigravity and
   Codex model-scoped windows.
-- OAuth/transport/admin: Antigravity legacy refresh token, refreshed credential
-  persistence, Google userinfo email, local `models` projection, legacy
-  `quota_by_model` reading, exact-Endpoint catalog import, and RFC3339 reset
-  parsing.
+- OAuth/transport/admin：保留 Antigravity 刷新凭据、Google userinfo email、`models` 投影、旧 `quota_by_model` 读取和 RFC3339 reset 解析覆盖；额度刷新不得修改模型目录，删除后刷新不得恢复模型，显式导入仍保留准确 Endpoint 绑定。
 - Admin/Gateway: Codex reset-credit activation and completion-order races,
   credential-generation replacement rejection, one-time local decrement, and
   failed-detail preservation.
