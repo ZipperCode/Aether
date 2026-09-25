@@ -99,6 +99,7 @@ use crate::execution_runtime::oauth_retry::{
 };
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_stream_plan_to_remote_execution_runtime;
+use crate::execution_runtime::stream_pump::BRIDGED_CLIENT_SSE_MARKER_HEADER;
 use crate::execution_runtime::stream_read_timeout::{
     await_stream_idle_read, resolve_stream_idle_timeout, stream_idle_timeout_message,
 };
@@ -6285,6 +6286,13 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             response_headers_observed_at_unix_ms: current_request_candidate_unix_ms(),
             request_order_id: uuid::Uuid::now_v7().to_string(),
         });
+    // 帧泵实际执行过同步 JSON→客户端 SSE 桥接时会携带显式标记。该标记是
+    // 网关内部信号：据此跳过 provider 流事件改写器，且不得进入用量上报
+    // 或客户端响应头，读取后立即从帧头移除。
+    let frames_carry_bridged_client_sse = headers
+        .get(BRIDGED_CLIENT_SSE_MARKER_HEADER)
+        .is_some_and(|value| value == "1");
+    headers.remove(BRIDGED_CLIENT_SSE_MARKER_HEADER);
     let mut report_context = attach_provider_response_headers_to_report_context(
         report_context,
         &headers,
@@ -6873,10 +6881,18 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     let mut agent_bridge_prefetched_rewrite_body = Vec::new();
     let upstream_headers = headers.clone();
     let private_stream_normalizer_context = report_context.clone();
-    let mut private_stream_normalizer =
-        maybe_build_provider_private_stream_normalizer(private_stream_normalizer_context.as_ref());
-    let mut local_stream_rewriter =
-        maybe_build_stream_response_rewriter(normalized_stream_report_context.as_ref());
+    let mut private_stream_normalizer = (!frames_carry_bridged_client_sse)
+        .then(|| {
+            maybe_build_provider_private_stream_normalizer(
+                private_stream_normalizer_context.as_ref(),
+            )
+        })
+        .flatten();
+    // 已桥接标记的帧内是客户端格式 SSE：不能再套 provider 流事件改写器，
+    // 否则改写器按 provider 事件词汇表处理会丢弃已桥接事件，客户端拿到空 body。
+    let mut local_stream_rewriter = (!frames_carry_bridged_client_sse)
+        .then(|| maybe_build_stream_response_rewriter(normalized_stream_report_context.as_ref()))
+        .flatten();
     let gemini_stream_content_type = report_context
         .as_ref()
         .and_then(resolve_gemini_stream_wire_mode)
@@ -7728,6 +7744,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     let provider_prefetched_body_for_report = provider_prefetched_body;
     let prefetched_body_for_report = prefetched_body;
     let prefetched_chunks_for_body = prefetched_chunks;
+
     let sync_json_stream_bridge_active_for_report = sync_json_stream_bridge_active;
     let initial_telemetry = prefetched_telemetry;
     let initial_reached_eof = reached_eof;
@@ -7748,6 +7765,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         || normalized_declared_stream_headers)
         && (response_headers_indicate_sse(&upstream_headers) || normalized_declared_stream_headers)
         && !is_openai_image_stream_for_report;
+    let frames_carry_bridged_client_sse_for_report = frames_carry_bridged_client_sse;
     let plan_kind_for_report = plan_kind.to_string();
     let stream_started_at_for_report = stream_started_at;
     observe_gateway_stage_trace_ms(
@@ -7769,12 +7787,14 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         let mut buffered_body = StreamBodyCapture::default();
         let mut provider_body_truncated = false;
         let mut client_body_truncated = false;
-        let mut private_stream_normalizer = if sync_json_stream_bridge_active_for_report {
+        let client_sse_already_bridged =
+            sync_json_stream_bridge_active_for_report || frames_carry_bridged_client_sse_for_report;
+        let mut private_stream_normalizer = if client_sse_already_bridged {
             None
         } else {
             maybe_build_provider_private_stream_normalizer(report_context_owned.as_ref())
         };
-        let mut local_stream_rewriter = if sync_json_stream_bridge_active_for_report {
+        let mut local_stream_rewriter = if client_sse_already_bridged {
             None
         } else {
             maybe_build_stream_response_rewriter(normalized_stream_report_context_owned.as_ref())
@@ -7787,9 +7807,11 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     "client_api_format": plan_for_report.client_api_format.as_str(),
                 }))
             });
+        // 用量观测与改写器同规则：帧泵已输出客户端格式 SSE 时按 provider
+        // 词汇解析只会产生错误 parser 状态，权威 summary 仍来自 EOF 帧。
         let mut stream_usage_observer = stream_usage_report_context
             .as_ref()
-            .filter(|_| !sync_json_stream_bridge_active_for_report)
+            .filter(|_| !client_sse_already_bridged)
             .map(|_| StreamingStandardTerminalObserver::default());
         let mut stream_usage_observer_buffered =
             StreamUsageObservationBuffer::new(max_stream_body_buffer_bytes);

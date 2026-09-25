@@ -1159,6 +1159,704 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
 }
 
 #[test]
+fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_local_upstream() {
+    run_image_sync_test(
+        "gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_local_upstream",
+        gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_local_upstream_impl,
+    );
+}
+
+// 与 runtime stub 版本不同：本测试不给执行 runtime 传 override 地址（空字符串会被
+// 过滤为 None），网关以进程内直连执行器对下方本机真实 HTTP 图片上游发起请求。
+// Key.allowed_models 采用发现刷新补全后的持久化状态：发现列表原本仅文本模型
+// gpt-5.4-mini，补全后包含 gpt-image-2，请求必须穿过该真实模型准入门。
+async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_local_upstream_impl() {
+    #[derive(Debug, Clone)]
+    struct SeenUpstreamImageRequest {
+        method: String,
+        path: String,
+        authorization: String,
+        content_type: String,
+        user_agent: String,
+        originator: String,
+        body: serde_json::Value,
+    }
+
+    #[derive(Debug, Clone)]
+    struct SeenRefreshRequest {
+        content_type: String,
+        body: String,
+    }
+
+    fn hash_api_key(value: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn sample_auth_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
+        StoredAuthApiKeySnapshot::new(
+            user_id.to_string(),
+            "alice".to_string(),
+            Some("alice@example.com".to_string()),
+            "user".to_string(),
+            "local".to_string(),
+            true,
+            false,
+            Some(serde_json::json!(["openai", "codex"])),
+            Some(serde_json::json!(["openai:image"])),
+            Some(serde_json::json!(["gpt-image-2"])),
+            api_key_id.to_string(),
+            Some("default".to_string()),
+            true,
+            false,
+            false,
+            Some(60),
+            Some(5),
+            Some(4_102_444_800_i64),
+            Some(serde_json::json!(["openai", "codex"])),
+            Some(serde_json::json!(["openai:image"])),
+            Some(serde_json::json!(["gpt-image-2"])),
+        )
+        .expect("auth snapshot should build")
+    }
+
+    fn sample_candidate_row() -> StoredMinimalCandidateSelectionRow {
+        StoredMinimalCandidateSelectionRow {
+            provider_id: "provider-codex-image-allowlist-local-1".to_string(),
+            provider_name: "codex".to_string(),
+            provider_type: "codex".to_string(),
+            provider_priority: 10,
+            provider_is_active: true,
+            endpoint_id: "endpoint-codex-image-allowlist-local-1".to_string(),
+            endpoint_api_format: "openai:image".to_string(),
+            endpoint_api_family: Some("openai".to_string()),
+            endpoint_kind: Some("image".to_string()),
+            endpoint_is_active: true,
+            key_id: "key-codex-image-allowlist-local-1".to_string(),
+            key_name: "oauth".to_string(),
+            key_auth_type: "oauth".to_string(),
+            key_is_active: true,
+            key_api_formats: Some(vec!["openai:image".to_string()]),
+            // 刷新补全后的持久化白名单：文本模型保留，gpt-image-2 被补进。
+            key_allowed_models: Some(vec!["gpt-5.4-mini".to_string(), "gpt-image-2".to_string()]),
+            key_capabilities: None,
+            key_internal_priority: 5,
+            key_global_priority_by_format: Some(serde_json::json!({"openai:image": 1})),
+            routing_facts: Default::default(),
+            model_id: "model-codex-image-allowlist-local-1".to_string(),
+            global_model_id: "global-model-codex-image-allowlist-local-1".to_string(),
+            global_model_name: "gpt-image-2".to_string(),
+            global_model_mappings: None,
+            global_model_supports_streaming: Some(true),
+            model_provider_model_name: "gpt-image-2".to_string(),
+            model_provider_model_mappings: Some(vec![StoredProviderModelMapping {
+                name: "gpt-image-2".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["openai:image".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+            }]),
+            model_supports_streaming: Some(true),
+            model_is_active: true,
+            model_is_available: true,
+        }
+    }
+
+    fn sample_provider_catalog_provider() -> StoredProviderCatalogProvider {
+        StoredProviderCatalogProvider::new(
+            "provider-codex-image-allowlist-local-1".to_string(),
+            "codex".to_string(),
+            Some("https://chatgpt.com".to_string()),
+            "codex".to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(
+            true,
+            false,
+            false,
+            None,
+            Some(2),
+            None,
+            Some(20.0),
+            None,
+            None,
+        )
+    }
+
+    fn sample_provider_catalog_endpoint(base_url: &str) -> StoredProviderCatalogEndpoint {
+        StoredProviderCatalogEndpoint::new(
+            "endpoint-codex-image-allowlist-local-1".to_string(),
+            "provider-codex-image-allowlist-local-1".to_string(),
+            "openai:image".to_string(),
+            Some("openai".to_string()),
+            Some("image".to_string()),
+            true,
+        )
+        .expect("endpoint should build")
+        .with_transport_fields(
+            format!("{base_url}/backend-api/codex"),
+            None,
+            None,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("endpoint transport should build")
+    }
+
+    fn sample_provider_catalog_key() -> StoredProviderCatalogKey {
+        let encrypted_auth_config = encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"codex","refresh_token":"rt-codex-image-allowlist-local-123"}"#,
+        )
+        .expect("auth config should encrypt");
+        StoredProviderCatalogKey::new(
+            "key-codex-image-allowlist-local-1".to_string(),
+            "provider-codex-image-allowlist-local-1".to_string(),
+            "oauth".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            Some(serde_json::json!(["openai:image"])),
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "__placeholder__")
+                .expect("placeholder api key should encrypt"),
+            Some(encrypted_auth_config),
+            None,
+            Some(serde_json::json!({"openai:image": 1})),
+            // 持久化在 Key 上的同一份白名单，供执行期 transport 快照读取。
+            Some(serde_json::json!(["gpt-5.4-mini", "gpt-image-2"])),
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build")
+    }
+
+    let seen_upstream_requests = Arc::new(Mutex::new(Vec::<SeenUpstreamImageRequest>::new()));
+    let seen_upstream_requests_clone = Arc::clone(&seen_upstream_requests);
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let seen_refresh = Arc::new(Mutex::new(None::<SeenRefreshRequest>));
+    let seen_refresh_clone = Arc::clone(&seen_refresh);
+    let refresh_hits = Arc::new(Mutex::new(0usize));
+    let refresh_hits_clone = Arc::clone(&refresh_hits);
+
+    let refresh = Router::new().route(
+        "/oauth/token",
+        any(move |request: Request| {
+            let seen_refresh_inner = Arc::clone(&seen_refresh_clone);
+            let refresh_hits_inner = Arc::clone(&refresh_hits_clone);
+            async move {
+                *refresh_hits_inner.lock().expect("mutex should lock") += 1;
+                let (parts, body) = request.into_parts();
+                let raw_body = to_bytes(body, usize::MAX).await.expect("body should read");
+                *seen_refresh_inner.lock().expect("mutex should lock") = Some(SeenRefreshRequest {
+                    content_type: parts
+                        .headers
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string(),
+                    body: String::from_utf8(raw_body.to_vec())
+                        .expect("refresh body should be utf8"),
+                });
+                Json(json!({
+                    "access_token": "refreshed-codex-image-allowlist-access-token",
+                    "refresh_token": "rt-codex-image-allowlist-local-456",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                }))
+            }
+        }),
+    );
+
+    let upstream = Router::new().route(
+        "/backend-api/codex/images/generations",
+        any(move |request: Request| {
+            let seen_upstream_inner = Arc::clone(&seen_upstream_requests_clone);
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                let (parts, body) = request.into_parts();
+                let raw_body = to_bytes(body, usize::MAX).await.expect("body should read");
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&raw_body).expect("upstream image payload should parse");
+                seen_upstream_inner.lock().expect("mutex should lock").push(
+                    SeenUpstreamImageRequest {
+                        method: parts.method.to_string(),
+                        path: parts.uri.path().to_string(),
+                        authorization: parts
+                            .headers
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                        content_type: parts
+                            .headers
+                            .get(http::header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                        user_agent: parts
+                            .headers
+                            .get(http::header::USER_AGENT)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                        originator: parts
+                            .headers
+                            .get("originator")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                        body: payload,
+                    },
+                );
+                Json(json!({
+                    "created": 1776841203_u64,
+                    "data": [{
+                        "b64_json": "cmVhbC1sb2NhbC11cHN0cmVhbS1pbWFnZS1ieXRlcw==",
+                        "revised_prompt": "真实本地上游图片"
+                    }],
+                    "usage": {"input_tokens": 171, "output_tokens": 1372, "total_tokens": 1543}
+                }))
+            }
+        }),
+    );
+
+    let client_api_key = "sk-client-codex-image-allowlist-local";
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key(client_api_key)),
+        sample_auth_snapshot(
+            "key-codex-image-allowlist-client-123",
+            "user-codex-image-allowlist-client-123",
+        ),
+    )]));
+    let candidate_selection_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_candidate_row(),
+        ]));
+
+    let (refresh_url, refresh_handle) = start_server(refresh).await;
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider_catalog_provider()],
+        vec![sample_provider_catalog_endpoint(&upstream_url)],
+        vec![sample_provider_catalog_key()],
+    ));
+
+    let oauth_refresh =
+        crate::provider_transport::LocalOAuthRefreshCoordinator::with_adapters_for_tests(vec![
+            Arc::new(
+                crate::provider_transport::oauth_refresh::GenericOAuthRefreshAdapter::default()
+                    .with_token_url_for_tests("codex", format!("{refresh_url}/oauth/token")),
+            ),
+        ]);
+    // 空 override：网关使用进程内直连执行器，真实 HTTP 访问本机图片上游。
+    let gateway_state = build_state_with_execution_runtime_override("")
+        .with_data_state_for_tests(
+            crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
+                auth_repository,
+                candidate_selection_repository,
+                provider_catalog_repository.clone(),
+                Arc::new(InMemoryRequestCandidateRepository::default()),
+                DEVELOPMENT_ENCRYPTION_KEY,
+            ),
+        )
+        .with_oauth_refresh_coordinator_for_tests(oauth_refresh);
+    let gateway = build_router_with_state(gateway_state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/images/generations"))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(
+            http::header::AUTHORIZATION,
+            format!("Bearer {client_api_key}"),
+        )
+        .header(TRACE_ID_HEADER, "trace-codex-image-allowlist-local-123")
+        .body("{\"model\":\"gpt-image-2\",\"prompt\":\"生成一张水墨视觉海报\",\"background\":\"auto\",\"quality\":\"high\",\"size\":\"1024x1024\",\"n\":1,\"response_format\":\"b64_json\"}")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_json: serde_json::Value = response.json().await.expect("body should parse");
+    assert_eq!(response_json["created"], 1776841203);
+    assert_eq!(
+        response_json["data"][0]["b64_json"],
+        "cmVhbC1sb2NhbC11cHN0cmVhbS1pbWFnZS1ieXRlcw=="
+    );
+    assert_eq!(
+        response_json["data"][0]["revised_prompt"],
+        "真实本地上游图片"
+    );
+    assert_eq!(response_json["usage"]["input_tokens"], 171);
+    assert_eq!(response_json["usage"]["output_tokens"], 1372);
+    assert_eq!(response_json["usage"]["total_tokens"], 1543);
+
+    let seen_refresh_request = seen_refresh
+        .lock()
+        .expect("mutex should lock")
+        .clone()
+        .expect("refresh request should be captured");
+    assert_eq!(
+        seen_refresh_request.content_type,
+        "application/x-www-form-urlencoded"
+    );
+    assert!(seen_refresh_request
+        .body
+        .contains("refresh_token=rt-codex-image-allowlist-local-123"));
+    assert_eq!(*refresh_hits.lock().expect("mutex should lock"), 1);
+
+    let upstream_requests = seen_upstream_requests
+        .lock()
+        .expect("mutex should lock")
+        .clone();
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 1);
+    assert_eq!(upstream_requests.len(), 1);
+    let seen_upstream_request = &upstream_requests[0];
+    assert_eq!(seen_upstream_request.method, "POST");
+    assert_eq!(
+        seen_upstream_request.path,
+        "/backend-api/codex/images/generations"
+    );
+    assert_eq!(
+        seen_upstream_request.authorization,
+        "Bearer refreshed-codex-image-allowlist-access-token"
+    );
+    assert_eq!(seen_upstream_request.content_type, "application/json");
+    assert_eq!(
+        seen_upstream_request.user_agent,
+        aether_ai_formats::CODEX_CLIENT_USER_AGENT
+    );
+    assert_eq!(seen_upstream_request.originator, "codex_cli_rs");
+    assert_eq!(
+        seen_upstream_request.body,
+        json!({
+            "prompt": "生成一张水墨视觉海报",
+            "background": "auto",
+            "model": "gpt-image-2",
+            "n": 1,
+            "quality": "high",
+            "size": "1024x1024"
+        })
+    );
+
+    let persisted_transport_state =
+        crate::data::GatewayDataState::with_provider_transport_reader_for_tests(
+            provider_catalog_repository,
+            DEVELOPMENT_ENCRYPTION_KEY,
+        );
+    let persisted_transport = persisted_transport_state
+        .read_provider_transport_snapshot(
+            "provider-codex-image-allowlist-local-1",
+            "endpoint-codex-image-allowlist-local-1",
+            "key-codex-image-allowlist-local-1",
+        )
+        .await
+        .expect("provider transport should read")
+        .expect("provider transport should exist");
+    assert_eq!(
+        persisted_transport.key.decrypted_api_key,
+        "refreshed-codex-image-allowlist-access-token"
+    );
+    assert!(persisted_transport.key.expires_at_unix_secs.is_some());
+    // 持久化白名单真实进入执行期 transport 快照，而不只是候选行或计划里的字符串。
+    assert_eq!(
+        persisted_transport.key.allowed_models,
+        Some(vec!["gpt-5.4-mini".to_string(), "gpt-image-2".to_string(),])
+    );
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+    refresh_handle.abort();
+}
+
+#[test]
+fn gateway_rejects_codex_image_sync_when_key_allowlist_excludes_image_model() {
+    run_image_sync_test(
+        "gateway_rejects_codex_image_sync_when_key_allowlist_excludes_image_model",
+        gateway_rejects_codex_image_sync_when_key_allowlist_excludes_image_model_impl,
+    );
+}
+
+// 显式模型限制仍然生效：Key 白名单只保留文本模型 gpt-image-2 未补全的旧状态时，
+// gpt-image-2 请求在本地调度被拒绝，且绝不触达 OAuth 刷新或图片上游。
+async fn gateway_rejects_codex_image_sync_when_key_allowlist_excludes_image_model_impl() {
+    fn hash_api_key(value: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn sample_auth_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
+        StoredAuthApiKeySnapshot::new(
+            user_id.to_string(),
+            "alice".to_string(),
+            Some("alice@example.com".to_string()),
+            "user".to_string(),
+            "local".to_string(),
+            true,
+            false,
+            Some(serde_json::json!(["openai", "codex"])),
+            Some(serde_json::json!(["openai:image"])),
+            Some(serde_json::json!(["gpt-image-2"])),
+            api_key_id.to_string(),
+            Some("default".to_string()),
+            true,
+            false,
+            false,
+            Some(60),
+            Some(5),
+            Some(4_102_444_800_i64),
+            Some(serde_json::json!(["openai", "codex"])),
+            Some(serde_json::json!(["openai:image"])),
+            Some(serde_json::json!(["gpt-image-2"])),
+        )
+        .expect("auth snapshot should build")
+    }
+
+    fn sample_candidate_row() -> StoredMinimalCandidateSelectionRow {
+        StoredMinimalCandidateSelectionRow {
+            provider_id: "provider-codex-image-excluded-local-1".to_string(),
+            provider_name: "codex".to_string(),
+            provider_type: "codex".to_string(),
+            provider_priority: 10,
+            provider_is_active: true,
+            endpoint_id: "endpoint-codex-image-excluded-local-1".to_string(),
+            endpoint_api_format: "openai:image".to_string(),
+            endpoint_api_family: Some("openai".to_string()),
+            endpoint_kind: Some("image".to_string()),
+            endpoint_is_active: true,
+            key_id: "key-codex-image-excluded-local-1".to_string(),
+            key_name: "oauth".to_string(),
+            key_auth_type: "oauth".to_string(),
+            key_is_active: true,
+            key_api_formats: Some(vec!["openai:image".to_string()]),
+            // 显式白名单不含 gpt-image-2：模型准入必须拒绝，不做任何绕过。
+            key_allowed_models: Some(vec!["gpt-5.4-mini".to_string()]),
+            key_capabilities: None,
+            key_internal_priority: 5,
+            key_global_priority_by_format: Some(serde_json::json!({"openai:image": 1})),
+            routing_facts: Default::default(),
+            model_id: "model-codex-image-excluded-local-1".to_string(),
+            global_model_id: "global-model-codex-image-excluded-local-1".to_string(),
+            global_model_name: "gpt-image-2".to_string(),
+            global_model_mappings: None,
+            global_model_supports_streaming: Some(true),
+            model_provider_model_name: "gpt-image-2".to_string(),
+            model_provider_model_mappings: Some(vec![StoredProviderModelMapping {
+                name: "gpt-image-2".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["openai:image".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+            }]),
+            model_supports_streaming: Some(true),
+            model_is_active: true,
+            model_is_available: true,
+        }
+    }
+
+    fn sample_provider_catalog_provider() -> StoredProviderCatalogProvider {
+        StoredProviderCatalogProvider::new(
+            "provider-codex-image-excluded-local-1".to_string(),
+            "codex".to_string(),
+            Some("https://chatgpt.com".to_string()),
+            "codex".to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(
+            true,
+            false,
+            false,
+            None,
+            Some(2),
+            None,
+            Some(20.0),
+            None,
+            None,
+        )
+    }
+
+    fn sample_provider_catalog_endpoint(base_url: &str) -> StoredProviderCatalogEndpoint {
+        StoredProviderCatalogEndpoint::new(
+            "endpoint-codex-image-excluded-local-1".to_string(),
+            "provider-codex-image-excluded-local-1".to_string(),
+            "openai:image".to_string(),
+            Some("openai".to_string()),
+            Some("image".to_string()),
+            true,
+        )
+        .expect("endpoint should build")
+        .with_transport_fields(
+            format!("{base_url}/backend-api/codex"),
+            None,
+            None,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("endpoint transport should build")
+    }
+
+    fn sample_provider_catalog_key() -> StoredProviderCatalogKey {
+        let encrypted_auth_config = encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"codex","refresh_token":"rt-codex-image-excluded-local-123"}"#,
+        )
+        .expect("auth config should encrypt");
+        StoredProviderCatalogKey::new(
+            "key-codex-image-excluded-local-1".to_string(),
+            "provider-codex-image-excluded-local-1".to_string(),
+            "oauth".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            Some(serde_json::json!(["openai:image"])),
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "__placeholder__")
+                .expect("placeholder api key should encrypt"),
+            Some(encrypted_auth_config),
+            None,
+            Some(serde_json::json!({"openai:image": 1})),
+            Some(serde_json::json!(["gpt-5.4-mini"])),
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build")
+    }
+
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let refresh_hits = Arc::new(Mutex::new(0usize));
+    let refresh_hits_clone = Arc::clone(&refresh_hits);
+
+    let refresh = Router::new().route(
+        "/oauth/token",
+        any(move || {
+            let refresh_hits_inner = Arc::clone(&refresh_hits_clone);
+            async move {
+                *refresh_hits_inner.lock().expect("mutex should lock") += 1;
+                Json(json!({
+                    "access_token": "refreshed-codex-image-excluded-access-token",
+                    "refresh_token": "rt-codex-image-excluded-local-456",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                }))
+            }
+        }),
+    );
+
+    let upstream = Router::new().route(
+        "/backend-api/codex/images/generations",
+        any(move || {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                Json(json!({
+                    "created": 1776849999_u64,
+                    "data": [{"b64_json": "c2hvdWxkLW5vdC1yZWFjaC11cHN0cmVhbQ=="}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                }))
+            }
+        }),
+    );
+
+    let client_api_key = "sk-client-codex-image-excluded-local";
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key(client_api_key)),
+        sample_auth_snapshot(
+            "key-codex-image-excluded-client-123",
+            "user-codex-image-excluded-client-123",
+        ),
+    )]));
+    let candidate_selection_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_candidate_row(),
+        ]));
+
+    let (refresh_url, refresh_handle) = start_server(refresh).await;
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider_catalog_provider()],
+        vec![sample_provider_catalog_endpoint(&upstream_url)],
+        vec![sample_provider_catalog_key()],
+    ));
+
+    let oauth_refresh =
+        crate::provider_transport::LocalOAuthRefreshCoordinator::with_adapters_for_tests(vec![
+            Arc::new(
+                crate::provider_transport::oauth_refresh::GenericOAuthRefreshAdapter::default()
+                    .with_token_url_for_tests("codex", format!("{refresh_url}/oauth/token")),
+            ),
+        ]);
+    let gateway_state = build_state_with_execution_runtime_override("")
+        .with_data_state_for_tests(
+            crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
+                auth_repository,
+                candidate_selection_repository,
+                provider_catalog_repository,
+                Arc::new(InMemoryRequestCandidateRepository::default()),
+                DEVELOPMENT_ENCRYPTION_KEY,
+            ),
+        )
+        .with_oauth_refresh_coordinator_for_tests(oauth_refresh);
+    let gateway = build_router_with_state(gateway_state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/images/generations"))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(
+            http::header::AUTHORIZATION,
+            format!("Bearer {client_api_key}"),
+        )
+        .header(TRACE_ID_HEADER, "trace-codex-image-excluded-local-123")
+        .body("{\"model\":\"gpt-image-2\",\"prompt\":\"生成一张水墨视觉海报\",\"background\":\"auto\",\"quality\":\"auto\",\"size\":\"auto\",\"n\":1,\"response_format\":\"b64_json\"}")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let response_status = response.status();
+    let response_text = response.text().await.expect("body should read");
+    assert!(
+        !response_status.is_success(),
+        "excluded model must be rejected locally, status={response_status}, body={response_text}"
+    );
+    assert!(
+        !response_text.contains("b64_json"),
+        "no image payload may leak for an excluded model, body={response_text}"
+    );
+    assert_eq!(
+        *upstream_hits.lock().expect("mutex should lock"),
+        0,
+        "image upstream must not be called for an excluded model"
+    );
+    assert_eq!(
+        *refresh_hits.lock().expect("mutex should lock"),
+        0,
+        "oauth refresh must not be called for an excluded model"
+    );
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+    refresh_handle.abort();
+}
+
+#[test]
 fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url() {
     run_image_sync_test(
         "gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url",

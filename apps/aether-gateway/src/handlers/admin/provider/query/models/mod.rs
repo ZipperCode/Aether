@@ -302,6 +302,39 @@ fn provider_query_attach_model_test_capabilities(
         .collect()
 }
 
+/// 计算当前 Key 实际可用的 Codex 图片端点 ID 列表。
+///
+/// 仅 provider_type=codex、存在 active 的 openai:image 端点、且 Key 的 API 格式允许
+/// openai:image 时返回非空；空列表表示不补全。与发现层
+/// `selected_models_fetch_endpoints_for_api_formats` 保持一致：key.api_formats 显式
+/// 非空时尊重该列表（不含 openai:image 即不补全），为空时按继承语义允许
+/// provider 的 active 图片端点，避免管理端展示与自动刷新补白名单不一致。
+fn provider_query_codex_image_endpoint_ids(
+    provider: &StoredProviderCatalogProvider,
+    endpoints: &[StoredProviderCatalogEndpoint],
+    key: &StoredProviderCatalogKey,
+) -> Vec<String> {
+    if !provider.provider_type.trim().eq_ignore_ascii_case("codex") {
+        return Vec::new();
+    }
+    let configured_formats = provider_key_configured_api_formats(key);
+    if !configured_formats.is_empty()
+        && !configured_formats
+            .iter()
+            .any(|api_format| api_format == "openai:image")
+    {
+        return Vec::new();
+    }
+    endpoints
+        .iter()
+        .filter(|endpoint| endpoint.is_active)
+        .filter(|endpoint| {
+            crate::ai_serving::normalize_api_format_alias(&endpoint.api_format) == "openai:image"
+        })
+        .map(|endpoint| endpoint.id.clone())
+        .collect()
+}
+
 fn provider_query_codex_preset_fallback(
     provider: &StoredProviderCatalogProvider,
     fetch_error: &str,
@@ -501,7 +534,7 @@ async fn provider_query_sort_antigravity_keys(
     Ok(ranked.into_iter().map(|(_, key)| key).collect())
 }
 
-async fn provider_query_fetch_models_for_key(
+async fn provider_query_fetch_discovered_models_for_key(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
     endpoints: &[StoredProviderCatalogEndpoint],
@@ -723,6 +756,34 @@ async fn provider_query_fetch_models_for_key(
         from_cache: false,
         has_success: outcome.has_success,
     })
+}
+
+/// 管理端 Codex 模型发现的统一出口：force 自动抓取、版本化目录缓存、内置 preset、
+/// 在线抓取与错误回退的结果都在此补全本地已支持的 gpt-image-2 能力投影，
+/// 避免各返回分支重复处理。
+///
+/// 补全仅作用于响应投影：原生 cached_models、Codex 版本化目录与上游元数据保持
+/// 上游原样（不写入 gpt-image-2），也不改写任何手工 allowed_models 白名单。
+async fn provider_query_fetch_models_for_key(
+    state: &AdminAppState<'_>,
+    provider: &StoredProviderCatalogProvider,
+    endpoints: &[StoredProviderCatalogEndpoint],
+    key: &StoredProviderCatalogKey,
+    force_refresh: bool,
+) -> Result<ProviderQueryKeyFetchResult, GatewayError> {
+    let mut result = provider_query_fetch_discovered_models_for_key(
+        state,
+        provider,
+        endpoints,
+        key,
+        force_refresh,
+    )
+    .await?;
+    let image_endpoint_ids = provider_query_codex_image_endpoint_ids(provider, endpoints, key);
+    if !image_endpoint_ids.is_empty() {
+        aether_model_fetch::supplement_codex_image_models(&mut result.models, &image_endpoint_ids);
+    }
+    Ok(result)
 }
 
 pub(crate) async fn build_admin_provider_query_models_response(
@@ -1148,5 +1209,118 @@ mod tests {
         ] {
             assert!(!exposed.contains(secret));
         }
+    }
+
+    fn codex_image_test_endpoint(
+        id: &str,
+        api_format: &str,
+        is_active: bool,
+    ) -> StoredProviderCatalogEndpoint {
+        StoredProviderCatalogEndpoint::new(
+            id.to_string(),
+            "provider-codex".to_string(),
+            api_format.to_string(),
+            None,
+            None,
+            is_active,
+        )
+        .expect("endpoint should build")
+    }
+
+    fn codex_image_test_key(auth_type: &str, api_formats: Value) -> StoredProviderCatalogKey {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-codex".to_string(),
+            "provider-codex".to_string(),
+            "key-codex".to_string(),
+            auth_type.to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.api_formats = Some(api_formats);
+        key
+    }
+
+    #[test]
+    fn codex_image_endpoint_ids_prefer_only_active_image_endpoints() {
+        let mut provider = StoredProviderCatalogProvider::new(
+            "provider-codex".to_string(),
+            "Codex".to_string(),
+            None,
+            "codex".to_string(),
+        )
+        .expect("provider should build");
+        provider.provider_type = "codex".to_string();
+        let endpoints = vec![
+            codex_image_test_endpoint("endpoint-responses", "openai:responses", true),
+            codex_image_test_endpoint("endpoint-image", "openai:image", true),
+            codex_image_test_endpoint("endpoint-image-off", "openai:image", false),
+        ];
+
+        // OAuth Key 未显式配置格式时按继承语义允许 active 图片端点。
+        let oauth_key = codex_image_test_key("oauth", Value::Null);
+        assert_eq!(
+            provider_query_codex_image_endpoint_ids(&provider, &endpoints, &oauth_key),
+            vec!["endpoint-image".to_string()]
+        );
+
+        // OAuth Key 显式列表不含 openai:image 时必须尊重列表：即使 provider 拥有
+        // active 图片端点也不补全，与发现层刷新补白名单的行为保持一致。
+        let oauth_text_only_key = codex_image_test_key("oauth", json!(["openai:responses"]));
+        assert!(provider_query_codex_image_endpoint_ids(
+            &provider,
+            &endpoints,
+            &oauth_text_only_key
+        )
+        .is_empty());
+
+        // 显式允许 openai:image 的 Key 只绑定 active 图片端点，不误绑 responses。
+        let formats_key =
+            codex_image_test_key("api_key", json!(["openai:responses", "openai:image"]));
+        assert_eq!(
+            provider_query_codex_image_endpoint_ids(&provider, &endpoints, &formats_key),
+            vec!["endpoint-image".to_string()]
+        );
+    }
+
+    #[test]
+    fn codex_image_endpoint_ids_stay_empty_without_usable_image_support() {
+        let mut provider = StoredProviderCatalogProvider::new(
+            "provider-codex".to_string(),
+            "Codex".to_string(),
+            None,
+            "codex".to_string(),
+        )
+        .expect("provider should build");
+        provider.provider_type = "codex".to_string();
+        let endpoints = vec![
+            codex_image_test_endpoint("endpoint-responses", "openai:responses", true),
+            codex_image_test_endpoint("endpoint-image", "openai:image", true),
+        ];
+
+        // Key 的有效 API 格式不含 openai:image（格式被禁用）时不补全。
+        let text_only_key = codex_image_test_key("api_key", json!(["openai:responses"]));
+        assert!(
+            provider_query_codex_image_endpoint_ids(&provider, &endpoints, &text_only_key)
+                .is_empty()
+        );
+
+        // 没有 active 图片端点时 OAuth 继承也不产生可用格式。
+        let imageless_endpoints = vec![codex_image_test_endpoint(
+            "endpoint-responses",
+            "openai:responses",
+            true,
+        )];
+        let oauth_key = codex_image_test_key("oauth", Value::Null);
+        assert!(provider_query_codex_image_endpoint_ids(
+            &provider,
+            &imageless_endpoints,
+            &oauth_key
+        )
+        .is_empty());
+
+        // 非 Codex provider 一律不补全。
+        let grok = grok_provider();
+        assert!(provider_query_codex_image_endpoint_ids(&grok, &endpoints, &oauth_key).is_empty());
     }
 }

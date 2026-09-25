@@ -98,3 +98,17 @@ Current pure entrypoints:
 - `convert_response_pure`
 
 `convert_request` and `convert_response` remain legacy wrappers for existing callers that still need mapped model/report-context behavior during migration.
+
+## Codex OAuth 图片模型与调度
+
+Codex 文本 `/models` 目录不返回 `gpt-image-2`，不代表账户没有生图能力。Aether 在管理用发现结果中补全本地已支持的图片模型，不修改原生 Codex 模型卡或版本化目录。
+
+- 提供商类型为 `codex`，启用 `openai:image` Endpoint；默认 base URL 为 `https://chatgpt.com/backend-api/codex`，不要填入完整的 `/images/generations` 地址。
+- 全局模型与提供商模型使用 `gpt-image-2`，启用生图能力，绑定 `openai:image` Endpoint，不要把图片模型映射为文本模型。
+- Key 的 API 格式显式列表若非空，必须包含 `openai:image`；空列表沿用发现层的继承语义。停用的图片端点不产生补全能力。
+- 启用自动模型获取的旧 Key，执行一次强制刷新模型或等待自动刷新：补全 ID 先经过原有 include/exclude/locked 规则，再写入 `allowed_models` 并重新协调提供商模型可用性。显式排除 `gpt-image-*` 仍会阻止调度。
+- 关闭自动获取、手工维护白名单的 Key，需自行允许 `gpt-image-2`；仅查看发现列表不会改写该白名单。
+
+请求 `POST /v1/images/generations` 或 `/v1/images/edits` 仍走正常调度和原生 `/backend-api/codex/images/*` 上游，不跳过鉴权、Key 模型限制、额度或健康检查。发现能力不保证真实账户权限，上游拒绝仍按原有错误处理返回。
+
+实现对照：[sub2api 的 Codex Images 直调](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/service/openai_images_direct.go) 对 `gpt-image-2` 使用相同路径；[codex-proxy 的 Responses 工具桥](https://github.com/icebear0828/codex-proxy/blob/dev/src/routes/shared/image-generation.ts) 则将文本宿主模型与图片工具分开。本次保留原生图片语义，不引入隐式 Responses 降级。

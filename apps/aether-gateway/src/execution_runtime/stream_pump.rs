@@ -36,6 +36,10 @@ use crate::GatewayError;
 const STREAM_USAGE_OBSERVER_MAX_LINE_BYTES: usize = 1024 * 1024;
 const UPSTREAM_STREAM_READ_ERROR_MESSAGE: &str = "Upstream response stream failed";
 
+/// 帧泵桥接标记：仅在真实完成同步 JSON→客户端 SSE 桥接时写入帧头。
+/// 上游响应不可信，进入帧构造前无条件剥除同名标记，防止伪造绕过改写。
+pub(crate) const BRIDGED_CLIENT_SSE_MARKER_HEADER: &str = "x-aether-bridged-client-sse";
+
 fn upstream_stream_error_category(response: &DirectUpstreamResponse) -> &'static str {
     match response {
         DirectUpstreamResponse::Reqwest(_) => "reqwest_body_read_failed",
@@ -66,6 +70,10 @@ pub(crate) fn build_direct_execution_frame_stream(
             stream_idle_timeout,
             upstream_target_permit,
         } = execution;
+        // 上游不可信：先剥除可能伪造的桥接标记，只有本帧泵真实完成桥接时
+        // （rewrite_headers_for_bridged_sse_response）才会重新写入。
+        let mut headers = headers;
+        headers.remove(BRIDGED_CLIENT_SSE_MARKER_HEADER);
         let _upstream_target_permit = upstream_target_permit;
         let upstream_error_category = upstream_stream_error_category(&response);
 
@@ -760,6 +768,13 @@ fn rewrite_headers_for_bridged_sse_response(
     rewritten.remove("content-encoding");
     rewritten.insert("content-type".to_string(), content_type.to_string());
     rewritten.insert("content-length".to_string(), body_len.to_string());
+    // 显式标记本次桥接真实发生：中继据此跳过 provider 流事件改写器，
+    // 避免对已是客户端格式的 SSE 二次转换（改写器会丢弃其词汇表外事件）。
+    // 中继读取后立即剥除，该标记不出现在用量上报或客户端响应中。
+    rewritten.insert(
+        BRIDGED_CLIENT_SSE_MARKER_HEADER.to_string(),
+        "1".to_string(),
+    );
     rewritten
 }
 
@@ -896,7 +911,8 @@ mod tests {
     use super::{
         build_direct_execution_frame_stream, encode_error_frame, observe_normalized_bytes,
         should_buffer_non_stream_response, should_treat_upstream_response_as_stream,
-        STREAM_USAGE_OBSERVER_MAX_LINE_BYTES, UPSTREAM_STREAM_READ_ERROR_MESSAGE,
+        BRIDGED_CLIENT_SSE_MARKER_HEADER, STREAM_USAGE_OBSERVER_MAX_LINE_BYTES,
+        UPSTREAM_STREAM_READ_ERROR_MESSAGE,
     };
     use crate::ai_serving::api::StreamingStandardTerminalObserver;
     use crate::execution_runtime::transport::{
@@ -1679,6 +1695,16 @@ mod tests {
                 .and_then(Value::as_str),
             Some("text/event-stream")
         );
+        // 真实桥接必须写入内部标记：中继据此跳过 provider 流事件改写器，
+        // 避免对已是客户端格式的 SSE 二次转换。
+        assert_eq!(
+            header_frame
+                .get("payload")
+                .and_then(|payload| payload.get("headers"))
+                .and_then(|headers| headers.get(BRIDGED_CLIENT_SSE_MARKER_HEADER))
+                .and_then(Value::as_str),
+            Some("1")
+        );
 
         let data_frame = frames
             .iter()
@@ -1723,6 +1749,129 @@ mod tests {
                 .and_then(|dimensions| dimensions.get("total_tokens"))
                 .and_then(Value::as_i64),
             Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_execution_frame_stream_strips_forged_bridge_marker_from_native_sse() {
+        // 上游不可信：native SSE 响应即使伪造内部桥接标记，也必须在帧构造入口
+        // 被剥除且字节原样透传；标记只能由真实桥接路径写入。
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let native_sse = concat!(
+            "event: image_generation.completed\n",
+            "data: {\"type\":\"image_generation.completed\",\"data\":[{\"b64_json\":\"bmF0aXZlLXB5bG9hZA==\"}]}\n",
+            "\n"
+        );
+        let expected_payload = native_sse.to_string();
+        let response_payload = native_sse.to_string();
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/images/generations",
+                post(move || {
+                    let response_payload = response_payload.clone();
+                    async move {
+                        let mut response = http::Response::builder()
+                            .status(axum::http::StatusCode::OK)
+                            .body(Body::from(Bytes::from(response_payload)))
+                            .expect("response should build");
+                        response.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/event-stream"),
+                        );
+                        response.headers_mut().insert(
+                            BRIDGED_CLIENT_SSE_MARKER_HEADER,
+                            HeaderValue::from_static("1"),
+                        );
+                        response
+                    }
+                }),
+            );
+            axum::serve(listener, app)
+                .await
+                .expect("server should start");
+        });
+
+        let runtime = DirectSyncExecutionRuntime::new();
+        let execution = runtime
+            .execute_stream(&ExecutionPlan {
+                request_id: "req-image-native-sse-forged-marker".to_string(),
+                candidate_id: Some("cand-image-native-sse-forged-marker".to_string()),
+                provider_name: Some("OpenAI".to_string()),
+                provider_id: "provider-1".to_string(),
+                endpoint_id: "endpoint-1".to_string(),
+                key_id: "key-1".to_string(),
+                method: "POST".to_string(),
+                url: format!("http://{addr}/images/generations"),
+                headers: BTreeMap::new(),
+                content_type: None,
+                content_encoding: None,
+                body: RequestBody::from_json(serde_json::json!({
+                    "model": "gpt-image-1",
+                    "prompt": "poster"
+                })),
+                stream: true,
+                client_api_format: "openai:image".to_string(),
+                provider_api_format: "openai:image".to_string(),
+                model_name: Some("gpt-image-1".into()),
+                proxy: None,
+                transport_profile: None,
+                timeouts: Some(ExecutionTimeouts {
+                    connect_ms: Some(5_000),
+                    total_ms: Some(5_000),
+                    ..ExecutionTimeouts::default()
+                }),
+            })
+            .await
+            .expect("stream execution should succeed");
+
+        let frames = build_direct_execution_frame_stream(execution)
+            .map(|item| item.expect("frame should encode"))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes.to_vec()).expect("frame should be utf8"))
+            .collect::<Vec<_>>();
+
+        server.abort();
+
+        let header_frame: Value =
+            serde_json::from_str(&frames[0]).expect("headers frame should parse");
+        let frame_headers = header_frame
+            .get("payload")
+            .and_then(|payload| payload.get("headers"))
+            .expect("frame headers should exist");
+        assert_eq!(
+            frame_headers.get("content-type").and_then(Value::as_str),
+            Some("text/event-stream")
+        );
+        assert!(
+            frame_headers
+                .get(BRIDGED_CLIENT_SSE_MARKER_HEADER)
+                .is_none(),
+            "forged upstream marker must be stripped: {frame_headers}"
+        );
+
+        let data_frame = frames
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).expect("frame should parse"))
+            .find(|frame| frame.get("type").and_then(Value::as_str) == Some("data"))
+            .expect("data frame should exist");
+        let forwarded_body = base64::engine::general_purpose::STANDARD
+            .decode(
+                data_frame
+                    .get("payload")
+                    .and_then(|payload| payload.get("chunk_b64"))
+                    .and_then(Value::as_str)
+                    .expect("chunk_b64 should exist"),
+            )
+            .expect("data frame should decode");
+        assert_eq!(
+            String::from_utf8(forwarded_body).expect("forwarded body should be utf8"),
+            expected_payload,
+            "native SSE bytes must be forwarded verbatim"
         );
     }
 

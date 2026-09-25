@@ -140,6 +140,7 @@ impl OpenAiImageStreamState {
             }
             "response.output_item.done" => self.handle_output_item_done(report_context, &event),
             "response.completed" => self.handle_completed(report_context, &event),
+            _ if is_native_openai_image_event_type(event_type) => Ok(block.to_vec()),
             _ => Ok(Vec::new()),
         }
     }
@@ -1114,6 +1115,10 @@ fn image_failed_event_name(report_context: &Value) -> &'static str {
     }
 }
 
+fn is_native_openai_image_event_type(event_type: &str) -> bool {
+    event_type.starts_with("image_generation.") || event_type.starts_with("image_edit.")
+}
+
 fn image_request_operation(report_context: &Value) -> Option<&str> {
     report_context
         .get("image_request")
@@ -1661,6 +1666,152 @@ mod tests {
             .finish(&report_context)
             .expect("finish should succeed")
             .is_empty());
+    }
+
+    #[test]
+    fn native_image_stream_events_pass_through_byte_exact() {
+        let report_context = json!({
+            "provider_api_format": "openai:image",
+            "client_api_format": "openai:image",
+            "needs_conversion": false,
+            "image_request": {"operation": "generate"}
+        });
+        let mut rewriter = OpenAiImageStreamState::default();
+
+        let output = rewriter
+            .push_chunk(
+                &report_context,
+                concat!(
+                    "event: response.created\n",
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_native\"}}\n\n",
+                    "event: image_generation.started\n",
+                    "data: {\"type\":\"image_generation.started\",\"sequence_number\":0,\"future_field\":{\"nested\":[1,2]}}\n\n",
+                    "event: image_generation.partial_image\n",
+                    "data: {\"type\":\"image_generation.partial_image\",\"sequence_number\":1,\"partial_image_index\":0,\"b64_json\":\"cGFydGlhbA==\",\"output_format\":\"png\"}\n\n",
+                    "event: image_generation.completed\n",
+                    "data: {\"type\":\"image_generation.completed\",\"sequence_number\":2, \"b64_json\":\"ZmluYWw=\",\"usage\":{\"input_tokens\":4,\"output_tokens\":5,\"total_tokens\":9},\"revised_prompt\":\"revised\"}\n\n"
+                )
+                .as_bytes(),
+            )
+            .expect("rewrite should succeed");
+        let expected = concat!(
+            "event: image_generation.started\n",
+            "data: {\"type\":\"image_generation.started\",\"sequence_number\":0,\"future_field\":{\"nested\":[1,2]}}\n\n",
+            "event: image_generation.partial_image\n",
+            "data: {\"type\":\"image_generation.partial_image\",\"sequence_number\":1,\"partial_image_index\":0,\"b64_json\":\"cGFydGlhbA==\",\"output_format\":\"png\"}\n\n",
+            "event: image_generation.completed\n",
+            "data: {\"type\":\"image_generation.completed\",\"sequence_number\":2, \"b64_json\":\"ZmluYWw=\",\"usage\":{\"input_tokens\":4,\"output_tokens\":5,\"total_tokens\":9},\"revised_prompt\":\"revised\"}\n\n"
+        );
+        assert_eq!(utf8(output), expected);
+        assert!(rewriter
+            .finish(&report_context)
+            .expect("finish should succeed")
+            .is_empty());
+    }
+
+    #[test]
+    fn native_image_stream_event_split_across_chunks_is_reassembled() {
+        let report_context = json!({
+            "provider_api_format": "openai:image",
+            "client_api_format": "openai:image",
+            "needs_conversion": false,
+            "image_request": {"operation": "generate"}
+        });
+        let mut rewriter = OpenAiImageStreamState::default();
+        let event = concat!(
+            "event: image_generation.completed\n",
+            "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"ZmluYWw=\"}\n\n"
+        )
+        .as_bytes();
+        let split = event.len() - 12;
+
+        let first = rewriter
+            .push_chunk(&report_context, &event[..split])
+            .expect("rewrite should succeed");
+        assert!(first.is_empty());
+
+        let second = rewriter
+            .push_chunk(&report_context, &event[split..])
+            .expect("rewrite should succeed");
+        assert_eq!(second, event.to_vec());
+    }
+
+    #[test]
+    fn native_image_failed_events_pass_through_verbatim() {
+        let report_context = json!({
+            "provider_api_format": "openai:image",
+            "client_api_format": "openai:image",
+            "needs_conversion": false,
+            "image_request": {"operation": "edit"}
+        });
+        let mut rewriter = OpenAiImageStreamState::default();
+        let input = concat!(
+            "event: image_edit.failed\n",
+            "data: {\"type\":\"image_edit.failed\",\"sequence_number\":3,\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit reached for gpt-image-2\",\"param\":null},\"future_detail\":{\"opaque\":[1,2]}}\n\n",
+            "event: image_edit.failed\n",
+            "data: {\"type\":\"image_edit.failed\",\"sequence_number\":4,\"error\":{\"code\":\"server_error\",\"message\":\"duplicate failure\"}}\n\n"
+        );
+
+        let output = rewriter
+            .push_chunk(&report_context, input.as_bytes())
+            .expect("rewrite should succeed");
+
+        assert_eq!(utf8(output), input);
+        assert!(rewriter
+            .finish(&report_context)
+            .expect("finish should succeed")
+            .is_empty());
+    }
+
+    #[test]
+    fn native_image_completed_events_pass_through_per_image() {
+        let report_context = json!({
+            "provider_api_format": "openai:image",
+            "client_api_format": "openai:image",
+            "needs_conversion": false,
+            "image_request": {"operation": "generate", "n": 2}
+        });
+        let mut rewriter = OpenAiImageStreamState::default();
+        let input = concat!(
+            "event: image_generation.partial_image\n",
+            "data: {\"type\":\"image_generation.partial_image\",\"partial_image_index\":0,\"b64_json\":\"cGFydGlhbA==\"}\n\n",
+            "event: image_generation.completed\n",
+            "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"Zmlyc3QtaW1hZ2U=\",\"output_format\":\"png\"}\n\n",
+            "event: image_generation.completed\n",
+            "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"c2Vjb25kLWltYWdl\",\"output_format\":\"png\"}\n\n"
+        );
+
+        let output = rewriter
+            .push_chunk(&report_context, input.as_bytes())
+            .expect("rewrite should succeed");
+
+        assert_eq!(utf8(output), input);
+        assert!(rewriter
+            .finish(&report_context)
+            .expect("finish should succeed")
+            .is_empty());
+    }
+
+    #[test]
+    fn native_image_stream_preserves_crlf_event_framing() {
+        let report_context = json!({
+            "provider_api_format": "openai:image",
+            "client_api_format": "openai:image",
+            "needs_conversion": false,
+            "image_request": {"operation": "generate"}
+        });
+        let mut rewriter = OpenAiImageStreamState::default();
+        let event = concat!(
+            "event: image_generation.completed\r\n",
+            "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"ZmluYWw=\"}\r\n\r\n"
+        )
+        .as_bytes();
+
+        let output = rewriter
+            .push_chunk(&report_context, event)
+            .expect("rewrite should succeed");
+
+        assert_eq!(output, event.to_vec());
     }
 
     #[test]

@@ -915,6 +915,520 @@ async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_
 }
 
 #[test]
+fn gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models() {
+    run_provider_query_test(
+        "gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models",
+        gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models_impl,
+    );
+}
+
+async fn gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models_impl() {
+    let execution_runtime_hits = Arc::new(Mutex::new(0usize));
+    let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let execution_runtime_hits_inner = Arc::clone(&execution_runtime_hits_clone);
+            async move {
+                *execution_runtime_hits_inner
+                    .lock()
+                    .expect("mutex should lock") += 1;
+                assert_eq!(
+                    plan.url,
+                    format!(
+                        "https://chatgpt.com/backend-api/codex/models?client_version={}",
+                        aether_ai_formats::CODEX_CLIENT_VERSION
+                    )
+                );
+                Json(json!({
+                    "request_id": "req-provider-query-codex-image",
+                    "status_code": 200,
+                    "headers": {
+                        "content-type": "application/json"
+                    },
+                    "body": {
+                        "json_body": {
+                            "models": [{
+                                "slug": "gpt-5.5",
+                                "display_name": "GPT 5.5",
+                                "description": "Upstream text model only",
+                                "api_format": "responses"
+                            }]
+                        }
+                    }
+                }))
+            }
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-codex-image", "Codex Image", 10);
+    provider.provider_type = "codex".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![
+            sample_endpoint(
+                "endpoint-codex-responses",
+                "provider-codex-image",
+                "openai:responses",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+            sample_endpoint(
+                "endpoint-codex-image",
+                "provider-codex-image",
+                "openai:image",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+        ],
+        vec![{
+            let mut key = sample_bound_key(
+                "key-codex-image",
+                "provider-codex-image",
+                "openai:responses",
+                "codex-image-token",
+            );
+            key.api_formats = Some(json!(["openai:responses", "openai:image"]));
+            key
+        }],
+    ));
+
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
+            provider_catalog_repository,
+            DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+        ));
+    let gateway = build_router_with_state(state.clone());
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    // 管理端指定 Key 的发现结果必须补全 gpt-image-2。
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/provider-query/models"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-codex-image",
+            "api_key_id": "key-codex-image"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], json!(true));
+    let models = payload["data"]["models"].as_array().expect("models array");
+    let text_model = models
+        .iter()
+        .find(|model| model["id"] == "gpt-5.5")
+        .expect("upstream text model should remain");
+    assert_eq!(text_model["api_formats"], json!(["openai:responses"]));
+    let image_model = models
+        .iter()
+        .find(|model| model["id"] == "gpt-image-2")
+        .expect("gpt-image-2 should be supplemented");
+    assert_eq!(image_model["api_formats"], json!(["openai:image"]));
+    assert_eq!(image_model["supports_image_generation"], json!(true));
+    assert_eq!(image_model["endpoint_ids"], json!(["endpoint-codex-image"]));
+    assert_eq!(
+        image_model["model_test_capabilities"]["openai:image"]["supports_generation"],
+        json!(true)
+    );
+
+    // 上游原生目录与共享版本化缓存必须保持原样：不包含 gpt-image-2。
+    let codex_catalog = crate::model_fetch::read_codex_management_catalog(
+        &state,
+        "provider-codex-image",
+        "key-codex-image",
+    )
+    .await
+    .expect("shared codex catalog should exist after fetch");
+    let catalog_models = codex_catalog
+        .models
+        .expect("codex catalog should hold models");
+    assert_eq!(catalog_models.len(), 1);
+    assert_eq!(catalog_models[0]["slug"], json!("gpt-5.5"));
+    assert!(
+        catalog_models
+            .iter()
+            .all(|model| model.get("id") != Some(&json!("gpt-image-2"))),
+        "native codex catalog must stay untouched by the supplement"
+    );
+
+    // 管理端不带 Key 的默认聚合查询必须同样看到 gpt-image-2。
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/provider-query/models"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-codex-image"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], json!(true));
+    let models = payload["data"]["models"].as_array().expect("models array");
+    assert_eq!(models.len(), 2);
+    let image_model = models
+        .iter()
+        .find(|model| model["id"] == "gpt-image-2")
+        .expect("aggregate query should also see gpt-image-2");
+    assert_eq!(image_model["api_formats"], json!(["openai:image"]));
+    assert_eq!(image_model["endpoint_ids"], json!(["endpoint-codex-image"]));
+
+    // 聚合后仅触发一次上游抓取，缓存命中不产生额外请求。
+    assert_eq!(
+        *execution_runtime_hits.lock().expect("mutex should lock"),
+        1
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_skips_codex_gpt_image_2_supplement_when_key_disallows_image_format() {
+    run_provider_query_test(
+        "gateway_skips_codex_gpt_image_2_supplement_when_key_disallows_image_format",
+        gateway_skips_codex_gpt_image_2_supplement_when_key_disallows_image_format_impl,
+    );
+}
+
+async fn gateway_skips_codex_gpt_image_2_supplement_when_key_disallows_image_format_impl() {
+    let execution_runtime_hits = Arc::new(Mutex::new(0usize));
+    let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(_plan): Json<ExecutionPlan>| {
+            let execution_runtime_hits_inner = Arc::clone(&execution_runtime_hits_clone);
+            async move {
+                *execution_runtime_hits_inner
+                    .lock()
+                    .expect("mutex should lock") += 1;
+                Json(json!({
+                    "request_id": "req-provider-query-codex-text-only",
+                    "status_code": 200,
+                    "headers": {
+                        "content-type": "application/json"
+                    },
+                    "body": {
+                        "json_body": {
+                            "models": [{
+                                "slug": "gpt-5.5",
+                                "display_name": "GPT 5.5",
+                                "description": "Upstream text model only"
+                            }]
+                        }
+                    }
+                }))
+            }
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-codex-text", "Codex Text", 10);
+    provider.provider_type = "codex".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![
+            sample_endpoint(
+                "endpoint-codex-responses",
+                "provider-codex-text",
+                "openai:responses",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+            sample_endpoint(
+                "endpoint-codex-image",
+                "provider-codex-text",
+                "openai:image",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+        ],
+        // Key 的 API 格式未允许 openai:image：即使 provider 拥有 active 图片端点也不补全。
+        vec![sample_bound_key(
+            "key-codex-text",
+            "provider-codex-text",
+            "openai:responses",
+            "codex-text-token",
+        )],
+    ));
+
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
+                provider_catalog_repository,
+                DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/provider-query/models"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-codex-text",
+            "api_key_id": "key-codex-text"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], json!(true));
+    let models = payload["data"]["models"].as_array().expect("models array");
+    assert!(
+        models.iter().all(|model| model["id"] != "gpt-image-2"),
+        "image format disallowed for the key must suppress the supplement"
+    );
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["id"], json!("gpt-5.5"));
+    assert_eq!(
+        *execution_runtime_hits.lock().expect("mutex should lock"),
+        1
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_supplements_codex_gpt_image_2_from_preset_without_fetch_endpoints() {
+    run_provider_query_test(
+        "gateway_supplements_codex_gpt_image_2_from_preset_without_fetch_endpoints",
+        gateway_supplements_codex_gpt_image_2_from_preset_without_fetch_endpoints_impl,
+    );
+}
+
+async fn gateway_supplements_codex_gpt_image_2_from_preset_without_fetch_endpoints_impl() {
+    let execution_runtime_hits = Arc::new(Mutex::new(0usize));
+    let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |_request: Request| {
+            let execution_runtime_hits_inner = Arc::clone(&execution_runtime_hits_clone);
+            async move {
+                *execution_runtime_hits_inner
+                    .lock()
+                    .expect("mutex should lock") += 1;
+                (StatusCode::INTERNAL_SERVER_ERROR, Body::from("unexpected"))
+            }
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-codex-preset", "Codex Preset", 10);
+    provider.provider_type = "codex".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        // 只有图片端点：没有可抓取的文本目录端点时走内置 preset 分支。
+        vec![sample_endpoint(
+            "endpoint-codex-image",
+            "provider-codex-preset",
+            "openai:image",
+            "https://chatgpt.com/backend-api/codex",
+        )],
+        vec![sample_bound_key(
+            "key-codex-preset",
+            "provider-codex-preset",
+            "openai:image",
+            "codex-preset-token",
+        )],
+    ));
+
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
+            provider_catalog_repository,
+            DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+        ));
+    let gateway = build_router_with_state(state.clone());
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/provider-query/models"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-codex-preset",
+            "api_key_id": "key-codex-preset"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(payload["data"]["from_cache"], json!(false));
+    let models = payload["data"]["models"].as_array().expect("models array");
+    assert!(
+        models.iter().any(|model| model["id"] == "gpt-5.2"),
+        "codex preset text cards should be listed"
+    );
+    let image_model = models
+        .iter()
+        .find(|model| model["id"] == "gpt-image-2")
+        .expect("preset branch should still supplement gpt-image-2");
+    assert_eq!(image_model["api_formats"], json!(["openai:image"]));
+    assert_eq!(image_model["supports_image_generation"], json!(true));
+    assert_eq!(image_model["endpoint_ids"], json!(["endpoint-codex-image"]));
+    // preset 持久化的共享缓存同样不能包含补全条目。
+    let cached = state
+        .runtime_state()
+        .kv_get("upstream_models:provider-codex-preset:key-codex-preset")
+        .await
+        .expect("preset cache read should succeed");
+    let cached_models: serde_json::Value =
+        serde_json::from_str(&cached.expect("preset cache should exist"))
+            .expect("preset cache should parse");
+    assert!(
+        cached_models
+            .as_array()
+            .expect("preset cache models")
+            .iter()
+            .all(|model| model["id"] != "gpt-image-2"),
+        "persisted preset cache must stay free of the supplemented entry"
+    );
+    assert_eq!(
+        *execution_runtime_hits.lock().expect("mutex should lock"),
+        0,
+        "preset branch must not hit the execution runtime"
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_supplements_codex_gpt_image_2_into_preset_error_fallback() {
+    run_provider_query_test(
+        "gateway_supplements_codex_gpt_image_2_into_preset_error_fallback",
+        gateway_supplements_codex_gpt_image_2_into_preset_error_fallback_impl,
+    );
+}
+
+async fn gateway_supplements_codex_gpt_image_2_into_preset_error_fallback_impl() {
+    let execution_runtime_hits = Arc::new(Mutex::new(0usize));
+    let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(_plan): Json<ExecutionPlan>| {
+            let execution_runtime_hits_inner = Arc::clone(&execution_runtime_hits_clone);
+            async move {
+                *execution_runtime_hits_inner
+                    .lock()
+                    .expect("mutex should lock") += 1;
+                Json(json!({
+                    "request_id": "req-provider-query-codex-image-invalidated",
+                    "status_code": 403,
+                    "headers": {
+                        "content-type": "application/json"
+                    },
+                    "body": {
+                        "json_body": {
+                            "error": {
+                                "message": "Your authentication token has been invalidated. Please sign in again."
+                            }
+                        }
+                    }
+                }))
+            }
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-codex-fallback", "Codex Fallback", 10);
+    provider.provider_type = "codex".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![
+            sample_endpoint(
+                "endpoint-codex-responses",
+                "provider-codex-fallback",
+                "openai:responses",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+            sample_endpoint(
+                "endpoint-codex-image",
+                "provider-codex-fallback",
+                "openai:image",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+        ],
+        vec![{
+            let mut key = sample_bound_key(
+                "key-codex-fallback",
+                "provider-codex-fallback",
+                "openai:responses",
+                "codex-fallback-token",
+            );
+            key.api_formats = Some(json!(["openai:responses", "openai:image"]));
+            key
+        }],
+    ));
+
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
+                provider_catalog_repository,
+                DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/provider-query/models"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-codex-fallback",
+            "api_key_id": "key-codex-fallback"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], json!(true));
+    let warning = payload["data"]["warning"]
+        .as_str()
+        .expect("Codex fallback warning should be present");
+    assert!(warning.contains("Codex 动态模型目录不可用"));
+    let models = payload["data"]["models"].as_array().expect("models array");
+    assert!(
+        models.iter().any(|model| model["id"] == "gpt-5.2"),
+        "preset fallback text cards should be listed"
+    );
+    let image_model = models
+        .iter()
+        .find(|model| model["id"] == "gpt-image-2")
+        .expect("error fallback should still supplement gpt-image-2");
+    assert_eq!(image_model["api_formats"], json!(["openai:image"]));
+    assert_eq!(image_model["endpoint_ids"], json!(["endpoint-codex-image"]));
+    assert_eq!(
+        *execution_runtime_hits.lock().expect("mutex should lock"),
+        1
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
 fn gateway_handles_admin_provider_query_models_respecting_key_api_formats() {
     run_provider_query_test(
         "gateway_handles_admin_provider_query_models_respecting_key_api_formats",

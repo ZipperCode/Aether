@@ -46,3 +46,12 @@ The overflow case proves heartbeat safety only. The pre-existing control filter 
 Wrong: timer fires -> yield a comment regardless of previously emitted bytes.
 Correct: observe emitted bytes -> timer fires -> yield only if no event is open.
 ```
+
+## 同步图片响应转流的单次转换边界
+
+- `stream_pump` 仅在实际完成同步 JSON→客户端 SSE 后向内部帧头写入 `x-aether-bridged-client-sse: 1`；读取上游响应时先剥除同名头，不能相信上游声明已转换。
+- relay 读取标记后立即移除，不能将内部标记暴露给客户端或写入上游响应报告。标记仅用于跳过 provider normalizer、rewriter 与 observer；终态仍消费帧泵的 EOF summary。
+- “帧泵已转换”与“relay 已消费原 JSON 并自行输出替代 SSE”是两个状态。前者不能触发 Data 帧跳过，否则 HTTP 200 会得到空 body。
+- 不通过 `upstream_is_stream=false` 加 SSE Content-Type 猜测格式；上游可以无视请求的流模式，只有实际转换动作能建立该证据。
+- 原生 `image_generation.*` / `image_edit.*` 事件保持块字节、未知字段、顺序与每张图片的 completed；`n>1` 不能因第一张完成而截断后续图片。Responses→Images 转换规则保持原样。
+- 回归须覆盖本机真实 HTTP 图片同步响应→下游 SSE、内部标记不泄露、伪造标记不能禁用转换、分片/CRLF 原生事件与多图片终态保真；仅 runtime stub 计划断言不能证明最终客户端字节正确。

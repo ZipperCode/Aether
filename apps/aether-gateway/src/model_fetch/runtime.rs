@@ -11,9 +11,10 @@ use aether_model_fetch::{
     global_model_matches_allowed_models, json_string_list, model_catalog_upstream_metadata,
     model_fetch_interval_minutes, model_fetch_startup_delay_seconds, model_fetch_startup_enabled,
     preset_models_for_provider, reconcile_provider_model_whitelist_availability,
-    selected_models_fetch_endpoints_for_api_formats, sync_provider_model_discovery_associations,
-    sync_provider_model_whitelist_associations, upstream_metadata_namespace_updates,
-    ModelFetchAssociationStore, ModelFetchRunSummary,
+    selected_models_fetch_endpoints_for_api_formats, supplement_codex_image_models,
+    sync_provider_model_discovery_associations, sync_provider_model_whitelist_associations,
+    upstream_metadata_namespace_updates, ModelFetchAssociationStore, ModelFetchRunSummary,
+    CODEX_IMAGE_API_FORMAT,
 };
 use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
@@ -488,6 +489,12 @@ async fn fetch_and_persist_key_models(
                 ))
                 .await?;
             attach_model_endpoint_ids(&mut models, &provider_endpoints);
+            // 预设路径的 codex_models 元数据只能来自原始预设卡；本地图片补全必须
+            // 在元数据形成之后进行，避免把补全卡写回 Codex 目录元数据。
+            let upstream_metadata =
+                model_catalog_upstream_metadata(&target.provider.provider_type, &models);
+            let image_endpoint_ids = codex_image_endpoint_ids(target, &provider_endpoints);
+            supplement_codex_image_models(&mut models, &image_endpoint_ids);
             let fetched_model_ids = models
                 .iter()
                 .filter_map(|model| model.get("id"))
@@ -500,8 +507,6 @@ async fn fetch_and_persist_key_models(
                 json_string_list(target.key.model_include_patterns.as_ref()),
                 json_string_list(target.key.model_exclude_patterns.as_ref()),
             );
-            let upstream_metadata =
-                model_catalog_upstream_metadata(&target.provider.provider_type, &models);
             persist_key_fetch_success(
                 state,
                 &target.key,
@@ -661,8 +666,34 @@ async fn fetch_and_persist_key_models(
             .await?;
         attach_model_endpoint_ids(&mut association_models, &provider_endpoints);
     }
+    // 上游文本目录不会返回本地直调图片模型；原始 codex_models 元数据在 strategy
+    // 内已由原生卡片生成，这里仅在兼容投影上补全 gpt-image-2 并让其参与白名单过滤。
+    let mut fetched_model_ids = result.fetched_model_ids;
+    if target
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+    {
+        let provider_endpoints = state
+            .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(
+                &target.provider.id,
+            ))
+            .await?;
+        let image_endpoint_ids = codex_image_endpoint_ids(target, &provider_endpoints);
+        if supplement_codex_image_models(&mut association_models, &image_endpoint_ids)
+            && !fetched_model_ids.iter().any(|model_id| {
+                model_id
+                    .trim()
+                    .eq_ignore_ascii_case(aether_ai_formats::api::CODEX_OPENAI_IMAGE_DEFAULT_MODEL)
+            })
+        {
+            fetched_model_ids
+                .push(aether_ai_formats::api::CODEX_OPENAI_IMAGE_DEFAULT_MODEL.to_string());
+        }
+    }
     let filtered_models = apply_model_filters(
-        &result.fetched_model_ids,
+        &fetched_model_ids,
         json_string_list(target.key.locked_models.as_ref()),
         json_string_list(target.key.model_include_patterns.as_ref()),
         json_string_list(target.key.model_exclude_patterns.as_ref()),
@@ -726,6 +757,41 @@ fn attach_model_endpoint_ids(models: &mut [Value], endpoints: &[StoredProviderCa
             object.insert("endpoint_ids".to_string(), json!(endpoint_ids));
         }
     }
+}
+
+/// 计算 Codex Key 可用的本地直调图片端点：Provider 当前 active、api_format 为
+/// openai:image、且 Key.api_formats 允许该格式（未配置格式表示继承 Provider 全部
+/// active 格式，与管理端 provider_key_effective_api_formats 语义一致）的真实端点 ID。
+/// 非 Codex Provider 一律返回空，不做任何扩权。
+fn codex_image_endpoint_ids(
+    target: &SelectedFetchTarget,
+    provider_endpoints: &[StoredProviderCatalogEndpoint],
+) -> Vec<String> {
+    if !target
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+    {
+        return Vec::new();
+    }
+    let key_formats = json_string_list(target.key.api_formats.as_ref())
+        .into_iter()
+        .map(|format| crate::ai_serving::normalize_api_format_alias(&format))
+        .filter(|format| !format.is_empty())
+        .collect::<BTreeSet<_>>();
+    if !key_formats.is_empty() && !key_formats.contains(CODEX_IMAGE_API_FORMAT) {
+        return Vec::new();
+    }
+    provider_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.is_active)
+        .filter(|endpoint| {
+            crate::ai_serving::normalize_api_format_alias(&endpoint.api_format)
+                == CODEX_IMAGE_API_FORMAT
+        })
+        .map(|endpoint| endpoint.id.clone())
+        .collect()
 }
 
 async fn persist_key_fetch_failure(
@@ -1797,6 +1863,123 @@ mod tests {
             .lock()
             .expect("cache mutex")
             .contains_key(&("provider-codex".to_string(), "key-codex".to_string())));
+    }
+
+    #[tokio::test]
+    /// StandardTransport 文本目录刷新后：补全卡只进入 legacy 缓存与关联绑定，
+    /// allowed_models 含 gpt-image-2，而 codex_models 元数据不写入本地补全卡。
+    async fn codex_standard_transport_supplements_image_model_into_legacy_cache_only() {
+        let provider = sample_provider("provider-codex", "codex");
+        let endpoints = vec![
+            sample_endpoint(
+                "endpoint-codex-responses",
+                "provider-codex",
+                "openai:responses",
+            ),
+            sample_endpoint("endpoint-codex-image", "provider-codex", "openai:image"),
+        ];
+        let key = sample_key(
+            "key-codex",
+            "provider-codex",
+            "api_key",
+            &["openai:responses", "openai:image"],
+        );
+        let mut transports = HashMap::new();
+        transports.insert(
+            (
+                "provider-codex".to_string(),
+                "endpoint-codex-responses".to_string(),
+                "key-codex".to_string(),
+            ),
+            sample_transport(
+                "codex",
+                "provider-codex",
+                "endpoint-codex-responses",
+                "key-codex",
+                "openai:responses",
+                "api_key",
+                None,
+            ),
+        );
+        let execution_results = vec![execution_result(json!({
+            "models": [
+                {"slug": "gpt-5.4", "display_name": "GPT-5.4"}
+            ]
+        }))];
+        let state = TestState::new(
+            vec![provider],
+            endpoints,
+            vec![key],
+            transports,
+            execution_results,
+        )
+        .with_provider_models(vec![sample_provider_model(
+            "provider-model-image",
+            "provider-codex",
+            "gpt-image-2",
+        )]);
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("codex model fetch should succeed");
+        assert_eq!(summary.succeeded, 1);
+
+        let updated = state.key("key-codex");
+        assert_eq!(
+            updated.allowed_models,
+            Some(json!(["gpt-5.4", "gpt-image-2"]))
+        );
+
+        // 补全卡只写入 legacy 缓存：字段精确、且仅绑定图片 Endpoint。
+        let cached_models = state
+            .cached_models
+            .lock()
+            .expect("cache mutex")
+            .get(&("provider-codex".to_string(), "key-codex".to_string()))
+            .cloned()
+            .expect("legacy cache should be written");
+        let image_cards = cached_models
+            .iter()
+            .filter(|model| model.get("id").and_then(Value::as_str) == Some("gpt-image-2"))
+            .collect::<Vec<_>>();
+        assert_eq!(image_cards.len(), 1, "image supplement card must be unique");
+        assert_eq!(image_cards[0]["api_formats"], json!(["openai:image"]));
+        assert_eq!(image_cards[0]["supports_image_generation"], json!(true));
+        assert_eq!(
+            image_cards[0]["endpoint_ids"],
+            json!(["endpoint-codex-image"])
+        );
+
+        // 原生 codex_models 元数据不含本地补全卡。
+        let metadata_updates = state
+            .upstream_metadata_updates
+            .lock()
+            .expect("metadata updates mutex");
+        assert_eq!(metadata_updates.len(), 1);
+        assert_eq!(metadata_updates[0].1, "codex_models");
+        let catalog_cards = metadata_updates[0].2["cards"]
+            .as_object()
+            .expect("codex catalog cards should be an object");
+        assert!(catalog_cards.contains_key("gpt-5.4"));
+        assert!(!catalog_cards.contains_key("gpt-image-2"));
+
+        // 关联绑定：image 模型只会绑定图片 Endpoint，绝不误绑 responses 文本 Endpoint。
+        let binding_syncs = state
+            .binding_syncs
+            .lock()
+            .expect("binding syncs mutex")
+            .clone();
+        let image_model_syncs = binding_syncs
+            .iter()
+            .filter(|(model_id, _, _, _)| model_id == "provider-model-image")
+            .collect::<Vec<_>>();
+        assert!(
+            !image_model_syncs.is_empty(),
+            "image provider model must receive discovered bindings"
+        );
+        assert!(image_model_syncs.iter().all(
+            |(_, endpoint_ids, _, _)| endpoint_ids == &vec!["endpoint-codex-image".to_string()]
+        ));
     }
 
     #[tokio::test]

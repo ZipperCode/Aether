@@ -17,7 +17,7 @@ use axum::routing::any;
 use axum::{extract::Request, Json, Router};
 use serde_json::json;
 
-use super::{perform_model_fetch_once, ModelFetchRunSummary};
+use super::{perform_model_fetch_for_key, perform_model_fetch_once, ModelFetchRunSummary};
 use crate::AppState;
 
 async fn start_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -640,4 +640,374 @@ async fn gateway_background_model_fetch_updates_key_and_syncs_provider_model_whi
 
     background_tasks.shutdown().await;
     execution_runtime_handle.abort();
+}
+
+/// Codex 专用 Endpoint fixture：api_format 可为 openai:responses / openai:image。
+fn codex_image_sample_endpoint(
+    endpoint_id: &str,
+    provider_id: &str,
+    api_format: &str,
+    base_url: &str,
+) -> StoredProviderCatalogEndpoint {
+    StoredProviderCatalogEndpoint::new(
+        endpoint_id.to_string(),
+        provider_id.to_string(),
+        api_format.to_string(),
+        None,
+        None,
+        true,
+    )
+    .expect("codex endpoint should build")
+    .with_transport_fields(
+        base_url.to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("codex endpoint transport should build")
+}
+
+fn codex_image_sample_provider(provider_id: &str) -> StoredProviderCatalogProvider {
+    StoredProviderCatalogProvider::new(
+        provider_id.to_string(),
+        "codex".to_string(),
+        Some("https://chatgpt.com".to_string()),
+        "codex".to_string(),
+    )
+    .expect("codex provider should build")
+    .with_transport_fields(true, false, true, None, None, None, None, None, None)
+}
+
+/// Codex 专用 Key fixture：api_formats 与旧白名单显式指定。
+fn codex_image_sample_key(
+    key_id: &str,
+    provider_id: &str,
+    api_formats: &[&str],
+    allowed_models: Option<Vec<&str>>,
+) -> StoredProviderCatalogKey {
+    let mut key = StoredProviderCatalogKey::new(
+        key_id.to_string(),
+        provider_id.to_string(),
+        "primary".to_string(),
+        "api_key".to_string(),
+        None,
+        true,
+    )
+    .expect("codex key should build")
+    .with_transport_fields(
+        Some(json!(api_formats)),
+        encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "live-secret-api-key")
+            .expect("api key should encrypt"),
+        None,
+        None,
+        None,
+        allowed_models.map(|models| json!(models)),
+        None,
+        None,
+        None,
+    )
+    .expect("codex key transport should build");
+    key.auto_fetch_models = true;
+    key
+}
+
+/// 断言 Provider 模型的 Endpoint 绑定集合与来源。
+async fn assert_codex_image_model_bindings(
+    global_model_repository: &Arc<InMemoryGlobalModelReadRepository>,
+    model_id: &str,
+    expected_endpoint_ids: &[&str],
+) {
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&[model_id.to_string()])
+        .await
+        .expect("bindings should load");
+    assert_eq!(
+        bindings
+            .iter()
+            .map(|binding| binding.endpoint_id.as_str())
+            .collect::<Vec<_>>(),
+        expected_endpoint_ids
+    );
+    assert!(bindings
+        .iter()
+        .all(|binding| binding.source == "discovered"));
+}
+
+#[tokio::test]
+/// 文本目录强制刷新必须修复旧白名单（缺 gpt-image-2），恢复既有 image ProviderModel
+/// 可用性并绑定图片 Endpoint；原生 codex_models 元数据不得写入本地补全卡。
+async fn codex_image_model_fetch_repairs_legacy_whitelist_and_restores_image_model_availability() {
+    let upstream = Router::new().route(
+        "/backend-api/codex/models",
+        any(|| async {
+            Json(json!({
+                "models": [
+                    {
+                        "slug": "gpt-5.4-codex",
+                        "family": "gpt-5.4",
+                        "display_name": "GPT-5.4 Codex"
+                    }
+                ]
+            }))
+        }),
+    );
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let base_url = format!("{}/backend-api/codex", upstream_url.trim_end_matches('/'));
+    let provider = codex_image_sample_provider("provider-codex-image");
+    let endpoints = vec![
+        codex_image_sample_endpoint(
+            "endpoint-codex-responses",
+            "provider-codex-image",
+            "openai:responses",
+            &base_url,
+        ),
+        codex_image_sample_endpoint(
+            "endpoint-codex-image",
+            "provider-codex-image",
+            "openai:image",
+            &base_url,
+        ),
+    ];
+    // 旧白名单：上次文本目录刷新写入的结果，缺 gpt-image-2。
+    let key = codex_image_sample_key(
+        "key-codex-image",
+        "provider-codex-image",
+        &["openai:responses", "openai:image"],
+        Some(vec!["gpt-5.4-codex"]),
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        endpoints,
+        vec![key],
+    ));
+    let mut legacy_image_model = sample_provider_model(
+        "provider-model-image",
+        "provider-codex-image",
+        "global-model-image",
+        "gpt-image-2",
+        "gpt-image-2",
+        &["gpt-image-2"],
+    );
+    // 上一次 availability reconcile 因旧白名单缺失把图片模型标记为不可用。
+    legacy_image_model.is_available = false;
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![
+                sample_global_model("global-model-image", "gpt-image-2", &["gpt-image-2"]),
+                sample_global_model("global-model-codex", "gpt-5.4-codex", &["gpt-5.4-codex"]),
+            ])
+            .with_admin_provider_models(vec![legacy_image_model])
+            .with_endpoint_provider_ids([
+                ("endpoint-codex-responses", "provider-codex-image"),
+                ("endpoint-codex-image", "provider-codex-image"),
+            ]),
+    );
+    let data_state = crate::data::GatewayDataState::disabled()
+        .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))
+        .with_global_model_repository_for_tests(Arc::clone(&global_model_repository))
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data_state);
+
+    let summary = perform_model_fetch_for_key(&state, "provider-codex-image", "key-codex-image")
+        .await
+        .expect("codex model fetch should succeed");
+    assert_eq!(
+        summary,
+        ModelFetchRunSummary {
+            attempted: 1,
+            succeeded: 1,
+            failed: 0,
+            skipped: 0,
+        }
+    );
+
+    let updated_key = provider_catalog_repository
+        .list_keys_by_ids(&["key-codex-image".to_string()])
+        .await
+        .expect("keys should load")
+        .into_iter()
+        .next()
+        .expect("updated key should exist");
+    // 强制刷新修复旧白名单：文本目录模型与补全的 gpt-image-2 同时写入。
+    assert_eq!(
+        updated_key.allowed_models,
+        Some(json!(["gpt-5.4-codex", "gpt-image-2"]))
+    );
+    // 原生 codex_models 元数据不写入本地补全卡，但保留上游文本卡。
+    let catalog_cards = updated_key
+        .upstream_metadata
+        .as_ref()
+        .and_then(|metadata| metadata["codex_models"]["cards"].as_object())
+        .expect("codex model catalog metadata should persist");
+    assert!(catalog_cards.contains_key("gpt-5.4-codex"));
+    assert!(!catalog_cards.contains_key("gpt-image-2"));
+
+    let provider_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-codex-image".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 10_000,
+        })
+        .await
+        .expect("provider models should load");
+    let image_model = provider_models
+        .iter()
+        .find(|model| model.provider_model_name == "gpt-image-2")
+        .expect("image provider model should exist");
+    assert!(
+        image_model.is_available,
+        "per-key force refresh must reconcile and restore image model availability"
+    );
+    assert_codex_image_model_bindings(
+        &global_model_repository,
+        &image_model.id,
+        &["endpoint-codex-image"],
+    )
+    .await;
+
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+/// Key 格式不允许 openai:image 或 Provider 无图片 Endpoint 时不得扩权：
+/// 白名单不出现 gpt-image-2，既有 image ProviderModel 保持不可用。
+async fn codex_image_model_fetch_without_image_permission_or_endpoint_does_not_expand_whitelist() {
+    async fn run_scenario(
+        include_image_endpoint: bool,
+        key_api_formats: &[&str],
+        exclude_patterns: &[&str],
+    ) -> (Option<serde_json::Value>, bool) {
+        let upstream = Router::new().route(
+            "/backend-api/codex/models",
+            any(|| async {
+                Json(json!({
+                    "models": [
+                        {
+                            "slug": "gpt-5.4-codex",
+                            "family": "gpt-5.4",
+                            "display_name": "GPT-5.4 Codex"
+                        }
+                    ]
+                }))
+            }),
+        );
+        let (upstream_url, upstream_handle) = start_server(upstream).await;
+        let base_url = format!("{}/backend-api/codex", upstream_url.trim_end_matches('/'));
+        let provider = codex_image_sample_provider("provider-codex-image");
+        let mut endpoints = vec![codex_image_sample_endpoint(
+            "endpoint-codex-responses",
+            "provider-codex-image",
+            "openai:responses",
+            &base_url,
+        )];
+        if include_image_endpoint {
+            endpoints.push(codex_image_sample_endpoint(
+                "endpoint-codex-image",
+                "provider-codex-image",
+                "openai:image",
+                &base_url,
+            ));
+        }
+        let mut key = codex_image_sample_key(
+            "key-codex-image",
+            "provider-codex-image",
+            key_api_formats,
+            Some(vec!["gpt-5.4-codex"]),
+        );
+        if !exclude_patterns.is_empty() {
+            key.model_exclude_patterns = Some(json!(exclude_patterns));
+        }
+        let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            endpoints,
+            vec![key],
+        ));
+        let mut legacy_image_model = sample_provider_model(
+            "provider-model-image",
+            "provider-codex-image",
+            "global-model-image",
+            "gpt-image-2",
+            "gpt-image-2",
+            &["gpt-image-2"],
+        );
+        legacy_image_model.is_available = false;
+        let mut endpoint_provider_ids = vec![("endpoint-codex-responses", "provider-codex-image")];
+        if include_image_endpoint {
+            endpoint_provider_ids.push(("endpoint-codex-image", "provider-codex-image"));
+        }
+        let global_model_repository = Arc::new(
+            InMemoryGlobalModelReadRepository::seed(Vec::new())
+                .with_admin_global_models(vec![sample_global_model(
+                    "global-model-image",
+                    "gpt-image-2",
+                    &["gpt-image-2"],
+                )])
+                .with_admin_provider_models(vec![legacy_image_model])
+                .with_endpoint_provider_ids(endpoint_provider_ids),
+        );
+        let data_state = crate::data::GatewayDataState::disabled()
+            .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))
+            .with_global_model_repository_for_tests(Arc::clone(&global_model_repository))
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+        let state = AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(data_state);
+
+        perform_model_fetch_for_key(&state, "provider-codex-image", "key-codex-image")
+            .await
+            .expect("codex model fetch should succeed");
+        upstream_handle.abort();
+
+        let updated_key = provider_catalog_repository
+            .list_keys_by_ids(&["key-codex-image".to_string()])
+            .await
+            .expect("keys should load")
+            .into_iter()
+            .next()
+            .expect("updated key should exist");
+        let provider_models = global_model_repository
+            .list_admin_provider_models(&AdminProviderModelListQuery {
+                provider_id: "provider-codex-image".to_string(),
+                is_active: None,
+                offset: 0,
+                limit: 10_000,
+            })
+            .await
+            .expect("provider models should load");
+        let image_available = provider_models
+            .iter()
+            .find(|model| model.provider_model_name == "gpt-image-2")
+            .expect("image provider model should exist")
+            .is_available;
+        (updated_key.allowed_models, image_available)
+    }
+
+    // Key 不允许 openai:image：即使存在 active 图片 Endpoint 也不补全、不恢复可用。
+    let (allowed_models, image_available) = run_scenario(true, &["openai:responses"], &[]).await;
+    assert_eq!(allowed_models, Some(json!(["gpt-5.4-codex"])));
+    assert!(!image_available);
+
+    // Provider 无图片 Endpoint：Key 格式允许 openai:image 也不补全。
+    let (allowed_models, image_available) =
+        run_scenario(false, &["openai:responses", "openai:image"], &[]).await;
+    assert_eq!(allowed_models, Some(json!(["gpt-5.4-codex"])));
+    assert!(!image_available);
+
+    // 双 Endpoint 双格式允许图片，但 exclude 模式过滤补全 ID：白名单不含 image、
+    // 既有 image ProviderModel 保持不可用。
+    let (allowed_models, image_available) = run_scenario(
+        true,
+        &["openai:responses", "openai:image"],
+        &["gpt-image-*"],
+    )
+    .await;
+    assert_eq!(allowed_models, Some(json!(["gpt-5.4-codex"])));
+    assert!(!image_available);
 }

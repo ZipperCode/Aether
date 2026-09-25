@@ -1,0 +1,5 @@
+{"file":".trellis/tasks/09-25-codex-image-scheduling/prd.md","reason":"需求与验收"}
+{"file":".trellis/tasks/09-25-codex-image-scheduling/design.md","reason":"设计与所有权"}
+{"file":".trellis/spec/guides/index.md","reason":"共享指南"}
+{"file":".trellis/spec/aether-gateway/backend/model-association-endpoint-contract.md","reason":"准确 Endpoint 证据，只读不可覆盖已有改动"}
+{"file":".trellis/spec/aether-gateway/backend/auth-maintenance-memory-contract.md","reason":"保持轻量模型刷新与批量协调"}
