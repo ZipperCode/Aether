@@ -42,6 +42,278 @@ where
     }
 }
 
+/// 全部候选在正文构造阶段跳过时，不得提交成功心跳，且保留失败记账和采集策略。
+#[test]
+fn gateway_image_sync_heartbeat_records_failed_usage_when_all_candidates_are_skipped() {
+    run_image_sync_test(
+        "gateway_image_sync_heartbeat_records_failed_usage_when_all_candidates_are_skipped",
+        || async {
+            for path in ["/v1/images/edits", "/v1/images/generations"] {
+                for record_level in ["basic", "full"] {
+                    assert_image_sync_heartbeat_runtime_miss(path, record_level, true).await;
+                }
+            }
+        },
+    );
+}
+
+/// 无候选场景仍交给相同的请求级失败记账入口。
+#[test]
+fn gateway_image_sync_heartbeat_records_failed_usage_without_candidates() {
+    run_image_sync_test(
+        "gateway_image_sync_heartbeat_records_failed_usage_without_candidates",
+        || async {
+            for path in ["/v1/images/edits", "/v1/images/generations"] {
+                assert_image_sync_heartbeat_runtime_miss(path, "full", false).await;
+            }
+        },
+    );
+}
+
+async fn assert_image_sync_heartbeat_runtime_miss(
+    path: &str,
+    record_level: &str,
+    with_candidate: bool,
+) {
+    use aether_data::repository::routing_profiles::InMemoryRoutingGroupRepository;
+    use aether_data::repository::usage::InMemoryUsageReadRepository;
+    use aether_data_contracts::repository::candidates::{
+        RequestCandidateReadRepository, RequestCandidateStatus,
+    };
+    use aether_data_contracts::repository::routing_profiles::StoredRoutingGroup;
+    use aether_data_contracts::repository::usage::{UsageBodyCaptureState, UsageReadRepository};
+
+    use crate::tests::usage::{
+        hash_api_key, sample_local_openai_auth_snapshot, sample_local_openai_candidate_row,
+        sample_local_openai_endpoint, sample_local_openai_key, sample_local_openai_provider,
+    };
+
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_for_handler = Arc::clone(&upstream_hits);
+    let upstream = Router::new().fallback(any(move || {
+        let upstream_hits = Arc::clone(&upstream_hits_for_handler);
+        async move {
+            *upstream_hits.lock().expect("mutex should lock") += 1;
+            StatusCode::IM_A_TEAPOT
+        }
+    }));
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+
+    // 复用用量夹具的关联 ID，仅将协议与模型切换为原生 Codex Images。
+    let client_api_key = "sk-client-image-heartbeat-runtime-miss";
+    let trace_id = "trace-image-heartbeat-runtime-miss";
+    let mut auth = sample_local_openai_auth_snapshot("image-client-key", "image-user");
+    auth.user_allowed_providers = Some(vec!["codex".to_string()]);
+    auth.api_key_allowed_providers = auth.user_allowed_providers.clone();
+    auth.user_allowed_api_formats = Some(vec!["openai:image".to_string()]);
+    auth.api_key_allowed_api_formats = auth.user_allowed_api_formats.clone();
+    auth.user_allowed_models = Some(vec!["gpt-image-2.5-flare".to_string()]);
+    auth.api_key_allowed_models = auth.user_allowed_models.clone();
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key(client_api_key)),
+        auth,
+    )]));
+    let mut candidate = sample_local_openai_candidate_row();
+    candidate.provider_name = "codex".to_string();
+    candidate.provider_type = "codex".to_string();
+    candidate.endpoint_api_format = "openai:image".to_string();
+    candidate.endpoint_kind = Some("image".to_string());
+    candidate.key_auth_type = "oauth".to_string();
+    candidate.key_api_formats = Some(vec!["openai:image".to_string()]);
+    candidate.key_global_priority_by_format = Some(json!({"openai:image": 1}));
+    candidate.global_model_name = "gpt-image-2.5-flare".to_string();
+    candidate.model_provider_model_name = candidate.global_model_name.clone();
+    candidate.model_provider_model_mappings = None;
+    let candidate_repository = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(
+        if with_candidate {
+            vec![candidate]
+        } else {
+            vec![]
+        },
+    ));
+    let mut provider = sample_local_openai_provider();
+    provider.name = "codex".to_string();
+    provider.provider_type = "codex".to_string();
+    let mut endpoint = sample_local_openai_endpoint();
+    endpoint.api_format = "openai:image".to_string();
+    endpoint.endpoint_kind = Some("image".to_string());
+    endpoint.base_url = format!("{upstream_url}/backend-api/codex");
+    let mut key = sample_local_openai_key();
+    key.auth_type = "oauth".to_string();
+    key.api_formats = Some(json!(["openai:image"]));
+    key.global_priority_by_format = Some(json!({"openai:image": 1}));
+    // 固定未过期凭据，失败必须来自正文构造而非 OAuth 刷新或认证通道过滤。
+    key.expires_at_unix_secs = Some(4_102_444_800);
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"codex","expires_at":4102444800}"#,
+        )
+        .expect("auth config should encrypt"),
+    );
+    let provider_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![key],
+    ));
+    let routing_repository = Arc::new(InMemoryRoutingGroupRepository::seed(
+        [StoredRoutingGroup {
+            id: "image-heartbeat".to_string(),
+            name: "image-heartbeat".to_string(),
+            description: None,
+            enabled: true,
+            is_system_default: true,
+            sort_order: 0,
+            config_json: json!({"default_policy": {"enable_cf_heartbeat": true}}),
+            version: 1,
+            created_at: 1,
+            updated_at: 1,
+            published_at: Some(1),
+        }],
+        [],
+        [],
+    ));
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::default());
+    let state = build_state_with_execution_runtime_override("")
+        .with_data_state_for_tests(
+            crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_request_candidates_and_usage_for_tests(
+                auth_repository,
+                candidate_repository,
+                provider_repository,
+                Arc::clone(&request_candidates),
+                Arc::clone(&usage_repository),
+                DEVELOPMENT_ENCRYPTION_KEY,
+            )
+            .with_routing_group_repository_for_tests(routing_repository)
+            .with_system_config_values_for_tests([(
+                "request_record_level".to_string(),
+                json!(record_level),
+            )]),
+        )
+        .with_usage_runtime_for_tests(super::UsageRuntimeConfig {
+            enabled: true,
+            ..super::UsageRuntimeConfig::default()
+        });
+    let (gateway_url, gateway_handle) = start_server(build_router_with_state(state.clone())).await;
+    // user 在公共生成和编辑协议有效，但 Codex 当前未支持；不依赖本次修复的 output_format。
+    let mut request_body = json!({
+        "model": "gpt-image-2.5-flare",
+        "prompt": "a blue square",
+        "n": 1,
+        "size": "1536x1024",
+        "user": "image-client"
+    });
+    if path.ends_with("/edits") {
+        request_body["images"] = json!([{"image_url": "data:image/png;base64,aGVsbG8="}]);
+    }
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}{path}"))
+        .bearer_auth(client_api_key)
+        .header(TRACE_ID_HEADER, trace_id)
+        .json(&request_body)
+        .send()
+        .await
+        .expect("image request should complete");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[TRACE_ID_HEADER], trace_id);
+    let response_body: serde_json::Value = response.json().await.expect("error should decode");
+    assert_eq!(response_body["error"]["type"], "http_error");
+    assert!(response_body.get("data").is_none());
+    assert!(response_body["error"].get("upstream_status").is_none());
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    let stored = usage_repository
+        .find_by_request_id(trace_id)
+        .await
+        .expect("usage should read")
+        .expect("no-plan failure must record terminal usage");
+    assert_eq!(stored.request_id, trace_id);
+    assert_eq!(stored.status, "failed");
+    assert_eq!(stored.billing_status, "void");
+    assert_eq!(stored.status_code, Some(503));
+    assert_eq!(stored.user_id.as_deref(), Some("image-user"));
+    assert_eq!(stored.model, "gpt-image-2.5-flare");
+    assert_eq!(stored.api_format.as_deref(), Some("openai:image"));
+    assert_eq!(stored.total_tokens, 0);
+    assert_eq!(
+        stored.routing_execution_path(),
+        Some("local_execution_runtime_miss")
+    );
+    assert_eq!(
+        usage_repository
+            .count_usage_audits(&Default::default())
+            .await
+            .expect("usage should count"),
+        1
+    );
+    assert_eq!(
+        state
+            .usage_runtime
+            .metrics_snapshot()
+            .terminal_submission_rejected_total,
+        0
+    );
+
+    let candidates = request_candidates
+        .list_by_request_id(trace_id)
+        .await
+        .expect("candidates should read");
+    assert_eq!(candidates.len(), usize::from(with_candidate));
+    if with_candidate {
+        let candidate = &candidates[0];
+        assert_eq!(candidate.status, RequestCandidateStatus::Skipped);
+        assert_eq!(
+            candidate.skip_reason.as_deref(),
+            Some("provider_request_body_missing")
+        );
+        assert!(candidate.started_at_unix_ms.is_none());
+        assert!(candidate.status_code.is_none());
+        assert_eq!(stored.provider_name, "codex");
+        assert_eq!(stored.routing_candidate_id(), Some(candidate.id.as_str()));
+        assert_eq!(
+            stored.routing_candidate_skip_reason(),
+            candidate.skip_reason.as_deref()
+        );
+        let diagnostic = &candidate
+            .extra_data
+            .as_ref()
+            .expect("skip metadata should persist")["failure_diagnostic"];
+        assert_eq!(diagnostic["path"], "$");
+        assert_eq!(diagnostic["stage"], "request");
+        assert_eq!(diagnostic["kind"], "request_body_build");
+        assert_eq!(diagnostic["source"], "codex_openai_images_request_contract");
+        assert!(stored.routing_failure_diagnostic().is_none());
+    }
+    assert!(stored.provider_request_body.is_none());
+    assert!(stored.provider_request_body_ref.is_none());
+    if record_level == "full" {
+        assert_eq!(
+            stored.request_body_state,
+            Some(UsageBodyCaptureState::Inline)
+        );
+        assert_eq!(stored.request_body, Some(request_body));
+        assert_eq!(
+            stored.provider_request_body_state,
+            Some(UsageBodyCaptureState::None)
+        );
+    } else {
+        assert_eq!(
+            stored.request_body_state,
+            Some(UsageBodyCaptureState::Disabled)
+        );
+        assert!(stored.request_body.is_none());
+        assert!(stored.request_body_ref.is_none());
+        assert_eq!(
+            stored.provider_request_body_state,
+            Some(UsageBodyCaptureState::Disabled)
+        );
+    }
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
 #[test]
 fn gateway_converts_openai_image_sync_to_gemini_image_provider() {
     run_image_sync_test(

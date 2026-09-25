@@ -20,6 +20,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Codex HTTP Responses Relay](./codex-http-responses-contract.md) | Executable create, compact, SSE, passthrough, and fail-closed contract | Current |
+| [Codex Images Request Projection](./codex-images-request-contract.md) | Shared output format preservation and confirmed rejection boundaries | Current |
 
 ---
 

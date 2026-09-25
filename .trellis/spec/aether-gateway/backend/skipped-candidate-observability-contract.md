@@ -35,6 +35,22 @@ polling. These fields describe scheduling decisions; they do not change policy.
   skip facts through sparse refreshes. Desktop/mobile users see generic markers;
   only administrators see detailed reasons. Existing retry/fallback filtering
   remains unchanged.
+- In `maybe_execute_sync_via_local_image_decision`, drain candidate preparation
+  before building a synchronous JSON heartbeat shell. If no execution attempt
+  remains, return the existing `NoPath` outcome before committing HTTP 200.
+  The ordinary proxy runtime-miss finalizer then records one failed usage with
+  the original trace ID, skipped candidates and configured request capture.
+  Preserve existing heartbeat behavior for nonempty attempts.
+- In `record_failed_usage_for_runtime_miss_request`, preserve diagnostic and
+  candidate model precedence. If both lack a model, use the nonempty string
+  `model` from the original request JSON already parsed by that writer. Reuse
+  the same parsed value for capture; do not enable ImageDecision diagnostics,
+  broaden candidate metadata or depend on body capture being enabled. Missing
+  or invalid model fields retain the existing unknown result.
+- Keep `failure_diagnostic.kind` and `failure_diagnostic.source` in the bounded
+  persistence/admin diagnostic projection. These locate the internal rejection
+  when breakpoint is `$`; ordinary-user projection stays unchanged. A skipped
+  candidate with `started_at=NULL` is not an upstream send or response.
 
 ## 4. Validation & Error Matrix
 | Input | Result |
@@ -45,6 +61,9 @@ polling. These fields describe scheduling decisions; they do not change policy.
 | Explicit active IDs include another user's row | Foreign row is absent |
 | Ordinary-user record | Boolean only; no provider/key or reason disclosure |
 | Candidate data source unavailable | Preserve existing data-error behavior; do not fabricate a reason |
+| All image candidates skipped with JSON heartbeat enabled | Real failure status and one failed usage; no empty HTTP 200 shell |
+| Stored failure_diagnostic has internal kind/source | Preserve in admin diagnostics through repeated projection |
+| No-plan failure has an explicit JSON model but no diagnostic/candidate model | Record the declared model under both basic and full capture |
 
 ## 5. Good / Base / Bad Cases
 Good: a successful request that skipped an earlier Key shows a skip marker even
@@ -62,6 +81,15 @@ Bad: infer skip existence from nonempty reason text or expose raw reasons to use
 - Frontend `UsageRecordsTable`, `useUsageData`, `recordFilterPolicy`, `recordSync`,
   `skipReason`, `status`, timeline and shared Usage filter suites cover both form
   factors, generic-user privacy, server paging and sparse updates.
+- Image-route regression must enable JSON heartbeat, skip every candidate and
+  assert non-200 error, one failed usage correlated with `x-trace-id`, skipped
+  candidate evidence, no upstream send and configured capture behavior. Keep
+  existing successful and attempted-failure heartbeat regressions passing.
+- Include explicit request model assertions for skipped-only and no-candidate
+  image requests. Candidate failure details remain on the candidate; preserve
+  the existing minimal usage diagnostic projection instead of copying them.
+- Candidate persistence regression preserves kind/source across repeated
+  sanitization while unrelated metadata and ordinary-user output remain filtered.
 
 ## 7. Wrong vs Correct
 Wrong: `has_skipped_candidate = !reasons.is_empty()` or filter the visible page.

@@ -906,6 +906,9 @@ pub fn sanitize_request_candidate_extra_data_for_persistence(
         (
             "failure_diagnostic",
             &[
+                // 内部固定类别与来源用于定位构造失败，仍只保留在管理诊断中。
+                "kind",
+                "source",
                 "path",
                 "field_path",
                 "message",
@@ -2648,6 +2651,47 @@ mod tests {
         assert!(candidate.api_key_name.is_none());
         candidate.sanitize_sensitive_diagnostics();
         assert!(candidate.error_message.is_none());
+    }
+
+    #[test]
+    fn candidate_body_build_diagnostic_survives_persistence_round_trip() {
+        let expected = json!({
+            "gateway_execution_runtime": true,
+            "failure_diagnostic": {
+                "kind": "request_body_build",
+                "source": "codex_openai_images_request_contract",
+                "path": "$",
+                "stage": "request",
+                "source_format": "openai:image",
+                "target_format": "openai:image",
+                "safe_to_show": true,
+            },
+        });
+        let mut extra_data = expected.clone();
+        // 固定诊断来源需要保留，但正文、凭据和无关字段仍按原投影剔除。
+        extra_data["request_body"] = json!({"prompt": "do-not-store"});
+        extra_data["failure_diagnostic"]["authorization"] = json!("do-not-store");
+        extra_data["failure_diagnostic"]["request_body"] = json!({"prompt": "do-not-store"});
+        let mut stored = candidate(
+            "candidate-body-build",
+            RequestCandidateStatus::Skipped,
+            None,
+        );
+        stored.started_at_unix_ms = None;
+        stored.extra_data = Some(extra_data);
+        stored.sanitize_for_persistence();
+
+        let serialized = serde_json::to_string(&stored).expect("candidate should serialize");
+        let mut restored: StoredRequestCandidate =
+            serde_json::from_str(&serialized).expect("candidate should deserialize");
+        assert_eq!(restored.extra_data, Some(expected.clone()));
+        restored.sanitize_for_persistence();
+        assert_eq!(restored.extra_data, Some(expected));
+        restored.sanitize_sensitive_diagnostics();
+        assert_eq!(
+            restored.extra_data,
+            Some(json!({"gateway_execution_runtime": true}))
+        );
     }
 
     #[test]

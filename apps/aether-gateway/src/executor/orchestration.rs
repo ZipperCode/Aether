@@ -1397,6 +1397,10 @@ pub(crate) async fn maybe_execute_sync_via_local_image_decision(
         while let Some(attempt) = attempt_source.next_execution_attempt().await? {
             attempts.push(attempt);
         }
+        // 全部候选已跳过时，让普通失败路径记账并返回真实错误状态，避免先提交 200 心跳。
+        if attempts.is_empty() {
+            return Ok(LocalExecutionRequestOutcome::NoPath);
+        }
         return Ok(LocalExecutionRequestOutcome::responded(
             build_openai_image_sync_heartbeat_shell_response(
                 state.clone(),

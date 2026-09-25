@@ -1048,6 +1048,7 @@ fn project_codex_openai_image_api_request_body_with_max_generation_count(
                 | "quality"
                 | "size"
                 | "images"
+                | "output_format"
                 | "response_format"
                 | "stream"
         )
@@ -1099,6 +1100,10 @@ fn project_codex_openai_image_api_request_body_with_max_generation_count(
             "size".to_string(),
             Value::String(non_empty_image_string(Some(size))?.to_string()),
         );
+    }
+    // 公共投影已校验模型与枚举，Codex 直接保留规范值，避免二次投影丢失输出格式。
+    if let Some(output_format) = object.get("output_format") {
+        projected.insert("output_format".to_string(), output_format.clone());
     }
     Some(Value::Object(projected))
 }
@@ -2618,12 +2623,86 @@ mod tests {
     }
 
     #[test]
+    fn codex_image_output_format_survives_generation_and_edit_projection() {
+        for (path, operation) in [
+            ("/v1/images/generations", OpenAiImageOperation::Generate),
+            ("/v1/images/edits", OpenAiImageOperation::Edit),
+        ] {
+            let parts = request_parts(path, Some("application/json"));
+            for (output_format, canonical) in [
+                ("png", "png"),
+                ("jpeg", "jpeg"),
+                ("webp", "webp"),
+                (" PNG ", "png"),
+            ] {
+                // 生成请求保留已采集的语义字段；编辑只添加无敏感信息的测试图片引用。
+                let mut body = json!({
+                    "model": "gpt-image-2.5-flare",
+                    "prompt": "a blue square",
+                    "n": 1,
+                    "size": "1536x1024",
+                    "output_format": output_format,
+                });
+                if operation == OpenAiImageOperation::Edit {
+                    body["images"] = json!([{"image_url": "https://example.test/input.png"}]);
+                }
+                let request = normalize_openai_image_request(&parts, &body, None)
+                    .expect("supported output format should normalize");
+                let mut expected = body.clone();
+                expected["output_format"] = json!(canonical);
+                assert_eq!(
+                    build_openai_image_api_provider_request_body(&request, None, false),
+                    Some(expected.clone()),
+                    "native image request should preserve {output_format} for {path}"
+                );
+                assert_eq!(
+                    build_codex_openai_image_api_provider_request_body(&request, None, false),
+                    Some(expected.clone()),
+                    "Codex image request should preserve {output_format} for {path}"
+                );
+                assert_eq!(
+                    project_codex_openai_image_api_request_body(&body, operation),
+                    Some(expected),
+                    "direct image projection should preserve {output_format} for {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_image_output_format_rejects_invalid_values() {
+        for (path, operation) in [
+            ("/v1/images/generations", OpenAiImageOperation::Generate),
+            ("/v1/images/edits", OpenAiImageOperation::Edit),
+        ] {
+            let parts = request_parts(path, Some("application/json"));
+            let mut body = json!({
+                "model": "gpt-image-2.5-flare",
+                "prompt": "a blue square",
+                "output_format": "gif",
+            });
+            if operation == OpenAiImageOperation::Edit {
+                body["images"] = json!([{"image_url": "https://example.test/input.png"}]);
+            }
+            // 共享校验继续拒绝无效枚举，不因 Codex 放行字段而绕过校验。
+            assert!(normalize_openai_image_request(&parts, &body, None).is_none());
+            assert!(project_openai_image_api_request_body(
+                &body,
+                "gpt-image-2.5-flare",
+                operation,
+                10,
+            )
+            .is_none());
+            assert!(project_codex_openai_image_api_request_body(&body, operation).is_none());
+        }
+    }
+
+    #[test]
     fn rejects_fields_outside_the_codex_images_contract() {
         let parts = request_parts("/v1/images/edits", Some("application/json"));
         for unsupported in [
             json!({"mask": "data:image/png;base64,bWFzaw=="}),
             json!({"input_fidelity": "high"}),
-            json!({"output_format": "png"}),
             json!({"partial_images": 1}),
             json!({"response_format": "url"}),
             json!({"user": "user-123"}),

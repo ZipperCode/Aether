@@ -119,3 +119,5 @@ Codex 文本 `/models` 目录不是完整图片目录。Aether 从该提供商�
 Responses 的既有格式权限覆盖 Search/Compact，人工停用的绑定保持停用。原生卡片 `supports_search_tool` 表示工具发现，不能用它推断网页搜索权限；官方 [独立网页搜索选择](https://github.com/openai/codex/blob/75e0e0aad97a86138b8b1ec87d9b544b4a35ecbf/codex-rs/core/src/tools/spec_plan.rs#L1038) 使用 Provider 网页搜索能力和客户端功能开关。
 
 图片与 Search 仍执行认证、Key 模型限制、额度和健康检查。可路由不等于上游必定授权，429 额度耗尽也不等于型号不支持。真实上游权限变化、型号协议或参数变化须依据返回证据适配；不隐式更换协议或伪造成功。
+
+Codex Images 生成和编辑保留通过共享图片校验的 `output_format`（`png`、`jpeg`、`webp`），不因客户端 DTO 缺少该字段而跳过账号。图片同步 JSON 心跳只用于存在可执行候选的请求；全候选跳过时返回正常错误并记录失败 usage，保留已配置的正文采集策略。

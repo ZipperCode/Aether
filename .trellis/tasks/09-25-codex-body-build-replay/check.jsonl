@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/09-25-codex-body-build-replay/research/live-evidence.md", "reason": "Evidence boundary for repair review"}
+{"file": ".trellis/spec/aether-ai-formats/backend/codex-images-request-contract.md", "reason": "Image field contract regression"}
+{"file": ".trellis/spec/aether-gateway/backend/skipped-candidate-observability-contract.md", "reason": "Empty attempts and persisted diagnostics"}
+{"file": ".trellis/tasks/09-25-codex-body-build-replay/research/image-missing-usage.md", "reason": "Confirmed empty-shell root cause and failure path"}

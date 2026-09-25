@@ -1,0 +1,7 @@
+# Implementation and verification
+
+1. Add and run a regression using the sanitized captured generation request: native succeeds, current Codex builder fails. Cover Edit and supported output_format values through the same owner; retain invalid-value rejection. Then repair forwarding at the shared Codex projector.
+2. Add and run the all-skipped Images JSON heartbeat regression before repair. Reuse terminal failure accounting; assert one failed usage record linked to skipped candidates, original capture behavior, no upstream send, and the existing client error contract. Check no-candidate and exhausted paths if they share the same hole; avoid duplicate records on already-accounted failures.
+3. Preserve diagnostic kind/source in the existing data-contract sanitizer with a persistence/projection regression and unchanged unrelated-field filtering.
+4. Run relevant image/heartbeat/candidate tests, cargo fmt and targeted Clippy. Gateway compile/test commands run serially to avoid Cargo lock contention. No all-workspace/full frontend run for this backend-only repair.
+5. Independent Trellis check agent reviews final shared callers and verification. Parent updates specs and commits in Chinese after checks. Continue the user's earlier authorized release order in a separate release task: push the exact source, wait for full GitHub CI success, then create the next annotated tag and verify publication. Deployment to154 remains separate.
