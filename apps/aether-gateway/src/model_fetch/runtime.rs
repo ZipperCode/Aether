@@ -685,11 +685,10 @@ async fn fetch_and_persist_key_models(
             && !fetched_model_ids.iter().any(|model_id| {
                 model_id
                     .trim()
-                    .eq_ignore_ascii_case(aether_ai_formats::api::CODEX_OPENAI_IMAGE_DEFAULT_MODEL)
+                    .eq_ignore_ascii_case(crate::ai_serving::CODEX_OPENAI_IMAGE_DEFAULT_MODEL)
             })
         {
-            fetched_model_ids
-                .push(aether_ai_formats::api::CODEX_OPENAI_IMAGE_DEFAULT_MODEL.to_string());
+            fetched_model_ids.push(crate::ai_serving::CODEX_OPENAI_IMAGE_DEFAULT_MODEL.to_string());
         }
     }
     let filtered_models = apply_model_filters(

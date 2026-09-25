@@ -60,6 +60,8 @@ Questions to answer:
 
 `supplement_codex_image_models(models: &mut Vec<Value>, image_endpoint_ids: &[String]) -> bool` 仅用于管理 legacy/association 投影。模型 ID 复用 `aether_ai_formats::api::CODEX_OPENAI_IMAGE_DEFAULT_MODEL`。
 
+Gateway 调用该常量必须经既有 `crate::ai_serving::CODEX_OPENAI_IMAGE_DEFAULT_MODEL` 入口，不得从业务模块直接引用 `aether_ai_formats::api`；以 `ai_serving_crate_api_is_confined_to_root_seams` 架构检查验证。
+
 ### 3. Contracts
 
 - 调用方确认 Provider 为 Codex、图片 Endpoint active、Key 显式非空格式列表允许 `openai:image`；空格式列表沿用模型发现的继承语义。管理查询与后台刷新必须一致。
