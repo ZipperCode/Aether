@@ -1,0 +1,41 @@
+{
+  "run_id": 36092942236,
+  "url": "https://github.com/ZipperCode/Aether/actions/runs/36092942236",
+  "head_sha": "22124fe5984ea1fb52c8d6b3195b999d9a1c6fbb",
+  "status": "completed",
+  "conclusion": "success",
+  "jobs": [
+    {
+      "name": "Release preflight",
+      "conclusion": "success"
+    },
+    {
+      "name": "Build VS Code Codex extension",
+      "conclusion": "success"
+    },
+    {
+      "name": "Build linux-arm64",
+      "conclusion": "success"
+    },
+    {
+      "name": "Build frontend",
+      "conclusion": "success"
+    },
+    {
+      "name": "Build linux-amd64",
+      "conclusion": "success"
+    },
+    {
+      "name": "Docker multi-arch",
+      "conclusion": "success"
+    },
+    {
+      "name": "Release tarballs",
+      "conclusion": "success"
+    },
+    {
+      "name": "GitHub Release assets",
+      "conclusion": "success"
+    }
+  ]
+}

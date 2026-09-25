@@ -1,0 +1,88 @@
+{
+  "release_url": "https://github.com/ZipperCode/Aether/releases/tag/v0.7.39",
+  "version": "v0.7.39",
+  "source_sha": "22124fe5984ea1fb52c8d6b3195b999d9a1c6fbb",
+  "ci_run_id": 36091500070,
+  "ci_jobs_success": 18,
+  "release_run_id": 36092942236,
+  "release_jobs_success": 8,
+  "tag_object": "934f4534d76a3489e1b3fe8f32ccf9172befa2c0",
+  "assets": [
+    {
+      "name": "aether-v0.7.39-linux-amd64.tar.gz",
+      "size": 46097490,
+      "sha256": "eeace056494cb96cb8e4c3a8d28d54f22c7c50a52f503622485d7afb1d2d9652",
+      "github_digest_verified": true,
+      "sha256sums_verified": true,
+      "archive_entries": 256,
+      "required_layout_verified": true,
+      "attestation_verified": true
+    },
+    {
+      "name": "aether-v0.7.39-linux-arm64.tar.gz",
+      "size": 42404382,
+      "sha256": "6a46a0cfd19eaa784010b088ce2acafa28de98ec57e9bccd2d464d1b3b12df0e",
+      "github_digest_verified": true,
+      "sha256sums_verified": true,
+      "archive_entries": 256,
+      "required_layout_verified": true,
+      "attestation_verified": true
+    },
+    {
+      "name": "aether-vscodex-0.4.0.vsix",
+      "size": 328733,
+      "sha256": "a7362ac93ba253b8dc7a1e5490df539fd7914e1de9936c89354f3cf6a50e826c",
+      "github_digest_verified": true,
+      "extension_version": "0.4.0",
+      "zip_integrity_verified": true,
+      "attestation_verified": false
+    },
+    {
+      "name": "AETHER_RELEASE_PROVENANCE.sigstore.json",
+      "size": 10914,
+      "sha256": "6d93847c4bde2c1624d387c0edf0577a01ae9f0ddce4a03835897bb4636c3392",
+      "github_digest_verified": true,
+      "attestation_verified": false
+    },
+    {
+      "name": "install.sh",
+      "size": 92886,
+      "sha256": "2107a1e314a8219f23e75c36c056917803e8ed23f180d4a238e41ced42213968",
+      "github_digest_verified": true,
+      "attestation_verified": true
+    },
+    {
+      "name": "SHA256SUMS",
+      "size": 200,
+      "sha256": "cc40fb7c412ca3c73b21af288f18bf6a54d887feb5bf36ce7e2a24954fe40f39",
+      "github_digest_verified": true,
+      "attestation_verified": true
+    }
+  ],
+  "ghcr": {
+    "image": "ghcr.io/zippercode/aether:0.7.39",
+    "digest": "sha256:a0f96036601ca36bcb05d4a4529dcacf22eae85a633f14f773ae0261a317205d",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "attestation_verified": true,
+    "manifests": {
+      "linux/amd64": "sha256:69db2107e31503228ab16c0ca815896fbd542a57da965989a47835e245987d57",
+      "linux/arm64": "sha256:1e2c82874b03e985d4f63ea20f356948235ceda7e79cf672bc70e33e96d249bf"
+    }
+  },
+  "deployed": false,
+  "package_provenance": {
+    "verified": true,
+    "signer_workflow": "ZipperCode/Aether/.github/workflows/release.yml",
+    "source_ref": "refs/tags/v0.7.39",
+    "source_sha": "22124fe5984ea1fb52c8d6b3195b999d9a1c6fbb",
+    "signed_subjects": [
+      "SHA256SUMS",
+      "aether-v0.7.39-linux-amd64.tar.gz",
+      "aether-v0.7.39-linux-arm64.tar.gz",
+      "install.sh"
+    ]
+  }
+}

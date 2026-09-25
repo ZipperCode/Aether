@@ -1,0 +1,81 @@
+{
+  "run_id": 36091500070,
+  "url": "https://github.com/ZipperCode/Aether/actions/runs/36091500070",
+  "head_sha": "22124fe5984ea1fb52c8d6b3195b999d9a1c6fbb",
+  "status": "completed",
+  "conclusion": "success",
+  "jobs": [
+    {
+      "name": "Format",
+      "conclusion": "success"
+    },
+    {
+      "name": "Clippy (Data)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Check (Data Feature - all-drivers)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Test (Data Adapter - aether-data-postgres)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Frontend",
+      "conclusion": "success"
+    },
+    {
+      "name": "Clippy (Gateway)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Data DB Smoke (Postgres)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Shell security fixtures",
+      "conclusion": "success"
+    },
+    {
+      "name": "Test (Data)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Clippy (Workspace Rest)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Test (Integration Scenarios)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Test (Gateway)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Test (Workspace Rest)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Check (Data Feature - postgres)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Data DB Smoke",
+      "conclusion": "success"
+    },
+    {
+      "name": "Clippy",
+      "conclusion": "success"
+    },
+    {
+      "name": "Test",
+      "conclusion": "success"
+    },
+    {
+      "name": "check",
+      "conclusion": "success"
+    }
+  ]
+}

@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 38
+- **Total Sessions**: 39
 - **Last Active**: 2026-09-25
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1006 | Active |
+| `journal-1.md` | ~1042 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 39 | 2026-09-25 | 发布 Aether v0.7.39 | `22124fe5984ea1fb52c8d6b3195b999d9a1c6fbb` | `master` |
 | 38 | 2026-09-25 | 完善 Codex OAuth 图片搜索与套餐准入 | `b2b87ce1547e88b6b6ea9a61a5cacfba628d9597` | `master` |
 | 37 | 2026-09-20 | 上游与候选跳过诊断合并 | `377ca367f` | `master` |
 | 36 | 2026-09-20 | Responses 开场空白与故障转移修复 | `970eab84ee09536237e743c146017f1b8567286b` | `master` |

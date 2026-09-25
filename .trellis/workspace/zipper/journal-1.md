@@ -1004,3 +1004,39 @@ Implemented independent quota sources, official plan recognition, regional query
 ### Next Steps
 
 - 尚未推送、发布或部署154；后续按发布流程上线后需刷新自动模型目录并验收真实上游权限。
+
+
+## Session 39: 发布 Aether v0.7.39
+
+**Date**: 2026-09-25
+**Task**: 发布 Aether v0.7.39
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+精确提交完整 CI 通过后推送 annotated v0.7.39，发布和资产验证完成。
+
+### Main Changes
+
+- Rust CI 36091500070 全部18项成功后创建 tag，tag peeled SHA保持22124fe5984ea1fb52c8d6b3195b999d9a1c6fbb。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `22124fe5984ea1fb52c8d6b3195b999d9a1c6fbb` | (see git log) |
+
+### Testing
+
+- [OK] Release36092942236 全部8项成功；6资产本地SHA256匹配，双tarball布局256项和安装器版本锚定正确，VSIX独立版本0.4.0完整。
+- [OK] 4个包签名subject与GHCR镜像均通过exact-source attestation验证；GHCR digest a0f96036601ca36bcb05d4a4529dcacf22eae85a633f14f773ae0261a317205d，amd64/arm64齐全。
+- [OK] 独立审查核对CI先于tag、资产元数据和Pages停用；临时下载已清理。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 未部署154；后续部署与真实账号验收需单独执行。
