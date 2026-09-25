@@ -75,6 +75,7 @@ const MODEL_CAPABILITY_NON_TEXT_TYPES = new Set([
 
 const MODEL_TEST_DIAGNOSTIC_LABELS: Record<string, string> = {
   key_model_not_allowed: 'Key 未允许当前模型，已跳过',
+  codex_plan_image_generation_unsupported: 'Codex Free 套餐不支持图片生成',
   pool_account_blocked: '账号已失效，需重新授权',
 }
 

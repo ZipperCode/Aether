@@ -27,6 +27,12 @@ pub trait ModelFetchAssociationStore {
         query: &AdminProviderModelListQuery,
     ) -> Result<Vec<StoredAdminProviderModel>, Self::Error>;
 
+    /// 读取准确绑定，为配置驱动的图片目录提供启用状态与端点证据。
+    async fn list_model_endpoint_bindings(
+        &self,
+        model_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, Self::Error>;
+
     async fn list_admin_global_models(
         &self,
         query: &AdminGlobalModelListQuery,
@@ -597,6 +603,13 @@ mod tests {
             &self,
             _provider_ids: &[String],
         ) -> Result<Vec<StoredProviderCatalogModelFetchCandidate>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn list_model_endpoint_bindings(
+            &self,
+            _model_ids: &[String],
+        ) -> Result<Vec<StoredModelEndpointBinding>, Self::Error> {
             Ok(Vec::new())
         }
     }

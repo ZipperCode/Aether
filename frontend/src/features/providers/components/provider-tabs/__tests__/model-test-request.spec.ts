@@ -502,6 +502,8 @@ describe('formatModelTestDiagnostic', () => {
   it('maps model permission skips to an actionable label', () => {
     expect(formatModelTestDiagnostic('key_model_not_allowed'))
       .toBe('Key 未允许当前模型，已跳过')
+    expect(formatModelTestDiagnostic('codex_plan_image_generation_unsupported'))
+      .toBe('Codex Free 套餐不支持图片生成')
   })
 
   it('maps pool account blocked scheduler code to an actionable label', () => {

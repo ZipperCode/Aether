@@ -352,6 +352,7 @@ const LIST_MODEL_FETCH_CANDIDATES_BY_PROVIDER_IDS_PREFIX: &str = r#"
 SELECT
   id,
   provider_id,
+  auth_type,
   is_active,
   auto_fetch_models,
   api_formats,
@@ -3754,6 +3755,7 @@ fn map_model_fetch_candidate_row(
     Ok(StoredProviderCatalogModelFetchCandidate {
         id: row_get(row, "id")?,
         provider_id: row_get(row, "provider_id")?,
+        auth_type: row_get(row, "auth_type")?,
         is_active: row_get(row, "is_active")?,
         auto_fetch_models: row_get(row, "auto_fetch_models")?,
         api_formats: row_get(row, "api_formats")?,
@@ -4107,6 +4109,7 @@ mod tests {
         for required in [
             "id",
             "provider_id",
+            "auth_type",
             "is_active",
             "auto_fetch_models",
             "api_formats",

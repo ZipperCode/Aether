@@ -1,4 +1,5 @@
 mod association_sync;
+mod codex;
 mod config;
 mod logic;
 mod strategy;
@@ -8,6 +9,9 @@ pub use association_sync::{
     global_model_matches_allowed_models, provider_model_matches_discovered_model,
     reconcile_provider_model_whitelist_availability, sync_provider_model_discovery_associations,
     sync_provider_model_whitelist_associations, ModelFetchAssociationStore,
+};
+pub use codex::{
+    load_codex_image_models, supplement_codex_management_models, CODEX_IMAGE_API_FORMAT,
 };
 pub use config::{
     model_fetch_interval_minutes, model_fetch_startup_delay_seconds, model_fetch_startup_enabled,
@@ -20,9 +24,8 @@ pub use logic::{
     parse_models_response_page, parse_windsurf_model_configs_response, preset_models_for_provider,
     project_codex_models_for_legacy_cache, provider_type_uses_preset_models,
     select_models_fetch_endpoint, selected_models_fetch_endpoints,
-    selected_models_fetch_endpoints_for_api_formats, supplement_codex_image_models,
-    upstream_metadata_namespace_updates, ModelFetchRunSummary, ModelsFetchPage, ModelsFetchSuccess,
-    CODEX_IMAGE_API_FORMAT,
+    selected_models_fetch_endpoints_for_api_formats, upstream_metadata_namespace_updates,
+    ModelFetchRunSummary, ModelsFetchPage, ModelsFetchSuccess,
 };
 pub use strategy::{
     antigravity_model_id_is_routable, fetch_models_from_transports,

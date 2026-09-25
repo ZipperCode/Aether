@@ -49,11 +49,21 @@ where
 fn gateway_executes_codex_search_with_responses_permission_and_search_contract() {
     run_search_sync_test(
         "gateway_executes_codex_search_with_responses_permission_and_search_contract",
-        gateway_executes_codex_search_with_responses_permission_and_search_contract_impl,
+        || gateway_executes_codex_search_with_responses_permission_and_search_contract_impl(false),
     );
 }
 
-async fn gateway_executes_codex_search_with_responses_permission_and_search_contract_impl() {
+#[test]
+fn gateway_executes_codex_search_via_real_http_without_tool_discovery_capability() {
+    run_search_sync_test(
+        "gateway_executes_codex_search_via_real_http_without_tool_discovery_capability",
+        || gateway_executes_codex_search_with_responses_permission_and_search_contract_impl(true),
+    );
+}
+
+async fn gateway_executes_codex_search_with_responses_permission_and_search_contract_impl(
+    real_http: bool,
+) {
     fn hash_api_key(value: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(value.as_bytes());
@@ -315,6 +325,36 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
     );
 
     let client_api_key = "sk-client-search";
+    // 本机直连记录最终上游头与正文，避免只验证 execution-runtime 计划。
+    let seen_http = Arc::new(Mutex::new(Vec::new()));
+    let seen_http_handler = seen_http.clone();
+    let (upstream_url, upstream_handle) = start_server(Router::new().route(
+        "/backend-api/codex/alpha/search",
+        any(move |request: Request| {
+            let seen = seen_http_handler.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let bytes = to_bytes(body, usize::MAX).await.expect("HTTP body");
+                let body: serde_json::Value = serde_json::from_slice(&bytes).expect("search JSON");
+                seen.lock().expect("HTTP requests").push((
+                    parts.method,
+                    parts.uri,
+                    parts.headers,
+                    body,
+                ));
+                (
+                    StatusCode::CREATED,
+                    [("x-search-upstream", "alpha")],
+                    Json(json!({
+                        "output": "search result",
+                        "encrypted_output": "encrypted-search-result",
+                        "future_response_field": {"enabled": true}
+                    })),
+                )
+            }
+        }),
+    ))
+    .await;
     let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
         Some(hash_api_key(client_api_key)),
         auth_snapshot(),
@@ -335,21 +375,55 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
     }));
     let catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         {
-            let primary = provider();
+            let mut primary = provider();
+            if real_http {
+                primary.config = Some(json!({"codex": {"fingerprint_convergence_enabled": true}}));
+            }
             let mut backup = primary.clone();
             backup.id = "provider-codex-search-2".to_string();
             backup.name = "codex-backup".to_string();
             vec![primary, backup]
         },
         {
-            let primary = endpoint();
+            let mut primary = endpoint();
+            if real_http {
+                primary.base_url = format!("{upstream_url}/backend-api/codex");
+                primary.header_rules = Some(json!([
+                    {"action": "set", "key": "Session_ID", "value": "rule-session"},
+                    {"action": "set", "key": "OpenAI-Beta", "value": "responses=v1"},
+                    {"action": "set", "key": "Accept", "value": "text/event-stream"}
+                ]));
+            }
             let mut backup = primary.clone();
             backup.id = "endpoint-codex-search-2".to_string();
             backup.provider_id = "provider-codex-search-2".to_string();
             vec![primary, backup]
         },
         {
-            let primary = key();
+            let mut primary = key();
+            if real_http {
+                // deferred tool discovery 的 false 不代表 Alpha Search 不可用。
+                primary.upstream_metadata = Some(json!({"codex_models": {"cards": {
+                    "gpt-5.6-sol": {"slug": "gpt-5.6-sol", "supports_search_tool": false}
+                }}}));
+                // 账号覆盖与端点规则之后仍须遵守 Search JSON 协议，不能泄漏 Responses 状态。
+                primary.encrypted_auth_config = Some(
+                    encrypt_python_fernet_plaintext(
+                        DEVELOPMENT_ENCRYPTION_KEY,
+                        &json!({
+                            "provider_type": "codex", "account_id": "account-search-1",
+                            "is_fedramp": true,
+                            "headers": {
+                                "content-type": "text/plain",
+                                "conversation_id": "account-conversation",
+                                "x-codex-turn-state": "account-state"
+                            }
+                        })
+                        .to_string(),
+                    )
+                    .expect("auth overrides should encrypt"),
+                );
+            }
             let mut backup = primary.clone();
             backup.id = "key-codex-search-2".to_string();
             backup.provider_id = "provider-codex-search-2".to_string();
@@ -372,8 +446,12 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
             crate::system_features::ENABLE_MODEL_DIRECTIVES_CONFIG_KEY.to_string(),
             json!(true),
         )]);
-    let state = build_state_with_execution_runtime_override(execution_runtime_url)
-        .with_data_state_for_tests(data_state);
+    let state = build_state_with_execution_runtime_override(if real_http {
+        String::new()
+    } else {
+        execution_runtime_url
+    })
+    .with_data_state_for_tests(data_state);
     let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -385,6 +463,15 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
             format!("Bearer {client_api_key}"),
         )
         .header(TRACE_ID_HEADER, "trace-search-1")
+        .header("user-agent", "codex_cli_rs/0.999.0")
+        .header("accept", "text/event-stream")
+        .header("openai-beta", "responses=v1")
+        .header("session_id", "responses-session")
+        .header("conversation_id", "responses-conversation")
+        .header("x-codex-beta-features", "responses_websockets")
+        .header("x-codex-turn-state", "responses-state")
+        .header("x-codex-turn-metadata", "search-turn")
+        .header("x-openai-internal-codex-responses-lite", "true")
         .json(&json!({
             "id": "session-search-1",
             "model": "gpt-5.6-sol-max",
@@ -430,6 +517,43 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
     assert_eq!(response_json["output"], "search result");
     assert_eq!(response_json["encrypted_output"], "encrypted-search-result");
     assert_eq!(response_json["future_response_field"]["enabled"], true);
+
+    if real_http {
+        let requests = seen_http.lock().expect("HTTP requests");
+        assert_eq!(requests.len(), 1);
+        let (method, uri, headers, body) = &requests[0];
+        assert_eq!(method, http::Method::POST);
+        assert_eq!(uri.path(), "/backend-api/codex/alpha/search");
+        assert_eq!(headers["authorization"], "Bearer codex-search-access-token");
+        assert_eq!(headers["chatgpt-account-id"], "account-search-1");
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers["accept"], "application/json");
+        assert_eq!(headers["user-agent"], "codex_cli_rs/0.999.0");
+        assert_eq!(headers["x-codex-turn-metadata"], "search-turn");
+        for header in [
+            "openai-beta",
+            "session_id",
+            "conversation_id",
+            "x-codex-beta-features",
+            "x-codex-turn-state",
+            "x-openai-internal-codex-responses-lite",
+        ] {
+            assert!(!headers.contains_key(header), "unexpected {header}");
+        }
+        assert_eq!(body["id"], "session-search-1");
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(
+            body["commands"]["search_query"][0]["q"],
+            "OpenAI Codex search"
+        );
+        assert_eq!(body["settings"]["search_context_size"], "high");
+        assert!(body.get("stream").is_none());
+        assert!(body.get("store").is_none());
+        gateway_handle.abort();
+        upstream_handle.abort();
+        execution_runtime_handle.abort();
+        return;
+    }
 
     let plan = seen_plans
         .lock()
@@ -599,5 +723,6 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
     assert_eq!(failover_candidates[2].status_code, Some(200));
 
     gateway_handle.abort();
+    upstream_handle.abort();
     execution_runtime_handle.abort();
 }

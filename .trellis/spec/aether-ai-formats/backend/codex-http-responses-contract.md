@@ -70,6 +70,10 @@ Codex 的 `apply_codex_openai_special_headers` 必须保留最终请求头集合
 
 2026-09-23 通过本机 `codex --version` 核实 `codex-cli 0.154.0`，内置版本及 UA 回退同步为 `0.154.0` / `codex_cli_rs/0.154.0`。共享常量同时用于缺省模型目录 `client_version` 和 Agent Identity 版本；客户端自带值仍优先。版本标识不是协议能力声明，不能据此省略请求、工具与流事件的兼容性验证。
 
+### Native Alpha Search headers
+
+Alpha Search is a separate synchronous JSON protocol (`/alpha/search`). Its final outgoing `Content-Type` and `Accept` are JSON. After passthrough and administrator header rules, remove Responses-only `OpenAI-Beta`, `Session_ID`, `Conversation_ID`, `X-Codex-Beta-Features`, `X-Codex-Turn-State` and the Responses Lite transport header; preserve selected credential/account identity and existing Codex client/turn metadata allowed by the Search contract. Do not apply this cleanup to Responses or Compact. Validate the final loopback HTTP request, not only the intermediate plan. The model-card field `supports_search_tool` describes deferred tool discovery and must not become an Alpha Search entitlement gate.
+
 ### HTTP SSE and errors
 
 Cross-format Responses output places raw reasoning in `content` entries of type

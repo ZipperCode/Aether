@@ -9,7 +9,7 @@ use aether_data_contracts::repository::candidates::{
     RequestCandidateReadRepository, RequestCandidateStatus,
 };
 use aether_data_contracts::repository::global_models::{
-    AdminProviderModelListQuery, GlobalModelReadRepository,
+    AdminProviderModelListQuery, GlobalModelReadRepository, StoredModelEndpointBinding,
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, StoredProviderCatalogEndpoint,
@@ -153,11 +153,25 @@ async fn assert_admin_provider_query_route(
 fn gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key() {
     run_provider_query_test(
         "gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key",
-        gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key_impl,
+        || {
+            gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key_impl(
+                false,
+            )
+        },
     );
 }
 
-async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key_impl() {
+#[test]
+fn gateway_codex_forced_legacy_discovery_does_not_infer_native_endpoints() {
+    run_provider_query_test(
+        "gateway_codex_forced_legacy_discovery_does_not_infer_native_endpoints",
+        || gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key_impl(true),
+    );
+}
+
+async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key_impl(
+    codex: bool,
+) {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
@@ -168,7 +182,17 @@ async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_select
                 *execution_runtime_hits_inner
                     .lock()
                     .expect("mutex should lock") += 1;
-                assert_eq!(plan.url, "https://api.openai.example/v1/models");
+                assert_eq!(
+                    plan.url,
+                    if codex {
+                        format!(
+                            "https://api.openai.example/v1/models?client_version={}",
+                            aether_ai_formats::CODEX_CLIENT_VERSION
+                        )
+                    } else {
+                        "https://api.openai.example/v1/models".to_string()
+                    }
+                );
                 assert_eq!(
                     plan.headers.get("authorization").map(String::as_str),
                     Some("Bearer sk-test")
@@ -196,37 +220,52 @@ async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_select
 
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let mut provider = sample_provider("provider-openai", "OpenAI", 10);
-    provider.provider_type = "openai".to_string();
+    provider.provider_type = if codex { "codex" } else { "openai" }.to_string();
+    let api_format = if codex {
+        "openai:responses"
+    } else {
+        "openai:chat"
+    };
     // 保留自动模型发现标志，同时让凭据绑定真实 Provider/Key 身份。
     let mut selected_key = sample_bound_key(
         "key-openai-selected",
         "provider-openai",
-        "openai:chat",
+        api_format,
         "sk-test",
     );
     selected_key.auto_fetch_models = true;
+    let mut endpoints = vec![StoredProviderCatalogEndpoint::new(
+        "endpoint-openai-chat".to_string(),
+        "provider-openai".to_string(),
+        api_format.to_string(),
+        Some("chat".to_string()),
+        Some("primary".to_string()),
+        true,
+    )
+    .expect("endpoint should build")
+    .with_transport_fields(
+        "https://api.openai.example/v1".to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("endpoint transport should build")];
+    if codex {
+        // 旧式 data 列表只证明抓取端点，强刷不能凭端点存在扩展原生 Search 能力。
+        endpoints.push(sample_endpoint(
+            "endpoint-codex-search",
+            "provider-openai",
+            "openai:search",
+            "https://api.openai.example/v1",
+        ));
+    }
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
-        vec![StoredProviderCatalogEndpoint::new(
-            "endpoint-openai-chat".to_string(),
-            "provider-openai".to_string(),
-            "openai:chat".to_string(),
-            Some("chat".to_string()),
-            Some("primary".to_string()),
-            true,
-        )
-        .expect("endpoint should build")
-        .with_transport_fields(
-            "https://api.openai.example/v1".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("endpoint transport should build")],
+        endpoints,
         vec![selected_key],
     ));
     let global_model_repository = Arc::new(
@@ -284,7 +323,7 @@ async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_select
         json!("LLM-Research/Llama-4-Maverick-17B-128E-Instruct")
     );
     assert_eq!(models[0]["owned_by"], json!("system"));
-    assert_eq!(models[0]["api_formats"], json!(["openai:chat"]));
+    assert_eq!(models[0]["api_formats"], json!([api_format]));
     assert_eq!(
         *execution_runtime_hits.lock().expect("mutex should lock"),
         1
@@ -914,6 +953,41 @@ async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_
     execution_runtime_handle.abort();
 }
 
+/// 图片目录补全必须有管理员启用的真实模型及准确绑定，运行态旧不可用标记不影响恢复。
+fn codex_image_query_repository(
+    provider_id: &str,
+    model_name: &str,
+) -> Arc<InMemoryGlobalModelReadRepository> {
+    let mut image = sample_admin_provider_model(
+        "model-codex-image",
+        provider_id,
+        "global-codex-image",
+        model_name,
+    );
+    image.provider_model_mappings = None;
+    image.supports_image_generation = None;
+    image.is_available = false;
+    Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "global-codex-image",
+                model_name,
+                model_name,
+            )])
+            .with_admin_provider_models(vec![image])
+            .with_model_endpoint_bindings([StoredModelEndpointBinding::new(
+                "model-codex-image".to_string(),
+                "endpoint-codex-image".to_string(),
+                "manual".to_string(),
+                true,
+                None,
+                None,
+            )
+            .expect("configured image binding")])
+            .with_endpoint_provider_ids([("endpoint-codex-image", provider_id)]),
+    )
+}
+
 #[test]
 fn gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models() {
     run_provider_query_test(
@@ -979,6 +1053,18 @@ async fn gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models_i
                 "openai:image",
                 "https://chatgpt.com/backend-api/codex",
             ),
+            sample_endpoint(
+                "endpoint-codex-search",
+                "provider-codex-image",
+                "openai:search",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+            sample_endpoint(
+                "endpoint-codex-compact",
+                "provider-codex-image",
+                "openai:responses:compact",
+                "https://chatgpt.com/backend-api/codex",
+            ),
         ],
         vec![{
             let mut key = sample_bound_key(
@@ -988,19 +1074,27 @@ async fn gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models_i
                 "codex-image-token",
             );
             key.api_formats = Some(json!(["openai:responses", "openai:image"]));
+            key.auto_fetch_models = false;
+            key.allowed_models = Some(json!(["gpt-5.5"]));
             key
         }],
     ));
 
     let state = build_state_with_execution_runtime_override(execution_runtime_url)
-        .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
-            provider_catalog_repository,
-            DEVELOPMENT_ENCRYPTION_KEY.to_string(),
-        ));
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_transport_reader_for_tests(
+                provider_catalog_repository.clone(),
+                DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+            )
+            .with_global_model_repository_for_tests(codex_image_query_repository(
+                "provider-codex-image",
+                "gpt-image-next-release",
+            )),
+        );
     let gateway = build_router_with_state(state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    // 管理端指定 Key 的发现结果必须补全 gpt-image-2。
+    // 管理端指定 Key 的发现结果必须补全 gpt-image-next-release。
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/api/admin/provider-query/models"))
         .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
@@ -1023,11 +1117,26 @@ async fn gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models_i
         .iter()
         .find(|model| model["id"] == "gpt-5.5")
         .expect("upstream text model should remain");
-    assert_eq!(text_model["api_formats"], json!(["openai:responses"]));
+    assert_eq!(
+        text_model["api_formats"],
+        json!([
+            "openai:responses",
+            "openai:responses:compact",
+            "openai:search"
+        ])
+    );
+    assert_eq!(
+        text_model["endpoint_ids"],
+        json!([
+            "endpoint-codex-compact",
+            "endpoint-codex-responses",
+            "endpoint-codex-search"
+        ])
+    );
     let image_model = models
         .iter()
-        .find(|model| model["id"] == "gpt-image-2")
-        .expect("gpt-image-2 should be supplemented");
+        .find(|model| model["id"] == "gpt-image-next-release")
+        .expect("gpt-image-next-release should be supplemented");
     assert_eq!(image_model["api_formats"], json!(["openai:image"]));
     assert_eq!(image_model["supports_image_generation"], json!(true));
     assert_eq!(image_model["endpoint_ids"], json!(["endpoint-codex-image"]));
@@ -1036,7 +1145,7 @@ async fn gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models_i
         json!(true)
     );
 
-    // 上游原生目录与共享版本化缓存必须保持原样：不包含 gpt-image-2。
+    // 上游原生目录与共享版本化缓存必须保持原样：不包含 gpt-image-next-release。
     let codex_catalog = crate::model_fetch::read_codex_management_catalog(
         &state,
         "provider-codex-image",
@@ -1052,11 +1161,11 @@ async fn gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models_i
     assert!(
         catalog_models
             .iter()
-            .all(|model| model.get("id") != Some(&json!("gpt-image-2"))),
+            .all(|model| model.get("id") != Some(&json!("gpt-image-next-release"))),
         "native codex catalog must stay untouched by the supplement"
     );
 
-    // 管理端不带 Key 的默认聚合查询必须同样看到 gpt-image-2。
+    // 管理端不带 Key 的默认聚合查询必须同样看到 gpt-image-next-release。
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/api/admin/provider-query/models"))
         .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
@@ -1075,10 +1184,19 @@ async fn gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models_i
     assert_eq!(payload["success"], json!(true));
     let models = payload["data"]["models"].as_array().expect("models array");
     assert_eq!(models.len(), 2);
+    let cached_text_model = models
+        .iter()
+        .find(|model| model["id"] == "gpt-5.5")
+        .expect("cached native card remains");
+    assert_eq!(cached_text_model["api_formats"], text_model["api_formats"]);
+    assert_eq!(
+        cached_text_model["endpoint_ids"],
+        text_model["endpoint_ids"]
+    );
     let image_model = models
         .iter()
-        .find(|model| model["id"] == "gpt-image-2")
-        .expect("aggregate query should also see gpt-image-2");
+        .find(|model| model["id"] == "gpt-image-next-release")
+        .expect("aggregate query should also see gpt-image-next-release");
     assert_eq!(image_model["api_formats"], json!(["openai:image"]));
     assert_eq!(image_model["endpoint_ids"], json!(["endpoint-codex-image"]));
 
@@ -1086,6 +1204,14 @@ async fn gateway_supplements_codex_gpt_image_2_for_admin_provider_query_models_i
     assert_eq!(
         *execution_runtime_hits.lock().expect("mutex should lock"),
         1
+    );
+    assert_eq!(
+        provider_catalog_repository
+            .list_keys_by_ids(&["key-codex-image".to_string()])
+            .await
+            .expect("manual key should load")[0]
+            .allowed_models,
+        Some(json!(["gpt-5.5"]))
     );
 
     gateway_handle.abort();
@@ -1161,10 +1287,15 @@ async fn gateway_skips_codex_gpt_image_2_supplement_when_key_disallows_image_for
 
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(execution_runtime_url)
-            .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
-                provider_catalog_repository,
-                DEVELOPMENT_ENCRYPTION_KEY.to_string(),
-            )),
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_transport_reader_for_tests(
+                    provider_catalog_repository,
+                    DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+                )
+                .with_global_model_repository_for_tests(
+                    codex_image_query_repository("provider-codex-text", "gpt-image-2"),
+                ),
+            ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -1246,10 +1377,16 @@ async fn gateway_supplements_codex_gpt_image_2_from_preset_without_fetch_endpoin
     ));
 
     let state = build_state_with_execution_runtime_override(execution_runtime_url)
-        .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
-            provider_catalog_repository,
-            DEVELOPMENT_ENCRYPTION_KEY.to_string(),
-        ));
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_transport_reader_for_tests(
+                provider_catalog_repository,
+                DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+            )
+            .with_global_model_repository_for_tests(codex_image_query_repository(
+                "provider-codex-preset",
+                "gpt-image-2",
+            )),
+        );
     let gateway = build_router_with_state(state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -1380,10 +1517,15 @@ async fn gateway_supplements_codex_gpt_image_2_into_preset_error_fallback_impl()
 
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(execution_runtime_url)
-            .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
-                provider_catalog_repository,
-                DEVELOPMENT_ENCRYPTION_KEY.to_string(),
-            )),
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_transport_reader_for_tests(
+                    provider_catalog_repository,
+                    DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+                )
+                .with_global_model_repository_for_tests(
+                    codex_image_query_repository("provider-codex-fallback", "gpt-image-2"),
+                ),
+            ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 

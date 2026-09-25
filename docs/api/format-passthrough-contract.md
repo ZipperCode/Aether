@@ -99,16 +99,23 @@ Current pure entrypoints:
 
 `convert_request` and `convert_response` remain legacy wrappers for existing callers that still need mapped model/report-context behavior during migration.
 
-## Codex OAuth 图片模型与调度
+## Codex OAuth 套餐、模型与 Endpoint
 
-Codex 文本 `/models` 目录不返回 `gpt-image-2`，不代表账户没有生图能力。Aether 在管理用发现结果中补全本地已支持的图片模型，不修改原生 Codex 模型卡或版本化目录。
+Codex 文本 `/models` 目录不是完整图片目录。Aether 从该提供商已启用的图片模型配置、真实图片 Endpoint 绑定及图片能力补全管理发现结果，不修改原生 Codex 模型卡或版本化目录。默认 `gpt-image-2` 只处理请求省略型号的情况，不再代表完整支持列表。
 
-- 提供商类型为 `codex`，启用 `openai:image` Endpoint；默认 base URL 为 `https://chatgpt.com/backend-api/codex`，不要填入完整的 `/images/generations` 地址。
-- 全局模型与提供商模型使用 `gpt-image-2`，启用生图能力，绑定 `openai:image` Endpoint，不要把图片模型映射为文本模型。
-- Key 的 API 格式显式列表若非空，必须包含 `openai:image`；空列表沿用发现层的继承语义。停用的图片端点不产生补全能力。
-- 启用自动模型获取的旧 Key，执行一次强制刷新模型或等待自动刷新：补全 ID 先经过原有 include/exclude/locked 规则，再写入 `allowed_models` 并重新协调提供商模型可用性。显式排除 `gpt-image-*` 仍会阻止调度。
-- 关闭自动获取、手工维护白名单的 Key，需自行允许 `gpt-image-2`；仅查看发现列表不会改写该白名单。
+- 启用 `openai:image` Endpoint，默认 base URL 为 `https://chatgpt.com/backend-api/codex`；配置真实图片型号及其生图能力和图片绑定。后续同协议的新型号只需配置并刷新，保留真实上游名称，不映射为文本宿主。
+- Key 的显式 API 格式权限、include/exclude/locked 规则继续生效。旧迁移将文本型号关联图片 Endpoint 的记录，不会因此自动变成图片模型。
+- 已知 Free Codex OAuth 不允许生图，返回独立原因 `codex_plan_image_generation_unsupported`。Plus、Pro、ProLite、ProMax 和未知套餐不被固定套餐名单额外排除；每个型号的实际权限和额度仍由原有规则与上游决定。官方 [图片能力判定](https://github.com/openai/codex/blob/75e0e0aad97a86138b8b1ec87d9b544b4a35ecbf/codex-rs/core/src/tools/spec_plan.rs#L727) 明确区分 Free，不能将套餐展示名称当作原始身份。
+- 启用自动模型获取的旧 Key，需要强制刷新一次或等待自动刷新，才能修复持久化白名单与 Endpoint 关联；只查看发现列表不会改写手工白名单。手工白名单仍需显式允许目标型号，显式空列表表示禁止。
 
-请求 `POST /v1/images/generations` 或 `/v1/images/edits` 仍走正常调度和原生 `/backend-api/codex/images/*` 上游，不跳过鉴权、Key 模型限制、额度或健康检查。发现能力不保证真实账户权限，上游拒绝仍按原有错误处理返回。
+| Endpoint | 发现与调用边界 |
+| --- | --- |
+| Responses | 保留原生 HTTP/SSE/WebSocket、实际模型及认证契约 |
+| Compact | 真实发现的文本型号关联已启用且 Key 允许的 Compact，调用原生 `/responses/compact` |
+| OpenAI Search | 真实发现的文本型号关联已启用且 Key 允许的 Search；使用同步 JSON `/alpha/search`，不改成 Responses 文本搜索 |
+| Images | 配置驱动的图片型号，调用原生 `/images/generations` 或 `/images/edits`，保留模型限制和套餐检查 |
+| Live | 保留显式模型绑定和 OAuth WebRTC 调用；没有专属能力证据时不从文本目录自动生成 Live 绑定，也不将普通模型测试冒充 Live 验证 |
 
-实现对照：[sub2api 的 Codex Images 直调](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/service/openai_images_direct.go) 对 `gpt-image-2` 使用相同路径；[codex-proxy 的 Responses 工具桥](https://github.com/icebear0828/codex-proxy/blob/dev/src/routes/shared/image-generation.ts) 则将文本宿主模型与图片工具分开。本次保留原生图片语义，不引入隐式 Responses 降级。
+Responses 的既有格式权限覆盖 Search/Compact，人工停用的绑定保持停用。原生卡片 `supports_search_tool` 表示工具发现，不能用它推断网页搜索权限；官方 [独立网页搜索选择](https://github.com/openai/codex/blob/75e0e0aad97a86138b8b1ec87d9b544b4a35ecbf/codex-rs/core/src/tools/spec_plan.rs#L1038) 使用 Provider 网页搜索能力和客户端功能开关。
+
+图片与 Search 仍执行认证、Key 模型限制、额度和健康检查。可路由不等于上游必定授权，429 额度耗尽也不等于型号不支持。真实上游权限变化、型号协议或参数变化须依据返回证据适配；不隐式更换协议或伪造成功。

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,10 +9,11 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use aether_model_fetch::{
     aggregate_models_for_cache, apply_model_filters, fetch_models_from_transports_for_management,
-    global_model_matches_allowed_models, json_string_list, model_catalog_upstream_metadata,
-    model_fetch_interval_minutes, model_fetch_startup_delay_seconds, model_fetch_startup_enabled,
-    preset_models_for_provider, reconcile_provider_model_whitelist_availability,
-    selected_models_fetch_endpoints_for_api_formats, supplement_codex_image_models,
+    global_model_matches_allowed_models, json_string_list, load_codex_image_models,
+    model_catalog_upstream_metadata, model_fetch_interval_minutes,
+    model_fetch_startup_delay_seconds, model_fetch_startup_enabled, preset_models_for_provider,
+    reconcile_provider_model_whitelist_availability,
+    selected_models_fetch_endpoints_for_api_formats, supplement_codex_management_models,
     sync_provider_model_discovery_associations, sync_provider_model_whitelist_associations,
     upstream_metadata_namespace_updates, ModelFetchAssociationStore, ModelFetchRunSummary,
     CODEX_IMAGE_API_FORMAT,
@@ -31,6 +33,8 @@ struct SelectedFetchTarget {
     provider: StoredProviderCatalogProvider,
     key: StoredProviderCatalogModelFetchCandidate,
     endpoints: Vec<StoredProviderCatalogEndpoint>,
+    capability_endpoints: Arc<Vec<StoredProviderCatalogEndpoint>>,
+    image_models: Arc<Vec<Value>>,
 }
 
 pub(crate) fn spawn_model_fetch_worker(state: AppState) -> Option<tokio::task::JoinHandle<()>> {
@@ -277,6 +281,13 @@ where
             .collect::<Vec<_>>();
         let keys = keys_by_provider.remove(&provider.id).unwrap_or_default();
         let provider = sanitize_model_fetch_provider(provider);
+        // 图片配置与准确绑定按 Provider 读取一次，所有 Key 共用，不读取完整 Key 列表。
+        let image_models = Arc::new(
+            load_codex_image_models(state, &provider, &endpoints)
+                .await
+                .map_err(GatewayError::Internal)?,
+        );
+        let capability_endpoints = Arc::new(endpoints);
         for key in keys {
             if key_id_filter.is_some_and(|key_ids| !key_ids.contains(&key.id)) {
                 continue;
@@ -285,13 +296,15 @@ where
                 continue;
             }
             let selected_endpoints = selected_models_fetch_endpoints_for_api_formats(
-                &endpoints,
+                &capability_endpoints,
                 key.api_formats.as_ref(),
             );
             targets.push(SelectedFetchTarget {
                 provider: provider.clone(),
                 key,
                 endpoints: selected_endpoints,
+                capability_endpoints: Arc::clone(&capability_endpoints),
+                image_models: Arc::clone(&image_models),
             });
         }
     }
@@ -483,6 +496,62 @@ async fn fetch_and_persist_key_models(
     let now_unix_secs = now_unix_secs();
     if target.endpoints.is_empty() {
         if let Some(mut models) = preset_models_for_provider(&target.provider.provider_type) {
+            let mut auth_config = None;
+            let key_formats = json_string_list(target.key.api_formats.as_ref());
+            if target
+                .provider
+                .provider_type
+                .trim()
+                .eq_ignore_ascii_case("codex")
+                && target.key.auth_type.trim().eq_ignore_ascii_case("oauth")
+                && (key_formats.is_empty()
+                    || key_formats.iter().any(|format| {
+                        crate::ai_serving::api_format_permission_covers(
+                            format,
+                            CODEX_IMAGE_API_FORMAT,
+                        )
+                    }))
+                && crate::provider_transport::provider_plan_tier_from_metadata(
+                    &target.provider.provider_type,
+                    target.key.upstream_metadata.as_ref(),
+                    None,
+                )
+                .is_none()
+            {
+                // 只有图片配置且未刷新套餐时，读取当前 Key 的一个图片传输身份；不请求上游。
+                if let Some(endpoint_id) = target
+                    .image_models
+                    .iter()
+                    .flat_map(|model| json_string_list(model.get("endpoint_ids")))
+                    .next()
+                {
+                    let transport = match state
+                        .read_provider_transport_snapshot(
+                            &target.provider.id,
+                            &endpoint_id,
+                            &target.key.id,
+                        )
+                        .await
+                    {
+                        Ok(transport) => transport,
+                        Err(error) if is_nonfatal_legacy_credential_error(&error) => {
+                            warn!(provider_id = %target.provider.id, key_id = %target.key.id,
+                                reason = "invalid_stored_credential", "Codex 图片目录跳过无效凭据");
+                            return Ok(KeyFetchOutcome::without_models(
+                                KeyFetchDisposition::Skipped,
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    auth_config = transport.and_then(|transport| {
+                        transport
+                            .key
+                            .decrypted_auth_config
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    });
+                }
+            }
             let provider_endpoints = state
                 .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(
                     &target.provider.id,
@@ -493,8 +562,7 @@ async fn fetch_and_persist_key_models(
             // 在元数据形成之后进行，避免把补全卡写回 Codex 目录元数据。
             let upstream_metadata =
                 model_catalog_upstream_metadata(&target.provider.provider_type, &models);
-            let image_endpoint_ids = codex_image_endpoint_ids(target, &provider_endpoints);
-            supplement_codex_image_models(&mut models, &image_endpoint_ids);
+            supplement_target_codex_models(target, &mut models, false, auth_config.as_ref());
             let fetched_model_ids = models
                 .iter()
                 .filter_map(|model| model.get("id"))
@@ -666,31 +734,34 @@ async fn fetch_and_persist_key_models(
             .await?;
         attach_model_endpoint_ids(&mut association_models, &provider_endpoints);
     }
-    // 上游文本目录不会返回本地直调图片模型；原始 codex_models 元数据在 strategy
-    // 内已由原生卡片生成，这里仅在兼容投影上补全 gpt-image-2 并让其参与白名单过滤。
-    let mut fetched_model_ids = result.fetched_model_ids;
-    if target
+    // 已选 transport 才解析认证套餐；轻量扫描不携带凭据，原生目录保持未补全状态。
+    let auth_config = transports.first().and_then(|transport| {
+        transport
+            .key
+            .decrypted_auth_config
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+    });
+    supplement_target_codex_models(
+        target,
+        &mut association_models,
+        result.native_codex_catalog,
+        auth_config.as_ref(),
+    );
+    let fetched_model_ids = if target
         .provider
         .provider_type
         .trim()
         .eq_ignore_ascii_case("codex")
     {
-        let provider_endpoints = state
-            .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(
-                &target.provider.id,
-            ))
-            .await?;
-        let image_endpoint_ids = codex_image_endpoint_ids(target, &provider_endpoints);
-        if supplement_codex_image_models(&mut association_models, &image_endpoint_ids)
-            && !fetched_model_ids.iter().any(|model_id| {
-                model_id
-                    .trim()
-                    .eq_ignore_ascii_case(crate::ai_serving::CODEX_OPENAI_IMAGE_DEFAULT_MODEL)
-            })
-        {
-            fetched_model_ids.push(crate::ai_serving::CODEX_OPENAI_IMAGE_DEFAULT_MODEL.to_string());
-        }
-    }
+        association_models
+            .iter()
+            .filter_map(|model| model.get("id").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        result.fetched_model_ids
+    };
     let filtered_models = apply_model_filters(
         &fetched_model_ids,
         json_string_list(target.key.locked_models.as_ref()),
@@ -758,39 +829,43 @@ fn attach_model_endpoint_ids(models: &mut [Value], endpoints: &[StoredProviderCa
     }
 }
 
-/// 计算 Codex Key 可用的本地直调图片端点：Provider 当前 active、api_format 为
-/// openai:image、且 Key.api_formats 允许该格式（未配置格式表示继承 Provider 全部
-/// active 格式，与管理端 provider_key_effective_api_formats 语义一致）的真实端点 ID。
-/// 非 Codex Provider 一律返回空，不做任何扩权。
-fn codex_image_endpoint_ids(
+/// 后台发现与管理查询共用能力投影，套餐判断不替代原有过滤或额度准入。
+fn supplement_target_codex_models(
     target: &SelectedFetchTarget,
-    provider_endpoints: &[StoredProviderCatalogEndpoint],
-) -> Vec<String> {
+    models: &mut Vec<Value>,
+    native_catalog: bool,
+    auth_config: Option<&Value>,
+) {
     if !target
         .provider
         .provider_type
         .trim()
         .eq_ignore_ascii_case("codex")
     {
-        return Vec::new();
+        return;
     }
-    let key_formats = json_string_list(target.key.api_formats.as_ref())
-        .into_iter()
-        .map(|format| crate::ai_serving::normalize_api_format_alias(&format))
-        .filter(|format| !format.is_empty())
-        .collect::<BTreeSet<_>>();
-    if !key_formats.is_empty() && !key_formats.contains(CODEX_IMAGE_API_FORMAT) {
-        return Vec::new();
+    let reason = crate::provider_transport::codex_oauth_capability_skip_reason(
+        &target.provider.provider_type,
+        &target.key.auth_type,
+        CODEX_IMAGE_API_FORMAT,
+        target.key.upstream_metadata.as_ref(),
+        auth_config,
+    );
+    if let Some(reason) = reason {
+        debug!(provider_id = %target.provider.id, key_id = %target.key.id, reason,
+            "Codex 图片发现受套餐限制");
     }
-    provider_endpoints
-        .iter()
-        .filter(|endpoint| endpoint.is_active)
-        .filter(|endpoint| {
-            crate::ai_serving::normalize_api_format_alias(&endpoint.api_format)
-                == CODEX_IMAGE_API_FORMAT
-        })
-        .map(|endpoint| endpoint.id.clone())
-        .collect()
+    supplement_codex_management_models(
+        models,
+        &target.capability_endpoints,
+        target.key.api_formats.as_ref(),
+        if reason.is_none() {
+            target.image_models.as_slice()
+        } else {
+            &[]
+        },
+        native_catalog,
+    );
 }
 
 async fn persist_key_fetch_failure(
@@ -1019,6 +1094,7 @@ mod tests {
         executed_plans: Arc<Mutex<Vec<ExecutionPlan>>>,
         cached_models: Arc<Mutex<HashMap<(String, String), Vec<Value>>>>,
         provider_models: Arc<Mutex<Vec<StoredAdminProviderModel>>>,
+        model_bindings: Arc<Vec<StoredModelEndpointBinding>>,
         binding_syncs: Arc<Mutex<Vec<(String, Vec<String>, bool, Vec<String>)>>>,
         upstream_metadata_updates: Arc<Mutex<Vec<(String, String, Value, Option<u64>)>>>,
         /// 记录测试仓储按 Provider 读取模型抓取轻量投影的参数，用于约束收集与批末重读次数。
@@ -1044,6 +1120,7 @@ mod tests {
                 executed_plans: Arc::new(Mutex::new(Vec::new())),
                 cached_models: Arc::new(Mutex::new(HashMap::new())),
                 provider_models: Arc::new(Mutex::new(Vec::new())),
+                model_bindings: Arc::new(Vec::new()),
                 binding_syncs: Arc::new(Mutex::new(Vec::new())),
                 upstream_metadata_updates: Arc::new(Mutex::new(Vec::new())),
                 model_fetch_candidate_queries: Arc::new(Mutex::new(Vec::new())),
@@ -1052,6 +1129,11 @@ mod tests {
 
         fn with_provider_models(self, models: Vec<StoredAdminProviderModel>) -> Self {
             *self.provider_models.lock().expect("provider models mutex") = models;
+            self
+        }
+
+        fn with_model_bindings(mut self, bindings: Vec<StoredModelEndpointBinding>) -> Self {
+            self.model_bindings = Arc::new(bindings);
             self
         }
 
@@ -1158,6 +1240,18 @@ mod tests {
                 items: Vec::new(),
                 total: 0,
             })
+        }
+
+        async fn list_model_endpoint_bindings(
+            &self,
+            model_ids: &[String],
+        ) -> Result<Vec<StoredModelEndpointBinding>, Self::Error> {
+            Ok(self
+                .model_bindings
+                .iter()
+                .filter(|binding| model_ids.contains(&binding.model_id))
+                .cloned()
+                .collect())
         }
 
         async fn create_admin_provider_model_with_bindings(
@@ -1916,7 +2010,16 @@ mod tests {
             "provider-model-image",
             "provider-codex",
             "gpt-image-2",
-        )]);
+        )])
+        .with_model_bindings(vec![StoredModelEndpointBinding::new(
+            "provider-model-image".to_string(),
+            "endpoint-codex-image".to_string(),
+            "discovered".to_string(),
+            true,
+            None,
+            None,
+        )
+        .expect("image binding should build")]);
 
         let summary = perform_model_fetch_once_with_state(&state)
             .await
@@ -1979,6 +2082,114 @@ mod tests {
         assert!(image_model_syncs.iter().all(
             |(_, endpoint_ids, _, _)| endpoint_ids == &vec!["endpoint-codex-image".to_string()]
         ));
+    }
+
+    #[tokio::test]
+    async fn codex_discovery_checks_oauth_plan_for_native_and_preset_catalogs() {
+        for preset in [false, true] {
+            for (auth_type, plan, auth_plan, expected_image) in [
+                ("oauth", Some("free"), None, false),
+                ("oauth", Some("plus"), None, true),
+                ("oauth", Some("pro"), None, true),
+                ("oauth", Some("future-plan"), None, true),
+                ("oauth", None, None, true),
+                ("oauth", None, Some("free"), false),
+                ("api_key", Some("free"), None, true),
+            ] {
+                let provider = sample_provider("provider-codex", "codex");
+                let mut endpoints =
+                    vec![sample_endpoint("image", "provider-codex", "openai:image")];
+                let mut key = sample_key(
+                    "key-codex",
+                    "provider-codex",
+                    auth_type,
+                    &["openai:responses", "openai:image"],
+                );
+                key.upstream_metadata = plan.map(|plan| json!({"codex": {"plan_type": plan}}));
+                let auth_config = auth_plan.map(|plan| json!({"plan_type": plan}).to_string());
+                let mut transports = HashMap::new();
+                let mut results = Vec::new();
+                if !preset {
+                    endpoints.push(sample_endpoint(
+                        "responses",
+                        "provider-codex",
+                        "openai:responses",
+                    ));
+                    transports.insert(
+                        (
+                            "provider-codex".to_string(),
+                            "responses".to_string(),
+                            "key-codex".to_string(),
+                        ),
+                        sample_transport(
+                            "codex",
+                            "provider-codex",
+                            "responses",
+                            "key-codex",
+                            "openai:responses",
+                            auth_type,
+                            auth_config.as_deref(),
+                        ),
+                    );
+                    results.push(execution_result(json!({"models": [{"slug": "gpt-next"}]})));
+                } else if auth_plan.is_some() {
+                    transports.insert(
+                        (
+                            "provider-codex".to_string(),
+                            "image".to_string(),
+                            "key-codex".to_string(),
+                        ),
+                        sample_transport(
+                            "codex",
+                            "provider-codex",
+                            "image",
+                            "key-codex",
+                            "openai:image",
+                            auth_type,
+                            auth_config.as_deref(),
+                        ),
+                    );
+                }
+                let state =
+                    TestState::new(vec![provider], endpoints, vec![key], transports, results)
+                        .with_provider_models(vec![sample_provider_model(
+                            "image-model",
+                            "provider-codex",
+                            "gpt-image-future",
+                        )])
+                        .with_model_bindings(vec![StoredModelEndpointBinding::new(
+                            "image-model".to_string(),
+                            "image".to_string(),
+                            "manual".to_string(),
+                            true,
+                            None,
+                            None,
+                        )
+                        .expect("configured image binding")]);
+                let summary = perform_model_fetch_once_with_state(&state)
+                    .await
+                    .expect("catalog refresh should succeed");
+                assert_eq!(summary.succeeded, 1);
+                let updated = state.key("key-codex");
+                assert_eq!(
+                    aether_model_fetch::json_string_list(updated.allowed_models.as_ref())
+                        .contains(&"gpt-image-future".to_string()),
+                    expected_image,
+                    "preset={preset} auth_type={auth_type} plan={plan:?} auth_plan={auth_plan:?}"
+                );
+                if preset {
+                    assert!(state.executed_plans.lock().expect("plans mutex").is_empty());
+                }
+                let cache = state.cached_models.lock().expect("cache mutex");
+                let cards = cache
+                    .get(&("provider-codex".to_string(), "key-codex".to_string()))
+                    .expect("legacy cards");
+                assert_eq!(
+                    cards.iter().any(|card| card["id"] == "gpt-image-future"),
+                    expected_image
+                );
+            }
+        }
     }
 
     #[tokio::test]

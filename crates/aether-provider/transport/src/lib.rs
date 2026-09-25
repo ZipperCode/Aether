@@ -4,6 +4,7 @@ pub mod antigravity;
 pub mod auth;
 mod auth_config;
 mod cache;
+mod capabilities;
 pub mod claude_code;
 mod codex_fingerprint;
 pub mod conversion;
@@ -58,6 +59,10 @@ pub use anthropic_compat::{
 pub use auth::{build_passthrough_headers, ensure_upstream_auth_header};
 pub use auth_config::apply_local_auth_config_header_overrides;
 pub use cache::{provider_transport_snapshot_looks_refreshed, ProviderTransportSnapshotCacheKey};
+pub use capabilities::{
+    codex_oauth_capability_skip_reason, codex_oauth_transport_capability_skip_reason,
+    normalize_provider_plan_tier, provider_plan_tier_from_fields, provider_plan_tier_from_metadata,
+};
 pub use codex_fingerprint::{
     apply_codex_fingerprint_convergence, apply_codex_fingerprint_convergence_with_context,
     codex_fingerprint_convergence_enabled, CodexFingerprintConvergenceContext,

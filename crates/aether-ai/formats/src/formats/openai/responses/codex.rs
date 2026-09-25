@@ -839,17 +839,6 @@ fn remove_btree_header(headers: &mut BTreeMap<String, String>, header_name: &str
     headers.retain(|name, _| !name.trim().eq_ignore_ascii_case(header_name));
 }
 
-/// 在逗号分隔且可带参数的媒体范围中精确匹配目标类型。
-fn header_value_contains_media_type(value: &str, media_type: &str) -> bool {
-    value.split(',').any(|media_range| {
-        media_range
-            .split(';')
-            .next()
-            .map(str::trim)
-            .is_some_and(|value| value.eq_ignore_ascii_case(media_type))
-    })
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 /// 从 Codex 凭据配置解析出的非敏感账号身份投影，供 OAuth 与传输指纹复用。
 pub struct CodexAuthIdentity {
@@ -2164,14 +2153,23 @@ pub fn apply_codex_openai_special_headers(
         CODEX_CLIENT_ORIGINATOR,
     );
     if endpoint_kind == CodexOpenAiEndpointKind::Search {
-        remove_btree_header(provider_request_headers, CODEX_RESPONSES_LITE_HEADER);
-        remove_btree_header(provider_request_headers, "openai-beta");
-        if provider_request_headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("accept")
-                && header_value_contains_media_type(value, "text/event-stream")
-        }) {
-            remove_btree_header(provider_request_headers, "accept");
+        // Alpha Search 使用独立同步 JSON 协议；规则覆盖后也不能携带 Responses 会话状态。
+        for header in [
+            CODEX_RESPONSES_LITE_HEADER,
+            "openai-beta",
+            "session_id",
+            "session-id",
+            "conversation_id",
+            "conversation-id",
+            "x-codex-beta-features",
+            "x-codex-turn-state",
+            "content-type",
+            "accept",
+        ] {
+            remove_btree_header(provider_request_headers, header);
         }
+        provider_request_headers.insert("content-type".to_string(), "application/json".to_string());
+        provider_request_headers.insert("accept".to_string(), "application/json".to_string());
         return;
     }
     if matches!(
@@ -3068,6 +3066,23 @@ mod tests {
                 "true".to_string(),
             ),
             ("openai-beta".to_string(), "responses=v1".to_string()),
+            ("Session_ID".to_string(), "responses-session".to_string()),
+            (
+                "conversation-id".to_string(),
+                "responses-conversation".to_string(),
+            ),
+            (
+                "x-codex-beta-features".to_string(),
+                "responses_websockets".to_string(),
+            ),
+            (
+                "x-codex-turn-state".to_string(),
+                "responses-state".to_string(),
+            ),
+            (
+                "x-codex-turn-metadata".to_string(),
+                "search-turn".to_string(),
+            ),
             (
                 "accept".to_string(),
                 "application/json, Text/Event-Stream; q=0.9".to_string(),
@@ -3102,7 +3117,22 @@ mod tests {
         );
         assert!(!headers.contains_key(CODEX_RESPONSES_LITE_HEADER));
         assert!(!headers.contains_key("openai-beta"));
-        assert!(!headers.contains_key("accept"));
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            headers.get("x-codex-turn-metadata").map(String::as_str),
+            Some("search-turn")
+        );
+        for header in [
+            "Session_ID",
+            "conversation-id",
+            "x-codex-beta-features",
+            "x-codex-turn-state",
+        ] {
+            assert!(!headers.contains_key(header), "{header}");
+        }
     }
 
     #[test]

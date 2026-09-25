@@ -17,7 +17,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
 | [Database Guidelines](./database-guidelines.md) | ORM patterns, queries, migrations | To fill |
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
-| [Quality Guidelines](./quality-guidelines.md) | Codex 图片能力投影、白名单过滤与原生目录隔离 | Current |
+| [Quality Guidelines](./quality-guidelines.md) | Codex 动态图片、Search/Compact 投影、套餐准入与原生目录隔离 | Current |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Authentication Maintenance Memory](../../aether-gateway/backend/auth-maintenance-memory-contract.md) | Compact model-fetch Key projection and once-per-Provider reconciliation contract | Current |
 

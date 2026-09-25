@@ -1152,7 +1152,8 @@ fn provider_query_key_allows_effective_test_model(
     effective_model: &str,
 ) -> bool {
     let allowed_models = json_string_list(key.allowed_models.as_ref());
-    if key.allowed_models.is_none() || allowed_models.is_empty() {
+    // 显式空白名单与正式调度一致：没有任何允许模型；只有 None 才继承权限。
+    if key.allowed_models.is_none() {
         return true;
     }
 
@@ -2303,6 +2304,20 @@ async fn provider_query_execute_openai_image_test_candidate(
             "Provider transport snapshot is unavailable",
         ));
     };
+
+    // 管理测试沿用正式候选的套餐判断，在认证刷新和图片请求前给出稳定原因。
+    if let Some(reason) =
+        crate::provider_transport::codex_oauth_transport_capability_skip_reason(&transport)
+    {
+        return Ok(provider_query_skipped_execution_outcome(
+            provider_query_build_openai_image_test_request_body_for_route(
+                payload,
+                &candidate.effective_model,
+                route_path,
+            ),
+            reason,
+        ));
+    }
 
     if let Some(reason) = crate::provider_transport::openai_image_transport_unsupported_reason(
         &transport,

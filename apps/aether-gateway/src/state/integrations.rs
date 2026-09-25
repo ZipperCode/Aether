@@ -560,6 +560,16 @@ impl ModelFetchAssociationStore for AppState {
             .map_err(|err| format!("{err:?}"))
     }
 
+    /// 图片发现复用现有绑定读取，不扩大 Key 维护投影。
+    async fn list_model_endpoint_bindings(
+        &self,
+        model_ids: &[String],
+    ) -> Result<Vec<StoredModelEndpointBinding>, Self::Error> {
+        AppState::list_model_endpoint_bindings(self, model_ids)
+            .await
+            .map_err(|err| format!("{err:?}"))
+    }
+
     async fn list_admin_global_models(
         &self,
         query: &AdminGlobalModelListQuery,

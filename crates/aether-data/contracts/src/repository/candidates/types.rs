@@ -28,6 +28,7 @@ define_candidate_diagnostic_categories!(
         "auth_api_key_concurrency_limit_reached",
         "auth_channel_mismatch",
         "auth_snapshot_missing",
+        "codex_plan_image_generation_unsupported",
         "endpoint_api_format_changed",
         "endpoint_inactive",
         "format_conversion_disabled",
@@ -2575,6 +2576,7 @@ mod tests {
     fn scheduling_skip_reasons_survive_persistence_and_count_projection() {
         // 固定调度原因及其次数必须保留，避免额度停用、低余额与读取失败被合并为未知原因。
         for reason in [
+            "codex_plan_image_generation_unsupported",
             "key_quota_exhausted",
             "key_balance_below_minimum",
             "pool_key_quota_exhausted",

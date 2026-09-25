@@ -15,6 +15,7 @@ describe('candidate skip reason formatting', () => {
     expect(formatCandidateSkipReason('key_circuit_open')).toBe('密钥熔断中（连续失败后暂停）')
     expect(formatCandidateSkipReason('pool_key_quota_exhausted')).toContain('需管理员手动恢复')
     expect(formatCandidateSkipReason('pool_key_state_unavailable')).toBe('无法读取号池密钥状态')
+    expect(formatCandidateSkipReason('codex_plan_image_generation_unsupported')).toBe('Codex Free 套餐不支持图片生成')
     expect(formatCandidateSkipReason(UNCLASSIFIED_CANDIDATE_SKIP_REASON)).toBe('未归类的调度原因')
   })
 
@@ -39,6 +40,7 @@ describe('candidate skip reason formatting', () => {
       'account_quota_exhausted',
       'api_key_concurrency_limit_reached',
       'auth_api_key_concurrency_limit_reached',
+      'codex_plan_image_generation_unsupported',
       'key_circuit_open',
       'key_health_score_zero',
       'key_rpm_exhausted',

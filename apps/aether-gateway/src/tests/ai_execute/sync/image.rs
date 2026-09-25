@@ -1162,15 +1162,30 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
 fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_local_upstream() {
     run_image_sync_test(
         "gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_local_upstream",
-        gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_local_upstream_impl,
+        || async {
+            // 同一真实 HTTP 链覆盖套餐、号池实际 Key 与非固定图片型号。
+            for (plan, pooled) in [
+                (None, false),
+                (Some("free"), false),
+                (Some("free"), true),
+                (Some("plus"), true),
+                (Some("pro"), false),
+                (Some("prolite"), true),
+            ] {
+                gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_local_upstream_impl(plan, pooled).await;
+            }
+        },
     );
 }
 
 // 与 runtime stub 版本不同：本测试不给执行 runtime 传 override 地址（空字符串会被
 // 过滤为 None），网关以进程内直连执行器对下方本机真实 HTTP 图片上游发起请求。
 // Key.allowed_models 采用发现刷新补全后的持久化状态：发现列表原本仅文本模型
-// gpt-5.4-mini，补全后包含 gpt-image-2，请求必须穿过该真实模型准入门。
-async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_local_upstream_impl() {
+// gpt-5.4-mini，补全后包含 gpt-image-future-test，请求必须穿过该真实模型准入门。
+async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_local_upstream_impl(
+    plan: Option<&str>,
+    pooled: bool,
+) {
     #[derive(Debug, Clone)]
     struct SeenUpstreamImageRequest {
         method: String,
@@ -1205,7 +1220,7 @@ async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_loc
             false,
             Some(serde_json::json!(["openai", "codex"])),
             Some(serde_json::json!(["openai:image"])),
-            Some(serde_json::json!(["gpt-image-2"])),
+            Some(serde_json::json!(["gpt-image-future-test"])),
             api_key_id.to_string(),
             Some("default".to_string()),
             true,
@@ -1216,7 +1231,7 @@ async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_loc
             Some(4_102_444_800_i64),
             Some(serde_json::json!(["openai", "codex"])),
             Some(serde_json::json!(["openai:image"])),
-            Some(serde_json::json!(["gpt-image-2"])),
+            Some(serde_json::json!(["gpt-image-future-test"])),
         )
         .expect("auth snapshot should build")
     }
@@ -1238,20 +1253,23 @@ async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_loc
             key_auth_type: "oauth".to_string(),
             key_is_active: true,
             key_api_formats: Some(vec!["openai:image".to_string()]),
-            // 刷新补全后的持久化白名单：文本模型保留，gpt-image-2 被补进。
-            key_allowed_models: Some(vec!["gpt-5.4-mini".to_string(), "gpt-image-2".to_string()]),
+            // 刷新补全后的持久化白名单：文本模型保留，gpt-image-future-test 被补进。
+            key_allowed_models: Some(vec![
+                "gpt-5.4-mini".to_string(),
+                "gpt-image-future-test".to_string(),
+            ]),
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:image": 1})),
             routing_facts: Default::default(),
             model_id: "model-codex-image-allowlist-local-1".to_string(),
             global_model_id: "global-model-codex-image-allowlist-local-1".to_string(),
-            global_model_name: "gpt-image-2".to_string(),
+            global_model_name: "gpt-image-future-test".to_string(),
             global_model_mappings: None,
             global_model_supports_streaming: Some(true),
-            model_provider_model_name: "gpt-image-2".to_string(),
+            model_provider_model_name: "gpt-image-future-test".to_string(),
             model_provider_model_mappings: Some(vec![StoredProviderModelMapping {
-                name: "gpt-image-2".to_string(),
+                name: "gpt-image-future-test".to_string(),
                 priority: 1,
                 api_formats: Some(vec!["openai:image".to_string()]),
                 endpoint_ids: None,
@@ -1330,7 +1348,7 @@ async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_loc
             None,
             Some(serde_json::json!({"openai:image": 1})),
             // 持久化在 Key 上的同一份白名单，供执行期 transport 快照读取。
-            Some(serde_json::json!(["gpt-5.4-mini", "gpt-image-2"])),
+            Some(serde_json::json!(["gpt-5.4-mini", "gpt-image-future-test"])),
             None,
             None,
             None,
@@ -1438,18 +1456,40 @@ async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_loc
             "user-codex-image-allowlist-client-123",
         ),
     )]));
+    let row = sample_candidate_row();
+    let mut rows = vec![row.clone()];
+    if pooled && plan != Some("free") {
+        // 首个逻辑号池代表为 Free，必须在展开后跳过它，而不能封掉整个号池。
+        let mut free_row = row;
+        free_row.key_id.push_str("-free");
+        free_row.key_internal_priority = 0;
+        rows.insert(0, free_row);
+    }
     let candidate_selection_repository =
-        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
-            sample_candidate_row(),
-        ]));
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows));
 
     let (refresh_url, refresh_handle) = start_server(refresh).await;
     let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let mut provider = sample_provider_catalog_provider();
+    if pooled {
+        provider.config = Some(json!({"pool_advanced": {}}));
+    }
+    let mut key = sample_provider_catalog_key();
+    key.upstream_metadata = plan.map(|plan| json!({"codex": {"plan_type": plan}}));
+    let mut keys = vec![key.clone()];
+    if pooled && plan != Some("free") {
+        let mut free_key = key;
+        free_key.id.push_str("-free");
+        free_key.internal_priority = 0;
+        free_key.upstream_metadata = Some(json!({"codex": {"plan_type": "free"}}));
+        keys.insert(0, free_key);
+    }
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider_catalog_provider()],
+        vec![provider],
         vec![sample_provider_catalog_endpoint(&upstream_url)],
-        vec![sample_provider_catalog_key()],
+        keys,
     ));
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::default());
 
     let oauth_refresh =
         crate::provider_transport::LocalOAuthRefreshCoordinator::with_adapters_for_tests(vec![
@@ -1465,7 +1505,7 @@ async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_loc
                 auth_repository,
                 candidate_selection_repository,
                 provider_catalog_repository.clone(),
-                Arc::new(InMemoryRequestCandidateRepository::default()),
+                request_candidates.clone(),
                 DEVELOPMENT_ENCRYPTION_KEY,
             ),
         )
@@ -1481,10 +1521,32 @@ async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_loc
             format!("Bearer {client_api_key}"),
         )
         .header(TRACE_ID_HEADER, "trace-codex-image-allowlist-local-123")
-        .body("{\"model\":\"gpt-image-2\",\"prompt\":\"生成一张水墨视觉海报\",\"background\":\"auto\",\"quality\":\"high\",\"size\":\"1024x1024\",\"n\":1,\"response_format\":\"b64_json\"}")
+        .body("{\"model\":\"gpt-image-future-test\",\"prompt\":\"生成一张水墨视觉海报\",\"background\":\"auto\",\"quality\":\"high\",\"size\":\"1024x1024\",\"n\":1,\"response_format\":\"b64_json\"}")
         .send()
         .await
         .expect("request should succeed");
+
+    if plan == Some("free") {
+        let status = response.status();
+        let body = response.text().await.expect("rejection body");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
+        let candidates = request_candidates
+            .list_by_request_id("trace-codex-image-allowlist-local-123")
+            .await
+            .expect("candidate diagnostics");
+        let diagnostics = format!("{candidates:?}");
+        assert!(
+            diagnostics.contains("codex_plan_image_generation_unsupported"),
+            "{diagnostics}"
+        );
+        assert_eq!(*upstream_hits.lock().expect("hits"), 0);
+        assert_eq!(*refresh_hits.lock().expect("refresh hits"), 0);
+        gateway_handle.abort();
+        upstream_handle.abort();
+        refresh_handle.abort();
+        return;
+    }
 
     assert_eq!(response.status(), StatusCode::OK);
     let response_json: serde_json::Value = response.json().await.expect("body should parse");
@@ -1542,7 +1604,7 @@ async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_loc
         json!({
             "prompt": "生成一张水墨视觉海报",
             "background": "auto",
-            "model": "gpt-image-2",
+            "model": "gpt-image-future-test",
             "n": 1,
             "quality": "high",
             "size": "1024x1024"
@@ -1571,7 +1633,10 @@ async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_loc
     // 持久化白名单真实进入执行期 transport 快照，而不只是候选行或计划里的字符串。
     assert_eq!(
         persisted_transport.key.allowed_models,
-        Some(vec!["gpt-5.4-mini".to_string(), "gpt-image-2".to_string(),])
+        Some(vec![
+            "gpt-5.4-mini".to_string(),
+            "gpt-image-future-test".to_string(),
+        ])
     );
 
     gateway_handle.abort();

@@ -868,6 +868,8 @@ pub struct StoredProviderCatalogModelFetchCandidate {
     pub id: String,
     /// Key 所属 Provider 的稳定标识，用于按 Provider 分组与批末去重核对。
     pub provider_id: String,
+    /// 套餐能力仅适用于 OAuth；认证类型标识不包含认证材料。
+    pub auth_type: String,
     /// 管理员是否启用该 Key；禁用项不得进入抓取目标。
     pub is_active: bool,
     /// 是否为该 Key 开启自动模型目录抓取。
@@ -892,6 +894,7 @@ impl From<&StoredProviderCatalogKey> for StoredProviderCatalogModelFetchCandidat
         Self {
             id: key.id.clone(),
             provider_id: key.provider_id.clone(),
+            auth_type: key.auth_type.clone(),
             is_active: key.is_active,
             auto_fetch_models: key.auto_fetch_models,
             api_formats: key.api_formats.clone(),

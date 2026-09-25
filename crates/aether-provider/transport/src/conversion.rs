@@ -291,7 +291,8 @@ pub fn candidate_common_transport_skip_reason(
         return Some("key_model_disabled");
     }
 
-    None
+    // 所有正式候选（含号池展开后的实际 Key）共用套餐准入，避免图片同步/流式分叉。
+    crate::codex_oauth_transport_capability_skip_reason(transport)
 }
 
 pub fn candidate_transport_pair_skip_reason(
@@ -915,6 +916,39 @@ mod tests {
                     mapping_matched_model: None,
                 },
                 Some("gpt-5.5-xhigh"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_candidate_policy_keeps_plan_refusal_separate_from_model_restriction() {
+        let mut transport = transport_snapshot("codex", "openai:image", "oauth", false, None);
+        transport.key.decrypted_auth_config = Some(json!({"plan_type": "free"}).to_string());
+        assert_eq!(
+            candidate_common_transport_skip_reason(
+                &transport,
+                candidate_facts("openai:image"),
+                None
+            ),
+            Some("codex_plan_image_generation_unsupported")
+        );
+        transport.key.allowed_models = Some(Vec::new());
+        assert_eq!(
+            candidate_common_transport_skip_reason(
+                &transport,
+                candidate_facts("openai:image"),
+                None
+            ),
+            Some("key_model_disabled")
+        );
+        transport.key.allowed_models = None;
+        transport.key.upstream_metadata = Some(json!({"codex": {"plan_type": "prolite"}}));
+        assert_eq!(
+            candidate_common_transport_skip_reason(
+                &transport,
+                candidate_facts("openai:image"),
+                None
             ),
             None
         );

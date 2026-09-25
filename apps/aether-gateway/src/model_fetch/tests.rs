@@ -7,7 +7,7 @@ use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data_contracts::repository::global_models::{
     AdminProviderModelListQuery, GlobalModelReadRepository, StoredAdminGlobalModel,
-    StoredAdminProviderModel,
+    StoredAdminProviderModel, StoredModelEndpointBinding,
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
@@ -749,8 +749,10 @@ async fn codex_image_model_fetch_repairs_legacy_whitelist_and_restores_image_mod
                     {
                         "slug": "gpt-5.4-codex",
                         "family": "gpt-5.4",
-                        "display_name": "GPT-5.4 Codex"
-                    }
+                        "display_name": "GPT-5.4 Codex",
+                        "supports_search_tool": true
+                    },
+                    {"slug": "gpt-6-astra", "supports_search_tool": false}
                 ]
             }))
         }),
@@ -771,8 +773,26 @@ async fn codex_image_model_fetch_repairs_legacy_whitelist_and_restores_image_mod
             "openai:image",
             &base_url,
         ),
+        codex_image_sample_endpoint(
+            "endpoint-codex-search",
+            "provider-codex-image",
+            "openai:search",
+            &base_url,
+        ),
+        codex_image_sample_endpoint(
+            "endpoint-codex-compact",
+            "provider-codex-image",
+            "openai:responses:compact",
+            &base_url,
+        ),
+        codex_image_sample_endpoint(
+            "endpoint-codex-live",
+            "provider-codex-image",
+            "codex:live",
+            &base_url,
+        ),
     ];
-    // 旧白名单：上次文本目录刷新写入的结果，缺 gpt-image-2。
+    // 旧白名单：上次文本目录刷新写入的结果，缺 gpt-image-next-release。
     let key = codex_image_sample_key(
         "key-codex-image",
         "provider-codex-image",
@@ -788,22 +808,69 @@ async fn codex_image_model_fetch_repairs_legacy_whitelist_and_restores_image_mod
         "provider-model-image",
         "provider-codex-image",
         "global-model-image",
-        "gpt-image-2",
-        "gpt-image-2",
-        &["gpt-image-2"],
+        "gpt-image-next-release",
+        "gpt-image-next-release",
+        &["gpt-image-next-release"],
     );
     // 上一次 availability reconcile 因旧白名单缺失把图片模型标记为不可用。
     legacy_image_model.is_available = false;
     let global_model_repository = Arc::new(
         InMemoryGlobalModelReadRepository::seed(Vec::new())
             .with_admin_global_models(vec![
-                sample_global_model("global-model-image", "gpt-image-2", &["gpt-image-2"]),
+                sample_global_model(
+                    "global-model-image",
+                    "gpt-image-next-release",
+                    &["gpt-image-next-release"],
+                ),
                 sample_global_model("global-model-codex", "gpt-5.4-codex", &["gpt-5.4-codex"]),
+                sample_global_model("global-model-astra", "gpt-6-astra", &["gpt-6-astra"]),
             ])
-            .with_admin_provider_models(vec![legacy_image_model])
+            .with_admin_provider_models(vec![
+                legacy_image_model,
+                sample_provider_model(
+                    "provider-model-text",
+                    "provider-codex-image",
+                    "global-model-codex",
+                    "gpt-5.4-codex",
+                    "gpt-5.4-codex",
+                    &["gpt-5.4-codex"],
+                ),
+            ])
+            .with_model_endpoint_bindings([
+                StoredModelEndpointBinding::new(
+                    "provider-model-image".to_string(),
+                    "endpoint-codex-image".to_string(),
+                    "discovered".to_string(),
+                    true,
+                    None,
+                    None,
+                )
+                .expect("image binding should build"),
+                StoredModelEndpointBinding::new(
+                    "provider-model-text".to_string(),
+                    "endpoint-codex-search".to_string(),
+                    "manual".to_string(),
+                    false,
+                    None,
+                    None,
+                )
+                .expect("manual disabled search binding"),
+                StoredModelEndpointBinding::new(
+                    "provider-model-text".to_string(),
+                    "endpoint-codex-image".to_string(),
+                    "manual".to_string(),
+                    true,
+                    None,
+                    None,
+                )
+                .expect("legacy text image binding"),
+            ])
             .with_endpoint_provider_ids([
                 ("endpoint-codex-responses", "provider-codex-image"),
                 ("endpoint-codex-image", "provider-codex-image"),
+                ("endpoint-codex-search", "provider-codex-image"),
+                ("endpoint-codex-compact", "provider-codex-image"),
+                ("endpoint-codex-live", "provider-codex-image"),
             ]),
     );
     let data_state = crate::data::GatewayDataState::disabled()
@@ -834,10 +901,14 @@ async fn codex_image_model_fetch_repairs_legacy_whitelist_and_restores_image_mod
         .into_iter()
         .next()
         .expect("updated key should exist");
-    // 强制刷新修复旧白名单：文本目录模型与补全的 gpt-image-2 同时写入。
+    // 强制刷新修复旧白名单：文本目录模型与补全的 gpt-image-next-release 同时写入。
     assert_eq!(
         updated_key.allowed_models,
-        Some(json!(["gpt-5.4-codex", "gpt-image-2"]))
+        Some(json!([
+            "gpt-5.4-codex",
+            "gpt-6-astra",
+            "gpt-image-next-release"
+        ]))
     );
     // 原生 codex_models 元数据不写入本地补全卡，但保留上游文本卡。
     let catalog_cards = updated_key
@@ -846,7 +917,8 @@ async fn codex_image_model_fetch_repairs_legacy_whitelist_and_restores_image_mod
         .and_then(|metadata| metadata["codex_models"]["cards"].as_object())
         .expect("codex model catalog metadata should persist");
     assert!(catalog_cards.contains_key("gpt-5.4-codex"));
-    assert!(!catalog_cards.contains_key("gpt-image-2"));
+    assert!(!catalog_cards.contains_key("gpt-image-next-release"));
+    assert_eq!(catalog_cards["gpt-6-astra"]["supports_search_tool"], false);
 
     let provider_models = global_model_repository
         .list_admin_provider_models(&AdminProviderModelListQuery {
@@ -859,7 +931,7 @@ async fn codex_image_model_fetch_repairs_legacy_whitelist_and_restores_image_mod
         .expect("provider models should load");
     let image_model = provider_models
         .iter()
-        .find(|model| model.provider_model_name == "gpt-image-2")
+        .find(|model| model.provider_model_name == "gpt-image-next-release")
         .expect("image provider model should exist");
     assert!(
         image_model.is_available,
@@ -872,12 +944,56 @@ async fn codex_image_model_fetch_repairs_legacy_whitelist_and_restores_image_mod
     )
     .await;
 
+    let new_text_model = provider_models
+        .iter()
+        .find(|model| model.provider_model_name == "gpt-6-astra")
+        .expect("new native model should be associated");
+    assert_codex_image_model_bindings(
+        &global_model_repository,
+        &new_text_model.id,
+        &[
+            "endpoint-codex-compact",
+            "endpoint-codex-responses",
+            "endpoint-codex-search",
+        ],
+    )
+    .await;
+    let manual_bindings = global_model_repository
+        .list_model_endpoint_bindings(&["provider-model-text".to_string()])
+        .await
+        .expect("manual bindings should load");
+    assert!(manual_bindings
+        .iter()
+        .any(|binding| binding.endpoint_id == "endpoint-codex-search"
+            && !binding.is_active
+            && binding.source == "manual"));
+    let cached: serde_json::Value = serde_json::from_str(
+        &state
+            .runtime_state()
+            .kv_get("upstream_models:provider-codex-image:key-codex-image")
+            .await
+            .expect("legacy cache read")
+            .expect("legacy cache exists"),
+    )
+    .expect("legacy cache parse");
+    let text_card = cached
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "gpt-5.4-codex")
+        .unwrap();
+    assert!(text_card.get("supports_image_generation").is_none());
+    assert!(!text_card["endpoint_ids"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("endpoint-codex-image")));
+
     upstream_handle.abort();
 }
 
 #[tokio::test]
 /// Key 格式不允许 openai:image 或 Provider 无图片 Endpoint 时不得扩权：
-/// 白名单不出现 gpt-image-2，既有 image ProviderModel 保持不可用。
+/// 白名单不出现 gpt-image-next-release，既有 image ProviderModel 保持不可用。
 async fn codex_image_model_fetch_without_image_permission_or_endpoint_does_not_expand_whitelist() {
     async fn run_scenario(
         include_image_endpoint: bool,
@@ -950,6 +1066,19 @@ async fn codex_image_model_fetch_without_image_permission_or_endpoint_does_not_e
                     &["gpt-image-2"],
                 )])
                 .with_admin_provider_models(vec![legacy_image_model])
+                .with_model_endpoint_bindings(if include_image_endpoint {
+                    vec![StoredModelEndpointBinding::new(
+                        "provider-model-image".to_string(),
+                        "endpoint-codex-image".to_string(),
+                        "discovered".to_string(),
+                        true,
+                        None,
+                        None,
+                    )
+                    .expect("image binding should build")]
+                } else {
+                    Vec::new()
+                })
                 .with_endpoint_provider_ids(endpoint_provider_ids),
         );
         let data_state = crate::data::GatewayDataState::disabled()

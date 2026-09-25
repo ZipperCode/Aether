@@ -447,16 +447,27 @@ async fn gateway_executes_codex_image_stream_via_local_decision_gate_after_oauth
 fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_local_upstream() {
     run_stream_image_test(
         "gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_local_upstream",
-        gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_local_upstream_impl,
+        || async {
+            // 同一真实 HTTP 链覆盖套餐、号池实际 Key 与非固定图片型号。
+            for (plan, pooled) in [
+                (Some("free"), false),
+                (Some("free"), true),
+                (Some("plus"), true),
+            ] {
+                gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_local_upstream_impl(plan, pooled).await;
+            }
+        },
     );
 }
 
 // 流式真实链路：不给执行 runtime 传 override（空字符串被过滤为 None），网关以进程内
 // 直连执行器真实 HTTP 访问本机图片上游；客户端 stream=true，codex 图片上游返回同步
 // JSON，由网关桥接为 image SSE。Key.allowed_models 为刷新补全后的持久化状态
-// [gpt-5.4-mini, gpt-image-2]，请求必须穿过真实模型准入门。
-async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_local_upstream_impl()
-{
+// [gpt-5.4-mini, gpt-image-future-test]，请求必须穿过真实模型准入门。
+async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_local_upstream_impl(
+    plan: Option<&str>,
+    pooled: bool,
+) {
     #[derive(Debug, Clone)]
     struct SeenUpstreamImageRequest {
         method: String,
@@ -490,7 +501,7 @@ async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_l
             false,
             Some(serde_json::json!(["openai", "codex"])),
             Some(serde_json::json!(["openai:image"])),
-            Some(serde_json::json!(["gpt-image-2"])),
+            Some(serde_json::json!(["gpt-image-future-test"])),
             api_key_id.to_string(),
             Some("default".to_string()),
             true,
@@ -501,7 +512,7 @@ async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_l
             Some(4_102_444_800_i64),
             Some(serde_json::json!(["openai", "codex"])),
             Some(serde_json::json!(["openai:image"])),
-            Some(serde_json::json!(["gpt-image-2"])),
+            Some(serde_json::json!(["gpt-image-future-test"])),
         )
         .expect("auth snapshot should build")
     }
@@ -523,20 +534,23 @@ async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_l
             key_auth_type: "oauth".to_string(),
             key_is_active: true,
             key_api_formats: Some(vec!["openai:image".to_string()]),
-            // 发现刷新补全后的持久化白名单：文本模型保留，gpt-image-2 被补进。
-            key_allowed_models: Some(vec!["gpt-5.4-mini".to_string(), "gpt-image-2".to_string()]),
+            // 发现刷新补全后的持久化白名单：文本模型保留，gpt-image-future-test 被补进。
+            key_allowed_models: Some(vec![
+                "gpt-5.4-mini".to_string(),
+                "gpt-image-future-test".to_string(),
+            ]),
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"openai:image": 1})),
             routing_facts: Default::default(),
             model_id: "model-codex-image-stream-allowlist-local-1".to_string(),
             global_model_id: "global-model-codex-image-stream-allowlist-local-1".to_string(),
-            global_model_name: "gpt-image-2".to_string(),
+            global_model_name: "gpt-image-future-test".to_string(),
             global_model_mappings: None,
             global_model_supports_streaming: Some(true),
-            model_provider_model_name: "gpt-image-2".to_string(),
+            model_provider_model_name: "gpt-image-future-test".to_string(),
             model_provider_model_mappings: Some(vec![StoredProviderModelMapping {
-                name: "gpt-image-2".to_string(),
+                name: "gpt-image-future-test".to_string(),
                 priority: 1,
                 api_formats: Some(vec!["openai:image".to_string()]),
                 endpoint_ids: None,
@@ -615,7 +629,7 @@ async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_l
             None,
             Some(serde_json::json!({"openai:image": 1})),
             // 持久化在 Key 上的同一份白名单，供执行期 transport 快照读取。
-            Some(serde_json::json!(["gpt-5.4-mini", "gpt-image-2"])),
+            Some(serde_json::json!(["gpt-5.4-mini", "gpt-image-future-test"])),
             None,
             None,
             None,
@@ -733,18 +747,40 @@ async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_l
             "user-codex-image-stream-allowlist-client-123",
         ),
     )]));
+    let row = sample_candidate_row();
+    let mut rows = vec![row.clone()];
+    if pooled && plan != Some("free") {
+        // 首个逻辑号池代表为 Free，必须在展开后跳过它，而不能封掉整个号池。
+        let mut free_row = row;
+        free_row.key_id.push_str("-free");
+        free_row.key_internal_priority = 0;
+        rows.insert(0, free_row);
+    }
     let candidate_selection_repository =
-        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
-            sample_candidate_row(),
-        ]));
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows));
 
     let (refresh_url, refresh_handle) = start_server(refresh).await;
     let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let mut provider = sample_provider_catalog_provider();
+    if pooled {
+        provider.config = Some(json!({"pool_advanced": {}}));
+    }
+    let mut key = sample_provider_catalog_key();
+    key.upstream_metadata = plan.map(|plan| json!({"codex": {"plan_type": plan}}));
+    let mut keys = vec![key.clone()];
+    if pooled && plan != Some("free") {
+        let mut free_key = key;
+        free_key.id.push_str("-free");
+        free_key.internal_priority = 0;
+        free_key.upstream_metadata = Some(json!({"codex": {"plan_type": "free"}}));
+        keys.insert(0, free_key);
+    }
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider_catalog_provider()],
+        vec![provider],
         vec![sample_provider_catalog_endpoint(&upstream_url)],
-        vec![sample_provider_catalog_key()],
+        keys,
     ));
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::default());
 
     let oauth_refresh =
         crate::provider_transport::LocalOAuthRefreshCoordinator::with_adapters_for_tests(vec![
@@ -760,7 +796,7 @@ async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_l
                 auth_repository,
                 candidate_selection_repository,
                 provider_catalog_repository,
-                Arc::new(InMemoryRequestCandidateRepository::default()),
+                request_candidates.clone(),
                 DEVELOPMENT_ENCRYPTION_KEY,
             ),
         )
@@ -780,7 +816,7 @@ async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_l
             "trace-codex-image-stream-allowlist-local-123",
         )
         .body(
-            "{\"model\":\"gpt-image-2\",\"prompt\":\"生成一张水墨视觉海报\",\"background\":\"auto\",\"quality\":\"high\",\"size\":\"1024x1024\",\"n\":1,\"stream\":true,\"response_format\":\"b64_json\"}",
+            "{\"model\":\"gpt-image-future-test\",\"prompt\":\"生成一张水墨视觉海报\",\"background\":\"auto\",\"quality\":\"high\",\"size\":\"1024x1024\",\"n\":1,\"stream\":true,\"response_format\":\"b64_json\"}",
         )
         .send()
         .await
@@ -797,6 +833,30 @@ async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_l
         .headers()
         .contains_key("x-aether-bridged-client-sse");
     let response_text = response.text().await.expect("body should read");
+    if plan == Some("free") {
+        assert_eq!(
+            response_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{response_text}"
+        );
+        use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
+        let candidates = request_candidates
+            .list_by_request_id("trace-codex-image-stream-allowlist-local-123")
+            .await
+            .expect("candidate diagnostics");
+        let diagnostics = format!("{candidates:?}");
+        assert!(
+            diagnostics.contains("codex_plan_image_generation_unsupported"),
+            "{diagnostics}"
+        );
+        assert_eq!(*upstream_hits.lock().expect("hits"), 0);
+        assert_eq!(*refresh_hits.lock().expect("refresh hits"), 0);
+        gateway_handle.abort();
+        upstream_handle.abort();
+        refresh_handle.abort();
+        return;
+    }
+
     assert_eq!(response_status, StatusCode::OK, "{response_text}");
     assert_eq!(
         response_content_type.as_deref(),
@@ -859,7 +919,7 @@ async fn gateway_executes_codex_image_stream_with_key_model_allowlist_via_real_l
         json!({
             "prompt": "生成一张水墨视觉海报",
             "background": "auto",
-            "model": "gpt-image-2",
+            "model": "gpt-image-future-test",
             "n": 1,
             "quality": "high",
             "size": "1024x1024"

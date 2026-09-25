@@ -1,0 +1,7 @@
+{"file":".trellis/spec/aether-model-fetch/backend/quality-guidelines.md","reason":"Replace fixed image supplementation while preserving native cards and filtering"}
+{"file":".trellis/spec/aether-gateway/backend/auth-maintenance-memory-contract.md","reason":"Compact model fetch reads and per-provider reconciliation"}
+{"file":".trellis/spec/aether-provider-pool/backend/key-admission-affinity-model-quota-contract.md","reason":"Preserve quota and per-key admission contracts"}
+{"file":".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md","reason":"Preserve protocol, auth, streaming and compact behavior"}
+{"file":".trellis/tasks/09-25-codex-oauth-capabilities/research/live-evidence.md","reason":"Production read-only reproduction and capability evidence"}
+{"file": ".trellis/tasks/09-25-codex-oauth-capabilities/research/upstream-capabilities.md", "reason": "Verify Free image gate and no false Alpha Search gate"}
+{"file": ".trellis/tasks/09-25-codex-oauth-capabilities/research/local-endpoint-audit.md", "reason": "End-to-end local routing and actual HTTP regression requirements"}

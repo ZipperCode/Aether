@@ -335,7 +335,7 @@ fn sample_catalog_key_with_allowed_models(
 }
 
 #[test]
-fn provider_query_model_test_allows_keys_without_model_restrictions() {
+fn provider_query_model_test_distinguishes_missing_and_empty_model_restrictions() {
     let unrestricted = sample_catalog_key_with_allowed_models(None);
     let empty = sample_catalog_key_with_allowed_models(Some(json!([])));
 
@@ -344,11 +344,92 @@ fn provider_query_model_test_allows_keys_without_model_restrictions() {
         "model-b",
         "model-b-upstream",
     ));
-    assert!(provider_query_key_allows_effective_test_model(
+    assert!(!provider_query_key_allows_effective_test_model(
         &empty,
         "model-b",
         "model-b-upstream",
     ));
+}
+
+#[tokio::test]
+async fn provider_query_codex_free_image_test_uses_runtime_plan_refusal() {
+    use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use std::sync::Arc;
+
+    let provider = StoredProviderCatalogProvider::new(
+        "provider-1".into(),
+        "codex".into(),
+        None,
+        "codex".into(),
+    )
+    .unwrap();
+    let endpoint = StoredProviderCatalogEndpoint::new(
+        "endpoint-1".into(),
+        provider.id.clone(),
+        "openai:image".into(),
+        Some("openai".into()),
+        Some("image".into()),
+        true,
+    )
+    .unwrap()
+    .with_transport_fields(
+        "http://127.0.0.1:1/backend-api/codex".into(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let mut key = sample_catalog_key_with_allowed_models(Some(json!(["gpt-image-future-test"])));
+    key.auth_type = "oauth".into();
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"codex","plan_type":"free"}"#,
+        )
+        .unwrap(),
+    );
+    key.encrypted_api_key = Some(
+        encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "test-access-token").unwrap(),
+    );
+    let state = AppState::new().unwrap().with_data_state_for_tests(
+        crate::data::GatewayDataState::with_provider_catalog_repository_for_tests(Arc::new(
+            InMemoryProviderCatalogReadRepository::seed(
+                vec![provider.clone()],
+                vec![endpoint.clone()],
+                vec![key.clone()],
+            ),
+        ))
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+    );
+    let candidate = ProviderQueryTestCandidate {
+        endpoint,
+        key,
+        effective_model: "gpt-image-future-test".into(),
+        scheduler_skip_reason: None,
+    };
+    // 无服务的本机端口仍应直接返回套餐原因，禁止刷新认证或尝试图片网络请求。
+    let result = provider_query_execute_openai_image_test_candidate(
+        &AdminAppState::new(&state),
+        &provider,
+        &candidate,
+        &json!({"model": "gpt-image-future-test"}),
+        "/api/admin/provider-query/test-model",
+        "admin-free-image",
+        "gpt-image-future-test",
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.status, "skipped");
+    assert_eq!(
+        result.skip_reason.as_deref(),
+        Some("codex_plan_image_generation_unsupported")
+    );
+    assert!(result.request_url.is_empty());
 }
 
 #[test]

@@ -1885,6 +1885,7 @@ mod tests {
     #[tokio::test]
     async fn model_fetch_candidates_are_lightweight_and_gate_metadata() {
         let mut eligible = sample_key("key-b", "provider-1");
+        eligible.auth_type = "oauth".to_string();
         eligible.auto_fetch_models = true;
         eligible.api_formats = Some(json!(["openai:chat"]));
         eligible.allowed_models = Some(json!(["gpt-5"]));
@@ -1914,6 +1915,7 @@ mod tests {
         assert_eq!(candidates[0].id, "key-a");
         assert!(candidates[0].upstream_metadata.is_none());
         assert_eq!(candidates[1].id, "key-b");
+        assert_eq!(candidates[1].auth_type, "oauth");
         assert_eq!(candidates[1].api_formats, Some(json!(["openai:chat"])));
         assert_eq!(candidates[1].allowed_models, Some(json!(["gpt-5"])));
         assert_eq!(
