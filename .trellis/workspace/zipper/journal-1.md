@@ -967,3 +967,40 @@ Implemented independent quota sources, official plan recognition, regional query
 ### Next Steps
 
 - 未推送、未发布、未部署；真实线上故障仍需对应请求记录验证
+
+
+## Session 38: 完善 Codex OAuth 图片搜索与套餐准入
+
+**Date**: 2026-09-25
+**Task**: 完善 Codex OAuth 图片搜索与套餐准入
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+动态配置图片型号，补齐原生 Search/Compact 绑定，统一已知 Free 生图拒绝与管理诊断；完成本机协议和权限回归。
+
+### Main Changes
+
+- 原生 Codex 模型卡保持不变，管理投影与自动白名单使用共享配置/绑定来源。
+- Search 最终 JSON 请求头清理；套餐解析保留原始 ProLite/Pro 等身份，额度独立处理。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b2b87ce1547e88b6b6ea9a61a5cacfba628d9597` | (see git log) |
+
+### Testing
+
+- [OK] Gateway Codex255、model_fetch65、Compact34、架构61、管理兼容发现1通过；包括真实本机 Images/Search HTTP及 Live calls/sideband回归。
+- [OK] model-fetch96、transport32、formats86与Search最终3、provider-pool11与plan2、data投影2、diagnostic1通过。
+- [OK] 前端类型检查、76项定向测试、4个TS文件只读ESLint、8个Rust包Clippy、格式和diff检查通过。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 尚未推送、发布或部署154；后续按发布流程上线后需刷新自动模型目录并验收真实上游权限。

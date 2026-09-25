@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 37
-- **Last Active**: 2026-09-20
+- **Total Sessions**: 38
+- **Last Active**: 2026-09-25
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~969 | Active |
+| `journal-1.md` | ~1006 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 38 | 2026-09-25 | 完善 Codex OAuth 图片搜索与套餐准入 | `b2b87ce1547e88b6b6ea9a61a5cacfba628d9597` | `master` |
 | 37 | 2026-09-20 | 上游与候选跳过诊断合并 | `377ca367f` | `master` |
 | 36 | 2026-09-20 | Responses 开场空白与故障转移修复 | `970eab84ee09536237e743c146017f1b8567286b` | `master` |
 | 35 | 2026-09-18 | 修复 SSE 预读交接的数据缺失 | `f18dad7ab957e72dd971489c4c3093d42230e85f` | `master` |
