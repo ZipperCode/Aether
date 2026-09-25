@@ -76,6 +76,9 @@ member claims rather than the rotating access token.
 - Responses WebSocket create-turn transport is supported. Retrieve, delete,
   cancel, input-items, input-tokens, Aether Response persistence, and
   `previous_response_id` affinity remain separate product contracts.
+- 头部 `x-codex-turn-metadata` 经身份收敛重写后必须为 ASCII-safe JSON；中文与非 BMP 字符使用 UTF-16 `\uXXXX` 转义，未知键/嵌套字段的 JSON 语义保留。已有 ASCII 输出直接复用序列化缓冲；正文元数据不做头部编码转换。
+- `UpstreamBindingIdentity::from_decision` 对合法头值使用原始字节，不得用 `HeaderValue::to_str()` 附加 ASCII 限制。先认证分类，再排除 turn-scoped 字段，仅对需要参与身份的值复制字节；显式认证头即使与 turn metadata 同名也必须进入凭据指纹。
+- 字节身份沿用现有摘要域与长度编码，ASCII 指纹保持逐位兼容；稳定头变化改变连接身份，turn metadata 变化不重绑。非法头名与 CR/LF/NUL 仍由握手构造验证拒绝。
 
 ## 4. Validation & Error Matrix
 
@@ -91,6 +94,10 @@ member claims rather than the rotating access token.
 | Final body removed `prompt_cache_key` | Keep it absent. |
 | OAuth refresh omits member claims | Preserve the stored fingerprint. |
 | Stable member claims unavailable | Use the stable Key fallback, never the rotating token. |
+| Unicode turn metadata 经收敛重写 | 输出 ASCII-safe JSON，解析语义与未知字段不丢失。 |
+| 合法 UTF-8 稳定握手头 | 原始字节参与身份与摘要，值改变必须被识别。 |
+| 仅 turn metadata 变化 | 复用绑定；若该名称是显式认证头则不得排除。 |
+| 非法头名或控制字符 | 保留 InvalidHandshakeHeaders 错误，不删头或吞错。 |
 
 ## 5. Good / Base / Bad Cases
 
@@ -117,6 +124,9 @@ member claims rather than the rotating access token.
 - OAuth tests: member-scoped fingerprint survives token rotation and refresh.
 - Responses WS/Live tests must cover bootstrap, rebind, and retry with the same
   context, while separate turns produce separate turn identities.
+- `header_turn_metadata_rewrite_outputs_ascii_safe_json`：中文/非 BMP、已有转义输入和畸形 JSON 边界。
+- binding 回归覆盖 UTF-8 turn/stable/auth 头、ASCII 摘要兼容、非法头拒绝及 token refresh generation 不变。
+- `codex_unicode_turn_metadata_binds_and_continuations_reuse_the_socket`：真实收敛→本机 WS 握手，上游收到 ASCII metadata 和原始 UTF-8 稳定头；先消费第一轮回复，再验证第二轮回复及握手计数仍为 1。
 
 ## 7. Wrong vs Correct
 
@@ -138,3 +148,7 @@ for candidate in candidates {
     send(candidate, context.clone()).await?;
 }
 ```
+
+错误：将 JSON 转义后的 Unicode 重序列化为原始中文，再通过 ASCII-only 访问器计算连接身份；或者简单删掉元数据“修复”握手。
+
+正确：头部 JSON 使用语义等价的 ASCII 编码，连接身份按合法原始头字节比较，turn-scoped 与认证优先级明确分离。

@@ -428,6 +428,7 @@ fn apply_converged_client_metadata(body: &mut Value, fingerprint: &CodexConverge
 }
 
 /// 若头部携带合法 JSON turn 元数据，则原位改写身份字段；畸形值保持原样。
+/// 重写后的 JSON 输出保持 ASCII 安全，非 ASCII 字符一律转义为 `\uXXXX` UTF-16 转义。
 fn rewrite_header_turn_metadata(
     headers: &mut BTreeMap<String, String>,
     fingerprint: &CodexConvergedFingerprint,
@@ -442,8 +443,34 @@ fn rewrite_header_turn_metadata(
     let Ok(rebuilt) = serde_json::to_string(&metadata) else {
         return;
     };
+    // 使用 ASCII-safe JSON，避免严格的头部文本读取与上游实现拒绝合法 Unicode 元数据。
+    // 纯 ASCII 输出直接复用序列化结果避免额外分配，否则统一转义为 UTF-16 转义。
+    let rebuilt = if rebuilt.is_ascii() {
+        rebuilt
+    } else {
+        escape_non_ascii_json_utf16(&rebuilt)
+    };
     headers.remove(&name);
     headers.insert("x-codex-turn-metadata".to_string(), rebuilt);
+}
+
+/// 将已序列化 JSON 中的非 ASCII 字符改写为 `\uXXXX` UTF-16 转义（非 BMP 用代理对）。
+/// serde_json 的输出中非 ASCII 只会出现在字符串字面量内，因此该替换不改变语义。
+fn escape_non_ascii_json_utf16(serialized: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut escaped = String::with_capacity(serialized.len());
+    for character in serialized.chars() {
+        if character.is_ascii() {
+            escaped.push(character);
+            continue;
+        }
+        let mut units = [0_u16; 2];
+        for unit in character.encode_utf16(&mut units) {
+            let _ = write!(escaped, "\\u{unit:04x}");
+        }
+    }
+    escaped
 }
 
 /// 同时支持对象和 JSON 字符串形态的嵌套 turn 元数据，其他类型不改写。
@@ -720,6 +747,89 @@ mod tests {
             .get_version_num(),
             7
         );
+    }
+
+    /// 验证头部 turn 元数据重写后的 JSON 始终 ASCII 安全：中文与非 BMP 字符
+    /// 输出为 `\uXXXX` UTF-16 转义且解析后内容保留，客户端原本的 `\uXXXX`
+    /// 转义输入重写后仍保持 ASCII，畸形 JSON 头部保持原样。
+    #[test]
+    fn header_turn_metadata_rewrite_outputs_ascii_safe_json() {
+        let transport = sample_transport();
+
+        // 原始中文、非 BMP 字符与未知嵌套属性混合出现。
+        let mut headers = BTreeMap::from([(
+            "x-codex-turn-metadata".to_string(),
+            json!({
+                "installation_id": "client-installation",
+                "session_id": "client-session",
+                "中文标签": "中文字段",
+                "emoji": "𝄞😀",
+                "unknown": {"nested": ["嵌套", 7, null]}
+            })
+            .to_string(),
+        )]);
+        let mut body = json!({"model": "gpt-5.4"});
+        assert!(apply_codex_fingerprint_convergence(
+            &transport,
+            "openai:responses",
+            Some("client-session"),
+            &mut headers,
+            &mut body,
+        ));
+        let raw = &headers["x-codex-turn-metadata"];
+        assert!(raw.is_ascii(), "header must stay ASCII-safe: {raw:?}");
+        assert!(raw.contains("\\u4e2d"));
+        // 𝄞 为非 BMP 字符，必须输出代理对转义。
+        assert!(raw.contains("\\ud834\\udd1e"));
+        let parsed: Value = serde_json::from_str(raw).expect("header metadata json");
+        assert_eq!(parsed["中文标签"], "中文字段");
+        assert_eq!(parsed["emoji"], "𝄞😀");
+        assert_eq!(parsed["unknown"]["nested"], json!(["嵌套", 7, null]));
+        assert_eq!(
+            parsed["installation_id"],
+            headers["x-codex-installation-id"]
+        );
+
+        // 客户端以 `\uXXXX` 转义发送的 ASCII 输入重写后仍保持 ASCII。
+        let mut escaped_headers = BTreeMap::from([(
+            "x-codex-turn-metadata".to_string(),
+            r#"{"installation_id":"client-installation","note":"\u4e2d\u6587"}"#.to_string(),
+        )]);
+        let mut escaped_body = json!({"model": "gpt-5.4"});
+        assert!(apply_codex_fingerprint_convergence(
+            &transport,
+            "openai:responses",
+            Some("client-session"),
+            &mut escaped_headers,
+            &mut escaped_body,
+        ));
+        let escaped_raw = &escaped_headers["x-codex-turn-metadata"];
+        assert!(escaped_raw.is_ascii());
+        let escaped_parsed: Value =
+            serde_json::from_str(escaped_raw).expect("escaped header metadata json");
+        assert_eq!(escaped_parsed["note"], "中文");
+
+        // 畸形 JSON 头部保持原样，其余身份收敛照常执行。
+        let mut malformed_headers = BTreeMap::from([
+            (
+                "x-codex-turn-metadata".to_string(),
+                "not-json{broken".to_string(),
+            ),
+            ("session-id".to_string(), "client-session".to_string()),
+        ]);
+        let mut malformed_body = json!({"model": "gpt-5.4"});
+        assert!(apply_codex_fingerprint_convergence(
+            &transport,
+            "openai:responses",
+            Some("client-session"),
+            &mut malformed_headers,
+            &mut malformed_body,
+        ));
+        assert_eq!(
+            malformed_headers["x-codex-turn-metadata"],
+            "not-json{broken"
+        );
+        assert!(Uuid::parse_str(&malformed_headers["session-id"]).is_ok());
     }
 
     /// 验证对象形态的嵌套 turn 元数据与外层字段使用同一套收敛身份。

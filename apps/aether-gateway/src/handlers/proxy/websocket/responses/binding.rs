@@ -33,7 +33,9 @@ pub(super) struct UpstreamBindingIdentity {
     endpoint_id: Option<String>,
     key_id: Option<String>,
     upstream_url: String,
-    handshake_headers: BTreeMap<String, String>,
+    /// 握手头按 HeaderValue 原始字节保存：合法非 ASCII（如 UTF-8 工作区名）
+    /// 不会因 ASCII-only 转码被误拒或改写，身份比较与指纹都以字节为准。
+    handshake_headers: BTreeMap<String, Vec<u8>>,
     /// One-way identity for the credential generation used by this socket.
     ///
     /// A provider key id identifies a catalog row, not the secret currently
@@ -78,13 +80,18 @@ impl UpstreamBindingIdentity {
         let mut authentication_headers = BTreeMap::new();
         for (name, value) in &headers {
             let name = name.as_str().to_ascii_lowercase();
-            let value = value
-                .to_str()
-                .map_err(|_| UpstreamBindingIdentityError::InvalidHandshakeHeaders)?;
+            // 头值按 HeaderValue 原始字节进入身份：http 的 HeaderValue 允许
+            // 合法 UTF-8（如中文工作区名），这里不得再用 ASCII-only 的
+            // to_str 误拒。非法头名与 CR/LF 等控制字符仍由
+            // websocket_handshake_headers 在此前拒绝，本层不做 lossy 转码、
+            // 不吞错误。
+            // 认证分类优先于 turn-scoped 排除：显式 auth_header 即使与
+            // turn-scoped 头同名，也必须进入凭据指纹，不能借排除规则绕开
+            // 认证绑定。
             if authentication_header_names.contains(name.as_str()) {
-                authentication_headers.insert(name, value.to_string());
+                authentication_headers.insert(name, value.as_bytes().to_vec());
             } else if !is_turn_scoped_handshake_header(adapter_kind, name.as_str()) {
-                handshake_headers.insert(name, value.to_string());
+                handshake_headers.insert(name, value.as_bytes().to_vec());
             }
         }
         let credential_fingerprint =
@@ -159,7 +166,7 @@ impl UpstreamBindingIdentity {
         update_optional_string_digest(&mut digest, self.endpoint_id.as_deref());
         update_optional_string_digest(&mut digest, self.key_id.as_deref());
         update_string_digest(&mut digest, self.upstream_url.as_str());
-        update_string_map_digest(&mut digest, &self.handshake_headers);
+        update_header_map_digest(&mut digest, &self.handshake_headers);
         digest.update(self.credential_fingerprint);
         update_proxy_digest(&mut digest, self.proxy.as_ref());
         update_transport_profile_digest(&mut digest, self.transport_profile.as_ref());
@@ -198,11 +205,13 @@ fn update_optional_bool_digest(digest: &mut Sha256, value: Option<bool>) {
     }]);
 }
 
-fn update_string_map_digest(digest: &mut Sha256, values: &BTreeMap<String, String>) {
+fn update_header_map_digest(digest: &mut Sha256, values: &BTreeMap<String, Vec<u8>>) {
+    // 字节序列与长度前缀编码和旧 String 版本完全一致：ASCII 输入的摘要
+    // 不因迁移到字节存储而改变。
     digest.update((values.len() as u64).to_be_bytes());
     for (name, value) in values {
         update_string_digest(digest, name);
-        update_string_digest(digest, value);
+        update_bytes_digest(digest, value);
     }
 }
 
@@ -324,14 +333,17 @@ fn authentication_header_names(decision: &AiExecutionDecision) -> BTreeSet<Strin
     names
 }
 
-fn fingerprint_headers(headers: &BTreeMap<String, String>) -> [u8; 32] {
+/// 凭据头的字节级指纹。非法头到不了这里：websocket_handshake_headers 已
+/// 拒绝非法头名与控制字符；合法非 ASCII 值按原始字节参与指纹。
+fn fingerprint_headers(headers: &BTreeMap<String, Vec<u8>>) -> [u8; 32] {
+    // 编码与旧 String 版本完全一致，ASCII 输入的指纹保持兼容。
     let mut hasher = Sha256::new();
     hasher.update(b"aether-responses-websocket-auth-headers-v1");
     for (name, value) in headers {
         hasher.update((name.len() as u64).to_be_bytes());
         hasher.update(name.as_bytes());
         hasher.update((value.len() as u64).to_be_bytes());
-        hasher.update(value.as_bytes());
+        hasher.update(value);
     }
     hasher.finalize().into()
 }
@@ -341,7 +353,7 @@ fn fingerprint_headers(headers: &BTreeMap<String, String>) -> [u8; 32] {
 /// provider-key metadata; it is not sourced from the downstream request.
 fn credential_binding_fingerprint(
     decision: &AiExecutionDecision,
-    authentication_headers: &BTreeMap<String, String>,
+    authentication_headers: &BTreeMap<String, Vec<u8>>,
 ) -> [u8; 32] {
     if decision
         .provider_type
@@ -368,7 +380,7 @@ fn credential_binding_fingerprint(
             let stable_authentication_headers = authentication_headers
                 .iter()
                 .filter(|(name, value)| {
-                    !is_planner_owned_codex_bearer(decision, name.as_str(), value.as_str())
+                    !is_planner_owned_codex_bearer(decision, name.as_str(), value.as_slice())
                 })
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect::<BTreeMap<_, _>>();
@@ -386,17 +398,17 @@ fn credential_binding_fingerprint(
 fn is_planner_owned_codex_bearer(
     decision: &AiExecutionDecision,
     name: &str,
-    effective_value: &str,
+    effective_value: &[u8],
 ) -> bool {
     name.eq_ignore_ascii_case("authorization")
         && decision
             .auth_header
             .as_deref()
             .is_some_and(|header| header.eq_ignore_ascii_case(name))
-        && decision.auth_value.as_deref() == Some(effective_value)
+        && decision.auth_value.as_deref().map(str::as_bytes) == Some(effective_value)
         && effective_value
             .get(.."bearer ".len())
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"bearer "))
 }
 
 /// Normalize only values that are provably direct transport.  Keep node/tunnel
@@ -527,7 +539,7 @@ mod tests {
         assert_eq!(identity.upstream_url, "wss://api.example.test/v1/responses");
         assert_eq!(
             identity.handshake_headers,
-            BTreeMap::from([("x-client".to_string(), "aether".to_string())])
+            BTreeMap::from([("x-client".to_string(), b"aether".to_vec())])
         );
     }
 
@@ -892,6 +904,273 @@ mod tests {
         assert_eq!(
             UpstreamBindingIdentity::from_decision(adapter, &invalid),
             Err(UpstreamBindingIdentityError::InvalidUpstreamUrl)
+        );
+    }
+
+    #[test]
+    fn utf8_turn_metadata_is_accepted_and_excluded_from_identity() {
+        let adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Codex);
+        let mut first = decision();
+        first.provider_type = Some("codex".to_string());
+        first.report_context = Some(json!({
+            "codex_credential_generation": "credential-generation-1"
+        }));
+        // 合成中文 + 非 BMP 字符的原始 UTF-8 turn 元数据：serde_json 序列化
+        // 不转义非 ASCII，正是线上触发 headers_invalid 的输入形态。
+        let metadata = json!({
+            "session_id": "session-synth-1",
+            "thread_id": "thread-synth-1",
+            "turn_id": "turn-1",
+            "turn_started_at_unix_ms": 1,
+            "workspace": "合成工作区𝕏"
+        })
+        .to_string();
+        first
+            .provider_request_headers
+            .insert("x-codex-turn-metadata".to_string(), metadata.clone());
+        let first_identity = UpstreamBindingIdentity::from_decision(adapter, &first)
+            .expect("legal UTF-8 turn metadata must not be rejected");
+        assert!(!first_identity
+            .handshake_headers
+            .contains_key("x-codex-turn-metadata"));
+
+        // Standard 适配器不排除该头：合法 UTF-8 值按原始字节参与身份。
+        let standard_adapter =
+            resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Standard);
+        let standard_identity = UpstreamBindingIdentity::from_decision(standard_adapter, &first)
+            .expect("standard adapter must accept legal UTF-8 header values");
+        assert_eq!(
+            standard_identity
+                .handshake_headers
+                .get("x-codex-turn-metadata")
+                .map(Vec::as_slice),
+            Some(metadata.as_bytes())
+        );
+
+        let mut continuation = first;
+        continuation.provider_request_headers.insert(
+            "x-codex-turn-metadata".to_string(),
+            json!({
+                "session_id": "session-synth-1",
+                "thread_id": "thread-synth-1",
+                "turn_id": "turn-2",
+                "turn_started_at_unix_ms": 2,
+                "workspace": "合成工作区𝕏"
+            })
+            .to_string(),
+        );
+        let continuation_identity = UpstreamBindingIdentity::from_decision(adapter, &continuation)
+            .expect("UTF-8 turn metadata continuation must not be rejected");
+        assert_eq!(first_identity, continuation_identity);
+        assert_eq!(
+            first_identity.continuation_fingerprint(),
+            continuation_identity.continuation_fingerprint()
+        );
+    }
+
+    #[test]
+    fn utf8_stable_header_values_change_identity_by_bytes() {
+        let adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Codex);
+        let mut first = decision();
+        first.provider_type = Some("codex".to_string());
+        first.report_context = Some(json!({
+            "codex_credential_generation": "credential-generation-1"
+        }));
+        first
+            .provider_request_headers
+            .insert("x-codex-window-name".to_string(), "合成窗口-一".to_string());
+        let first_identity = UpstreamBindingIdentity::from_decision(adapter, &first)
+            .expect("legal UTF-8 stable header must not be rejected");
+        assert_eq!(
+            first_identity
+                .handshake_headers
+                .get("x-codex-window-name")
+                .map(Vec::as_slice),
+            Some("合成窗口-一".as_bytes())
+        );
+
+        let mut changed = first.clone();
+        changed
+            .provider_request_headers
+            .insert("x-codex-window-name".to_string(), "合成窗口-二".to_string());
+        let changed_identity = UpstreamBindingIdentity::from_decision(adapter, &changed)
+            .expect("changed UTF-8 stable header must not be rejected");
+        assert_ne!(first_identity, changed_identity);
+        assert_ne!(
+            first_identity.continuation_fingerprint(),
+            changed_identity.continuation_fingerprint()
+        );
+        assert_eq!(
+            first_identity.changed_field_names(&changed_identity),
+            vec!["handshake_header:x-codex-window-name".to_string()]
+        );
+
+        // 字节精确比较：同一文本的 \uXXXX ASCII 转义与原始 UTF-8 是不同字节，
+        // 对稳定头而言就是不同的身份输入。
+        let mut escaped = first;
+        escaped.provider_request_headers.insert(
+            "x-codex-window-name".to_string(),
+            "\\u5408\\u6210\\u7a97\\u53e3-\\u4e00".to_string(),
+        );
+        assert_ne!(
+            first_identity,
+            UpstreamBindingIdentity::from_decision(adapter, &escaped).unwrap()
+        );
+    }
+
+    #[test]
+    fn ascii_binding_digests_match_the_legacy_string_encoding() {
+        use sha2::{Digest, Sha256};
+
+        fn legacy_bytes(digest: &mut Sha256, value: &[u8]) {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+
+        fn legacy_string(digest: &mut Sha256, value: &str) {
+            legacy_bytes(digest, value.as_bytes());
+        }
+
+        fn legacy_optional_string(digest: &mut Sha256, value: Option<&str>) {
+            match value {
+                Some(value) => {
+                    digest.update([1]);
+                    legacy_string(digest, value);
+                }
+                None => digest.update([0]),
+            }
+        }
+
+        fn legacy_string_map(digest: &mut Sha256, values: &BTreeMap<String, String>) {
+            digest.update((values.len() as u64).to_be_bytes());
+            for (name, value) in values {
+                legacy_string(digest, name);
+                legacy_string(digest, value);
+            }
+        }
+
+        fn legacy_auth_fingerprint(values: &BTreeMap<String, String>) -> [u8; 32] {
+            let mut hasher = Sha256::new();
+            hasher.update(b"aether-responses-websocket-auth-headers-v1");
+            for (name, value) in values {
+                hasher.update((name.len() as u64).to_be_bytes());
+                hasher.update(name.as_bytes());
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            hasher.finalize().into()
+        }
+
+        // 旧实现以 String 存储握手头。ASCII 输入下，字节版身份/凭据摘要
+        // 必须与旧编码逐位一致，保证既有 continuation 注册表兼容。
+        let adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Standard);
+        let identity = UpstreamBindingIdentity::from_decision(adapter, &decision()).unwrap();
+        let mut legacy = Sha256::new();
+        legacy.update(b"aether-responses-websocket-binding-v1");
+        legacy.update([0]);
+        legacy_optional_string(&mut legacy, Some("provider-1"));
+        legacy_optional_string(&mut legacy, Some("endpoint-1"));
+        legacy_optional_string(&mut legacy, Some("key-1"));
+        legacy_string(&mut legacy, "wss://api.example.test/v1/responses");
+        legacy_string_map(
+            &mut legacy,
+            &BTreeMap::from([("x-client".to_string(), "aether".to_string())]),
+        );
+        legacy.update(legacy_auth_fingerprint(&BTreeMap::from([(
+            "authorization".to_string(),
+            "Bearer secret".to_string(),
+        )])));
+        legacy.update([0]);
+        legacy.update([0]);
+        assert_eq!(
+            identity.continuation_fingerprint(),
+            Into::<[u8; 32]>::into(legacy.finalize())
+        );
+    }
+
+    #[test]
+    fn invalid_header_names_and_control_characters_still_reject_binding() {
+        let adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Codex);
+        for (name, value) in [
+            ("bad name", "value"),
+            ("x-codex\r-name", "value"),
+            ("x-codex-window", "value\r\nX-Inject: 1"),
+            ("x-codex-window", "value\u{0}"),
+        ] {
+            let mut invalid = decision();
+            invalid.provider_type = Some("codex".to_string());
+            invalid
+                .provider_request_headers
+                .insert(name.to_string(), value.to_string());
+            assert_eq!(
+                UpstreamBindingIdentity::from_decision(adapter, &invalid),
+                Err(UpstreamBindingIdentityError::InvalidHandshakeHeaders),
+                "illegal header must still be rejected: name={name:?} value={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_header_matching_turn_scoped_name_stays_credential_scoped() {
+        let adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Codex);
+        let mut first = decision();
+        first.provider_type = Some("codex".to_string());
+        first.report_context = Some(json!({
+            "codex_credential_generation": "credential-generation-1"
+        }));
+        // 把显式 auth_header 命名为 turn-scoped 头：认证分类必须优先，
+        // 不能借 turn-scoped 排除把凭据变化挡在身份之外。
+        first.auth_header = Some("x-codex-turn-metadata".to_string());
+        first.auth_value = Some("Bearer 合成令牌-一".to_string());
+        first.provider_request_headers.insert(
+            "x-codex-turn-metadata".to_string(),
+            "Bearer 合成令牌-一".to_string(),
+        );
+        let first_identity = UpstreamBindingIdentity::from_decision(adapter, &first)
+            .expect("legal UTF-8 auth values must not be rejected");
+        assert!(!first_identity
+            .handshake_headers
+            .contains_key("x-codex-turn-metadata"));
+
+        let mut rotated = first;
+        rotated.auth_value = Some("Bearer 合成令牌-二".to_string());
+        rotated.provider_request_headers.insert(
+            "x-codex-turn-metadata".to_string(),
+            "Bearer 合成令牌-二".to_string(),
+        );
+        assert_ne!(
+            first_identity,
+            UpstreamBindingIdentity::from_decision(adapter, &rotated).unwrap()
+        );
+    }
+
+    #[test]
+    fn utf8_codex_access_token_refresh_still_reuses_the_credential_generation() {
+        let adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Codex);
+        let mut first = decision();
+        first.provider_type = Some("codex".to_string());
+        first.report_context = Some(json!({
+            "codex_credential_generation": "credential-generation-1"
+        }));
+        first.auth_value = Some("Bearer 合成令牌-一".to_string());
+        first.provider_request_headers.insert(
+            "Authorization".to_string(),
+            "Bearer 合成令牌-一".to_string(),
+        );
+        let first_identity = UpstreamBindingIdentity::from_decision(adapter, &first)
+            .expect("legal UTF-8 bearer values must not be rejected");
+
+        // 同一 credential generation 下的访问令牌轮换（值含 UTF-8）不换连接：
+        // planner 持有的 bearer 按字节识别并从稳定凭据指纹中剔除。
+        let mut refreshed = first;
+        refreshed.auth_value = Some("Bearer 合成令牌-二".to_string());
+        refreshed.provider_request_headers.insert(
+            "Authorization".to_string(),
+            "Bearer 合成令牌-二".to_string(),
+        );
+        assert_eq!(
+            first_identity,
+            UpstreamBindingIdentity::from_decision(adapter, &refreshed).unwrap()
         );
     }
 }

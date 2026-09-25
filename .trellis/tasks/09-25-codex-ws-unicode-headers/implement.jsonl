@@ -1,0 +1,4 @@
+{"file":".trellis/tasks/09-25-codex-ws-unicode-headers/prd.md","reason":"需求、设计、归属及验证"}
+{"file":".trellis/spec/aether-gateway-execution/backend/codex-logical-identity-contract.md","reason":"turn/connection/credential稳定性"}
+{"file":".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md","reason":"同格式保真与凭据边界"}
+{"file":".trellis/spec/guides/index.md","reason":"共享开发指南"}

@@ -1310,7 +1310,10 @@ mod tests {
         ResponsesWebSocketTurnOutcome, ResponsesWebSocketTurnTimeoutPhase,
     };
     use super::super::turn_state::{LogicalTurn, ResponsesTurnState};
-    use super::super::upstream::bind_responses_upstream;
+    use super::super::upstream::{
+        bind_responses_upstream, decision_bound_upstream_change_fields,
+        decision_reuses_bound_upstream, send_responses_websocket_upstream_message,
+    };
     use crate::ai_serving::{
         AiExecutionDecision, OpenAiResponsesReasoningReplayPolicy,
         ResponsesWebSocketBodyNormalization,
@@ -1320,6 +1323,10 @@ mod tests {
         websocket_handshake_headers, websocket_timeouts, websocket_upstream_url,
     };
     use crate::privacy::{RedactionSession, RedactionSessionConfig};
+    use aether_provider_transport::snapshot::{
+        GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
+        GatewayProviderTransportProvider, GatewayProviderTransportSnapshot,
+    };
     use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
     use axum::extract::State;
     use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -1331,14 +1338,19 @@ mod tests {
     use serde_json::json;
     use tokio::sync::{oneshot, Mutex};
 
-    #[derive(Default)]
     struct MockState {
         observed: Mutex<Option<oneshot::Sender<ObservedInitialEvent>>>,
+        // 已完成 HTTP Upgrade 的握手数：续接不得产生新握手。
+        handshakes: Arc<AtomicUsize>,
     }
 
     struct ObservedInitialEvent {
         authorization_present: bool,
         account_header_present: bool,
+        // 握手中 x-codex-turn-metadata 的 HeaderValue 原始字节。
+        turn_metadata_bytes: Option<Vec<u8>>,
+        // 握手中稳定 UTF-8 头 x-codex-workspace-name 的原始字节。
+        workspace_name_bytes: Option<Vec<u8>>,
         event: serde_json::Value,
     }
 
@@ -2110,7 +2122,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_binding_uses_provider_headers_and_rewrites_the_first_event() {
-        let (upstream_url, observed, server) = spawn_mock_server().await;
+        let (upstream_url, observed, server, handshakes) = spawn_mock_server().await;
         let mut decision = sample_decision();
         decision.upstream_url = Some(upstream_url);
         decision.provider_request_headers = BTreeMap::from([
@@ -2169,16 +2181,311 @@ mod tests {
         assert!(observed.event.get("stream").is_none());
         assert!(observed.event.get("background").is_none());
         assert!(matches!(response, wreq::ws::message::Message::Text(_)));
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn codex_unicode_turn_metadata_binds_and_continuations_reuse_the_socket() {
+        let (upstream_url, observed, server, handshakes) = spawn_mock_server().await;
+        // 真实收敛路径生成握手头：客户端 turn 元数据带合成中文工作区与非 BMP
+        // 字符，经 transport crate 的指纹收敛（ASCII-safe 重写）与 gateway 的
+        // 逻辑 turn 上下文封装产出最终 provider 请求头。
+        let transport = synthetic_codex_convergence_transport();
+        let client_event = json!({
+            "type": "response.create",
+            "model": "public-model",
+            "input": "hello"
+        });
+        let first_headers =
+            converged_codex_handshake_headers(&transport, &client_event, "logical-turn-synth-1", 1);
+        let continuation_headers =
+            converged_codex_handshake_headers(&transport, &client_event, "logical-turn-synth-2", 2);
+        // 收敛只轮换 turn 元数据；稳定身份头跨逻辑 turn 必须保持一致。
+        for name in [
+            "session-id",
+            "thread-id",
+            "x-session-id",
+            "x-codex-installation-id",
+            "x-codex-window-id",
+            "x-client-request-id",
+        ] {
+            assert_eq!(
+                first_headers.get(name),
+                continuation_headers.get(name),
+                "converged stable header {name} must not rotate across turns"
+            );
+        }
+        let first_metadata = first_headers
+            .get("x-codex-turn-metadata")
+            .expect("convergence must rewrite turn metadata")
+            .clone();
+        assert!(
+            first_metadata.is_ascii(),
+            "converged turn metadata must stay ASCII-safe: {first_metadata:?}"
+        );
+        assert_ne!(
+            first_headers.get("x-codex-turn-metadata"),
+            continuation_headers.get("x-codex-turn-metadata"),
+            "turn metadata must rotate across logical turns"
+        );
+
+        let mut decision = sample_decision();
+        decision.provider_type = Some("codex".to_string());
+        decision.provider_api_format = Some("openai:responses".to_string());
+        decision.upstream_url = Some(upstream_url);
+        decision.report_context =
+            Some(json!({"codex_credential_generation": "credential-generation-1"}));
+        decision.provider_request_headers = first_headers;
+        decision.provider_request_body = Some(json!({
+            "model": "provider-model",
+            "input": "hello",
+            "stream": true,
+            "background": true,
+        }));
+
+        let adapter = resolve_responses_websocket_adapter(
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+        );
+        let mut bound = bind_responses_upstream(
+            &decision,
+            ResponsesWebSocketBodyNormalization::for_tests("provider-model"),
+            &client_event,
+            adapter,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("legal UTF-8 handshake headers must not be rejected as headers_invalid");
+        // bind 内部已发出首条 response.create：先消费并解析第一轮回复，后续
+        // 收到的才是续接响应而不是滞留的旧帧。
+        let first_reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            bound
+                .upstream
+                .as_mut()
+                .expect("bound upstream should be present")
+                .recv(),
+        )
+        .await
+        .expect("mock should answer the first turn")
+        .expect("upstream should remain open")
+        .expect("first upstream response should be valid");
+        assert_mock_response_created(&first_reply, "resp-test-0");
+
+        let observed = tokio::time::timeout(Duration::from_secs(2), observed)
+            .await
+            .expect("mock should observe first event")
+            .expect("mock event channel should remain open");
+        // 上游按字节看到收敛后的 ASCII 转义 JSON；解析后中文与非 BMP 语义不变。
+        let observed_metadata = observed
+            .turn_metadata_bytes
+            .as_deref()
+            .expect("upstream should receive x-codex-turn-metadata");
+        assert_eq!(observed_metadata, first_metadata.as_bytes());
+        let parsed_metadata: serde_json::Value =
+            serde_json::from_slice(observed_metadata).expect("metadata should be JSON");
+        assert_eq!(parsed_metadata["workspace"], "合成工作区𝕏");
+        assert_ne!(
+            parsed_metadata["turn_id"].as_str(),
+            Some("client-turn-1"),
+            "turn identity must be converged away from the client value"
+        );
+        // 稳定 UTF-8 头按原始字节透传，不做 lossy 改写。
+        assert_eq!(
+            observed.workspace_name_bytes.as_deref(),
+            Some("合成窗口-一".as_bytes())
+        );
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+
+        // 续接 turn：稳定头相同、仅 turn 元数据轮换 → 同一连接身份 → 不重连。
+        let mut continuation = decision.clone();
+        continuation.provider_request_headers = continuation_headers;
+        assert!(decision_reuses_bound_upstream(
+            &bound,
+            adapter,
+            &continuation
+        ));
+        send_responses_websocket_upstream_message(
+            bound
+                .upstream
+                .as_mut()
+                .expect("bound upstream should be present"),
+            wreq::ws::message::Message::text(
+                r#"{"type":"response.create","model":"provider-model","input":"again"}"#
+                    .to_string(),
+            ),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("the second turn should send over the same socket");
+        let second_reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            bound
+                .upstream
+                .as_mut()
+                .expect("bound upstream should be present")
+                .recv(),
+        )
+        .await
+        .expect("mock should answer the second turn on the same socket")
+        .expect("upstream should remain open")
+        .expect("second upstream response should be valid");
+        assert_mock_response_created(&second_reply, "resp-test-1");
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+        server.abort();
+
+        // 稳定头变化（仍是 UTF-8）必须重绑，且诊断指明具体头。
+        let mut rebound = continuation;
+        rebound.provider_request_headers.insert(
+            "x-codex-workspace-name".to_string(),
+            "合成窗口-二".to_string(),
+        );
+        assert!(!decision_reuses_bound_upstream(&bound, adapter, &rebound));
+        assert_eq!(
+            decision_bound_upstream_change_fields(&bound, adapter, &rebound),
+            vec!["handshake_header:x-codex-workspace-name".to_string()]
+        );
+    }
+
+    /// 构造启用指纹收敛的合成 Codex 传输快照；全部字段为合成数据。
+    fn synthetic_codex_convergence_transport() -> GatewayProviderTransportSnapshot {
+        GatewayProviderTransportSnapshot {
+            provider: GatewayProviderTransportProvider {
+                id: "provider-codex-synth".to_string(),
+                name: "Codex".to_string(),
+                provider_type: "codex".to_string(),
+                website: None,
+                is_active: true,
+                keep_priority_on_conversion: false,
+                enable_format_conversion: true,
+                concurrent_limit: None,
+                max_retries: None,
+                proxy: None,
+                request_timeout_secs: None,
+                stream_first_byte_timeout_secs: None,
+                config: Some(json!({
+                    "codex": {"fingerprint_convergence_enabled": true}
+                })),
+            },
+            endpoint: GatewayProviderTransportEndpoint {
+                id: "endpoint-codex-synth".to_string(),
+                provider_id: "provider-codex-synth".to_string(),
+                api_format: "openai:responses".to_string(),
+                api_family: Some("openai".to_string()),
+                endpoint_kind: Some("responses".to_string()),
+                is_active: true,
+                base_url: "https://codex-synth.example.test/backend-api/codex".to_string(),
+                header_rules: None,
+                body_rules: None,
+                max_retries: None,
+                custom_path: None,
+                config: None,
+                format_acceptance_config: None,
+                proxy: None,
+            },
+            key: GatewayProviderTransportKey {
+                id: "key-codex-synth".to_string(),
+                provider_id: "provider-codex-synth".to_string(),
+                name: "Codex key".to_string(),
+                auth_type: "oauth".to_string(),
+                is_active: true,
+                api_formats: Some(vec!["openai:responses".to_string()]),
+                auth_type_by_format: None,
+                allow_auth_channel_mismatch_formats: None,
+                allowed_models: None,
+                capabilities: None,
+                rate_multipliers: None,
+                global_priority_by_format: None,
+                expires_at_unix_secs: None,
+                proxy: None,
+                fingerprint: None,
+                upstream_metadata: None,
+                decrypted_api_key: "synthetic-access-token".to_string(),
+                decrypted_auth_config: Some(json!({"account_id": "account-synth-1"}).to_string()),
+            },
+        }
+    }
+
+    /// 通过生产收敛路径（gateway 上下文封装 + transport 指纹收敛）生成一个
+    /// 逻辑 turn 的最终握手头。
+    fn converged_codex_handshake_headers(
+        transport: &GatewayProviderTransportSnapshot,
+        client_event: &serde_json::Value,
+        logical_turn_id: &str,
+        client_turn: u64,
+    ) -> BTreeMap<String, String> {
+        let mut headers = BTreeMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer synthetic-codex-token".to_string(),
+            ),
+            ("content-type".to_string(), "application/json".to_string()),
+            // 未知稳定头，收敛不接管：原始 UTF-8 必须按字节透传。
+            (
+                "x-codex-workspace-name".to_string(),
+                "合成窗口-一".to_string(),
+            ),
+            (
+                "x-codex-turn-metadata".to_string(),
+                json!({
+                    "turn_id": format!("client-turn-{client_turn}"),
+                    "turn_started_at_unix_ms": client_turn,
+                    "workspace": "合成工作区𝕏"
+                })
+                .to_string(),
+            ),
+        ]);
+        let request = http::Request::builder()
+            .method("POST")
+            .header("thread-id", "thread-synth-1")
+            .body(())
+            .expect("synthetic request should build");
+        let (mut parts, ()) = request.into_parts();
+        let context = crate::ai_serving::codex_context::attach_codex_logical_turn_context(
+            &mut parts,
+            client_event,
+            logical_turn_id,
+        );
+        let mut body = client_event.clone();
+        assert!(
+            crate::ai_serving::transport::apply_codex_fingerprint_convergence_with_context(
+                transport,
+                "openai:responses",
+                &context,
+                &mut headers,
+                &mut body
+            ),
+            "synthetic codex transport must enable fingerprint convergence"
+        );
+        headers
+    }
+
+    /// 解析 mock 上游回复并断言其属于指明 turn 的 response.created 事件。
+    fn assert_mock_response_created(message: &wreq::ws::message::Message, expected_id: &str) {
+        let wreq::ws::message::Message::Text(text) = message else {
+            panic!("expected a text reply for {expected_id}, got a non-text frame");
+        };
+        let event: serde_json::Value =
+            serde_json::from_slice(text.as_bytes()).expect("mock reply should be JSON");
+        assert_eq!(event["type"], "response.created", "reply for {expected_id}");
+        assert_eq!(
+            event["response"]["id"], expected_id,
+            "reply must belong to the expected mock turn"
+        );
     }
 
     async fn spawn_mock_server() -> (
         String,
         oneshot::Receiver<ObservedInitialEvent>,
         tokio::task::JoinHandle<()>,
+        Arc<AtomicUsize>,
     ) {
         let (observed_tx, observed_rx) = oneshot::channel();
+        let handshakes = Arc::new(AtomicUsize::new(0));
         let state = Arc::new(MockState {
             observed: Mutex::new(Some(observed_tx)),
+            handshakes: Arc::clone(&handshakes),
         });
         let app = Router::new()
             .route("/v1/responses", get(mock_websocket))
@@ -2198,6 +2505,7 @@ mod tests {
             format!("http://{address}/v1/responses"),
             observed_rx,
             server,
+            handshakes,
         )
     }
 
@@ -2206,13 +2514,30 @@ mod tests {
         State(state): State<Arc<MockState>>,
         headers: HeaderMap,
     ) -> impl IntoResponse {
+        state.handshakes.fetch_add(1, Ordering::SeqCst);
         let authorization_present = headers
             .get("authorization")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("Bearer "));
         let account_header_present = headers.contains_key("chatgpt-account-id");
+        // 按 HeaderValue 原始字节捕获 turn 元数据与稳定 UTF-8 头，验证合法
+        // 非 ASCII 值原样透传、不被 lossy 改写。
+        let turn_metadata_bytes = headers
+            .get("x-codex-turn-metadata")
+            .map(|value| value.as_bytes().to_vec());
+        let workspace_name_bytes = headers
+            .get("x-codex-workspace-name")
+            .map(|value| value.as_bytes().to_vec());
         ws.on_upgrade(move |socket| async move {
-            serve_mock_socket(socket, state, authorization_present, account_header_present).await;
+            serve_mock_socket(
+                socket,
+                state,
+                authorization_present,
+                account_header_present,
+                turn_metadata_bytes,
+                workspace_name_bytes,
+            )
+            .await;
         })
     }
 
@@ -2221,30 +2546,40 @@ mod tests {
         state: Arc<MockState>,
         authorization_present: bool,
         account_header_present: bool,
+        mut turn_metadata_bytes: Option<Vec<u8>>,
+        mut workspace_name_bytes: Option<Vec<u8>>,
     ) {
         let (mut sender, mut receiver) = socket.split();
-        let message = receiver
-            .next()
-            .await
-            .expect("client should send the initial event")
-            .expect("initial event should be valid");
-        let Message::Text(text) = message else {
-            panic!("expected a text response.create event");
-        };
-        let event = serde_json::from_str(text.as_str()).expect("event should be JSON");
-        let _ = sender
-            .send(Message::Text(
-                json!({"type": "response.created", "response": {"id": "resp-test"}})
+        // 服务两个 turn：同一 socket 上的续接必须命中同一连接，而不是新握手。
+        for turn in 0..2 {
+            let Some(Ok(message)) = receiver.next().await else {
+                return;
+            };
+            let Message::Text(text) = message else {
+                panic!("expected a text response.create event");
+            };
+            let event = serde_json::from_str(text.as_str()).expect("event should be JSON");
+            let _ = sender
+                .send(Message::Text(
+                    json!({
+                        "type": "response.created",
+                        "response": {"id": format!("resp-test-{turn}")}
+                    })
                     .to_string()
                     .into(),
-            ))
-            .await;
-        if let Some(observed) = state.observed.lock().await.take() {
-            let _ = observed.send(ObservedInitialEvent {
-                authorization_present,
-                account_header_present,
-                event,
-            });
+                ))
+                .await;
+            if turn == 0 {
+                if let Some(observed) = state.observed.lock().await.take() {
+                    let _ = observed.send(ObservedInitialEvent {
+                        authorization_present,
+                        account_header_present,
+                        turn_metadata_bytes: turn_metadata_bytes.take(),
+                        workspace_name_bytes: workspace_name_bytes.take(),
+                        event,
+                    });
+                }
+            }
         }
     }
 

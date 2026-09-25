@@ -21,6 +21,14 @@ The Responses API supports a WebSocket mode for long-running, tool-call-heavy wo
 
 WebSocket mode is compatible with both Zero Data Retention (ZDR) and `store=false`.
 
+### Codex 非 ASCII 元数据与连接身份
+
+Codex `x-codex-turn-metadata` 可以包含中文工作区、非 BMP 字符和未知嵌套属性。启用指纹收敛后，Aether 重写身份字段并以 ASCII-safe JSON 输出该头（Unicode 使用 `\uXXXX`，非 BMP 使用 UTF-16 代理对），解析后的元数据语义不变；正文仍是普通 UTF-8 JSON。未启用收敛与 Compact 请求沿用原有行为。
+
+WebSocket 连接身份按已验证 `HeaderValue` 的原始字节比较，不使用 ASCII-only `to_str()`，因此不会再把合法 UTF-8 头误报为 `codex_websocket_headers_invalid`。Codex turn metadata 与 trace 头不参与稳定连接身份；显式认证头优先于该排除规则。稳定头或凭据变化仍触发身份变化，原有 ASCII 指纹与 Codex token refresh 的 credential-generation 语义保持兼容。
+
+非法头名、CR/LF/NUL 等控制字符仍拒绝。此修复不删除元数据、不绕过认证、不更改 User-Agent，也不把 WS 降级为 HTTP。客户端 WS 入口仍为 `GET /v1/responses` 的 Upgrade，Codex 上游为 `/backend-api/codex/responses`；HTTP POST 的审计导出不等于实际 WS 握手。
+
 ## OpenAI Realtime WebSocket bridge
 
 Configure an active `openai:realtime` provider endpoint, then connect to:
