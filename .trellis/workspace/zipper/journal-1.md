@@ -1062,3 +1062,26 @@ Implemented independent quota sources, official plan recognition, regional query
 ### Status
 
 [OK] **Completed**
+
+
+## Session 41: 发布并验证 Aether v0.7.40
+
+**Date**: 2026-09-25
+**Task**: 发布并验证 Aether v0.7.40
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+先完成exact-SHA Rust CI18/18，再推annotated v0.7.40；Release8/8、6项资产本地哈希和包结构、4个签名subject及GHCR双架构provenance全部通过。Pages保持停用，未部署154，临时校验文件已清理。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ec4d8d1da` | (see git log) |
+| `1f953b84d` | (see git log) |
+
+### Status
+
+[OK] **Completed**
