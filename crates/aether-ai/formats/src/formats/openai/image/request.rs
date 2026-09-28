@@ -788,7 +788,6 @@ pub fn project_openai_image_api_request_body(
                 model_family,
                 OpenAiImageModelFamily::DallE2 | OpenAiImageModelFamily::DallE3
             )
-            || (model_family == OpenAiImageModelFamily::GptImage2 && value == "transparent")
             || (value == "transparent"
                 && !matches!(output_format.as_deref().unwrap_or("png"), "png" | "webp"))
         {
@@ -2698,6 +2697,94 @@ mod tests {
     }
 
     #[test]
+    fn gpt_image_2_transparent_background_survives_public_and_codex_projection() {
+        let parts = request_parts("/v1/images/generations", Some("application/json"));
+        for output_format in ["png", "webp"] {
+            // 154 号已采集请求：gpt-image-2、n=1、1024x1536、透明背景。
+            let body = json!({
+                "model": "gpt-image-2",
+                "prompt": "a red panda mascot",
+                "n": 1,
+                "size": "1024x1536",
+                "background": "transparent",
+                "output_format": output_format,
+            });
+            let request = normalize_openai_image_request(&parts, &body, None)
+                .expect("transparent background with an alpha-capable format should normalize");
+            let expected = body.clone();
+            assert_eq!(
+                build_openai_image_api_provider_request_body(&request, None, false),
+                Some(expected.clone()),
+                "public projection should keep the transparent background for {output_format}"
+            );
+            assert_eq!(
+                build_codex_openai_image_api_provider_request_body(&request, None, false),
+                Some(expected.clone()),
+                "Codex projection should keep the transparent background for {output_format}"
+            );
+            assert_eq!(
+                project_codex_openai_image_api_request_body(&body, OpenAiImageOperation::Generate),
+                Some(expected),
+                "direct Codex projection should keep the transparent background for {output_format}"
+            );
+        }
+
+        // 与已删除旧断言同形：未显式指定 output_format 时按默认 png 放行透明背景。
+        let default_format_body = json!({
+            "model": "gpt-image-2",
+            "prompt": "generate image",
+            "background": "transparent"
+        });
+        assert_eq!(
+            project_openai_image_api_request_body(
+                &default_format_body,
+                "gpt-image-2",
+                OpenAiImageOperation::Generate,
+                10,
+            ),
+            Some(default_format_body.clone())
+        );
+        assert_eq!(
+            project_codex_openai_image_api_request_body(
+                &default_format_body,
+                OpenAiImageOperation::Generate
+            ),
+            Some(default_format_body)
+        );
+    }
+
+    #[test]
+    fn gpt_image_2_transparent_background_still_rejects_jpeg_output() {
+        let parts = request_parts("/v1/images/generations", Some("application/json"));
+        let body = json!({
+            "model": "gpt-image-2",
+            "prompt": "a red panda mascot",
+            "n": 1,
+            "size": "1024x1536",
+            "background": "transparent",
+            "output_format": "jpeg",
+        });
+        let request = normalize_openai_image_request(&parts, &body, None)
+            .expect("jpeg output format stays valid; transparency is rejected at projection");
+        // JPEG 无法承载透明像素：透明背景仅允许 png/webp，该边界保持 fail-closed。
+        assert!(build_openai_image_api_provider_request_body(&request, None, false).is_none());
+        assert!(
+            build_codex_openai_image_api_provider_request_body(&request, None, false).is_none()
+        );
+        assert!(project_openai_image_api_request_body(
+            &body,
+            "gpt-image-2",
+            OpenAiImageOperation::Generate,
+            10,
+        )
+        .is_none());
+        assert!(
+            project_codex_openai_image_api_request_body(&body, OpenAiImageOperation::Generate)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn rejects_fields_outside_the_codex_images_contract() {
         let parts = request_parts("/v1/images/edits", Some("application/json"));
         for unsupported in [
@@ -2872,11 +2959,6 @@ mod tests {
         assert_eq!(gpt_image_2["size"], "1536x864");
 
         for invalid in [
-            json!({
-                "model": "gpt-image-2",
-                "prompt": "generate image",
-                "background": "transparent"
-            }),
             json!({
                 "model": "gpt-image-2",
                 "prompt": "generate image",
