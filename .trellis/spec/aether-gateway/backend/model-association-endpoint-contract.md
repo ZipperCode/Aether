@@ -10,6 +10,7 @@
 - Exact creation: `createModel(providerId, { global_model_id, provider_model_name, endpoint_ids? })`
 - Compatibility fallback: `batchAssignModelsToProvider(providerId, globalModelIds)`
 - Each discovered model is shaped as `UpstreamModel { id, api_formats, endpoint_ids? }`.
+- Manual Endpoint choices: `getProviderEndpoints(providerId) -> ProviderEndpoint[]`.
 
 ## 3. Contracts
 
@@ -21,6 +22,9 @@
 - 用户显式导入发现模型时，继续传递完整的 `id`、`api_formats`、`endpoint_ids`；发现列表沿用共享的大小写不敏感内部模型过滤，不从额度响应自动发起目录导入。
 - Saving is unavailable while the initial aggregate query is pending. Async results may update state only when Provider ID, open state, and dialog session still match.
 - If discovery returns no usable model, the existing batch inference path remains available for single-Endpoint Providers, explicit metadata, and Providers that do not publish a model list.
+- Every newly selected model exposes manual association, even when discovery is empty or failed. In **手动指定模型与 Endpoint**, prefill the Global Model name, allow editing the real upstream name, and require explicit selection of at least one Provider Endpoint. Never infer support from a model-name prefix or select all Endpoints automatically.
+- Manual entries call `createModel` with the trimmed name and selected `endpoint_ids`, never batch inference. Discovery refresh cannot overwrite manual names or bindings. Deselecting a row, closing/reopening, or changing Providers discards its manual state.
+- Endpoint loading is session-fenced separately from manual input resets; synchronizing existing associations must not erase freshly loaded Endpoint choices. Manual-mode select values must not collide with real upstream model IDs.
 
 ## 4. Validation & Error Matrix
 
@@ -32,6 +36,9 @@
 | Aggregate query empty or failed | Keep the compatibility fallback |
 | Response belongs to an old dialog session | Discard it without changing current state |
 | Endpoint ID is empty, duplicated, or foreign | Normalize duplicates in the UI; backend validation rejects empty or foreign IDs |
+| Manual name blank/whitespace or no Endpoint selected | Show inline guidance; disable Save and guard all writes, including pending deletions |
+| Endpoint list failed or empty | Show the loading failure or missing-Endpoint guidance; manual association remains unavailable |
+| Manual row followed by discovery refresh | Preserve manual name and chosen Endpoints |
 | 额度刷新发现可路由或内部模型 | 保留上游额度元数据，不写模型目录 |
 | 删除全局模型后再次刷新额度 | 不恢复全局模型、提供商模型或 Endpoint 绑定 |
 | 用户显式导入模型 | 按原导入流程创建目录记录，保留准确 Endpoint 证据 |
@@ -41,6 +48,7 @@
 - Good：用户确认导入 `gemini-3.7-flash` 后，以发现的 Endpoint IDs 创建 Provider Model；仅刷新额度时不创建。
 - Base: a Provider with no published upstream list continues through existing backend inference.
 - Bad: `gemini-3.8` must not silently choose `gemini-3.8-flash-high`; the user selects that mapping explicitly.
+- Good: `gpt-6.1-sol` absent from discovery is explicitly associated with the known-working Responses Endpoint; its absence is not treated as proof that it cannot be called.
 
 ## 6. Tests Required
 
@@ -49,6 +57,9 @@
 - Race path: keep discovery pending and assert save is disabled and guarded.
 - Session path: resolve an older request after reopening and assert that only current-session models are rendered.
 - Contract path: frontend type-checking must include `endpoint_ids` on the provider-query response type.
+- Manual boundaries: empty/whitespace names and missing Endpoints block every write; completing the row saves only the selected binding.
+- Manual precedence/session isolation: Key refresh cannot replace manual edits; deselection, reopen, Provider switches, and stale Endpoint responses cannot leak bindings.
+- Select collision: a discovered model literally named `__manual__` remains a discovered model, not the manual-mode control.
 - 管理端额度路径：通过真实刷新接口验证额度与发现元数据正常持久化、既有模型及手动绑定不变；删除全局模型后再次刷新仍无目录记录。另保留显式导入成功与失败清理的行为测试。
 
 ## 7. Wrong vs Correct
@@ -60,3 +71,5 @@ Test only a hidden or optional Key-selection path, then assume the normal “sel
 ### Correct
 
 Load aggregate upstream evidence on the default path, guard saving until it settles, and keep manual Key selection only as an explicit refresh or disambiguation tool.
+
+Do not ask users to select an Endpoint without exposing that action in the normal association dialog. Keep both discovered evidence and explicit manual association reachable.

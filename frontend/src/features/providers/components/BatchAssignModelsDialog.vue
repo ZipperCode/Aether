@@ -119,35 +119,150 @@
                         {{ model.name }}
                       </p>
                       <div
-                        v-if="globalModelsToAdd.includes(model.id) && upstreamModels.length > 0"
-                        class="mt-2 space-y-1"
+                        v-if="globalModelsToAdd.includes(model.id)"
+                        class="mt-2 space-y-2"
                         @click.stop
                       >
-                        <label
-                          :for="`upstream-model-${model.id}`"
-                          class="block text-xs text-muted-foreground"
-                        >
-                          真实上游模型（可选）
-                        </label>
-                        <select
-                          :id="`upstream-model-${model.id}`"
-                          :value="selectedUpstreamModelIds.get(model.id) || ''"
-                          :aria-label="`为 ${model.display_name} 选择上游模型`"
-                          class="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
-                          @click.stop
-                          @change="setUpstreamModelSelection(model.id, $event)"
-                        >
-                          <option value="">
-                            未指定（使用全局模型名自动推断）
-                          </option>
-                          <option
-                            v-for="upstreamModel in upstreamModels"
-                            :key="upstreamModel.id"
-                            :value="upstreamModel.id"
+                        <div class="space-y-1">
+                          <label
+                            :for="`upstream-model-${model.id}`"
+                            class="block text-xs text-muted-foreground"
                           >
-                            {{ upstreamModel.id }}
-                          </option>
-                        </select>
+                            真实上游模型（可选）
+                          </label>
+                          <select
+                            :id="`upstream-model-${model.id}`"
+                            :value="getUpstreamSelectValue(model.id)"
+                            :aria-label="`为 ${model.display_name} 选择上游模型`"
+                            class="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
+                            @change="setUpstreamModelSelection(model.id, $event)"
+                          >
+                            <option value="">
+                              未指定（使用全局模型名自动推断）
+                            </option>
+                            <option :value="MANUAL_MODE_VALUE">
+                              手动指定模型与 Endpoint
+                            </option>
+                            <option
+                              v-for="upstreamModel in upstreamModels"
+                              :key="upstreamModel.id"
+                              :value="encodeUpstreamModelOption(upstreamModel.id)"
+                            >
+                              {{ upstreamModel.id }}
+                            </option>
+                          </select>
+                        </div>
+
+                        <!-- 手动配置区域 -->
+                        <div
+                          v-if="manualModelIds.has(model.id)"
+                          class="space-y-2.5 p-2.5 rounded-md border border-border/80 bg-muted/20"
+                          :data-testid="`manual-config-${model.id}`"
+                        >
+                          <!-- 真实上游模型名称 -->
+                          <div class="space-y-1">
+                            <label
+                              :for="`manual-model-name-${model.id}`"
+                              class="block text-xs text-muted-foreground"
+                            >
+                              真实上游模型名称
+                            </label>
+                            <Input
+                              :id="`manual-model-name-${model.id}`"
+                              :model-value="getManualProviderModelName(model.id)"
+                              placeholder="例如 gpt-6.1-sol"
+                              class="h-8 text-xs font-mono"
+                              data-testid="manual-model-name-input"
+                              :data-model-id="model.id"
+                              @update:model-value="updateManualProviderModelName(model.id, $event)"
+                            />
+                            <p
+                              v-if="!isManualModelNameValid(model.id)"
+                              class="text-xs text-destructive"
+                              data-testid="manual-model-name-error"
+                            >
+                              请输入真实上游模型名称（不可为空或仅包含空白字符）
+                            </p>
+                          </div>
+
+                          <!-- 端点多选 -->
+                          <div
+                            class="space-y-1.5"
+                            data-testid="manual-endpoints-group"
+                            :data-model-id="model.id"
+                          >
+                            <label class="block text-xs text-muted-foreground">
+                              选择 Endpoint（至少选择一个）
+                            </label>
+
+                            <div
+                              v-if="loadingEndpoints"
+                              class="flex items-center gap-1.5 py-2 text-xs text-muted-foreground"
+                            >
+                              <Loader2 class="w-3.5 h-3.5 animate-spin text-primary" />
+                              <span>正在加载端点...</span>
+                            </div>
+
+                            <div
+                              v-else-if="endpointLoadError"
+                              class="flex items-center justify-between text-xs text-destructive py-1"
+                              data-testid="manual-endpoints-error"
+                            >
+                              <span>{{ endpointLoadError }}</span>
+                              <button
+                                type="button"
+                                class="text-xs text-primary hover:underline ml-2 shrink-0"
+                                @click="retryLoadEndpoints"
+                              >
+                                重试
+                              </button>
+                            </div>
+
+                            <div
+                              v-else-if="providerEndpoints.length === 0"
+                              class="text-xs text-destructive py-1"
+                              data-testid="manual-endpoints-empty"
+                            >
+                              当前提供商暂无可用 Endpoint，请先在提供商详情中添加端点
+                            </div>
+
+                            <template v-else>
+                              <div class="space-y-1 max-h-36 overflow-y-auto rounded border border-border p-2 bg-background">
+                                <label
+                                  v-for="endpoint in providerEndpoints"
+                                  :key="endpoint.id"
+                                  class="flex items-center gap-2 text-xs cursor-pointer hover:bg-muted/50 p-1 rounded"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    :value="endpoint.id"
+                                    :checked="isEndpointSelectedForModel(model.id, endpoint.id)"
+                                    :data-testid="`manual-endpoint-checkbox-${endpoint.id}`"
+                                    class="rounded border-input text-primary focus:ring-primary h-3.5 w-3.5 shrink-0"
+                                    @change="toggleEndpointSelection(model.id, endpoint.id, $event)"
+                                  >
+                                  <span class="font-mono text-xs px-1 py-0.5 rounded bg-muted text-muted-foreground shrink-0">
+                                    {{ endpoint.api_format }}
+                                  </span>
+                                  <span
+                                    class="font-mono text-xs truncate flex-1 text-foreground"
+                                    :title="endpoint.base_url"
+                                  >
+                                    {{ endpoint.base_url }}
+                                  </span>
+                                </label>
+                              </div>
+
+                              <p
+                                v-if="!isManualEndpointsValid(model.id)"
+                                class="text-xs text-destructive"
+                                data-testid="manual-endpoint-error"
+                              >
+                                请至少选择一个 Endpoint
+                              </p>
+                            </template>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -174,12 +289,21 @@
     </template>
     <template #footer>
       <div class="flex items-center justify-between w-full">
-        <p class="text-xs text-muted-foreground">
-          {{ hasChanges ? `${pendingChangesCount} 项更改待保存` : '' }}
-        </p>
+        <div class="space-y-0.5">
+          <p class="text-xs text-muted-foreground">
+            {{ hasChanges ? `${pendingChangesCount} 项更改待保存` : '' }}
+          </p>
+          <p
+            v-if="hasChanges && manualValidationErrorMessage"
+            class="text-xs text-destructive"
+            data-testid="manual-save-disabled-reason"
+          >
+            {{ manualValidationErrorMessage }}
+          </p>
+        </div>
         <div class="flex items-center gap-2">
           <Button
-            :disabled="!hasChanges || saving || fetchingAutoMatchedModels"
+            :disabled="!hasChanges || saving || fetchingAutoMatchedModels || loadingEndpoints || hasInvalidManualRows"
             @click="handleSave"
           >
             <Loader2
@@ -223,12 +347,14 @@ import {
 import {
   getProviderModels,
   getProviderKeys,
+  getProviderEndpoints,
   batchAssignModelsToProvider,
   createModel,
   deleteModel,
   type Model,
   type EndpointAPIKey,
   type UpstreamModel,
+  type ProviderEndpoint,
 } from '@/api/endpoints'
 
 type AutoMatchKey = Pick<EndpointAPIKey, 'id' | 'name' | 'api_key_masked'>
@@ -275,6 +401,150 @@ const upstreamModels = ref<UpstreamModel[]>([])
 const selectedGlobalModelIds = ref<Set<string>>(new Set())
 // 本轮新增关联中，Global Model ID 到真实上游模型 ID 的显式对应关系。
 const selectedUpstreamModelIds = ref<Map<string, string>>(new Map())
+// 手动关联模式状态（仅属于当前弹窗会话，打开/关闭/切换 Provider/取消勾选时清理）
+const manualModelIds = ref<Set<string>>(new Set())
+const manualProviderModelNames = ref<Map<string, string>>(new Map())
+const manualSelectedEndpointIds = ref<Map<string, Set<string>>>(new Map())
+
+// 端点数据与状态
+const loadingEndpoints = ref(false)
+const endpointLoadError = ref<string | null>(null)
+const providerEndpoints = ref<ProviderEndpoint[]>([])
+
+const MANUAL_MODE_VALUE = '__manual__'
+
+function clearManualStateForModel(globalModelId: string) {
+  const nextManual = new Set(manualModelIds.value)
+  nextManual.delete(globalModelId)
+  manualModelIds.value = nextManual
+
+  const nextNames = new Map(manualProviderModelNames.value)
+  nextNames.delete(globalModelId)
+  manualProviderModelNames.value = nextNames
+
+  const nextEndpoints = new Map(manualSelectedEndpointIds.value)
+  nextEndpoints.delete(globalModelId)
+  manualSelectedEndpointIds.value = nextEndpoints
+}
+
+function clearAllManualState() {
+  manualModelIds.value = new Set()
+  manualProviderModelNames.value = new Map()
+  manualSelectedEndpointIds.value = new Map()
+}
+
+function resetEndpointState() {
+  providerEndpoints.value = []
+  endpointLoadError.value = null
+  loadingEndpoints.value = false
+}
+
+function encodeUpstreamModelOption(id: string): string {
+  return JSON.stringify([id])
+}
+
+function decodeUpstreamModelOption(optionValue: string): { isManual: boolean; upstreamModelId: string } {
+  if (optionValue === MANUAL_MODE_VALUE) {
+    return { isManual: true, upstreamModelId: '' }
+  }
+  if (!optionValue) {
+    return { isManual: false, upstreamModelId: '' }
+  }
+  try {
+    const parsed: unknown = JSON.parse(optionValue)
+    if (Array.isArray(parsed) && parsed.length === 1 && typeof parsed[0] === 'string') {
+      return { isManual: false, upstreamModelId: parsed[0] }
+    }
+  } catch {
+    // Malformed values cannot become provider model names.
+  }
+  return { isManual: false, upstreamModelId: '' }
+}
+
+function getUpstreamSelectValue(globalModelId: string): string {
+  if (manualModelIds.value.has(globalModelId)) {
+    return MANUAL_MODE_VALUE
+  }
+  const upstreamId = selectedUpstreamModelIds.value.get(globalModelId)
+  return upstreamId ? encodeUpstreamModelOption(upstreamId) : ''
+}
+
+function getManualProviderModelName(globalModelId: string): string {
+  return manualProviderModelNames.value.get(globalModelId) ?? ''
+}
+
+function updateManualProviderModelName(globalModelId: string, rawValue: string | number) {
+  const val = String(rawValue ?? '')
+  const next = new Map(manualProviderModelNames.value)
+  next.set(globalModelId, val)
+  manualProviderModelNames.value = next
+}
+function isManualModelNameValid(globalModelId: string): boolean {
+  if (!manualModelIds.value.has(globalModelId)) return true
+  const name = manualProviderModelNames.value.get(globalModelId) || ''
+  return name.trim().length > 0
+}
+
+function isEndpointSelectedForModel(globalModelId: string, endpointId: string): boolean {
+  const set = manualSelectedEndpointIds.value.get(globalModelId)
+  return Boolean(set && set.has(endpointId))
+}
+
+function toggleEndpointSelection(globalModelId: string, endpointId: string, event: Event) {
+  const checked = (event.target as HTMLInputElement).checked
+  const nextMap = new Map(manualSelectedEndpointIds.value)
+  const currentSet = new Set(nextMap.get(globalModelId) || [])
+  if (checked) {
+    currentSet.add(endpointId)
+  } else {
+    currentSet.delete(endpointId)
+  }
+  nextMap.set(globalModelId, currentSet)
+  manualSelectedEndpointIds.value = nextMap
+}
+
+function isManualEndpointsValid(globalModelId: string): boolean {
+  if (!manualModelIds.value.has(globalModelId)) return true
+  const set = manualSelectedEndpointIds.value.get(globalModelId)
+  return Boolean(set && set.size > 0)
+}
+
+const activeManualRows = computed(() => {
+  return globalModelsToAdd.value.filter(id => manualModelIds.value.has(id))
+})
+
+const hasInvalidManualRows = computed(() => {
+  for (const id of activeManualRows.value) {
+    if (!isManualModelNameValid(id) || !isManualEndpointsValid(id)) {
+      return true
+    }
+  }
+  return false
+})
+
+const manualValidationErrorMessage = computed(() => {
+  if (loadingEndpoints.value) {
+    return '正在加载端点，请稍候...'
+  }
+  if (activeManualRows.value.length === 0) {
+    return null
+  }
+  if (endpointLoadError.value) {
+    return `端点加载失败: ${endpointLoadError.value}`
+  }
+  for (const id of activeManualRows.value) {
+    if (!isManualModelNameValid(id)) {
+      return '存在未填写真实上游模型名称的手动关联项'
+    }
+    if (!isManualEndpointsValid(id)) {
+      if (providerEndpoints.value.length === 0) {
+        return '当前提供商暂无可用 Endpoint，无法完成手动关联'
+      }
+      return '存在未选择 Endpoint 的手动关联项'
+    }
+  }
+  return null
+})
 
 // 初始状态（用于计算变更）
 const initialGlobalModelIds = ref<Set<string>>(new Set())
@@ -392,6 +662,7 @@ function toggleGlobalModelSelection(id: string) {
   const wasSelected = selectedGlobalModelIds.value.has(id)
   if (wasSelected) {
     selectedGlobalModelIds.value.delete(id)
+    clearManualStateForModel(id)
   } else {
     selectedGlobalModelIds.value.add(id)
   }
@@ -406,6 +677,7 @@ function toggleAllGlobalModels() {
   if (wasAllSelected) {
     for (const id of allIds) {
       selectedGlobalModelIds.value.delete(id)
+      clearManualStateForModel(id)
     }
   } else {
     for (const id of allIds) {
@@ -441,6 +713,7 @@ function syncUpstreamModelSelections(autoSelectGlobalModelIds: Iterable<string> 
   const nextSelections = new Map<string, string>()
 
   for (const [globalModelId, upstreamModelId] of selectedUpstreamModelIds.value) {
+    if (manualModelIds.value.has(globalModelId)) continue
     if (
       selectedGlobalModelIds.value.has(globalModelId)
       && !initialGlobalModelIds.value.has(globalModelId)
@@ -451,6 +724,7 @@ function syncUpstreamModelSelections(autoSelectGlobalModelIds: Iterable<string> 
   }
 
   for (const globalModelId of autoSelectGlobalModelIds) {
+    if (manualModelIds.value.has(globalModelId)) continue
     const globalModel = allGlobalModels.value.find(model => model.id === globalModelId)
     if (!globalModel) continue
     if (
@@ -472,14 +746,41 @@ function syncUpstreamModelSelections(autoSelectGlobalModelIds: Iterable<string> 
 
 /** 记录用户为某个新 Global Model 显式选择的真实上游模型。 */
 function setUpstreamModelSelection(globalModelId: string, event: Event) {
-  const upstreamModelId = (event.target as HTMLSelectElement).value
-  const nextSelections = new Map(selectedUpstreamModelIds.value)
-  if (upstreamModelId) {
-    nextSelections.set(globalModelId, upstreamModelId)
-  } else {
+  const rawValue = (event.target as HTMLSelectElement).value
+  const { isManual, upstreamModelId } = decodeUpstreamModelOption(rawValue)
+
+  if (isManual) {
+    const nextManual = new Set(manualModelIds.value)
+    nextManual.add(globalModelId)
+    manualModelIds.value = nextManual
+    const nextSelections = new Map(selectedUpstreamModelIds.value)
     nextSelections.delete(globalModelId)
+    selectedUpstreamModelIds.value = nextSelections
+
+    if (!manualProviderModelNames.value.has(globalModelId)) {
+      const globalModel = allGlobalModels.value.find(m => m.id === globalModelId)
+      const nextNames = new Map(manualProviderModelNames.value)
+      nextNames.set(globalModelId, globalModel?.name || '')
+      manualProviderModelNames.value = nextNames
+    }
+
+    if (!manualSelectedEndpointIds.value.has(globalModelId)) {
+      const nextEndpoints = new Map(manualSelectedEndpointIds.value)
+      nextEndpoints.set(globalModelId, new Set())
+      manualSelectedEndpointIds.value = nextEndpoints
+    }
+  } else {
+    if (manualModelIds.value.has(globalModelId)) {
+      clearManualStateForModel(globalModelId)
+    }
+    const nextSelections = new Map(selectedUpstreamModelIds.value)
+    if (upstreamModelId) {
+      nextSelections.set(globalModelId, upstreamModelId)
+    } else {
+      nextSelections.delete(globalModelId)
+    }
+    selectedUpstreamModelIds.value = nextSelections
   }
-  selectedUpstreamModelIds.value = nextSelections
 }
 
 /**
@@ -579,7 +880,13 @@ async function handleDialogUpdate(value: boolean) {
  * 保存关联变更：显式上游选择逐项精确创建，其余新增项继续使用原批量推断接口。
  */
 async function handleSave() {
-  if (!hasChanges.value || saving.value || fetchingAutoMatchedModels.value) return
+  if (
+    !hasChanges.value
+    || saving.value
+    || fetchingAutoMatchedModels.value
+    || loadingEndpoints.value
+    || hasInvalidManualRows.value
+  ) return
 
   saving.value = true
   let hasAnyOperation = false
@@ -601,14 +908,39 @@ async function handleSave() {
       }
     }
 
-    // 显式选择真实上游模型的新增项逐项创建，确保名称和 Endpoint 链路不丢失。
-    const explicitlyHandledGlobalModelIds = new Set<string>()
+    const handledGlobalModelIds = new Set<string>()
+
+    // 1. 手动指定模型与 Endpoint：逐项调用 createModel，传递去除首尾空白的 provider_model_name 及所选 endpoint_ids
     for (const globalModelId of globalModelsToAdd.value) {
+      if (!manualModelIds.value.has(globalModelId)) continue
+
+      const providerModelName = (manualProviderModelNames.value.get(globalModelId) || '').trim()
+      const endpointIds = Array.from(manualSelectedEndpointIds.value.get(globalModelId) || [])
+      handledGlobalModelIds.add(globalModelId)
+
+      hasAnyOperation = true
+      try {
+        await createModel(props.providerId, {
+          global_model_id: globalModelId,
+          provider_model_name: providerModelName,
+          endpoint_ids: endpointIds,
+        })
+        totalSuccess++
+      } catch (err: unknown) {
+        allErrors.push(parseApiError(err, `模型 ${providerModelName} 关联失败`))
+      }
+    }
+
+    // 2. 显式选择真实上游模型的新增项逐项创建，确保名称和 Endpoint 链路不丢失。
+    for (const globalModelId of globalModelsToAdd.value) {
+      if (handledGlobalModelIds.has(globalModelId)) continue
+
       const upstreamModelId = selectedUpstreamModelIds.value.get(globalModelId)
       const upstreamModel = upstreamModels.value.find(model => model.id === upstreamModelId)
       if (!upstreamModel) continue
 
       hasAnyOperation = true
+      handledGlobalModelIds.add(globalModelId)
       try {
         const endpointIds = [...new Set((upstreamModel.endpoint_ids || []).filter(Boolean))]
         await createModel(props.providerId, {
@@ -616,17 +948,15 @@ async function handleSave() {
           provider_model_name: upstreamModel.id,
           ...(endpointIds.length > 0 ? { endpoint_ids: endpointIds } : {}),
         })
-        explicitlyHandledGlobalModelIds.add(globalModelId)
         totalSuccess++
       } catch (err: unknown) {
-        explicitlyHandledGlobalModelIds.add(globalModelId)
         allErrors.push(parseApiError(err, `模型 ${upstreamModel.id} 关联失败`))
       }
     }
 
-    // 未选择上游模型的新增项保持历史自动推断行为。
+    // 3. 未选择上游模型的新增项保持历史自动推断行为。
     const inferredGlobalModelIds = globalModelsToAdd.value.filter(
-      id => !explicitlyHandledGlobalModelIds.has(id),
+      id => !handledGlobalModelIds.has(id),
     )
     if (inferredGlobalModelIds.length > 0) {
       hasAnyOperation = true
@@ -667,6 +997,7 @@ function syncGlobalModelSelection() {
   selectedGlobalModelIds.value = new Set(globalIds)
   initialGlobalModelIds.value = new Set(globalIds)
   selectedUpstreamModelIds.value = new Map()
+  clearAllManualState()
 }
 
 // 监听打开状态
@@ -676,6 +1007,8 @@ watch(
     const session = ++dialogSession
     upstreamModels.value = []
     selectedUpstreamModelIds.value = new Map()
+    clearAllManualState()
+    resetEndpointState()
     fetchingAutoMatchedModels.value = false
     if (isOpen && providerId) {
       await loadData(providerId, session)
@@ -692,7 +1025,7 @@ watch(
 )
 
 /**
- * 并行加载基础关联数据，再查询 Provider 全部 Key 聚合的真实上游模型。
+ * 并行加载基础关联数据与端点，再查询 Provider 全部 Key 聚合的真实上游模型。
  * 整个初始加载链路禁止保存；仅当前弹窗会话可写入结果，失败或空结果继续使用批量推断兜底。
  */
 async function loadData(providerId: string, session: number) {
@@ -704,6 +1037,7 @@ async function loadData(providerId: string, session: number) {
       loadGlobalModels(providerId, session),
       loadExistingModels(providerId, session),
       loadProviderKeys(providerId, session),
+      loadProviderEndpoints(providerId, session),
     ])
     if (session !== dialogSession || !props.open || props.providerId !== providerId) return
 
@@ -717,6 +1051,33 @@ async function loadData(providerId: string, session: number) {
     if (session === dialogSession && props.open && props.providerId === providerId) {
       fetchingAutoMatchedModels.value = false
     }
+  }
+}
+
+/** 加载当前 Provider 全部可用 Endpoint，用于未发现模型的手动关联。 */
+async function loadProviderEndpoints(providerId: string, session: number) {
+  try {
+    loadingEndpoints.value = true
+    endpointLoadError.value = null
+    const endpoints = await getProviderEndpoints(providerId)
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      providerEndpoints.value = endpoints
+    }
+  } catch (err: unknown) {
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      providerEndpoints.value = []
+      endpointLoadError.value = parseApiError(err, '加载端点失败')
+    }
+  } finally {
+    if (session === dialogSession && props.open && props.providerId === providerId) {
+      loadingEndpoints.value = false
+    }
+  }
+}
+
+function retryLoadEndpoints() {
+  if (props.providerId && props.open) {
+    loadProviderEndpoints(props.providerId, dialogSession)
   }
 }
 
