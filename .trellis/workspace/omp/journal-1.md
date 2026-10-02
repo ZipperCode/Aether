@@ -53,3 +53,26 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: 审查上游合并并发布 v0.7.42
+
+**Date**: 2026-10-02
+**Task**: 审查上游合并并发布 v0.7.42
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+修复四项审查问题及首次 CI 的失效断言/大号池夹具超时。dfe1de0ab 的 Rust CI 全绿后发布注释 tag v0.7.42，Release8/8通过，六项资产发布。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6ef9eb3c1` | (see git log) |
+| `dfe1de0ab` | (see git log) |
+
+### Status
+
+[OK] **Completed**
