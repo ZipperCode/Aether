@@ -654,28 +654,60 @@ async function loadGlobalModelList(options: { cacheTtlMs?: number } = {}) {
   }
 }
 
-// 加载提供商列表（服务端分页）
+// 加载提供商列表（服务端分页 / 前端自定义排序全量分页）
 async function loadProviders(options: { cacheTtlMs?: number } = {}) {
   const requestId = ++providersRequestId
   loading.value = true
   try {
-    const requestParams = localPaging.value
-      ? { ...queryParams.value, page: 1, page_size: DISPLAY_ORDER_FETCH_PAGE_SIZE }
-      : queryParams.value
-    const response = await getProvidersSummary(requestParams, {
-      cacheTtlMs: options.cacheTtlMs ?? 0,
-    })
+    if (!localPaging.value) {
+      const response = await getProvidersSummary(queryParams.value, {
+        cacheTtlMs: options.cacheTtlMs ?? 0,
+      })
+      if (requestId !== providersRequestId) return
+      const existingProviders = new Map(providers.value.map(provider => [provider.id, provider]))
+      providers.value = response.items.map((item) => {
+        const existing = existingProviders.get(item.id)
+        if (!existing) return item
+        Object.assign(existing, item)
+        return existing
+      })
+      total.value = response.total
+      loadBalances(providers.value)
+      return
+    }
+
+    // 前端分页模式：按服务端的 total 和已拉取条数分页拉取全量，避免截断超出第一批的记录
+    const targetParams = { ...queryParams.value }
+    const allItems: ProviderWithEndpointsSummary[] = []
+    let page = 1
+    let serverTotal = 0
+
+    while (true) {
+      const response = await getProvidersSummary(
+        { ...targetParams, page, page_size: DISPLAY_ORDER_FETCH_PAGE_SIZE },
+        { cacheTtlMs: options.cacheTtlMs ?? 0 },
+      )
+      if (requestId !== providersRequestId) return
+
+      serverTotal = response.total
+      allItems.push(...response.items)
+
+      if (response.items.length === 0 || allItems.length >= serverTotal) {
+        break
+      }
+      page += 1
+    }
+
     if (requestId !== providersRequestId) return
+
     const existingProviders = new Map(providers.value.map(provider => [provider.id, provider]))
-    providers.value = response.items.map((item) => {
+    providers.value = allItems.map((item) => {
       const existing = existingProviders.get(item.id)
       if (!existing) return item
       Object.assign(existing, item)
       return existing
     })
-    // 前端分页模式下总数以实际拉取到的条目为准，避免切片越界
-    total.value = localPaging.value ? response.items.length : response.total
-    // 异步加载配置了 ops 的 provider 的余额数据
+    total.value = Math.max(serverTotal, allItems.length)
     loadBalances(providers.value)
   } catch (err: unknown) {
     if (requestId !== providersRequestId) return

@@ -607,4 +607,91 @@ describe('ProviderManagement shared display order', () => {
       'provider-6', 'provider-7', 'provider-8', 'provider-9',
     ])
   })
+
+  it('fetches all pages when server reports total beyond the first batch without allocating 10001 records', async () => {
+    const providers = [1, 2, 3].map(index => createProvider({
+      id: `provider-${index}`,
+      name: `Provider ${index}`,
+      provider_priority: index * 10,
+    }))
+    apiMocks.getProvidersSummary.mockImplementation(async (query: { page?: number; page_size?: number } = {}) => {
+      const page = query.page ?? 1
+      if (page === 1) {
+        return {
+          items: providers.slice(0, 2),
+          total: 3,
+        }
+      }
+      if (page === 2) {
+        return {
+          items: providers.slice(2, 3),
+          total: 3,
+        }
+      }
+      return {
+        items: [],
+        total: 3,
+      }
+    })
+    localStorage.setItem('aether-provider-display-order', JSON.stringify(['provider-3', 'provider-1', 'provider-2']))
+    const root = await mountView()
+
+    expect(providerOrder(root)).toEqual(['provider-3', 'provider-1', 'provider-2'])
+    expect(root.textContent).toContain('Provider 3')
+    expect(providerElements(root)).toHaveLength(3)
+  })
+
+  it('prevents removed or stale filter results from overwriting newer requests', async () => {
+    const initialProviders = [1, 2].map(index => createProvider({
+      id: `provider-${index}`,
+      name: `Provider ${index}`,
+      provider_priority: index * 10,
+    }))
+    const staleFilteredProvider = createProvider({
+      id: 'provider-stale',
+      name: 'Stale Filtered Provider',
+      provider_priority: 99,
+    })
+
+    let resolveStaleRequest!: (value: { items: ProviderWithEndpointsSummary[]; total: number }) => void
+    apiMocks.getProvidersSummary.mockImplementation(async (query: { search?: string } = {}) => {
+      if (query.search === 'stale') {
+        return new Promise((resolve) => {
+          resolveStaleRequest = resolve
+        })
+      }
+      return {
+        items: initialProviders,
+        total: initialProviders.length,
+      }
+    })
+
+    const root = await mountView()
+    expect(providerOrder(root)).toEqual(['provider-1', 'provider-2'])
+
+    const search = root.querySelector<HTMLInputElement>('#provider-search')
+    expect(search).not.toBeNull()
+    search!.value = 'stale'
+    search!.dispatchEvent(new Event('input', { bubbles: true }))
+
+    await vi.waitFor(() => {
+      expect(resolveStaleRequest).toBeDefined()
+      expect(root.querySelector('button[title="重置筛选"]')).not.toBeNull()
+    })
+    findButton(root, '重置筛选').click()
+    await vi.waitFor(() => {
+      expect(providerOrder(root)).toEqual(['provider-1', 'provider-2'])
+    })
+
+    // 较慢的旧筛选响应此时返回，应被丢弃
+    resolveStaleRequest({
+      items: [staleFilteredProvider],
+      total: 1,
+    })
+
+    expect(providerOrder(root)).toEqual(['provider-1', 'provider-2'])
+    expect(root.textContent).not.toContain('Stale Filtered Provider')
+    expect(root.textContent).toContain('Provider 1')
+    expect(root.textContent).toContain('Provider 2')
+  })
 })
