@@ -3,7 +3,7 @@ import { createApp, nextTick, type App } from 'vue'
 import UserStats from '../UserStats.vue'
 
 const api = vi.hoisted(() => ({
-  getAllUsers: vi.fn().mockResolvedValue([{ id: 'user-1', username: 'Alice' }]),
+  getAllUsers: vi.fn().mockResolvedValue([{ id: 'user-1', username: 'Alice', groups: [] }]),
   listUserGroups: vi.fn().mockResolvedValue({ items: [] }),
   listUserGroupMembers: vi.fn(),
   getLeaderboardUsers: vi.fn().mockResolvedValue({ items: [], total: 0 }),
@@ -78,28 +78,35 @@ async function settle() {
   }
 }
 
-it('clears pending panels when switching to an empty group scope and ignores the old response', async () => {
+it('shows the synthetic ungrouped group when no groups exist and ignores the stale user response', async () => {
   vi.useFakeTimers()
-  let resolveSummary: ((summary: { total_requests: number }) => void) | undefined
-  api.getUsageStats.mockReturnValue(new Promise(resolve => { resolveSummary = resolve }))
+  const resolveSummary: Array<(summary: { total_requests: number }) => void> = []
+  // 项目 lib 为 ES2021,无 Promise.withResolvers;按调用顺序记录各次摘要请求的 resolver。
+  api.getUsageStats.mockImplementation(() => new Promise(resolve => { resolveSummary.push(resolve) }))
   root = document.createElement('div')
   document.body.appendChild(root)
   app = createApp(UserStats)
   app.mount(root)
   await settle()
-  expect(api.getUsageStats).toHaveBeenCalledOnce()
   expect(root.querySelectorAll('[data-loading]')).toHaveLength(2)
 
   root.querySelector<HTMLButtonElement>('[data-switch-group]')?.click()
   await nextTick()
   await vi.advanceTimersByTimeAsync(120)
   await settle()
-  expect(api.getLeaderboardUserGroups).toHaveBeenCalledOnce()
-  expect(api.getUsageStats).toHaveBeenCalledOnce()
-  expect(root.querySelectorAll('[data-loading]')).toHaveLength(0)
+  // 上游特性:没有真实分组时组作用域仍合成 __ungrouped__ 并以其为选中实体重新加载面板。
+  expect(api.getUsageStats).toHaveBeenLastCalledWith(expect.objectContaining({ user_group_id: '__ungrouped__' }))
+  expect(root.querySelectorAll('[data-loading]')).toHaveLength(2)
 
-  resolveSummary?.({ total_requests: 777 })
+  resolveSummary[1]({ total_requests: 42 })
   await settle()
   expect(root.querySelectorAll('[data-loading]')).toHaveLength(0)
+  expect(root.textContent).toContain('42')
+
+  resolveSummary[0]({ total_requests: 777 })
+  await settle()
+  // 旧的用户维度响应迟到,不得覆盖未分组结果,也不得重启加载态。
+  expect(root.querySelectorAll('[data-loading]')).toHaveLength(0)
+  expect(root.textContent).toContain('42')
   expect(root.textContent).not.toContain('777')
 })

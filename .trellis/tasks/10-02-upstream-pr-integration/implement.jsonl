@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Integration spans gateway, formats, scheduler, data, frontend; preserve cross-layer contracts"}
+{"file": ".trellis/spec/aether-gateway/backend/sse-keepalive-framing-contract.md", "reason": "Validate stream handoff and SSE boundary behavior"}

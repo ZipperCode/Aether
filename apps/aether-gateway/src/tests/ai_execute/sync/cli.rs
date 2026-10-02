@@ -2561,6 +2561,7 @@ async fn gateway_returns_openai_responses_to_claude_code_applies_body_mimicry_im
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"claude:messages": 1})),
+            routing_facts: Default::default(),
             model_id: "model-openai-cli-claude-code-local-1".to_string(),
             global_model_id: "global-model-openai-cli-claude-code-local-1".to_string(),
             global_model_name: "gpt-5".to_string(),
