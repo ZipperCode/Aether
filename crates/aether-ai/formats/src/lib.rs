@@ -10,7 +10,7 @@ pub mod provider_compat;
 pub use codex_profile::{
     codex_client_originator, codex_client_profile, codex_client_user_agent, codex_client_version,
     set_codex_cli_version, set_codex_client_profile, CodexClientKind, CodexClientProfile,
-    CODEX_CLIENT_ORIGINATOR, CODEX_CLIENT_USER_AGENT, CODEX_CLIENT_VERSION,
+    CODEX_CLIENT_VERSION,
 };
 pub use contracts::{ApiOperation, ClientSurface};
 

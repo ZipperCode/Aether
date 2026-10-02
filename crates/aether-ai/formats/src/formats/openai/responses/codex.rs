@@ -381,149 +381,22 @@ fn bundled_codex_model_card(spec: BundledCodexModelCardSpec<'_>) -> Value {
     })
 }
 
-fn bundled_gpt_5_6_codex_model_card(
-    model_id: &str,
-    display_name: &str,
-    description: &str,
-    default_reasoning_level: &str,
-    priority: u64,
-    multi_agent_version: &str,
-    supports_ultra: bool,
-) -> Value {
-    let mut efforts = vec!["low", "medium", "high", "xhigh", "max"];
-    if supports_ultra {
-        efforts.push("ultra");
-    }
-    let mut card = bundled_codex_model_card(BundledCodexModelCardSpec {
-        model_id,
-        display_name,
-        description,
-        default_reasoning_level,
-        default_reasoning_summary: "none",
-        use_responses_lite: true,
-        efforts: &efforts,
-        default_verbosity: "low",
-        supports_priority_tier: true,
-    });
-    let object = card
-        .as_object_mut()
-        .expect("bundled Codex model card must be an object");
-    object.extend(
-        json!({
-            "shell_type": "shell_command",
-            "supports_image_detail_original": true,
-            "supports_search_tool": true,
-            "input_modalities": ["text", "image"],
-            "context_window": 372_000,
-            "max_context_window": 372_000,
-            "comp_hash": "3000",
-            "experimental_supported_tools": [],
-            "visibility": "list",
-            "supported_in_api": true,
-            "priority": priority,
-            "additional_speed_tiers": ["fast"],
-            "multi_agent_version": multi_agent_version,
-            "tool_mode": "code_mode_only",
-            "prefer_websockets": true,
-            "reasoning_summary_format": "experimental",
-            "include_skills_usage_instructions": false,
-            "apply_patch_tool_type": "freeform",
-            "web_search_tool_type": "text_and_image",
-            "truncation_policy": { "mode": "tokens", "limit": 10_000 },
-            "minimal_client_version": "0.144.0",
-        })
-        .as_object()
-        .expect("bundled Codex model card extension must be an object")
-        .clone(),
-    );
-    card
-}
-
-fn bundled_codex_auto_review_model_card() -> Value {
-    let mut card = bundled_codex_model_card(BundledCodexModelCardSpec {
-        model_id: "codex-auto-review",
-        display_name: "Codex Auto Review",
-        description: "Automatic approval review model for Codex.",
-        default_reasoning_level: "medium",
-        default_reasoning_summary: "none",
-        use_responses_lite: false,
-        efforts: &["low", "medium", "high", "xhigh"],
-        default_verbosity: "low",
-        supports_priority_tier: false,
-    });
-    let object = card
-        .as_object_mut()
-        .expect("bundled Codex model card must be an object");
-    object.extend(
-        json!({
-            "shell_type": "shell_command",
-            "supports_image_detail_original": true,
-            "supports_search_tool": true,
-            "input_modalities": ["text", "image"],
-            "context_window": 272_000,
-            "max_context_window": 1_000_000,
-            "experimental_supported_tools": [],
-            "visibility": "hide",
-            "supported_in_api": true,
-            "priority": 43,
-            "additional_speed_tiers": [],
-            "prefer_websockets": true,
-            "reasoning_summary_format": "experimental",
-            "include_skills_usage_instructions": false,
-            "apply_patch_tool_type": "freeform",
-            "web_search_tool_type": "text_and_image",
-            "truncation_policy": { "mode": "tokens", "limit": 10_000 },
-            "minimal_client_version": "0.98.0",
-        })
-        .as_object()
-        .expect("bundled Codex model card extension must be an object")
-        .clone(),
-    );
-    card
-}
-
 pub fn bundled_codex_model_cards() -> &'static [Value] {
     static CARDS: OnceLock<Vec<Value>> = OnceLock::new();
     CARDS.get_or_init(|| {
-        vec![
-            bundled_gpt_5_6_codex_model_card(
-                "gpt-5.6-sol",
-                "GPT-5.6-Sol",
-                "Latest frontier agentic coding model.",
-                "low",
-                1,
-                "v2",
-                true,
-            ),
-            bundled_gpt_5_6_codex_model_card(
-                "gpt-5.6-terra",
-                "GPT-5.6-Terra",
-                "Balanced agentic coding model for everyday work.",
-                "medium",
-                2,
-                "v2",
-                true,
-            ),
-            bundled_gpt_5_6_codex_model_card(
-                "gpt-5.6-luna",
-                "GPT-5.6-Luna",
-                "Fast and affordable agentic coding model.",
-                "medium",
-                3,
-                "v1",
-                false,
-            ),
-            bundled_codex_model_card(BundledCodexModelCardSpec {
-                model_id: "gpt-5.5",
-                display_name: "GPT-5.5",
-                description: "Frontier model for complex coding, research, and real-world work.",
-                default_reasoning_level: "medium",
-                default_reasoning_summary: "none",
-                use_responses_lite: false,
-                efforts: &["low", "medium", "high", "xhigh"],
-                default_verbosity: "low",
-                supports_priority_tier: true,
-            }),
+        // 公开能力快照来自 openai/codex rust-v0.159.3 的
+        // codex-rs/models-manager/models.json；账户远端目录继续优先。
+        let mut cards: Vec<Value> = serde_json::from_str(include_str!("codex_models_0_159_3.json"))
+            .expect("bundled Codex model capability snapshot must be valid JSON");
+        for card in &mut cards {
+            let object = card.as_object_mut().expect("model card must be an object");
+            object.insert("id".to_string(), object["slug"].clone());
+            object.insert("object".to_string(), json!("model"));
+            object.insert("owned_by".to_string(), json!("openai"));
+            object.insert("api_formats".to_string(), json!(["openai:responses"]));
+        }
+        // 保留现有配置路由使用的旧模型标识。
+        cards.extend(vec![
             bundled_codex_model_card(BundledCodexModelCardSpec {
                 model_id: "gpt-5.4",
                 display_name: "GPT-5.4",
@@ -557,8 +430,8 @@ pub fn bundled_codex_model_cards() -> &'static [Value] {
                 default_verbosity: "low",
                 supports_priority_tier: false,
             }),
-            bundled_codex_auto_review_model_card(),
-        ]
+        ]);
+        cards
     })
 }
 
@@ -2116,10 +1989,10 @@ pub fn apply_codex_openai_special_headers(
 
     // 透传来路 User-Agent：来路请求头经透传收集、管理员 header rules set 或
     // auth-config overrides 写入的非空值优先保留；仅在没有非空值时回退到当前
-    // Codex 客户端画像（内置基线 0.154.0，随后台发布检查动态升级）。该身份层
-    // 运行于 header rules 之后且无规则上下文，无法区分"未提供"与"被 drop 规则
-    // 显式删除"，与原先无条件覆盖一致，被移除后仍会得到回退值（remove 语义
-    // 维持既有行为，不在本次扩展）。
+    // Codex 客户端画像（内置基线见 CODEX_CLIENT_VERSION，随后台发布检查动态
+    // 升级）。该身份层运行于 header rules 之后且无规则上下文，无法区分"未提供"
+    // 与"被 drop 规则显式删除"，与原先无条件覆盖一致，被移除后仍会得到回退值
+    // （remove 语义维持既有行为，不在本次扩展）。
     let has_existing_user_agent = provider_request_headers.iter().any(|(name, value)| {
         name.trim().eq_ignore_ascii_case("user-agent") && !value.trim().is_empty()
     });
@@ -2204,16 +2077,52 @@ mod tests {
         CODEX_OPENAI_IMAGE_INTERNAL_MODEL, CODEX_OPENAI_RESPONSES_UNSUPPORTED_BODY_FIELDS,
         CODEX_RESPONSES_LITE_HEADER,
     };
-    use crate::codex_profile::{CODEX_CLIENT_ORIGINATOR, CODEX_CLIENT_USER_AGENT};
+    use crate::codex_profile::CODEX_CLIENT_ORIGINATOR;
     use serde_json::{json, Value};
 
     #[test]
     fn codex_client_user_agent_matches_originator_and_version() {
         let profile = crate::codex_client_profile();
-        assert_eq!(
-            profile.user_agent,
-            format!("{}/{}", profile.originator, profile.codex_version)
-        );
+        assert!(profile.user_agent.starts_with(&format!(
+            "{}/{} (",
+            profile.originator, profile.codex_version
+        )));
+        assert!(profile.user_agent.ends_with(") unknown"));
+    }
+
+    #[test]
+    fn bundled_latest_cli_models_preserve_capabilities_without_account_data() {
+        for model in ["gpt-6-astra", "gpt-6.1-sol"] {
+            let card = bundled_codex_model_cards()
+                .iter()
+                .find(|card| card["slug"] == model)
+                .unwrap();
+            assert_eq!(card["context_window"], 272_000);
+            assert_eq!(card["max_context_window"], 872_000);
+            assert_eq!(card["comp_hash"], "3000");
+            assert_eq!(card["minimal_client_version"], "0.153.0");
+            assert_eq!(
+                card["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|level| level["effort"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["low", "medium", "high", "xhigh", "max", "ultra"]
+            );
+            for private in [
+                "account_id",
+                "user_id",
+                "installation_id",
+                "cookie",
+                "authorization",
+            ] {
+                assert!(
+                    card.get(private).is_none(),
+                    "unexpected account field: {private}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2296,7 +2205,7 @@ mod tests {
 
         assert_eq!(
             headers.get("user-agent").map(String::as_str),
-            Some(CODEX_CLIENT_USER_AGENT)
+            Some(crate::codex_client_user_agent().as_str())
         );
     }
 
@@ -2937,7 +2846,7 @@ mod tests {
             "codex-auto-review",
             None,
         );
-        assert!(!capabilities.use_responses_lite);
+        assert!(capabilities.use_responses_lite);
         assert_eq!(
             capabilities.default_reasoning_effort.as_deref(),
             Some("medium")
@@ -2945,7 +2854,7 @@ mod tests {
         assert_eq!(capabilities.default_reasoning_summary, None);
         assert!(capabilities.supports_parallel_tool_calls);
         assert_eq!(capabilities.default_verbosity.as_deref(), Some("low"));
-        assert!(capabilities.supported_service_tiers.is_empty());
+        assert_eq!(capabilities.supported_service_tiers, vec!["priority"]);
     }
 
     /// 验证成员声明与已持久化指纹可从兼容字段完整解析。

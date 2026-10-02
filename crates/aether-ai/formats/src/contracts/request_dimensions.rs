@@ -35,6 +35,7 @@ pub enum ApiOperation {
     ClaudeCountTokens,
     GeminiCountTokens,
     OpenAiResponsesCompact,
+    OpenAiMemoriesSummarize,
 }
 
 impl ApiOperation {
@@ -44,6 +45,7 @@ impl ApiOperation {
             Self::ClaudeCountTokens => "count_tokens",
             Self::GeminiCountTokens => "count_tokens",
             Self::OpenAiResponsesCompact => "compact",
+            Self::OpenAiMemoriesSummarize => "trace_summarize",
         }
     }
 }
@@ -58,5 +60,9 @@ mod tests {
         assert_eq!(ApiOperation::ClaudeMessagesCreate.as_str(), "messages");
         assert_eq!(ApiOperation::ClaudeCountTokens.as_str(), "count_tokens");
         assert_eq!(ApiOperation::GeminiCountTokens.as_str(), "count_tokens");
+        assert_eq!(
+            ApiOperation::OpenAiMemoriesSummarize.as_str(),
+            "trace_summarize"
+        );
     }
 }

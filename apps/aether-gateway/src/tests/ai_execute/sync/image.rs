@@ -1868,7 +1868,7 @@ async fn gateway_executes_codex_image_sync_with_key_model_allowlist_via_real_loc
     assert_eq!(seen_upstream_request.content_type, "application/json");
     assert_eq!(
         seen_upstream_request.user_agent,
-        aether_ai_formats::CODEX_CLIENT_USER_AGENT
+        aether_ai_formats::codex_client_user_agent()
     );
     assert_eq!(seen_upstream_request.originator, "codex_cli_rs");
     assert_eq!(

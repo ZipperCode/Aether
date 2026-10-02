@@ -13,7 +13,7 @@ use crate::contracts::{
     GEMINI_INTERACTIONS_SYNC_PLAN_KIND, GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND,
     GEMINI_VIDEO_CREATE_SYNC_PLAN_KIND, OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_CHAT_SYNC_PLAN_KIND,
     OPENAI_EMBEDDING_SYNC_PLAN_KIND, OPENAI_IMAGE_STREAM_PLAN_KIND, OPENAI_IMAGE_SYNC_PLAN_KIND,
-    OPENAI_REALTIME_STREAM_PLAN_KIND, OPENAI_RERANK_SYNC_PLAN_KIND,
+    OPENAI_MEMORIES_SYNC_PLAN_KIND, OPENAI_REALTIME_STREAM_PLAN_KIND, OPENAI_RERANK_SYNC_PLAN_KIND,
     OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND, OPENAI_RESPONSES_COMPACT_SYNC_PLAN_KIND,
     OPENAI_RESPONSES_STREAM_PLAN_KIND, OPENAI_RESPONSES_SYNC_PLAN_KIND,
     OPENAI_SEARCH_SYNC_PLAN_KIND, OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND,
@@ -257,6 +257,14 @@ pub fn resolve_execution_runtime_sync_plan_kind_with_client_surface(
         .unwrap_or(path);
     if route_class != Some("ai_public") {
         return None;
+    }
+
+    if route_family == Some("openai")
+        && route_kind == Some("memories")
+        && *method == Method::POST
+        && path == "/v1/memories/trace_summarize"
+    {
+        return Some(OPENAI_MEMORIES_SYNC_PLAN_KIND);
     }
 
     if route_family == Some("openai")
@@ -654,6 +662,7 @@ pub fn supports_sync_execution_decision_kind(plan_kind: &str) -> bool {
     matches!(
         plan_kind,
         OPENAI_CHAT_SYNC_PLAN_KIND
+            | OPENAI_MEMORIES_SYNC_PLAN_KIND
             | OPENAI_EMBEDDING_SYNC_PLAN_KIND
             | OPENAI_RERANK_SYNC_PLAN_KIND
             | OPENAI_SEARCH_SYNC_PLAN_KIND

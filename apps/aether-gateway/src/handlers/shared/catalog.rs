@@ -2821,8 +2821,9 @@ pub(crate) fn provider_key_status_snapshot_payload(
     // (claude_code usage windows, codex metadata refresh, grok/xai/... models)
     // re-derive exhaustion from live upstream metadata, so the stored-snapshot
     // clearing below must not overwrite them.
-    let uses_materialized_snapshot = quota_snapshot_has_materialized_data(quota_snapshot, provider_type)
-        && !refresh_codex_snapshot;
+    let uses_materialized_snapshot =
+        quota_snapshot_has_materialized_data(quota_snapshot, provider_type)
+            && !refresh_codex_snapshot;
     let payload = if uses_materialized_snapshot {
         status_snapshot
             .cloned()
@@ -2849,7 +2850,8 @@ pub(crate) fn provider_key_status_snapshot_payload(
     // 5h/7d 窗口）刚按最新元数据推导过耗尽状态，存储快照缺失证据（None 按
     // 未耗尽处理）不能反向清掉它，否则未到重置时间的 Claude 限流会被误显示为可用。
     if uses_materialized_snapshot
-        && !aether_provider_pool::provider_pool_key_account_quota_exhausted(key, provider_type) {
+        && !aether_provider_pool::provider_pool_key_account_quota_exhausted(key, provider_type)
+    {
         if let Some(quota) = snapshot.get_mut("quota").and_then(Value::as_object_mut) {
             quota.insert("exhausted".to_string(), json!(false));
             if quota.get("code").and_then(Value::as_str) == Some("exhausted") {

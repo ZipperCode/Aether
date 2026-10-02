@@ -1,11 +1,13 @@
-use std::sync::{OnceLock, RwLock};
+use std::sync::{LazyLock, OnceLock, RwLock};
+
+static OS_INFO: LazyLock<os_info::Info> = LazyLock::new(os_info::get);
 
 /// 内置 Codex CLI 基线版本：动态画像刷新（npm stable 标签）不可用时的回退值。
-/// 2026-09-23 经本机 `codex --version` 核实为 `codex-cli 0.154.0`；不要回退到
-/// 更旧的基线。共享常量同时用于缺省模型目录 `client_version` 与 Agent
-/// Identity 版本；客户端自带值仍优先。
-pub const CODEX_CLIENT_VERSION: &str = "0.154.0";
-pub const CODEX_CLIENT_USER_AGENT: &str = "codex_cli_rs/0.154.0";
+/// 跟随 #876 对齐 openai/codex rust-v0.159.3 模型目录；不要回退到更旧的基线。
+/// 该常量同时用作缺省模型目录 `client_version` 期望值；客户端自带值仍优先。
+/// 线上 User-Agent 由 `CodexClientProfile::cli` 按当前平台动态生成，因此不存在
+/// 静态 UA 常量。
+pub const CODEX_CLIENT_VERSION: &str = "0.159.3";
 pub const CODEX_CLIENT_ORIGINATOR: &str = "codex_cli_rs";
 
 /// 当前支持的 Codex 客户端类型。
@@ -40,7 +42,20 @@ impl CodexClientProfile {
         Ok(Self {
             client_kind: CodexClientKind::Cli,
             codex_version: version.to_owned(),
-            user_agent: format!("{}/{}", originator, version),
+            // 按 CLI 格式使用当前网关的公开平台信息；架构缺失时与官方 CLI 一致
+            // 回退 unknown，不使用 Rust 目标三元组。无客户端终端时不复制调用
+            // 方终端后缀、安装标识或个人身份。
+            user_agent: format!(
+                "{}/{} ({} {}; {}) unknown",
+                originator,
+                version,
+                OS_INFO.os_type(),
+                OS_INFO.version(),
+                OS_INFO.architecture().unwrap_or("unknown"),
+            )
+            .chars()
+            .map(|ch| if matches!(ch, ' '..='~') { ch } else { '_' })
+            .collect(),
             originator,
         })
     }
@@ -48,9 +63,9 @@ impl CodexClientProfile {
 
 impl Default for CodexClientProfile {
     fn default() -> Self {
-        // 远程发布检查不可用时仍保持现有线上行为，避免启动或请求被版本服务拖住。
-        // 内置基线跟随 CODEX_CLIENT_VERSION（本地核实的 0.154.0），不随上游
-        // 基线回退。
+        // 最新已核验稳定版本（见 CODEX_CLIENT_VERSION）；后台版本刷新继续作为
+        // 版本真源，远程发布检查不可用时保持现有线上行为，避免启动或请求被
+        // 版本服务拖住。
         Self::cli(CODEX_CLIENT_VERSION).expect("built-in Codex CLI profile must be valid")
     }
 }
@@ -101,8 +116,7 @@ pub fn codex_client_originator() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexClientKind, CodexClientProfile, CODEX_CLIENT_ORIGINATOR, CODEX_CLIENT_USER_AGENT,
-        CODEX_CLIENT_VERSION,
+        CodexClientKind, CodexClientProfile, CODEX_CLIENT_ORIGINATOR, CODEX_CLIENT_VERSION,
     };
 
     #[test]
@@ -110,7 +124,15 @@ mod tests {
         let profile = CodexClientProfile::cli("0.200.1").expect("valid version");
         assert_eq!(profile.client_kind, CodexClientKind::Cli);
         assert_eq!(profile.originator, "codex_cli_rs");
-        assert_eq!(profile.user_agent, "codex_cli_rs/0.200.1");
+        // 括号段的架构位来自 os_info 快照（Darwin arm64 为 "arm64"），缺失时
+        // 与官方 CLI 一致回退 "unknown"；不使用 Rust 目标三元组。
+        let parenthetical = profile
+            .user_agent
+            .strip_prefix("codex_cli_rs/0.200.1 (")
+            .and_then(|rest| rest.strip_suffix(") unknown"))
+            .expect("codex_cli_rs/<version> (<os> <osver>; <arch>) unknown");
+        let (_, arch) = parenthetical.rsplit_once("; ").expect("os/arch separator");
+        assert_eq!(arch, super::OS_INFO.architecture().unwrap_or("unknown"));
     }
 
     #[test]
@@ -123,7 +145,12 @@ mod tests {
     fn built_in_client_constants_match_default_profile() {
         let profile = CodexClientProfile::default();
         assert_eq!(profile.codex_version, CODEX_CLIENT_VERSION);
-        assert_eq!(profile.user_agent, CODEX_CLIENT_USER_AGENT);
         assert_eq!(profile.originator, CODEX_CLIENT_ORIGINATOR);
+        // User-Agent 由平台信息动态生成，无静态常量可比对；基线版本必须落在
+        // 动态 UA 的版本位上。
+        assert!(profile
+            .user_agent
+            .starts_with(&format!("codex_cli_rs/{CODEX_CLIENT_VERSION} (")));
+        assert!(profile.user_agent.ends_with(") unknown"));
     }
 }
