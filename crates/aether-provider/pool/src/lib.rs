@@ -68,7 +68,7 @@ pub use quota::{
     provider_pool_key_quota_hard_blocked, provider_pool_key_runtime_quota_blocked,
     provider_pool_key_scheduling_label, provider_pool_member_quota_snapshot,
     provider_pool_quota_metadata_provider_type, provider_pool_quota_metadata_updated_at,
-    provider_pool_quota_snapshot_updated_at,
+    provider_pool_quota_snapshot_updated_at, provider_pool_reset_deadline_elapsed,
 };
 pub use quota_refresh::{
     official_balance_backoff_secs, official_balance_backoff_with_jitter_secs,
