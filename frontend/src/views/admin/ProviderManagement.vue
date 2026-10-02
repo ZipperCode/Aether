@@ -108,7 +108,7 @@
       <!-- 桌面端表格 -->
       <div
         v-else
-        class="hidden 2xl:block overflow-x-auto"
+        class="hidden xl:block overflow-x-auto"
       >
         <Table>
           <TableHeader>
