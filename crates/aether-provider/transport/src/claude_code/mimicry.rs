@@ -147,11 +147,28 @@ fn is_genuine_claude_code_body(body: &Map<String, Value>) -> bool {
             })
 }
 
-fn has_claude_code_prefix(text: &str) -> bool {
+/// Strips a recognized Claude identity (Claude Code itself, an Agent SDK agent, a search
+/// specialist, ...) from the start of `text` so the identity is not duplicated when the
+/// remaining system instructions are migrated into the conversation. Only the identity
+/// text itself is removed: every character after it is unknown caller content and is
+/// preserved verbatim. Text without a recognized identity is returned unchanged; text
+/// that carries nothing but the identity and its own sentence terminator yields an empty
+/// string.
+fn strip_claude_code_identity(text: &str) -> &str {
     let text = text.trim_start();
-    CLAUDE_CODE_PROMPT_PREFIXES
+    let Some(prefix) = CLAUDE_CODE_PROMPT_PREFIXES
         .iter()
-        .any(|prefix| text.starts_with(prefix))
+        .find(|prefix| text.starts_with(*prefix))
+    else {
+        return text;
+    };
+    // The prefixes are partial sentences, so the end of the identity sentence cannot be
+    // located in the text that follows. Strip only the known identity text plus an
+    // immediately adjacent sentence terminator (its own period); never search further
+    // into unknown instruction text.
+    text[prefix.len()..]
+        .trim_start_matches(['.', '!', '?'])
+        .trim_start()
 }
 
 fn first_user_text(body: &Map<String, Value>) -> String {
@@ -250,10 +267,14 @@ fn rewrite_system_and_migrate_instructions(
     body.insert("system".to_string(), Value::Array(system));
 
     let original_text = original_text.trim();
-    if original_text.is_empty()
-        || original_text == CLAUDE_CODE_SYSTEM_PROMPT
-        || has_claude_code_prefix(original_text)
-    {
+    if original_text.is_empty() {
+        return;
+    }
+    // The rewrite above already carries the Claude Code identity, so a system prompt that
+    // starts with a Claude identity only migrates whatever follows the identity text:
+    // neither dropping instructions nor duplicating the identity.
+    let original_text = strip_claude_code_identity(original_text);
+    if original_text.is_empty() {
         return;
     }
 
@@ -581,6 +602,89 @@ mod tests {
         apply_claude_code_body_mimicry(&mut body, CONTEXT);
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         assert_eq!(body["system"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn preserves_instructions_that_follow_a_recognized_claude_identity() {
+        // Agent SDK identity block followed by a separate block of task-specific
+        // instructions: the instructions must survive, the identity must not be
+        // duplicated into the migrated block.
+        let mut body = pi_body();
+        body["system"] = json!([
+            {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+            {
+                "type": "text",
+                "text": "Return only the requested JSON schema and no extra prose.",
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]);
+        assert!(apply_claude_code_body_mimicry(&mut body, CONTEXT));
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        let migrated = messages[0]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            migrated,
+            "[System Instructions]\nReturn only the requested JSON schema and no extra prose."
+        );
+        assert!(!migrated.contains("Claude Agent SDK"));
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "hello world, please help");
+
+        // Identity sentence combined with the instructions in one string system: only the
+        // identity and its own period are stripped.
+        let mut body = pi_body();
+        body["system"] =
+            json!("You are Claude Code, Anthropic's official CLI for Claude. Return only the requested JSON schema.");
+        assert!(apply_claude_code_body_mimicry(&mut body, CONTEXT));
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[0]["content"][0]["text"],
+            "[System Instructions]\nReturn only the requested JSON schema."
+        );
+
+        // The prefixes are partial sentences: when task text continues on the same line
+        // right after the identity with no punctuation, everything past the known
+        // identity text must be kept instead of being swallowed as sentence end.
+        let mut body = pi_body();
+        body["system"] = json!(
+            "You are a Claude agent, built on Anthropic's Claude Agent SDK and you must return only the requested JSON schema."
+        );
+        assert!(apply_claude_code_body_mimicry(&mut body, CONTEXT));
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        let migrated = messages[0]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            migrated,
+            "[System Instructions]\nand you must return only the requested JSON schema."
+        );
+        assert!(!migrated.contains("Claude Agent SDK"));
+
+        // A multi-line identity block keeps every line after the identity, across both
+        // the line break and the block boundary.
+        let mut body = pi_body();
+        body["system"] = json!([
+            {
+                "type": "text",
+                "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK\nUse the file search tools before answering."
+            },
+            {"type": "text", "text": "Return only the requested JSON schema."}
+        ]);
+        assert!(apply_claude_code_body_mimicry(&mut body, CONTEXT));
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[0]["content"][0]["text"],
+            "[System Instructions]\nUse the file search tools before answering.\n\nReturn only the requested JSON schema."
+        );
     }
 
     #[test]

@@ -2159,6 +2159,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
+/// Start the runtime tasks owned by this node role and return the background
+/// task supervisor that the process must drain before exiting.
+///
+/// The CLI client profile cache appliers are part of the every-process
+/// lifecycle: frontdoor-only processes send upstream requests too, so they
+/// must keep applying the shared cache that the background singleton owner
+/// refreshes. Background workers stay gated on the role so frontdoor
+/// processes never compete for singleton leases.
+fn spawn_node_role_tasks(
+    state: &AppState,
+    node_role: NodeRoleArg,
+) -> Option<aether_task_runtime::TaskSupervisor> {
+    state.spawn_cli_client_profile_appliers();
+    if node_role.spawns_background_tasks() {
+        Some(state.spawn_background_tasks())
+    } else {
+        info!(
+            node_role = node_role.as_str(),
+            "background workers disabled for this node role"
+        );
+        None
+    }
+}
+
 /// 组合网关运行态并启动服务；数据就绪后尽力引导系统默认路由组。
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -2575,15 +2599,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let background_tasks = if args.node_role.spawns_background_tasks() {
-        Some(state.spawn_background_tasks())
-    } else {
-        info!(
-            node_role = args.node_role.as_str(),
-            "background workers disabled for this node role"
-        );
-        None
-    };
+    let background_tasks = spawn_node_role_tasks(&state, args.node_role);
     if state.prewarm_metric_snapshot().await {
         info!("gateway metric snapshot prewarmed");
     } else {
@@ -3625,20 +3641,21 @@ mod tests {
         copy_database_config, ensure_database_backfills_are_current,
         ensure_database_schema_is_current, pending_backfills_error, pending_schema_error,
         read_data_import_input_with_limit, resolve_database_mode, resolve_healthcheck_url,
-        usage_database_config_for_role, validate_gateway_data_encryption_key,
-        write_atomic_private_export, Args, DataCommand, DatabaseCommand, DatabaseDriverArg,
-        DatabaseModeArg, DeploymentTopologyArg, GatewayDataArgs, GatewayFrontdoorArgs,
-        GatewayLogDestinationArg, GatewayLogFormatArg, GatewayLogRotationArg, GatewayLoggingArgs,
-        GatewayRateLimitArgs, GatewayUsageArgs, NodeRoleArg, RuntimeBackendArg,
-        VideoTaskTruthSourceArg, DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
-        DEFAULT_GATEWAY_HTTP_HEADER_MAX_BYTES, DEFAULT_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS,
-        DEFAULT_GATEWAY_HTTP_MAX_HEADERS, DEFAULT_GATEWAY_LISTENER_SHARDS,
-        DEFAULT_GATEWAY_LISTEN_BACKLOG, MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
-        MAX_GATEWAY_LISTENER_SHARDS, MAX_GATEWAY_LISTEN_BACKLOG,
-        MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, MIN_GATEWAY_LISTEN_BACKLOG,
+        spawn_node_role_tasks, usage_database_config_for_role,
+        validate_gateway_data_encryption_key, write_atomic_private_export, Args, DataCommand,
+        DatabaseCommand, DatabaseDriverArg, DatabaseModeArg, DeploymentTopologyArg,
+        GatewayDataArgs, GatewayFrontdoorArgs, GatewayLogDestinationArg, GatewayLogFormatArg,
+        GatewayLogRotationArg, GatewayLoggingArgs, GatewayRateLimitArgs, GatewayUsageArgs,
+        NodeRoleArg, RuntimeBackendArg, VideoTaskTruthSourceArg,
+        DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, DEFAULT_GATEWAY_HTTP_HEADER_MAX_BYTES,
+        DEFAULT_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS, DEFAULT_GATEWAY_HTTP_MAX_HEADERS,
+        DEFAULT_GATEWAY_LISTENER_SHARDS, DEFAULT_GATEWAY_LISTEN_BACKLOG,
+        MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, MAX_GATEWAY_LISTENER_SHARDS,
+        MAX_GATEWAY_LISTEN_BACKLOG, MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
+        MIN_GATEWAY_LISTEN_BACKLOG,
     };
     use aether_data::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
-    use aether_gateway::AppState;
+    use aether_gateway::{codex_client_user_agent, AppState};
     use bytes::Bytes;
     use clap::Parser;
     use http_body_util::{BodyExt, Full};
@@ -4941,6 +4958,104 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("AETHER_DATABASE_DRIVER/AETHER_DATABASE_URL"));
         assert!(message.contains("--apply-backfills"));
+    }
+
+    /// Environment marker that routes a re-invocation of this test executable
+    /// into the child role of the frontdoor cache applier regression below.
+    const FRONTDOOR_APPLIER_CHILD_ENV: &str = "AETHER_GATEWAY_TEST_FRONTDOOR_APPLIER_CHILD";
+    const FRONTDOOR_APPLIER_CHILD_SENTINEL: &str = "frontdoor-applier-child-started";
+    const FRONTDOOR_APPLIER_TEST_PATH: &str =
+        "tests::frontdoor_node_role_still_applies_shared_cli_client_profile_cache";
+
+    #[tokio::test]
+    async fn frontdoor_node_role_still_applies_shared_cli_client_profile_cache() {
+        if std::env::var_os(FRONTDOOR_APPLIER_CHILD_ENV).is_some() {
+            frontdoor_applier_child_assertions().await;
+            return;
+        }
+
+        // The child publishes a version to the process-global Codex profile,
+        // so it runs in a fresh process re-invoking this test executable with
+        // `--exact` on this test: process isolation replaces any global
+        // restore, and this process (and its sibling tests) never observe the
+        // mutation. The child self-bounds via its own 2s convergence deadline,
+        // and the wait below is a safety net on top.
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("test executable path should resolve"),
+        );
+        command
+            .arg("--exact")
+            .arg(FRONTDOOR_APPLIER_TEST_PATH)
+            .arg("--nocapture")
+            .env(FRONTDOOR_APPLIER_CHILD_ENV, "1")
+            .env_remove("AETHER_CODEX_CLIENT_VERSION")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tokio::task::spawn_blocking(move || {
+                command
+                    .output()
+                    .expect("child test process should run to completion")
+            }),
+        )
+        .await
+        .expect("child test process should finish within the deadline")
+        .expect("child test process should join");
+
+        // The sentinel proves the child actually executed this test; a mistyped
+        // filter would otherwise run zero tests and still exit successfully.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(FRONTDOOR_APPLIER_CHILD_SENTINEL),
+            "child test did not run the frontdoor applier check; stdout:\n{stdout}"
+        );
+        assert!(
+            output.status.success(),
+            "frontdoor child test failed; stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Child half of the frontdoor regression: seed the shared cache the
+    /// background owner would have written (a version newer than anything
+    /// prewarm could have learned), start the frontdoor lifecycle, and observe
+    /// convergence through the public gateway root seam.
+    async fn frontdoor_applier_child_assertions() {
+        println!("{FRONTDOOR_APPLIER_CHILD_SENTINEL}");
+        let state = AppState::new().expect("state should build");
+        state
+            .runtime_state()
+            .kv_set(
+                "aether:codex:client-profile:v1",
+                serde_json::json!({
+                    "version": "999.999.999",
+                    "verified_at_unix_secs": 1,
+                })
+                .to_string(),
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+            .expect("shared CLI client profile cache should seed");
+
+        let background_tasks = spawn_node_role_tasks(&state, NodeRoleArg::Frontdoor);
+        assert!(
+            background_tasks.is_none(),
+            "frontdoor nodes must not start background workers"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if codex_client_user_agent().starts_with("codex_cli_rs/999.999.999") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "frontdoor process never applied the shared CLI client profile cache"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

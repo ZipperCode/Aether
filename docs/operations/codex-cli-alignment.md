@@ -45,3 +45,10 @@ RUST_MIN_STACK=16777216 cargo test --locked -p aether-gateway --test admin_unsig
 原生记忆端到端测试覆盖真实网关的权限、候选调度、执行计划、模型指令、原生 JSON、成功候选状态与明确停止重试策略下的上游错误响应；执行端使用本地测试服务器，实际账户网络可用性须在部署现场单独验证。
 
 upstream 同步与重点 PR 集成（含 #876、#875）后的针对性验证记录：formats 1083、provider transport 559、原生记忆端到端 1、搜索相关 3、CLI 画像相关 13、提供商页面 23 项前端测试通过；上游合并基线 gateway 回归在 Docker 重跑后 5438 通过、3 忽略，前端 1885 通过。最终整仓集成回归已完成：gateway lib 5456 通过、3 忽略（Docker wrapper 精确管理的 PG 路径），architecture_guard 与 admin_unsigned_identity_headers 共 210 项通过，workspace all-target 检查与 cargo fmt --check 通过，前端 238 文件 type-check、1889 项测试与构建通过。现场冒烟首轮（提供商 UI、HTTP/SSE、迁移 70 项）来自此前 smoke 二进制；最终重建二进制的复验冒烟已通过：clippy（`-D warnings`）与重建通过，启动日志 Codex 0.159.3 / Claude 2.1.284，聊天同步 200（`finish_reason=stop`）、SSE 200 [DONE]，admin/tasks 两项客户端画像维护任务运行中。冒烟仅使用本地伪造上游，未验证真实上游 CLI/OAuth，也不含真实提供商密钥。
+
+## 发布前审查补充
+
+- 前台节点（`--node-role frontdoor`）也启动只读画像缓存应用任务；后台单例刷新资格不决定前台进程是否接收缓存更新。每个进程仅启动一组应用任务，固定版本及防回退规则保持不变。
+- Claude 系统提示的已知身份前缀只用于识别身份文本，不得吞掉后续同一行指令、换行续文或其他 system 文本块；真正 CLI 请求仍由原有完整身份判定保持原样。
+- 配额从元数据回填时，只有支撑账号耗尽结论的窗口均明确过期才能清除顶层耗尽状态。未来重置窗口、无重置证据和仅有拒绝标志的账号不得被显示归一化误放行。
+- 提供商本地分页切换不得取消已排队的搜索防抖请求；仅分页变化不重新发起请求，但最新筛选必须最终生效。

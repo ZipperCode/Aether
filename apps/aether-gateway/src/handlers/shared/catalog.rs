@@ -2798,6 +2798,139 @@ fn normalize_expired_quota_windows(snapshot: &mut serde_json::Map<String, Value>
     }
 }
 
+/// 判断窗口是否带有明确的“已耗尽”观测。
+///
+/// 口径与调度侧 `provider_pool_quota_window_is_exhausted` 一致：显式
+/// `is_exhausted`/`exhausted` 布尔优先（明确为 false 时不视为耗尽），
+/// 否则回退比例、百分比以及“剩余/上限”数值观测。
+fn quota_window_reports_exhaustion(window: &Map<String, Value>) -> bool {
+    ["is_exhausted", "exhausted"]
+        .into_iter()
+        .find_map(|field| window.get(field))
+        .and_then(admin_provider_quota_pure::coerce_json_bool)
+        .or_else(|| {
+            ["used_ratio", "usage_ratio"]
+                .into_iter()
+                .find_map(|field| window.get(field))
+                .and_then(admin_provider_quota_pure::coerce_json_f64)
+                .map(|value| value >= 1.0 - 1e-6)
+        })
+        .or_else(|| {
+            window
+                .get("used_percent")
+                .and_then(admin_provider_quota_pure::coerce_json_f64)
+                .map(|value| value >= 100.0 - 1e-6)
+        })
+        .or_else(|| {
+            ["remaining_ratio", "remaining_fraction"]
+                .into_iter()
+                .find_map(|field| window.get(field))
+                .and_then(admin_provider_quota_pure::coerce_json_f64)
+                .map(|value| value <= 1e-6)
+        })
+        .or_else(|| {
+            window
+                .get("remaining_percent")
+                .and_then(admin_provider_quota_pure::coerce_json_f64)
+                .map(|value| value <= 1e-6)
+        })
+        .or_else(|| {
+            let remaining = ["remaining", "remaining_value"]
+                .into_iter()
+                .find_map(|field| window.get(field))
+                .and_then(admin_provider_quota_pure::coerce_json_f64)?;
+            let limit = ["limit", "limit_value", "total"]
+                .into_iter()
+                .find_map(|field| window.get(field))
+                .and_then(admin_provider_quota_pure::coerce_json_f64)?;
+            (limit > 0.0).then_some(remaining <= 0.0)
+        })
+        .unwrap_or(false)
+}
+
+/// 与调度侧账号级判定同口径：模型作用域窗口不构成账号级耗尽证据。
+fn quota_window_is_model_scoped(window: &Map<String, Value>) -> bool {
+    if window
+        .get("scope")
+        .and_then(Value::as_str)
+        .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("model"))
+    {
+        return true;
+    }
+    [
+        "model",
+        "model_name",
+        "model_id",
+        "quota_model",
+        "quota_model_name",
+        "target_model",
+    ]
+    .into_iter()
+    .any(|field| {
+        window
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    }) || ["models", "model_ids"].into_iter().any(|field| {
+        window
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|value| value.as_str().is_some_and(|value| !value.trim().is_empty()))
+            })
+    })
+}
+
+/// 回填载荷的耗尽结论只锚定上游元数据的观测时间；读取时若所有支撑该结论的
+/// 账号级窗口都已越过重置时间点，则与调度侧一样按“已重置”处理。
+///
+/// 只认窗口证据：积分、余额、显式拒绝（allowed/limit_reached）等非窗口结论
+/// 保持原状；模型作用域窗口不阻塞账号，无重置时间或观测不完整的窗口无法
+/// 证明已重置，同样保持原状。
+fn backfilled_quota_exhaustion_windows_reset_elapsed(snapshot: &Map<String, Value>) -> bool {
+    let Some(quota) = snapshot.get("quota").and_then(Value::as_object) else {
+        return false;
+    };
+    if !quota
+        .get("code")
+        .and_then(Value::as_str)
+        .is_some_and(|code| code.trim().eq_ignore_ascii_case("exhausted"))
+    {
+        return false;
+    }
+    let Some(windows) = quota.get("windows").and_then(Value::as_array) else {
+        return false;
+    };
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let fallback_observed_at = provider_quota_timestamp_unix_secs(quota.get("observed_at"))
+        .or_else(|| provider_quota_timestamp_unix_secs(quota.get("updated_at")));
+    let mut saw_exhausted_window = false;
+    for window in windows.iter().filter_map(Value::as_object) {
+        // 与 normalize_expired_quota_windows 一致：window_minutes=0 不是真实配额窗口。
+        if window.get("window_minutes").and_then(Value::as_u64) == Some(0) {
+            continue;
+        }
+        if quota_window_is_model_scoped(window) || !quota_window_reports_exhaustion(window) {
+            continue;
+        }
+        saw_exhausted_window = true;
+        if !aether_provider_pool::provider_pool_reset_deadline_elapsed(
+            window,
+            fallback_observed_at,
+            now_unix_secs,
+        ) {
+            return false;
+        }
+    }
+    saw_exhausted_window
+}
+
 pub(crate) fn provider_key_status_snapshot_payload(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
@@ -2846,12 +2979,17 @@ pub(crate) fn provider_key_status_snapshot_payload(
     // newer quota observation. Use the same decision as scheduling so the
     // account list and its status filter do not keep displaying that stale block.
     // 对所有提供商生效：适配器判定已是“重置感知”的，与调度口径保持一致。
-    // 仅清理“物化快照”路径：回填载荷（如 claude_code 从 usage 元数据重建的
-    // 5h/7d 窗口）刚按最新元数据推导过耗尽状态，存储快照缺失证据（None 按
-    // 未耗尽处理）不能反向清掉它，否则未到重置时间的 Claude 限流会被误显示为可用。
-    if uses_materialized_snapshot
-        && !aether_provider_pool::provider_pool_key_account_quota_exhausted(key, provider_type)
-    {
+    // 物化快照路径直接沿用调度判定；回填载荷（如 claude_code 从 usage 元数据
+    // 重建的 5h/7d 窗口）刚按最新元数据推导过耗尽状态，存储快照缺失证据
+    // （None 按未耗尽处理）不能反向清掉它，否则未到重置时间的 Claude 限流会
+    // 被误显示为可用——只有当支撑耗尽结论的账号级窗口全部越过重置时间点时
+    // 才清理，避免窗口已按“已重置”恢复 100% 而账号仍被钉在耗尽过滤器里。
+    let stale_exhausted_summary = if uses_materialized_snapshot {
+        !aether_provider_pool::provider_pool_key_account_quota_exhausted(key, provider_type)
+    } else {
+        backfilled_quota_exhaustion_windows_reset_elapsed(&snapshot)
+    };
+    if stale_exhausted_summary {
         if let Some(quota) = snapshot.get_mut("quota").and_then(Value::as_object_mut) {
             quota.insert("exhausted".to_string(), json!(false));
             if quota.get("code").and_then(Value::as_str) == Some("exhausted") {
@@ -4401,11 +4539,11 @@ mod tests {
             "claude_code": {
                 "updated_at": 1_800_000_000u64,
                 "five_hour_used_percent": 100.0,
-                "five_hour_reset_at": 1_800_003_600u64,
+                "five_hour_reset_at": 4_102_444_800u64,
                 "seven_day_used_percent": 40.0,
-                "seven_day_reset_at": 1_800_400_000u64,
+                "seven_day_reset_at": 4_102_444_800u64,
                 "seven_day_sonnet_used_percent": 10.0,
-                "seven_day_sonnet_reset_at": 1_800_400_000u64,
+                "seven_day_sonnet_reset_at": 4_102_444_800u64,
                 "reset_credits": {
                     "available_count": 2,
                     "updated_at": 1_800_000_000u64,
@@ -4427,7 +4565,7 @@ mod tests {
         assert_eq!(quota.get("provider_type"), Some(&json!("claude_code")));
         // An exhausted 5h window blocks the whole account until it resets.
         assert_eq!(quota.get("exhausted"), Some(&json!(true)));
-        assert_eq!(quota.get("reset_at"), Some(&json!(1_800_003_600u64)));
+        assert_eq!(quota.get("reset_at"), Some(&json!(4_102_444_800u64)));
         let windows = quota
             .get("windows")
             .and_then(Value::as_array)
@@ -4444,6 +4582,60 @@ mod tests {
         assert_eq!(
             quota["reset_credits"]["credits"][0]["remaining_seconds"],
             json!(144_000u64)
+        );
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_reconciles_backfilled_claude_code_exhaustion_after_reset(
+    ) {
+        // 观测时未到期、读取时已过期的 5H 窗口：构建器按观测时间推导出耗尽，
+        // 读取层必须与窗口归一化一致地把摘要恢复为“已重置”。
+        let mut expired = sample_catalog_key();
+        expired.upstream_metadata = Some(json!({
+            "claude_code": {
+                "updated_at": 1_700_000_000u64,
+                "five_hour_used_percent": 100.0,
+                "five_hour_reset_at": 1_700_003_600u64,
+                "seven_day_used_percent": 40.0,
+                "seven_day_reset_at": 4_102_444_800u64
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&expired, "claude_code");
+        assert_eq!(payload.pointer("/quota/code"), Some(&json!("ok")));
+        assert_eq!(payload.pointer("/quota/exhausted"), Some(&json!(false)));
+        assert_eq!(payload.pointer("/quota/windows/0/code"), Some(&json!("5h")));
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_ratio"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/is_exhausted"),
+            Some(&json!(false))
+        );
+
+        // 未到重置时间的耗尽窗口继续阻断整个账号，不能被读取层提前恢复。
+        let mut active = sample_catalog_key();
+        active.upstream_metadata = Some(json!({
+            "claude_code": {
+                "updated_at": 1_700_000_000u64,
+                "five_hour_used_percent": 100.0,
+                "five_hour_reset_at": 4_102_444_800u64,
+                "seven_day_used_percent": 40.0,
+                "seven_day_reset_at": 4_102_444_800u64
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&active, "claude_code");
+        assert_eq!(payload.pointer("/quota/code"), Some(&json!("exhausted")));
+        assert_eq!(payload.pointer("/quota/exhausted"), Some(&json!(true)));
+        assert_eq!(
+            payload.pointer("/quota/windows/0/is_exhausted"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_ratio"),
+            Some(&json!(1.0))
         );
     }
 
@@ -5038,6 +5230,95 @@ mod tests {
         let payload = provider_key_status_snapshot_payload(&key, "codex");
         assert_eq!(payload["quota"]["code"], "exhausted");
         assert_eq!(payload["quota"]["exhausted"], true);
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_clears_expired_backfilled_codex_exhaustion() {
+        // 元数据观测时已用满、读取时早已越过重置时间点的窗口：回填出的耗尽
+        // 摘要必须与调度侧一样按“已重置”清理，而不是窗口恢复 100%、账号
+        // 仍被钉在耗尽过滤器里。
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "codex": {
+                "observed_at": 1_700_000_000u64,
+                "primary_used_percent": 100.0,
+                "primary_reset_at": 1_700_003_600u64
+            }
+        }));
+
+        assert!(!aether_provider_pool::provider_pool_key_account_quota_exhausted(&key, "codex"));
+        let payload = provider_key_status_snapshot_payload(&key, "codex");
+        assert_eq!(payload.pointer("/quota/code"), Some(&json!("ok")));
+        assert_eq!(payload.pointer("/quota/exhausted"), Some(&json!(false)));
+        assert_eq!(
+            payload.pointer("/quota/windows/0/code"),
+            Some(&json!("weekly"))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_ratio"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/remaining_ratio"),
+            Some(&json!(1.0))
+        );
+
+        // 显式拒绝没有窗口证据，不参与重置清理，保持耗尽展示。
+        let mut refused = sample_catalog_key();
+        refused.upstream_metadata = Some(json!({
+            "codex": {
+                "observed_at": 1_700_000_000u64,
+                "allowed": false,
+                "limit_reached": true
+            }
+        }));
+
+        assert!(aether_provider_pool::provider_pool_key_account_quota_exhausted(&refused, "codex"));
+        let payload = provider_key_status_snapshot_payload(&refused, "codex");
+        assert_eq!(payload.pointer("/quota/code"), Some(&json!("exhausted")));
+        assert_eq!(payload.pointer("/quota/exhausted"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_clears_expired_codex_refresh_exhaustion() {
+        // 比存储快照更新的元数据刷新走回填路径；过期已用满的窗口同样按
+        // “已重置”清理摘要，且载荷确实来自新元数据而不是旧快照。
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "codex": {
+                "observed_at": 1_700_000_000u64,
+                "primary_used_percent": 100.0,
+                "primary_reset_at": 1_700_003_600u64
+            }
+        }));
+        key.status_snapshot = Some(json!({"quota": {
+            "provider_type": "codex",
+            "observed_at": 1_600_000_000u64,
+            "code": "exhausted",
+            "exhausted": true,
+            "windows": [{
+                "code": "weekly", "scope": "account",
+                "used_ratio": 1.0, "remaining_ratio": 0.0,
+                "reset_at": 1_600_003_600u64
+            }]
+        }}));
+
+        assert!(!aether_provider_pool::provider_pool_key_account_quota_exhausted(&key, "codex"));
+        let payload = provider_key_status_snapshot_payload(&key, "codex");
+        assert_eq!(
+            payload.pointer("/quota/observed_at"),
+            Some(&json!(1_700_000_000u64))
+        );
+        assert_eq!(
+            payload.pointer("/quota/windows/0/reset_at"),
+            Some(&json!(1_700_003_600u64))
+        );
+        assert_eq!(payload.pointer("/quota/code"), Some(&json!("ok")));
+        assert_eq!(payload.pointer("/quota/exhausted"), Some(&json!(false)));
+        assert_eq!(
+            payload.pointer("/quota/windows/0/used_ratio"),
+            Some(&json!(0.0))
+        );
     }
 
     #[test]

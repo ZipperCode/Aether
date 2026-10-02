@@ -350,6 +350,14 @@ fn spawn_cache_applier(spec: &'static CliClientProfileSpec, app: AppState) {
     });
 }
 
+/// 为本进程启动全部 CLI 客户端画像的缓存 applier。属于每个进程的生命周期，与节点
+/// 角色无关：frontdoor-only 进程同样发出上游请求，若只在后台角色启动 applier，
+/// 这些进程在启动 prewarm 之后就再也不会应用后台 owner 写入共享缓存的画像。
+pub(crate) fn spawn_cache_appliers(app: AppState) {
+    spawn_cache_applier(&CODEX_CLI_PROFILE, app.clone());
+    spawn_cache_applier(&CLAUDE_CODE_CLI_PROFILE, app);
+}
+
 async fn refresh_once_with_fetch<F, Fut>(
     spec: &CliClientProfileSpec,
     runtime: &RuntimeState,
@@ -438,9 +446,8 @@ pub(crate) fn spawn_worker(
     spec: &'static CliClientProfileSpec,
     app: AppState,
 ) -> tokio::task::JoinHandle<()> {
-    // 单例 owner 独占网络刷新与共享缓存写入；所有进程（含非 owner）由 applier
-    // 周期性应用共享缓存，消除进程本地画像的漂移。
-    spawn_cache_applier(spec, app.clone());
+    // 单例 owner 独占网络刷新与共享缓存写入；所有进程（含 frontdoor-only）的缓存
+    // 应用由 spawn_cache_appliers 在每个节点角色的启动路径中独立启动。
     crate::task_runtime::spawn_singleton_worker(app, spec.task_key, move |app| async move {
         let mut interval = tokio::time::interval(PROFILE_REFRESH_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

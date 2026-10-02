@@ -729,8 +729,8 @@ watch(hasCustomOrder, (enabled) => {
 // 分页/筛选/搜索变化时重新加载
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 watch(queryParams, (newParams, oldParams) => {
-  if (debounceTimer) clearTimeout(debounceTimer)
-  // 前端分页模式下翻页/换每页条数只影响本地切片，无需重新请求
+  // 前端分页模式下翻页/换每页条数只影响本地切片，无需重新请求；
+  // 提前返回时保留挂起的搜索防抖，避免筛选重载被永久取消
   const isPagingOnly = (newParams.page !== oldParams?.page || newParams.page_size !== oldParams?.page_size) &&
     newParams.search === oldParams?.search &&
     newParams.status === oldParams?.status &&
@@ -739,6 +739,7 @@ watch(queryParams, (newParams, oldParams) => {
   if (localPaging.value && isPagingOnly) {
     return
   }
+  if (debounceTimer) clearTimeout(debounceTimer)
   // 搜索输入 debounce 300ms，其他变化立即执行
   const isSearchOnly = newParams.search !== oldParams?.search &&
     newParams.page === oldParams?.page &&

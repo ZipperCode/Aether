@@ -55,6 +55,7 @@ use super::super::{control::GatewayControlDecision, error::GatewayError};
 use super::super::{provider_transport, usage};
 
 use crate::cli_client_profile::{
+    spawn_cache_appliers as spawn_cli_client_profile_cache_appliers,
     spawn_worker as spawn_cli_client_profile_worker, CLAUDE_CODE_CLI_PROFILE, CODEX_CLI_PROFILE,
 };
 use crate::maintenance::spawn_account_self_check_worker;
@@ -158,6 +159,14 @@ impl AppState {
 
     pub async fn prewarm_claude_code_client_profile(&self) -> Result<String, String> {
         crate::cli_client_profile::prewarm(&CLAUDE_CODE_CLI_PROFILE, self.runtime_state()).await
+    }
+
+    /// Start this process's CLI client profile cache appliers. This is part of
+    /// the every-process lifecycle and is independent of the node role:
+    /// frontdoor-only processes send upstream requests too and must keep
+    /// applying the shared cache that the background singleton owner refreshes.
+    pub fn spawn_cli_client_profile_appliers(&self) {
+        spawn_cli_client_profile_cache_appliers(self.clone());
     }
 
     pub async fn prewarm_chat_pii_redaction_runtime_config(&self) -> Result<bool, String> {

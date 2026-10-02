@@ -146,6 +146,13 @@ beforeEach(() => {
 
 const originalElementFromPoint = Object.getOwnPropertyDescriptor(document, 'elementFromPoint')
 
+// jsdom 未实现 Pointer Capture API，radix-vue 的 SelectTrigger 打开下拉时会调用
+if (!('hasPointerCapture' in Element.prototype)) {
+  Object.defineProperty(Element.prototype, 'hasPointerCapture', { configurable: true, value: () => false })
+  Object.defineProperty(Element.prototype, 'setPointerCapture', { configurable: true, value() {} })
+  Object.defineProperty(Element.prototype, 'releasePointerCapture', { configurable: true, value() {} })
+}
+
 afterEach(() => {
   unmountView()
   if (originalElementFromPoint) {
@@ -367,6 +374,26 @@ function mockSortableProviders() {
   return providers
 }
 
+function mockSearchAwareProviders() {
+  const providers = Array.from({ length: 20 }, (_, index) => createProvider({
+    id: `provider-${index + 1}`,
+    name: index < 15 ? `Alpha ${index + 1}` : `Beta ${index + 1}`,
+    provider_priority: (index + 1) * 10,
+  }))
+  apiMocks.getProvidersSummary.mockImplementation(async (query: { page?: number, page_size?: number, search?: string } = {}) => {
+    const search = query.search
+    const filtered = search
+      ? providers.filter(provider => provider.name.includes(search))
+      : providers
+    const page = query.page ?? 1
+    const pageSize = query.page_size ?? 20
+    return {
+      items: filtered.slice((page - 1) * pageSize, page * pageSize),
+      total: filtered.length,
+    }
+  })
+}
+
 function providerElements(root: HTMLElement): HTMLElement[] {
   const container = root.querySelector('table') ?? root
   return [...container.querySelectorAll<HTMLElement>('[data-provider-sort-id]')]
@@ -567,6 +594,87 @@ describe('ProviderManagement shared display order', () => {
         'provider-2', 'provider-1', 'provider-3', 'provider-4', 'provider-5', 'provider-6',
         'provider-7', 'provider-8', 'provider-9', 'provider-10', 'provider-11', 'provider-12',
       ])
+  })
+
+  it('still applies a pending search after a local page change before the debounce fires', async () => {
+    mockSearchAwareProviders()
+    localStorage.setItem('provider-management-page-size', '10')
+    localStorage.setItem('aether-provider-display-order', JSON.stringify(
+      Array.from({ length: 20 }, (_, index) => `provider-${index + 1}`),
+    ))
+    const root = await mountView()
+    expect(providerOrder(root)).toEqual([
+      'provider-1', 'provider-2', 'provider-3', 'provider-4', 'provider-5',
+      'provider-6', 'provider-7', 'provider-8', 'provider-9', 'provider-10',
+    ])
+
+    const search = root.querySelector<HTMLInputElement>('#provider-search')!
+    search.value = 'Alpha'
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await settle()
+
+    const requestsBeforePaging = apiMocks.getProvidersSummary.mock.calls.length
+    const secondPage = [...root.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent?.trim() === '2')!
+    secondPage.click()
+    await settle()
+    // 前端分页下翻页本身不触发请求
+    expect(apiMocks.getProvidersSummary).toHaveBeenCalledTimes(requestsBeforePaging)
+
+    await vi.waitFor(() => {
+      expect(providerOrder(root)).toEqual([
+        'provider-11', 'provider-12', 'provider-13', 'provider-14', 'provider-15',
+      ])
+    })
+    expect(apiMocks.getProvidersSummary).toHaveBeenCalledTimes(requestsBeforePaging + 1)
+    expect(apiMocks.getProvidersSummary).toHaveBeenLastCalledWith(
+      expect.objectContaining({ search: 'Alpha', page_size: 10_000 }),
+      expect.any(Object),
+    )
+    expect(root.textContent).not.toContain('Beta')
+  })
+
+  it('still applies a pending search after a page-size change before the debounce fires', async () => {
+    mockSearchAwareProviders()
+    localStorage.setItem('provider-management-page-size', '10')
+    localStorage.setItem('aether-provider-display-order', JSON.stringify(
+      Array.from({ length: 20 }, (_, index) => `provider-${index + 1}`),
+    ))
+    const root = await mountView()
+
+    const search = root.querySelector<HTMLInputElement>('#provider-search')!
+    search.value = 'Alpha'
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await settle()
+
+    const requestsBeforeResize = apiMocks.getProvidersSummary.mock.calls.length
+    const pageSizeTrigger = root.querySelector<HTMLButtonElement>('button[aria-label="每页条数"]')!
+    expect(pageSizeTrigger).not.toBeNull()
+    pageSizeTrigger.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0 }))
+    await settle()
+    const fiftyOption = [...document.querySelectorAll<HTMLElement>('[role="option"]')]
+      .find(element => element.textContent?.trim() === '50 条/页')
+    expect(fiftyOption).toBeDefined()
+    fiftyOption!.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0 }))
+    await nextTick()
+    fiftyOption!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+    await settle()
+    // 前端分页下换每页条数本身不触发请求
+    expect(apiMocks.getProvidersSummary).toHaveBeenCalledTimes(requestsBeforeResize)
+
+    await vi.waitFor(() => {
+      expect(providerOrder(root)).toEqual([
+        'provider-1', 'provider-2', 'provider-3', 'provider-4', 'provider-5',
+        'provider-6', 'provider-7', 'provider-8', 'provider-9', 'provider-10',
+        'provider-11', 'provider-12', 'provider-13', 'provider-14', 'provider-15',
+      ])
+    })
+    expect(apiMocks.getProvidersSummary).toHaveBeenCalledTimes(requestsBeforeResize + 1)
+    expect(apiMocks.getProvidersSummary).toHaveBeenLastCalledWith(
+      expect.objectContaining({ search: 'Alpha', page_size: 10_000 }),
+      expect.any(Object),
+    )
+    expect(root.textContent).not.toContain('Beta')
   })
 
   it('ignores stale IDs and appends providers that are not in the saved order', async () => {
