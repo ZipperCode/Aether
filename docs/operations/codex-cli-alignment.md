@@ -14,6 +14,8 @@
 | 上游账户配额 | `codex.rate_limits` 继续进入账户级熔断与持久化路径，不当作网关用户自己的配额公开 |
 | 原生记忆接口 | `POST /v1/memories/trace_summarize` 复用 Responses 权限及调度，执行原生同步操作，保留 traces、output 数组和未来字段，不注入 Responses 的 input/store/include 或流式默认值 |
 
+客户端画像按 #875 引入的动态画像与多实例缓存同步运行：单一 fetch 进程继续执行后台稳定版本刷新并写入共享缓存版本；其余 follower 进程不各自发起刷新，而是每 5 分钟应用共享缓存中的最新版本。显式版本固定与防回滚规则保持不变，缓存传播不会把已固定的画像回退到更旧版本。该机制只改变版本的获取与传播路径，不改变上表的协议行为。
+
 公开快照来源为 `codex-rs/models-manager/models.json`。未复制提示词或账户套餐可见性；保留官方公开的 `comp_hash` 压缩兼容性标记，以支持 CLI Guardian 的压缩上下文复用；没有引入个人用户标识、已有会话 UUID、Cookie、访问令牌或账户凭据。运行时鉴权和账户字段仍由提供商密钥配置产生。
 
 新增模型能力快照不等于授权访问该模型。可用模型应通过正式管理界面的上游模型查询、全局模型和提供商模型配置，以及密钥模型限制来设置。远端目录及实际账户权限决定上游是否支持模型，不能通过修改 `/models` 列表绕过。
@@ -41,3 +43,5 @@ RUST_MIN_STACK=16777216 cargo test --locked -p aether-gateway --test admin_unsig
 完整网关测试需要可执行的临时 PostgreSQL 工具（`AETHER_INITDB_BIN`、`AETHER_POSTGRES_BIN`、`AETHER_PG_CTL_BIN`）、权限受控的临时目录，以及不允许组写入的测试运行目录。Unix socket、更新元数据与私有运行文件测试会主动拒绝不安全的路径；测试目录应以 `umask 022` 或更严格的权限创建。
 
 原生记忆端到端测试覆盖真实网关的权限、候选调度、执行计划、模型指令、原生 JSON、成功候选状态与明确停止重试策略下的上游错误响应；执行端使用本地测试服务器，实际账户网络可用性须在部署现场单独验证。
+
+upstream 同步与重点 PR 集成（含 #876、#875）后的针对性验证记录：formats 1083、provider transport 559、原生记忆端到端 1、搜索相关 3、CLI 画像相关 13、提供商页面 23 项前端测试通过；上游合并基线 gateway 回归在 Docker 重跑后 5438 通过、3 忽略，前端 1885 通过。最终整仓集成回归已完成：gateway lib 5456 通过、3 忽略（Docker wrapper 精确管理的 PG 路径），architecture_guard 与 admin_unsigned_identity_headers 共 210 项通过，workspace all-target 检查与 cargo fmt --check 通过，前端 238 文件 type-check、1889 项测试与构建通过。现场冒烟首轮（提供商 UI、HTTP/SSE、迁移 70 项）来自此前 smoke 二进制；最终重建二进制的复验冒烟已通过：clippy（`-D warnings`）与重建通过，启动日志 Codex 0.159.3 / Claude 2.1.284，聊天同步 200（`finish_reason=stop`）、SSE 200 [DONE]，admin/tasks 两项客户端画像维护任务运行中。冒烟仅使用本地伪造上游，未验证真实上游 CLI/OAuth，也不含真实提供商密钥。
