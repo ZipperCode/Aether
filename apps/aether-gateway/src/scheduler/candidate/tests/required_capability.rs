@@ -20,7 +20,9 @@ use super::super::{
     list_selectable_candidates_for_required_capability_without_requested_model_with_auth_limit_signal,
     CandidateSchedulingContext,
 };
-use super::support::{sample_auth_snapshot, sample_provider, sample_row};
+use super::support::{
+    sample_auth_snapshot, sample_provider, sample_row, sample_row_without_model_mappings,
+};
 
 /// 验证兼容型能力只提升匹配 Key，不会把其他可用 Key 硬过滤掉。
 #[tokio::test]
@@ -83,7 +85,7 @@ async fn compatible_required_capability_prefers_matching_keys_without_hard_filte
 /// 验证独占型能力仍只保留明确匹配的 Key。
 #[tokio::test]
 async fn exclusive_required_capability_keeps_hard_filtering_only_matching_keys() {
-    let mut incompatible = sample_row();
+    let mut incompatible = sample_row_without_model_mappings();
     incompatible.provider_id = "provider-a".to_string();
     incompatible.provider_name = "provider-a".to_string();
     incompatible.endpoint_id = "endpoint-a".to_string();
@@ -95,7 +97,7 @@ async fn exclusive_required_capability_keeps_hard_filtering_only_matching_keys()
     incompatible.global_model_name = "gemini-2.5-pro".to_string();
     incompatible.key_capabilities = Some(serde_json::json!({}));
 
-    let mut compatible = sample_row();
+    let mut compatible = sample_row_without_model_mappings();
     compatible.provider_id = "provider-b".to_string();
     compatible.provider_name = "provider-b".to_string();
     compatible.endpoint_id = "endpoint-b".to_string();
@@ -143,7 +145,7 @@ async fn exclusive_required_capability_keeps_hard_filtering_only_matching_keys()
 /// 验证无模型能力选择仍使用会话级缓存亲和和显式排序配置。
 #[tokio::test]
 async fn required_capability_without_model_uses_session_scoped_affinity() {
-    let mut fallback = sample_row();
+    let mut fallback = sample_row_without_model_mappings();
     fallback.provider_id = "provider-a".to_string();
     fallback.provider_name = "provider-a".to_string();
     fallback.endpoint_id = "endpoint-a".to_string();

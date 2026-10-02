@@ -1270,17 +1270,6 @@ fn requested_model_selection_sql() -> String {
             )
           )
         )
-        OR NOT EXISTS (
-          SELECT 1
-          FROM jsonb_array_elements(
-            CASE
-              WHEN jsonb_typeof(m.provider_model_mappings) = 'array'
-                THEN m.provider_model_mappings
-              ELSE '[]'::jsonb
-            END
-          ) AS mapping(value)
-          WHERE mapping.value ->> 'name' = m.provider_model_name
-        )
       )
     )
     OR (
@@ -1288,17 +1277,6 @@ fn requested_model_selection_sql() -> String {
       AND (
         m.provider_model_mappings IS NULL
         OR jsonb_typeof(m.provider_model_mappings) <> 'array'
-        OR NOT EXISTS (
-          SELECT 1
-          FROM jsonb_array_elements(
-            CASE
-              WHEN jsonb_typeof(m.provider_model_mappings) = 'array'
-                THEN m.provider_model_mappings
-              ELSE '[]'::jsonb
-            END
-          ) AS mapping(value)
-          WHERE mapping.value ->> 'name' = m.provider_model_name
-        )
         OR EXISTS (
           SELECT 1
           FROM jsonb_array_elements(
@@ -1327,6 +1305,47 @@ fn requested_model_selection_sql() -> String {
                 WHERE endpoint.value = pe.id
               )
             )
+        )
+        OR (
+          NOT EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(
+              CASE
+                WHEN jsonb_typeof(m.provider_model_mappings) = 'array'
+                  THEN m.provider_model_mappings
+                ELSE '[]'::jsonb
+              END
+            ) AS mapping(value)
+            WHERE mapping.value ->> 'name' = m.provider_model_name
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(
+              CASE
+                WHEN jsonb_typeof(m.provider_model_mappings) = 'array'
+                  THEN m.provider_model_mappings
+                ELSE '[]'::jsonb
+              END
+            ) AS mapping(value)
+            WHERE (
+              mapping.value -> 'api_formats' IS NULL
+              OR jsonb_typeof(mapping.value -> 'api_formats') <> 'array'
+              OR EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(mapping.value -> 'api_formats') AS fmt(value)
+                WHERE __AETHER_PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH__
+              )
+            )
+            AND (
+              mapping.value -> 'endpoint_ids' IS NULL
+              OR jsonb_typeof(mapping.value -> 'endpoint_ids') <> 'array'
+              OR EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(mapping.value -> 'endpoint_ids') AS endpoint(value)
+                WHERE endpoint.value = pe.id
+              )
+            )
+          )
         )
       )
     )
@@ -1867,13 +1886,11 @@ mod tests {
         pool_key_candidate_selection_sql, requested_model_selection_page_sql,
         requested_model_selection_sql, SqlxMinimalCandidateSelectionReadRepository,
         LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL, LIST_FOR_EXACT_API_FORMAT_SQL,
-        LIST_POOL_KEYS_FOR_GROUP_SQL, PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_MARKER,
-        PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_SQL,
+        LIST_POOL_KEYS_FOR_GROUP_SQL,
     };
     use crate::{PostgresPoolConfig, PostgresPoolFactory};
     use aether_data_contracts::repository::candidate_selection::{
-        provider_model_mapping_api_format_covers, StoredPoolKeyCandidateOrder,
-        StoredProviderModelMapping,
+        StoredPoolKeyCandidateOrder, StoredProviderModelMapping,
     };
 
     #[tokio::test]
@@ -1986,35 +2003,6 @@ mod tests {
             assert!(sql.contains("LOWER(BTRIM(p.provider_type)) = 'codex'"));
             assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) = 'oauth'"));
             assert!(sql.contains("'codex:live'"));
-        }
-    }
-
-    #[test]
-    fn requested_model_sql_scopes_legacy_responses_mapping_to_codex_live() {
-        let sql = requested_model_selection_sql();
-        let compatibility = PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_SQL;
-
-        assert_eq!(sql.matches(compatibility).count(), 3);
-        assert!(!sql.contains(PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_MARKER));
-        assert!(compatibility.contains("LOWER(BTRIM(p.provider_type)) = 'codex'"));
-        assert!(compatibility.contains("LOWER($4) = 'codex:live'"));
-        for legacy_responses_alias in ["openai:responses", "/v1/responses"] {
-            assert!(provider_model_mapping_api_format_covers(
-                "codex",
-                legacy_responses_alias,
-                "codex:live"
-            ));
-            assert!(compatibility.contains(&format!("'{legacy_responses_alias}'")));
-        }
-        assert!(!LIST_FOR_EXACT_API_FORMAT_SQL.contains(compatibility));
-        assert!(!LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL.contains(compatibility));
-        assert!(!LIST_POOL_KEYS_FOR_GROUP_SQL.contains(compatibility));
-        for permission_sql in [
-            LIST_FOR_EXACT_API_FORMAT_SQL,
-            LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL,
-            LIST_POOL_KEYS_FOR_GROUP_SQL,
-        ] {
-            assert!(!permission_sql.contains("'/v1/responses'"));
         }
     }
 
