@@ -11,12 +11,12 @@ use crate::capability::{ProviderPoolCapability, ProviderQuotaServingPolicy};
 use crate::presets::normalize_provider_scheduling_presets;
 use crate::provider::{ProviderPoolAdapter, ProviderPoolMemberInput};
 use crate::providers::{
-    AntigravityProviderPoolAdapter, ChatGptWebProviderPoolAdapter, CodexProviderPoolAdapter,
-    DeepSeekProviderPoolAdapter, DefaultProviderPoolAdapter, GeminiCliProviderPoolAdapter,
-    GrokProviderPoolAdapter, KiroProviderPoolAdapter, NousProviderPoolAdapter,
-    OfficialApiKeyQuotaProvider, OfficialApiKeyQuotaProviderPoolAdapter,
+    AntigravityProviderPoolAdapter, ChatGptWebProviderPoolAdapter, ClaudeCodeProviderPoolAdapter,
+    CodexProviderPoolAdapter, DeepSeekProviderPoolAdapter, DefaultProviderPoolAdapter,
+    GeminiCliProviderPoolAdapter, GrokProviderPoolAdapter, KiroProviderPoolAdapter,
+    NousProviderPoolAdapter, OfficialApiKeyQuotaProvider, OfficialApiKeyQuotaProviderPoolAdapter,
     OpenRouterProviderPoolAdapter, WindsurfProviderPoolAdapter, XaiProviderPoolAdapter,
-    CLAUDE_CODE_PROVIDER_POOL_ADAPTER, VERTEX_AI_PROVIDER_POOL_ADAPTER,
+    VERTEX_AI_PROVIDER_POOL_ADAPTER,
 };
 
 #[derive(Clone)]
@@ -50,7 +50,7 @@ impl ProviderPoolService {
     pub fn with_builtin_adapters() -> Self {
         Self::new()
             .with_adapter(Arc::new(AntigravityProviderPoolAdapter))
-            .with_adapter(Arc::new(CLAUDE_CODE_PROVIDER_POOL_ADAPTER))
+            .with_adapter(Arc::new(ClaudeCodeProviderPoolAdapter))
             .with_adapter(Arc::new(CodexProviderPoolAdapter))
             .with_adapter(Arc::new(DeepSeekProviderPoolAdapter))
             .with_adapter(Arc::new(GeminiCliProviderPoolAdapter))

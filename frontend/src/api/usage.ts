@@ -20,6 +20,7 @@ export interface UsageRecord {
   reasoning_effort?: string | null
   service_tier?: string | null
   actual_service_tier?: string | null
+  response_model?: string | null
   input_tokens: number
   effective_input_tokens?: number
   output_tokens: number
@@ -261,6 +262,7 @@ type ActiveUsageRequestsResponse = {
     has_skipped_candidate?: boolean | null
     skipped_candidate_reasons?: string[]
     target_model?: string | null
+    response_model?: string | null
     request_type?: string | null
     requested_reasoning_effort?: string | null
     reasoning_effort?: string | null

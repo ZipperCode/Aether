@@ -1,5 +1,6 @@
 pub mod antigravity;
 pub mod chatgpt_web;
+pub mod claude_code;
 pub mod codex;
 pub mod deepseek;
 pub mod default;
@@ -26,6 +27,11 @@ pub use chatgpt_web::{
     build_chatgpt_web_pool_quota_request, enrich_chatgpt_web_quota_metadata,
     normalize_chatgpt_web_image_quota_limit, CHATGPT_WEB_CONVERSATION_INIT_PATH,
     CHATGPT_WEB_DEFAULT_BASE_URL,
+};
+pub use claude_code::ClaudeCodeProviderPoolAdapter;
+pub use claude_code::{
+    build_claude_code_pool_quota_request, CLAUDE_CODE_OAUTH_BETA, CLAUDE_CODE_OAUTH_USAGE_URL,
+    CLAUDE_CODE_USAGE_USER_AGENT,
 };
 pub use codex::CodexProviderPoolAdapter;
 pub use codex::{
@@ -72,10 +78,7 @@ pub use openrouter::{
     openrouter_quota_url_host_is_allowed, parse_openrouter_credits, OpenRouterProviderPoolAdapter,
     OPENROUTER_CREDITS_URL,
 };
-pub use unsupported::{
-    UnsupportedQuotaProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,
-    VERTEX_AI_PROVIDER_POOL_ADAPTER,
-};
+pub use unsupported::{UnsupportedQuotaProviderPoolAdapter, VERTEX_AI_PROVIDER_POOL_ADAPTER};
 pub use windsurf::{
     build_windsurf_pool_model_configs_request,
     build_windsurf_pool_model_configs_request_with_base_url, build_windsurf_pool_quota_request,

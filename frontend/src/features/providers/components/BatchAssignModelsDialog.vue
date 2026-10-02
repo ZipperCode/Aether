@@ -62,6 +62,16 @@
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+          <Button
+            variant="outline"
+            size="sm"
+            class="shrink-0 gap-1.5"
+            data-testid="batch-assign-create-model"
+            @click="openCreateModelDialog"
+          >
+            <Plus class="w-4 h-4" />
+            创建模型
+          </Button>
         </div>
 
         <!-- 模型列表 -->
@@ -286,6 +296,15 @@
           </div>
         </div>
       </div>
+
+      <!-- 创建统一模型对话框（嵌套，创建成功后刷新下方模型列表）
+           注意：不使用 v-if 挂载，GlobalModelFormDialog 依赖 open 变化来加载模型目录 -->
+      <GlobalModelFormDialog
+        :open="createModelDialogOpen"
+        :z-index="70"
+        @update:open="createModelDialogOpen = $event"
+        @success="handleGlobalModelCreated"
+      />
     </template>
     <template #footer>
       <div class="flex items-center justify-between w-full">
@@ -326,10 +345,11 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { Layers, Loader2, Search, Check, ListChecks } from 'lucide-vue-next'
+import { Layers, Loader2, Search, Check, ListChecks, Plus } from 'lucide-vue-next'
 import Dialog from '@/components/ui/dialog/Dialog.vue'
 import Button from '@/components/ui/button.vue'
 import Input from '@/components/ui/input.vue'
+import GlobalModelFormDialog from '@/features/models/components/GlobalModelFormDialog.vue'
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -389,6 +409,9 @@ const saving = ref(false)
 const fetchingAutoMatchedModels = ref(false)
 // 弹窗每次打开、关闭或切换 Provider 都递增，用于丢弃上一会话的异步结果。
 let dialogSession = 0
+
+// 创建统一模型对话框是否打开（嵌套在本弹窗内）
+const createModelDialogOpen = ref(false)
 
 // 数据
 const allGlobalModels = ref<GlobalModelResponse[]>([])
@@ -858,6 +881,16 @@ async function applyAutoMatchFromKey(key: AutoMatchKey) {
   }
 }
 
+// 打开"创建统一模型"对话框
+function openCreateModelDialog() {
+  createModelDialogOpen.value = true
+}
+
+// 统一模型创建成功：刷新下方全局模型列表，便于直接勾选新模型
+async function handleGlobalModelCreated() {
+  await loadGlobalModels(props.providerId, dialogSession)
+}
+
 /** 关闭弹窗；存在未保存变更时先请求用户确认。 */
 async function handleClose() {
   if (hasChanges.value) {
@@ -1019,6 +1052,8 @@ watch(
       providerKeys.value = []
       loadingGlobalModels.value = false
       loadingProviderKeys.value = false
+      fetchingAutoMatchedModels.value = false
+      createModelDialogOpen.value = false
     }
   },
   { immediate: true },
@@ -1082,7 +1117,7 @@ function retryLoadEndpoints() {
 }
 
 /** 加载可供关联的完整 Global Model 列表。 */
-async function loadGlobalModels(providerId: string, session: number) {
+async function loadGlobalModels(providerId: string = props.providerId, session: number = dialogSession) {
   try {
     loadingGlobalModels.value = true
     const response = await getGlobalModels({ limit: 1000 })
