@@ -29,4 +29,9 @@ Review integration from 47681f9ec through the merged upstream and seven priority
 - Quota snapshot family: 34 passed.
 - Frontdoor startup cache convergence: 1 passed.
 - Frontend type-check and full suite: 238 files, 1,891 passed.
-- Full pre-push backend gate and remote CI/release receipts pending.
+- Pre-push gateway lib/bins: 5,543 passed, 3 ignored; architecture/identity: 210 passed; Clippy and formatting passed.
+- First remote CI 36980882312 failed obsolete workflow source assertions and two large-pool fixture timeouts. Removed obsolete source-text assertions, retained dispatcher behavior coverage, and reused credential fixture bootstrap state without reducing 5,025/20,001-key boundaries. Focused pool suite: 10 passed in 3.83s; Python dispatcher and build-watch fixtures passed.
+- Reviewed correction commit: 6ef9eb3c1; CI correction and release commit: dfe1de0ab62ad83e4eec876306fc424a18a3c32e.
+- Exact-SHA Rust CI 36983529093: success, all jobs successful. https://github.com/ZipperCode/Aether/actions/runs/36983529093
+- Annotated tag v0.7.42 published on the CI-proven commit only after success. Release workflow 36984639244: 8/8 jobs successful, including linux-amd64/linux-arm64 and Docker multi-arch.
+- Published stable, non-draft release: https://github.com/ZipperCode/Aether/releases/tag/v0.7.42 ; six assets: two Linux tarballs, independent-version VSIX 0.4.0, Sigstore provenance, install.sh and SHA256SUMS.
