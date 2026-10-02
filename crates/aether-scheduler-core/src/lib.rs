@@ -47,9 +47,11 @@ pub use model::{
     resolve_provider_model_name_with_model_directives_and_request_operation,
     resolve_requested_global_model_name, resolve_requested_global_model_name_with_model_directives,
     resolve_requested_global_model_name_with_model_directives_and_request_operation,
-    row_supports_requested_model, row_supports_requested_model_with_model_directives,
+    resolve_requested_global_model_name_with_reserved_global_model, row_supports_requested_model,
+    row_supports_requested_model_with_model_directives,
     row_supports_requested_model_with_model_directives_and_request_operation,
-    row_supports_required_capability, select_provider_model_name,
+    row_supports_requested_model_with_reserved_global_model, row_supports_required_capability,
+    select_provider_model_name,
 };
 pub use model_mapping::{
     compiled_model_mappings, model_mapping_cache_stats, CompiledModelMappings,
