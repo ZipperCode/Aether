@@ -27,3 +27,29 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: 同步上游与七个重点 PR
+
+**Date**: 2026-10-02
+**Task**: 同步上游与七个重点 PR
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+同步 upstream/main 并合入 #872/#857/#874/#869/#873/#876/#875；修复配额快照、排序分页、断点和多实例画像同步。Gateway 5456通过3忽略，架构210通过，前端1889通过，Workspace/Clippy/格式/构建与本地HTTP、浏览器冒烟通过。PostgreSQL测试通过Docker执行，未push。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5f37fa2af` | (see git log) |
+| `23c1d0bd3` | (see git log) |
+| `d93a0198d` | (see git log) |
+| `1999c9771` | (see git log) |
+| `87411aaff` | (see git log) |
+
+### Status
+
+[OK] **Completed**
