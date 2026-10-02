@@ -591,6 +591,25 @@ pub(super) fn sample_key(
     .expect("key transport should build")
 }
 
+/// Shared bootstrap state for provider-catalog credential fixtures.
+///
+/// `AppState::new()` builds two rustls HTTP clients and runs a full
+/// `sysinfo` process/network scan, so rebuilding it for every sealed
+/// credential made bulk fixtures (10k+ keys) the slowest part of the
+/// suite on CI.  Sealing only reads the configured encryption key, so a
+/// single lazily built state per test process emits identical envelopes.
+fn provider_catalog_credential_bootstrap_state() -> &'static AppState {
+    static BOOTSTRAP: std::sync::LazyLock<AppState> = std::sync::LazyLock::new(|| {
+        AppState::new()
+            .expect("bootstrap state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+    });
+    &BOOTSTRAP
+}
+
 /// Build a provider catalog key using the same provider/key-bound v2 envelope
 /// that production writes use.  Most control-plane tests intentionally mount
 /// a read-only catalog repository; using a legacy Fernet fixture there would
@@ -603,35 +622,43 @@ pub(super) fn sample_bound_key(
     api_format: &str,
     secret: &str,
 ) -> StoredProviderCatalogKey {
-    let bootstrap = AppState::new()
-        .expect("bootstrap state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::disabled().with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
-        );
-    let mut key = sample_key(id, provider_id, api_format, secret);
-    key.encrypted_api_key = Some(
-        bootstrap
-            .seal_provider_catalog_key_api_key(provider_id, id, secret)
-            .expect("bound provider api key ciphertext should build"),
-    );
-    key
+    let encrypted_api_key = provider_catalog_credential_bootstrap_state()
+        .seal_provider_catalog_key_api_key(provider_id, id, secret)
+        .expect("bound provider api key ciphertext should build");
+    StoredProviderCatalogKey::new(
+        id.to_string(),
+        provider_id.to_string(),
+        "default".to_string(),
+        "api_key".to_string(),
+        None,
+        true,
+    )
+    .expect("key should build")
+    .with_transport_fields(
+        Some(json!([api_format])),
+        encrypted_api_key,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("key transport should build")
 }
 
 /// Build the provider-scoped proxy representation used by the catalog reader.
 /// Stored proxy credentials are record-bound before they are accepted by
 /// read-only repositories, so fixtures must use the same envelope.
 pub(super) fn sample_bound_provider_proxy(provider_id: &str, host: &str, password: &str) -> Value {
-    let bootstrap = AppState::new()
-        .expect("bootstrap state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::disabled().with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
-        );
+    let bootstrap = provider_catalog_credential_bootstrap_state();
     let purpose = format!(
         "provider-catalog-proxy-credential-v2\0scope=provider\0field=password\0record-id-bytes={}\0{provider_id}",
         provider_id.len(),
     );
     let sealed =
-        crate::handlers::shared::seal_runtime_secret_payload(&bootstrap, &purpose, password)
+        crate::handlers::shared::seal_runtime_secret_payload(bootstrap, &purpose, password)
             .expect("provider proxy password should seal");
     json!({
         "host": host,
@@ -642,11 +669,7 @@ pub(super) fn sample_bound_provider_proxy(provider_id: &str, host: &str, passwor
 /// Seal an auth-config fixture with the provider/key-bound v2 envelope.
 /// Ordinary read-only catalog tests must not rely on the migration writer.
 pub(super) fn sample_bound_auth_config(provider_id: &str, key_id: &str, plaintext: &str) -> String {
-    let bootstrap = AppState::new()
-        .expect("bootstrap state should build")
-        .with_data_state_for_tests(
-            GatewayDataState::disabled().with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
-        );
+    let bootstrap = provider_catalog_credential_bootstrap_state();
     bootstrap
         .seal_provider_catalog_key_auth_config(provider_id, key_id, plaintext)
         .expect("bound provider auth config ciphertext should build")

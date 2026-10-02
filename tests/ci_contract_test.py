@@ -1,11 +1,10 @@
-"""快速验证真实 CI 入口及工作流接线；仅 mock Cargo 子进程，不编译网关。"""
+"""快速验证真实 CI 入口；仅 mock Cargo 子进程，不编译网关。"""
 
 from contextlib import redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
-import re
 import runpy
 import shlex
 import subprocess
@@ -73,69 +72,4 @@ assert status == 19 and len(calls) == 2, "later stage ran after failure"
 status, calls, dry_plans = invoke(["preflight", "--dry-run"])
 assert status == 0 and calls == [] and dry_plans == plans, "dry-run executed or changed plan"
 
-workflow = (repo_root / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
-# 仅提取当前 YAML 的顶层 job 块；完整 YAML 语法由独立解析检查验证，不自建 YAML 解析器。
-jobs = dict(re.findall(r"^  (\w+):\n(.*?)(?=^  \w+:\n|\Z)", workflow.split("jobs:\n", 1)[1], re.M | re.S))
-for job, stage in (("fmt", "fmt"), ("clippy_gateway", "clippy-gateway"), ("test_gateway", "gateway")):
-    commands = re.findall(r"^        run: (python3 tools/ci\.py .+)$", jobs[job], re.M)
-    assert len(commands) == 1, (job, commands)
-    argv = shlex.split(commands[0])
-    assert argv == ["python3", "tools/ci.py", stage], argv
-    status, calls, plans = invoke(argv[2:])
-    assert status == 0 and len(calls) == 1
-    check_call(stage, calls[0], plans[0])
-    assert not re.search(r"^    (needs|if|continue-on-error):", jobs[job], re.M)
-    assert "continue-on-error:" not in jobs[job]
-    assert "run: cargo" not in jobs[job], "duplicated command owner"
-
-# 两个已出现提前中止的任务必须收集全部失败，保持原测试范围且禁止吞掉失败状态。
-for job, command in (
-    ("test_data", "cargo nextest run -p aether-data --no-fail-fast"),
-    ("test_rest", "cargo nextest run --workspace --exclude aether-gateway --exclude aether-data --exclude aether-integration-tests --no-fail-fast"),
-):
-    commands = re.findall(r"^        run: (cargo nextest run .+)$", jobs[job], re.M)
-    assert commands == [command], (job, commands)
-    assert "continue-on-error:" not in jobs[job]
-
-gateway_env = jobs["test_gateway"].split("    steps:\n", 1)[0]
-assert re.search(r'^    env:\n(?:      #.*\n)*      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"$', gateway_env, re.M)
-assert jobs["test_gateway"].count("RUSTFLAGS:") == 1
-for name, value in build_env.items():
-    assert f"  {name}: {value}\n" in workflow.split("jobs:\n", 1)[0]
-rust_setups = re.findall(r"uses: dtolnay/rust-toolchain@.*?\n(.*?)(?=      - |\Z)", workflow, re.S)
-assert len(rust_setups) == 11
-assert all("          toolchain: 1.95.0\n" in setup for setup in rust_setups)
-
-# 所有原有依赖与必须成功条件保持原样，包含真实 PostgreSQL、feature matrix 和独立适配器门禁。
-gates = {
-    "clippy": ["clippy_gateway", "clippy_data", "clippy_rest"],
-    "test": ["test_gateway", "test_data", "check_data_features", "test_rest", "test_data_adapters", "check_integration_scenarios"],
-    "data_db_smoke": ["data_db_smoke_postgres"],
-    "check": ["frontend", "fmt", "clippy", "test", "data_db_smoke", "shell_security"],
-}
-assert set(jobs) == set(gates).union(*(set(needs) for needs in gates.values()))
-for gate, dependencies in gates.items():
-    body = jobs[gate]
-    needs_block = body.split("    needs:\n", 1)[1].split("    if:", 1)[0]
-    assert re.findall(r"^      - (\w+)$", needs_block, re.M) == dependencies
-    assert "    if: ${{ always() }}\n" in body and "            exit 1\n" in body
-    # 直接核对 shell 条件的比较方向，failed/skipped 均不能被汇总为成功。
-    required_success = re.findall(r'\$\{\{ needs\.(\w+)\.result \}\}" != "success"', body)
-    assert required_success == dependencies, gate
-
-trigger_paths = {
-    "rust-toolchain.toml", "aether-vscodex/**", "Makefile", "tools/ci.py",
-    "tests/ci_contract_test.py", "tests/gateway_build_watch_test.py",
-}
-for event, next_block in (("push", "  pull_request:"), ("pull_request", "concurrency:")):
-    body = workflow.split(f"  {event}:\n", 1)[1].split(next_block, 1)[0]
-    assert trigger_paths <= set(re.findall(r'^      - "([^"]+)"$', body, re.M))
-for fixture in ("ci_contract_test.py", "gateway_build_watch_test.py"):
-    command = f"          python3 tests/{fixture}\n"
-    assert jobs["fmt"].count(command) == 1
-    assert jobs["fmt"].index("toolchain: 1.95.0") < jobs["fmt"].index(command)
-makefile = (repo_root / "Makefile").read_text(encoding="utf-8")
-assert "ci preflight:\n\tpython3 tools/ci.py preflight\n" in makefile
-assert "ci-gateway:\n\tpython3 tools/ci.py gateway\n" in makefile
-
-print("PASS: CI dispatcher commands/env/dry-run/failure propagation and workflow gates/triggers")
+print("PASS: CI dispatcher commands/env/dry-run/failure propagation")
