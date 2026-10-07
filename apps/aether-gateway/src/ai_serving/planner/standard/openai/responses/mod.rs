@@ -144,7 +144,7 @@ pub(crate) async fn maybe_build_sync_local_openai_responses_decision_payload(
 
     while let Some(attempt) = source.next_attempt().await? {
         if let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
-            state, parts, trace_id, body_json, &input, attempt, spec,
+            state, parts, trace_id, body_json, &input, &attempt, spec,
         )
         .await?
         {
@@ -183,7 +183,7 @@ pub(crate) async fn maybe_build_stream_local_openai_responses_decision_payload(
 
     while let Some(attempt) = source.next_attempt().await? {
         if let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
-            state, parts, trace_id, body_json, &input, attempt, spec,
+            state, parts, trace_id, body_json, &input, &attempt, spec,
         )
         .await?
         {
@@ -784,7 +784,7 @@ pub(crate) async fn maybe_build_responses_websocket_decision(
             trace_id,
             body_json,
             &input,
-            attempt,
+            &attempt,
             spec,
             websocket_continuation,
         )

@@ -57,6 +57,13 @@ use crate::{AppState, GatewayError};
 
 const AUTH_API_KEY_CONCURRENCY_WAIT_BUDGET: Duration = Duration::from_millis(100);
 const AUTH_API_KEY_CONCURRENCY_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// 运行时能力隔离丢弃候选时写入请求级运行时诊断的原因。
+///
+/// 隔离缓存只记录键（模型/端点/密钥/格式/模式/操作），不保存触发隔离的原始
+/// 静态失败原因，因此丢弃点只能记录实际观测到的隔离状态本身，而不是臆造的
+/// 通用原因；静态原因已在首次隔离时由跳过持久化路径记录过。
+pub(crate) const ENDPOINT_CAPABILITY_QUARANTINED_SKIP_REASON: &str =
+    "endpoint_capability_quarantined";
 
 pub(crate) fn is_static_endpoint_capability_skip_reason(reason: &str) -> bool {
     matches!(
@@ -108,6 +115,8 @@ pub(crate) struct LocalExecutionCandidateAttemptSource<'a> {
     client_api_format: Option<String>,
     require_streaming: bool,
     request_operation: Option<String>,
+    /// 运行时诊断启用的请求 trace；仅当持久化策略开启 runtime miss 诊断时存在。
+    runtime_miss_trace_id: Option<String>,
 }
 
 type DecorateSkippedCandidateFn<'a> = Arc<
@@ -175,6 +184,8 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
             client_api_format: Some(client_api_format.to_ascii_lowercase()),
             require_streaming,
             request_operation: request_operation.map(ToOwned::to_owned),
+            // 图像桥接候选已预持久化，隔离丢弃沿用其自身终态记账，不接入请求级诊断。
+            runtime_miss_trace_id: None,
         }
     }
 
@@ -208,6 +219,7 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                             self.items.pop_front();
                         }
                         if self.attempt_is_runtime_quarantined(&attempt) {
+                            self.record_runtime_quarantine_skip();
                             if self.static_attempts_are_persisted {
                                 self.retired_persisted_static_attempts.push(attempt);
                             }
@@ -239,6 +251,7 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                     }
                     if let Some(attempt) = next_attempt_from_dispatch_sequence(pending_attempts) {
                         if self.attempt_is_runtime_quarantined(&attempt) {
+                            self.record_runtime_quarantine_skip();
                             continue;
                         }
                         return Ok(Some(attempt));
@@ -288,6 +301,7 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                         continue;
                     };
                     if self.attempt_is_runtime_quarantined(&attempt) {
+                        self.record_runtime_quarantine_skip();
                         continue;
                     }
                     return Ok(Some(attempt));
@@ -304,6 +318,14 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
             self.request_operation.as_deref(),
             attempt,
         )
+    }
+
+    /// 运行时隔离丢弃尝试时写入请求级跳过诊断；同一尝试只会被一个门禁丢弃，因此只记一次。
+    fn record_runtime_quarantine_skip(&self) {
+        record_endpoint_capability_quarantine_skip(
+            self.state,
+            self.runtime_miss_trace_id.as_deref(),
+        );
     }
 
     pub(crate) fn drain_static_attempts(&mut self) -> Vec<LocalExecutionCandidateAttempt> {
@@ -380,6 +402,22 @@ fn attempt_is_runtime_quarantined(
         require_streaming,
         request_operation,
     )
+}
+
+/// 把运行时能力隔离丢弃同步到请求级 runtime miss 诊断；trace 缺失（策略未启用
+/// 诊断或图像桥接源）时保持原有静默语义。
+fn record_endpoint_capability_quarantine_skip(
+    state: Option<&AppState>,
+    runtime_miss_trace_id: Option<&str>,
+) {
+    let (Some(state), Some(trace_id)) = (state, runtime_miss_trace_id) else {
+        return;
+    };
+    record_local_runtime_candidate_skip_reason(
+        state,
+        trace_id,
+        ENDPOINT_CAPABILITY_QUARANTINED_SKIP_REASON,
+    );
 }
 
 impl LocalExecutionCandidateAttempt {
@@ -882,6 +920,10 @@ where
             client_api_format: Some(client_api_format.to_ascii_lowercase()),
             require_streaming,
             request_operation: request_operation.map(ToOwned::to_owned),
+            runtime_miss_trace_id: persistence_policy
+                .skipped
+                .record_runtime_miss_diagnostic
+                .then(|| trace_id.to_string()),
         },
         candidate_count,
     )
@@ -1059,6 +1101,7 @@ where
             client_api_format: Some(client_api_format.to_ascii_lowercase()),
             require_streaming,
             request_operation: request_operation.map(ToOwned::to_owned),
+            runtime_miss_trace_id: record_runtime_miss_diagnostic.then(|| trace_id.to_string()),
         },
         candidate_count,
     )
@@ -1127,6 +1170,9 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
             return Err(error);
         }
         loop {
+            let runtime_miss_trace_id = self
+                .record_runtime_miss_diagnostic
+                .then(|| self.trace_id.as_str());
             if let Some(attempt) = pop_attempt_from_items(
                 &mut self.pending_items,
                 &self.skipped_provider_ids,
@@ -1136,6 +1182,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                 Some(&self.client_api_format),
                 self.require_streaming,
                 self.page_cursor.resolved_page_cache_request_operation(),
+                runtime_miss_trace_id,
             )
             .await
             {
@@ -1176,20 +1223,34 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
             if self.skipped_provider_ids.contains(&candidate.provider_id)
                 || self.skipped_endpoint_ids.contains(&candidate.endpoint_id)
                 || self.skipped_credential_ids.contains(&candidate.key_id)
-                || self.state.app().endpoint_capability_is_quarantined(
-                    &candidate.model_id,
-                    &candidate.endpoint_id,
-                    &candidate.key_id,
-                    &self.client_api_format,
-                    self.require_streaming,
-                    self.page_cursor.resolved_page_cache_request_operation(),
-                )
             {
+                continue;
+            }
+            if self.state.app().endpoint_capability_is_quarantined(
+                &candidate.model_id,
+                &candidate.endpoint_id,
+                &candidate.key_id,
+                &self.client_api_format,
+                self.require_streaming,
+                self.page_cursor.resolved_page_cache_request_operation(),
+            ) {
+                self.record_endpoint_capability_quarantine_skip();
                 continue;
             }
             return Some(pending);
         }
         None
+    }
+
+    fn record_endpoint_capability_quarantine_skip(&self) {
+        if !self.record_runtime_miss_diagnostic {
+            return;
+        }
+        record_local_runtime_candidate_skip_reason(
+            self.state.app(),
+            &self.trace_id,
+            ENDPOINT_CAPABILITY_QUARANTINED_SKIP_REASON,
+        );
     }
 
     /// 将唯一已 hydration 的候选接入原有 SingleKey/Pool 尝试序列。
@@ -1446,6 +1507,7 @@ async fn pop_attempt_from_items(
     client_api_format: Option<&str>,
     require_streaming: bool,
     request_operation: Option<&str>,
+    runtime_miss_trace_id: Option<&str>,
 ) -> Option<LocalExecutionCandidateAttempt> {
     loop {
         let front = items.front_mut()?;
@@ -1471,6 +1533,7 @@ async fn pop_attempt_from_items(
                         request_operation,
                         &attempt,
                     ) {
+                        record_endpoint_capability_quarantine_skip(state, runtime_miss_trace_id);
                         continue;
                     }
                     return Some(attempt);
@@ -1505,6 +1568,7 @@ async fn pop_attempt_from_items(
                         request_operation,
                         &attempt,
                     ) {
+                        record_endpoint_capability_quarantine_skip(state, runtime_miss_trace_id);
                         continue;
                     }
                     return Some(attempt);
@@ -2509,9 +2573,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::ai_serving::planner::runtime_miss::apply_local_runtime_candidate_terminal_reason;
     use crate::data::GatewayDataState;
     use crate::orchestration::LocalExecutionCandidateMetadata;
     use crate::scheduler::affinity::SCHEDULER_AFFINITY_TTL;
+    use crate::LocalExecutionRuntimeMissDiagnostic;
 
     /// 统计 transport hydration 的普通 Key 读取，同时让预选强读保持独立计数。
     struct CountingProviderCatalogReadRepository {
@@ -3620,6 +3686,7 @@ mod tests {
             client_api_format: None,
             require_streaming: false,
             request_operation: None,
+            runtime_miss_trace_id: None,
         };
 
         let first = source
@@ -3669,6 +3736,7 @@ mod tests {
             client_api_format: None,
             require_streaming: false,
             request_operation: None,
+            runtime_miss_trace_id: None,
         };
         let request_body = json!({
             "model": "gpt-large-candidate-regression",
@@ -3831,6 +3899,7 @@ mod tests {
             client_api_format: None,
             require_streaming: false,
             request_operation: None,
+            runtime_miss_trace_id: None,
         };
 
         source.skip_credential("key-a");
@@ -3902,6 +3971,7 @@ mod tests {
             client_api_format: None,
             require_streaming: false,
             request_operation: None,
+            runtime_miss_trace_id: None,
         };
 
         source.skip_credential("pool-key-a");
@@ -3952,6 +4022,7 @@ mod tests {
             client_api_format: Some("openai:responses".to_string()),
             require_streaming: true,
             request_operation: None,
+            runtime_miss_trace_id: None,
         };
 
         let attempt = source
@@ -3962,6 +4033,319 @@ mod tests {
 
         assert_eq!(attempt.eligible.candidate.endpoint_id, "endpoint-1");
         assert_eq!(attempt.eligible.candidate.key_id, "key-b");
+    }
+
+    /// 运行时隔离丢弃静态候选时必须写入请求级跳过诊断；否则唯一候选被丢弃后
+    /// 诊断仍是 skipped=0，终态原因停留在 no_local_stream_plans（静默退出）。
+    #[tokio::test]
+    async fn runtime_quarantine_drop_records_request_level_skip_reason() {
+        let app = AppState::new().expect("state should build");
+        assert!(app.quarantine_endpoint_capability(
+            "model-1",
+            "endpoint-1",
+            "key-a",
+            "openai:responses",
+            true,
+            None,
+        ));
+        let quarantined_attempts = dispatch_sequence_from_attempts(
+            build_unpersisted_local_execution_candidate_attempts(sample_eligible("key-a", None), 0)
+                .into(),
+        );
+        let mut source = LocalExecutionCandidateAttemptSource {
+            items: VecDeque::from([LocalExecutionCandidateAttemptSourceItem::Static {
+                attempts: quarantined_attempts,
+            }]),
+            retired_persisted_static_attempts: Vec::new(),
+            static_attempts_are_persisted: false,
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+            state: Some(&app),
+            client_api_format: Some("openai:responses".to_string()),
+            require_streaming: true,
+            request_operation: None,
+            runtime_miss_trace_id: Some("trace-quarantine-static".to_string()),
+        };
+        app.set_local_execution_runtime_miss_diagnostic(
+            "trace-quarantine-static",
+            LocalExecutionRuntimeMissDiagnostic {
+                reason: "candidate_evaluation_incomplete".to_string(),
+                candidate_count: Some(1),
+                ..Default::default()
+            },
+        );
+
+        assert!(source
+            .next_attempt()
+            .await
+            .expect("candidate source should succeed")
+            .is_none());
+
+        apply_local_runtime_candidate_terminal_reason(
+            &app,
+            "trace-quarantine-static",
+            "no_local_stream_plans",
+        );
+        let diagnostic = app
+            .take_local_execution_runtime_miss_diagnostic("trace-quarantine-static")
+            .expect("runtime miss diagnostic should exist");
+        assert_eq!(diagnostic.skipped_candidate_count, Some(1));
+        assert_eq!(diagnostic.reason, "all_candidates_skipped");
+        assert_eq!(
+            diagnostic
+                .skip_reasons
+                .get(ENDPOINT_CAPABILITY_QUARANTINED_SKIP_REASON),
+            Some(&1)
+        );
+    }
+
+    /// 号池 Key 已产出（pending_attempts 已填充）后遭运行时隔离：returned_key_count
+    /// 守卫会抑制池耗尽原因，此时隔离丢弃本身必须留下请求级诊断。
+    #[tokio::test]
+    async fn pool_yielded_key_quarantine_drop_records_request_level_skip_reason() {
+        let app = AppState::new().expect("state should build");
+        assert!(app.quarantine_endpoint_capability(
+            "model-1",
+            "endpoint-1",
+            "pool-key-a",
+            "openai:responses",
+            true,
+            None,
+        ));
+        let mut pool_group = sample_eligible("pool-group", None);
+        pool_group.kind = LocalExecutionCandidateKind::PoolGroup;
+        pool_group.transport = sample_transport("pool-group", Some(json!({ "pool_advanced": {} })));
+        let pool_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            pool_group,
+            None,
+            Some("gpt-5"),
+            None,
+        );
+        // 复现 next_key 已产出 pool-key-a 并填充 pending_attempts 的生产状态。
+        let yielded_key_attempts = dispatch_sequence_from_attempts(
+            build_unpersisted_local_execution_candidate_attempts(
+                sample_eligible("pool-key-a", Some(0)),
+                0,
+            )
+            .into(),
+        );
+        let mut source = LocalExecutionCandidateAttemptSource {
+            items: VecDeque::from([LocalExecutionCandidateAttemptSourceItem::Pool {
+                cursor: pool_cursor,
+                candidate_index: 0,
+                pending_attempts: yielded_key_attempts,
+                pool_exhaustion_persistence: None,
+            }]),
+            retired_persisted_static_attempts: Vec::new(),
+            static_attempts_are_persisted: false,
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+            state: Some(&app),
+            client_api_format: Some("openai:responses".to_string()),
+            require_streaming: true,
+            request_operation: None,
+            runtime_miss_trace_id: Some("trace-quarantine-pool".to_string()),
+        };
+        app.set_local_execution_runtime_miss_diagnostic(
+            "trace-quarantine-pool",
+            LocalExecutionRuntimeMissDiagnostic {
+                reason: "candidate_evaluation_incomplete".to_string(),
+                candidate_count: Some(1),
+                ..Default::default()
+            },
+        );
+
+        assert!(source
+            .next_attempt()
+            .await
+            .expect("pool attempt read should succeed")
+            .is_none());
+
+        apply_local_runtime_candidate_terminal_reason(
+            &app,
+            "trace-quarantine-pool",
+            "no_local_stream_plans",
+        );
+        let diagnostic = app
+            .take_local_execution_runtime_miss_diagnostic("trace-quarantine-pool")
+            .expect("runtime miss diagnostic should exist");
+        assert_eq!(diagnostic.skipped_candidate_count, Some(1));
+        assert_eq!(diagnostic.reason, "all_candidates_skipped");
+        assert_eq!(
+            diagnostic
+                .skip_reasons
+                .get(ENDPOINT_CAPABILITY_QUARANTINED_SKIP_REASON),
+            Some(&1)
+        );
+        assert_eq!(diagnostic.skip_reasons.len(), 1);
+    }
+
+    /// 请求模型分页路径的隔离丢弃只记一次：轻量候选门禁、hydration 后门禁与
+    /// 外层源门禁对同一候选串联检查，只有真正丢弃它的门禁计数。
+    #[tokio::test]
+    async fn page_ranked_quarantine_drop_records_single_request_skip_reason() {
+        let provider = StoredProviderCatalogProvider::new(
+            "provider-1".to_string(),
+            "provider-1".to_string(),
+            Some("https://provider.example".to_string()),
+            "custom".to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(true, false, false, None, None, None, None, None, None);
+        let endpoint = StoredProviderCatalogEndpoint::new(
+            "endpoint-1".to_string(),
+            "provider-1".to_string(),
+            "openai:chat".to_string(),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            true,
+        )
+        .expect("endpoint should build")
+        .with_transport_fields(
+            "https://provider.example/v1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("endpoint transport should build");
+        let credential_state = AppState::new()
+            .expect("credential state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let encrypted_key = credential_state
+            .seal_provider_catalog_key_api_key("provider-1", "key-0000", "secret")
+            .expect("test key should encrypt with its catalog binding");
+        let key = StoredProviderCatalogKey::new(
+            "key-0000".to_string(),
+            "provider-1".to_string(),
+            "key-0000".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            Some(json!(["openai:chat"])),
+            encrypted_key,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build");
+        let repository: Arc<dyn ProviderCatalogReadRepository> = Arc::new(
+            InMemoryProviderCatalogReadRepository::seed(vec![provider], vec![endpoint], vec![key]),
+        );
+        let candidate_repository: Arc<
+            dyn aether_data_contracts::repository::candidate_selection::MinimalCandidateSelectionReadRepository,
+        > = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_candidate_row("key-0000", 0),
+        ]));
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    repository,
+                    candidate_repository,
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        // 隔离该端点能力：排名候选在 hydration 前的轻量门禁即被丢弃。
+        assert!(app.quarantine_endpoint_capability(
+            "model-1",
+            "endpoint-1",
+            "key-0000",
+            "openai:chat",
+            false,
+            None,
+        ));
+        let state = PlannerAppState::new(&app);
+        let auth_snapshot = sample_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let (mut source, candidate_count) =
+            build_lazy_requested_model_execution_candidate_attempt_source_with_serving(
+                state,
+                &model_directive_policy,
+                "trace-quarantine-page",
+                "openai:chat",
+                "gpt-5",
+                None,
+                false,
+                &auth_snapshot,
+                None,
+                None,
+                None,
+                None,
+                None,
+                LocalCandidatePersistencePolicy {
+                    available: LocalAvailableCandidatePersistenceContext {
+                        user_id: "user-1",
+                        api_key_id: "api-key-1",
+                        required_capabilities: None,
+                        error_context: "test available candidate persistence",
+                    },
+                    skipped: LocalSkippedCandidatePersistenceContext {
+                        user_id: "user-1",
+                        api_key_id: "api-key-1",
+                        required_capabilities: None,
+                        error_context: "test skipped candidate persistence",
+                        record_runtime_miss_diagnostic: true,
+                    },
+                },
+                false,
+                LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
+                false,
+                LocalCandidateResolutionMode::Standard,
+                no_extra_data,
+                identity_skipped_candidate,
+            )
+            .await;
+        assert_eq!(candidate_count, 1);
+        app.set_local_execution_runtime_miss_diagnostic(
+            "trace-quarantine-page",
+            LocalExecutionRuntimeMissDiagnostic {
+                reason: "candidate_evaluation_incomplete".to_string(),
+                candidate_count: Some(candidate_count),
+                ..Default::default()
+            },
+        );
+
+        assert!(source
+            .next_attempt()
+            .await
+            .expect("lazy attempt source should succeed")
+            .is_none());
+
+        apply_local_runtime_candidate_terminal_reason(
+            &app,
+            "trace-quarantine-page",
+            "no_local_stream_plans",
+        );
+        let diagnostic = app
+            .take_local_execution_runtime_miss_diagnostic("trace-quarantine-page")
+            .expect("runtime miss diagnostic should exist");
+        assert_eq!(diagnostic.skipped_candidate_count, Some(1));
+        assert_eq!(diagnostic.reason, "all_candidates_skipped");
+        assert_eq!(
+            diagnostic
+                .skip_reasons
+                .get(ENDPOINT_CAPABILITY_QUARANTINED_SKIP_REASON),
+            Some(&1)
+        );
+        assert_eq!(diagnostic.skip_reasons.len(), 1);
     }
 
     #[tokio::test]
@@ -4006,6 +4390,7 @@ mod tests {
             client_api_format: None,
             require_streaming: false,
             request_operation: None,
+            runtime_miss_trace_id: None,
         };
 
         source.skip_provider("provider-1");
@@ -4080,6 +4465,7 @@ mod tests {
             client_api_format: None,
             require_streaming: false,
             request_operation: None,
+            runtime_miss_trace_id: None,
         };
 
         assert!(source

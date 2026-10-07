@@ -4,6 +4,7 @@ use tracing::warn;
 
 use super::decision::{
     build_local_openai_responses_candidate_attempt_source,
+    mark_skipped_local_openai_responses_candidate_with_failure_diagnostic,
     maybe_build_local_openai_responses_decision_payload_for_candidate,
     resolve_local_openai_responses_decision_input, LocalOpenAiResponsesCandidateAttempt,
     LocalOpenAiResponsesCandidateAttemptSource, LocalOpenAiResponsesDecisionInput,
@@ -261,7 +262,7 @@ impl LocalOpenAiResponsesSyncAttemptSource<'_> {
             self.trace_id,
             &self.body_json,
             &self.input,
-            attempt,
+            &attempt,
             self.spec,
         )
         .await?
@@ -299,11 +300,13 @@ impl LocalOpenAiResponsesStreamAttemptSource<'_> {
             self.trace_id,
             &self.body_json,
             &self.input,
-            attempt,
+            &attempt,
             self.spec,
         )
         .await?
         else {
+            // 标准 Responses 解析路径的每个 None 分支都会先落候选级诊断（已核对）；
+            // responses→image 桥接路径存在未标记的 None（另行跟进），此处不重复持久化。
             return Ok(None);
         };
 
@@ -313,13 +316,31 @@ impl LocalOpenAiResponsesStreamAttemptSource<'_> {
             payload,
             self.spec.compact,
         ) {
-            Ok(value) => Ok(value),
+            Ok(plan_attempt) => Ok(Some(plan_attempt)),
             Err(err) => {
-                warn!(
-                    trace_id = %self.trace_id,
-                    error = ?err,
-                    "gateway local openai responses stream decision plan build failed"
-                );
+                if let Some(skip_reason) = err.candidate_skip_reason() {
+                    let spec_metadata = local_openai_responses_spec_metadata(self.spec);
+                    mark_skipped_local_openai_responses_candidate_with_failure_diagnostic(
+                        self.state,
+                        &self.input,
+                        self.trace_id,
+                        &attempt.eligible.candidate,
+                        attempt.candidate_index,
+                        &attempt.candidate_id,
+                        skip_reason,
+                        err.candidate_failure_diagnostic(
+                            spec_metadata.api_format,
+                            attempt.eligible.provider_api_format.as_str(),
+                        ),
+                    )
+                    .await;
+                } else {
+                    warn!(
+                        trace_id = %self.trace_id,
+                        error = ?err,
+                        "gateway local openai responses stream decision plan build failed"
+                    );
+                }
                 Ok(None)
             }
         }

@@ -30,6 +30,7 @@ use crate::ai_serving::api::{
     LocalCoreSyncErrorKind, LocalStandardSpec, EXECUTION_RUNTIME_STREAM_DECISION_ACTION,
     EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
 };
+use crate::ai_serving::apply_local_runtime_execution_exhausted_reason;
 use crate::ai_serving::LocalExecutionAttemptSource;
 use crate::api::response::{
     attach_control_metadata_headers, build_client_response_from_parts_with_mutator,
@@ -340,7 +341,7 @@ pub(crate) async fn maybe_execute_stream_via_local_openai_responses_decision(
     plan_kind: &str,
     transfer_tracker: &ProviderTransferTracker,
 ) -> Result<LocalExecutionRequestOutcome, GatewayError> {
-    let Some((attempt_source, _candidate_count)) =
+    let Some((attempt_source, candidate_count)) =
         build_local_openai_responses_stream_attempt_source_for_kind(
             state, parts, trace_id, decision, body_json, plan_kind,
         )
@@ -349,15 +350,55 @@ pub(crate) async fn maybe_execute_stream_via_local_openai_responses_decision(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
 
-    execute_stream_attempt_source_with_transfer_tracker::<AiStreamAttempt, _>(
+    execute_responses_stream_source_with_exhausted_reason(
         state,
         trace_id,
         decision,
         plan_kind,
+        body_json.get("model").and_then(Value::as_str),
+        candidate_count,
         attempt_source,
         transfer_tracker,
     )
     .await
+}
+
+/// 执行 Responses 流候选源。Exhausted 只在至少一个候选真正执行后出现，此时 planner 在
+/// 游标耗尽时写入的 no_local_stream_plans 会掩盖真实执行失败；只纠正终态原因并保留
+/// 已累计的候选计数与跳过原因。NoPath 保持 planner 诊断不变。
+async fn execute_responses_stream_source_with_exhausted_reason<S>(
+    state: &AppState,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    requested_model: Option<&str>,
+    candidate_count: usize,
+    source: S,
+    transfer_tracker: &ProviderTransferTracker,
+) -> Result<LocalExecutionRequestOutcome, GatewayError>
+where
+    S: LocalExecutionAttemptSource<AiStreamAttempt>,
+{
+    let outcome = execute_stream_attempt_source_with_transfer_tracker::<AiStreamAttempt, _>(
+        state,
+        trace_id,
+        decision,
+        plan_kind,
+        source,
+        transfer_tracker,
+    )
+    .await?;
+    if let LocalExecutionRequestOutcome::Exhausted(_) = &outcome {
+        apply_local_runtime_execution_exhausted_reason(
+            state,
+            trace_id,
+            decision,
+            plan_kind,
+            requested_model,
+            candidate_count,
+        );
+    }
+    Ok(outcome)
 }
 
 pub(crate) async fn maybe_execute_sync_via_standard_family_decision(
@@ -1651,11 +1692,15 @@ pub(crate) fn decision_payload_is_direct_execution(payload: &AiExecutionDecision
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_serving::{
+        apply_local_runtime_candidate_terminal_reason, record_local_runtime_candidate_skip_reason,
+    };
+    use crate::LocalExecutionRuntimeMissDiagnostic;
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
     use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data_contracts::repository::candidates::{
-        RequestCandidateStatus, StoredRequestCandidate,
+        RequestCandidateReadRepository, RequestCandidateStatus, StoredRequestCandidate,
     };
     use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
     use aether_data_contracts::repository::usage::{UsageBodyCaptureState, UsageReadRepository};
@@ -2948,5 +2993,310 @@ mod tests {
 
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
         assert_eq!(body, json!({"id": "resp_second_candidate", "output": []}));
+    }
+
+    // ---- Responses 流候选源执行耗尽诊断回归（真实候选源 + 真实动态执行循环） ----
+
+    /// 复刻真实 Responses 候选源的诊断行为：候选内前序 Key 计划构建失败时记录跳过原因，
+    /// 游标耗尽时写入 planner 终态原因；可选产出真实可执行尝试（指向必然拒绝的本地端口）。
+    struct TestResponsesStreamAttemptSource {
+        state: AppState,
+        trace_id: String,
+        skip_reason: &'static str,
+        attempt: Option<AiStreamAttempt>,
+        first_next_attempt: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LocalExecutionAttemptSource<AiStreamAttempt> for TestResponsesStreamAttemptSource {
+        async fn next_execution_attempt(
+            &mut self,
+        ) -> Result<Option<AiStreamAttempt>, GatewayError> {
+            if self.first_next_attempt {
+                self.first_next_attempt = false;
+                // 与真实 builder 一致：同候选前序 Key 计划构建失败会记录跳过原因。
+                record_local_runtime_candidate_skip_reason(
+                    &self.state,
+                    self.trace_id.as_str(),
+                    self.skip_reason,
+                );
+                if let Some(attempt) = self.attempt.take() {
+                    return Ok(Some(attempt));
+                }
+            }
+            // 与真实候选源一致：游标耗尽时写入 planner 终态原因后返回 None。
+            apply_local_runtime_candidate_terminal_reason(
+                &self.state,
+                self.trace_id.as_str(),
+                "no_local_stream_plans",
+            );
+            Ok(None)
+        }
+
+        async fn drain_execution_attempts(&mut self) -> Result<Vec<AiStreamAttempt>, GatewayError> {
+            Ok(self.attempt.take().into_iter().collect())
+        }
+
+        async fn skip_credential(&mut self, _key_id: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn skip_endpoint(&mut self, _endpoint_id: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn skip_provider(&mut self, _provider_id: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+    }
+
+    fn test_responses_stream_decision() -> GatewayControlDecision {
+        GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("responses".to_string()),
+            Some("openai:responses".to_string()),
+        )
+        .with_execution_runtime_candidate(true)
+    }
+
+    fn test_responses_stream_attempt(request_id: &str, candidate_id: &str) -> AiStreamAttempt {
+        AiStreamAttempt {
+            plan: aether_contracts::ExecutionPlan {
+                request_id: request_id.to_string(),
+                candidate_id: Some(candidate_id.to_string()),
+                provider_name: Some("OpenAI".to_string()),
+                provider_id: "provider-openai".to_string(),
+                endpoint_id: "endpoint-openai-responses".to_string(),
+                key_id: "key-openai".to_string(),
+                method: "POST".to_string(),
+                // 端口 1 无监听，连接立即被拒绝：走真实进程内传输失败路径。
+                url: "http://127.0.0.1:1/v1/responses".to_string(),
+                headers: BTreeMap::new(),
+                content_type: Some("application/json".to_string()),
+                content_encoding: None,
+                body: aether_contracts::RequestBody::from_json(json!({"model": "gpt-6-astra"})),
+                stream: true,
+                client_api_format: "openai:responses".to_string(),
+                provider_api_format: "openai:responses".to_string(),
+                model_name: Some("gpt-6-astra".to_string()),
+                proxy: None,
+                transport_profile: None,
+                timeouts: None,
+            },
+            report_kind: None,
+            report_context: Some(json!({
+                "candidate_index": 1,
+                "retry_index": 0,
+            })),
+        }
+    }
+
+    /// 从流式尝试计划生成去重的活跃 Key 目录，保持与心跳测试一致的生产级准入数据。
+    fn responses_stream_provider_catalog(
+        attempts: &[AiStreamAttempt],
+    ) -> InMemoryProviderCatalogReadRepository {
+        let mut keys = std::collections::BTreeMap::new();
+        for attempt in attempts {
+            let plan = &attempt.plan;
+            keys.entry((plan.provider_id.clone(), plan.key_id.clone()))
+                .or_insert_with(|| {
+                    StoredProviderCatalogKey::new(
+                        plan.key_id.clone(),
+                        plan.provider_id.clone(),
+                        plan.key_id.clone(),
+                        "api_key".to_string(),
+                        None,
+                        true,
+                    )
+                    .expect("responses stream catalog key should build")
+                });
+        }
+        InMemoryProviderCatalogReadRepository::seed(
+            Vec::new(),
+            Vec::new(),
+            keys.into_values().collect(),
+        )
+    }
+
+    /// 复刻 planner 构造 Responses 候选源后的诊断状态：评估中原因 + 已确认候选计数。
+    /// 直接经 AppState 诊断写入而非私有 planner seam，保持与生产一致的初始形状。
+    fn seed_responses_planner_evaluation_diagnostic(
+        state: &AppState,
+        trace_id: &str,
+        decision: &GatewayControlDecision,
+        candidate_count: usize,
+    ) {
+        state.set_local_execution_runtime_miss_diagnostic(
+            trace_id,
+            LocalExecutionRuntimeMissDiagnostic {
+                reason: "candidate_evaluation_incomplete".to_string(),
+                route_family: decision.route_family.clone(),
+                route_kind: decision.route_kind.clone(),
+                public_path: Some(decision.public_path.clone()),
+                plan_kind: Some("openai_responses_stream".to_string()),
+                requested_model: Some("gpt-6-astra".to_string()),
+                candidate_count: Some(candidate_count),
+                skipped_candidate_count: None,
+                skip_reasons: BTreeMap::new(),
+            },
+        );
+    }
+
+    fn responses_stream_test_state(
+        attempts: &[AiStreamAttempt],
+    ) -> (AppState, Arc<InMemoryRequestCandidateRepository>) {
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::new(InMemoryUsageReadRepository::default()),
+                )
+                .with_provider_catalog_reader(Arc::new(responses_stream_provider_catalog(
+                    attempts,
+                )))
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        (state, request_candidate_repository)
+    }
+
+    /// 等待异步候选行写入落盘；超时即失败，避免脆弱的固定等待。
+    async fn wait_for_failed_candidate_row(
+        repository: &InMemoryRequestCandidateRepository,
+        request_id: &str,
+        candidate_id: &str,
+    ) -> StoredRequestCandidate {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let candidates = repository
+                .list_by_request_id(request_id)
+                .await
+                .expect("request candidates should read");
+            if let Some(row) = candidates
+                .iter()
+                .find(|candidate| candidate.id == candidate_id)
+                .filter(|candidate| candidate.status == RequestCandidateStatus::Failed)
+            {
+                return row.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed candidate row should settle before deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// 混合路径回归：一个候选计划构建失败（记录跳过原因），另一个候选真实执行并在传输层
+    /// 失败。Exhausted 只在真实执行后出现，终态原因必须纠正为执行耗尽，同时保留候选计数、
+    /// 跳过计数与跳过原因；执行候选行携带安全的传输错误详情而非无差别常量。
+    #[tokio::test]
+    async fn responses_stream_execution_exhaustion_corrects_reason_and_preserves_skips() {
+        let trace_id = "trace-responses-stream-exhausted";
+        let attempts = vec![test_responses_stream_attempt(trace_id, "candidate-exec-1")];
+        let (state, request_candidate_repository) = responses_stream_test_state(&attempts);
+        let decision = test_responses_stream_decision();
+        seed_responses_planner_evaluation_diagnostic(&state, trace_id, &decision, 2);
+        let source = TestResponsesStreamAttemptSource {
+            state: state.clone(),
+            trace_id: trace_id.to_string(),
+            skip_reason: "provider_request_body_missing",
+            attempt: attempts.into_iter().next(),
+            first_next_attempt: true,
+        };
+        let transfer_tracker = ProviderTransferTracker::default();
+
+        let outcome = execute_responses_stream_source_with_exhausted_reason(
+            &state,
+            trace_id,
+            &decision,
+            "openai_responses_stream",
+            Some("gpt-6-astra"),
+            2,
+            source,
+            &transfer_tracker,
+        )
+        .await
+        .expect("responses stream source should execute");
+
+        assert!(matches!(
+            outcome,
+            LocalExecutionRequestOutcome::Exhausted(_)
+        ));
+        let diagnostic = state
+            .take_local_execution_runtime_miss_diagnostic(trace_id)
+            .expect("runtime miss diagnostic should exist");
+        assert_eq!(diagnostic.reason, "execution_runtime_candidates_exhausted");
+        assert_eq!(diagnostic.candidate_count, Some(2));
+        assert_eq!(diagnostic.skipped_candidate_count, Some(1));
+        assert_eq!(
+            diagnostic.skip_reasons.get("provider_request_body_missing"),
+            Some(&1)
+        );
+
+        let executed = wait_for_failed_candidate_row(
+            &request_candidate_repository,
+            trace_id,
+            "candidate-exec-1",
+        )
+        .await;
+        let error_message = executed
+            .error_message
+            .as_deref()
+            .expect("executed candidate should carry transport error message");
+        assert!(
+            !error_message.contains("127.0.0.1"),
+            "transport detail must not leak upstream host: {error_message}"
+        );
+    }
+
+    /// 全计划失败回归：候选存在但所有计划构建失败时零执行尝试，结果必须是 NoPath，
+    /// planner 的 all_candidates_skipped 分类与跳过原因保持原样，不被执行耗尽原因覆盖。
+    #[tokio::test]
+    async fn responses_stream_all_plan_failures_keep_planner_classification_on_no_path() {
+        let trace_id = "trace-responses-stream-no-path";
+        let (state, _request_candidate_repository) = responses_stream_test_state(&[]);
+        let decision = test_responses_stream_decision();
+        seed_responses_planner_evaluation_diagnostic(&state, trace_id, &decision, 1);
+        let source = TestResponsesStreamAttemptSource {
+            state: state.clone(),
+            trace_id: trace_id.to_string(),
+            skip_reason: "provider_request_body_missing",
+            attempt: None,
+            first_next_attempt: true,
+        };
+        let transfer_tracker = ProviderTransferTracker::default();
+
+        let outcome = execute_responses_stream_source_with_exhausted_reason(
+            &state,
+            trace_id,
+            &decision,
+            "openai_responses_stream",
+            Some("gpt-6-astra"),
+            1,
+            source,
+            &transfer_tracker,
+        )
+        .await
+        .expect("responses stream source should execute");
+
+        assert!(matches!(outcome, LocalExecutionRequestOutcome::NoPath));
+        let diagnostic = state
+            .take_local_execution_runtime_miss_diagnostic(trace_id)
+            .expect("runtime miss diagnostic should exist");
+        assert_eq!(diagnostic.reason, "all_candidates_skipped");
+        assert_eq!(diagnostic.candidate_count, Some(1));
+        assert_eq!(diagnostic.skipped_candidate_count, Some(1));
+        assert_eq!(
+            diagnostic.skip_reasons.get("provider_request_body_missing"),
+            Some(&1)
+        );
     }
 }

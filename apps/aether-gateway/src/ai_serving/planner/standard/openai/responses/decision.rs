@@ -11,6 +11,7 @@ pub(super) use self::payload::{
 };
 pub(super) use self::support::{
     build_local_openai_responses_candidate_attempt_source,
+    mark_skipped_local_openai_responses_candidate_with_failure_diagnostic,
     materialize_local_openai_responses_candidate_attempts,
     resolve_local_openai_responses_decision_input,
     resolve_local_openai_responses_decision_input_with_snapshot,

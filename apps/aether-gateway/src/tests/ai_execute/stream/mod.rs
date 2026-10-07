@@ -28,3 +28,4 @@ mod chat_failover;
 mod decision;
 mod image;
 mod pii_redaction;
+mod pool_failover;

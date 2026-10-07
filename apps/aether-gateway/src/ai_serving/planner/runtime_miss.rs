@@ -180,6 +180,41 @@ pub(crate) fn set_local_runtime_execution_exhausted_diagnostic(
     );
 }
 
+/// 执行耗尽分类字面量，与 aether-ai serving 的 execution exhausted 诊断分类保持一致。
+const EXECUTION_EXHAUSTED_REASON: &str = "execution_runtime_candidates_exhausted";
+
+/// 真实候选已执行且全部失败时的终态原因纠正：Exhausted 只会在至少一个候选真正执行后出现，
+/// 此时 planner 在游标耗尽时写入的 no_local_stream_plans 会掩盖执行失败。这里只更新 reason，
+/// 保留 planner 已累计的候选计数、跳过计数与跳过原因；无既有诊断时退回完整构建以保留路由元数据。
+pub(crate) fn apply_local_runtime_execution_exhausted_reason(
+    state: &AppState,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    requested_model: Option<&str>,
+    candidate_count: usize,
+) {
+    let mut reason_recorded = false;
+    state.mutate_local_execution_runtime_miss_diagnostic(trace_id, |diagnostic| {
+        diagnostic.reason = EXECUTION_EXHAUSTED_REASON.to_string();
+        if diagnostic.candidate_count.is_none() {
+            diagnostic.candidate_count = Some(candidate_count);
+        }
+        reason_recorded = true;
+    });
+    if reason_recorded {
+        return;
+    }
+    set_local_runtime_execution_exhausted_diagnostic(
+        state,
+        trace_id,
+        decision,
+        plan_kind,
+        requested_model,
+        candidate_count,
+    );
+}
+
 pub(crate) fn build_local_runtime_candidate_evaluation_diagnostic(
     decision: &GatewayControlDecision,
     plan_kind: &str,

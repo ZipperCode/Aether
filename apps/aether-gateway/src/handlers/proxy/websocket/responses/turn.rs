@@ -36,7 +36,10 @@ use super::admission::ResponsesWebSocketTurnAdmission;
 use super::frame::ParsedResponsesWebSocketFrame;
 use super::observation::ResponsesStructuredTerminalObserver;
 use super::settlement::attempt_facts_for_outcome;
-use crate::ai_serving::{build_openai_responses_stream_plan_from_decision, AiExecutionDecision};
+use crate::ai_serving::{
+    build_openai_responses_stream_plan_from_decision, AiExecutionDecision,
+    OpenAiResponsesStreamPlanBuildError,
+};
 use crate::clock::current_unix_ms;
 use crate::control::{
     execution_plan_balance_capacity_rejection, GatewayControlDecision, GatewayLocalAuthRejection,
@@ -531,18 +534,18 @@ pub(super) async fn begin_unowned_responses_websocket_turn(
         decision,
         false,
     ) {
-        Ok(Some(attempt)) => attempt,
-        Ok(None) => {
+        Ok(attempt) => attempt,
+        Err(OpenAiResponsesStreamPlanBuildError::Gateway(error)) => {
+            release_pool_key_lease_from_report_context(state, planned_report_context.as_ref())
+                .await;
+            return Err(error);
+        }
+        Err(_) => {
             release_pool_key_lease_from_report_context(state, planned_report_context.as_ref())
                 .await;
             return Err(GatewayError::Internal(
                 "Responses WebSocket request could not build a usage/audit stream plan".to_string(),
             ));
-        }
-        Err(error) => {
-            release_pool_key_lease_from_report_context(state, planned_report_context.as_ref())
-                .await;
-            return Err(error);
         }
     };
     let mut plan = attempt.plan;

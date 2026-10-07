@@ -8,7 +8,7 @@ use crate::ai_serving::api::{
     build_openai_responses_stream_plan_from_decision,
     build_openai_responses_sync_plan_from_decision, build_passthrough_sync_plan_from_decision,
     build_standard_stream_plan_from_decision, build_standard_sync_plan_from_decision,
-    AiExecutionDecision,
+    AiExecutionDecision, OpenAiResponsesStreamPlanBuildError,
 };
 use crate::execution_runtime::submission::{
     build_best_effort_local_core_error_body, has_nested_error,
@@ -565,22 +565,24 @@ fn generic_decision_builders_require_exact_provider_request() {
     let parts = test_parts();
     let body_json = json!({"messages":[{"role":"user","content":"hi"}]});
 
-    assert!(build_openai_responses_stream_plan_from_decision(
-        &parts,
-        &body_json,
-        missing_exact_provider_request_payload("openai_responses_stream"),
-        false,
-    )
-    .expect("builder should not error")
-    .is_none());
-    assert!(build_openai_responses_stream_plan_from_decision(
-        &parts,
-        &body_json,
-        missing_exact_provider_request_payload("openai_responses_compact_stream"),
-        true,
-    )
-    .expect("builder should not error")
-    .is_none());
+    assert!(matches!(
+        build_openai_responses_stream_plan_from_decision(
+            &parts,
+            &body_json,
+            missing_exact_provider_request_payload("openai_responses_stream"),
+            false
+        ),
+        Err(OpenAiResponsesStreamPlanBuildError::MissingProviderRequestHeaders)
+    ));
+    assert!(matches!(
+        build_openai_responses_stream_plan_from_decision(
+            &parts,
+            &body_json,
+            missing_exact_provider_request_payload("openai_responses_compact_stream"),
+            true
+        ),
+        Err(OpenAiResponsesStreamPlanBuildError::MissingProviderRequestHeaders)
+    ));
     assert!(build_standard_stream_plan_from_decision(
         &parts,
         &body_json,
@@ -766,8 +768,7 @@ fn openai_responses_stream_plan_injects_auth_header_when_exact_headers_omit_it()
 
     let plan_and_report =
         build_openai_responses_stream_plan_from_decision(&parts, &json!({}), payload, false)
-            .expect("builder should not error")
-            .expect("plan should be built");
+            .expect("plan build should succeed");
 
     assert_eq!(
         plan_and_report

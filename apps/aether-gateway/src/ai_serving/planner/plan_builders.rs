@@ -27,7 +27,7 @@ pub(crate) use gemini_builders::{
 pub(crate) use openai_builders::{
     build_openai_chat_stream_plan_from_decision, build_openai_chat_sync_plan_from_decision,
     build_openai_responses_stream_plan_from_decision,
-    build_openai_responses_sync_plan_from_decision,
+    build_openai_responses_sync_plan_from_decision, OpenAiResponsesStreamPlanBuildError,
 };
 pub(crate) use passthrough_builders::{
     build_passthrough_stream_plan_from_decision, build_passthrough_sync_plan_from_decision,

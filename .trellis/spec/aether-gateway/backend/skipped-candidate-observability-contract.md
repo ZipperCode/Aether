@@ -51,6 +51,19 @@ polling. These fields describe scheduling decisions; they do not change policy.
   persistence/admin diagnostic projection. These locate the internal rejection
   when breakpoint is `$`; ordinary-user projection stays unchanged. A skipped
   candidate with `started_at=NULL` is not an upstream send or response.
+- Responses stream plan rejection is a typed categorical failure, not a body
+  failure inferred from `None`. Distinguish missing headers/body, plan identity,
+  incomplete auth and URL. Persist via the existing direct candidate skip seam;
+  it bypasses the bulk pool-membership filter and records request-level counts.
+- A PoolGroup count is a logical candidate count, not the number of attempted
+  accounts. Keep ordinary pool-row suppression and the yielded-key exhaustion
+  guard; record rejection where a concrete plan or quarantined candidate drops.
+- Runtime quarantine drops record `endpoint_capability_quarantined` once at the
+  dropping gate. The quarantine cache stores membership, not the original reason;
+  do not invent its cause or change quarantine scope/TTL to improve diagnostics.
+- Responses `Exhausted` means at least one attempt executed: update only the
+  terminal reason to `execution_runtime_candidates_exhausted`, retaining skip
+  counts and routing metadata. `NoPath` retains planner rejection diagnostics.
 
 ## 4. Validation & Error Matrix
 | Input | Result |
@@ -64,6 +77,9 @@ polling. These fields describe scheduling decisions; they do not change policy.
 | All image candidates skipped with JSON heartbeat enabled | Real failure status and one failed usage; no empty HTTP 200 shell |
 | Stored failure_diagnostic has internal kind/source | Preserve in admin diagnostics through repeated projection |
 | No-plan failure has an explicit JSON model but no diagnostic/candidate model | Record the declared model under both basic and full capture |
+| Pool key lacks a complete auth pair | No upstream send; categorical `transport_auth_unavailable` skipped diagnostic |
+| Candidate dropped by runtime quarantine | Count `endpoint_capability_quarantined` once, not a silent plan miss |
+| Planning skips followed by actual execution exhaustion | Preserve skips and classify execution exhaustion |
 
 ## 5. Good / Base / Bad Cases
 Good: a successful request that skipped an earlier Key shows a skip marker even
@@ -90,6 +106,13 @@ Bad: infer skip existence from nonempty reason text or expose raw reasons to use
   the existing minimal usage diagnostic projection instead of copying them.
 - Candidate persistence regression preserves kind/source across repeated
   sanitization while unrelated metadata and ordinary-user output remain filtered.
+- Exercise real HTTP Responses pool failover and all-key failures; separately
+  cover pre-send plan rejection and capacity skips. A constructor serialization
+  assertion is not proof of candidate persistence or terminal classification.
+- Use an isolated real gateway + loopback upstream for before/after smoke:
+  missing pool-key authentication must move from an anonymous plan miss to a
+  categorized skipped trace without sending upstream. Verify exact Responses
+  endpoint selection with Compact/Search bindings present.
 
 ## 7. Wrong vs Correct
 Wrong: `has_skipped_candidate = !reasons.is_empty()` or filter the visible page.

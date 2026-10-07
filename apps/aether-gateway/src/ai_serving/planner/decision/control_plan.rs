@@ -20,7 +20,7 @@ use crate::ai_serving::planner::plan_builders::{
     build_openai_responses_stream_plan_from_decision,
     build_openai_responses_sync_plan_from_decision, build_passthrough_stream_plan_from_decision,
     build_passthrough_sync_plan_from_decision, build_standard_stream_plan_from_decision,
-    build_standard_sync_plan_from_decision,
+    build_standard_sync_plan_from_decision, OpenAiResponsesStreamPlanBuildError,
 };
 use crate::ai_serving::planner::route::{
     resolve_execution_runtime_stream_plan_kind as resolve_stream_plan_kind,
@@ -153,13 +153,23 @@ fn build_stream_plan_payload_from_decision(
             build_openai_chat_stream_plan_from_decision(parts, body_json, payload)?
         }
         OPENAI_RESPONSES_STREAM_PLAN_KIND => {
-            build_openai_responses_stream_plan_from_decision(parts, body_json, payload, false)?
+            match build_openai_responses_stream_plan_from_decision(parts, body_json, payload, false)
+            {
+                Ok(plan) => Some(plan),
+                Err(OpenAiResponsesStreamPlanBuildError::Gateway(error)) => return Err(error),
+                Err(_) => None,
+            }
         }
         OPENAI_IMAGE_STREAM_PLAN_KIND => {
             build_standard_stream_plan_from_decision(parts, body_json, payload, false)?
         }
         OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND => {
-            build_openai_responses_stream_plan_from_decision(parts, body_json, payload, true)?
+            match build_openai_responses_stream_plan_from_decision(parts, body_json, payload, true)
+            {
+                Ok(plan) => Some(plan),
+                Err(OpenAiResponsesStreamPlanBuildError::Gateway(error)) => return Err(error),
+                Err(_) => None,
+            }
         }
         CLAUDE_CHAT_STREAM_PLAN_KIND | CLAUDE_CLI_STREAM_PLAN_KIND => {
             build_standard_stream_plan_from_decision(parts, body_json, payload, true)?

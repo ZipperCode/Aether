@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use aether_ai_serving::{CandidateFailureDiagnostic, CandidateFailureDiagnosticKind};
 use aether_contracts::RequestBody;
 use tracing::debug;
 
@@ -151,28 +152,119 @@ pub(crate) fn build_openai_chat_stream_plan_from_decision(
     }))
 }
 
+/// OpenAI Responses 流式计划构造失败的安全分类。
+///
+/// 只携带静态类别，不携带请求正文、认证值或完整 URL；planner 据此在候选维度
+/// 持久化可区分的失败诊断，替代原先无法归因的 `Ok(None)`。
+#[derive(Debug)]
+pub(crate) enum OpenAiResponsesStreamPlanBuildError {
+    /// 决策未携带任何上游请求 Header（此时即使请求体有效也无法构造精确请求）。
+    MissingProviderRequestHeaders,
+    /// 决策缺少构造计划所需的身份字段（request/provider/endpoint/key/API format）。
+    MissingPlanIdentity,
+    /// 认证 Header 与 Value 只存在一半。
+    IncompleteUpstreamAuthPair,
+    /// 既无 upstream_url 也无 upstream_base_url。
+    MissingUpstreamUrl,
+    /// 决策缺少 JSON 请求体（base64-only 或完全缺失时均无法构造流式计划）。
+    MissingProviderRequestBody,
+    /// 报告上下文构造失败；保持既有 GatewayError 语义。
+    Gateway(GatewayError),
+}
+
+impl OpenAiResponsesStreamPlanBuildError {
+    /// 候选持久化与请求级运行时诊断使用的 skip reason；`Gateway` 保持原语义不落候选。
+    pub(crate) fn candidate_skip_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::MissingProviderRequestHeaders => Some("provider_request_headers_missing"),
+            Self::MissingPlanIdentity => Some("execution_plan_identity_missing"),
+            Self::IncompleteUpstreamAuthPair => Some("transport_auth_unavailable"),
+            Self::MissingUpstreamUrl => Some("upstream_url_missing"),
+            Self::MissingProviderRequestBody => Some("provider_request_body_missing"),
+            Self::Gateway(_) => None,
+        }
+    }
+
+    /// 构造只含静态类别与格式身份的候选级失败诊断。
+    pub(crate) fn candidate_failure_diagnostic(
+        &self,
+        client_api_format: &str,
+        provider_api_format: &str,
+    ) -> CandidateFailureDiagnostic {
+        const SOURCE: &str = "openai_responses_stream_plan_builder";
+        match self {
+            Self::MissingProviderRequestHeaders => CandidateFailureDiagnostic::new(
+                CandidateFailureDiagnosticKind::HeaderRules,
+                "$.provider_request_headers",
+                "执行决策未携带任何上游请求 Header，无法构造精确上游请求",
+            )
+            .formats(client_api_format, provider_api_format)
+            .source(SOURCE),
+            Self::MissingProviderRequestBody => {
+                CandidateFailureDiagnostic::provider_request_body_missing(
+                    client_api_format,
+                    provider_api_format,
+                    SOURCE,
+                )
+            }
+            Self::MissingPlanIdentity => CandidateFailureDiagnostic::new(
+                CandidateFailureDiagnosticKind::EnvelopeBuild,
+                "$.plan",
+                "执行决策缺少构造计划所必需的身份字段（request/provider/endpoint/key/API format）",
+            )
+            .formats(client_api_format, provider_api_format)
+            .source(SOURCE),
+            Self::IncompleteUpstreamAuthPair => CandidateFailureDiagnostic::new(
+                CandidateFailureDiagnosticKind::TransportAuth,
+                "$.auth",
+                "上游认证 Header 与 Value 只配置了一半，无法构造可执行计划",
+            )
+            .formats(client_api_format, provider_api_format)
+            .source(SOURCE),
+            Self::MissingUpstreamUrl => CandidateFailureDiagnostic::upstream_url_missing(
+                client_api_format,
+                provider_api_format,
+                SOURCE,
+            ),
+            Self::Gateway(_) => CandidateFailureDiagnostic::new(
+                CandidateFailureDiagnosticKind::EnvelopeBuild,
+                "$.plan",
+                "执行计划报告上下文构造失败",
+            )
+            .formats(client_api_format, provider_api_format)
+            .source(SOURCE),
+        }
+    }
+}
+
 /// 从最终 OpenAI Responses/Compact 候选构建流式执行计划，并保持首段分类与后续流处理所需元数据不变。
 pub(crate) fn build_openai_responses_stream_plan_from_decision(
     parts: &http::request::Parts,
     _body_json: &serde_json::Value,
     payload: AiExecutionDecision,
     compact: bool,
-) -> Result<Option<AiStreamAttempt>, GatewayError> {
+) -> Result<AiStreamAttempt, OpenAiResponsesStreamPlanBuildError> {
     let mut payload = payload;
     if generic_decision_missing_exact_provider_request(&payload) {
-        return Ok(None);
+        // 谓词是 OR：Header 为空（即使请求体有效）或完全没有请求体。
+        // 在真实门禁处拆分，避免把 Header 缺失误标为请求体缺失。
+        return Err(if payload.provider_request_headers.is_empty() {
+            OpenAiResponsesStreamPlanBuildError::MissingProviderRequestHeaders
+        } else {
+            OpenAiResponsesStreamPlanBuildError::MissingProviderRequestBody
+        });
     }
     let Some(core) = take_ai_decision_plan_core(&mut payload) else {
-        return Ok(None);
+        return Err(OpenAiResponsesStreamPlanBuildError::MissingPlanIdentity);
     };
     let Some(auth_pair) = take_ai_upstream_auth_pair(&mut payload) else {
-        return Ok(None);
+        return Err(OpenAiResponsesStreamPlanBuildError::IncompleteUpstreamAuthPair);
     };
     let url = if let Some(upstream_url) = take_non_empty_string(&mut payload.upstream_url) {
         upstream_url
     } else {
         let Some(upstream_base_url) = take_non_empty_string(&mut payload.upstream_base_url) else {
-            return Ok(None);
+            return Err(OpenAiResponsesStreamPlanBuildError::MissingUpstreamUrl);
         };
         build_standard_plan_fallback_openai_responses_url(
             &upstream_base_url,
@@ -181,7 +273,7 @@ pub(crate) fn build_openai_responses_stream_plan_from_decision(
         )
     };
     let Some(provider_request_body_value) = payload.provider_request_body.take() else {
-        return Ok(None);
+        return Err(OpenAiResponsesStreamPlanBuildError::MissingProviderRequestBody);
     };
 
     let envelope_name = payload
@@ -226,7 +318,8 @@ pub(crate) fn build_openai_responses_stream_plan_from_decision(
         payload.report_context.take(),
         &provider_request_headers,
         &provider_request_body_value,
-    )?;
+    )
+    .map_err(OpenAiResponsesStreamPlanBuildError::Gateway)?;
     let request_body = resolve_openai_plan_request_body(
         parts,
         provider_request_body_value,
@@ -275,11 +368,11 @@ pub(crate) fn build_openai_responses_stream_plan_from_decision(
         "gateway built local openai responses stream execution plan"
     );
 
-    Ok(Some(AiStreamAttempt {
+    Ok(AiStreamAttempt {
         plan,
         report_kind: payload.report_kind,
         report_context,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -290,7 +383,7 @@ mod tests {
 
     use super::{
         build_openai_chat_stream_plan_from_decision,
-        build_openai_responses_stream_plan_from_decision,
+        build_openai_responses_stream_plan_from_decision, OpenAiResponsesStreamPlanBuildError,
     };
     use crate::AiExecutionDecision;
 
@@ -373,8 +466,7 @@ mod tests {
 
         let built =
             build_openai_responses_stream_plan_from_decision(&parts, &json!({}), payload, false)
-                .expect("plan build should succeed")
-                .expect("plan should be produced");
+                .expect("plan build should succeed");
         let plan_body = built
             .plan
             .body
@@ -434,8 +526,7 @@ mod tests {
 
         let built =
             build_openai_responses_stream_plan_from_decision(&parts, &json!({}), payload, true)
-                .expect("plan build should succeed")
-                .expect("plan should be produced");
+                .expect("plan build should succeed");
 
         assert!(!built.plan.stream);
         assert!(built
@@ -445,6 +536,93 @@ mod tests {
             .as_ref()
             .is_some_and(|body| body.get("stream").is_none()));
         assert!(!built.plan.headers.contains_key("accept"));
+    }
+
+    #[test]
+    fn responses_stream_plan_rejects_each_missing_decision_field_with_distinct_category() {
+        let parts = http::Request::builder()
+            .uri("http://localhost/v1/responses")
+            .body(())
+            .expect("request should build")
+            .into_parts()
+            .0;
+
+        let mut missing_body = sample_responses_payload();
+        missing_body.provider_request_body = None;
+        missing_body.provider_request_body_base64 = Some("aGVsbG8=".to_string());
+        assert!(matches!(
+            build_openai_responses_stream_plan_from_decision(
+                &parts,
+                &json!({}),
+                missing_body,
+                false
+            ),
+            Err(OpenAiResponsesStreamPlanBuildError::MissingProviderRequestBody)
+        ));
+
+        let mut missing_url = sample_responses_payload();
+        missing_url.upstream_url = None;
+        missing_url.upstream_base_url = None;
+        assert!(matches!(
+            build_openai_responses_stream_plan_from_decision(
+                &parts,
+                &json!({}),
+                missing_url,
+                false
+            ),
+            Err(OpenAiResponsesStreamPlanBuildError::MissingUpstreamUrl)
+        ));
+
+        let mut partial_auth = sample_responses_payload();
+        partial_auth.auth_value = None;
+        assert!(matches!(
+            build_openai_responses_stream_plan_from_decision(
+                &parts,
+                &json!({}),
+                partial_auth,
+                false
+            ),
+            Err(OpenAiResponsesStreamPlanBuildError::IncompleteUpstreamAuthPair)
+        ));
+
+        let mut blank_identity = sample_responses_payload();
+        blank_identity.endpoint_id = Some("   ".to_string());
+        assert!(matches!(
+            build_openai_responses_stream_plan_from_decision(
+                &parts,
+                &json!({}),
+                blank_identity,
+                false
+            ),
+            Err(OpenAiResponsesStreamPlanBuildError::MissingPlanIdentity)
+        ));
+
+        // Header 为空但请求体有效：谓词是 OR，必须归类为 Header 缺失而非请求体缺失。
+        let mut missing_headers = sample_responses_payload();
+        missing_headers.provider_request_headers = BTreeMap::new();
+        assert!(matches!(
+            build_openai_responses_stream_plan_from_decision(
+                &parts,
+                &json!({}),
+                missing_headers,
+                false
+            ),
+            Err(OpenAiResponsesStreamPlanBuildError::MissingProviderRequestHeaders)
+        ));
+
+        // Header 完整但请求体与 base64 都缺失：走同一个门禁的请求体分支。
+        let mut missing_body_entirely = sample_responses_payload();
+        missing_body_entirely.provider_request_body = None;
+        missing_body_entirely.provider_request_body_base64 = None;
+        assert!(matches!(
+            build_openai_responses_stream_plan_from_decision(
+                &parts,
+                &json!({}),
+                missing_body_entirely,
+                false
+            ),
+            Err(OpenAiResponsesStreamPlanBuildError::MissingProviderRequestBody)
+        ));
     }
 
     #[test]

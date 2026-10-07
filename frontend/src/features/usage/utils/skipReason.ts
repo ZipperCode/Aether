@@ -35,7 +35,9 @@ export const CANDIDATE_SKIP_REASON_LABELS: Record<string, string> = {
   auth_channel_mismatch: '鉴权通道不匹配',
   auth_snapshot_missing: '缺少该密钥的鉴权快照',
   endpoint_api_format_changed: '端点 API 格式已变更',
+  endpoint_capability_quarantined: '端点能力已被运行时隔离（此前静态失败触发）',
   endpoint_inactive: '端点已停用',
+  execution_plan_identity_missing: '执行计划缺少提供商/端点/密钥身份',
   format_conversion_disabled: '该提供商未开启格式转换',
   mapped_model_missing: '缺少映射后的上游模型',
   routing_profile_disallowed_key: '路由策略未允许该密钥',
@@ -44,6 +46,7 @@ export const CANDIDATE_SKIP_REASON_LABELS: Record<string, string> = {
   gemini_file_mapping_mismatch: 'Gemini 文件映射不匹配',
   provider_request_body_build_failed: '上游请求体转换失败',
   provider_request_body_missing: '无法构建上游请求体',
+  provider_request_headers_missing: '无法构建上游请求 Header',
 
   // —— transport_* 系列：该提供商/端点不支持当前这种转发方式 ——
   transport_unsupported: '该传输方式不受支持',

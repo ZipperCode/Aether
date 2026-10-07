@@ -45,7 +45,7 @@ pub(crate) use self::plan_builders::{
     build_openai_responses_stream_plan_from_decision,
     build_openai_responses_sync_plan_from_decision, build_passthrough_sync_plan_from_decision,
     build_standard_stream_plan_from_decision, build_standard_sync_plan_from_decision,
-    AiStreamAttempt, AiSyncAttempt,
+    AiStreamAttempt, AiSyncAttempt, OpenAiResponsesStreamPlanBuildError,
 };
 pub(crate) use self::pool_scores::{
     build_provider_key_pool_score_upsert, provider_key_pool_score_id, provider_key_pool_score_scope,
@@ -54,7 +54,8 @@ pub(crate) use self::redaction::resolve_provider_chat_pii_redaction;
 pub(crate) use self::request_gzip::resolve_transport_request_encoding_policy;
 pub(crate) use self::route::is_matching_stream_request as planner_is_matching_stream_request;
 pub(crate) use self::runtime_miss::{
-    apply_local_runtime_candidate_terminal_reason, record_local_runtime_candidate_skip_reason,
+    apply_local_runtime_candidate_terminal_reason, apply_local_runtime_execution_exhausted_reason,
+    record_local_runtime_candidate_skip_reason,
 };
 pub(crate) use self::specialized::{
     build_local_gemini_files_stream_attempt_source_for_kind,

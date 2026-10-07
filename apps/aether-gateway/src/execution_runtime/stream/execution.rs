@@ -112,8 +112,8 @@ use crate::execution_runtime::transport::{
     execute_stream_plan_via_local_tunnel, format_hyper_error_chain, format_upstream_request_error,
     format_wreq_upstream_request_error, record_manual_proxy_request_failure,
     record_manual_proxy_request_success, record_manual_proxy_stream_error,
-    stream_first_byte_timeout_message, DirectSyncExecutionRuntime, DirectUpstreamResponse,
-    DirectUpstreamStreamExecution, ExecutionRuntimeTransportError,
+    safe_transport_error_message, stream_first_byte_timeout_message, DirectSyncExecutionRuntime,
+    DirectUpstreamResponse, DirectUpstreamStreamExecution, ExecutionRuntimeTransportError,
 };
 use crate::execution_runtime::windsurf::maybe_execute_windsurf_stream;
 use crate::execution_runtime::{
@@ -4438,8 +4438,11 @@ async fn execute_execution_runtime_stream_inner(
         {
             Ok(execution) => execution,
             Err(InProcessStreamExecutionError::Gateway(err)) => return Err(err),
-            Err(InProcessStreamExecutionError::Transport(_err)) => {
-                let transport_error_message = "Execution runtime unavailable".to_string();
+            Err(InProcessStreamExecutionError::Transport(error)) => {
+                let transport_error_message = format!(
+                    "Execution runtime unavailable: {}",
+                    safe_transport_error_message(&error)
+                );
                 info!(
                     event_name = "stream_execution_runtime_unavailable",
                     log_type = "ops",
@@ -4568,8 +4571,11 @@ async fn execute_execution_runtime_stream_inner(
             {
                 Ok(execution) => execution,
                 Err(InProcessStreamExecutionError::Gateway(err)) => return Err(err),
-                Err(InProcessStreamExecutionError::Transport(_err)) => {
-                    let transport_error_message = "Execution runtime unavailable".to_string();
+                Err(InProcessStreamExecutionError::Transport(error)) => {
+                    let transport_error_message = format!(
+                        "Execution runtime unavailable: {}",
+                        safe_transport_error_message(&error)
+                    );
                     info!(
                         event_name = "stream_execution_runtime_unavailable",
                         log_type = "ops",

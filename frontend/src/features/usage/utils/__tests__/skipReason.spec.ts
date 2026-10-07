@@ -41,6 +41,7 @@ describe('candidate skip reason formatting', () => {
       'api_key_concurrency_limit_reached',
       'auth_api_key_concurrency_limit_reached',
       'codex_plan_image_generation_unsupported',
+      'endpoint_capability_quarantined',
       'key_circuit_open',
       'key_health_score_zero',
       'key_rpm_exhausted',

@@ -43,6 +43,7 @@ fn resolve_openai_plan_request_body(
 
 pub(crate) use self::stream::{
     build_openai_chat_stream_plan_from_decision, build_openai_responses_stream_plan_from_decision,
+    OpenAiResponsesStreamPlanBuildError,
 };
 pub(crate) use self::sync::{
     build_openai_chat_sync_plan_from_decision, build_openai_responses_sync_plan_from_decision,
@@ -155,8 +156,7 @@ mod tests {
             ),
             false,
         )
-        .expect("responses stream plan should build")
-        .expect("responses stream plan should exist");
+        .expect("responses stream plan should build");
 
         assert_eq!(
             responses_sync.plan.provider_api_format,

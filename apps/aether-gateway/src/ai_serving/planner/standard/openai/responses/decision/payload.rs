@@ -43,7 +43,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
     trace_id: &str,
     body_json: &serde_json::Value,
     input: &LocalOpenAiResponsesDecisionInput,
-    attempt: LocalOpenAiResponsesCandidateAttempt,
+    attempt: &LocalOpenAiResponsesCandidateAttempt,
     spec: LocalOpenAiResponsesSpec,
 ) -> Result<Option<AiExecutionDecision>, GatewayError> {
     maybe_build_local_openai_responses_decision_payload_for_candidate_with_websocket_mode(
@@ -63,18 +63,15 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
     trace_id: &str,
     body_json: &serde_json::Value,
     input: &LocalOpenAiResponsesDecisionInput,
-    attempt: LocalOpenAiResponsesCandidateAttempt,
+    attempt: &LocalOpenAiResponsesCandidateAttempt,
     spec: LocalOpenAiResponsesSpec,
     websocket_continuation: bool,
 ) -> Result<Option<AiExecutionDecision>, GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let attempt_identity = attempt.attempt_identity();
-    let LocalOpenAiResponsesCandidateAttempt {
-        eligible,
-        candidate_index,
-        candidate_id,
-        ..
-    } = attempt;
+    let eligible = &attempt.eligible;
+    let candidate_index = attempt.candidate_index;
+    let candidate_id = attempt.candidate_id.as_str();
     let resolved = if websocket_continuation {
         resolve_local_openai_responses_candidate_payload_parts_with_websocket_mode(
             state,
@@ -82,9 +79,9 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
             trace_id,
             body_json,
             input,
-            &eligible,
+            eligible,
             candidate_index,
-            &candidate_id,
+            candidate_id,
             spec,
             true,
         )
@@ -96,9 +93,9 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
             trace_id,
             body_json,
             input,
-            &eligible,
+            eligible,
             candidate_index,
-            &candidate_id,
+            candidate_id,
             spec,
         )
         .await?
@@ -164,7 +161,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
             build_local_execution_report_context(LocalExecutionReportContextParts {
                 auth_context: &input.auth_context,
                 request_id: trace_id,
-                candidate_id: &candidate_id,
+                candidate_id,
                 attempt_identity,
                 model: &input.requested_model,
                 provider_name: &resolved.transport.provider.name,
@@ -272,7 +269,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         execution_strategy,
         conversion_mode,
         request_id: trace_id.to_string(),
-        candidate_id: candidate_id.clone(),
+        candidate_id: candidate_id.to_string(),
         provider_name: transport.provider.name.clone(),
         provider_type: transport.provider.provider_type.clone(),
         provider_id: candidate.provider_id.clone(),
