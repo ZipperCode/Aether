@@ -1938,6 +1938,191 @@ mod tests {
 
     /// 验证路由策略会先收集候选分页，再统一执行最终优先级排序。
     #[tokio::test]
+    async fn routing_policy_excludes_group_disabled_providers_from_candidate_pages() {
+        let repository: Arc<dyn MinimalCandidateSelectionReadRepository> =
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed([
+                standard_candidate_row("provider-disabled", "openai:chat", 0),
+                standard_candidate_row("provider-enabled", "openai:chat", 1),
+            ]));
+        let app = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_minimal_candidate_selection_reader_for_tests(repository),
+            );
+        let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let config = serde_json::from_value(serde_json::json!({
+            "disabled_providers": ["provider-disabled"],
+            "model_policies": [{
+                "model": "*",
+                "allowed_providers": ["provider-disabled", "provider-enabled"]
+            }]
+        }))
+        .expect("routing config should parse");
+        let routing_policy = aether_routing_core::resolve_routing_policy(
+            &config,
+            aether_routing_core::RoutingPolicyInput {
+                group_id: Some("routing-group-1"),
+                group_version: Some(1),
+                selection_source: "test",
+                requested_model: "gpt-5",
+                resolved_model: "gpt-5",
+                api_format: "openai:chat",
+                user_id: None,
+                api_key_id: None,
+                headers: &serde_json::json!({}),
+                body: &serde_json::json!({}),
+                phase: aether_routing_core::RoutingRulePhase::ClientRequest,
+            },
+        )
+        .expect("routing policy should resolve");
+        let mut cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:chat",
+            "gpt-5",
+            None,
+            false,
+            None,
+            &auth_snapshot,
+            Some(&routing_policy),
+            None,
+            None,
+            true,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            false,
+            None,
+        )
+        .await;
+
+        let page = cursor
+            .next_page()
+            .await
+            .expect("routing candidate scan should succeed")
+            .expect("the enabled provider should remain");
+        assert_eq!(
+            page.candidates
+                .iter()
+                .map(|candidate| candidate.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["provider-enabled"]
+        );
+        assert!(cursor
+            .next_page()
+            .await
+            .expect("routing scan should finish")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn model_provider_enablement_filters_candidate_pages_without_affecting_other_models() {
+        let mut rows = Vec::new();
+        for model in ["model-a", "model-b", "model-c"] {
+            for (provider, priority) in [
+                ("provider-legacy-disabled", 0),
+                ("provider-model-disabled", 1),
+                ("provider-other", 2),
+                ("provider-inactive", 3),
+            ] {
+                let mut row = standard_candidate_row(provider, "openai:chat", priority);
+                row.global_model_id = format!("global-{model}");
+                row.global_model_name = model.into();
+                row.model_provider_model_name = model.into();
+                row.model_id = format!("{provider}-{model}");
+                row.provider_is_active = provider != "provider-inactive";
+                rows.push(row);
+            }
+        }
+        let repository: Arc<dyn MinimalCandidateSelectionReadRepository> =
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows));
+        let app = AppState::new().unwrap().with_data_state_for_tests(
+            GatewayDataState::with_minimal_candidate_selection_reader_for_tests(repository),
+        );
+        let auth = unrestricted_auth_snapshot();
+        let directives = crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let config = serde_json::from_value(serde_json::json!({
+            "disabled_providers": ["provider-legacy-disabled"],
+            "model_policies": [
+                { "model": "model-a", "provider_enabled_overrides": {
+                    "provider-model-disabled": false, "provider-inactive": true
+                } },
+                { "model": "model-b", "provider_enabled_overrides": {
+                    "provider-legacy-disabled": true, "provider-inactive": true
+                } }
+            ],
+            "rules": [{ "id": "legacy-allowlist", "actions": [{
+                "type": "restrict_providers", "provider_ids": [
+                    "provider-legacy-disabled", "provider-model-disabled", "provider-other", "provider-inactive"
+                ]
+            }] }]
+        })).unwrap();
+        // Revisit A after B to exercise candidate caches shared by the app.
+        for (model, expected) in [
+            ("model-a", vec!["provider-other"]),
+            (
+                "model-b",
+                vec![
+                    "provider-legacy-disabled",
+                    "provider-model-disabled",
+                    "provider-other",
+                ],
+            ),
+            ("model-c", vec!["provider-model-disabled", "provider-other"]),
+            ("model-a", vec!["provider-other"]),
+        ] {
+            let policy = aether_routing_core::resolve_routing_policy(
+                &config,
+                aether_routing_core::RoutingPolicyInput {
+                    group_id: Some("group-1"),
+                    group_version: Some(1),
+                    selection_source: "test",
+                    requested_model: model,
+                    resolved_model: model,
+                    api_format: "openai:chat",
+                    user_id: None,
+                    api_key_id: None,
+                    headers: &serde_json::json!({}),
+                    body: &serde_json::json!({}),
+                    phase: aether_routing_core::RoutingRulePhase::ClientRequest,
+                },
+            )
+            .unwrap();
+            let mut cursor = LocalCandidatePreselectionPageCursor::new(
+                PlannerAppState::new(&app),
+                &directives,
+                "openai:chat",
+                model,
+                None,
+                false,
+                None,
+                &auth,
+                Some(&policy),
+                None,
+                None,
+                true,
+                LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+                true,
+                None,
+            )
+            .await;
+            let mut providers = Vec::new();
+            while let Some(page) = cursor.next_page().await.unwrap() {
+                providers.extend(
+                    page.candidates
+                        .into_iter()
+                        .map(|candidate| candidate.provider_id),
+                );
+            }
+            providers.sort();
+            assert_eq!(
+                providers, expected,
+                "provider enablement must remain isolated for {model}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn routing_policy_collects_candidate_pages_before_final_ranking() {
         let rows = (0..300)
             .map(|index| {
@@ -1959,6 +2144,8 @@ mod tests {
         let model_directive_policy =
             crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
         let routing_policy = ResolvedRoutingPolicy {
+            billing_multiplier: 1.0,
+            group_name: None,
             group_id: Some("routing-group-1".to_string()),
             group_version: Some(1),
             selection_source: "test".to_string(),
@@ -2025,6 +2212,8 @@ mod tests {
         let model_directive_policy =
             crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
         let routing_policy = ResolvedRoutingPolicy {
+            billing_multiplier: 1.0,
+            group_name: None,
             group_id: Some("routing-group-fallback".to_string()),
             group_version: Some(1),
             selection_source: "test".to_string(),
@@ -2877,6 +3066,8 @@ mod tests {
         let model_directive_policy =
             crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
         let routing_policy = ResolvedRoutingPolicy {
+            billing_multiplier: 1.0,
+            group_name: None,
             group_id: Some("routing-group-codex-first".to_string()),
             group_version: Some(1),
             selection_source: "test".to_string(),

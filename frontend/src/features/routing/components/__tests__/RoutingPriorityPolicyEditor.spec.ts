@@ -190,24 +190,6 @@ describe('RoutingPriorityPolicyEditor Provider 可排序范围', () => {
     expect(root.textContent).toContain('Provider Inactive')
     expect(root.textContent).toContain('Provider No Key')
   })
-
-  it('优先级模式变化时重载 Provider，并让 Key 排序查询保持全量', async () => {
-    const { state } = await mountEditor()
-
-    state.priorityMode = 'global_key'
-    await flushPromises()
-    expect(apiMocks.getProvidersSummary).toHaveBeenLastCalledWith({ page: 1, page_size: 9999 })
-    expect(apiMocks.getGlobalKeys).toHaveBeenCalledTimes(1)
-
-    state.priorityMode = 'provider'
-    await flushPromises()
-    expect(apiMocks.getProvidersSummary).toHaveBeenLastCalledWith({
-      page: 1,
-      page_size: 9999,
-      model_id: 'global-a',
-    })
-  })
-
   it('丢弃旧作用域请求的成功和失败结果', async () => {
     let resolveStaleSuccess!: (value: { items: typeof providerFixtures }) => void
     const staleSuccess = new Promise<{ items: typeof providerFixtures }>((resolve) => {

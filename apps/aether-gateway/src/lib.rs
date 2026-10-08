@@ -44,6 +44,7 @@ mod data;
 mod dispatch;
 mod email_delivery;
 mod error;
+mod execution_activity;
 mod execution_runtime;
 mod executor;
 mod fallback_metrics;
@@ -70,6 +71,7 @@ mod provider_key_auth;
 mod provider_pool_demand;
 pub(crate) use aether_provider_transport as provider_transport;
 mod rate_limit;
+mod request_activity;
 mod request_candidate_queue;
 mod request_candidate_runtime;
 mod request_diagnostics;
@@ -91,6 +93,7 @@ mod upstream_admission;
 mod usage;
 mod video_tasks;
 mod wallet_runtime;
+pub use cli_client_profile::ClientProfileSyncGuard;
 
 pub use self::ai_serving::api::{codex_client_originator, codex_client_user_agent};
 pub(crate) use self::ai_serving::api::{

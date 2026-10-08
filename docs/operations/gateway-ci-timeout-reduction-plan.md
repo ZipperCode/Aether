@@ -3,7 +3,7 @@
 - 文档日期：2026-09-23（Asia/Shanghai）
 - 目标 job：`.github/workflows/rust-ci.yml` 中的 `test_gateway`（显示名 `Test (Gateway)`）
 - 优化目标：**缩短 CI 耗时**，不减少安全/回归断言
-- 关联审计：`docs/operations/system-slimming-audit-2026-09-08.md`
+- 关联审计：`docs/operations/system-slimming-audit-2026-09-08.md`（该审计文档已随上游文档清理删除）
 - **第一批（A1+A2+A4）已实施**，待 CI 前后对照确认分钟数。
 
 本文只新增方案文档，不修改业务代码、测试或工作流。文中收益均为基于历史日志与源码结构的**估计值**，每批改动落地后须用同一提交做前后对照实测。
@@ -51,7 +51,7 @@ Workflow 级（72-76 行）：`CARGO_INCREMENTAL=0`、`CARGO_PROFILE_DEV_DEBUG=0
 
 ### 2.2 耗时拆分（历史日志）
 
-来源：`docs/operations/system-slimming-audit-2026-09-08.md`。
+来源：`docs/operations/system-slimming-audit-2026-09-08.md`（该审计文档已删除，下表为其数据摘录）。
 
 | 运行 | Gateway lib 编译 | Gateway lib 执行 | Test lib 步骤合计 |
 | --- | --- | --- | --- |
@@ -229,7 +229,7 @@ rg -n 'aether-gateway' apps/aether-tunnel/Cargo.toml
 rg -n 'mold|RUSTFLAGS|shared-key|nextest run -p aether-gateway' .github/workflows/rust-ci.yml
 ```
 
-历史耗时与慢用例计时以 `docs/operations/system-slimming-audit-2026-09-08.md` 及对应 GitHub Actions 运行 ID 为准；临时 API JSON 不入库。
+历史耗时与慢用例计时以对应 GitHub Actions 运行 ID 为准（原 `docs/operations/system-slimming-audit-2026-09-08.md` 审计文档已删除）；临时 API JSON 不入库。
 
 ---
 
@@ -259,4 +259,4 @@ rg -n 'mold|RUSTFLAGS|shared-key|nextest run -p aether-gateway' .github/workflow
 | 池调度扫描预算语义 | `src/dispatch/pool_scheduler.rs` | 可改夹具实现，不可删语义断言 |
 | AI 断开结算 / PII | `src/tests/ai_execute/...` | 计费完整性与隐私 |
 
-> 与 `system-slimming-audit-2026-09-08.md` 一致：首要结果是 **PR 更快得到正确反馈**，不是测试条数变少。
+> 与 `system-slimming-audit-2026-09-08.md`（已删除）的结论一致：首要结果是 **PR 更快得到正确反馈**，不是测试条数变少。

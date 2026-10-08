@@ -36,18 +36,22 @@ function mountEditor(selectedModels?: string[], initialModels = globalModels) {
     models: selectedModels,
   }]))
   const models = ref(initialModels)
+  const inspect = vi.fn()
   const root = document.createElement('div')
   document.body.appendChild(root)
   const app = createApp({
     setup: () => () => h(RoutingSchedulingPolicyEditor, {
       config: config.value,
       globalModels: models.value,
+      onInspectProvider: inspect,
       'onUpdate:config': (value: RoutingGroupConfig) => { config.value = value },
+    }, {
+      'provider-status': ({ provider }: { provider: ProviderWithEndpointsSummary }) => h('span', { 'data-provider-status': provider.id }, '余额已连接'),
     }),
   })
   app.mount(root)
   mounted.push({ app, root })
-  return { root, config, models }
+  return { root, config, models, inspect }
 }
 
 function providerNames(root: HTMLElement): string[] {
@@ -94,6 +98,16 @@ afterEach(() => {
 })
 
 describe('scheduling provider filtering', () => {
+  it('makes shared-model edits explicit and forwards provider inspection and status slots', async () => {
+    const { root, inspect } = mountEditor(['model-a', 'model-b'])
+    await vi.waitFor(() => expect(providerNames(root)).toHaveLength(3))
+    expect(root.textContent).toContain('正在编辑 2 个模型共用的配置')
+    expect(root.textContent).toContain('model-a、model-b')
+    expect(root.querySelector('[data-provider-status="provider-shared"]')?.textContent).toBe('余额已连接')
+    await clickButton(root, '查看提供商 共享提供商')
+    expect(inspect).toHaveBeenCalledWith('provider-shared')
+  })
+
   // 多模型并集沿用单模型排序的资格约束，停用或没有启用 Key 的提供商不可排序。
   it('keeps inactive providers and providers without active keys out of selected-model ordering', async () => {
     const items = [

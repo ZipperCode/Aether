@@ -22,13 +22,14 @@
         </div>
 
         <div
-          class="grid w-full grid-cols-3 gap-2 sm:contents"
+          class="grid w-full gap-2 sm:contents"
+          :class="mobileGridColsClass"
           data-testid="provider-mobile-filters"
         >
           <!-- 状态筛选 -->
           <div
-            class="min-w-0"
-            :class="{ 'xl:hidden': !cardView }"
+            v-if="statusFilters && statusFilters.length > 0"
+            class="min-w-0 xl:hidden"
           >
             <Select
               :model-value="filterStatus"
@@ -50,10 +51,7 @@
           </div>
 
           <!-- API 格式筛选 -->
-          <div
-            class="min-w-0"
-            :class="{ 'xl:hidden': !cardView }"
-          >
+          <div class="min-w-0 xl:hidden">
             <Select
               :model-value="filterApiFormat"
               @update:model-value="$emit('update:filterApiFormat', $event)"
@@ -75,8 +73,8 @@
 
           <!-- 模型筛选 -->
           <div
-            class="min-w-0"
-            :class="{ 'xl:hidden': !cardView }"
+            v-if="showModelFilter !== false"
+            class="min-w-0 xl:hidden"
           >
             <Select
               :model-value="filterModel"
@@ -136,32 +134,14 @@
           :loading="loading"
           @click="$emit('refresh')"
         />
-        <Button
-          variant="ghost"
-          size="icon"
-          class="h-8 w-8"
-          :class="{ 'bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary': cardView }"
-          :title="legacyT(cardView ? '切换到列表视图' : '切换到卡片视图')"
-          :aria-label="legacyT('卡片视图')"
-          :aria-pressed="cardView"
-          @click="$emit('toggleView')"
-        >
-          <List
-            v-if="cardView"
-            class="w-3.5 h-3.5"
-          />
-          <LayoutGrid
-            v-else
-            class="w-3.5 h-3.5"
-          />
-        </Button>
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { Search, Plus, FilterX, Users, LayoutGrid, List } from 'lucide-vue-next'
+import { computed } from 'vue'
+import { Search, Plus, FilterX, Users } from 'lucide-vue-next'
 import Button from '@/components/ui/button.vue'
 import Input from '@/components/ui/input.vue'
 import Select from '@/components/ui/select.vue'
@@ -173,18 +153,25 @@ import RefreshButton from '@/components/ui/refresh-button.vue'
 import type { FilterOption } from '@/features/providers/composables/useProviderFilters'
 import { useI18n } from '@/i18n'
 
-defineProps<{
+const props = withDefaults(defineProps<{
   searchQuery: string
-  filterStatus: string
+  filterStatus?: string
   filterApiFormat: string
+  showModelFilter?: boolean
   filterModel: string
-  statusFilters: FilterOption[]
+  statusFilters?: FilterOption[]
   apiFormatFilters: FilterOption[]
   modelFilters: FilterOption[]
   hasActiveFilters: boolean
   loading: boolean
-  cardView: boolean
-}>()
+  cardView?: boolean
+  priorityModeLabel?: string
+}>(), {
+  showModelFilter: true,
+  filterStatus: '',
+  statusFilters: () => [],
+  cardView: false,
+})
 
 defineEmits<{
   'update:searchQuery': [value: string]
@@ -199,4 +186,13 @@ defineEmits<{
 }>()
 
 const { legacyT } = useI18n()
+
+const mobileGridColsClass = computed(() => {
+  let count = 1
+  if (props.statusFilters && props.statusFilters.length > 0) count++
+  if (props.showModelFilter !== false) count++
+  if (count === 3) return 'grid-cols-3'
+  if (count === 2) return 'grid-cols-2'
+  return 'grid-cols-1'
+})
 </script>

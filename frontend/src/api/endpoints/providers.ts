@@ -163,6 +163,7 @@ export async function updateProvider(
  */
 export async function createProvider(
   data: {
+    routing_group_id?: string
     name: string
     provider_type?: ProviderType
     description?: string

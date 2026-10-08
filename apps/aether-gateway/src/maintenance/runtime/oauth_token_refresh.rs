@@ -146,13 +146,16 @@ async fn perform_oauth_token_refresh_once_with_gate(
                             ..OAuthTokenRefreshRunSummary::default()
                         }
                     }
-                    Err(_err) => {
+                    Err(err) => {
                         warn!(
                             event_name = "oauth_token_refresh_failed",
                             log_type = "ops",
                             worker = "oauth_token_refresh",
                             provider_id = %provider_ref.id,
+                            provider_type = %provider_ref.provider_type,
+                            endpoint_id = %endpoint_ref.id,
                             key_id,
+                            error = %crate::error::redact_error_debug(&err),
                             "gateway oauth token auto refresh failed"
                         );
                         OAuthTokenRefreshRunSummary {
@@ -598,6 +601,7 @@ mod tests {
         is_nonfatal_legacy_catalog_credential_error, oauth_refresh_candidate,
         oauth_refresh_maintenance_candidate,
     };
+    use crate::error::redact_error_debug;
 
     /// 验证旧版 Antigravity `refreshToken` 仍可进入后台刷新候选。
     use crate::GatewayError;
@@ -749,5 +753,19 @@ mod tests {
                 "endpoint proxy credential encryption is unavailable".to_string(),
             )
         ));
+    }
+
+    #[test]
+    fn oauth_refresh_failure_detail_preserves_context_without_credentials() {
+        let error = GatewayError::Internal(
+            r#"oauth request failed: status=503 token="refresh-secret" retry=2"#.to_string(),
+        );
+
+        let detail = redact_error_debug(&error);
+
+        assert!(detail.contains("oauth request failed"));
+        assert!(detail.contains("status=503"));
+        assert!(detail.contains("[REDACTED]"));
+        assert!(!detail.contains("refresh-secret"));
     }
 }

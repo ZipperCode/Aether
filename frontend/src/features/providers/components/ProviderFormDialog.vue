@@ -11,6 +11,12 @@
       class="space-y-5"
       @submit.prevent="handleSubmit"
     >
+      <p
+        v-if="!isEditMode && routingGroupId"
+        class="rounded-lg bg-muted/40 px-3 py-2 text-sm text-muted-foreground"
+      >
+        新提供商仅在“{{ routingGroupName || '当前策略分组' }}”中启用，在其他策略分组中默认禁用。
+      </p>
       <!-- 基本信息 -->
       <div class="space-y-3">
         <h3 class="text-sm font-medium border-b pb-2">
@@ -424,6 +430,8 @@ import {
 const props = defineProps<{
   modelValue: boolean
   provider?: ProviderWithEndpointsSummary | null  // 编辑模式时传入
+  routingGroupId?: string
+  routingGroupName?: string
   maxPriority?: number  // 当前已有的最大优先级值
   suggestedType?: ProviderType | null  // 推荐的目标类型（如官方域名检测提示）
 }>()
@@ -676,8 +684,8 @@ const handleSubmit = async () => {
       emit('providerUpdated', updated)
     } else {
       // 创建提供商（优先级由后端自动置顶）
-      await createProvider(basePayload)
-      success(legacyT('提供商已创建，请继续添加端点和密钥，或在优先级管理中调整顺序'), legacyT('创建成功'))
+      await createProvider({ ...basePayload, routing_group_id: props.routingGroupId })
+      success(legacyT('提供商已创建，可添加端点和密钥，并在目录中调整调度顺序'), legacyT('创建成功'))
       emit('providerCreated')
     }
 

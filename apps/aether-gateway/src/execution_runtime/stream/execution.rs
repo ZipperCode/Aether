@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use aether_ai_serving::{AiAttemptExecutionOutcome, AiAttemptRetryScope};
 use aether_contracts::{
     ExecutionPlan, ExecutionResponseObservation, ExecutionStreamTerminalSummary,
-    ExecutionTelemetry, StandardizedUsage, StreamFrame, StreamFramePayload,
+    ExecutionTelemetry, StandardizedUsage, StreamFrame, StreamFramePayload, UsageTokenSource,
 };
 use aether_data_contracts::repository::candidates::{
     RequestCandidateStatus, UpsertRequestCandidateRecord,
@@ -453,11 +453,15 @@ fn build_sync_terminal_usage_seeds(
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
 ) -> (TerminalUsageContextSeed, SyncTerminalUsagePayloadSeed) {
+    let analytics_context =
+        crate::usage::reporting::failure::sync_analytics_context(report_context, payload);
     let report_context_with_diagnostics =
-        attach_current_request_diagnostics_to_report_context(report_context);
+        attach_current_request_diagnostics_to_report_context(analytics_context.as_ref());
     let context_seed = build_terminal_usage_context_seed(
         plan,
-        report_context_with_diagnostics.as_ref().or(report_context),
+        report_context_with_diagnostics
+            .as_ref()
+            .or(analytics_context.as_ref()),
     );
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
     (context_seed, payload_seed)
@@ -594,7 +598,12 @@ async fn record_stream_terminal_usage(
     cancelled: bool,
 ) {
     crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started();
-    let context_seed = build_terminal_usage_context_seed(plan, report_context);
+    let analytics_context = crate::usage::reporting::failure::stream_analytics_context(
+        report_context,
+        payload,
+        cancelled,
+    );
+    let context_seed = build_terminal_usage_context_seed(plan, analytics_context.as_ref());
     let payload_seed = build_stream_terminal_usage_payload_seed(payload);
     state
         .usage_runtime
@@ -948,6 +957,9 @@ async fn maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
         usage.cache_read_tokens = 0;
         if usage.input_tokens <= 0 {
             usage.input_tokens = estimated_input_tokens as i64;
+            if usage.input_tokens > 0 {
+                mark_kiro_stream_estimated_usage(usage, report_context, false);
+            }
         }
         return;
     }
@@ -956,6 +968,10 @@ async fn maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
         usage.input_tokens = kiro_billed_input_tokens(estimated_input_tokens, cache_usage) as i64;
         usage.cache_creation_tokens = cache_usage.cache_creation_input_tokens as i64;
         usage.cache_read_tokens = cache_usage.cache_read_input_tokens as i64;
+        if usage.input_tokens > 0 || usage.cache_creation_tokens > 0 || usage.cache_read_tokens > 0
+        {
+            mark_kiro_stream_estimated_usage(usage, report_context, false);
+        }
         return;
     }
 
@@ -968,12 +984,18 @@ async fn maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
                     cache_read_input_tokens: usage.cache_read_tokens.max(0) as u64,
                 },
             ) as i64;
+            if usage.input_tokens > 0 {
+                mark_kiro_stream_estimated_usage(usage, report_context, true);
+            }
         }
         return;
     }
 
     if usage.input_tokens <= 0 {
         usage.input_tokens = estimated_input_tokens as i64;
+        if usage.input_tokens > 0 {
+            mark_kiro_stream_estimated_usage(usage, report_context, true);
+        }
     }
 
     let Some(profile) =
@@ -996,6 +1018,35 @@ async fn maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
     usage.input_tokens = billed_input_tokens as i64;
     usage.cache_creation_tokens = cache_usage.cache_creation_input_tokens as i64;
     usage.cache_read_tokens = cache_usage.cache_read_input_tokens as i64;
+    mark_kiro_stream_estimated_usage(usage, report_context, false);
+}
+
+fn mark_kiro_stream_estimated_usage(
+    usage: &mut StandardizedUsage,
+    report_context: &Value,
+    retains_cache: bool,
+) {
+    let retained_source = usage.token_source.unwrap_or_else(|| {
+        match report_context
+            .get("usage_token_source")
+            .and_then(Value::as_str)
+        {
+            Some("estimated") => UsageTokenSource::Estimated,
+            Some("mixed") => UsageTokenSource::Mixed,
+            _ => UsageTokenSource::Reported,
+        }
+    });
+    let retains_reported_tokens = retained_source != UsageTokenSource::Estimated
+        && (usage.output_tokens > 0
+            || usage.reasoning_tokens > 0
+            || usage.cache_creation_ephemeral_5m_tokens > 0
+            || usage.cache_creation_ephemeral_1h_tokens > 0
+            || (retains_cache && (usage.cache_creation_tokens > 0 || usage.cache_read_tokens > 0)));
+    usage.token_source = Some(if retains_reported_tokens {
+        UsageTokenSource::Mixed
+    } else {
+        UsageTokenSource::Estimated
+    });
 }
 
 fn append_stream_capture_bytes(
@@ -4048,7 +4099,7 @@ async fn execute_execution_runtime_stream_inner(
     let candidate_started_unix_secs = current_request_candidate_unix_ms();
     let provider_in_flight_started_at = Instant::now();
     let mut provider_pool_in_flight_guard =
-        match acquire_provider_pool_execution_guard(state, &plan).await? {
+        match acquire_provider_pool_execution_guard(state, &plan, report_context.as_ref()).await? {
             ProviderPoolInFlightAdmission::Acquired(guard) => guard,
             ProviderPoolInFlightAdmission::Saturated { limit } => {
                 record_local_runtime_candidate_skip_reason(
@@ -13789,6 +13840,10 @@ pub(crate) mod tests {
             .expect("first usage should exist");
         assert!(first_usage.cache_creation_tokens > 0);
         assert_eq!(first_usage.cache_read_tokens, 0);
+        assert_eq!(
+            first_usage.token_source,
+            Some(aether_contracts::UsageTokenSource::Mixed)
+        );
 
         let mut second_summary = Some(ExecutionStreamTerminalSummary {
             standardized_usage: Some(StandardizedUsage {
@@ -13813,6 +13868,10 @@ pub(crate) mod tests {
         assert_eq!(second_usage.cache_creation_tokens, 0);
         assert!(second_usage.input_tokens < 6_000);
         assert_eq!(second_usage.output_tokens, 19);
+        assert_eq!(
+            second_usage.token_source,
+            Some(aether_contracts::UsageTokenSource::Mixed)
+        );
     }
 
     #[tokio::test]
@@ -14008,6 +14067,49 @@ pub(crate) mod tests {
         assert_eq!(usage.cache_creation_tokens, 0);
         assert_eq!(usage.cache_read_tokens, 0);
         assert_eq!(usage.output_tokens, 13);
+        assert_eq!(
+            usage.token_source,
+            Some(aether_contracts::UsageTokenSource::Mixed)
+        );
+
+        use aether_contracts::UsageTokenSource::{Estimated, Mixed};
+        for (hint, source, input, output, cache, expected) in [
+            (Some("estimated"), None, 0, 13, 0, Some(Estimated)),
+            (None, Some(Estimated), 0, 13, 0, Some(Estimated)),
+            (None, None, 0, 0, 200, Some(Mixed)),
+            (None, None, 0, 0, 0, Some(Estimated)),
+            (None, None, 50, 13, 0, None),
+        ] {
+            let mut context = report_context.clone();
+            if let Some(hint) = hint {
+                context["usage_token_source"] = json!(hint);
+            }
+            let mut summary = Some(ExecutionStreamTerminalSummary {
+                standardized_usage: Some(StandardizedUsage {
+                    token_source: source,
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_read_tokens: cache,
+                    ..StandardizedUsage::new()
+                }),
+                ..Default::default()
+            });
+            maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+                &state,
+                &plan,
+                Some(&context),
+                &mut summary,
+            )
+            .await;
+            let usage = summary.unwrap().standardized_usage.unwrap();
+            assert!(usage.input_tokens > 0);
+            assert_eq!(usage.output_tokens, output);
+            assert_eq!(usage.cache_read_tokens, cache);
+            assert_eq!(
+                usage.token_source, expected,
+                "hint={hint:?}, source={source:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -14247,6 +14349,10 @@ pub(crate) mod tests {
         assert_eq!(usage.cache_creation_tokens, 175);
         assert_eq!(usage.cache_read_tokens, 24_463);
         assert_eq!(usage.output_tokens, 167);
+        assert_eq!(
+            usage.token_source,
+            Some(aether_contracts::UsageTokenSource::Mixed)
+        );
     }
 
     #[tokio::test]

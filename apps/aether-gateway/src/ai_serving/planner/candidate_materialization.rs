@@ -1172,7 +1172,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
         loop {
             let runtime_miss_trace_id = self
                 .record_runtime_miss_diagnostic
-                .then(|| self.trace_id.as_str());
+                .then_some(self.trace_id.as_str());
             if let Some(attempt) = pop_attempt_from_items(
                 &mut self.pending_items,
                 &self.skipped_provider_ids,
@@ -2983,6 +2983,8 @@ mod tests {
             );
         let state = PlannerAppState::new(&app);
         let routing_policy = ResolvedRoutingPolicy {
+            billing_multiplier: 1.0,
+            group_name: None,
             group_id: Some("routing-group-memory".to_string()),
             group_version: Some(1),
             selection_source: "test".to_string(),
@@ -3372,6 +3374,8 @@ mod tests {
         cursor.client_session_affinity =
             Some(ClientSessionAffinity::from_session_key("routed-session"));
         cursor.routing_policy = Some(ResolvedRoutingPolicy {
+            billing_multiplier: 1.0,
+            group_name: None,
             group_id: Some("group-1".to_string()),
             group_version: Some(1),
             selection_source: "test".to_string(),
@@ -3429,6 +3433,8 @@ mod tests {
 
         let fixed_order_app = AppState::new().expect("state should build");
         let fixed_order_policy = ResolvedRoutingPolicy {
+            billing_multiplier: 1.0,
+            group_name: None,
             group_id: Some("routing-group-fixed-order".to_string()),
             group_version: Some(1),
             selection_source: "test".to_string(),

@@ -2162,16 +2162,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Start the runtime tasks owned by this node role and return the background
 /// task supervisor that the process must drain before exiting.
 ///
-/// The CLI client profile cache appliers are part of the every-process
-/// lifecycle: frontdoor-only processes send upstream requests too, so they
-/// must keep applying the shared cache that the background singleton owner
-/// refreshes. Background workers stay gated on the role so frontdoor
-/// processes never compete for singleton leases.
+/// Background workers stay gated on the role so frontdoor processes never
+/// compete for singleton leases; the every-process CLI client profile cache
+/// sync is started separately in `run` and its guard is held until exit.
 fn spawn_node_role_tasks(
     state: &AppState,
     node_role: NodeRoleArg,
 ) -> Option<aether_task_runtime::TaskSupervisor> {
-    state.spawn_cli_client_profile_appliers();
     if node_role.spawns_background_tasks() {
         Some(state.spawn_background_tasks())
     } else {
@@ -2538,39 +2535,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    // 两个 CLI 画像的发布检查互不依赖，并发执行以免叠加启动阶段的网络超时。
-    let (codex_profile, claude_code_profile) = tokio::join!(
-        state.prewarm_codex_client_profile(),
-        state.prewarm_claude_code_client_profile(),
-    );
-    match codex_profile {
-        Ok(version) => {
-            info!(
-                codex_client_version = %version,
-                "prewarmed Codex client profile"
-            );
-        }
-        Err(err) => {
-            warn!(
-                error = %err,
-                "failed to refresh Codex client profile; built-in or cached profile remains active"
-            );
+    for (client, result) in state.prewarm_client_profiles().await {
+        match result {
+            Ok(version) => info!(client, version = %version, "prewarmed client profile"),
+            Err(error) => warn!(client, error = %error,
+                "client profile refresh failed; built-in or cached profile remains active"),
         }
     }
-    match claude_code_profile {
-        Ok(version) => {
-            info!(
-                claude_code_client_version = %version,
-                "prewarmed Claude Code client profile"
-            );
-        }
-        Err(err) => {
-            warn!(
-                error = %err,
-                "failed to refresh Claude Code client profile; built-in or cached profile remains active"
-            );
-        }
-    }
+    // All roles synchronize local snapshots, not just the singleton owner.
+    // Keep the guard alive until main exits so shutdown cancels the task.
+    let _client_profile_cache_sync = state.spawn_client_profile_cache_sync();
     match prewarm_direct_h2c_sender_cache_from_env_for_startup().await {
         Ok(Some(report)) => {
             if report.failed_targets > 0 {
@@ -4961,16 +4935,16 @@ mod tests {
     }
 
     /// Environment marker that routes a re-invocation of this test executable
-    /// into the child role of the frontdoor cache applier regression below.
-    const FRONTDOOR_APPLIER_CHILD_ENV: &str = "AETHER_GATEWAY_TEST_FRONTDOOR_APPLIER_CHILD";
-    const FRONTDOOR_APPLIER_CHILD_SENTINEL: &str = "frontdoor-applier-child-started";
-    const FRONTDOOR_APPLIER_TEST_PATH: &str =
+    /// into the child role of the frontdoor cache sync regression below.
+    const FRONTDOOR_SYNC_CHILD_ENV: &str = "AETHER_GATEWAY_TEST_FRONTDOOR_SYNC_CHILD";
+    const FRONTDOOR_SYNC_CHILD_SENTINEL: &str = "frontdoor-sync-child-started";
+    const FRONTDOOR_SYNC_TEST_PATH: &str =
         "tests::frontdoor_node_role_still_applies_shared_cli_client_profile_cache";
 
     #[tokio::test]
     async fn frontdoor_node_role_still_applies_shared_cli_client_profile_cache() {
-        if std::env::var_os(FRONTDOOR_APPLIER_CHILD_ENV).is_some() {
-            frontdoor_applier_child_assertions().await;
+        if std::env::var_os(FRONTDOOR_SYNC_CHILD_ENV).is_some() {
+            frontdoor_sync_child_assertions().await;
             return;
         }
 
@@ -4985,9 +4959,9 @@ mod tests {
         );
         command
             .arg("--exact")
-            .arg(FRONTDOOR_APPLIER_TEST_PATH)
+            .arg(FRONTDOOR_SYNC_TEST_PATH)
             .arg("--nocapture")
-            .env(FRONTDOOR_APPLIER_CHILD_ENV, "1")
+            .env(FRONTDOOR_SYNC_CHILD_ENV, "1")
             .env_remove("AETHER_CODEX_CLIENT_VERSION")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -5008,8 +4982,8 @@ mod tests {
         // filter would otherwise run zero tests and still exit successfully.
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains(FRONTDOOR_APPLIER_CHILD_SENTINEL),
-            "child test did not run the frontdoor applier check; stdout:\n{stdout}"
+            stdout.contains(FRONTDOOR_SYNC_CHILD_SENTINEL),
+            "child test did not run the frontdoor sync check; stdout:\n{stdout}"
         );
         assert!(
             output.status.success(),
@@ -5020,10 +4994,11 @@ mod tests {
 
     /// Child half of the frontdoor regression: seed the shared cache the
     /// background owner would have written (a version newer than anything
-    /// prewarm could have learned), start the frontdoor lifecycle, and observe
-    /// convergence through the public gateway root seam.
-    async fn frontdoor_applier_child_assertions() {
-        println!("{FRONTDOOR_APPLIER_CHILD_SENTINEL}");
+    /// prewarm could have learned), start the frontdoor lifecycle plus the
+    /// per-process cache sync, and observe convergence through the public
+    /// gateway root seam.
+    async fn frontdoor_sync_child_assertions() {
+        println!("{FRONTDOOR_SYNC_CHILD_SENTINEL}");
         let state = AppState::new().expect("state should build");
         state
             .runtime_state()
@@ -5044,6 +5019,11 @@ mod tests {
             background_tasks.is_none(),
             "frontdoor nodes must not start background workers"
         );
+
+        // In `run` the per-process cache sync starts with the same guard and
+        // is held until exit; mirror that here so the frontdoor-only process
+        // converges from the shared cache exactly as production does.
+        let _client_profile_cache_sync = state.spawn_client_profile_cache_sync();
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {

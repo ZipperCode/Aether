@@ -278,9 +278,9 @@ const modeOptions: BatchModeOption[] = [
 ]
 
 const statusActionOptions: ProviderStatusActionOption[] = [
-  { value: 'enable', label: '启用', hint: '恢复所选提供商参与调度。', icon: Power },
-  { value: 'disable', label: '停用', hint: '停止所选提供商参与调度，保留配置。', icon: PowerOff },
-  { value: 'delete', label: '删除', hint: '永久删除所选提供商及其端点、账号和配置。', icon: Trash2, destructive: true },
+  { value: 'enable', label: '启用', hint: '全局启用所选提供商；各策略分组的启用设置仍分别生效。', icon: Power },
+  { value: 'disable', label: '停用', hint: '在所有策略分组中停止所选提供商参与调度，保留配置。', icon: PowerOff },
+  { value: 'delete', label: '删除', hint: '永久删除所选提供商及其端点、账号和配置，此操作不可恢复。', icon: Trash2, destructive: true },
 ]
 
 const MODE_ACCENT: Record<BatchMode, string> = {

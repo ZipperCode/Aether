@@ -52,6 +52,9 @@ No database migration is involved; routing configuration remains opaque JSON.
 - A resolved `ResolvedRoutingPolicy` is the only request-level source for
   `priority_mode`, `scheduling_mode`, `keep_priority_on_conversion`, and
   `sticky_key_attempts`. Do not OR or merge legacy global values into it.
+- Group policies normalize legacy `global_key` to Provider-first ordering.
+  Per-Key overrides remain valid within each Provider; the unified scheduling
+  workspace must not restore a separate global-Key sorting mode.
 - Request candidate ordering requires its resolved policy. The optional
   system-default-group reader returns no value for a missing, disabled or
   invalid group; it never falls back to legacy system-config keys.

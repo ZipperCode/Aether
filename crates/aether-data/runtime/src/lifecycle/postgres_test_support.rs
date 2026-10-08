@@ -14,10 +14,13 @@ pub(super) struct ManagedPostgresServer {
     workdir: PathBuf,
     data_dir: PathBuf,
     database_url: String,
-    /// 外部测试服务的管理 URL，仅用于创建及回收本测试数据库，不读取应用配置。
+    /// 外部测试服务的管理 URL，仅用于创建及回收本测试数据库及相邻数据库，
+    /// 不读取应用配置。
     admin_database_url: Option<String>,
     /// 本夹具创建的独立数据库名；本地进程模式为空。
     owned_database_name: Option<String>,
+    /// 本夹具在同一实例上创建的相邻数据库名，Drop 时与主库一并回收。
+    sibling_database_names: Vec<String>,
 }
 
 impl ManagedPostgresServer {
@@ -109,6 +112,7 @@ impl ManagedPostgresServer {
             database_url: database_url.into(),
             admin_database_url: Some(base_url.to_string()),
             owned_database_name: Some(database_name),
+            sibling_database_names: Vec::new(),
         };
         admin.close().await?;
         wait_for_postgres(server.database_url()).await?;
@@ -137,6 +141,7 @@ impl ManagedPostgresServer {
             database_url: format!("postgres://aether@127.0.0.1:{port}/postgres"),
             admin_database_url: None,
             owned_database_name: None,
+            sibling_database_names: Vec::new(),
         };
 
         let init_output = Command::new(&initdb_bin)
@@ -197,6 +202,38 @@ impl ManagedPostgresServer {
         &self.database_url
     }
 
+    /// 在同一实例上创建以 name_hint 为前缀的唯一相邻数据库，返回其连接 URL。
+    ///
+    /// 数据库名由夹具登记并在 Drop 时统一回收；外部服务模式经管理 URL 派生
+    /// 连接串，本地进程模式直接基于维护库连接创建。相邻库与主库隔离，
+    /// 供需要在同一实例上演练导出/恢复目标的测试使用。
+    pub(super) async fn create_sibling_database(
+        &mut self,
+        name_hint: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let database_name = format!(
+            "{name_hint}_{}_{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        validate_postgres_identifier(&database_name)?;
+        let base_url = self
+            .admin_database_url
+            .clone()
+            .unwrap_or_else(|| self.database_url.clone());
+        let mut database_url = url::Url::parse(&base_url)?;
+        database_url.set_path(&format!("/{database_name}"));
+        let mut admin = PgConnection::connect(&base_url).await?;
+        query(&format!("CREATE DATABASE \"{database_name}\""))
+            .execute(&mut admin)
+            .await?;
+        admin.close().await?;
+        self.sibling_database_names.push(database_name);
+        let database_url: String = database_url.into();
+        wait_for_postgres(&database_url).await?;
+        Ok(database_url)
+    }
+
     fn stop(&mut self) -> Result<(), std::io::Error> {
         let Some(child) = self.child.as_mut() else {
             return Ok(());
@@ -223,14 +260,20 @@ impl ManagedPostgresServer {
         Ok(())
     }
 
-    /// 析构时在短生命周期线程中回收本测试数据库，避免阻塞当前异步运行时。
+    /// 析构时在短生命周期线程中回收本测试数据库及全部相邻数据库，
+    /// 避免阻塞当前异步运行时。
     fn drop_owned_database(&mut self) {
-        let (Some(admin_url), Some(database_name)) = (
-            self.admin_database_url.take(),
-            self.owned_database_name.take(),
-        ) else {
+        let Some(admin_url) = self.admin_database_url.take() else {
+            // 本地进程模式没有外部服务；数据目录随进程停止一并回收。
             return;
         };
+        let mut databases = std::mem::take(&mut self.sibling_database_names);
+        if let Some(database_name) = self.owned_database_name.take() {
+            databases.push(database_name);
+        }
+        if databases.is_empty() {
+            return;
+        }
         let join = std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -242,12 +285,14 @@ impl ManagedPostgresServer {
                     return;
                 }
             };
-            if let Err(error) =
-                runtime.block_on(drop_isolated_postgres_database(&admin_url, &database_name))
-            {
-                eprintln!(
-                    "failed to drop isolated postgres fixture database {database_name}: {error}"
-                );
+            for database_name in databases {
+                if let Err(error) =
+                    runtime.block_on(drop_isolated_postgres_database(&admin_url, &database_name))
+                {
+                    eprintln!(
+                        "failed to drop isolated postgres fixture database {database_name}: {error}"
+                    );
+                }
             }
         });
         let _ = join.join();

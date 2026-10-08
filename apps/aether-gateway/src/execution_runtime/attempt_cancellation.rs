@@ -263,6 +263,14 @@ async fn settle_attempt(
         usage_data.request_metadata.take(),
         request_diagnostics.as_ref(),
     );
+    if matches!(usage_event_type, UsageEventType::Cancelled) {
+        usage_data.request_metadata = crate::usage::reporting::failure::with_analytics_failure(
+            usage_data.request_metadata.as_ref(),
+            "unknown",
+            "finalize",
+            "request_task_cancelled",
+        );
+    }
     usage_data.status_code = Some(status_code);
     usage_data.error_message = Some(error_message.to_string());
     usage_data.error_category = Some(
