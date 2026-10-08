@@ -76,3 +76,25 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: 合并上游路由计费与统计更新
+
+**Date**: 2026-10-08
+**Task**: 合并上游路由计费与统计更新
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+完整合并 upstream/main 911c7f887，保留本地 Endpoint、Responses、额度与认证修复；冲突全部解决。Rust workspace 编译及 CI 范围 Clippy/fmt、网关5860/数据419/外围4136/集成31/前端2198测试通过；真实 PostgreSQL 与浏览器验证分组选择、倍率保存及新统计页面。无 push，临时验证资源已清理。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5b7c806a4` | (see git log) |
+
+### Status
+
+[OK] **Completed**
