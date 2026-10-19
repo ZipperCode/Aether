@@ -38,9 +38,8 @@ Questions to answer:
 
 ## Testing Requirements
 
-<!-- What level of testing is expected -->
-
-(To be filled by the team)
+- **Test runner stack size**: Integration scenarios (`aether-integration-tests`, e.g. `responses_websocket_e2e`) instantiate in-process Aether gateways, temporary PostgreSQL stores, mock upstream servers, and multi-turn WebSocket pipelines. Because debug-profile async futures hold unoptimized nested state across await points, test runner threads must be allocated at least 16 MiB stack space (`RUST_MIN_STACK=16777216`). The CI workflow `check_integration_scenarios` and local test invocations must set `RUST_MIN_STACK=16777216` to prevent test thread stack overflow aborts.
+- **Complete failure collection**: Tests must never be suppressed, ignored, or retried to mask stack overflow or async timing issues. All tests collect and report their results deterministically.
 
 ---
 

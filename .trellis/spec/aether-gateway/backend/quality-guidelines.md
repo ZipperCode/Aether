@@ -183,7 +183,10 @@ The gateway command is `cargo nextest run -p aether-gateway --lib --bins
 ### 3. Contracts
 
 - `tools/ci.py` owns the local/CI argument arrays and child profile overrides:
-  incremental, dev debug and test debug are `0`; gateway test stack is 16 MiB.
+  incremental, dev debug and test debug are `0`; gateway test stack is 16 MiB (`RUST_MIN_STACK=16777216`).
+  Integration scenarios (`aether-integration-tests`) also instantiate the full in-process gateway runtime,
+  routing backends, and multi-turn WebSocket relay state machines; they require the same `RUST_MIN_STACK=16777216`
+  (16 MiB) on test runner threads in CI and local harnesses to prevent stack overflow on unoptimized debug async futures.
 - Linux mold flags are job-scoped before cache restoration. Local execution
   inherits its host linker; the entry does not install tools or modify `.env`.
 - Gateway tests collect all failures in the selected lib/bin targets and return
