@@ -703,6 +703,9 @@ async function pollActiveRequests() {
           record.has_fallback = record.has_fallback === true || update.has_fallback
         }
         Object.assign(record, mergeUsageRecordSkippedCandidates(record, update))
+        if (typeof update.chat_pii_redaction === 'boolean') {
+          record.chat_pii_redaction = record.chat_pii_redaction === true || update.chat_pii_redaction
+        }
         // Active responses are complete final-provider snapshots. Absence clears facts left by
         // a previous candidate, while requested reasoning remains tied to the client request.
         record.target_model = typeof update.target_model === 'string' && update.target_model.trim()
@@ -1300,6 +1303,7 @@ function handleDetailRequestState(update: {
   apiFormat?: string | null
   endpointApiFormat?: string | null
   hasFormatConversion?: boolean | null
+  chatPiiRedaction?: boolean | null
   targetModel?: string | null
   requestedReasoningEffort?: string | null
   reasoningEffort?: string | null
@@ -1435,6 +1439,9 @@ function handleDetailRequestState(update: {
   }
   if ('hasFormatConversion' in update && typeof update.hasFormatConversion === 'boolean') {
     record.has_format_conversion = update.hasFormatConversion
+  }
+  if ('chatPiiRedaction' in update && typeof update.chatPiiRedaction === 'boolean') {
+    record.chat_pii_redaction = record.chat_pii_redaction === true || update.chatPiiRedaction
   }
   if ('targetModel' in update) {
     record.target_model = typeof update.targetModel === 'string' ? update.targetModel : update.targetModel ?? undefined

@@ -368,4 +368,85 @@ mod tests {
             .expect("lease runner should build");
         let _provider_quota_writer = backend.provider_quota_write_repository();
     }
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL"]
+    async fn live_table_maintenance_skips_missing_tables_and_vacuums_existing() {
+        use futures_util::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        let database_url = std::env::var("AETHER_TEST_DATABASE_URL")
+            .expect("AETHER_TEST_DATABASE_URL must point at the test database");
+        let backend = PostgresBackend::from_config(PostgresPoolConfig {
+            database_url,
+            min_connections: 1,
+            max_connections: 2,
+            ..PostgresPoolConfig::default()
+        })
+        .expect("backend should build");
+
+        let probe_id = uuid::Uuid::new_v4().simple().to_string();
+        let table_name = format!("maint_probe_{probe_id}");
+        let missing_table = format!("maint_probe_missing_{probe_id}");
+
+        let outcome = AssertUnwindSafe(async {
+            sqlx::query(&format!(
+                "CREATE TABLE \"{table_name}\" (id INT PRIMARY KEY, name TEXT)"
+            ))
+            .execute(backend.pool())
+            .await
+            .expect("probe table creation should succeed");
+
+            sqlx::query(&format!(
+                "INSERT INTO \"{table_name}\" (id, name) VALUES (1, 'alpha'), (2, 'beta')"
+            ))
+            .execute(backend.pool())
+            .await
+            .expect("probe table seed should succeed");
+
+            let pre_reltuples: f32 =
+                sqlx::query_scalar("SELECT reltuples FROM pg_class WHERE relname = $1")
+                    .bind(&table_name)
+                    .fetch_one(backend.pool())
+                    .await
+                    .expect("pre reltuples query should succeed");
+            assert_eq!(pre_reltuples, -1.0);
+
+            let summary = backend
+                .run_table_maintenance(&[&table_name, &missing_table])
+                .await
+                .expect("maintenance should succeed");
+
+            assert_eq!(summary.attempted, 1);
+            assert_eq!(summary.succeeded, 1);
+
+            let post_reltuples: f32 =
+                sqlx::query_scalar("SELECT reltuples FROM pg_class WHERE relname = $1")
+                    .bind(&table_name)
+                    .fetch_one(backend.pool())
+                    .await
+                    .expect("post reltuples query should succeed");
+            assert_eq!(post_reltuples, 2.0);
+
+            let analyzed: bool = sqlx::query_scalar(
+                "SELECT last_analyze IS NOT NULL FROM pg_stat_user_tables WHERE relname = $1",
+            )
+            .bind(&table_name)
+            .fetch_one(backend.pool())
+            .await
+            .expect("analyzed status query should succeed");
+            assert!(analyzed, "table must be analyzed by maintenance");
+        })
+        .catch_unwind()
+        .await;
+
+        let cleanup_result = sqlx::query(&format!("DROP TABLE IF EXISTS \"{table_name}\""))
+            .execute(backend.pool())
+            .await;
+
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        cleanup_result.expect("probe table cleanup should succeed");
+    }
 }

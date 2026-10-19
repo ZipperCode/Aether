@@ -161,6 +161,52 @@ async fn overview_model_performance_merges_provider_samples_without_pagination()
 }
 
 #[tokio::test]
+async fn overview_provider_breakdown_labels_rows_with_provider_name() {
+    use aether_data_contracts::repository::usage::*;
+    let at = chrono::DateTime::parse_from_rfc3339("2026-09-12T10:05:00Z").unwrap();
+    // 同一 provider_id 的两条记录，展示标签应解析成提供商名称而不是 provider_id。
+    let mut first = sample_usage("provider-label-1", at.timestamp());
+    first.provider_id = Some("provider-1".into());
+    first.provider_name = "Provider One".into();
+    let mut second = sample_usage("provider-label-2", at.timestamp());
+    second.provider_id = Some("provider-1".into());
+    second.provider_name = "Provider One".into();
+    // 名称为历史占位值时回退到 provider_id。
+    let mut unnamed = sample_usage("provider-label-3", at.timestamp());
+    unnamed.provider_id = Some("provider-2".into());
+    unnamed.provider_name = "unknown".into();
+    // provider_id 为空说明无法归属，标签保持为空，由前端显示“未归属提供商”。
+    let mut unattributed = sample_usage("provider-label-4", at.timestamp());
+    unattributed.provider_id = None;
+    unattributed.provider_name = "legacy".into();
+    let repo = InMemoryUsageReadRepository::seed([first, second, unnamed, unattributed]);
+    let result = repo
+        .query_usage_analytics(&UsageAnalyticsQuery {
+            from_unix_ms: (at - chrono::Duration::minutes(5)).timestamp_millis() as u64,
+            to_unix_ms: (at + chrono::Duration::minutes(55)).timestamp_millis() as u64,
+            timezone: "UTC".into(),
+            view: UsageAnalyticsView::Breakdown,
+            group_by: UsageAnalyticsGroupBy::Provider,
+            limit: 25,
+            descending: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.total, 3);
+    let rows = result
+        .rows
+        .iter()
+        .map(|row| (row.id.as_deref(), row.label.as_deref()))
+        .collect::<Vec<_>>();
+    assert!(rows.contains(&(Some("provider-1"), Some("Provider One"))));
+    assert!(rows.contains(&(Some("provider-2"), Some("provider-2"))));
+    assert!(rows.contains(&(None, None)));
+    // 明细分组不填充 bucket_start。
+    assert!(result.rows.iter().all(|row| row.bucket_start.is_none()));
+}
+
+#[tokio::test]
 async fn overview_memory_chart_hour_buckets_are_utc_in_half_hour_zones() {
     use aether_data_contracts::repository::usage::*;
     let at = chrono::DateTime::parse_from_rfc3339("2026-09-12T10:05:00Z").unwrap();
@@ -3592,5 +3638,82 @@ async fn future_dashboard_summary_streak_uses_local_days_before_heatmap_truncati
     assert_eq!(
         summary.activity_days.last().unwrap().date,
         today.pred_opt().unwrap().to_string()
+    );
+}
+
+/// 回归测试：健康监控时间线条必须覆盖完整回溯窗口。
+///
+/// 历史缺陷：时间线条此前是用"最近 N 条事件样本"在内存里分桶，
+/// 于是 6 小时内请求数超过 N 的模型，早期时段会被判成"无请求"（灰条），
+/// 与卡片头部的全窗口请求数自相矛盾。这里验证聚合直接按全窗口分桶，不受样本条数影响。
+#[tokio::test]
+async fn usage_health_timeline_covers_full_window_regardless_of_sample_size() {
+    use aether_data_contracts::repository::usage::{
+        UsageHealthTimelineGroupBy, UsageHealthTimelineQuery,
+    };
+
+    let segments = 60u32;
+    let window_secs = 6 * 3600u64; // 6 小时回溯窗口
+    let now = 1_800_000_000u64;
+    let since = now - window_secs;
+    // 265 次请求均匀铺满整个窗口，远多于旧的默认样本上限（60/100 条）。
+    let rows = (0..265u64)
+        .map(|index| {
+            let at = since + index * window_secs / 265;
+            let mut usage = sample_usage(&format!("health-timeline-{index}"), at as i64);
+            usage.model = "deepseek-v4.1-flash".to_string();
+            usage.provider_name = "codebuddy2api".to_string();
+            usage
+        })
+        .collect::<Vec<_>>();
+    let repo = InMemoryUsageReadRepository::seed(rows);
+
+    let buckets = repo
+        .aggregate_usage_health_timeline(&UsageHealthTimelineQuery {
+            created_from_unix_secs: since,
+            created_until_unix_secs: now,
+            group_by: UsageHealthTimelineGroupBy::Model,
+            group_values: vec!["deepseek-v4.1-flash".to_string()],
+            provider_name: None,
+            model: None,
+            api_format: None,
+            segments,
+            exclude_status_codes: vec![499],
+        })
+        .await
+        .unwrap();
+
+    // 全窗口分桶：几乎每一段都应有样本，总请求数必须等于窗口内的全部请求。
+    assert!(
+        buckets.len() >= (segments as usize) - 1,
+        "时间线应覆盖整个窗口，实际只有 {} 段有数据",
+        buckets.len()
+    );
+    let total_requests: u64 = buckets.iter().map(|row| row.request_count).sum();
+    assert_eq!(total_requests, 265);
+    assert!(buckets.iter().all(|row| row.segment_idx < segments));
+    assert!(buckets
+        .iter()
+        .all(|row| row.success_count == row.request_count));
+
+    // 按提供商维度聚合时，同一批请求应落在同一个分组键下。
+    let provider_buckets = repo
+        .aggregate_usage_health_timeline(&UsageHealthTimelineQuery {
+            created_from_unix_secs: since,
+            created_until_unix_secs: now,
+            group_by: UsageHealthTimelineGroupBy::Provider,
+            group_values: vec!["codebuddy2api".to_string()],
+            provider_name: None,
+            model: None,
+            api_format: None,
+            segments,
+            exclude_status_codes: vec![499],
+        })
+        .await
+        .unwrap();
+    let provider_total: u64 = provider_buckets.iter().map(|row| row.request_count).sum();
+    assert_eq!(
+        provider_total, total_requests,
+        "唯一提供商下的模型与提供商自身必须看到同一批请求"
     );
 }

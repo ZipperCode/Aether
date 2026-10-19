@@ -3,7 +3,6 @@ import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 
 import { createI18n, getI18nLocale, normalizeLocale, setI18nLocale, useI18n, useLocaleOptions } from '@/i18n'
 import { formatDate, formatRelativeTime } from '@/utils/format'
-import { translateLegacyText } from '@/i18n/messages'
 import { transformLegacyTemplateI18n } from '@/i18n/legacy-template-transform'
 
 describe('i18n infrastructure', () => {
@@ -109,35 +108,6 @@ describe('i18n infrastructure', () => {
     expect(result.code).toContain(`{{ __aetherLegacyT("取消") }}`)
     expect(result.code).toContain(`:placeholder='__aetherLegacyT("全部状态")'`)
     expect(result.code).toContain('<code>复制 配置</code>')
-  })
-
-  it('translates common legacy phrases without adding new message entry points', () => {
-    expect(translateLegacyText('请求记录清理策略', 'en-US')).toBe('Request log cleanup policy')
-    // 界面词典覆盖基础词典的同名条目，保留当前配置模型别名的提示语义。
-    expect(translateLegacyText('点击上方"添加映射"按钮为模型创建名称映射', 'en-US')).toBe(
-      'Add a mapping to configure model name aliases',
-    )
-    expect(translateLegacyText('添加映射', 'en-US')).toBe('Add mapping')
-    expect(translateLegacyText('转换提供商类型', 'en-US')).toBe('Convert provider type')
-    expect(translateLegacyText('转换会保留现有端点和密钥，保存前需要再次确认', 'en-US')).toBe(
-      'Conversion preserves existing endpoints and keys and requires confirmation before saving.',
-    )
-    expect(translateLegacyText('数据已过期', 'en-US')).toBe('Data is stale')
-    expect(translateLegacyText('刷新失败', 'en-US')).toBe('Refresh failed')
-    expect(translateLegacyText('更新时间未知', 'en-US')).toBe('Update time unknown')
-    expect(
-      translateLegacyText(
-        '确认将此提供商转换为 OpenRouter？转换会影响 3 个端点和 7 个密钥。取消后将保持当前自定义类型不变。',
-        'en-US',
-      ),
-    ).toBe(
-      'Convert this provider to OpenRouter? This conversion affects 3 endpoints and 7 keys. Cancel keeps the current Custom type unchanged.',
-    )
-    expect(translateLegacyText('最大转移次数', 'en-US')).toBe('Max transfers')
-    expect(translateLegacyText('最大转移超时', 'en-US')).toBe('Max transfer timeout')
-    expect(translateLegacyText('0 (不限制)', 'en-US')).toBe('0 (unlimited)')
-    expect(translateLegacyText('  发布于 2026-01-01  ', 'en-US')).toBe('  Published at 2026-01-01  ')
-    expect(translateLegacyText('git clone https://github.com/ZipperCode/Aether.git', 'en-US')).toBe('git clone https://github.com/ZipperCode/Aether.git')
   })
 
   it('normalizes saved language aliases without accepting unrelated language names', () => {

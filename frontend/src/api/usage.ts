@@ -49,6 +49,7 @@ export interface UsageRecord {
   updated_at?: string | null
   response_time_updated_at?: string | null
   has_fallback?: boolean // 🆕 是否发生了 fallback
+  chat_pii_redaction?: boolean // 请求体实际发生过敏感信息脱敏
   client_family?: string | null
   client_ip?: string | null
   user_agent?: string | null
@@ -271,6 +272,7 @@ type ActiveUsageRequestsResponse = {
     has_fallback?: boolean | null
     has_skipped_candidate?: boolean | null
     skipped_candidate_reasons?: string[]
+    chat_pii_redaction?: boolean | null
     target_model?: string | null
     response_model?: string | null
     request_type?: string | null

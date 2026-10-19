@@ -314,6 +314,12 @@ where
             attempt.report_context(),
             self.transfer_tracker.usage_policy_reservation_token(),
         );
+        let report_context = crate::usage::attach_plan_wallet_fallback_context(
+            self.state,
+            report_context,
+            self.transfer_tracker.uses_wallet_fallback(),
+        )
+        .await?;
         let balance_response = execution_plan_balance_capacity_response(
             self.state,
             self.trace_id,
@@ -376,6 +382,12 @@ where
                 {
                     return Ok(AiAttemptExecutionOutcome::Responded(response));
                 }
+                let report_context = crate::usage::attach_plan_wallet_fallback_context(
+                    self.state,
+                    report_context,
+                    self.transfer_tracker.uses_wallet_fallback(),
+                )
+                .await?;
                 execute_execution_runtime_sync_with_retry_scope(
                     self.state,
                     self.parts.uri.path(),
@@ -759,7 +771,14 @@ impl ProviderTransferTracker {
     fn usage_policy_reservation_token(&self) -> Option<&str> {
         self.usage_policy_reservation
             .as_ref()
+            .filter(|reservation| !reservation.uses_wallet_fallback())
             .map(crate::plan_usage_policy::PlanUsageReservationContext::token)
+    }
+
+    fn uses_wallet_fallback(&self) -> bool {
+        self.usage_policy_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.uses_wallet_fallback())
     }
 
     fn record_usage_policy_reservation_plan(&self, plan: &aether_contracts::ExecutionPlan) {
@@ -1288,6 +1307,12 @@ where
             attempt.report_context(),
             self.transfer_tracker.usage_policy_reservation_token(),
         );
+        let report_context = crate::usage::attach_plan_wallet_fallback_context(
+            self.state,
+            report_context,
+            self.transfer_tracker.uses_wallet_fallback(),
+        )
+        .await?;
         let candidate_index = parse_request_candidate_report_context(report_context.as_ref())
             .and_then(|context| context.candidate_index)
             .map(|value| value.to_string())
@@ -1340,6 +1365,24 @@ where
             return Ok(AiAttemptExecutionOutcome::Responded(response));
         }
         prewarm_direct_reqwest_candidate_client(plan);
+        if let Some(response) = execution_plan_cost_capacity_response(
+            self.state,
+            self.trace_id,
+            self.decision,
+            plan,
+            report_context.as_ref(),
+            self.transfer_tracker,
+        )
+        .await?
+        {
+            return Ok(AiAttemptExecutionOutcome::Responded(response));
+        }
+        let report_context = crate::usage::attach_plan_wallet_fallback_context(
+            self.state,
+            report_context,
+            self.transfer_tracker.uses_wallet_fallback(),
+        )
+        .await?;
         let watchdog_report_context_owned = report_context.clone();
         let watchdog_report_context = watchdog_report_context_owned.as_ref();
         let execution_state = self.state.clone();
@@ -1348,7 +1391,6 @@ where
         let execution_decision = self.decision.clone();
         let execution_report_kind = attempt.report_kind();
         let execution_plan = plan.clone();
-        let execution_transfer_tracker = self.transfer_tracker.clone();
         let stop_on_transport_errors = matches!(
             resolve_local_transport_failover_analysis_for_attempt(
                 self.state,
@@ -1368,18 +1410,6 @@ where
             watchdog_report_context,
             stop_on_transport_errors,
             move || async move {
-                if let Some(response) = execution_plan_cost_capacity_response(
-                    &execution_state,
-                    execution_trace_id.as_str(),
-                    &execution_decision,
-                    &execution_plan,
-                    report_context.as_ref(),
-                    &execution_transfer_tracker,
-                )
-                .await?
-                {
-                    return Ok(AiAttemptExecutionOutcome::Responded(response));
-                }
                 execute_execution_runtime_stream_with_retry_scope(
                     &execution_state,
                     execution_plan,
@@ -1597,6 +1627,12 @@ async fn execution_plan_cost_capacity_response(
     };
     let rejection = match outcome {
         crate::plan_usage_policy::PlanUsageCostReservationOutcome::NotRequired => return Ok(None),
+        crate::plan_usage_policy::PlanUsageCostReservationOutcome::WalletFallback => {
+            transfer_tracker
+                .usage_policy_cost_reserved
+                .store(false, Ordering::Release);
+            return Ok(None);
+        }
         crate::plan_usage_policy::PlanUsageCostReservationOutcome::Reserved => {
             transfer_tracker.record_usage_policy_reservation_plan(plan);
             transfer_tracker

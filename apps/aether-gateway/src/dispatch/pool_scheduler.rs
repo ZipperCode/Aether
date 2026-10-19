@@ -388,7 +388,7 @@ fn active_probe_member_is_unschedulable_for_request(
             || context.account_blocked
             || context.runtime_quota_hard_blocked
             || context.quota_hard_blocked
-            || context.quota_exhausted
+            || (pool_config.skip_exhausted_accounts && context.quota_exhausted)
             || context.balance_below_minimum
     })
 }
@@ -1674,12 +1674,14 @@ async fn read_pool_catalog_key_contexts_by_id(
             provider_type.as_str(),
             provider_model_name,
         );
-        context.quota_exhausted |= reserve_minimum_quota_key_ids.contains(&key.id)
+        let reserve_reached = reserve_minimum_quota_key_ids.contains(&key.id)
             && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
                 key,
                 provider_type.as_str(),
                 provider_model_name,
             );
+        context.quota_exhausted |= reserve_reached;
+        context.quota_hard_blocked |= reserve_reached;
         contexts.insert(key.id.clone(), context);
     }
     (contexts, keys_by_id)
@@ -2478,6 +2480,31 @@ mod tests {
     }
 
     /// 验证 Pool 排序结果携带组索引、Key 索引、租约及粘性尝试预算。
+    #[test]
+    fn pool_scheduler_allows_quota_exhausted_key_when_ignored() {
+        let exhausted = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-exhausted",
+            10,
+            Some(json!({ "pool_advanced": { "ignore_exhausted_accounts": true } })),
+        );
+        let contexts = BTreeMap::from([(
+            "key-exhausted".to_string(),
+            PoolCatalogKeyContext {
+                quota_exhausted: true,
+                ..PoolCatalogKeyContext::default()
+            },
+        )]);
+        let (scheduled, skipped) = apply_local_execution_pool_scheduler_with_runtime_map(
+            vec![exhausted],
+            &BTreeMap::new(),
+            &contexts,
+        );
+        assert_eq!(scheduled.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
     #[test]
     fn pool_scheduler_skips_quota_exhausted_key_when_flag_is_false() {
         let ready = sample_eligible_candidate(

@@ -665,6 +665,13 @@ async fn live_overview_settlement_allocations_preserve_unlimited_and_finite_wall
             _ => 0.0,
         };
         if quota > 0.0 {
+            sqlx::query(
+                "INSERT INTO user_preferences(id,user_id,allow_wallet_overage) VALUES($1,$1,true)",
+            )
+            .bind(&user)
+            .execute(&pool)
+            .await
+            .unwrap();
             let grant = serde_json::json!([{"type":"daily_quota","daily_quota_usd":quota,"reset_timezone":"UTC","allow_wallet_overage":true}]);
             sqlx::query("INSERT INTO billing_plans(id,title,price_amount,duration_unit,duration_value,entitlements_json,created_at,updated_at) VALUES($1,'test',1,'month',1,$2,NOW(),NOW())").bind(&user).bind(&grant).execute(&pool).await.unwrap();
             sqlx::query("INSERT INTO payment_orders(id,order_no,wallet_id,user_id,amount_usd,payment_method,created_at) VALUES($1,$1,$2,$1,1,'test',NOW())").bind(&user).bind(&wallet).execute(&pool).await.unwrap();
@@ -1077,6 +1084,11 @@ async fn live_overview_cache_pricing_and_record_drilldown() {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("INSERT INTO api_keys(id,user_id,key_hash,is_standalone) VALUES($1,$1,$1,false)")
+        .bind(&owner)
+        .execute(&pool)
+        .await
+        .unwrap();
     let metadata = serde_json::json!({"analytics_attribution":{"is_standalone":false},"analytics_measurement":{"source":"reported"}});
     for (id, latency) in [(&request, 6000), (&other, 100)] {
         sqlx::query("INSERT INTO usage(id,request_id,user_id,api_key_id,provider_id,provider_name,model,api_format,endpoint_kind,request_type,is_stream,has_format_conversion,status,billing_status,response_time_ms,input_tokens,output_tokens,cache_read_input_tokens,request_metadata) VALUES($1,$1,$2,$2,$2,'test',$2,'openai:chat','chat','chat',true,true,'completed','settled',$3,1000,20,100,$4)")
@@ -1181,6 +1193,11 @@ async fn live_overview_cache_pricing_and_record_drilldown() {
         .unwrap();
     sqlx::query("DELETE FROM usage WHERE request_id=ANY($1)")
         .bind(vec![request, other])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM api_keys WHERE id=$1")
+        .bind(&owner)
         .execute(&pool)
         .await
         .unwrap();

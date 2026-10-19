@@ -42,6 +42,7 @@ export interface UserPreferences {
   theme: string
   language: string
   timezone?: string
+  allow_wallet_overage?: boolean
   notifications?: {
     email?: boolean
     usage_alerts?: boolean
@@ -114,6 +115,8 @@ export interface UsageRecordDetail {
   price_per_request?: number  // 按次计费价格
   has_fallback?: boolean
   has_skipped_candidate?: boolean
+  /** 请求体实际发生过敏感信息脱敏（上游收到的是占位符）。 */
+  chat_pii_redaction?: boolean
   api_key?: {
     id: string
     name: string
@@ -416,6 +419,7 @@ export const meApi = {
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
       has_skipped_candidate?: boolean | null
+      chat_pii_redaction?: boolean | null
       target_model?: string | null
       response_model?: string | null
       request_type?: string | null
@@ -468,6 +472,7 @@ export const meApi = {
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
       has_skipped_candidate?: boolean | null
+      chat_pii_redaction?: boolean | null
       target_model?: string | null
       response_model?: string | null
       request_type?: string | null
@@ -590,6 +595,7 @@ export const meApi = {
   }): Promise<{
     analysis_period_hours: number
     total_points: number
+    truncated?: boolean
     points: Array<{ x: string; y: number; model?: string }>
     models?: string[]
   }> {
@@ -600,6 +606,7 @@ export const meApi = {
         const response = await apiClient.get<{
           analysis_period_hours: number
           total_points: number
+          truncated?: boolean
           points: Array<{ x: string; y: number; model?: string }>
           models?: string[]
         }>('/api/users/me/usage/interval-timeline', { params })

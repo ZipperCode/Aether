@@ -6225,6 +6225,7 @@ async fn gateway_handles_users_me_preferences_locally_without_proxying_upstream(
     assert_eq!(get_payload["theme"], "light");
     assert_eq!(get_payload["language"], "zh-CN");
     assert_eq!(get_payload["timezone"], "Asia/Shanghai");
+    assert_eq!(get_payload["allow_wallet_overage"], false);
     assert_eq!(get_payload["notifications"]["email"], true);
     assert_eq!(get_payload["default_provider_id"], "provider-openai");
     assert!(get_payload.get("default_provider").is_none());
@@ -6242,6 +6243,7 @@ async fn gateway_handles_users_me_preferences_locally_without_proxying_upstream(
             "email_notifications": false,
             "usage_alerts": false,
             "announcement_notifications": true,
+            "allow_wallet_overage": true,
         }))
         .send()
         .await
@@ -6267,9 +6269,46 @@ async fn gateway_handles_users_me_preferences_locally_without_proxying_upstream(
     assert_eq!(verify_payload["language"], "en-US");
     assert_eq!(verify_payload["timezone"], "UTC");
     assert_eq!(verify_payload["bio"], "hello");
+    assert_eq!(verify_payload["allow_wallet_overage"], true);
     assert_eq!(verify_payload["notifications"]["email"], false);
     assert_eq!(verify_payload["notifications"]["usage_alerts"], false);
     assert_eq!(verify_payload["notifications"]["announcements"], true);
+    for (payload, expected_status, expected_overage) in [
+        (
+            json!({"allow_wallet_overage": "true"}),
+            StatusCode::BAD_REQUEST,
+            true,
+        ),
+        (json!({"theme": "light"}), StatusCode::OK, true),
+        (
+            json!({"allow_wallet_overage": false}),
+            StatusCode::OK,
+            false,
+        ),
+    ] {
+        let response = client
+            .put(format!("{gateway_url}/api/users/me/preferences"))
+            .header("authorization", format!("Bearer {access_token}"))
+            .header("x-client-device-id", "device-user-pref-1")
+            .header("user-agent", "AetherTest/1.0")
+            .json(&payload)
+            .send()
+            .await
+            .expect("preference update should succeed");
+        assert_eq!(response.status(), expected_status);
+        let preferences: serde_json::Value = client
+            .get(format!("{gateway_url}/api/users/me/preferences"))
+            .header("authorization", format!("Bearer {access_token}"))
+            .header("x-client-device-id", "device-user-pref-1")
+            .header("user-agent", "AetherTest/1.0")
+            .send()
+            .await
+            .expect("preference lookup should succeed")
+            .json()
+            .await
+            .expect("preferences should parse");
+        assert_eq!(preferences["allow_wallet_overage"], expected_overage);
+    }
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -7105,6 +7144,114 @@ async fn gateway_handles_users_me_usage_interval_timeline_and_heatmap_locally_wi
             >= 2
     );
     assert!(heatmap_payload["max_requests"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_samples_users_me_usage_interval_timeline_across_full_window_when_over_limit() {
+    let now = Utc::now();
+    let user = sample_auth_user(now);
+    let access_token = build_test_auth_token(
+        "access",
+        serde_json::Map::from_iter([
+            ("user_id".to_string(), json!(user.id)),
+            ("role".to_string(), json!(user.role)),
+            (
+                "created_at".to_string(),
+                json!(user.created_at.map(|value| value.to_rfc3339())),
+            ),
+            (
+                "session_id".to_string(),
+                json!("session-users-me-usage-timeline-sampling"),
+            ),
+        ]),
+        now + chrono::Duration::hours(1),
+    );
+    let first_request_at = now - chrono::Duration::hours(4);
+    let latest_request_at = now - chrono::Duration::minutes(1);
+    let mut seeded = Vec::new();
+    for index in 0..250_i64 {
+        // The latest request is isolated from the early burst so losing it is visible.
+        let created_at = if index == 249 {
+            latest_request_at
+        } else {
+            first_request_at + chrono::Duration::seconds(index)
+        };
+        seeded.push(sample_user_usage_audit(
+            &format!("usage-users-me-timeline-sampling-{index}"),
+            &format!("req-users-me-timeline-sampling-{index}"),
+            "user-auth-1",
+            "gpt-4.1",
+            "OpenAI",
+            "completed",
+            created_at,
+        ));
+    }
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(seeded));
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_usage_state(
+            user,
+            sample_auth_wallet("user-auth-1", now),
+            [sample_auth_session(
+                "user-auth-1",
+                "session-users-me-usage-timeline-sampling",
+                "device-users-me-usage-timeline-sampling",
+                "refresh-token-placeholder",
+                now,
+            )],
+            usage_repository,
+        )
+        .await;
+
+    let client = reqwest::Client::new();
+    let timeline_response = client
+        .get(format!(
+            "{gateway_url}/api/users/me/usage/interval-timeline?hours=24&limit=100"
+        ))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header(
+            "x-client-device-id",
+            "device-users-me-usage-timeline-sampling",
+        )
+        .header("user-agent", "AetherTest/1.0")
+        .send()
+        .await
+        .expect("timeline request should succeed");
+    assert_eq!(timeline_response.status(), StatusCode::OK);
+    let payload: serde_json::Value = timeline_response
+        .json()
+        .await
+        .expect("timeline json should parse");
+
+    // 250 条 completed 记录产生 249 个间隔点，limit=100 时应均匀抽样并标记 truncated
+    assert_eq!(payload["truncated"], json!(true));
+    assert_eq!(payload["total_points"], 249);
+    let points = payload["points"].as_array().expect("points array");
+    let parse_x = |point: &serde_json::Value| {
+        chrono::DateTime::parse_from_rfc3339(point["x"].as_str().expect("x should be a string"))
+            .expect("x should be rfc3339")
+            .timestamp()
+    };
+    let newest = parse_x(points.last().expect("points should not be empty"));
+    let oldest = parse_x(&points[0]);
+    assert_eq!(
+        newest,
+        latest_request_at.timestamp(),
+        "sampling should keep the most recent interval"
+    );
+    assert_eq!(
+        oldest,
+        first_request_at.timestamp() + 1,
+        "sampling should keep the first interval"
+    );
+    assert_eq!(points.len(), 100, "sampling should fill the point budget");
+    assert!(points
+        .windows(2)
+        .all(|pair| parse_x(&pair[0]) <= parse_x(&pair[1])));
+
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

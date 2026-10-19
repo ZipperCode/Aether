@@ -9,14 +9,14 @@ use crate::repository::candidates::sanitize_request_candidate_skip_reason;
 
 use super::{
     billing_multiplier_snapshot, normalize_provider_response_model,
-    BILLING_MULTIPLIER_SNAPSHOT_METADATA_KEY, LIVE_SESSION_METADATA_KEY,
-    PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY, PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY,
-    PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY, PROVIDER_REASONING_EFFORT_METADATA_KEY,
-    PROVIDER_RESPONSE_MODEL_METADATA_KEY, PROVIDER_SERVICE_TIER_METADATA_KEY,
-    REALTIME_SESSION_METADATA_KEY, REQUESTED_REASONING_EFFORT_METADATA_KEY,
-    ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY, ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY,
-    ROUTING_GROUP_BILLING_MULTIPLIER_METADATA_KEY, ROUTING_GROUP_ID_METADATA_KEY,
-    ROUTING_GROUP_NAME_METADATA_KEY, USAGE_AVAILABLE_METADATA_KEY,
+    BILLING_MULTIPLIER_SNAPSHOT_METADATA_KEY, CHAT_PII_REDACTION_METADATA_KEY,
+    LIVE_SESSION_METADATA_KEY, PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY,
+    PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY,
+    PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_RESPONSE_MODEL_METADATA_KEY,
+    PROVIDER_SERVICE_TIER_METADATA_KEY, REALTIME_SESSION_METADATA_KEY,
+    REQUESTED_REASONING_EFFORT_METADATA_KEY, ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY,
+    ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY, ROUTING_GROUP_BILLING_MULTIPLIER_METADATA_KEY,
+    ROUTING_GROUP_ID_METADATA_KEY, ROUTING_GROUP_NAME_METADATA_KEY, USAGE_AVAILABLE_METADATA_KEY,
     USAGE_PRICING_AVAILABLE_METADATA_KEY, WEBSOCKET_MODE_METADATA_KEY,
     WEBSOCKET_TRANSPORT_METADATA_KEY,
 };
@@ -82,13 +82,36 @@ pub fn preserve_usage_routing_group_snapshot(
             captured,
         );
     }
-    let Some(Value::Object(snapshot)) = sanitize_usage_request_metadata_object(&snapshot) else {
+    let snapshot = sanitize_usage_request_metadata_object(&snapshot)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if snapshot.is_empty()
+        && previous
+            .get("plan_wallet_fallback")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
         return incoming;
-    };
+    }
     let mut metadata = incoming
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     metadata.extend(snapshot);
+    if previous
+        .get("plan_wallet_fallback")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        metadata.insert("plan_wallet_fallback".to_string(), Value::Bool(true));
+    }
+    if metadata
+        .get("plan_wallet_fallback")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        metadata.remove(PLAN_USAGE_RESERVATION_TOKEN_KEY);
+        metadata.remove(PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY);
+    }
     Some(Value::Object(metadata))
 }
 
@@ -152,12 +175,14 @@ pub fn sanitize_usage_request_metadata_object(source: &Map<String, Value>) -> Op
         "client_requested_stream",
         UPSTREAM_IS_STREAM_KEY,
         "api_key_is_standalone",
+        "plan_wallet_fallback",
         WEBSOCKET_MODE_METADATA_KEY,
         PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY,
         "transport_error",
         "is_free_tier",
         CANCELLED_REQUEST_FEE_METADATA_KEY,
         USAGE_AVAILABLE_METADATA_KEY,
+        CHAT_PII_REDACTION_METADATA_KEY,
         USAGE_PRICING_AVAILABLE_METADATA_KEY,
     ] {
         insert_bool(source, &mut target, key);
@@ -1370,6 +1395,26 @@ mod tests {
     };
 
     #[test]
+    fn wallet_fallback_survives_sparse_video_completion_and_removes_plan_reservation() {
+        let token = "550e8400-e29b-41d4-a716-446655440000";
+        let previous = json!({"plan_wallet_fallback": true, "plan_usage_reservation_token": token});
+        let preserved = preserve_usage_routing_group_snapshot(None, Some(&previous)).unwrap();
+        assert_eq!(preserved["plan_wallet_fallback"], true);
+        assert!(preserved.get("plan_usage_reservation_token").is_none());
+        let incoming = json!({"plan_wallet_fallback": true});
+        let previous =
+            json!({"plan_wallet_fallback": false, "plan_usage_reservation_token": token});
+        let preserved =
+            preserve_usage_routing_group_snapshot(Some(incoming), Some(&previous)).unwrap();
+        assert_eq!(preserved["plan_wallet_fallback"], true);
+        assert!(preserved.get("plan_usage_reservation_token").is_none());
+        assert!(
+            sanitize_usage_request_metadata(Some(json!({"plan_wallet_fallback": "true"})))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn billing_multiplier_snapshot_projection_preserves_invalid_marker_and_immutable_factors() {
         for snapshot in [
             serde_json::Value::Null,
@@ -1830,5 +1875,26 @@ mod tests {
             .pointer("/realtime_session/authorization")
             .is_none());
         assert!(metadata.pointer("/realtime_session/nested").is_none());
+    }
+
+    #[test]
+    fn usage_metadata_keeps_chat_pii_redaction_bool_only() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "chat_pii_redaction": true,
+            "trace_id": "trace-pii",
+        })))
+        .expect("pii redaction marker should remain");
+        assert_eq!(metadata["chat_pii_redaction"], true);
+        assert_eq!(metadata["trace_id"], "trace-pii");
+
+        // 只接受布尔值：字符串/数字形态不能把“是否脱敏”变成含糊事实。
+        for invalid in [json!("true"), json!(1)] {
+            let projected = sanitize_usage_request_metadata(Some(json!({
+                "chat_pii_redaction": invalid,
+                "trace_id": "trace-pii",
+            })))
+            .expect("trace_id alone should keep the object");
+            assert!(projected.get("chat_pii_redaction").is_none());
+        }
     }
 }

@@ -22,6 +22,7 @@ use axum::{
 use chrono::Utc;
 use serde_json::{json, Value};
 
+use crate::handlers::shared::sample_interval_timeline;
 use crate::GatewayError;
 
 use super::{
@@ -521,6 +522,17 @@ fn infer_client_family_from_user_agent(user_agent: &str) -> Option<&'static str>
     Some("unknown")
 }
 
+fn users_me_usage_chat_pii_redacted(item: &StoredRequestUsageAudit) -> bool {
+    item.request_metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|metadata| {
+            metadata.get(aether_data_contracts::repository::usage::CHAT_PII_REDACTION_METADATA_KEY)
+        })
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 fn users_me_usage_client_family(item: &StoredRequestUsageAudit) -> Option<&str> {
     item.client_family
         .as_deref()
@@ -602,6 +614,7 @@ fn build_users_me_usage_record_payload(
         "status": item.status,
         "has_fallback": item.has_fallback(),
         "has_skipped_candidate": false,
+        "chat_pii_redaction": users_me_usage_chat_pii_redacted(item),
         "created_at": unix_secs_to_rfc3339(item.created_at_unix_ms),
         "cache_creation_input_tokens": cache_creation_input_tokens,
         "cache_creation_ephemeral_5m_input_tokens": item.cache_creation_ephemeral_5m_input_tokens,
@@ -698,6 +711,7 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "response_model": item.provider_response_model(),
         "has_fallback": item.has_fallback(),
         "has_skipped_candidate": false,
+        "chat_pii_redaction": users_me_usage_chat_pii_redacted(item),
     });
     payload["routing_group_id"] = json!(item.routing_group_id());
     payload["routing_group_name"] = json!(item.routing_group_name());
@@ -1591,21 +1605,23 @@ pub(super) async fn handle_users_me_usage_interval_timeline_get(
         }
     };
 
-    let mut points = Vec::new();
-    for row in intervals {
-        points.push(json!({
-            "x": unix_secs_to_rfc3339(row.created_at_unix_secs),
-            "y": round_to(row.interval_minutes, 2),
-            "model": row.model,
-        }));
-        if points.len() >= limit {
-            break;
-        }
-    }
+    // 按请求顺序抽样并保留首尾点，避免窗口末尾的稀疏请求被截掉。
+    let total_points = intervals.len();
+    let points = sample_interval_timeline(intervals, limit)
+        .into_iter()
+        .map(|row| {
+            json!({
+                "x": unix_secs_to_rfc3339(row.created_at_unix_secs),
+                "y": round_to(row.interval_minutes, 2),
+                "model": row.model,
+            })
+        })
+        .collect::<Vec<_>>();
 
     Json(json!({
         "analysis_period_hours": hours,
-        "total_points": points.len(),
+        "total_points": total_points,
+        "truncated": points.len() < total_points,
         "points": points,
     }))
     .into_response()
@@ -2402,6 +2418,7 @@ mod tests {
             client_response_body_ref: Some(
                 "usage://request/req-1/client_response_body".to_string(),
             ),
+            request_metadata: Some(json!({"chat_pii_redaction": true})),
             ..sample_usage("completed")
         };
 
@@ -2420,5 +2437,7 @@ mod tests {
         assert_eq!(active_payload["upstream_is_stream"], true);
         assert_eq!(active_payload["client_requested_stream"], false);
         assert_eq!(active_payload["client_is_stream"], false);
+        assert_eq!(record_payload["chat_pii_redaction"], true);
+        assert_eq!(active_payload["chat_pii_redaction"], true);
     }
 }

@@ -1542,6 +1542,7 @@ mod tests {
                     force_body_stream_field: false,
                     kiro_auth_config: None,
                     is_claude_code: false,
+                    is_vertex: false,
                     enable_model_directives: false,
                 })
                 .expect("ordinary Gemini body should build");
