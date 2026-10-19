@@ -523,19 +523,16 @@ fn claude_request_has_protocol_cache_control(body: &Value) -> bool {
     }
     if let Some(system) = object.get("system") {
         match system {
-            Value::Array(blocks) => {
-                if blocks.iter().any(|b| {
-                    b.as_object()
-                        .is_some_and(|o| o.contains_key("cache_control"))
-                }) {
-                    return true;
-                }
+            Value::Array(blocks)
+                if blocks.iter().any(|block| {
+                    block
+                        .as_object()
+                        .is_some_and(|object| object.contains_key("cache_control"))
+                }) =>
+            {
+                return true;
             }
-            Value::Object(o) => {
-                if o.contains_key("cache_control") {
-                    return true;
-                }
-            }
+            Value::Object(object) if object.contains_key("cache_control") => return true,
             _ => {}
         }
     }

@@ -15,3 +15,9 @@ Read-only review identified a real arbitrary-data collision: tool_result.content
 
 ## Delivery state
 Documentation updated. The user explicitly authorized committing and pushing despite the documented local PostgreSQL prerequisite, with tag publication gated on successful GitHub CI for the exact fix commit. Production deployment remains unauthorized and unperformed. Latest existing remote version is v0.7.44; the next patch tag is v0.7.45.
+
+## GitHub gate
+- Fix commit ab104724a was pushed to master. Rust CI run 39271734538 failed: two collapsible-match warnings in the new protocol marker detector and the existing architecture guard rejected one new direct provider_transport call from ai_serving.
+- Correct the match guards without suppressing warnings and route the rule call through the existing ai_serving::transport facade. No architecture-test weakening or compatibility shim.
+- CI failure blocks tag publication; rerun the full exact-SHA gate after the correction commit.
+- Correction verification: strict Clippy for gateway/formats all targets passed; the exact failing architecture guard passed; all 3 cache-control behavior regressions passed. Existing transport-envelope smoke proof remains valid (no conversion behavior changed).

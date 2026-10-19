@@ -736,7 +736,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     // 确保占位符解析（如 {{body.xxx}}）依然取自原始未修改的 conversion_body_json（保留业务数据与 prompt_cache 字段），
     // 避免裁剪后的正文导致占位符提取源发生静默漂移。
     if is_antigravity_sanitized {
-        if !crate::provider_transport::apply_local_body_rules_with_request_headers(
+        if !crate::ai_serving::transport::apply_local_body_rules_with_request_headers(
             &mut provider_request_body,
             transport.endpoint.body_rules.as_ref(),
             Some(conversion_body_json),
