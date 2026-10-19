@@ -1,6 +1,8 @@
 name: Rust CI
 
 on:
+  # 发布前允许显式校验当前分支，避免 push 事件未创建运行时绕过 CI。
+  workflow_dispatch:
   workflow_call:
     inputs:
       full_scope:
