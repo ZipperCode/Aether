@@ -459,6 +459,224 @@ fn normalize_standard_request_to_openai_chat_request_cow<'a>(
     }
 }
 
+/// Provider-aware cache-control preparation for Claude Messages -> Gemini on Antigravity.
+///
+/// Discards Claude prompt-cache breakpoints and ephemeral TTL semantics strictly for
+/// Antigravity routes when converting Claude Messages to Gemini GenerateContent.
+/// Anthropic prompt caching does not have a lossless equivalent on Gemini, so passing
+/// protocol cache markers to the Gemini converter triggers strict conversion refusal.
+///
+/// This policy strips protocol-level `cache_control` markers before conversion to allow
+/// upstream dispatch, without claiming equivalent TTL, breakpoints, cache pricing,
+/// or fabricating cache usage.
+///
+/// Native fallback and non-qualifying provider requests retain original markers.
+/// Business fields (tool input, input schemas, document sources) and signatures
+/// remain strictly preserved.
+pub fn prepare_antigravity_claude_cache_control_body<'a>(
+    body: &'a Value,
+    client_api_format: &str,
+    provider_type: &str,
+    provider_api_format: &str,
+    provider_config: Option<&Value>,
+) -> Cow<'a, Value> {
+    // Return borrowed immediately when provider_type is not Antigravity
+    // to avoid unnecessary normalization allocations on out-of-scope providers.
+    if !provider_type.trim().eq_ignore_ascii_case("antigravity") {
+        return Cow::Borrowed(body);
+    }
+
+    // Config defaults to enabled; explicit false retains strict refusal.
+    if let Some(config) = provider_config.and_then(Value::as_object) {
+        if matches!(
+            config.get("antigravity_cache_control_compat"),
+            Some(Value::Bool(false))
+        ) {
+            return Cow::Borrowed(body);
+        }
+    }
+
+    // Only Claude Messages source -> Gemini GenerateContent destination qualifies.
+    if aether_ai_formats::normalize_api_format_alias(client_api_format) != "claude:messages"
+        || aether_ai_formats::normalize_api_format_alias(provider_api_format)
+            != "gemini:generate_content"
+    {
+        return Cow::Borrowed(body);
+    }
+
+    // Borrow if no protocol markers present to avoid cloning.
+    if !claude_request_has_protocol_cache_control(body) {
+        return Cow::Borrowed(body);
+    }
+
+    let mut sanitized = body.clone();
+    strip_claude_protocol_cache_control(&mut sanitized);
+    Cow::Owned(sanitized)
+}
+
+fn claude_request_has_protocol_cache_control(body: &Value) -> bool {
+    let Some(object) = body.as_object() else {
+        return false;
+    };
+    if object.contains_key("cache_control") {
+        return true;
+    }
+    if let Some(system) = object.get("system") {
+        match system {
+            Value::Array(blocks) => {
+                if blocks.iter().any(|b| {
+                    b.as_object()
+                        .is_some_and(|o| o.contains_key("cache_control"))
+                }) {
+                    return true;
+                }
+            }
+            Value::Object(o) => {
+                if o.contains_key("cache_control") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(tools) = object.get("tools").and_then(Value::as_array) {
+        if tools.iter().any(|t| {
+            t.as_object()
+                .is_some_and(|o| o.contains_key("cache_control"))
+        }) {
+            return true;
+        }
+    }
+    if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+        if messages
+            .iter()
+            .any(claude_message_has_protocol_cache_control)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn claude_message_has_protocol_cache_control(message: &Value) -> bool {
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    if object.contains_key("cache_control") {
+        return true;
+    }
+    if let Some(content) = object.get("content") {
+        return claude_content_has_protocol_cache_control(content);
+    }
+    false
+}
+
+fn claude_content_has_protocol_cache_control(content: &Value) -> bool {
+    match content {
+        Value::Array(blocks) => blocks
+            .iter()
+            .any(claude_content_block_has_protocol_cache_control),
+        _ => false,
+    }
+}
+
+fn claude_content_block_has_protocol_cache_control(block: &Value) -> bool {
+    let Some(object) = block.as_object() else {
+        return false;
+    };
+    if object.contains_key("cache_control") {
+        return true;
+    }
+    if object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case("tool_result"))
+    {
+        // tool_result.content can be an arbitrary JSON Value/object (e.g. {"cache_control": "business"}).
+        // Only descend if content is an array of content blocks; never traverse arbitrary objects.
+        if let Some(nested_content) = object.get("content").and_then(Value::as_array) {
+            return nested_content
+                .iter()
+                .any(claude_content_block_has_protocol_cache_control);
+        }
+    }
+    false
+}
+
+fn strip_claude_protocol_cache_control(body: &mut Value) {
+    let Some(root) = body.as_object_mut() else {
+        return;
+    };
+    root.remove("cache_control");
+
+    if let Some(system) = root.get_mut("system") {
+        match system {
+            Value::Array(blocks) => {
+                for block in blocks {
+                    if let Some(block_obj) = block.as_object_mut() {
+                        block_obj.remove("cache_control");
+                    }
+                }
+            }
+            Value::Object(block_obj) => {
+                block_obj.remove("cache_control");
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(tools) = root.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            if let Some(tool_obj) = tool.as_object_mut() {
+                tool_obj.remove("cache_control");
+            }
+        }
+    }
+
+    if let Some(messages) = root.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(message_obj) = message.as_object_mut() {
+                message_obj.remove("cache_control");
+                if let Some(content) = message_obj.get_mut("content") {
+                    strip_claude_content_cache_control(content);
+                }
+            }
+        }
+    }
+}
+
+fn strip_claude_content_cache_control(content: &mut Value) {
+    if let Value::Array(blocks) = content {
+        for block in blocks {
+            strip_claude_content_block_cache_control(block);
+        }
+    }
+}
+
+fn strip_claude_content_block_cache_control(block: &mut Value) {
+    let Some(object) = block.as_object_mut() else {
+        return;
+    };
+    object.remove("cache_control");
+
+    // Only tool_result content arrays are traversed for nested protocol content blocks.
+    // An arbitrary JSON Value or object in tool_result.content (e.g. `{"cache_control": "business"}`)
+    // is user/tool business data and MUST NOT be traversed or modified.
+    // Tool inputs (e.g. `tool_use.input`), thinking signatures, image/document sources, etc.
+    // MUST NOT be traversed or modified.
+    let is_tool_result = object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case("tool_result"));
+    if is_tool_result {
+        if let Some(nested_content) = object.get_mut("content").and_then(Value::as_array_mut) {
+            for nested_block in nested_content {
+                strip_claude_content_block_cache_control(nested_block);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::formats::openai::responses::history::record_converted_response_history;
@@ -468,6 +686,7 @@ mod tests {
         build_standard_request_body_with_model_directives,
         build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy,
         normalize_standard_request_to_openai_chat_request,
+        prepare_antigravity_claude_cache_control_body,
     };
     use crate::formats::openai::responses::OpenAiResponsesReasoningReplayPolicy;
     use serde_json::{json, Value};
@@ -2657,5 +2876,414 @@ mod tests {
         assert!(converted.get("previous_response_id").is_none());
         assert!(converted.get("stop").is_none());
         assert!(converted.get("metadata").is_none());
+    }
+
+    #[test]
+    fn antigravity_claude_cache_control_scope_and_toggle_matrix() {
+        use std::borrow::Cow;
+
+        let clean_request = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let cached_request = json!({
+            "model": "claude-sonnet-4-5",
+            "system": [{"type": "text", "text": "Be concise.", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        // 1. Clean request has no markers -> borrowed Cow regardless of scope/config
+        let clean_res = prepare_antigravity_claude_cache_control_body(
+            &clean_request,
+            "claude:messages",
+            "antigravity",
+            "gemini:generate_content",
+            None,
+        );
+        assert!(matches!(clean_res, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(clean_res.as_ref(), &clean_request));
+
+        // 2. Non-Antigravity provider -> borrowed Cow
+        for other_provider in ["gemini", "openai", "claude", "bedrock"] {
+            let res = prepare_antigravity_claude_cache_control_body(
+                &cached_request,
+                "claude:messages",
+                other_provider,
+                "gemini:generate_content",
+                None,
+            );
+            assert!(matches!(res, Cow::Borrowed(_)));
+            assert!(std::ptr::eq(res.as_ref(), &cached_request));
+        }
+
+        // 3. Non-qualifying client format -> borrowed Cow
+        let non_claude_client = prepare_antigravity_claude_cache_control_body(
+            &cached_request,
+            "openai:chat",
+            "antigravity",
+            "gemini:generate_content",
+            None,
+        );
+        assert!(matches!(non_claude_client, Cow::Borrowed(_)));
+
+        // 4. Non-qualifying provider format -> borrowed Cow
+        let non_gemini_target = prepare_antigravity_claude_cache_control_body(
+            &cached_request,
+            "claude:messages",
+            "antigravity",
+            "claude:messages",
+            None,
+        );
+        assert!(matches!(non_gemini_target, Cow::Borrowed(_)));
+
+        // 5. Config toggle: explicit false retains strict refusal (borrowed)
+        let disabled_config = json!({"antigravity_cache_control_compat": false});
+        let strict = prepare_antigravity_claude_cache_control_body(
+            &cached_request,
+            "claude:messages",
+            "antigravity",
+            "gemini:generate_content",
+            Some(&disabled_config),
+        );
+        assert!(matches!(strict, Cow::Borrowed(_)));
+
+        // 6. Qualifying + enabled (None, empty obj, or true) with markers -> owned sanitized Cow
+        for config in [
+            None,
+            Some(json!({})),
+            Some(json!({"antigravity_cache_control_compat": true})),
+        ] {
+            let prepared = prepare_antigravity_claude_cache_control_body(
+                &cached_request,
+                "claude:messages",
+                "antigravity",
+                "gemini:generate_content",
+                config.as_ref(),
+            );
+            assert!(matches!(prepared, Cow::Owned(_)));
+            assert!(prepared.get("system").unwrap()[0]
+                .get("cache_control")
+                .is_none());
+        }
+
+        // 7. Case and whitespace insensitivity on provider and format
+        let loose_alias = prepare_antigravity_claude_cache_control_body(
+            &cached_request,
+            " CLAUDE:MESSAGES ",
+            " AnTiGrAvItY ",
+            " GEMINI:GENERATE_CONTENT ",
+            None,
+        );
+        assert!(matches!(loose_alias, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn antigravity_claude_cache_control_sanitizes_protocol_preserves_business_fields_and_converts()
+    {
+        use std::borrow::Cow;
+
+        let original = json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 4096,
+            "cache_control": {"type": "ephemeral"},
+            "system": [{"type": "text", "text": "Lookup tool instructions.", "cache_control": {"type": "ephemeral"}}],
+            "tools": [{
+                "name": "lookup",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "cache_control": {"type": "string", "description": "business field"}
+                    }
+                },
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [
+                {"role": "user", "content": "Perform lookup."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "Formulating query.",
+                            "signature": "opaque-signature-token"
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "call_1",
+                            "name": "lookup",
+                            "input": {"cache_control": "business-payload-value"}
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "result details",
+                                "cache_control": {"type": "ephemeral"}
+                            }
+                        ],
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Continue.", "cache_control": {"type": "ephemeral"}}]
+                }
+            ]
+        });
+
+        let snapshot = original.clone();
+
+        // Strict conversion on original fails closed because Gemini target has no lossless cache_control equivalent
+        let disabled_config = json!({"antigravity_cache_control_compat": false});
+        let strict = prepare_antigravity_claude_cache_control_body(
+            &original,
+            "claude:messages",
+            "antigravity",
+            "gemini:generate_content",
+            Some(&disabled_config),
+        );
+        assert!(matches!(strict, Cow::Borrowed(_)));
+        assert!(build_standard_request_body(
+            &strict,
+            "claude:messages",
+            "claude-opus-5-5",
+            "antigravity",
+            "gemini:generate_content",
+            "/v1/messages",
+            false,
+            None,
+            None
+        )
+        .is_none());
+
+        // Sanitized conversion succeeds for both stream=false and stream=true
+        for stream in [false, true] {
+            let prepared = prepare_antigravity_claude_cache_control_body(
+                &original,
+                "claude:messages",
+                "antigravity",
+                "gemini:generate_content",
+                None,
+            );
+            assert!(matches!(prepared, Cow::Owned(_)));
+
+            // Protocol markers stripped
+            assert!(prepared.get("cache_control").is_none());
+            assert!(prepared["system"][0].get("cache_control").is_none());
+            assert!(prepared["tools"][0].get("cache_control").is_none());
+            assert!(prepared["messages"][2]["content"][0]
+                .get("cache_control")
+                .is_none());
+            assert!(prepared["messages"][2]["content"][0]["content"][0]
+                .get("cache_control")
+                .is_none());
+            assert!(prepared["messages"][3]["content"][0]
+                .get("cache_control")
+                .is_none());
+
+            // Business fields preserved
+            assert_eq!(
+                prepared["tools"][0]["input_schema"]["properties"]["cache_control"]["type"],
+                "string"
+            );
+            assert_eq!(
+                prepared["messages"][1]["content"][1]["input"]["cache_control"],
+                "business-payload-value"
+            );
+            assert_eq!(
+                prepared["messages"][1]["content"][0]["signature"],
+                "opaque-signature-token"
+            );
+            assert_eq!(
+                prepared["messages"][2]["content"][0]["content"][0]["text"],
+                "result details"
+            );
+
+            // Conversion into Gemini request body succeeds
+            let converted = build_standard_request_body(
+                &prepared,
+                "claude:messages",
+                "claude-opus-5-5",
+                "antigravity",
+                "gemini:generate_content",
+                "/v1/messages",
+                stream,
+                None,
+                None,
+            )
+            .expect("prepared body should convert cleanly to Gemini");
+            assert!(converted.get("contents").is_some());
+        }
+
+        // Original request completely untouched
+        assert_eq!(original, snapshot);
+
+        // Native Claude fallback retains all original cache markers
+        let fallback = build_standard_request_body(
+            &original,
+            "claude:messages",
+            "claude-opus-5-5",
+            "claude",
+            "claude:messages",
+            "/v1/messages",
+            false,
+            None,
+            None,
+        )
+        .expect("native Claude fallback must succeed");
+        assert_eq!(fallback["system"], snapshot["system"]);
+        assert_eq!(fallback["tools"], snapshot["tools"]);
+
+        let fallback_blocks: Vec<&Value> = fallback["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| {
+                m.get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        let tool_result_block = fallback_blocks
+            .iter()
+            .find(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .expect("tool_result block preserved in fallback");
+        assert_eq!(
+            tool_result_block["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            tool_result_block["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        let continue_block = fallback_blocks
+            .iter()
+            .find(|b| b.get("text").and_then(Value::as_str) == Some("Continue."))
+            .expect("continue text block preserved in fallback");
+        assert_eq!(
+            continue_block["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn antigravity_claude_cache_control_preserves_arbitrary_object_tool_result_content() {
+        use std::borrow::Cow;
+
+        // 1. Tool result content is an arbitrary JSON object with a business `cache_control` key.
+        // No protocol markers present -> must return Borrowed (no clone, no modification).
+        let clean_with_object_tool_result = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {"role": "user", "content": "Fetch data."},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call_1", "name": "fetch", "input": {}}]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": {"cache_control": "business-header-value", "status": "ok"}
+                    }]
+                }
+            ]
+        });
+
+        let borrowed = prepare_antigravity_claude_cache_control_body(
+            &clean_with_object_tool_result,
+            "claude:messages",
+            "antigravity",
+            "gemini:generate_content",
+            None,
+        );
+        assert!(matches!(borrowed, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(
+            borrowed.as_ref(),
+            &clean_with_object_tool_result
+        ));
+        assert_eq!(
+            borrowed["messages"][2]["content"][0]["content"]["cache_control"],
+            "business-header-value"
+        );
+
+        // 2. Same arbitrary object tool result, but with outer protocol cache_control markers.
+        // Sanitizer must strip outer protocol markers, preserve the tool_result object intact,
+        // and standard conversion into Gemini must retain it under functionResponse.response.result.
+        let cached_with_object_tool_result = json!({
+            "model": "claude-sonnet-4-5",
+            "system": [{"type": "text", "text": "System prompt", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": "Fetch data."},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call_1", "name": "fetch", "input": {}}]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": {"cache_control": "business-header-value", "status": "ok"},
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }
+            ]
+        });
+
+        let prepared = prepare_antigravity_claude_cache_control_body(
+            &cached_with_object_tool_result,
+            "claude:messages",
+            "antigravity",
+            "gemini:generate_content",
+            None,
+        );
+        assert!(matches!(prepared, Cow::Owned(_)));
+        assert!(prepared["system"][0].get("cache_control").is_none());
+        assert!(prepared["messages"][2]["content"][0]
+            .get("cache_control")
+            .is_none());
+        // Business object inside tool_result.content untouched
+        assert_eq!(
+            prepared["messages"][2]["content"][0]["content"],
+            json!({"cache_control": "business-header-value", "status": "ok"})
+        );
+
+        // Standard conversion succeeds into Gemini GenerateContent
+        let converted = build_standard_request_body(
+            &prepared,
+            "claude:messages",
+            "claude-sonnet-4-5",
+            "antigravity",
+            "gemini:generate_content",
+            "/v1/messages",
+            false,
+            None,
+            None,
+        )
+        .expect("conversion into Gemini must succeed");
+
+        let parts: Vec<&Value> = converted["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["parts"].as_array().unwrap())
+            .collect();
+        let function_response = parts
+            .iter()
+            .find_map(|p| p.get("functionResponse"))
+            .expect("functionResponse part present in Gemini body");
+        assert_eq!(
+            function_response["response"]["result"]["cache_control"],
+            "business-header-value"
+        );
     }
 }

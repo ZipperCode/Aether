@@ -147,6 +147,18 @@ High-risk fields:
 | `generationConfig.responseModalities` | OpenAI/Claude modality mismatch | lossy-blocked |
 | `functionResponse.id` | tool result id | conversion preserves id; Gemini upstream cleanup is transport-layer edit only |
 
+### Antigravity Claude prompt-cache compatibility
+
+The gateway prepares a candidate-local Claude body before strict Claude-to-Gemini conversion when `provider_type=antigravity`. Provider `config.antigravity_cache_control_compat` defaults to `true`; set it to `false` to retain strict rejection:
+
+```json
+{"antigravity_cache_control_compat": false}
+```
+
+Compatibility removes `cache_control` only at protocol positions: request root, system blocks, tool declarations, messages/content blocks, and nested tool-result content-block arrays. Object-valued tool results, tool input, JSON Schema properties, document/image source data, and opaque thinking signatures are not recursively rewritten. Original client capture and native Claude fallback retain their markers. No database migration is required.
+
+This is an explicit lossy provider adaptation, not a mapping to Gemini `cachedContent`: Claude cache breakpoints and TTL guarantees are discarded. Upstream may still cache automatically; cache usage is reported only from real upstream usage, never inferred from removed markers. Generic format conversion and public Gemini routes remain strict. Endpoint body rules run after conversion and cannot independently resolve the original rejection.
+
 ## Embedding And Rerank
 
 Embedding and rerank request parse/emit capability and strict target guards are implemented. Provider schema fields outside these canonical conversion surfaces are marked `not-in-conversion-surface` in the field coverage matrix instead of being left implicit.

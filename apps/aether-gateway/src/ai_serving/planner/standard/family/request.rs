@@ -677,16 +677,27 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         .as_ref()
         .map(|(body, _)| body)
         .unwrap_or(body_json);
+    let prepared_antigravity_body =
+        crate::ai_serving::prepare_antigravity_claude_cache_control_body(
+            conversion_body_json,
+            spec_metadata.api_format,
+            transport.provider.provider_type.as_str(),
+            provider_api_format,
+            transport.provider.config.as_ref(),
+        );
+    let is_antigravity_sanitized = matches!(prepared_antigravity_body, std::borrow::Cow::Owned(_));
+    let effective_conversion_body = prepared_antigravity_body.as_ref();
+
     let mut provider_request_body =
         match crate::ai_serving::planner::standard::build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy(
-            conversion_body_json,
+            effective_conversion_body,
             spec_metadata.api_format,
             &prepared_candidate.mapped_model,
             transport.provider.provider_type.as_str(),
             provider_api_format,
             parts.uri.path(),
             upstream_is_stream,
-            if is_kiro_claude_cli || is_windsurf_cascade {
+            if is_kiro_claude_cli || is_windsurf_cascade || is_antigravity_sanitized {
                 None
             } else {
                 transport.endpoint.body_rules.as_ref()
@@ -707,7 +718,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
                     &attempt.candidate_id,
                     "provider_request_body_build_failed",
                     request_conversion_failure_extra_data(
-                        body_json,
+                        effective_conversion_body,
                         spec_metadata.api_format,
                         provider_api_format,
                         Some(prepared_candidate.mapped_model.as_str()),
@@ -720,6 +731,35 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
                 return Ok(None);
             }
         };
+
+    // 对于经 Antigravity 缓存裁剪产生 Owned 新正文的请求，在外层单独应用 body_rules，
+    // 确保占位符解析（如 {{body.xxx}}）依然取自原始未修改的 conversion_body_json（保留业务数据与 prompt_cache 字段），
+    // 避免裁剪后的正文导致占位符提取源发生静默漂移。
+    if is_antigravity_sanitized {
+        if !crate::provider_transport::apply_local_body_rules_with_request_headers(
+            &mut provider_request_body,
+            transport.endpoint.body_rules.as_ref(),
+            Some(conversion_body_json),
+            Some(effective_headers),
+        ) {
+            mark_skipped_local_standard_candidate_with_extra_data(
+                state,
+                input,
+                trace_id,
+                candidate,
+                attempt.candidate_index,
+                &attempt.candidate_id,
+                "provider_request_body_build_failed",
+                request_body_build_failure_extra_data(
+                    effective_conversion_body,
+                    spec_metadata.api_format,
+                    provider_api_format,
+                ),
+            )
+            .await;
+            return Ok(None);
+        }
+    }
     enforce_provider_body_stream_policy(
         &mut provider_request_body,
         provider_api_format,
@@ -912,6 +952,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             parts,
             trace_id,
             body_json,
+            effective_conversion_body,
             input,
             attempt,
             transport,
@@ -1076,6 +1117,7 @@ async fn build_antigravity_cross_format_payload_parts(
     parts: &http::request::Parts,
     trace_id: &str,
     original_body_json: &serde_json::Value,
+    conversion_diagnostic_body: &serde_json::Value,
     input: &LocalStandardDecisionInput,
     attempt: &LocalStandardCandidateAttempt,
     transport: &Arc<GatewayProviderTransportSnapshot>,
@@ -1132,7 +1174,7 @@ async fn build_antigravity_cross_format_payload_parts(
                     &attempt.candidate_id,
                     "provider_request_body_build_failed",
                     request_body_build_failure_extra_data(
-                        original_body_json,
+                        conversion_diagnostic_body,
                         client_api_format,
                         provider_api_format,
                     ),

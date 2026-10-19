@@ -611,6 +611,140 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_claude_cache_control_compat_preserves_tool_history_and_fallback() {
+        use aether_ai_formats::api::prepare_antigravity_claude_cache_control_body;
+        use aether_ai_formats::formats::shared::standard_matrix::build_standard_request_body;
+
+        let body = json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 4096,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "high"},
+            "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+            "system": [{"type": "text", "text": "Keep the tool result.", "cache_control": {"type": "ephemeral"}}],
+            "tools": [{
+                "name": "lookup", "description": "Find a value",
+                "input_schema": {"type": "object", "properties": {"cache_control": {"type": "string"}}},
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [
+                {"role": "user", "content": "Look up the value."},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Use lookup.", "signature": "opaque-signed-history"},
+                    {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"cache_control": "business-value"}}
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "found", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "user", "content": [{"type": "text", "text": "Continue.", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        });
+        let original = body.clone();
+        for stream in [false, true] {
+            let prepared = prepare_antigravity_claude_cache_control_body(
+                &body,
+                "claude:messages",
+                "antigravity",
+                "gemini:generate_content",
+                None,
+            );
+            let converted = build_standard_request_body(
+                &prepared,
+                "claude:messages",
+                "claude-opus-5-5",
+                "antigravity",
+                "gemini:generate_content",
+                "/v1/messages",
+                stream,
+                None,
+                None,
+            )
+            .expect("cache compatibility should unblock standard conversion");
+            let AntigravityRequestEnvelopeSupport::Supported(envelope) =
+                build_antigravity_safe_v1internal_request(
+                    &sample_auth(),
+                    "cache-compat",
+                    "claude-opus-5-5",
+                    &converted,
+                    AntigravityEnvelopeRequestType::Agent,
+                )
+            else {
+                panic!("expected supported Antigravity envelope");
+            };
+            assert_eq!(envelope["model"], "claude-opus-5-5");
+            assert_eq!(
+                envelope["request"]["systemInstruction"]["parts"][0]["text"],
+                "Keep the tool result."
+            );
+            assert!(envelope["request"]["systemInstruction"]["parts"][0]
+                .get("cache_control")
+                .is_none());
+            let declaration = &envelope["request"]["tools"][0]["functionDeclarations"][0];
+            assert_eq!(
+                declaration["parameters"]["properties"]["cache_control"]["type"],
+                "string"
+            );
+            assert!(declaration.get("cache_control").is_none());
+            let parts: Vec<_> = envelope["request"]["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["parts"].as_array().unwrap())
+                .collect();
+            assert!(parts.iter().all(|part| part.get("cache_control").is_none()));
+            assert!(parts
+                .iter()
+                .any(|part| part["thoughtSignature"] == "opaque-signed-history"));
+            assert!(parts
+                .iter()
+                .any(|part| part["functionCall"]["args"]["cache_control"] == "business-value"));
+            assert!(parts
+                .iter()
+                .any(|part| part["functionResponse"]["id"] == "call_1"));
+            assert!(parts.iter().any(|part| part["text"] == "Continue."));
+            assert_eq!(
+                envelope["request"]["generationConfig"],
+                converted["generationConfig"]
+            );
+        }
+        assert_eq!(
+            body, original,
+            "fallback and audit must retain the source body"
+        );
+        let native = build_standard_request_body(
+            &body,
+            "claude:messages",
+            "claude-opus-5-5",
+            "claude",
+            "claude:messages",
+            "/v1/messages",
+            false,
+            None,
+            None,
+        )
+        .expect("native Claude fallback should retain cache metadata");
+        assert_eq!(native["system"], original["system"]);
+        assert_eq!(native["tools"], original["tools"]);
+        let native_blocks: Vec<_> = native["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+            .collect();
+        for original_block in original["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+        {
+            assert!(
+                native_blocks.contains(&original_block),
+                "native fallback must retain each content block"
+            );
+        }
+    }
+
+    #[test]
     fn antigravity_claude_cross_format_unsigned_reasoning_history() {
         use aether_ai_formats::formats::shared::standard_matrix::build_standard_request_body;
         let clients = [

@@ -147,7 +147,10 @@ pub use crate::formats::shared::routing::{
     GeminiStreamWireMode,
 };
 pub use crate::formats::shared::sse::{encode_done_sse, encode_json_sse, map_claude_stop_reason};
-pub use crate::formats::shared::standard_matrix::normalize_standard_request_to_openai_chat_request;
+pub use crate::formats::shared::standard_matrix::{
+    normalize_standard_request_to_openai_chat_request,
+    prepare_antigravity_claude_cache_control_body,
+};
 pub use crate::formats::shared::stream_core::common::*;
 pub use crate::formats::shared::stream_core::{
     CanonicalStreamFrame, StreamingStandardFormatMatrix, StreamingStandardTerminalObserver,

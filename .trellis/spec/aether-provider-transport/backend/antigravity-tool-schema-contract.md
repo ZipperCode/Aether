@@ -45,3 +45,47 @@ Inline `antigravity::request` and `antigravity::schema` tests cover twelve tools
 Wrong: apply private wire normalization during every Gemini conversion or treat a relaxed private schema as proof that arbitrary tool arguments are valid.
 
 Correct: defer Antigravity tool schema handling to its bounded private transport owner, retain original validation at tool execution, and preserve ordinary public Gemini behavior.
+
+## Claude cache-control candidate preparation
+
+### 1. Scope / Trigger
+
+Claude clients may attach `cache_control` to system, tools and historical content. Strict Claude-to-Gemini conversion correctly has no lossless cache equivalent, but Antigravity compatibility must deliberately discard that metadata before validation. This is separate from schema normalization and signature-error recovery.
+
+### 2. Signatures
+
+`aether_ai_formats::api::prepare_antigravity_claude_cache_control_body(body: &Value, client_api_format: &str, provider_type: &str, provider_api_format: &str, provider_config: Option<&Value>) -> Cow<Value>` owns preparation. Gateway candidate construction invokes it before standard conversion. No schema migration or upstream cache-management call is introduced.
+
+### 3. Contracts
+
+- Require explicit Antigravity identity, Claude Messages source and Gemini GenerateContent destination. `provider.config.antigravity_cache_control_compat` is a boolean, enabled when omitted; `false` preserves strict rejection.
+- Borrow out-of-scope/disabled/unmarked requests. Clone only a request containing protocol markers, keeping original audit/fallback data intact.
+- Remove protocol metadata at root, system, tool declaration, message/content blocks and nested tool-result content-block arrays. Object-valued tool results are arbitrary business data, not protocol blocks; preserve their cache_control fields even when another real marker causes cloning. Never descend into tool arguments, JSON schemas, document/image sources or arbitrary business objects. Preserve signatures byte-for-byte.
+- Preserve original request as body-rule placeholder input; diagnostics for failed conversion inspect the prepared body so removed markers do not obscure later failures.
+- Do not weaken universal conversion or native same-format passthrough. Claude TTL/breakpoint and pricing semantics are not guaranteed; real upstream usage alone determines cache accounting.
+
+### 4. Validation & Error Matrix
+
+| Condition | Result |
+| --- | --- |
+| Scoped provider and compatibility enabled | Remove markers before strict conversion |
+| Explicit false | Original strict cache-control rejection |
+| Other provider/source/destination | Borrow unchanged; existing policy applies |
+| Business field named cache_control | Preserve schema/argument value |
+| Native Claude fallback after preparation | Original cache markers retained |
+
+### 5. Good / Base / Bad Cases
+
+- Good: tool declaration marker disappears while `input_schema.properties.cache_control` and `tool_use.input.cache_control` survive.
+- Base: an unmarked request remains borrowed.
+- Bad: recursive global key deletion, mutation of shared fallback input, fake `cachedContent` resource IDs, or globally allowing Claude cache extensions through Gemini validation.
+
+### 6. Tests Required
+
+Standard-matrix regressions cover scope/toggle, nested tool-result markers, business-data preservation and strict/native isolation. Transport `antigravity_claude_cache_control_compat_preserves_tool_history_and_fallback` exercises adaptive thinking, effort, context controls, signed tool history and final private envelopes in stream/non-stream modes. Native conversion can merge adjacent same-role messages; assert preserved semantic blocks rather than incidental message grouping.
+
+### 7. Wrong vs Correct
+
+Wrong: add a post-conversion body rule to remove source markers; strict conversion has already rejected the request.
+
+Correct: prepare a candidate-local source body before validation, preserve the original source for audit/rules/fallback, and retain strict checks elsewhere.
