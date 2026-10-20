@@ -12,6 +12,8 @@ const PLAN_TYPE_LABELS: Record<string, string> = {
   basic: 'Basic',
   super: 'Super',
   heavy: 'Heavy',
+  unknown: 'Unknown',
+  '未知': '未知',
 }
 
 const PLAN_TYPE_CLASS_NAMES: Record<string, string> = {
@@ -27,6 +29,8 @@ const PLAN_TYPE_CLASS_NAMES: Record<string, string> = {
   basic: 'border-primary/50 text-primary',
   super: 'border-green-500/50 text-green-600 dark:text-green-400',
   heavy: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
+  unknown: 'border-muted-foreground/40 text-muted-foreground',
+  '未知': 'border-muted-foreground/40 text-muted-foreground',
 }
 
 export function normalizeOAuthPlanType(planType?: string | null): string | null {

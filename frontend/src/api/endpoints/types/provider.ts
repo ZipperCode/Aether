@@ -387,6 +387,7 @@ export interface AntigravityUpstreamMetadata {
   is_forbidden?: boolean  // 账户是否被禁止访问
   forbidden_reason?: string  // 禁止访问原因
   forbidden_at?: number  // 禁止时间（Unix 时间戳，秒）
+  subscription_tier?: 'free' | 'pro' | 'ultra' | null  // 套餐等级: free / pro / ultra
 }
 
 // Kiro 上游配额信息

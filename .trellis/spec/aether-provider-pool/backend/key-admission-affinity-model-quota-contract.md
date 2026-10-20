@@ -44,6 +44,11 @@ The current Antigravity admin snapshot stores model entries under
 `quota_by_model` key as a compatibility input, but new local writes and tests
 must use `models`.
 
+Antigravity account badges read `upstream_metadata.antigravity.subscription_tier`
+(`free | pro | ultra | null`). This is display-only: keep
+`status_snapshot.quota.plan_type` null because `derive_plan_tier` consumes it for
+scheduling. Existing accounts acquire the badge on the next quota refresh.
+
 ## 3. Contracts
 
 - Before every provider execution, strongly read the selected Key and confirm
@@ -92,6 +97,16 @@ must use `models`.
 - Antigravity OAuth exchange resolves Google userinfo through the same selected
   network context as token exchange and persists the returned email in both the
   normalized auth configuration and raw payload.
+- Antigravity quota refresh probes `loadCodeAssist` once for project and tier,
+  including accounts with an existing project. `paidTier` precedes `currentTier`;
+  nonempty ID precedes name. Match whole identifier words: ultra/helium,
+  free/starter, pro/premium/advanced. `standard-tier`, missing evidence and
+  available upgrade options remain unknown; never infer membership from models.
+- Discovery failure preserves the old tier in storage and refresh-response
+  metadata, and a known project permits quota refresh to continue. Successful
+  unknown evidence writes null to clear stale badges. Discovery uses canonical
+  `antigravity` origin policy, selected proxy, quota timeouts and disabled
+  redirects even when the provider has a custom display name.
 - A successful Codex reset-credit consumption decrements the locally projected
   available count exactly once under the existing credential-generation,
   reservation, and compare-and-set fences. A failed detail refresh preserves
@@ -125,6 +140,9 @@ must use `models`.
 | 用户显式导入模型 | 使用准确的发现 Endpoint 证据，沿用现有导入校验。 |
 | Codex reset consumption wins its reservation/generation fence | Decrement the projected count once. |
 | Codex detail refresh fails | Preserve the previous count/items and mark detail failure. |
+| Antigravity paid Pro with current Free | Display Pro; paid evidence wins. |
+| Antigravity discovery fails with cached Ultra/project | Continue quota refresh and retain Ultra in response and storage. |
+| Antigravity discovery succeeds with unknown/missing tier | Display unknown and clear the old tier; never default Free. |
 
 ## 5. Good / Base / Bad Cases
 
@@ -137,6 +155,10 @@ must use `models`.
 - Bad: reading `concurrent_limit` from a stale local snapshot, using separate
   semaphores per protocol, treating every quota window as Provider-wide, or
   implementing three independent Antigravity account-window projections.
+- Good: paid Ultra and current Free renders Ultra in provider/Pool lists and
+  quota detail without changing Pool ranking.
+- Bad: `allowedTiers` contains Pro, or a Claude model exists, so classifying the
+  account as Pro; neither proves an active subscription.
 
 ## 6. Tests Required
 
@@ -165,6 +187,11 @@ must use `models`.
   failed-detail preservation.
 - Frontend: concurrent-limit input/save, scheduling-mode metadata, shared
   `quota_group` windows, weekly/five-hour labels, percentage and countdown.
+- Antigravity parser: paid/current precedence, blank identifiers, aliases,
+  unrecognized evidence and project variants. Gateway HTTP refresh: Pro to Free
+  to Ultra, failed discovery retention, successful unknown clearing, unchanged
+  scheduling plan and model catalog. UI: all three badges plus unknown in
+  provider/Pool desktop/mobile and quota detail.
 
 ## 7. Wrong vs Correct
 
@@ -186,3 +213,7 @@ let ProviderPoolInFlightAdmission::Acquired(guard) = admission else {
 };
 // Keep `guard` alive for the complete execution/turn lifetime.
 ```
+
+For account tier display, wrong: `quota.plan_type = subscription_tier` (changes
+Pool scoring). Correct: persist `antigravity.subscription_tier` and render it
+through the shared frontend account-tier resolver.

@@ -12,7 +12,7 @@ vi.mock('@/components/ui', async () => {
     name,
     setup(_, { slots }) {
       return () => h('div', [
-        slots.headerActions?.(),
+        slots['header-actions']?.(),
         slots.default?.(),
         slots.footer?.(),
       ])
@@ -112,6 +112,25 @@ function mount(
 describe('AntigravityQuotaDialog', () => {
   afterEach(() => {
     setI18nLocale('zh-CN')
+  })
+
+  it.each([
+    ['free', 'Free'],
+    ['pro', 'Pro'],
+    ['ultra', 'Ultra'],
+    [null, '未知'],
+  ] as const)('displays authoritative %s account tier without quota data', (tier, label) => {
+    const { root, unmount } = mount({ antigravity: { subscription_tier: tier } })
+    expect(root.querySelector('[data-testid="antigravity-quota-dialog-tier-badge"]')?.textContent?.trim()).toBe(label)
+    unmount()
+  })
+
+  it('does not reuse an old quota plan when account tier is unknown', () => {
+    const { root, unmount } = mount({}, { code: 'ok', exhausted: false, plan_type: 'pro' }, 'en-US')
+    const badge = root.querySelector('[data-testid="antigravity-quota-dialog-tier-badge"]')
+    expect(badge).not.toBeNull()
+    expect(badge?.textContent).not.toMatch(/free|pro|ultra/i)
+    unmount()
   })
 
   it('renders only compact localized quota-group windows in Chinese', () => {

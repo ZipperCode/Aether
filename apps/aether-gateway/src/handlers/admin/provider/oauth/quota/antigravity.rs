@@ -1,6 +1,7 @@
 use super::shared::{
     build_provider_quota_execution_plan, build_quota_snapshot_payload, coerce_json_f64,
     coerce_json_string, execute_provider_quota_plan, extract_execution_error_message,
+    force_provider_quota_redirects_disabled, merge_upstream_metadata,
     oauth_refresh_auto_removed_result, persist_provider_quota_refresh_state,
     quota_key_auto_removed, quota_refresh_success_invalid_state,
     resolve_provider_quota_execution_timeouts, ProviderQuotaExecutionOutcome,
@@ -8,13 +9,15 @@ use super::shared::{
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::GatewayError;
 use aether_admin::provider::quota::{
-    parse_antigravity_quota_summary_response, parse_antigravity_usage_response,
+    parse_antigravity_code_assist_response, parse_antigravity_quota_summary_response,
+    parse_antigravity_usage_response, AntigravityCodeAssistInfo,
 };
 use aether_admin::provider::redaction::admin_provider_metadata_bucket_safe_json;
 use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
+use aether_model_fetch::build_antigravity_load_code_assist_plan;
 use aether_provider_pool::{
     build_antigravity_pool_quota_request, build_antigravity_pool_quota_summary_request,
 };
@@ -59,6 +62,68 @@ async fn execute_antigravity_quota_plan(
     );
 
     execute_provider_quota_plan(state, transport, plan, "antigravity").await
+}
+
+async fn fetch_antigravity_code_assist_best_effort(
+    state: &AdminAppState<'_>,
+    transport: &AdminGatewayProviderTransportSnapshot,
+    proxy_override: Option<&ProxySnapshot>,
+) -> Option<AntigravityCodeAssistInfo> {
+    let mut plan = match build_antigravity_load_code_assist_plan(state.app(), transport).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!(error = %error, "Antigravity loadCodeAssist plan build failed");
+            return None;
+        }
+    };
+    // 模型发现 builder 使用用户自定义显示名；额度执行器需要规范提供商类型校验源站。
+    plan.provider_name = Some("antigravity".to_string());
+    force_provider_quota_redirects_disabled(&mut plan.headers);
+
+    let proxy = match proxy_override {
+        Some(proxy) => Some(proxy.clone()),
+        None => {
+            state
+                .resolve_transport_proxy_snapshot_with_tunnel_affinity(transport)
+                .await
+        }
+    };
+    if let Some(proxy) = proxy {
+        plan.proxy = Some(proxy);
+    }
+    plan.timeouts = Some(resolve_provider_quota_execution_timeouts(
+        state.resolve_transport_execution_timeouts(transport),
+        plan.proxy.as_ref(),
+    ));
+
+    let outcome = match execute_provider_quota_plan(state, transport, plan, "antigravity").await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            warn!(error = ?error, "Antigravity loadCodeAssist request failed");
+            return None;
+        }
+    };
+    let result = match outcome {
+        ProviderQuotaExecutionOutcome::Response(result) => result,
+        ProviderQuotaExecutionOutcome::Failure(_) => {
+            warn!("Antigravity loadCodeAssist execution failed");
+            return None;
+        }
+    };
+
+    if result.status_code == 200 {
+        result
+            .body
+            .as_ref()
+            .and_then(|body| body.json_body.as_ref())
+            .and_then(parse_antigravity_code_assist_response)
+    } else {
+        warn!(
+            status_code = result.status_code,
+            "Antigravity loadCodeAssist returned a non-success status"
+        );
+        None
+    }
 }
 
 async fn fetch_antigravity_quota_summary_best_effort(
@@ -184,18 +249,22 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
             }
         };
 
-        let identity = match state.resolve_local_antigravity_identity_headers(&transport) {
-            Some(identity) => Some(identity),
-            None => state
-                .app()
-                .hydrate_antigravity_project_metadata_for_transport(&transport)
-                .await
-                .and_then(|hydrated| {
-                    let identity = state.resolve_local_antigravity_identity_headers(&hydrated);
-                    transport = hydrated;
-                    identity
-                }),
-        };
+        let account_info =
+            fetch_antigravity_code_assist_best_effort(state, &transport, proxy_override.as_ref())
+                .await;
+        if let Some(project_id) = account_info
+            .as_ref()
+            .and_then(|info| info.project_id.as_ref())
+        {
+            // 同一份发现结果同时提供项目和套餐，避免缺项目账号重复调用 loadCodeAssist。
+            let update = json!({ "antigravity": { "project_id": project_id } });
+            transport.key.upstream_metadata = Some(merge_upstream_metadata(
+                transport.key.upstream_metadata.as_ref(),
+                &update,
+            ));
+        }
+
+        let identity = state.resolve_local_antigravity_identity_headers(&transport);
         let Some((project_id, identity_headers)) = identity else {
             failed_count += 1;
             results.push(json!({
@@ -217,18 +286,8 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
         )
         .await?
         {
-            ProviderQuotaExecutionOutcome::Response(result) => result,
-            ProviderQuotaExecutionOutcome::Failure(_) => {
-                failed_count += 1;
-                results.push(json!({
-                    "key_id": key.id,
-                    "key_name": key.name,
-                    "status": "error",
-                    "message": "fetchAvailableModels 请求执行失败",
-                    "status_code": 502,
-                }));
-                continue;
-            }
+            ProviderQuotaExecutionOutcome::Response(result) => Some(result),
+            ProviderQuotaExecutionOutcome::Failure(_) => None,
         };
 
         let now_unix_secs = SystemTime::now()
@@ -242,10 +301,11 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
         let mut status = "error".to_string();
         let mut message = None::<String>;
 
-        if result.status_code == 200 {
+        let status_code = result.as_ref().map(|result| result.status_code);
+        if status_code == Some(200) {
             if let Some(body_json) = result
-                .body
                 .as_ref()
+                .and_then(|result| result.body.as_ref())
                 .and_then(|body| body.json_body.as_ref())
             {
                 if let Some(mut metadata) =
@@ -283,23 +343,43 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
                 message = Some("响应中未包含配额信息".to_string());
             }
         } else {
-            message = Some(format!(
-                "fetchAvailableModels 返回状态码 {}",
-                result.status_code
-            ));
-            if result.status_code == 403 {
+            message = Some(match status_code {
+                Some(code) => format!("fetchAvailableModels 返回状态码 {code}"),
+                None => "fetchAvailableModels 请求执行失败".to_string(),
+            });
+            if status_code == Some(403) {
                 let reason = "账户访问被禁止".to_string();
                 oauth_invalid_at_unix_secs = Some(now_unix_secs);
                 oauth_invalid_reason = Some(format!("账户访问被禁止: {reason}"));
-                metadata_update = Some(json!({
-                    "antigravity": {
-                        "is_forbidden": true,
-                        "forbidden_reason": reason,
-                        "forbidden_at": now_unix_secs,
-                        "updated_at": now_unix_secs,
-                    }
-                }));
-                status = "forbidden".to_string();
+                let anti_meta = json!({
+                    "is_forbidden": true,
+                    "forbidden_reason": reason,
+                    "forbidden_at": now_unix_secs,
+                    "updated_at": now_unix_secs,
+                });
+                metadata_update = Some(json!({ "antigravity": anti_meta }));
+            }
+        }
+        // 请求失败保留旧观察；成功但未知时写 null，清除失效套餐标签。
+        if let Some(info) = account_info.as_ref() {
+            let update = json!({ "antigravity": {
+                "subscription_tier": info.subscription_tier,
+                "project_id": project_id,
+            } });
+            metadata_update = Some(merge_upstream_metadata(metadata_update.as_ref(), &update));
+        } else if let Some(metadata) = metadata_update
+            .as_mut()
+            .and_then(|update| update.get_mut("antigravity"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if let Some(tier) = transport
+                .key
+                .upstream_metadata
+                .as_ref()
+                .and_then(|value| value.pointer("/antigravity/subscription_tier"))
+            {
+                // 页面直接应用本次刷新结果，也必须保留未能更新的套餐观察。
+                metadata.insert("subscription_tier".to_string(), tier.clone());
             }
         }
 

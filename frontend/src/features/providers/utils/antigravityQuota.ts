@@ -1,4 +1,4 @@
-import type { QuotaWindowSnapshot } from '@/api/endpoints/types'
+import type { QuotaWindowSnapshot, UpstreamMetadata } from '@/api/endpoints/types'
 
 /** 可参与 Antigravity 排序和家族汇总的原始模型额度条目。 */
 export interface AntigravityQuotaSortableItem {
@@ -189,4 +189,45 @@ export function resolveAntigravityQuotaGroupLabel(
   const periodLabel = getAntigravityQuotaPeriodLabel(window, translate)
   if (groupName && periodLabel) return `${groupName} · ${periodLabel}`
   return groupName || String(window.label || window.code || '').trim()
+}
+
+export type AntigravityAccountTier = 'free' | 'pro' | 'ultra'
+
+/**
+ * 校验并规范化 Antigravity 订阅等级。
+ * 仅严格接受 free / pro / ultra，未识别或空值统一返回 null，绝不推断为 free。
+ */
+export function normalizeAntigravityAccountTier(tier?: string | null): AntigravityAccountTier | null {
+  if (typeof tier !== 'string') return null
+  const normalized = tier.trim().toLowerCase()
+  if (normalized === 'free' || normalized === 'pro' || normalized === 'ultra') {
+    return normalized
+  }
+  return null
+}
+
+/**
+ * 从上游元数据中解析 Antigravity 账号等级。
+ * 若无元数据、未配置或无法识别，显式返回 'unknown'，绝不推断为 'free'。
+ */
+export function resolveAntigravityAccountTier(
+  metadata?: UpstreamMetadata | null,
+): AntigravityAccountTier | 'unknown' {
+  const tier = normalizeAntigravityAccountTier(metadata?.antigravity?.subscription_tier)
+  return tier ?? 'unknown'
+}
+
+/**
+ * 解析 Antigravity 账号等级徽章显示文案。
+ * 已知等级返回 Free / Pro / Ultra；未知显式展示 Unknown / 未知。
+ */
+export function resolveAntigravityAccountTierLabel(
+  metadata?: UpstreamMetadata | null,
+  translate?: ((text: string) => string) | null,
+): string {
+  const tier = resolveAntigravityAccountTier(metadata)
+  if (tier === 'free') return 'Free'
+  if (tier === 'pro') return 'Pro'
+  if (tier === 'ultra') return 'Ultra'
+  return translate ? translate('未知') : 'Unknown'
 }

@@ -1236,7 +1236,7 @@ import {
 } from '@/features/pool/utils/poolStatsDisplay'
 import { resetCodexCycleUsageWindows } from '@/features/pool/utils/poolCycleStats'
 import { mergePoolKeyQuotaSnapshots } from '@/features/pool/utils/poolQuotaRefresh'
-import { resolveAntigravityQuotaGroupLabel } from '@/features/providers/utils/antigravityQuota'
+import { resolveAntigravityAccountTier, resolveAntigravityAccountTierLabel, resolveAntigravityQuotaGroupLabel } from '@/features/providers/utils/antigravityQuota'
 import {
   clearPendingCodexResetCreditIdempotencyKey,
   clearPendingCodexResetCreditIdempotencyKeyForOutcome,
@@ -2286,7 +2286,9 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
       oauthRefreshButtonTitle: showOAuthRefreshControl ? getOAuthRefreshButtonTitle(key) : '',
       showOAuthRefreshControl,
       canRefreshToken,
-      planLabel: planType ? formatOAuthPlanType(planType) : '',
+      planLabel: selectedProviderType.value === 'antigravity'
+        ? resolveAntigravityAccountTierLabel(key.upstream_metadata, legacyT)
+        : planType ? formatOAuthPlanType(planType) : '',
       planClass: planType ? getOAuthPlanTypeClass(planType) : '',
       accountQuotaText,
       quotaFallbackText,
@@ -3761,7 +3763,9 @@ function getMobileTagItems(key: PoolKeyDetail): PoolMobileTagItem[] {
     oauthStatusTone: getMobileOAuthTone(key),
     priorityLabel: `P${key.internal_priority ?? 50}`,
     authLabel: getAuthTypeChipLabel(key),
-    planLabel: planType ? formatOAuthPlanType(planType) : null,
+    planLabel: selectedProviderType.value === 'antigravity'
+      ? resolveAntigravityAccountTierLabel(key.upstream_metadata, legacyT)
+      : planType ? formatOAuthPlanType(planType) : null,
     orgLabel: orgBadge?.label ?? null,
     proxyLabel: key.proxy?.node_id ? '独立代理' : null,
   })
@@ -4163,6 +4167,9 @@ function getQuotaWindowValueText(window: QuotaWindowSnapshot | null | undefined)
 }
 
 function resolvePoolKeyPlanType(key: PoolKeyDetail): string | null {
+  if (selectedProviderType.value === 'antigravity') {
+    return resolveAntigravityAccountTier(key.upstream_metadata)
+  }
   const direct = key.oauth_plan_type?.trim()
   if (direct) return direct
   const quota = getQuotaSnapshot(key)

@@ -2395,10 +2395,12 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
 
     let seen_execution_runtime = Arc::new(Mutex::new(Vec::<SeenExecutionRuntimeRequest>::new()));
     let seen_execution_runtime_clone = Arc::clone(&seen_execution_runtime);
+    let account_discoveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |request: Request| {
             let seen_execution_runtime_inner = Arc::clone(&seen_execution_runtime_clone);
+            let account_discoveries = Arc::clone(&account_discoveries);
             async move {
                 let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
                     &to_bytes(request.into_body(), usize::MAX)
@@ -2427,6 +2429,25 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
                         request_body: request_body.clone(),
                     });
                 let (status_code, json_body) = match plan.provider_api_format.as_str() {
+                    "antigravity:load_code_assist" => {
+                        let observation =
+                            account_discoveries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        match observation {
+                            0 => (
+                                200,
+                                json!({
+                                    "cloudaicompanionProject": { "id": "project-ant-123" },
+                                    "paidTier": { "id": "g1-pro-tier" },
+                                    "currentTier": { "id": "free-tier" },
+                                }),
+                            ),
+                            1 => (200, json!({ "currentTier": { "id": "free-tier" } })),
+                            2 => (200, json!({ "paidTier": { "id": "g1-ultra-tier" } })),
+                            3 => (503, json!({ "error": "temporarily unavailable" })),
+                            4 => (200, json!({ "paidTier": { "id": "g1-pro-tier" } })),
+                            _ => (200, json!({ "paidTier": { "id": "standard-tier" } })),
+                        }
+                    }
                     "antigravity:fetch_available_models" => (
                         200,
                         json!({
@@ -2481,7 +2502,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
                     ),
                     unexpected => panic!("unexpected quota request format: {unexpected}"),
                 };
-                let result = aether_contracts::ExecutionResult {
+                let mut result = aether_contracts::ExecutionResult {
                     request_id: plan.request_id,
                     candidate_id: None,
                     status_code,
@@ -2494,7 +2515,20 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
                     telemetry: None,
                     error: None,
                 };
-                (StatusCode::OK, Json(result))
+                let fail_model_probe = plan.provider_api_format
+                    == "antigravity:fetch_available_models"
+                    && account_discoveries.load(std::sync::atomic::Ordering::SeqCst) >= 6;
+                if fail_model_probe {
+                    result.status_code = 502;
+                }
+                (
+                    if fail_model_probe {
+                        StatusCode::BAD_GATEWAY
+                    } else {
+                        StatusCode::OK
+                    },
+                    Json(result),
+                )
             }
         }),
     );
@@ -2624,14 +2658,31 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             .map(Vec::len),
         Some(3usize)
     );
+    assert_eq!(
+        payload["results"][0]["metadata"]["subscription_tier"],
+        json!("pro")
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     let seen_execution_runtime_requests = seen_execution_runtime
         .lock()
         .expect("mutex should lock")
         .clone();
-    assert_eq!(seen_execution_runtime_requests.len(), 3);
-    let fetch_models_request = &seen_execution_runtime_requests[0];
+    assert_eq!(seen_execution_runtime_requests.len(), 4);
+    let load_code_assist_request = &seen_execution_runtime_requests[0];
+    assert_eq!(
+        load_code_assist_request.url,
+        "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+    );
+    assert_eq!(
+        load_code_assist_request.authorization,
+        "Bearer ya29.ant-token"
+    );
+    assert_eq!(
+        load_code_assist_request.provider_api_format,
+        "antigravity:load_code_assist"
+    );
+    let fetch_models_request = &seen_execution_runtime_requests[1];
     assert_eq!(
         fetch_models_request.url,
         "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
@@ -2650,8 +2701,8 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         fetch_models_request.request_body,
         Some(json!({ "project": "project-ant-123" }))
     );
-    let grouped_with_project = &seen_execution_runtime_requests[1];
-    let grouped_without_project = &seen_execution_runtime_requests[2];
+    let grouped_with_project = &seen_execution_runtime_requests[2];
+    let grouped_without_project = &seen_execution_runtime_requests[3];
     assert_eq!(
         grouped_with_project.url,
         "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
@@ -2666,11 +2717,14 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
     );
     assert_eq!(grouped_without_project.url, grouped_with_project.url);
     assert_eq!(grouped_without_project.request_body, Some(json!({})));
-    assert!(seen_execution_runtime_requests.iter().all(|request| {
-        request.authorization == "Bearer ya29.ant-token"
-            && request.user_agent == "vscode/1.X.X (Antigravity/4.3.0)"
-            && request.x_client_version == "4.3.0"
-    }));
+    assert!(seen_execution_runtime_requests
+        .iter()
+        .filter(|request| request.provider_api_format != "antigravity:load_code_assist")
+        .all(|request| {
+            request.authorization == "Bearer ya29.ant-token"
+                && request.user_agent == "vscode/1.X.X (Antigravity/4.3.0)"
+                && request.x_client_version == "4.3.0"
+        }));
 
     let reloaded = provider_catalog_repository
         .list_keys_by_ids(&["key-antigravity-a".to_string()])
@@ -2687,6 +2741,13 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             .and_then(|value| value.get("claude-sonnet-4"))
             .and_then(|value| value.get("remaining_fraction")),
         Some(&json!(0.25))
+    );
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.pointer("/antigravity/subscription_tier")),
+        Some(&json!("pro"))
     );
     // 刷新只更新额度/发现元数据：上游发现的模型（含内部模型）完整保留在 metadata 中，
     // 供手动导入使用，但不落任何模型目录记录。
@@ -2838,6 +2899,56 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         .expect("json body should parse");
     assert_eq!(second_payload["success"], 1);
     assert_eq!(second_payload["results"][0]["status"], "success");
+    assert_eq!(
+        second_payload["results"][0]["metadata"]["subscription_tier"],
+        json!("free")
+    );
+
+    // 套餐切换、发现失败和成功但未知的观察必须通过真实刷新链路持久化。
+    for (expected, success) in [
+        (json!("ultra"), 1),
+        (json!("ultra"), 1),
+        (json!("pro"), 1),
+        (serde_json::Value::Null, 0),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{gateway_url}/api/admin/endpoints/providers/provider-antigravity/refresh-quota"
+            ))
+            .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .send()
+            .await
+            .expect("tier refresh should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = response.json().await.expect("refresh JSON");
+        assert_eq!(payload["success"], success);
+        assert_eq!(
+            payload["results"][0]["metadata"]["subscription_tier"],
+            expected
+        );
+        let stored = provider_catalog_repository
+            .list_keys_by_ids(&["key-antigravity-a".to_string()])
+            .await
+            .expect("refreshed key should read");
+        assert_eq!(
+            stored[0]
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pointer("/antigravity/subscription_tier")),
+            Some(&expected)
+        );
+        assert!(
+            stored[0]
+                .status_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pointer("/quota/plan_type"))
+                .is_none_or(serde_json::Value::is_null),
+            "display tier must not affect scheduling"
+        );
+    }
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     let provider_models_after_second_refresh = global_model_repository

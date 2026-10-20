@@ -2506,6 +2506,40 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_subscription_tier_survives_admin_metadata_safe_serialization() {
+        let metadata = json!({
+            "antigravity": {
+                "project_id": "project-ant-123",
+                "subscription_tier": "pro",
+                "updated_at": 1_777_000_000,
+            }
+        });
+        let projected = admin_provider_upstream_metadata_safe_json(Some(&metadata));
+        assert_eq!(projected["antigravity"]["subscription_tier"], json!("pro"));
+        assert_eq!(
+            projected["antigravity"]["project_id"],
+            json!("project-ant-123")
+        );
+
+        let bucket_safe = admin_provider_metadata_bucket_safe_json(
+            "antigravity",
+            Some(&json!({
+                "project_id": "project-ant-123",
+                "subscription_tier": "ultra",
+            })),
+        );
+        assert_eq!(bucket_safe["subscription_tier"], json!("ultra"));
+
+        let null_tier = admin_provider_metadata_bucket_safe_json(
+            "antigravity",
+            Some(&json!({
+                "subscription_tier": null,
+            })),
+        );
+        assert_eq!(null_tier["subscription_tier"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn chatgpt_metadata_projection_keeps_bounded_quota_dedup_key() {
         let projected = admin_provider_metadata_bucket_safe_json(
             "chatgpt_web",

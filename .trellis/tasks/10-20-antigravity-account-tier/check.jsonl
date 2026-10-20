@@ -1,0 +1,2 @@
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Verify authoritative tier data survives metadata and admin API projection into UI."}
+{"file":".trellis/spec/aether-gateway/backend/quality-guidelines.md","reason":"Check focused behavior tests and preserve quota request boundaries."}

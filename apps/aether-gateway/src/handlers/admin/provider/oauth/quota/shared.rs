@@ -244,7 +244,7 @@ pub(super) fn coerce_json_bool(value: &serde_json::Value) -> Option<bool> {
     admin_provider_quota_pure::coerce_json_bool(value)
 }
 
-fn merge_upstream_metadata(
+pub(super) fn merge_upstream_metadata(
     current: Option<&serde_json::Value>,
     updates: &serde_json::Value,
 ) -> serde_json::Value {
@@ -1037,7 +1037,7 @@ pub(super) fn build_provider_quota_execution_plan(
     }
 }
 
-fn force_provider_quota_redirects_disabled(
+pub(super) fn force_provider_quota_redirects_disabled(
     headers: &mut std::collections::BTreeMap<String, String>,
 ) {
     headers.retain(|name, _| !name.eq_ignore_ascii_case(EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER));

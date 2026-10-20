@@ -98,3 +98,41 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: Antigravity 账号套餐识别与展示
+
+**Date**: 2026-10-20
+**Task**: Antigravity 账号套餐识别与展示
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+新增 Antigravity 套餐识别和账号标识，参考 AntigravityManager 的权威档位优先级；缺失或未知不默认判为 Free。
+
+### Main Changes
+
+- 通过 loadCodeAssist paidTier/currentTier 识别账号套餐，使用独立 subscription_tier 元数据，不改变调度
+- 账号详情、号池桌面/移动列表、额度弹窗显示 Free/Pro/Ultra/未知
+
+### Git Commits
+
+用户在获知本地 PostgreSQL 验证限制后，明确要求提交推送并触发 GitHub CI；据此发布当前已通过相关验证的改动。
+
+### Testing
+
+- [OK] 前端 vue-tsc 类型检查通过；6 个相关 Vitest 文件、25 项检查通过
+- [OK] 浏览器实际挂载 ProviderDetailDrawer、PoolManagement、AntigravityQuotaDialog，验证三档与未知、桌面及移动端；本地夹具，未使用真实 Google 凭证
+- [OK] aether-admin 14 个 Antigravity 解析/投影检查通过
+- [BLOCKED] 广义 Antigravity 网关过滤命中额外跨节点 PostgreSQL 用例，缺少 initdb/postgres 可执行程序；52 项通过，1 项环境失败。
+- [OK] 最终相关验证：aether-admin 14 项、调度隔离 1 项、网关 Antigravity 52 项（显式排除缺 PostgreSQL 的跨节点用例），cargo fmt 检查通过
+- [OK] 已修改前端文件 ESLint（无 --fix）通过
+
+### Status
+
+Implementation and scoped verification completed; publication explicitly authorized by the user.
+
+### Next Steps
+
+- 推送本次改动并触发 Rust CI，由 GitHub 环境执行完整编译和检查。

@@ -238,27 +238,8 @@ impl AppState {
 }
 
 fn extract_antigravity_load_code_assist_project_id(value: &Value) -> Option<String> {
-    let raw = value
-        .get("cloudaicompanionProject")
-        .or_else(|| value.get("cloudAiCompanionProject"))?;
-    if let Some(project_id) = raw
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(project_id.to_string());
-    }
-    raw.as_object()
-        .and_then(|object| {
-            object
-                .get("id")
-                .or_else(|| object.get("project_id"))
-                .or_else(|| object.get("projectId"))
-        })
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+    aether_admin::provider::quota::parse_antigravity_code_assist_response(value)
+        .and_then(|info| info.project_id)
 }
 
 #[async_trait]

@@ -1153,7 +1153,7 @@ import ProviderQuotaProgressRow from '@/features/providers/components/ProviderQu
 import ProviderQuotaSectionHeader from '@/features/providers/components/ProviderQuotaSectionHeader.vue'
 import NousQuotaCard from '@/features/providers/components/NousQuotaCard.vue'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
-import { resolveAntigravityQuotaGroupLabel } from '@/features/providers/utils/antigravityQuota'
+import { resolveAntigravityAccountTierLabel, resolveAntigravityQuotaGroupLabel } from '@/features/providers/utils/antigravityQuota'
 import { refreshQuotaInBackground } from '@/features/providers/utils/refreshQuotaInBackground'
 import {
   deleteEndpointKey,
@@ -4157,6 +4157,9 @@ function getOAuthPlanTypeClass(planType: string): string {
 }
 
 function getKeyPlanBadgeLabel(key: EndpointAPIKey): string | null {
+  if (provider.value?.provider_type === 'antigravity') {
+    return resolveAntigravityAccountTierLabel(key.upstream_metadata, legacyT)
+  }
   if (key.oauth_plan_type) return formatOAuthPlanType(key.oauth_plan_type)
   if (provider.value?.provider_type !== 'openrouter') return null
   const isFreeTier = key.status_snapshot?.quota?.is_free_tier

@@ -51,3 +51,40 @@ fn provider_pool_auth_managed(
             && key.auth_type.trim().eq_ignore_ascii_case("bearer")
             && has_auth_config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn derive_plan_tier_ignores_antigravity_subscription_tier() {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "account".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.upstream_metadata = Some(json!({
+            "antigravity": {
+                "subscription_tier": "pro",
+                "project_id": "project-1",
+            }
+        }));
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "provider_type": "antigravity",
+                "plan_type": serde_json::Value::Null,
+            }
+        }));
+
+        let plan_tier = derive_plan_tier("antigravity", &key, None);
+        assert_eq!(
+            plan_tier, None,
+            "subscription_tier must remain display-only and not affect pool scheduling"
+        );
+    }
+}

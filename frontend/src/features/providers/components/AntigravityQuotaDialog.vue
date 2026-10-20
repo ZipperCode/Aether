@@ -7,11 +7,20 @@
     :z-index="70"
     @update:model-value="$emit('update:open', $event)"
   >
-    <template
-      v-if="providerId && rawItems.length > 0"
-      #header-actions
-    >
-      <DropdownMenu :modal="false">
+    <template #header-actions>
+      <Badge
+        v-if="tierBadgeLabel"
+        variant="outline"
+        class="text-[10px] px-1.5 py-0 shrink-0"
+        :class="tierBadgeClass"
+        data-testid="antigravity-quota-dialog-tier-badge"
+      >
+        {{ tierBadgeLabel }}
+      </Badge>
+      <DropdownMenu
+        v-if="providerId && rawItems.length > 0"
+        :modal="false"
+      >
         <DropdownMenuTrigger as-child>
           <Button
             variant="ghost"
@@ -114,16 +123,20 @@ import {
   DropdownMenuItem,
 } from '@/components/ui'
 import Button from '@/components/ui/button.vue'
+import Badge from '@/components/ui/badge.vue'
 import { testModel } from '@/api/endpoints/providers'
 import type { UpstreamMetadata, QuotaStatusSnapshot, QuotaWindowSnapshot } from '@/api/endpoints/types'
 import { useToast } from '@/composables/useToast'
 import { useI18n } from '@/i18n'
 import { parseApiError } from '@/utils/errorParser'
+import { getOAuthPlanTypeClass } from '@/utils/oauthPlanType'
 import {
   compareAntigravityQuotaItems,
   dedupeAntigravityQuotaItemsByLabel,
   resolveAntigravityQuotaGroupLabel,
   resolveAntigravityQuotaLabel,
+  resolveAntigravityAccountTier,
+  resolveAntigravityAccountTierLabel,
 } from '@/features/providers/utils/antigravityQuota'
 
 const props = defineProps<{
@@ -151,7 +164,10 @@ interface QuotaItem {
 }
 
 const { error: showError, success: showSuccess } = useToast()
-const { t } = useI18n()
+const { t, legacyT } = useI18n()
+const accountTier = computed(() => resolveAntigravityAccountTier(props.metadata))
+const tierBadgeLabel = computed(() => resolveAntigravityAccountTierLabel(props.metadata, legacyT))
+const tierBadgeClass = computed(() => getOAuthPlanTypeClass(accountTier.value))
 const testingModel = ref<string | null>(null)
 
 function getQuotaSnapshotUpdatedAt(quota: QuotaStatusSnapshot | null | undefined): number | undefined {
