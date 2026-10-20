@@ -136,3 +136,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Next Steps
 
 - 推送本次改动并触发 Rust CI，由 GitHub 环境执行完整编译和检查。
+
+
+## Session 6: 推送 Antigravity 套餐支持并触发 CI
+
+**Date**: 2026-10-20
+**Task**: 推送 Antigravity 套餐支持并触发 CI
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+用户知悉本地 PostgreSQL 环境限制后明确授权推送；实现和相关验证已完成，推送后手动触发 Rust CI。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9167a087d` | (see git log) |
+
+### Status
+
+[OK] **Completed**
