@@ -711,6 +711,19 @@ async fn fetch_and_persist_key_models(
             result.errors.join("; ")
         };
         let safe_error = safe_model_fetch_error(&error);
+        if let Some(observation_patch) = result
+            .upstream_metadata
+            .as_ref()
+            .filter(|metadata| metadata.get("antigravity").is_some())
+        {
+            state
+                .persist_antigravity_account_observation(
+                    &target.key.id,
+                    observation_patch,
+                    now_unix_secs,
+                )
+                .await?;
+        }
         persist_key_fetch_failure(state, &target.key, now_unix_secs, safe_error.clone()).await?;
         warn!(
             provider_id = %target.provider.id,
@@ -1441,6 +1454,25 @@ mod tests {
                         updated_at_unix_secs,
                     )
                 }));
+            Ok(())
+        }
+
+        async fn persist_antigravity_account_observation(
+            &self,
+            key_id: &str,
+            observation_patch: &Value,
+            now_unix_secs: u64,
+        ) -> Result<(), GatewayError> {
+            let mut keys = self.keys.lock().expect("keys mutex");
+            let key = keys
+                .iter_mut()
+                .find(|key| key.id == key_id)
+                .ok_or_else(|| GatewayError::Internal("key not found".to_string()))?;
+            key.upstream_metadata = Some(aether_model_fetch::merge_upstream_metadata(
+                key.upstream_metadata.as_ref(),
+                observation_patch,
+            ));
+            key.updated_at_unix_secs = Some(now_unix_secs);
             Ok(())
         }
 
@@ -2236,16 +2268,22 @@ mod tests {
                 ),
                 transport,
             )]),
-            vec![execution_result(json!({
-                "models": {
-                    "gemini-2.5-pro": {
-                        "displayName": "Gemini 2.5 Pro",
-                        "quotaInfo": {
-                            "remainingFraction": 0.25
+            vec![
+                execution_result(json!({
+                    "cloudaicompanionProject": "project-1",
+                    "paidTier": {"id": "g1-pro-tier"}
+                })),
+                execution_result(json!({
+                    "models": {
+                        "gemini-2.5-pro": {
+                            "displayName": "Gemini 2.5 Pro",
+                            "quotaInfo": {
+                                "remainingFraction": 0.25
+                            }
                         }
                     }
-                }
-            }))],
+                })),
+            ],
         );
 
         let summary = perform_model_fetch_once_with_state(&state)
@@ -2265,6 +2303,77 @@ mod tests {
                 .and_then(|value| value.get("reset_time")),
             Some(&json!("2026-04-12T00:00:00Z"))
         );
+    }
+
+    #[tokio::test]
+    async fn antigravity_failed_models_still_persist_account_observation_without_whitelist_change()
+    {
+        let provider = sample_provider("provider-antigravity", "antigravity");
+        let endpoint = sample_endpoint(
+            "endpoint-antigravity",
+            "provider-antigravity",
+            "gemini:generate_content",
+        );
+        let mut key = sample_key(
+            "key-antigravity",
+            "provider-antigravity",
+            "oauth",
+            &["gemini:generate_content"],
+        );
+        key.allowed_models = Some(json!(["existing-model"]));
+        let transport = sample_transport(
+            "antigravity",
+            "provider-antigravity",
+            "endpoint-antigravity",
+            "key-antigravity",
+            "gemini:generate_content",
+            "oauth",
+            Some(r#"{"project_id":"project-1"}"#),
+        );
+        let mut rejection = execution_result(
+            json!({"error":{"status":"UNAUTHENTICATED","message":"invalid token"}}),
+        );
+        rejection.status_code = 401;
+        let state = TestState::new(
+            vec![provider],
+            vec![endpoint],
+            vec![key],
+            HashMap::from([(
+                (
+                    "provider-antigravity".into(),
+                    "endpoint-antigravity".into(),
+                    "key-antigravity".into(),
+                ),
+                transport,
+            )]),
+            vec![
+                execution_result(
+                    json!({"cloudaicompanionProject":"project-1", "paidTier":{"id":"g1-ultra-tier"}}),
+                ),
+                rejection,
+            ],
+        );
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("worker should record failure");
+        assert_eq!(summary.failed, 1);
+        let stored = state.key("key-antigravity");
+        assert_eq!(stored.allowed_models, Some(json!(["existing-model"])));
+        assert_eq!(
+            stored
+                .upstream_metadata
+                .as_ref()
+                .and_then(|m| m.pointer("/antigravity/subscription_tier")),
+            Some(&json!("ultra"))
+        );
+        assert_eq!(
+            stored
+                .upstream_metadata
+                .as_ref()
+                .and_then(|m| m.pointer("/antigravity/account_info_status")),
+            Some(&json!("success"))
+        );
+        assert!(stored.last_models_fetch_error.is_some());
     }
 
     #[tokio::test]

@@ -31,10 +31,11 @@ use crate::handlers::shared::{
 use crate::model_fetch::ModelFetchRuntimeState;
 use crate::provider_key_auth::provider_key_auth_semantics;
 use crate::provider_transport::antigravity::{
-    build_antigravity_safe_v1internal_request, build_antigravity_static_identity_headers,
-    classify_local_antigravity_request_support, AntigravityEnvelopeRequestType,
-    AntigravityRequestAuthUnsupportedReason, AntigravityRequestEnvelopeSupport,
-    AntigravityRequestSideSupport, AntigravityRequestSideUnsupportedReason,
+    antigravity_account_observation_due, build_antigravity_safe_v1internal_request,
+    build_antigravity_static_identity_headers, classify_local_antigravity_request_support,
+    AntigravityEnvelopeRequestType, AntigravityRequestAuthUnsupportedReason,
+    AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
+    AntigravityRequestSideUnsupportedReason,
 };
 use crate::provider_transport::kiro::{
     build_kiro_generate_assistant_response_url, build_kiro_provider_headers,
@@ -2820,14 +2821,24 @@ async fn provider_query_execute_antigravity_test_candidate(
         &base_provider_request_body,
         AntigravityEnvelopeRequestType::EndpointTest,
     );
-    if matches!(
+    let is_missing_project = matches!(
         antigravity_support,
         AntigravityRequestSideSupport::Unsupported(
             AntigravityRequestSideUnsupportedReason::UnsupportedAuth(
                 AntigravityRequestAuthUnsupportedReason::MissingProjectId
             )
         )
-    ) {
+    );
+    let is_due = is_missing_project
+        || (matches!(
+            antigravity_support,
+            AntigravityRequestSideSupport::Supported(_)
+        ) && antigravity_account_observation_due(
+            transport.key.upstream_metadata.as_ref(),
+            crate::clock::current_unix_secs(),
+        ));
+
+    if is_due {
         if let Some(hydrated) = state
             .app()
             .hydrate_antigravity_project_metadata_for_transport(&transport)

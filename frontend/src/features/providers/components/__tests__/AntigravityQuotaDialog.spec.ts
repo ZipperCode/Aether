@@ -46,6 +46,20 @@ vi.mock('@/components/ui/button.vue', async () => {
     }),
   }
 })
+vi.mock('@/components/common/AlertDialog.vue', async () => {
+  const { defineComponent, h } = await import('vue')
+  return {
+    default: defineComponent({
+      name: 'AlertDialogStub',
+      props: { modelValue: Boolean, title: String, description: String, loading: Boolean },
+      emits: ['confirm', 'cancel'],
+      setup(_, { slots }) {
+        return () => h('div', slots.default?.())
+      },
+    }),
+  }
+})
+
 
 vi.mock('lucide-vue-next', async () => {
   const { defineComponent, h } = await import('vue')
@@ -60,6 +74,8 @@ vi.mock('lucide-vue-next', async () => {
     BarChart3: Icon,
     Loader2: Icon,
     Play: Icon,
+    Sparkles: Icon,
+    AlertCircle: Icon,
   }
 })
 
@@ -240,7 +256,6 @@ describe('AntigravityQuotaDialog', () => {
       },
     })
 
-    expect(root.textContent).toContain('暂无配额数据')
     expect(root.textContent).not.toContain('Gemini额度')
     expect(root.textContent).not.toContain('Claude & ChatGPT')
     expect(root.textContent).not.toContain('Gemini 3.5 Flash (High)')

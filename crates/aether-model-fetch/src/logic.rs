@@ -650,36 +650,36 @@ pub fn merge_upstream_metadata(current: Option<&Value>, incoming: &Value) -> Val
             merged.get(namespace).and_then(Value::as_object),
         ) {
             if namespace.eq_ignore_ascii_case("antigravity") {
-                for field in ["quota_groups", "quota_groups_updated_at"] {
-                    if !next_namespace.contains_key(field) {
-                        if let Some(value) = old_namespace.get(field) {
-                            next_namespace.insert(field.to_string(), value.clone());
+                let mut combined = old_namespace.clone();
+                if let (Some(new_quota), Some(old_quota)) = (
+                    next_namespace
+                        .get_mut("quota_by_model")
+                        .and_then(Value::as_object_mut),
+                    old_namespace
+                        .get("quota_by_model")
+                        .and_then(Value::as_object),
+                ) {
+                    for (model_id, new_info) in new_quota.iter_mut() {
+                        let Some(new_info_object) = new_info.as_object_mut() else {
+                            continue;
+                        };
+                        let Some(old_info_object) =
+                            old_quota.get(model_id).and_then(Value::as_object)
+                        else {
+                            continue;
+                        };
+                        if !new_info_object.contains_key("reset_time") {
+                            if let Some(reset_time) = old_info_object.get("reset_time") {
+                                new_info_object
+                                    .insert("reset_time".to_string(), reset_time.clone());
+                            }
                         }
                     }
                 }
-            }
-            if let (Some(new_quota), Some(old_quota)) = (
-                next_namespace
-                    .get_mut("quota_by_model")
-                    .and_then(Value::as_object_mut),
-                old_namespace
-                    .get("quota_by_model")
-                    .and_then(Value::as_object),
-            ) {
-                for (model_id, new_info) in new_quota.iter_mut() {
-                    let Some(new_info_object) = new_info.as_object_mut() else {
-                        continue;
-                    };
-                    let Some(old_info_object) = old_quota.get(model_id).and_then(Value::as_object)
-                    else {
-                        continue;
-                    };
-                    if !new_info_object.contains_key("reset_time") {
-                        if let Some(reset_time) = old_info_object.get("reset_time") {
-                            new_info_object.insert("reset_time".to_string(), reset_time.clone());
-                        }
-                    }
+                for (k, v) in next_namespace.iter() {
+                    combined.insert(k.clone(), v.clone());
                 }
+                next_value = Value::Object(combined);
             }
         }
         merged.insert(namespace.clone(), next_value);
@@ -1209,7 +1209,7 @@ mod tests {
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{
         aggregate_models_for_cache, apply_model_filters, build_gemini_models_url,
@@ -1883,6 +1883,84 @@ mod tests {
             merged["antigravity"]["quota_groups_updated_at"],
             json!(1_777_000_000u64)
         );
+    }
+
+    #[test]
+    fn merge_upstream_metadata_antigravity_preserves_old_fields_on_failure_update() {
+        let current = json!({
+            "other_vendor": { "active": true },
+            "antigravity": {
+                "project_id": "proj-123",
+                "subscription_tier": "ultra",
+                "paid_tier_id": "g1-ultra-tier",
+                "current_tier_id": "g1-pro-tier",
+                "account_info_status": "success",
+                "account_info_checked_at": 1000,
+                "account_info_updated_at": 1000,
+                "quota_groups": [{"name": "group"}],
+                "quota_by_model": {
+                    "chat_model": { "remaining_fraction": 0.5 }
+                }
+            }
+        });
+
+        // Failure update only contains error status and checked_at
+        let failure_update = json!({
+            "antigravity": {
+                "account_info_status": "error",
+                "account_info_checked_at": 2000
+            }
+        });
+
+        let merged = merge_upstream_metadata(Some(&current), &failure_update);
+        assert_eq!(merged["other_vendor"]["active"], true);
+        assert_eq!(merged["antigravity"]["account_info_status"], "error");
+        assert_eq!(merged["antigravity"]["account_info_checked_at"], 2000);
+        assert_eq!(merged["antigravity"]["account_info_updated_at"], 1000);
+        assert_eq!(merged["antigravity"]["project_id"], "proj-123");
+        assert_eq!(merged["antigravity"]["subscription_tier"], "ultra");
+        assert_eq!(merged["antigravity"]["paid_tier_id"], "g1-ultra-tier");
+        assert_eq!(merged["antigravity"]["current_tier_id"], "g1-pro-tier");
+        assert_eq!(merged["antigravity"]["quota_groups"][0]["name"], "group");
+        assert_eq!(
+            merged["antigravity"]["quota_by_model"]["chat_model"]["remaining_fraction"],
+            0.5
+        );
+    }
+
+    #[test]
+    fn merge_upstream_metadata_antigravity_explicit_null_clears_old_tier() {
+        let current = json!({
+            "antigravity": {
+                "project_id": "proj-123",
+                "subscription_tier": "pro",
+                "paid_tier_id": "g1-pro-tier",
+                "current_tier_id": "g1-pro-tier",
+                "account_info_status": "success",
+                "account_info_checked_at": 1000,
+                "account_info_updated_at": 1000,
+            }
+        });
+
+        let success_unknown_update = json!({
+            "antigravity": {
+                "subscription_tier": null,
+                "paid_tier_id": null,
+                "current_tier_id": null,
+                "account_info_status": "success",
+                "account_info_checked_at": 2000,
+                "account_info_updated_at": 2000,
+            }
+        });
+
+        let merged = merge_upstream_metadata(Some(&current), &success_unknown_update);
+        assert_eq!(merged["antigravity"]["account_info_status"], "success");
+        assert_eq!(merged["antigravity"]["account_info_checked_at"], 2000);
+        assert_eq!(merged["antigravity"]["account_info_updated_at"], 2000);
+        assert_eq!(merged["antigravity"]["subscription_tier"], Value::Null);
+        assert_eq!(merged["antigravity"]["paid_tier_id"], Value::Null);
+        assert_eq!(merged["antigravity"]["current_tier_id"], Value::Null);
+        assert_eq!(merged["antigravity"]["project_id"], "proj-123");
     }
 
     #[test]

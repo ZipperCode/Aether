@@ -82,7 +82,7 @@ pub(crate) enum CodexAccountResetCompleteResult {
     Replay(CodexAccountResetTerminal),
 }
 
-pub(super) enum ProviderQuotaExecutionOutcome {
+pub(crate) enum ProviderQuotaExecutionOutcome {
     Response(ExecutionResult),
     Failure(String),
 }
@@ -105,7 +105,7 @@ pub(super) fn default_provider_quota_execution_timeouts(
     }
 }
 
-pub(super) fn resolve_provider_quota_execution_timeouts(
+pub(crate) fn resolve_provider_quota_execution_timeouts(
     configured: Option<ExecutionTimeouts>,
     proxy: Option<&ProxySnapshot>,
 ) -> ExecutionTimeouts {
@@ -1037,7 +1037,7 @@ pub(super) fn build_provider_quota_execution_plan(
     }
 }
 
-pub(super) fn force_provider_quota_redirects_disabled(
+pub(crate) fn force_provider_quota_redirects_disabled(
     headers: &mut std::collections::BTreeMap<String, String>,
 ) {
     headers.retain(|name, _| !name.eq_ignore_ascii_case(EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER));
@@ -1586,7 +1586,7 @@ fn provider_quota_refresh_status_patch(
     serde_json::Value::Object(patch)
 }
 
-pub(super) async fn execute_provider_quota_plan(
+pub(crate) async fn execute_provider_quota_plan(
     state: &AdminAppState<'_>,
     transport: &AdminGatewayProviderTransportSnapshot,
     mut plan: ExecutionPlan,

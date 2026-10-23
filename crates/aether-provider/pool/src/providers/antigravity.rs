@@ -66,6 +66,7 @@ pub fn build_antigravity_pool_quota_request(
     endpoint_base_url: &str,
     authorization: (String, String),
     project_id: &str,
+    tier: Option<&str>,
     mut identity_headers: BTreeMap<String, String>,
 ) -> ProviderPoolQuotaRequestSpec {
     let mut headers = std::mem::take(&mut identity_headers);
@@ -75,6 +76,11 @@ pub fn build_antigravity_pool_quota_request(
     headers
         .entry("user-agent".to_string())
         .or_insert_with(|| "antigravity".to_string());
+
+    let json_body =
+        aether_provider_transport::antigravity::build_antigravity_fetch_available_models_body(
+            project_id, tier,
+        );
 
     ProviderPoolQuotaRequestSpec {
         request_id: format!("antigravity-quota:{key_id}"),
@@ -88,7 +94,7 @@ pub fn build_antigravity_pool_quota_request(
         ),
         headers,
         content_type: Some("application/json".to_string()),
-        json_body: Some(json!({ "project": project_id })),
+        json_body: Some(json_body),
         client_api_format: "gemini:generate_content".to_string(),
         provider_api_format: "antigravity:fetch_available_models".to_string(),
         model_name: Some("fetchAvailableModels".to_string()),
@@ -141,7 +147,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_antigravity_pool_quota_summary_request, ANTIGRAVITY_RETRIEVE_USER_QUOTA_SUMMARY_PATH,
+        build_antigravity_pool_quota_request, build_antigravity_pool_quota_summary_request,
+        ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH, ANTIGRAVITY_RETRIEVE_USER_QUOTA_SUMMARY_PATH,
     };
 
     #[test]
@@ -173,5 +180,43 @@ mod tests {
         );
         assert_eq!(without_project.url, with_project.url);
         assert_eq!(without_project.json_body, Some(json!({})));
+    }
+
+    #[test]
+    fn quota_request_includes_optional_entitlement_user_tier() {
+        let without_tier = build_antigravity_pool_quota_request(
+            "key-1",
+            "https://daily-cloudcode-pa.googleapis.com/",
+            ("authorization".to_string(), "Bearer token".to_string()),
+            "project-1",
+            None,
+            BTreeMap::new(),
+        );
+        let with_tier = build_antigravity_pool_quota_request(
+            "key-1",
+            "https://daily-cloudcode-pa.googleapis.com/",
+            ("authorization".to_string(), "Bearer token".to_string()),
+            "project-1",
+            Some("g1-pro-tier"),
+            BTreeMap::new(),
+        );
+
+        assert_eq!(
+            without_tier.url,
+            format!(
+                "https://daily-cloudcode-pa.googleapis.com{ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH}"
+            )
+        );
+        assert_eq!(
+            without_tier.json_body,
+            Some(json!({"project": "project-1"}))
+        );
+        assert_eq!(
+            with_tier.json_body,
+            Some(json!({
+                "project": "project-1",
+                "entitlement": { "userTier": "g1-pro-tier" }
+            }))
+        );
     }
 }

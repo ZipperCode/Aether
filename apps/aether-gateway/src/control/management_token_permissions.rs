@@ -515,6 +515,7 @@ fn access_for_route(method: &http::Method, decision: &GatewayControlDecision) ->
                 Some(
                     "complete_key_oauth"
                         | "refresh_key_oauth"
+                        | "initialize_antigravity_key_project"
                         | "complete_provider_oauth"
                         | "import_refresh_token"
                         | "cookie_authorize"

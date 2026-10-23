@@ -1086,6 +1086,7 @@
     :provider-id="providerId ?? undefined"
     :key-id="antigravityQuotaDialogKey.id"
     @update:open="antigravityQuotaDialogOpen = $event"
+    @update:metadata="handleAntigravityMetadataUpdate"
   />
 
   <!-- 故障转移规则弹窗 -->
@@ -3372,6 +3373,24 @@ async function openAntigravityQuotaDialog(key: EndpointAPIKey) {
     } finally {
       refreshingQuota.value = false
     }
+  }
+}
+
+function handleAntigravityMetadataUpdate(newMetadata: UpstreamMetadata) {
+  if (antigravityQuotaDialogKey.value) {
+    antigravityQuotaDialogKey.value.upstream_metadata = newMetadata
+    const updated = {
+      ...antigravityQuotaDialogKey.value,
+      upstream_metadata: newMetadata,
+    }
+    applyUpdatedKeySnapshot(updated)
+    for (const endpoint of endpoints.value) {
+      const target = endpoint.keys?.find(k => k.id === updated.id)
+      if (target) {
+        target.upstream_metadata = newMetadata
+      }
+    }
+    emit('refresh')
   }
 }
 

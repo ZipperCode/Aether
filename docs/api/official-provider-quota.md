@@ -52,6 +52,18 @@
 - 号池桌面与移动端的额度区提供单 Key 刷新图标，复用现有额度接口、冷却规则与快照合并；加载时禁用重复刷新，切换提供商后丢弃旧响应，不触发全页重载。
 - 历史 `custom` 提供商仅在启用端点精确匹配唯一官方类型时提示转换，通过现有编辑表单由管理员确认。不会自动迁移生产配置。本地月度预算明确标记“本地配置”。
 
+## Antigravity 账号权益观察
+
+- 套餐显示读取 `upstream_metadata.antigravity.subscription_tier`，只接受权威 `paidTier` / `currentTier`，标准化为 `free`、`pro`、`ultra` 或未知。该字段不写入参与调度的 `plan_type`。
+- `loadCodeAssist` 同时保存原始 `paid_tier_id`、`current_tier_id`，用于 `fetchAvailableModels` 的 `entitlement.userTier`；不能从展示用的 Pro/Ultra 反推协议 ID，也不根据 `allowedTiers` 升级菜单判断已购套餐。
+- 额度刷新始终补查账号观察；正常请求的项目补全与模型发现会补查缺失或到期的观察。成功观察缓存 15 分钟，失败尝试退避 60 秒；已有可用项目在查询失败时继续使用。
+- `account_info_status=success` 但套餐为空表示上游未返回可识别等级；`error` 表示本次查询失败，保留上次等级。`account_info_checked_at` 为最后尝试时间，`account_info_updated_at` 为最后成功时间。刷新 Token 本身不等于刷新套餐。
+- 模型和额度查询依次使用原始付费权益、当前权益、不带权益，跳过 Free/Legacy 与重复 ID；只有明确的权益参数拒绝才切换下一项。认证失败、限流和传输失败不触发权益降级，模型发现原有的主机回退另行保留。
+- Antigravity 元数据按字段合并，缺失字段保留旧观察，显式 `null` 清除失效套餐；模型刷新不得覆盖套餐或其他命名空间。
+- 缺项目账号可在配额详情中选择“初始化伴生项目”，确认后调用管理员接口 `POST /api/admin/provider-oauth/keys/{key_id}/initialize-project`。已有配置项目仅同步观察，不重复初始化；普通聊天、额度刷新和后台发现不执行 `onboardUser`。
+- 初始化先走生产端 `loadCodeAssist`，必要时向配置的允许源站发送 `onboardUser`；仅显式 pending 状态继续轮询，最多 5 次、总工作流 15 秒。硬拒绝立即停止；项目创建完成后立即保存，后续查询失败不会删除项目。
+- 账号观察通过 Antigravity 命名空间 CAS 合并，保留并发更新的套餐、项目、额度及其他命名空间；模型发现失败仍保存本次账号观察，但不修改模型白名单或上次成功目录。
+
 ## 只读联调范围
 
 2026-09-15 使用用户授权的 9 把 Key 进行了 11 次官方额度 GET 查询，并将脱敏响应回放到当前解析器、来源合并逻辑和前端共用展示函数。未把 Key 写入项目、未调用模型、未将凭据跨区域重试；这是接口与数据处理验证，不是完整网关部署集成测试。

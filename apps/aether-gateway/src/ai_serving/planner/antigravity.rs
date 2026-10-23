@@ -4,11 +4,11 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::ai_serving::transport::antigravity::{
-    build_antigravity_safe_v1internal_request, build_antigravity_static_identity_headers,
-    classify_local_antigravity_request_support, AntigravityEnvelopeRequestType,
-    AntigravityRequestAuth, AntigravityRequestAuthUnsupportedReason,
-    AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
-    AntigravityRequestSideUnsupportedReason,
+    antigravity_account_observation_due, build_antigravity_safe_v1internal_request,
+    build_antigravity_static_identity_headers, classify_local_antigravity_request_support,
+    AntigravityEnvelopeRequestType, AntigravityRequestAuth,
+    AntigravityRequestAuthUnsupportedReason, AntigravityRequestEnvelopeSupport,
+    AntigravityRequestSideSupport, AntigravityRequestSideUnsupportedReason,
 };
 use crate::ai_serving::transport::{
     build_standard_provider_request_headers, GatewayProviderTransportSnapshot,
@@ -121,14 +121,24 @@ async fn build_antigravity_v1internal_payload(
         AntigravityEnvelopeRequestType::Agent,
     );
 
-    if matches!(
+    let is_missing_project = matches!(
         antigravity_support,
         AntigravityRequestSideSupport::Unsupported(
             AntigravityRequestSideUnsupportedReason::UnsupportedAuth(
                 AntigravityRequestAuthUnsupportedReason::MissingProjectId
             )
         )
-    ) {
+    );
+    let is_due = is_missing_project
+        || (matches!(
+            antigravity_support,
+            AntigravityRequestSideSupport::Supported(_)
+        ) && antigravity_account_observation_due(
+            resolved_transport.key.upstream_metadata.as_ref(),
+            crate::clock::current_unix_secs(),
+        ));
+
+    if is_due {
         if let Some(hydrated) = state
             .hydrate_antigravity_project_metadata_for_transport(&resolved_transport)
             .await

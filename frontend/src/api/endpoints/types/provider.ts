@@ -381,6 +381,8 @@ export interface AntigravityModelQuota {
   is_exhausted?: boolean | null
 }
 
+export type AntigravityAccountInfoStatus = 'success' | 'error' | 'pending' | 'unknown'
+
 export interface AntigravityUpstreamMetadata {
   updated_at?: number  // Unix 时间戳（秒）
   quota_by_model?: Record<string, AntigravityModelQuota>
@@ -388,6 +390,12 @@ export interface AntigravityUpstreamMetadata {
   forbidden_reason?: string  // 禁止访问原因
   forbidden_at?: number  // 禁止时间（Unix 时间戳，秒）
   subscription_tier?: 'free' | 'pro' | 'ultra' | null  // 套餐等级: free / pro / ultra
+  project_id?: string | null
+  account_info_status?: AntigravityAccountInfoStatus | null
+  account_info_checked_at?: number | null
+  account_info_updated_at?: number | null
+  paid_tier_id?: string | null
+  current_tier_id?: string | null
 }
 
 // Kiro 上游配额信息

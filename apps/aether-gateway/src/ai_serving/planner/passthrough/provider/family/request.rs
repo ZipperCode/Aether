@@ -11,10 +11,11 @@ use crate::ai_serving::planner::redaction::{
     request_identity_response_encoding_when_redacted, resolve_provider_chat_pii_redaction,
 };
 use crate::ai_serving::transport::antigravity::{
-    build_antigravity_safe_v1internal_request, build_antigravity_static_identity_headers,
-    classify_local_antigravity_request_support, AntigravityEnvelopeRequestType,
-    AntigravityRequestAuthUnsupportedReason, AntigravityRequestEnvelopeSupport,
-    AntigravityRequestSideSupport, AntigravityRequestSideUnsupportedReason,
+    antigravity_account_observation_due, build_antigravity_safe_v1internal_request,
+    build_antigravity_static_identity_headers, classify_local_antigravity_request_support,
+    AntigravityEnvelopeRequestType, AntigravityRequestAuthUnsupportedReason,
+    AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
+    AntigravityRequestSideUnsupportedReason,
 };
 use crate::ai_serving::transport::{
     build_gemini_cli_v1internal_request, build_grok_browser_headers, build_grok_upstream_url,
@@ -358,14 +359,24 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             &base_provider_request_body,
             AntigravityEnvelopeRequestType::Agent,
         );
-        if matches!(
+        let is_missing_project = matches!(
             antigravity_support,
             AntigravityRequestSideSupport::Unsupported(
                 AntigravityRequestSideUnsupportedReason::UnsupportedAuth(
                     AntigravityRequestAuthUnsupportedReason::MissingProjectId
                 )
             )
-        ) {
+        );
+        let is_due = is_missing_project
+            || (matches!(
+                antigravity_support,
+                AntigravityRequestSideSupport::Supported(_)
+            ) && antigravity_account_observation_due(
+                transport.key.upstream_metadata.as_ref(),
+                crate::clock::current_unix_secs(),
+            ));
+
+        if is_due {
             if let Some(hydrated) = state
                 .hydrate_antigravity_project_metadata_for_transport(&transport)
                 .await

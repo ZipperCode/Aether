@@ -90,6 +90,14 @@ pub(crate) trait ModelFetchRuntimeState:
         updated_at_unix_secs: Option<u64>,
     ) -> Result<(), GatewayError>;
 
+    /// 模型发现失败仍持久化新账号观察，不改写白名单或上次成功目录。
+    async fn persist_antigravity_account_observation(
+        &self,
+        key_id: &str,
+        observation_patch: &Value,
+        now_unix_secs: u64,
+    ) -> Result<(), GatewayError>;
+
     async fn write_upstream_models_cache(
         &self,
         provider_id: &str,

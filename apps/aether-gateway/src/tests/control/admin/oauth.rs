@@ -10692,3 +10692,494 @@ async fn gateway_rejects_partial_management_token_for_admin_management_token_rou
     gateway_handle.abort();
     upstream_handle.abort();
 }
+#[test]
+fn gateway_antigravity_initialize_project_onboards_when_no_project() {
+    run_admin_oauth_test(
+        "gateway_antigravity_initialize_project_onboards_when_no_project",
+        gateway_antigravity_initialize_project_onboards_when_no_project_impl,
+    );
+}
+
+async fn gateway_antigravity_initialize_project_onboards_when_no_project_impl() {
+    let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
+    let execution_plans_clone = Arc::clone(&execution_plans);
+    let onboard_attempts = Arc::new(Mutex::new(0usize));
+    let onboard_attempts_clone = Arc::clone(&onboard_attempts);
+
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let execution_plans = Arc::clone(&execution_plans_clone);
+            let onboard_attempts = Arc::clone(&onboard_attempts_clone);
+            async move {
+                let url = plan.url.clone();
+                let request_id = plan.request_id.clone();
+                execution_plans.lock().expect("mutex").push(plan);
+                if url.ends_with("/v1internal:loadCodeAssist") {
+                    Json(json!({
+                        "request_id": request_id,
+                        "status_code": 200,
+                        "headers": { "content-type": "application/json" },
+                        "body": {
+                            "json_body": {
+                                "allowedTiers": [
+                                    { "id": "free-tier", "isDefault": true }
+                                ]
+                            }
+                        }
+                    }))
+                } else if url.ends_with("/v1internal:onboardUser") {
+                    let mut attempts = onboard_attempts.lock().expect("mutex");
+                    *attempts += 1;
+                    if *attempts == 1 {
+                        Json(json!({
+                            "request_id": request_id,
+                            "status_code": 200,
+                            "headers": { "content-type": "application/json" },
+                            "body": {
+                                "json_body": {
+                                    "done": false
+                                }
+                            }
+                        }))
+                    } else {
+                        Json(json!({
+                            "request_id": request_id,
+                            "status_code": 200,
+                            "headers": { "content-type": "application/json" },
+                            "body": {
+                                "json_body": {
+                                    "done": true,
+                                    "response": {
+                                        "cloudaicompanionProject": "proj-new-antigravity"
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                } else {
+                    Json(json!({
+                        "request_id": request_id,
+                        "status_code": 200,
+                        "headers": { "content-type": "application/json" },
+                        "body": { "json_body": {} }
+                    }))
+                }
+            }
+        }),
+    );
+    let mut provider = sample_provider("provider-antigravity", "antigravity", 10);
+    provider.provider_type = "antigravity".to_string();
+    let endpoint = sample_endpoint(
+        "endpoint-antigravity",
+        "provider-antigravity",
+        "gemini:generate_content",
+        "https://cloudcode-pa.googleapis.com",
+    );
+    let mut key = sample_key(
+        "key-antigravity-no-proj",
+        "provider-antigravity",
+        "gemini:generate_content",
+        "ya29.test-access-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"antigravity","refresh_token":"ya29.rt","access_token":"ya29.valid","expires_in":3600,"expires_at":9999999999}"#,
+        )
+        .expect("auth config ciphertext"),
+    );
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![key],
+    ));
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/keys/key-antigravity-no-proj/initialize-project"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let text = response.text().await.expect("text");
+    assert_eq!(status, StatusCode::OK, "response body: {text}");
+    let payload: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(payload["key_id"], "key-antigravity-no-proj");
+    assert_eq!(payload["project_id"], "proj-new-antigravity");
+    assert_eq!(payload["onboarded"], true);
+
+    // 验证实际执行计划与请求体字段
+    let plans = execution_plans.lock().expect("mutex");
+    let onboard_plans = plans
+        .iter()
+        .filter(|p| p.url.ends_with("/v1internal:onboardUser"))
+        .collect::<Vec<_>>();
+    assert_eq!(onboard_plans.len(), 2);
+    let first_body = onboard_plans[0].body.json_body.as_ref().expect("body json");
+    assert_eq!(first_body["tier_id"], "free-tier");
+    assert_eq!(first_body["metadata"]["ide_type"], "ANTIGRAVITY");
+    assert_eq!(first_body["metadata"]["ide_name"], "antigravity");
+
+    // 验证仓储持久化状态：project_id 与 status 均落盘
+    let stored_key = provider_catalog_repository
+        .list_keys_by_ids(&["key-antigravity-no-proj".to_string()])
+        .await
+        .expect("list_keys")
+        .into_iter()
+        .next()
+        .expect("stored key");
+    let meta = stored_key.upstream_metadata.as_ref().expect("metadata");
+    assert_eq!(meta["antigravity"]["project_id"], "proj-new-antigravity");
+    assert_eq!(meta["antigravity"]["account_info_status"], "success");
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_antigravity_initialize_project_is_idempotent_with_existing_project() {
+    run_admin_oauth_test(
+        "gateway_antigravity_initialize_project_is_idempotent_with_existing_project",
+        gateway_antigravity_initialize_project_is_idempotent_with_existing_project_impl,
+    );
+}
+
+async fn gateway_antigravity_initialize_project_is_idempotent_with_existing_project_impl() {
+    let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
+    let execution_plans_clone = Arc::clone(&execution_plans);
+
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let execution_plans = Arc::clone(&execution_plans_clone);
+            async move {
+                let url = plan.url.clone();
+                let request_id = plan.request_id.clone();
+                execution_plans.lock().expect("mutex").push(plan);
+                Json(json!({
+                    "request_id": request_id,
+                    "status_code": 200,
+                    "headers": { "content-type": "application/json" },
+                    "body": {
+                        "json_body": {
+                            "cloudaicompanionProject": { "id": "proj-existing-123" },
+                            "paidTier": { "id": "g1-pro-tier", "name": "Google One Pro" }
+                        }
+                    }
+                }))
+            }
+        }),
+    );
+    let mut provider = sample_provider("provider-antigravity", "antigravity", 10);
+    provider.provider_type = "antigravity".to_string();
+    let endpoint = sample_endpoint(
+        "endpoint-antigravity",
+        "provider-antigravity",
+        "gemini:generate_content",
+        "https://cloudcode-pa.googleapis.com",
+    );
+    let mut key = sample_key(
+        "key-antigravity-existing",
+        "provider-antigravity",
+        "gemini:generate_content",
+        "ya29.test-access-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"antigravity","refresh_token":"ya29.rt","access_token":"ya29.valid","expires_in":3600,"expires_at":9999999999,"project_id":"proj-existing-123"}"#,
+        )
+        .expect("auth config ciphertext"),
+    );
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![key],
+    ));
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/keys/key-antigravity-existing/initialize-project"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let text = response.text().await.expect("text");
+    assert_eq!(status, StatusCode::OK, "response body: {text}");
+    let payload: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(payload["key_id"], "key-antigravity-existing");
+    assert_eq!(payload["project_id"], "proj-existing-123");
+    assert_eq!(payload["onboarded"], false);
+
+    // Existing project MUST NOT call onboardUser
+    let plans = execution_plans.lock().expect("mutex");
+    assert!(!plans
+        .iter()
+        .any(|p| p.url.ends_with("/v1internal:onboardUser")));
+    let stored_key = provider_catalog_repository
+        .list_keys_by_ids(&["key-antigravity-existing".to_string()])
+        .await
+        .expect("list_keys")
+        .into_iter()
+        .next()
+        .expect("stored key");
+    let meta = stored_key.upstream_metadata.as_ref().expect("metadata");
+    assert_eq!(meta["antigravity"]["project_id"], "proj-existing-123");
+    assert_eq!(meta["antigravity"]["account_info_status"], "success");
+    assert_eq!(meta["antigravity"]["subscription_tier"], "pro");
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_antigravity_initialize_project_rejects_wrong_provider_or_unauthorized() {
+    run_admin_oauth_test(
+        "gateway_antigravity_initialize_project_rejects_wrong_provider_or_unauthorized",
+        gateway_antigravity_initialize_project_rejects_wrong_provider_or_unauthorized_impl,
+    );
+}
+
+async fn gateway_antigravity_initialize_project_rejects_wrong_provider_or_unauthorized_impl() {
+    let mut provider = sample_provider("provider-openai", "openai", 10);
+    provider.provider_type = "openai".to_string();
+    let endpoint = sample_endpoint(
+        "endpoint-openai",
+        "provider-openai",
+        "openai:chat",
+        "https://api.openai.com",
+    );
+    let mut key = sample_key(
+        "key-openai-1",
+        "provider-openai",
+        "openai:chat",
+        "sk-openai-token",
+    );
+    key.auth_type = "api_key".to_string();
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![key],
+    ));
+
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    // 1. Wrong provider type -> 400 Bad Request
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/keys/key-openai-1/initialize-project"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Unauthorized (missing admin headers) -> 401 or 403
+    let response_unauth = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/keys/key-openai-1/initialize-project"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert!(response_unauth.status().is_client_error());
+
+    gateway_handle.abort();
+}
+#[test]
+fn gateway_antigravity_initialize_project_stops_on_hard_refusal() {
+    run_admin_oauth_test(
+        "gateway_antigravity_initialize_project_stops_on_hard_refusal",
+        gateway_antigravity_initialize_project_stops_on_hard_refusal_impl,
+    );
+}
+
+async fn gateway_antigravity_initialize_project_stops_on_hard_refusal_impl() {
+    let onboard_attempts = Arc::new(Mutex::new(0usize));
+    let onboard_attempts_clone = Arc::clone(&onboard_attempts);
+
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let onboard_attempts = Arc::clone(&onboard_attempts_clone);
+            async move {
+                let url = plan.url.clone();
+                let request_id = plan.request_id.clone();
+                if url.ends_with("/v1internal:loadCodeAssist") {
+                    Json(json!({
+                        "request_id": request_id,
+                        "status_code": 200,
+                        "headers": { "content-type": "application/json" },
+                        "body": {
+                            "json_body": {
+                                "allowedTiers": [
+                                    { "id": "free-tier", "isDefault": true }
+                                ]
+                            }
+                        }
+                    }))
+                } else if url.ends_with("/v1internal:onboardUser") {
+                    let mut attempts = onboard_attempts.lock().expect("mutex");
+                    *attempts += 1;
+                    Json(json!({
+                        "request_id": request_id,
+                        "status_code": 400,
+                        "headers": { "content-type": "application/json" },
+                        "body": {
+                            "json_body": {
+                                "error": {
+                                    "code": 400,
+                                    "message": "ACCOUNT_INELIGIBLE"
+                                }
+                            }
+                        }
+                    }))
+                } else {
+                    Json(json!({
+                        "request_id": request_id,
+                        "status_code": 200,
+                        "headers": { "content-type": "application/json" },
+                        "body": { "json_body": {} }
+                    }))
+                }
+            }
+        }),
+    );
+    let mut provider = sample_provider("provider-antigravity", "antigravity", 10);
+    provider.provider_type = "antigravity".to_string();
+    let endpoint = sample_endpoint(
+        "endpoint-antigravity",
+        "provider-antigravity",
+        "gemini:generate_content",
+        "https://cloudcode-pa.googleapis.com",
+    );
+    let mut key = sample_key(
+        "key-antigravity-refusal",
+        "provider-antigravity",
+        "gemini:generate_content",
+        "ya29.test-access-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"antigravity","refresh_token":"ya29.rt","access_token":"ya29.valid","expires_in":3600,"expires_at":9999999999}"#,
+        )
+        .expect("auth config ciphertext"),
+    );
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![key],
+    ));
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/keys/key-antigravity-refusal/initialize-project"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let text = response.text().await.expect("text");
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "response body: {text}"
+    );
+
+    // 硬拒绝必须立即停止，不得轮询重试 5 次
+    let attempts = *onboard_attempts.lock().expect("mutex");
+    assert_eq!(attempts, 1);
+
+    // 验证仓储持久化状态更新为 error 观察
+    let stored_key = provider_catalog_repository
+        .list_keys_by_ids(&["key-antigravity-refusal".to_string()])
+        .await
+        .expect("list_keys")
+        .into_iter()
+        .next()
+        .expect("stored key");
+    let meta = stored_key.upstream_metadata.as_ref().expect("metadata");
+    assert_eq!(meta["antigravity"]["account_info_status"], "error");
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}

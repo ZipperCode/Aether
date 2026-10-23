@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot, RequestBody};
 use aether_provider_transport::antigravity::{
-    build_antigravity_static_client_headers, build_antigravity_static_identity_headers,
-    resolve_local_antigravity_request_auth, AntigravityRequestAuthSupport,
-    ANTIGRAVITY_REQUEST_USER_AGENT,
+    build_antigravity_fetch_available_models_body, build_antigravity_static_client_headers,
+    build_antigravity_static_identity_headers, resolve_local_antigravity_request_auth,
+    AntigravityRequestAuthSupport, ANTIGRAVITY_REQUEST_USER_AGENT,
 };
 use aether_provider_transport::auth::{
     ensure_upstream_auth_header, resolve_local_gemini_auth, resolve_local_openai_bearer_auth,
@@ -219,6 +219,7 @@ pub async fn build_antigravity_fetch_available_models_plan(
     transport: &GatewayProviderTransportSnapshot,
     base_url: &str,
     project_id: &str,
+    tier: Option<&str>,
 ) -> Result<ExecutionPlan, String> {
     let authorization = resolve_oauth_header_auth(runtime, transport)
         .await?
@@ -255,7 +256,9 @@ pub async fn build_antigravity_fetch_available_models_plan(
             url,
             headers,
             content_type: Some("application/json".to_string()),
-            body: RequestBody::from_json(json!({ "project": project_id })),
+            body: RequestBody::from_json(build_antigravity_fetch_available_models_body(
+                project_id, tier,
+            )),
             client_api_format: "gemini:generate_content".to_string(),
             provider_api_format: ANTIGRAVITY_FETCH_PROVIDER_API_FORMAT.to_string(),
             model_name: Some("fetchAvailableModels".to_string()),
@@ -1187,6 +1190,7 @@ mod tests {
             &transport,
             "https://daily-cloudcode-pa.sandbox.googleapis.com",
             "project-1",
+            None,
         )
         .await
         .expect("plan");
@@ -1206,6 +1210,31 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.get("project")),
             Some(&json!("project-1"))
+        );
+        assert_eq!(
+            plan.body
+                .json_body
+                .as_ref()
+                .and_then(|value| value.get("entitlement")),
+            None
+        );
+
+        let plan_with_tier = build_antigravity_fetch_available_models_plan(
+            &runtime,
+            &transport,
+            "https://daily-cloudcode-pa.sandbox.googleapis.com",
+            "project-1",
+            Some("g1-pro-tier"),
+        )
+        .await
+        .expect("plan with tier");
+        assert_eq!(
+            plan_with_tier
+                .body
+                .json_body
+                .as_ref()
+                .and_then(|value| value.pointer("/entitlement/userTier")),
+            Some(&json!("g1-pro-tier"))
         );
         assert_eq!(
             plan.headers.get("user-agent").map(String::as_str),

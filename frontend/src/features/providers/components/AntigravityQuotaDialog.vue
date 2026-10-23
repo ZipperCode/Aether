@@ -17,6 +17,25 @@
       >
         {{ tierBadgeLabel }}
       </Badge>
+      <Button
+        v-if="!hasProject && keyId"
+        variant="outline"
+        size="sm"
+        class="h-7 text-xs px-2 text-primary shrink-0"
+        :disabled="isInitializing"
+        data-testid="antigravity-initialize-project-header-button"
+        @click="showConfirm = true"
+      >
+        <Loader2
+          v-if="isInitializing"
+          class="w-3 h-3 mr-1 animate-spin"
+        />
+        <Sparkles
+          v-else
+          class="w-3 h-3 mr-1"
+        />
+        初始化伴生项目
+      </Button>
       <DropdownMenu
         v-if="providerId && rawItems.length > 0"
         :modal="false"
@@ -53,6 +72,30 @@
     </template>
 
     <div class="py-2">
+      <div
+        v-if="accountInfoStatus === 'error'"
+        class="mb-3 flex items-center justify-between rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+        data-testid="antigravity-account-info-error"
+      >
+        <div class="flex items-center gap-1.5">
+          <AlertCircle class="w-3.5 h-3.5 shrink-0" />
+          <span>账号状态查询失败</span>
+        </div>
+        <span
+          v-if="accountInfoCheckedAtText"
+          class="text-[10px] text-muted-foreground"
+        >
+          检查于 {{ accountInfoCheckedAtText }}
+        </span>
+      </div>
+      <div
+        v-else-if="accountInfoStatus === 'pending'"
+        class="mb-3 flex items-center gap-1.5 rounded-md border border-muted bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
+        data-testid="antigravity-account-info-pending"
+      >
+        <Loader2 class="w-3.5 h-3.5 shrink-0 animate-spin" />
+        <span>正在获取账号信息...</span>
+      </div>
       <div
         v-if="displayItems.length > 0"
         class="grid grid-cols-2 gap-3"
@@ -96,9 +139,12 @@
       </div>
       <div
         v-else
-        class="text-center text-sm text-muted-foreground py-8"
+        class="text-center py-8 space-y-3"
+        data-testid="antigravity-quota-empty"
       >
-        暂无配额数据
+        <p class="text-sm text-muted-foreground">
+          {{ !hasProject ? '该账号尚未绑定或初始化伴生项目' : '暂无配额数据' }}
+        </p>
       </div>
     </div>
     <template #footer>
@@ -109,13 +155,25 @@
         关闭
       </Button>
     </template>
+    <AlertDialog
+      :model-value="showConfirm"
+      title="初始化伴生项目"
+      description="将为该 Google 账号在上游 Google Cloud Code 执行伴生项目发现与初始化（onboardUser）。此操作将在上游 Google 账号创建/激活伴生项目。确认继续吗？"
+      :loading="isInitializing"
+      confirm-text="确认初始化"
+      cancel-text="取消"
+      @confirm="handleInitializeProject"
+      @cancel="showConfirm = false"
+    />
   </Dialog>
 </template>
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { BarChart3, Play, Loader2 } from 'lucide-vue-next'
+import { BarChart3, Play, Loader2, Sparkles, AlertCircle } from 'lucide-vue-next'
 import { Dialog } from '@/components/ui'
+import AlertDialog from '@/components/common/AlertDialog.vue'
+import { initializeAntigravityKeyProject, type InitializeAntigravityProjectResponse } from '@/api/endpoints/provider_oauth'
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -148,9 +206,58 @@ const props = defineProps<{
   keyId?: string
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   'update:open': [value: boolean]
+  'update:metadata': [value: UpstreamMetadata]
+  'initialized': [value: InitializeAntigravityProjectResponse]
 }>()
+
+const showConfirm = ref(false)
+const isInitializing = ref(false)
+
+const hasProject = computed(() => {
+  const project = props.metadata?.antigravity?.project_id
+  return typeof project === 'string' && project.trim().length > 0
+})
+
+const accountInfoStatus = computed(() => {
+  return props.metadata?.antigravity?.account_info_status ?? 'unknown'
+})
+function formatTimestampText(unixSecs?: number | null): string | null {
+  if (!unixSecs || !Number.isFinite(unixSecs)) return null
+  const date = new Date(unixSecs * 1000)
+  if (Number.isNaN(date.getTime())) return null
+  const diffSec = Math.floor((Date.now() - date.getTime()) / 1000)
+  if (diffSec < 60) return '刚刚'
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)} 分钟前`
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} 小时前`
+  return `${Math.floor(diffSec / 86400)} 天前`
+}
+
+const accountInfoCheckedAtText = computed(() => {
+  return formatTimestampText(props.metadata?.antigravity?.account_info_checked_at)
+})
+
+async function handleInitializeProject() {
+  const targetKeyId = props.keyId
+  if (!targetKeyId) return
+  isInitializing.value = true
+  try {
+    const res = await initializeAntigravityKeyProject(targetKeyId)
+    if (props.keyId !== targetKeyId) return
+    showSuccess(res.message || '伴生项目初始化成功')
+    emit('update:metadata', res.metadata)
+    emit('initialized', res)
+    showConfirm.value = false
+  } catch (error) {
+    if (props.keyId !== targetKeyId) return
+    showError(parseApiError(error, '伴生项目初始化失败'))
+  } finally {
+    if (props.keyId === targetKeyId) {
+      isInitializing.value = false
+    }
+  }
+}
 
 /** Antigravity 原始模型额度与可选家族范围展示字段。 */
 interface QuotaItem {

@@ -1,4 +1,5 @@
 import client from '../client'
+import type { UpstreamMetadata } from './types'
 
 const CLAUDE_COOKIE_AUTHORIZE_TIMEOUT_MS = 4 * 60 * 1000
 
@@ -231,6 +232,26 @@ export function normalizeBatchImportCredentials(text: string): BatchImportCreden
 
 export async function refreshProviderOAuth(keyId: string): Promise<ProviderOAuthCompleteResponse> {
   const resp = await client.post<ProviderOAuthCompleteResponse>(`/api/admin/provider-oauth/keys/${keyId}/refresh`)
+  return resp.data
+}
+
+export interface InitializeAntigravityProjectResponse {
+  key_id: string
+  project_id?: string | null
+  subscription_tier?: string | null
+  paid_tier_id?: string | null
+  current_tier_id?: string | null
+  onboarded: boolean
+  message?: string | null
+  metadata: UpstreamMetadata
+}
+
+export async function initializeAntigravityKeyProject(
+  keyId: string,
+): Promise<InitializeAntigravityProjectResponse> {
+  const resp = await client.post<InitializeAntigravityProjectResponse>(
+    `/api/admin/provider-oauth/keys/${keyId}/initialize-project`,
+  )
   return resp.data
 }
 

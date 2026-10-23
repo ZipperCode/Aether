@@ -2699,7 +2699,12 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
     );
     assert_eq!(
         fetch_models_request.request_body,
-        Some(json!({ "project": "project-ant-123" }))
+        Some(json!({
+            "project": "project-ant-123",
+            "entitlement": {
+                "userTier": "g1-pro-tier"
+            }
+        }))
     );
     let grouped_with_project = &seen_execution_runtime_requests[2];
     let grouped_without_project = &seen_execution_runtime_requests[3];

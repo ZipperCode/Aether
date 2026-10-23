@@ -308,3 +308,53 @@ diagnostic normalization, or their memory/PostgreSQL persistence paths.
 Wrong: weaken each caller's test after a shared projection loses its fields.
 Correct: repair the one shared projection/registry and preserve caller contracts.
 ```
+
+## Scenario: Explicit Antigravity project initialization
+
+### 1. Scope / Trigger
+
+Changes to Antigravity onboarding, admin OAuth mutations, request hydration or account observation persistence.
+
+### 2. Signatures
+
+- `POST /api/admin/provider-oauth/keys/{key_id}/initialize-project` uses the existing `admin:provider_oauth` authorization and audit dispatch.
+- `AppState::persist_antigravity_account_observation(key_id, patch, now) -> Result<Option<Value>, GatewayError>` owns atomic namespace persistence.
+- Response includes `key_id`, `project_id`, canonical/raw tier fields, `onboarded`, message and safely projected root metadata.
+
+### 3. Contracts
+
+- Only an explicit confirmed administrator action may execute onboardUser. Chat, background discovery and quota reads never initialize an upstream account.
+- Resolve existing projects from both auth config and metadata. Discover on production loadCodeAssist; onboard on the configured allowed Antigravity origin with redirects disabled and existing proxy/body/timeout guards.
+- Bound the full discovery/onboard/followup workflow to 15 seconds. At most five onboard attempts; only explicit `done=false` is pending. Hard errors and malformed completed responses stop immediately.
+- Persist initial tier evidence before onboarding and acquired project before optional followup. Query failure must never be converted into a successful observation.
+- Strong-read and CAS only the Antigravity namespace, retry conflicts at most three times, propagate database errors. Never fall back to unconditional writes from stale transport snapshots after CAS failure.
+- Request callers must permit TTL-controlled enrichment for already-supported accounts; checking freshness before hydration avoids full snapshot copying on fresh requests.
+- Apply returned metadata in the dialog/drawer and notify the pool parent, so desktop/mobile badges update without a page reload. Ignore results for a changed selected key.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Unauthenticated / wrong provider / unmanaged key | Reject without upstream initialization |
+| Project already configured | No onboardUser call |
+| Initial discovery invalid | Fail closed; save failed observation |
+| Pending operation | Bounded poll; no unbounded retry |
+| Completed project, followup failure | Retain project and previous tier; mark query failure |
+| Namespace CAS conflict / key deleted | Never fabricate successful persistence |
+
+### 5. Good / Base / Bad Cases
+
+Good: old account acquires its tier and missing-project initialization persists once. Base: initialized accounts only refresh observations. Bad: optional enrichment overwrites newer account data, or onboarding retries authentication failures.
+
+### 6. Tests Required
+
+- Existing configured project idempotency, pending-to-complete with actual wire body and stored metadata, hard refusal stop, unauthorized/wrong-provider rejection.
+- Hydration freshness and cached-tier preservation; failed discovery persists observations without replacing model whitelist.
+- Browser exercise of explicit confirmation and reactive badge update with local-only mock traffic.
+
+### 7. Wrong vs Correct
+
+Wrong: handle CAS failure with a stale full-metadata write, or hide query failure as successful cached data.
+
+Correct: one namespace-CAS owner, explicit success/error observations and a confirmed mutation boundary.
+

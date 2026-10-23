@@ -6,7 +6,10 @@ use aether_contracts::{
 };
 use aether_crypto::{rsa_pkcs1_sha256_sign, RsaPkcs1Sha256Error};
 use aether_provider_transport::antigravity::{
-    resolve_local_antigravity_request_auth, AntigravityRequestAuthSupport,
+    antigravity_account_observation_due, antigravity_account_observation_update,
+    antigravity_entitlement_candidates, is_antigravity_entitlement_rejection,
+    parse_antigravity_code_assist_response, resolve_local_antigravity_request_auth,
+    AntigravityRequestAuthSupport,
 };
 use aether_provider_transport::vertex::{
     looks_like_vertex_ai_host, parse_vertex_service_account_auth_config,
@@ -525,8 +528,27 @@ async fn fetch_antigravity_models(
     runtime: &(impl ModelFetchTransportRuntime + ?Sized),
     transport: &GatewayProviderTransportSnapshot,
 ) -> Result<ModelsFetchOutcome, String> {
-    let (project_id, hydrated_transport, project_metadata) =
+    let (project_id, hydrated_transport, observation_update) =
         resolve_or_hydrate_antigravity_project(runtime, transport).await?;
+
+    let Some(project_id) = project_id else {
+        return Ok(ModelsFetchOutcome {
+            fetched_model_ids: Vec::new(),
+            cached_models: Vec::new(),
+            legacy_models: Vec::new(),
+            errors: vec!["antigravity: loadCodeAssist response missing project_id".to_string()],
+            has_success: false,
+            used_preset_catalog: false,
+            successful_endpoint_ids: Vec::new(),
+            native_codex_catalog: false,
+            upstream_metadata: observation_update,
+            etag: None,
+            upstream_status: None,
+        });
+    };
+
+    let candidates =
+        antigravity_entitlement_candidates(hydrated_transport.key.upstream_metadata.as_ref());
 
     let mut errors = Vec::new();
     for base_url in [
@@ -534,44 +556,73 @@ async fn fetch_antigravity_models(
         ANTIGRAVITY_PROD_BASE_URL,
         ANTIGRAVITY_SANDBOX_BASE_URL,
     ] {
-        let plan = match build_antigravity_fetch_available_models_plan(
-            runtime,
-            &hydrated_transport,
-            base_url,
-            &project_id,
-        )
-        .await
-        {
-            Ok(plan) => plan,
-            Err(err) => return Err(sanitize_model_fetch_error(&err)),
-        };
+        'tier_loop: for tier in &candidates {
+            let plan = match build_antigravity_fetch_available_models_plan(
+                runtime,
+                &hydrated_transport,
+                base_url,
+                &project_id,
+                tier.as_deref(),
+            )
+            .await
+            {
+                Ok(plan) => plan,
+                Err(err) => return Err(sanitize_model_fetch_error(&err)),
+            };
 
-        let result = match runtime.execute_model_fetch_execution_plan(&plan).await {
-            Ok(result) => result,
-            Err(err) => {
-                errors.push(format!(
-                    "antigravity models fetch failed: {}",
-                    sanitize_model_fetch_error(&err)
-                ));
-                continue;
+            let result = match runtime.execute_model_fetch_execution_plan(&plan).await {
+                Ok(result) => result,
+                Err(err) => {
+                    errors.push(format!(
+                        "antigravity models fetch failed: {}",
+                        sanitize_model_fetch_error(&err)
+                    ));
+                    break 'tier_loop;
+                }
+            };
+
+            if (200..300).contains(&result.status_code) {
+                let body_json = execution_result_json_body_allow_empty(&result)?;
+                let (models, models_metadata) = parse_antigravity_models_response(&body_json)?;
+                let final_metadata = merge_antigravity_metadata(
+                    transport.key.upstream_metadata.as_ref(),
+                    observation_update.as_ref(),
+                    models_metadata.as_ref(),
+                    Some(&project_id),
+                );
+                return Ok(build_success_outcome(models, Some(final_metadata), true));
             }
-        };
 
-        if (200..300).contains(&result.status_code) {
-            let body_json = execution_result_json_body_allow_empty(&result)?;
-            let (models, metadata) = parse_antigravity_models_response(&body_json)?;
-            let metadata = metadata
-                .map(|metadata| attach_antigravity_project_metadata(metadata, &project_id))
-                .or(project_metadata.clone());
-            return Ok(build_success_outcome(models, metadata, true));
-        }
+            let body_json = execution_result_json_body_allow_empty(&result).unwrap_or_default();
+            if tier.is_some()
+                && is_antigravity_entitlement_rejection(result.status_code, &body_json)
+            {
+                continue 'tier_loop;
+            }
 
-        let error = execution_result_error_message(&result);
-        if should_fallback_antigravity_status(result.status_code) {
+            let error = execution_result_error_message(&result);
+            if should_fallback_antigravity_status(result.status_code) {
+                errors.push(format!("antigravity models fetch failed: {error}"));
+                break 'tier_loop;
+            }
+
+            // Terminal error (e.g. 401, 403, or non-entitlement 400):
+            // Return failure outcome preserving observation metadata patch and upstream status!
             errors.push(format!("antigravity models fetch failed: {error}"));
-            continue;
+            return Ok(ModelsFetchOutcome {
+                fetched_model_ids: Vec::new(),
+                cached_models: Vec::new(),
+                legacy_models: Vec::new(),
+                errors,
+                has_success: false,
+                used_preset_catalog: false,
+                successful_endpoint_ids: Vec::new(),
+                native_codex_catalog: false,
+                upstream_metadata: observation_update,
+                etag: None,
+                upstream_status: Some(result.status_code),
+            });
         }
-        return Err(sanitize_model_fetch_error(&error));
     }
 
     Ok(ModelsFetchOutcome {
@@ -583,42 +634,65 @@ async fn fetch_antigravity_models(
         used_preset_catalog: false,
         successful_endpoint_ids: Vec::new(),
         native_codex_catalog: false,
-        upstream_metadata: None,
+        upstream_metadata: observation_update,
         etag: None,
         upstream_status: None,
     })
 }
-
 async fn resolve_or_hydrate_antigravity_project(
     runtime: &(impl ModelFetchTransportRuntime + ?Sized),
     transport: &GatewayProviderTransportSnapshot,
-) -> Result<(String, GatewayProviderTransportSnapshot, Option<Value>), String> {
-    if let Some(project_id) = resolve_antigravity_project_id_from_transport(transport) {
-        let metadata = Some(build_antigravity_project_metadata(&project_id));
-        return Ok((project_id, transport.clone(), metadata));
-    }
+) -> Result<
+    (
+        Option<String>,
+        GatewayProviderTransportSnapshot,
+        Option<Value>,
+    ),
+    String,
+> {
+    let now = now_unix_secs();
+    let existing_project = resolve_antigravity_project_id_from_transport(transport);
+    let is_due = antigravity_account_observation_due(transport.key.upstream_metadata.as_ref(), now);
 
-    let plan = build_antigravity_load_code_assist_plan(runtime, transport)
-        .await
-        .map_err(|error| sanitize_model_fetch_error(&error))?;
-    let result = runtime
-        .execute_model_fetch_execution_plan(&plan)
-        .await
-        .map_err(|error| sanitize_model_fetch_error(&error))?;
-    if !(200..300).contains(&result.status_code) {
-        return Err(format!(
-            "antigravity: loadCodeAssist failed: {}",
-            execution_result_error_message(&result)
-        ));
-    }
-    let body_json = execution_result_json_body_allow_empty(&result)?;
-    let project_id = extract_cloud_ai_companion_project_id(&body_json)
-        .ok_or_else(|| "antigravity: loadCodeAssist response missing project_id".to_string())?;
-    let metadata = build_antigravity_project_metadata(&project_id);
+    let (active_project, observation_update) = if is_due {
+        let load_plan = build_antigravity_load_code_assist_plan(runtime, transport).await;
+        let exec_result = match load_plan {
+            Ok(plan) => runtime.execute_model_fetch_execution_plan(&plan).await,
+            Err(err) => Err(err),
+        };
+
+        match exec_result {
+            Ok(result) if (200..300).contains(&result.status_code) => {
+                let body_json = execution_result_json_body_allow_empty(&result).unwrap_or_default();
+                if let Some(info) = parse_antigravity_code_assist_response(&body_json) {
+                    let update = antigravity_account_observation_update(Some(&info), now);
+                    let project = info.project_id.or(existing_project);
+                    (project, Some(update))
+                } else {
+                    let update = antigravity_account_observation_update(None, now);
+                    (existing_project, Some(update))
+                }
+            }
+            _ => {
+                let update = antigravity_account_observation_update(None, now);
+                (existing_project, Some(update))
+            }
+        }
+    } else {
+        (existing_project, None)
+    };
+
+    let merged_metadata = merge_antigravity_metadata(
+        transport.key.upstream_metadata.as_ref(),
+        observation_update.as_ref(),
+        None,
+        active_project.as_deref(),
+    );
+
     let mut hydrated_transport = transport.clone();
-    hydrated_transport.key.upstream_metadata = Some(metadata.clone());
+    hydrated_transport.key.upstream_metadata = Some(merged_metadata);
 
-    Ok((project_id, hydrated_transport, Some(metadata)))
+    Ok((active_project, hydrated_transport, observation_update))
 }
 
 fn resolve_antigravity_project_id_from_transport(
@@ -630,36 +704,29 @@ fn resolve_antigravity_project_id_from_transport(
     }
 }
 
-fn build_antigravity_project_metadata(project_id: &str) -> Value {
-    json!({
-        "antigravity": {
-            "project_id": project_id,
-            "updated_at": now_unix_secs(),
-        }
-    })
-}
-
-fn attach_antigravity_project_metadata(mut metadata: Value, project_id: &str) -> Value {
-    let Value::Object(root) = &mut metadata else {
-        return build_antigravity_project_metadata(project_id);
-    };
-    let antigravity = root
-        .entry("antigravity".to_string())
-        .or_insert_with(|| json!({}));
-    let Some(object) = antigravity.as_object_mut() else {
-        *antigravity = json!({
-            "project_id": project_id,
-            "updated_at": now_unix_secs(),
+fn merge_antigravity_metadata(
+    current: Option<&Value>,
+    observation_update: Option<&Value>,
+    models_metadata: Option<&Value>,
+    project_id: Option<&str>,
+) -> Value {
+    let mut merged = current.cloned().unwrap_or_else(|| json!({}));
+    if let Some(update) = observation_update {
+        merged = crate::logic::merge_upstream_metadata(Some(&merged), update);
+    }
+    if let Some(models_meta) = models_metadata {
+        merged = crate::logic::merge_upstream_metadata(Some(&merged), models_meta);
+    }
+    if let Some(project_id) = project_id {
+        let project_update = json!({
+            "antigravity": {
+                "project_id": project_id,
+                "updated_at": now_unix_secs(),
+            }
         });
-        return metadata;
-    };
-    object
-        .entry("project_id".to_string())
-        .or_insert_with(|| Value::String(project_id.to_string()));
-    object
-        .entry("updated_at".to_string())
-        .or_insert_with(|| Value::from(now_unix_secs()));
-    metadata
+        merged = crate::logic::merge_upstream_metadata(Some(&merged), &project_update);
+    }
+    merged
 }
 
 async fn fetch_gemini_cli_models(
@@ -1540,14 +1607,12 @@ fn parse_antigravity_models_response(body: &Value) -> Result<(Vec<Value>, Option
         }
     }
 
-    let upstream_metadata = (!quota_by_model.is_empty()).then(|| {
-        json!({
-            "antigravity": {
-                "updated_at": now_unix_secs(),
-                "quota_by_model": quota_by_model,
-            }
-        })
-    });
+    let upstream_metadata = Some(json!({
+        "antigravity": {
+            "updated_at": now_unix_secs(),
+            "quota_by_model": quota_by_model,
+        }
+    }));
 
     Ok((models, upstream_metadata))
 }
@@ -2195,8 +2260,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use aether_contracts::{
-        redact_url_for_debug, ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionResult,
-        ResponseBody,
+        redact_url_for_debug, ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionPlan,
+        ExecutionResult, ResponseBody,
     };
     use aether_provider_transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -2212,7 +2277,7 @@ mod tests {
 
     use super::{
         build_vertex_google_list_url, build_vertex_service_account_assertion,
-        build_vertex_service_account_list_url, parse_antigravity_models_response,
+        build_vertex_service_account_list_url, now_unix_secs, parse_antigravity_models_response,
         parse_codex_models_response_for_request, select_model_fetch_strategy, ModelFetchStrategy,
         ModelFetchStrategyKind,
     };
@@ -2544,6 +2609,18 @@ mod tests {
         transport.key.decrypted_api_key = "__placeholder__".to_string();
         transport.key.decrypted_auth_config =
             Some(r#"{"provider_type":"antigravity","refresh_token":"rt"}"#.to_string());
+        transport
+    }
+
+    fn sample_antigravity_transport_with_project(
+        project_id: &str,
+        metadata: Option<Value>,
+    ) -> GatewayProviderTransportSnapshot {
+        let mut transport = sample_antigravity_transport_without_project();
+        transport.key.decrypted_auth_config = Some(format!(
+            r#"{{"provider_type":"antigravity","refresh_token":"rt","project_id":"{project_id}"}}"#
+        ));
+        transport.key.upstream_metadata = metadata;
         transport
     }
 
@@ -3725,6 +3802,640 @@ mod tests {
         );
     }
 
+    struct AntigravityMockRuntime<F>
+    where
+        F: Fn(&ExecutionPlan) -> Result<ExecutionResult, String> + Send + Sync,
+    {
+        handler: F,
+        executed_plans: Arc<Mutex<Vec<ExecutionPlan>>>,
+    }
+
+    impl<F> AntigravityMockRuntime<F>
+    where
+        F: Fn(&ExecutionPlan) -> Result<ExecutionResult, String> + Send + Sync,
+    {
+        fn new(handler: F) -> (Self, Arc<Mutex<Vec<ExecutionPlan>>>) {
+            let executed_plans = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    handler,
+                    executed_plans: Arc::clone(&executed_plans),
+                },
+                executed_plans,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl<F> ModelFetchTransportRuntime for AntigravityMockRuntime<F>
+    where
+        F: Fn(&ExecutionPlan) -> Result<ExecutionResult, String> + Send + Sync,
+    {
+        async fn resolve_local_oauth_request_auth(
+            &self,
+            _transport: &GatewayProviderTransportSnapshot,
+        ) -> Result<Option<aether_provider_transport::LocalResolvedOAuthRequestAuth>, String>
+        {
+            Ok(Some(
+                aether_provider_transport::LocalResolvedOAuthRequestAuth::Header {
+                    name: "authorization".to_string(),
+                    value: "Bearer oauth-token".to_string(),
+                },
+            ))
+        }
+
+        async fn resolve_model_fetch_proxy(
+            &self,
+            _transport: &GatewayProviderTransportSnapshot,
+        ) -> Option<aether_contracts::ProxySnapshot> {
+            None
+        }
+
+        async fn execute_model_fetch_execution_plan(
+            &self,
+            plan: &ExecutionPlan,
+        ) -> Result<ExecutionResult, String> {
+            self.executed_plans
+                .lock()
+                .expect("executed_plans lock")
+                .push(plan.clone());
+            (self.handler)(plan)
+        }
+    }
+
+    fn mock_json_result(
+        plan: &ExecutionPlan,
+        status_code: u16,
+        body: Value,
+    ) -> Result<ExecutionResult, String> {
+        Ok(ExecutionResult {
+            request_id: plan.request_id.clone(),
+            candidate_id: plan.candidate_id.clone(),
+            status_code,
+            headers: BTreeMap::new(),
+            response_observation: None,
+            body: Some(ResponseBody {
+                json_body: Some(body),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        })
+    }
+
+    /// 验证权益回退顺序：优先尝试 raw paid_tier_id，被拒绝后降级至 current_tier_id，再次被拒后以无 entitlement 发起请求。
+    #[tokio::test]
+    async fn antigravity_model_fetch_entitlement_order_tries_paid_then_current_then_none() {
+        let (runtime, executed_plans) = AntigravityMockRuntime::new(|plan| {
+            if plan.url.contains("fetchAvailableModels") {
+                let tier = plan
+                    .body
+                    .json_body
+                    .as_ref()
+                    .and_then(|b| b.pointer("/entitlement/userTier"))
+                    .and_then(Value::as_str);
+                match tier {
+                    Some("g1-ultra-tier") => mock_json_result(
+                        plan,
+                        400,
+                        json!({
+                            "error": {
+                                "status": "INVALID_ARGUMENT",
+                                "message": "The userTier entitlement is invalid for this account"
+                            }
+                        }),
+                    ),
+                    Some("g1-pro-tier") => mock_json_result(
+                        plan,
+                        412,
+                        json!({
+                            "error": {
+                                "status": "FAILED_PRECONDITION",
+                                "message": "Precondition failed: tier not allowed"
+                            }
+                        }),
+                    ),
+                    None => mock_json_result(
+                        plan,
+                        200,
+                        json!({
+                            "models": {
+                                "chat_model": {
+                                    "displayName": "Antigravity Chat"
+                                }
+                            }
+                        }),
+                    ),
+                    _ => Err(format!("unexpected tier: {tier:?}")),
+                }
+            } else {
+                Err(format!("unexpected URL: {}", plan.url))
+            }
+        });
+
+        let transport = sample_antigravity_transport_with_project(
+            "test-project-1",
+            Some(json!({
+                "antigravity": {
+                    "paid_tier_id": "g1-ultra-tier",
+                    "current_tier_id": "g1-pro-tier",
+                    "subscription_tier": "ultra",
+                    "account_info_status": "success",
+                    "account_info_checked_at": now_unix_secs(),
+                }
+            })),
+        );
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("fetch should succeed on None fallback");
+
+        assert!(outcome.has_success);
+        assert_eq!(outcome.fetched_model_ids, vec!["chat_model"]);
+
+        let plans = executed_plans.lock().expect("lock");
+        assert_eq!(plans.len(), 3);
+        assert_eq!(
+            plans[0]
+                .body
+                .json_body
+                .as_ref()
+                .and_then(|b| b.pointer("/entitlement/userTier")),
+            Some(&json!("g1-ultra-tier"))
+        );
+        assert_eq!(
+            plans[1]
+                .body
+                .json_body
+                .as_ref()
+                .and_then(|b| b.pointer("/entitlement/userTier")),
+            Some(&json!("g1-pro-tier"))
+        );
+        assert_eq!(
+            plans[2]
+                .body
+                .json_body
+                .as_ref()
+                .and_then(|b| b.get("entitlement")),
+            None
+        );
+    }
+
+    /// 验证认证失败（401/403）绝不触发套餐回退，立即终止。
+    #[tokio::test]
+    async fn antigravity_model_fetch_does_not_fallback_entitlement_on_auth_failure() {
+        let (runtime, executed_plans) = AntigravityMockRuntime::new(|plan| {
+            mock_json_result(
+                plan,
+                401,
+                json!({
+                    "error": {
+                        "status": "UNAUTHENTICATED",
+                        "message": "Invalid credentials or token expired"
+                    }
+                }),
+            )
+        });
+
+        let transport = sample_antigravity_transport_with_project(
+            "test-project-1",
+            Some(json!({
+                "antigravity": {
+                    "paid_tier_id": "g1-ultra-tier",
+                    "current_tier_id": "g1-pro-tier",
+                    "subscription_tier": "ultra",
+                    "account_info_status": "success",
+                    "account_info_checked_at": now_unix_secs(),
+                }
+            })),
+        );
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("terminal auth failure should return failure outcome with metadata, not Err");
+
+        assert!(!outcome.has_success);
+        assert_eq!(outcome.upstream_status, Some(401));
+        assert!(outcome.fetched_model_ids.is_empty());
+        let plans = executed_plans.lock().expect("lock");
+        assert_eq!(
+            plans.len(),
+            1,
+            "must not attempt secondary entitlement on auth failure"
+        );
+    }
+
+    /// 验证 loadCodeAssist 成功识别套餐但缺少 companion project 时，返回携带元数据的失败结果，绝不丢弃已观察套餐。
+    #[tokio::test]
+    async fn antigravity_model_fetch_preserves_observation_when_project_missing() {
+        let (runtime, _plans) = AntigravityMockRuntime::new(|plan| {
+            if plan.url.contains("loadCodeAssist") {
+                mock_json_result(
+                    plan,
+                    200,
+                    json!({
+                        "paidTier": {
+                            "id": "g1-pro-tier",
+                            "name": "Google One Pro"
+                        }
+                    }),
+                )
+            } else {
+                Err(format!("unexpected URL: {}", plan.url))
+            }
+        });
+
+        let transport = sample_antigravity_transport_without_project();
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("fetch should return failure outcome when project missing, not Err");
+
+        assert!(!outcome.has_success);
+        assert!(outcome.fetched_model_ids.is_empty());
+        let meta = outcome
+            .upstream_metadata
+            .expect("observation must be preserved");
+        assert_eq!(meta["antigravity"]["account_info_status"], "success");
+        assert_eq!(meta["antigravity"]["subscription_tier"], "pro");
+        assert_eq!(meta["antigravity"]["paid_tier_id"], "g1-pro-tier");
+    }
+
+    /// 验证 429 限流触发主机故障转移，而不作为套餐降级重试。
+    #[tokio::test]
+    async fn antigravity_model_fetch_does_not_fallback_entitlement_on_throttle() {
+        let (runtime, executed_plans) = AntigravityMockRuntime::new(|plan| {
+            if plan.url.contains("daily-cloudcode-pa") {
+                mock_json_result(
+                    plan,
+                    429,
+                    json!({
+                        "error": {
+                            "status": "RESOURCE_EXHAUSTED",
+                            "message": "Quota exceeded on daily"
+                        }
+                    }),
+                )
+            } else {
+                mock_json_result(
+                    plan,
+                    200,
+                    json!({
+                        "models": {
+                            "chat_model": {
+                                "displayName": "Antigravity Chat"
+                            }
+                        }
+                    }),
+                )
+            }
+        });
+
+        let transport = sample_antigravity_transport_with_project(
+            "test-project-1",
+            Some(json!({
+                "antigravity": {
+                    "paid_tier_id": "g1-ultra-tier",
+                    "current_tier_id": "g1-pro-tier",
+                    "subscription_tier": "ultra",
+                    "account_info_status": "success",
+                    "account_info_checked_at": now_unix_secs(),
+                }
+            })),
+        );
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("host fallback should succeed");
+
+        assert!(outcome.has_success);
+        let plans = executed_plans.lock().expect("lock");
+        assert_eq!(
+            plans.len(),
+            2,
+            "throttle triggers host fallback, not entitlement fallback"
+        );
+        assert!(plans[0].url.contains("daily-cloudcode-pa"));
+        assert_eq!(
+            plans[0]
+                .body
+                .json_body
+                .as_ref()
+                .and_then(|b| b.pointer("/entitlement/userTier")),
+            Some(&json!("g1-ultra-tier"))
+        );
+        assert!(plans[1].url.contains("cloudcode-pa.googleapis.com"));
+        assert_eq!(
+            plans[1]
+                .body
+                .json_body
+                .as_ref()
+                .and_then(|b| b.pointer("/entitlement/userTier")),
+            Some(&json!("g1-ultra-tier"))
+        );
+    }
+
+    /// 验证底层网络传输错误不进行套餐降级重试，直接进入主机故障转移。
+    #[tokio::test]
+    async fn antigravity_model_fetch_does_not_fallback_entitlement_on_transport_error() {
+        let (runtime, executed_plans) = AntigravityMockRuntime::new(|plan| {
+            if plan.url.contains("daily-cloudcode-pa") {
+                Err("network connection reset".to_string())
+            } else {
+                mock_json_result(
+                    plan,
+                    200,
+                    json!({
+                        "models": {
+                            "chat_model": {
+                                "displayName": "Antigravity Chat"
+                            }
+                        }
+                    }),
+                )
+            }
+        });
+
+        let transport = sample_antigravity_transport_with_project(
+            "test-project-1",
+            Some(json!({
+                "antigravity": {
+                    "paid_tier_id": "g1-ultra-tier",
+                    "current_tier_id": "g1-pro-tier",
+                    "subscription_tier": "ultra",
+                    "account_info_status": "success",
+                    "account_info_checked_at": now_unix_secs(),
+                }
+            })),
+        );
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("host fallback should succeed after transport error");
+
+        assert!(outcome.has_success);
+        let plans = executed_plans.lock().expect("lock");
+        assert_eq!(plans.len(), 2);
+        assert!(plans[0].url.contains("daily-cloudcode-pa"));
+        assert!(plans[1].url.contains("cloudcode-pa.googleapis.com"));
+    }
+
+    /// 验证已有 project_id 的账号在观察过期时仍主动调用 loadCodeAssist 补全套餐。
+    #[tokio::test]
+    async fn antigravity_model_fetch_existing_project_queries_due_observation() {
+        let (runtime, executed_plans) = AntigravityMockRuntime::new(|plan| {
+            if plan.url.contains("loadCodeAssist") {
+                mock_json_result(
+                    plan,
+                    200,
+                    json!({
+                        "paidTier": {
+                            "id": "g1-ultra-tier",
+                            "name": "Google One Ultra"
+                        },
+                        "currentTier": {
+                            "id": "free-tier"
+                        }
+                    }),
+                )
+            } else {
+                mock_json_result(
+                    plan,
+                    200,
+                    json!({
+                        "models": {
+                            "chat_model": { "displayName": "Antigravity Chat" }
+                        }
+                    }),
+                )
+            }
+        });
+
+        let transport = sample_antigravity_transport_with_project("cached-proj-123", None);
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("fetch should succeed");
+
+        assert!(outcome.has_success);
+        let plans = executed_plans.lock().expect("lock");
+        assert_eq!(plans.len(), 2);
+        assert!(plans[0].url.contains("loadCodeAssist"));
+        assert!(plans[1].url.contains("fetchAvailableModels"));
+        assert_eq!(
+            plans[1]
+                .body
+                .json_body
+                .as_ref()
+                .and_then(|b| b.pointer("/entitlement/userTier")),
+            Some(&json!("g1-ultra-tier"))
+        );
+
+        let meta = outcome.upstream_metadata.expect("metadata");
+        assert_eq!(meta["antigravity"]["account_info_status"], "success");
+        assert_eq!(meta["antigravity"]["subscription_tier"], "ultra");
+        assert_eq!(meta["antigravity"]["paid_tier_id"], "g1-ultra-tier");
+        assert_eq!(meta["antigravity"]["current_tier_id"], "free-tier");
+        assert_eq!(meta["antigravity"]["project_id"], "cached-proj-123");
+    }
+
+    /// 验证 loadCodeAssist 偶发失败（best-effort）时保留旧缓存项目和已记录套餐证据，并标记 account_info_status: error。
+    #[tokio::test]
+    async fn antigravity_model_fetch_preserves_cached_project_and_tier_on_load_code_assist_failure()
+    {
+        let (runtime, executed_plans) = AntigravityMockRuntime::new(|plan| {
+            if plan.url.contains("loadCodeAssist") {
+                mock_json_result(
+                    plan,
+                    500,
+                    json!({ "error": { "code": 500, "message": "internal server error" } }),
+                )
+            } else {
+                mock_json_result(
+                    plan,
+                    200,
+                    json!({
+                        "models": {
+                            "chat_model": { "displayName": "Antigravity Chat" }
+                        }
+                    }),
+                )
+            }
+        });
+
+        let transport = sample_antigravity_transport_with_project(
+            "cached-proj-123",
+            Some(json!({
+                "antigravity": {
+                    "subscription_tier": "pro",
+                    "paid_tier_id": "g1-pro-tier",
+                    "current_tier_id": "g1-pro-tier",
+                    "account_info_status": "success",
+                    "account_info_checked_at": 100,
+                    "account_info_updated_at": 100,
+                }
+            })),
+        );
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("fetch should proceed with cached project even if loadCodeAssist fails");
+
+        assert!(outcome.has_success);
+        let plans = executed_plans.lock().expect("lock");
+        assert_eq!(plans.len(), 2);
+        assert!(plans[0].url.contains("loadCodeAssist"));
+        assert!(plans[1].url.contains("fetchAvailableModels"));
+        assert_eq!(
+            plans[1]
+                .body
+                .json_body
+                .as_ref()
+                .and_then(|b| b.pointer("/entitlement/userTier")),
+            Some(&json!("g1-pro-tier"))
+        );
+
+        let meta = outcome.upstream_metadata.expect("metadata");
+        assert_eq!(meta["antigravity"]["account_info_status"], "error");
+        assert_eq!(meta["antigravity"]["subscription_tier"], "pro");
+        assert_eq!(meta["antigravity"]["paid_tier_id"], "g1-pro-tier");
+        assert_eq!(meta["antigravity"]["current_tier_id"], "g1-pro-tier");
+        assert_eq!(meta["antigravity"]["account_info_updated_at"], 100);
+        assert_eq!(meta["antigravity"]["project_id"], "cached-proj-123");
+    }
+
+    /// 验证元数据合并时不会冲掉其他厂商命名空间。
+    #[tokio::test]
+    async fn antigravity_model_fetch_preserves_other_namespaces() {
+        let (runtime, _plans) = AntigravityMockRuntime::new(|plan| {
+            mock_json_result(
+                plan,
+                200,
+                json!({
+                    "models": {
+                        "chat_model": { "displayName": "Antigravity Chat" }
+                    }
+                }),
+            )
+        });
+
+        let transport = sample_antigravity_transport_with_project(
+            "cached-proj-123",
+            Some(json!({
+                "gemini_cli": { "plan_type": "enterprise" },
+                "custom_ns": { "flag": true },
+                "antigravity": {
+                    "subscription_tier": "ultra",
+                    "paid_tier_id": "g1-ultra-tier",
+                    "account_info_status": "success",
+                    "account_info_checked_at": now_unix_secs(),
+                }
+            })),
+        );
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("fetch should succeed");
+
+        assert!(outcome.has_success);
+        let meta = outcome.upstream_metadata.expect("metadata");
+        assert_eq!(meta["gemini_cli"]["plan_type"], "enterprise");
+        assert_eq!(meta["custom_ns"]["flag"], true);
+        assert_eq!(meta["antigravity"]["subscription_tier"], "ultra");
+        assert_eq!(meta["antigravity"]["project_id"], "cached-proj-123");
+    }
+
+    /// 验证上游权威返回未知套餐时，正确将套餐清空（设为 null），而不是保留旧值或推断为 Free。
+    #[tokio::test]
+    async fn antigravity_model_fetch_successful_unknown_clears_old_tier() {
+        let (runtime, _plans) = AntigravityMockRuntime::new(|plan| {
+            if plan.url.contains("loadCodeAssist") {
+                mock_json_result(
+                    plan,
+                    200,
+                    json!({
+                        "cloudaicompanionProject": {
+                            "id": "new-proj-456"
+                        }
+                    }),
+                )
+            } else {
+                mock_json_result(
+                    plan,
+                    200,
+                    json!({
+                        "models": {
+                            "chat_model": { "displayName": "Antigravity Chat" }
+                        }
+                    }),
+                )
+            }
+        });
+
+        let transport = sample_antigravity_transport_with_project(
+            "cached-proj-123",
+            Some(json!({
+                "antigravity": {
+                    "subscription_tier": "pro",
+                    "paid_tier_id": "g1-pro-tier",
+                    "current_tier_id": "g1-pro-tier",
+                    "account_info_status": "success",
+                    "account_info_checked_at": 100,
+                }
+            })),
+        );
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("fetch should succeed");
+
+        assert!(outcome.has_success);
+        let meta = outcome.upstream_metadata.expect("metadata");
+        assert_eq!(meta["antigravity"]["account_info_status"], "success");
+        assert_eq!(meta["antigravity"]["subscription_tier"], Value::Null);
+        assert_eq!(meta["antigravity"]["paid_tier_id"], Value::Null);
+        assert_eq!(meta["antigravity"]["current_tier_id"], Value::Null);
+        assert_eq!(meta["antigravity"]["project_id"], "new-proj-456");
+    }
+
+    /// 验证所有主机发现均失败时，已更新的账号观察元数据仍通过 ModelsFetchOutcome 完整传出，不丢弃。
+    #[tokio::test]
+    async fn antigravity_model_fetch_preserves_failure_metadata_when_all_hosts_fail() {
+        let (runtime, _plans) = AntigravityMockRuntime::new(|plan| {
+            if plan.url.contains("loadCodeAssist") {
+                mock_json_result(
+                    plan,
+                    200,
+                    json!({
+                        "paidTier": {
+                            "id": "g1-ultra-tier",
+                            "name": "Google One Ultra"
+                        }
+                    }),
+                )
+            } else {
+                mock_json_result(
+                    plan,
+                    503,
+                    json!({ "error": { "code": 503, "message": "service unavailable" } }),
+                )
+            }
+        });
+
+        let transport = sample_antigravity_transport_with_project("cached-proj-123", None);
+
+        let outcome = fetch_models_from_transports(&runtime, std::slice::from_ref(&transport))
+            .await
+            .expect("outcome returned even on host failures");
+
+        assert!(!outcome.has_success);
+        let patch = outcome
+            .upstream_metadata
+            .expect("failure observation patch must be preserved");
+        assert_eq!(patch["antigravity"]["account_info_status"], "success");
+        assert_eq!(patch["antigravity"]["subscription_tier"], "ultra");
+        assert_eq!(patch["antigravity"]["paid_tier_id"], "g1-ultra-tier");
+    }
     #[test]
     fn antigravity_models_without_explicit_quota_are_not_marked_exhausted() {
         let (models, metadata) = parse_antigravity_models_response(&json!({

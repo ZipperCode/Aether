@@ -1,9 +1,16 @@
+mod account;
 mod auth;
 mod policy;
 mod request;
 mod schema;
 mod url;
 
+pub use account::{
+    antigravity_account_observation_due, antigravity_account_observation_update,
+    antigravity_entitlement_candidates, build_antigravity_fetch_available_models_body,
+    is_antigravity_entitlement_rejection, parse_antigravity_code_assist_response,
+    AntigravityCodeAssistInfo,
+};
 pub use auth::{
     build_antigravity_static_client_headers, build_antigravity_static_identity_headers,
     resolve_local_antigravity_request_auth, AntigravityRequestAuth, AntigravityRequestAuthSupport,

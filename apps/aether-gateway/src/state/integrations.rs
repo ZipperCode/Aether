@@ -10,9 +10,9 @@ use aether_data_contracts::repository::global_models::{
     StoredAdminProviderModel, StoredModelEndpointBinding, UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::repository::provider_catalog::{
-    ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
-    StoredProviderCatalogKey, StoredProviderCatalogModelFetchCandidate,
-    StoredProviderCatalogProvider,
+    ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogUpstreamMetadataNamespaceUpdate,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
 use aether_data_contracts::DataLayerError;
@@ -85,11 +85,23 @@ impl AppState {
         if !provider_transport::antigravity::is_antigravity_provider_transport(transport) {
             return None;
         }
-        if matches!(
+        let had_usable_transport = matches!(
             provider_transport::antigravity::resolve_local_antigravity_request_auth(transport),
             provider_transport::antigravity::AntigravityRequestAuthSupport::Supported(_)
-        ) {
-            return Some(transport.clone());
+        );
+        let now_unix_secs = current_unix_secs();
+        let observation_due = provider_transport::antigravity::antigravity_account_observation_due(
+            transport.key.upstream_metadata.as_ref(),
+            now_unix_secs,
+        );
+
+        // 未到期时压制查询：有可用项目直接返回快照；无可用项目（处于失败冷却期）直接返回 None。
+        if !observation_due {
+            return if had_usable_transport {
+                Some(transport.clone())
+            } else {
+                None
+            };
         }
 
         let plan = match build_antigravity_load_code_assist_plan(self, transport).await {
@@ -102,9 +114,16 @@ impl AppState {
                     error = %err,
                     "antigravity project metadata hydration failed"
                 );
-                return None;
+                return self
+                    .persist_antigravity_hydration_failure(
+                        transport,
+                        had_usable_transport,
+                        now_unix_secs,
+                    )
+                    .await;
             }
         };
+
         let result =
             match execution_runtime::execute_execution_runtime_sync_plan(self, None, &plan).await {
                 Ok(result) => result,
@@ -116,9 +135,16 @@ impl AppState {
                         error = ?err,
                         "antigravity project metadata hydration request failed"
                     );
-                    return None;
+                    return self
+                        .persist_antigravity_hydration_failure(
+                            transport,
+                            had_usable_transport,
+                            now_unix_secs,
+                        )
+                        .await;
                 }
             };
+
         if !(200..300).contains(&result.status_code) {
             warn!(
                 provider_id = %transport.provider.id,
@@ -127,58 +153,199 @@ impl AppState {
                 status_code = result.status_code,
                 "antigravity project metadata hydration returned non-success status"
             );
-            return None;
+            return self
+                .persist_antigravity_hydration_failure(
+                    transport,
+                    had_usable_transport,
+                    now_unix_secs,
+                )
+                .await;
         }
-        let Some(project_id) = result
+
+        let parsed_info = result
             .body
             .as_ref()
             .and_then(|body| body.json_body.as_ref())
-            .and_then(extract_antigravity_load_code_assist_project_id)
-        else {
+            .and_then(provider_transport::antigravity::parse_antigravity_code_assist_response);
+
+        let Some(info) = parsed_info else {
             warn!(
                 provider_id = %transport.provider.id,
                 endpoint_id = %transport.endpoint.id,
                 key_id = %transport.key.id,
-                "antigravity project metadata hydration response missing project"
+                "antigravity project metadata hydration response missing project or invalid"
             );
-            return None;
+            return self
+                .persist_antigravity_hydration_failure(
+                    transport,
+                    had_usable_transport,
+                    now_unix_secs,
+                )
+                .await;
         };
-        let upstream_metadata = serde_json::json!({
-            "antigravity": {
-                "project_id": project_id,
-                "updated_at": current_unix_secs(),
-            }
-        });
-        let merged_metadata =
-            merge_upstream_metadata(transport.key.upstream_metadata.as_ref(), &upstream_metadata);
 
+        let observation_update =
+            provider_transport::antigravity::antigravity_account_observation_update(
+                Some(&info),
+                now_unix_secs,
+            );
         let mut hydrated = transport.clone();
-        hydrated.key.upstream_metadata = Some(merged_metadata.clone());
-        if !matches!(
-            provider_transport::antigravity::resolve_local_antigravity_request_auth(&hydrated),
-            provider_transport::antigravity::AntigravityRequestAuthSupport::Supported(_)
-        ) {
-            return None;
-        }
-
-        if let Err(err) = self
-            .update_provider_catalog_key_upstream_metadata(
+        if let Ok(Some(persisted_meta)) = self
+            .persist_antigravity_account_observation(
                 &transport.key.id,
-                Some(&merged_metadata),
-                Some(current_unix_secs()),
+                &observation_update,
+                now_unix_secs,
             )
             .await
         {
-            warn!(
-                provider_id = %transport.provider.id,
-                endpoint_id = %transport.endpoint.id,
-                key_id = %transport.key.id,
-                error = ?err,
-                "antigravity project metadata hydration could not persist metadata"
+            hydrated.key.upstream_metadata = Some(persisted_meta);
+        } else {
+            let merged_metadata = merge_upstream_metadata(
+                transport.key.upstream_metadata.as_ref(),
+                &observation_update,
             );
+            hydrated.key.upstream_metadata = Some(merged_metadata);
         }
 
-        Some(hydrated)
+        if matches!(
+            provider_transport::antigravity::resolve_local_antigravity_request_auth(&hydrated),
+            provider_transport::antigravity::AntigravityRequestAuthSupport::Supported(_)
+        ) {
+            Some(hydrated)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) async fn persist_antigravity_hydration_failure(
+        &self,
+        transport: &GatewayProviderTransportSnapshot,
+        had_usable_transport: bool,
+        now_unix_secs: u64,
+    ) -> Option<GatewayProviderTransportSnapshot> {
+        let observation_update =
+            provider_transport::antigravity::antigravity_account_observation_update(
+                None,
+                now_unix_secs,
+            );
+        let mut hydrated = transport.clone();
+        if let Ok(Some(persisted_meta)) = self
+            .persist_antigravity_account_observation(
+                &transport.key.id,
+                &observation_update,
+                now_unix_secs,
+            )
+            .await
+        {
+            hydrated.key.upstream_metadata = Some(persisted_meta);
+        } else {
+            let merged_metadata = merge_upstream_metadata(
+                transport.key.upstream_metadata.as_ref(),
+                &observation_update,
+            );
+            hydrated.key.upstream_metadata = Some(merged_metadata);
+        }
+
+        if had_usable_transport
+            && matches!(
+                provider_transport::antigravity::resolve_local_antigravity_request_auth(&hydrated),
+                provider_transport::antigravity::AntigravityRequestAuthSupport::Supported(_)
+            )
+        {
+            Some(hydrated)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) async fn persist_antigravity_account_observation(
+        &self,
+        key_id: &str,
+        observation_patch: &Value,
+        now_unix_secs: u64,
+    ) -> Result<Option<Value>, GatewayError> {
+        let obs_obj = observation_patch
+            .get("antigravity")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                GatewayError::Internal(
+                    "antigravity observation patch missing antigravity object".to_string(),
+                )
+            })?;
+
+        for _ in 0..3 {
+            let latest_key = match self
+                .list_provider_catalog_keys_by_ids_strong(&[key_id.to_string()])
+                .await?
+                .into_iter()
+                .next()
+            {
+                Some(key) => key,
+                None => return Ok(None),
+            };
+
+            let expected_upstream_metadata_value = latest_key
+                .upstream_metadata
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|m| m.get("antigravity"))
+                .cloned();
+
+            let mut target_map = expected_upstream_metadata_value
+                .as_ref()
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+
+            for (k, v) in obs_obj {
+                target_map.insert(k.clone(), v.clone());
+            }
+
+            let updated_namespace = Value::Object(target_map);
+
+            let update = ProviderCatalogKeyRuntimeMetadataUpdate {
+                key_id: key_id.to_string(),
+                namespace: "antigravity".to_string(),
+                expected_upstream_metadata_value,
+                upstream_metadata_value: updated_namespace.clone(),
+                status_snapshot_patch: serde_json::json!({}),
+                updated_at_unix_secs: Some(now_unix_secs),
+            };
+
+            match self
+                .update_provider_catalog_key_runtime_metadata(&update)
+                .await
+            {
+                Ok(true) => {
+                    let mut full_meta = latest_key
+                        .upstream_metadata
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    full_meta.insert("antigravity".to_string(), updated_namespace);
+                    return Ok(Some(Value::Object(full_meta)));
+                }
+                Ok(false) => {
+                    continue;
+                }
+                Err(err) => {
+                    warn!(
+                        key_id,
+                        error = ?err,
+                        "antigravity hydration metadata CAS persistence error"
+                    );
+                    return Err(err);
+                }
+            }
+        }
+        warn!(
+            key_id,
+            "antigravity hydration metadata CAS retries exhausted"
+        );
+        Err(GatewayError::Internal(
+            "antigravity account observation CAS conflict retries exhausted".to_string(),
+        ))
     }
 
     pub(crate) async fn hydrate_gemini_cli_project_metadata_for_transport(
@@ -235,11 +402,6 @@ impl AppState {
 
         Some(hydrated)
     }
-}
-
-fn extract_antigravity_load_code_assist_project_id(value: &Value) -> Option<String> {
-    aether_admin::provider::quota::parse_antigravity_code_assist_response(value)
-        .and_then(|info| info.project_id)
 }
 
 #[async_trait]
@@ -478,6 +640,27 @@ impl ModelFetchRuntimeState for AppState {
             updated_at_unix_secs,
         )
         .await?;
+        Ok(())
+    }
+
+    async fn persist_antigravity_account_observation(
+        &self,
+        key_id: &str,
+        observation_patch: &Value,
+        now_unix_secs: u64,
+    ) -> Result<(), GatewayError> {
+        AppState::persist_antigravity_account_observation(
+            self,
+            key_id,
+            observation_patch,
+            now_unix_secs,
+        )
+        .await?
+        .ok_or_else(|| {
+            GatewayError::Internal(
+                "provider key disappeared during account observation".to_string(),
+            )
+        })?;
         Ok(())
     }
 
@@ -753,5 +936,203 @@ impl SchedulerRuntimeState for AppState {
             max_entries,
             expected_epoch,
         )
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether_provider_transport::snapshot::{
+        GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
+        GatewayProviderTransportProvider, GatewayProviderTransportSnapshot,
+    };
+    use serde_json::json;
+
+    fn sample_antigravity_snapshot(
+        project_id: Option<&str>,
+        metadata: Option<Value>,
+    ) -> GatewayProviderTransportSnapshot {
+        GatewayProviderTransportSnapshot {
+            provider: GatewayProviderTransportProvider {
+                id: "provider-antigravity".to_string(),
+                name: "antigravity".to_string(),
+                provider_type: "antigravity".to_string(),
+                website: None,
+                is_active: true,
+                keep_priority_on_conversion: false,
+                enable_format_conversion: false,
+                concurrent_limit: None,
+                max_retries: None,
+                proxy: None,
+                request_timeout_secs: None,
+                stream_first_byte_timeout_secs: None,
+                config: None,
+            },
+            endpoint: GatewayProviderTransportEndpoint {
+                id: "endpoint-antigravity".to_string(),
+                provider_id: "provider-antigravity".to_string(),
+                api_format: "gemini:generate_content".to_string(),
+                api_family: Some("gemini".to_string()),
+                endpoint_kind: Some("generate_content".to_string()),
+                is_active: true,
+                base_url: "https://cloudcode-pa.googleapis.com".to_string(),
+                header_rules: None,
+                body_rules: None,
+                max_retries: None,
+                custom_path: None,
+                config: None,
+                format_acceptance_config: None,
+                proxy: None,
+            },
+            key: GatewayProviderTransportKey {
+                id: "key-antigravity-1".to_string(),
+                provider_id: "provider-antigravity".to_string(),
+                name: "Antigravity Key".to_string(),
+                auth_type: "oauth".to_string(),
+                is_active: true,
+                api_formats: Some(vec!["gemini:generate_content".to_string()]),
+                auth_type_by_format: None,
+                allow_auth_channel_mismatch_formats: None,
+                allowed_models: None,
+                capabilities: None,
+                rate_multipliers: None,
+                global_priority_by_format: None,
+                expires_at_unix_secs: None,
+                proxy: None,
+                fingerprint: None,
+                upstream_metadata: metadata,
+                decrypted_api_key: "antigravity-token".to_string(),
+                decrypted_auth_config: Some(
+                    json!({
+                        "provider_type": "antigravity",
+                        "project_id": project_id,
+                    })
+                    .to_string(),
+                ),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_hydration_skips_when_usable_and_observation_not_due() {
+        let app = AppState::new().expect("app state should build");
+        let now = current_unix_secs();
+        let meta = json!({
+            "antigravity": {
+                "project_id": "cached-proj",
+                "subscription_tier": "pro",
+                "account_info_status": "success",
+                "account_info_checked_at": now - 300,
+            }
+        });
+        let transport = sample_antigravity_snapshot(Some("cached-proj"), Some(meta));
+        let hydrated = app
+            .hydrate_antigravity_project_metadata_for_transport(&transport)
+            .await;
+        assert!(hydrated.is_some());
+        let hydrated = hydrated.unwrap();
+        assert_eq!(
+            hydrated
+                .key
+                .upstream_metadata
+                .as_ref()
+                .unwrap()
+                .pointer("/antigravity/subscription_tier")
+                .and_then(Value::as_str),
+            Some("pro")
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_hydration_suppresses_discovery_when_missing_project_and_not_due() {
+        let app = AppState::new().expect("app state should build");
+        let now = current_unix_secs();
+        // 观察处于 60 秒失败冷却期内，且缺少 project_id，应直接返回 None 压制多余请求
+        let meta = json!({
+            "antigravity": {
+                "account_info_status": "error",
+                "account_info_checked_at": now - 10,
+            }
+        });
+        let transport = sample_antigravity_snapshot(None, Some(meta));
+        let hydrated = app
+            .hydrate_antigravity_project_metadata_for_transport(&transport)
+            .await;
+        assert!(
+            hydrated.is_none(),
+            "cooling down failed account must not re-query upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_hydration_failure_preserves_usable_project_and_cached_tier() {
+        let app = AppState::new().expect("app state should build");
+        let now = current_unix_secs();
+        let meta = json!({
+            "antigravity": {
+                "project_id": "cached-proj",
+                "subscription_tier": "ultra",
+                "paid_tier_id": "g1-ultra-tier",
+                "account_info_status": "success",
+                "account_info_checked_at": now - 1000,
+            },
+            "other_namespace": {
+                "some_key": "some_value"
+            }
+        });
+        let transport = sample_antigravity_snapshot(Some("cached-proj"), Some(meta));
+
+        // 模拟 hydration 失败写入：即使失败，可用传输仍然存活，且保留先前的套餐与命名空间
+        let hydrated = app
+            .persist_antigravity_hydration_failure(&transport, true, now)
+            .await;
+        assert!(
+            hydrated.is_some(),
+            "usable cached transport must survive best-effort failure"
+        );
+        let hydrated = hydrated.unwrap();
+        let meta = hydrated.key.upstream_metadata.as_ref().unwrap();
+
+        assert_eq!(
+            meta.pointer("/antigravity/account_info_status")
+                .and_then(Value::as_str),
+            Some("error")
+        );
+        assert_eq!(
+            meta.pointer("/antigravity/account_info_checked_at")
+                .and_then(Value::as_u64),
+            Some(now)
+        );
+        assert_eq!(
+            meta.pointer("/antigravity/subscription_tier")
+                .and_then(Value::as_str),
+            Some("ultra"),
+            "previous subscription tier must survive failure"
+        );
+        assert_eq!(
+            meta.pointer("/antigravity/paid_tier_id")
+                .and_then(Value::as_str),
+            Some("g1-ultra-tier")
+        );
+        assert_eq!(
+            meta.pointer("/other_namespace/some_key")
+                .and_then(Value::as_str),
+            Some("some_value"),
+            "unrelated namespaces must survive hydration failure update"
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_hydration_failure_returns_none_when_project_missing() {
+        let app = AppState::new().expect("app state should build");
+        let now = current_unix_secs();
+        let transport = sample_antigravity_snapshot(None, None);
+
+        let hydrated = app
+            .persist_antigravity_hydration_failure(&transport, false, now)
+            .await;
+        assert!(
+            hydrated.is_none(),
+            "missing companion project cannot return usable transport on failure"
+        );
     }
 }

@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/aether-gateway/backend/auth-maintenance-memory-contract.md", "reason": "Preserve bounded per-account hydration and maintenance gates"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Account evidence persists across protocol, gateway and frontend boundaries"}
+{"file": ".trellis/tasks/10-23-antigravity-entitlement-onboarding/design.md", "reason": "Shared account observation and entitlement interfaces"}

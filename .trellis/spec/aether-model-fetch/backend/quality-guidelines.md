@@ -108,3 +108,52 @@ Good：配置新图片型号后刷新即可路由，新发现文本型号恢复�
 Wrong：默认型号就是全部支持范围，或者把模型卡上含有 search 的任意字段当作 Alpha Search 权限。
 
 Correct：配置/真实发现生成可路由模型和 Endpoint，已核实的 Free 限制独立执行，其余实际权限由既有策略与上游确定。官方依据见任务研究记录及 [Codex image generation guard](https://github.com/openai/codex/blob/75e0e0aad97a86138b8b1ec87d9b544b4a35ecbf/codex-rs/core/src/tools/spec_plan.rs#L727)、[standalone search selection](https://github.com/openai/codex/blob/75e0e0aad97a86138b8b1ec87d9b544b4a35ecbf/codex-rs/core/src/tools/spec_plan.rs#L1038)。
+
+## Antigravity account evidence and model discovery
+
+### 1. Scope / Trigger
+
+Required when changing Antigravity account hydration, quota refresh, model discovery or metadata persistence. Existing companion projects do not establish that paid-tier observations exist.
+
+### 2. Signatures
+
+- Pure owner: `aether_provider_transport::antigravity::parse_antigravity_code_assist_response(&Value) -> Option<AntigravityCodeAssistInfo>`.
+- Shared policies: `antigravity_account_observation_update`, `antigravity_account_observation_due`, `antigravity_entitlement_candidates`, `is_antigravity_entitlement_rejection`.
+- Model builder: `build_antigravity_fetch_available_models_plan(runtime, transport, base_url, project_id, tier: Option<&str>)`.
+- Quota builder: `build_antigravity_pool_quota_request(key_id, base_url, authorization, project_id, tier: Option<&str>, identity_headers)`.
+
+### 3. Contracts
+
+- `subscription_tier` is display-only canonical `free|pro|ultra|null`; it never populates scheduling `plan_type`. Raw `paid_tier_id` and `current_tier_id` are protocol evidence, never inferred from display names or upgrade menus.
+- Successful observation writes nullable tier fields, `account_info_status=success`, checked and updated Unix-second timestamps. Failure writes only `account_info_status=error` and checked timestamp, preserving last successful evidence.
+- Success (including unknown tier) has a 900-second refresh TTL; failures have a 60-second cooldown. Future timestamps are stale. Explicit quota refresh always attempts discovery.
+- Antigravity namespace updates shallow-merge old fields absent from incoming updates. Explicit null clears old evidence. Replacing `quota_by_model` still drops removed models and preserves a returned model's missing reset time.
+- Both discovery paths try observed paid ID, current ID, then no entitlement; exclude free-tier, legacy-tier and duplicates. Only explicit 400/412 invalid/precondition tier evidence advances entitlement fallback. Independent model host failover is not entitlement fallback.
+
+### 4. Validation & Error Matrix
+
+| Input / failure | Required result |
+| --- | --- |
+| Existing project, missing/due observation | Query account evidence without re-import |
+| loadCodeAssist failure, usable cached project | Continue with cached project/tier; persist error observation |
+| Successful unknown tier | Clear previous canonical tier and raw IDs explicitly |
+| 401/403/429 or transport failure | Do not switch entitlement candidate |
+| Invalid entitlement parameter | Advance bounded candidate list |
+| Model metadata refresh | Preserve account evidence and other namespaces |
+
+### 5. Good / Base / Bad Cases
+
+Good: an old project-only account acquires Pro, paid entitlement rejection falls back to current entitlement. Base: free account sends project without entitlement. Bad: a failure patch replaces the entire Antigravity namespace, deleting the project and last successful tier.
+
+### 6. Tests Required
+
+- Shared parsing precedence, raw-ID versus display-name distinction, candidate deduplication/exclusion and TTL boundaries.
+- Real model-fetch execution sequence, authentication/throttle/transport non-fallback and cached evidence on discovery failure.
+- Namespace merge failure preservation and explicit-null clearing; local HTTP smoke must inspect actual request bodies and returned metadata.
+
+### 7. Wrong vs Correct
+
+Wrong: return early solely because project_id exists, or infer `g1-pro-tier` from a UI label.
+
+Correct: use the shared observation freshness and raw-entitlement policy, and merge field patches without erasing successful evidence.
+
