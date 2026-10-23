@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
-- **Last Active**: 2026-10-20
+- **Total Sessions**: 7
+- **Last Active**: 2026-10-24
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~160 | Active |
+| `journal-1.md` | ~182 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-10-24 | Antigravity 套餐权益与显式项目初始化 | `bfa15036e` | `master` |
 | 6 | 2026-10-20 | 推送 Antigravity 套餐支持并触发 CI | `9167a087d` | `master` |
 | 5 | 2026-10-20 | Antigravity 账号套餐识别与展示 | - | `master` |
 | 4 | 2026-10-08 | 合并上游路由计费与统计更新 | `5b7c806a4` | `master` |
