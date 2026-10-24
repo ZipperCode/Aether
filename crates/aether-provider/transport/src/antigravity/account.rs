@@ -189,19 +189,18 @@ pub fn build_antigravity_fetch_available_models_body(
     body
 }
 
-/// 只对明确的权益拒绝降级；认证、限流与传输错误不能触发套餐重试。
+/// 携带权益参数的 400 INVALID_ARGUMENT 按 Magpie 兼容策略降级；认证、限流与传输错误不能触发套餐重试。
 pub fn is_antigravity_entitlement_rejection(status: u16, body: &Value) -> bool {
-    if !matches!(status, 400 | 412) {
-        return false;
-    }
     let Some(error) = body.get("error") else {
         return false;
     };
-    let invalid = matches!(
-        error.get("status").and_then(Value::as_str),
-        Some("INVALID_ARGUMENT" | "FAILED_PRECONDITION")
-    );
-    if !invalid {
+    if status == 400 && error.get("status").and_then(Value::as_str) == Some("INVALID_ARGUMENT") {
+        return true;
+    }
+    if status != 412 {
+        return false;
+    }
+    if error.get("status").and_then(Value::as_str) != Some("FAILED_PRECONDITION") {
         return false;
     }
     let mentions_tier = |text: &str| {
@@ -552,12 +551,17 @@ mod tests {
     #[test]
     fn entitlement_rejection_does_not_retry_unrelated_failures() {
         let refusal = json!({"error":{"status":"FAILED_PRECONDITION", "message":"Invalid entitlement userTier"}});
-        assert!(is_antigravity_entitlement_rejection(400, &refusal));
+        assert!(!is_antigravity_entitlement_rejection(400, &refusal));
         assert!(is_antigravity_entitlement_rejection(412, &refusal));
         for status in [401, 403, 429, 500] {
             assert!(!is_antigravity_entitlement_rejection(status, &refusal));
         }
-        assert!(!is_antigravity_entitlement_rejection(
+
+        assert!(is_antigravity_entitlement_rejection(
+            400,
+            &json!({"error":{"status":"INVALID_ARGUMENT","message":"Request contains an invalid argument."}})
+        ));
+        assert!(is_antigravity_entitlement_rejection(
             400,
             &json!({"error":{"status":"INVALID_ARGUMENT","message":"Invalid project"}})
         ));

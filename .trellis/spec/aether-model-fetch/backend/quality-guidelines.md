@@ -128,7 +128,7 @@ Required when changing Antigravity account hydration, quota refresh, model disco
 - Successful observation writes nullable tier fields, `account_info_status=success`, checked and updated Unix-second timestamps. Failure writes only `account_info_status=error` and checked timestamp, preserving last successful evidence.
 - Success (including unknown tier) has a 900-second refresh TTL; failures have a 60-second cooldown. Future timestamps are stale. Explicit quota refresh always attempts discovery.
 - Antigravity namespace updates shallow-merge old fields absent from incoming updates. Explicit null clears old evidence. Replacing `quota_by_model` still drops removed models and preserves a returned model's missing reset time.
-- Both discovery paths try observed paid ID, current ID, then no entitlement; exclude free-tier, legacy-tier and duplicates. Only explicit 400/412 invalid/precondition tier evidence advances entitlement fallback. Independent model host failover is not entitlement fallback.
+- Both discovery paths try observed paid ID, current ID, then no entitlement; exclude free-tier, legacy-tier and duplicates. A 400 `INVALID_ARGUMENT` from a request carrying an entitlement is a bounded compatibility rejection and advances the candidate; 400 project errors without an entitlement reference remain terminal. A 412 `FAILED_PRECONDITION` still requires explicit tier evidence. Independent model host failover is not entitlement fallback.
 
 ### 4. Validation & Error Matrix
 

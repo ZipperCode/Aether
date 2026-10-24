@@ -58,7 +58,7 @@
 - `loadCodeAssist` 同时保存原始 `paid_tier_id`、`current_tier_id`，用于 `fetchAvailableModels` 的 `entitlement.userTier`；不能从展示用的 Pro/Ultra 反推协议 ID，也不根据 `allowedTiers` 升级菜单判断已购套餐。
 - 额度刷新始终补查账号观察；正常请求的项目补全与模型发现会补查缺失或到期的观察。成功观察缓存 15 分钟，失败尝试退避 60 秒；已有可用项目在查询失败时继续使用。
 - `account_info_status=success` 但套餐为空表示上游未返回可识别等级；`error` 表示本次查询失败，保留上次等级。`account_info_checked_at` 为最后尝试时间，`account_info_updated_at` 为最后成功时间。刷新 Token 本身不等于刷新套餐。
-- 模型和额度查询依次使用原始付费权益、当前权益、不带权益，跳过 Free/Legacy 与重复 ID；只有明确的权益参数拒绝才切换下一项。认证失败、限流和传输失败不触发权益降级，模型发现原有的主机回退另行保留。
+- 模型和额度查询依次使用原始付费权益、当前权益、不带权益，跳过 Free/Legacy 与重复 ID；携带 `entitlement` 的 400 `INVALID_ARGUMENT` 按兼容策略切换下一候选或无权益请求；认证失败、限流和传输失败不触发权益降级，模型发现原有的主机回退另行保留。
 - Antigravity 元数据按字段合并，缺失字段保留旧观察，显式 `null` 清除失效套餐；模型刷新不得覆盖套餐或其他命名空间。
 - 缺项目账号可在配额详情中选择“初始化伴生项目”，确认后调用管理员接口 `POST /api/admin/provider-oauth/keys/{key_id}/initialize-project`。已有配置项目仅同步观察，不重复初始化；普通聊天、额度刷新和后台发现不执行 `onboardUser`。
 - 初始化先走生产端 `loadCodeAssist`，必要时向配置的允许源站发送 `onboardUser`；仅显式 pending 状态继续轮询，最多 5 次、总工作流 15 秒。硬拒绝立即停止；项目创建完成后立即保存，后续查询失败不会删除项目。

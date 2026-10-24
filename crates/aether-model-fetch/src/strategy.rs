@@ -3981,6 +3981,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn antigravity_model_fetch_falls_back_after_generic_invalid_argument() {
+        let (runtime, executed_plans) = AntigravityMockRuntime::new(|plan| {
+            let tier = plan
+                .body
+                .json_body
+                .as_ref()
+                .and_then(|body| body.pointer("/entitlement/userTier"));
+            if tier.is_some() {
+                mock_json_result(
+                    plan,
+                    400,
+                    json!({"error":{"status":"INVALID_ARGUMENT","message":"Request contains an invalid argument."}}),
+                )
+            } else {
+                mock_json_result(plan, 200, json!({"models":{"gemini-smoke":{}}}))
+            }
+        });
+        let transport = sample_antigravity_transport_with_project(
+            "test-project-1",
+            Some(
+                json!({"antigravity":{"paid_tier_id":"g1-pro-tier","account_info_status":"success","account_info_checked_at":now_unix_secs()}}),
+            ),
+        );
+
+        let outcome = fetch_models_from_transports(&runtime, &[transport])
+            .await
+            .expect("generic invalid argument should fall back without entitlement");
+        assert!(outcome.has_success);
+        assert_eq!(outcome.fetched_model_ids, vec!["gemini-smoke"]);
+        assert_eq!(
+            executed_plans.lock().expect("lock").len(),
+            2,
+            "paid-tier request must be followed by a no-entitlement request"
+        );
+    }
+
     /// 验证认证失败（401/403）绝不触发套餐回退，立即终止。
     #[tokio::test]
     async fn antigravity_model_fetch_does_not_fallback_entitlement_on_auth_failure() {
