@@ -320,7 +320,11 @@ impl SqlxUsageReadRepository {
             .execute(&mut *tx)
             .await
             .map_postgres_err()?;
-        sqlx::query("SET LOCAL statement_timeout = '15s'")
+        let statement_timeout_sql = format!(
+            "SET LOCAL statement_timeout = '{}s'",
+            self.overview_report_timeout_secs
+        );
+        sqlx::query(&statement_timeout_sql)
             .execute(&mut *tx)
             .await
             .map_postgres_err()?;

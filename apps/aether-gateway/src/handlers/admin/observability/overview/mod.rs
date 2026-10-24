@@ -118,7 +118,7 @@ pub(crate) async fn maybe_build_overview_response(
         )));
     }
     let snapshot = match tokio::time::timeout(
-        std::time::Duration::from_secs(if request.csv { 30 } else { 15 }),
+        overview_report_timeout(request.csv),
         state.as_ref().query_usage_analytics(&request.query),
     )
     .await
@@ -181,4 +181,73 @@ pub(crate) async fn maybe_build_overview_response(
 
 fn error(status: StatusCode, detail: &str) -> Response<Body> {
     (status, Json(json!({"detail": detail}))).into_response()
+}
+
+pub(crate) const OVERVIEW_REPORT_TIMEOUT_SECS_ENV: &str = "AETHER_OVERVIEW_REPORT_TIMEOUT_SECS";
+pub(crate) const DEFAULT_OVERVIEW_REPORT_TIMEOUT_SECS: u64 = 15;
+pub(crate) const DEFAULT_OVERVIEW_CSV_REPORT_TIMEOUT_SECS: u64 = 30;
+
+pub(crate) fn overview_report_timeout(csv: bool) -> std::time::Duration {
+    let configured = std::env::var(OVERVIEW_REPORT_TIMEOUT_SECS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0);
+    resolve_overview_report_timeout(configured, csv)
+}
+
+fn resolve_overview_report_timeout(configured: Option<u64>, csv: bool) -> std::time::Duration {
+    let secs = match configured {
+        Some(custom) => {
+            if csv {
+                custom.max(DEFAULT_OVERVIEW_CSV_REPORT_TIMEOUT_SECS)
+            } else {
+                custom
+            }
+        }
+        None => {
+            if csv {
+                DEFAULT_OVERVIEW_CSV_REPORT_TIMEOUT_SECS
+            } else {
+                DEFAULT_OVERVIEW_REPORT_TIMEOUT_SECS
+            }
+        }
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overview_report_timeout_defaults() {
+        assert_eq!(
+            resolve_overview_report_timeout(None, false),
+            std::time::Duration::from_secs(15)
+        );
+        assert_eq!(
+            resolve_overview_report_timeout(None, true),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn overview_report_timeout_custom() {
+        assert_eq!(
+            resolve_overview_report_timeout(Some(60), false),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            resolve_overview_report_timeout(Some(60), true),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            resolve_overview_report_timeout(Some(10), false),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            resolve_overview_report_timeout(Some(10), true),
+            std::time::Duration::from_secs(30)
+        );
+    }
 }

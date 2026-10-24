@@ -270,8 +270,10 @@ export interface OverviewPerformance {
   errors: { reason: string; count: number }[]
 }
 
+const OVERVIEW_REPORT_TIMEOUT_MS = 120 * 1000
+
 async function get<T>(path: string, params?: OverviewQuery, signal?: AbortSignal): Promise<OverviewResponse<T>> {
-  return (await apiClient.get<OverviewResponse<T>>(`/api/admin/overview/${path}`, { params, signal })).data
+  return (await apiClient.get<OverviewResponse<T>>(`/api/admin/overview/${path}`, { params, signal, timeout: OVERVIEW_REPORT_TIMEOUT_MS })).data
 }
 
 export const overviewApi = {
@@ -301,7 +303,7 @@ export const overviewApi = {
   async exportCsv(path: 'users' | 'consumption' | 'breakdown', query: OverviewQuery, signal?: AbortSignal): Promise<Blob> {
     const { limit: _limit, offset: _offset, ...filters } = query
     return (await apiClient.get<Blob>(`/api/admin/overview/${path}`, {
-      params: { ...filters, format: 'csv' }, responseType: 'blob', signal,
+      params: { ...filters, format: 'csv' }, responseType: 'blob', signal, timeout: OVERVIEW_REPORT_TIMEOUT_MS,
     })).data
   },
 }

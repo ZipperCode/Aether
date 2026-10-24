@@ -2403,6 +2403,9 @@ async fn repository_constructs_from_lazy_pool() {
     let repository = SqlxUsageReadRepository::new(pool);
     let _ = repository.pool();
     let _ = repository.transaction_runner();
+    assert_eq!(repository.overview_report_timeout_secs(), 15);
+    let customized = repository.with_overview_report_timeout_secs(45);
+    assert_eq!(customized.overview_report_timeout_secs(), 45);
 }
 
 #[test]

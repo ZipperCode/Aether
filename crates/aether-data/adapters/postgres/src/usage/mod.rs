@@ -2310,6 +2310,7 @@ pub struct SqlxUsageReadRepository {
     pool: PgPool,
     tx_runner: PostgresTransactionRunner,
     overview_projection_reads: bool,
+    overview_report_timeout_secs: u64,
 }
 
 #[derive(Debug)]
@@ -2545,11 +2546,26 @@ impl SqlxUsageReadRepository {
                     "false" | "0" | "off"
                 )
             });
+        let overview_report_timeout_secs = std::env::var("AETHER_OVERVIEW_REPORT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(15);
         Self {
             pool,
             tx_runner,
             overview_projection_reads,
+            overview_report_timeout_secs,
         }
+    }
+
+    pub fn with_overview_report_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.overview_report_timeout_secs = timeout_secs.max(1);
+        self
+    }
+
+    pub fn overview_report_timeout_secs(&self) -> u64 {
+        self.overview_report_timeout_secs
     }
 
     pub fn with_overview_projection_reads(mut self, enabled: bool) -> Self {
