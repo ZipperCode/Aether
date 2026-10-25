@@ -180,3 +180,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 8: 修复 Antigravity 逐账号模型发现
+
+**Date**: 2026-10-26
+**Task**: 修复 Antigravity 逐账号模型发现
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+统一 Antigravity CLI 身份与账号级版本覆盖；模型发现遍历全部账号、移除首账号和提供商级旧缓存截断、过滤 disabled 模型；补充混合权益/失败/缓存隔离/额度投影回归与 loopback HTTP smoke。验证通过 transport/model-fetch/provider-pool/provider_query 及受影响 gateway 套件；完整 antigravity 套件有 1 项 PostgreSQL 临时实例测试因本机无 initdb 未执行。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `71e2ad824` | (see git log) |
+
+### Status
+
+[OK] **Completed**
