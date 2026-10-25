@@ -69,11 +69,13 @@ const POOL_SCORE_SCHEDULE_INTEREST_MIN_INTERVAL_SECS: u64 = 60;
 type PoolCatalogKeyContext = PoolMemberSignals;
 
 /// 展开请求中的 Pool 组候选并收集跳过事实；普通候选保持原顺序进入后续执行。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_local_execution_pool_scheduler(
     state: PlannerAppState<'_>,
     candidates: Vec<EligibleLocalExecutionCandidate>,
     sticky_session_token: Option<&str>,
     requested_model: Option<&str>,
+    request_operation: Option<&str>,
     request_auth_channel: Option<&str>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
@@ -96,6 +98,7 @@ pub(crate) async fn apply_local_execution_pool_scheduler(
                 candidate,
                 sticky_session_token,
                 requested_model,
+                request_operation,
                 request_auth_channel,
             )
             .await;
@@ -111,14 +114,13 @@ pub(crate) async fn apply_local_execution_pool_scheduler(
 
 /// 对一页 Pool 候选统一执行目录、额度、余额和运行时硬过滤。
 ///
-/// `provider_model_name` 是本次实际发送给 Provider 的模型名，仅收窄可恢复的模型额度窗口；
-/// 目录缺失、余额下限和管理员恢复型阻断仍保持 Key 级语义。
+/// 每个成员的 `selected_provider_model_name` 是该账号实际发送给 Provider 的模型名，
+/// 仅收窄可恢复的模型额度窗口；目录缺失、余额下限和管理员恢复型阻断仍保持 Key 级语义。
 async fn schedule_pool_page_candidates(
     state: PlannerAppState<'_>,
     candidates: Vec<EligibleLocalExecutionCandidate>,
     sticky_session_token: Option<&str>,
     effective_pool_config: Option<&AdminProviderPoolConfig>,
-    provider_model_name: Option<&str>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
@@ -142,13 +144,8 @@ async fn schedule_pool_page_candidates(
         entry.1.insert(candidate.candidate.key_id.clone());
     }
 
-    let (key_context_by_id, keys_by_id) = read_pool_catalog_key_contexts_by_id(
-        state,
-        &candidates,
-        provider_model_name,
-        effective_pool_config,
-    )
-    .await;
+    let (key_context_by_id, keys_by_id) =
+        read_pool_catalog_key_contexts_by_id(state, &candidates, effective_pool_config).await;
     let now_unix_secs = crate::clock::current_unix_secs();
     // 复用普通 Key 的计数窗口和 RPM 重置水位；实际执行仍由原子并发准入兜住竞争。
     let recent_candidates = if keys_by_id.values().any(|key| {
@@ -393,11 +390,13 @@ fn active_probe_member_is_unschedulable_for_request(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn expand_pool_group_candidate(
     state: PlannerAppState<'_>,
     group: EligibleLocalExecutionCandidate,
     sticky_session_token: Option<&str>,
     requested_model: Option<&str>,
+    request_operation: Option<&str>,
     request_auth_channel: Option<&str>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
@@ -409,7 +408,8 @@ async fn expand_pool_group_candidate(
         sticky_session_token,
         requested_model,
         request_auth_channel,
-    );
+    )
+    .with_request_operation(request_operation);
     let mut scheduled = Vec::new();
     let mut skipped = Vec::new();
 
@@ -429,6 +429,10 @@ pub(crate) struct PoolKeyCursor<'a> {
     group: EligibleLocalExecutionCandidate,
     sticky_session_token: Option<String>,
     requested_model: Option<String>,
+    /// 请求操作（如 Responses 会话压缩）；参与操作范围映射的逐账号模型解析。
+    request_operation: Option<String>,
+    /// 与预选同源的指令路由模型快照（指令基座）；解析输入缺失时沿用原始请求名。
+    routing_model: Option<String>,
     request_auth_channel: Option<String>,
     routing_overlay: Option<RankingOverlay>,
     routing_allowed_key_ids: Option<Vec<String>>,
@@ -531,6 +535,8 @@ impl<'a> PoolKeyCursor<'a> {
             group,
             sticky_session_token: sticky_session_token.map(str::to_string),
             requested_model: requested_model.map(str::to_string),
+            request_operation: None,
+            routing_model: None,
             request_auth_channel: request_auth_channel.map(str::to_string),
             routing_overlay,
             routing_allowed_key_ids,
@@ -572,6 +578,24 @@ impl<'a> PoolKeyCursor<'a> {
             self.runtime_miss_trace_id = Some(trace_id.to_string());
             self.record_runtime_miss_diagnostic = true;
         }
+        self
+    }
+
+    /// 附加本次请求的操作（如 Responses 会话压缩），供操作范围映射解析逐账号模型。
+    pub(crate) fn with_request_operation(mut self, request_operation: Option<&str>) -> Self {
+        self.request_operation = request_operation
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self
+    }
+
+    /// 附加与预选同源的指令路由模型快照（指令基座或空）；未附带时沿用原始请求名。
+    pub(crate) fn with_routing_model(mut self, routing_model: Option<&str>) -> Self {
+        self.routing_model = routing_model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         self
     }
 
@@ -1106,18 +1130,66 @@ impl<'a> PoolKeyCursor<'a> {
             return None;
         }
 
+        // sticky 成员必须使用自己行上的映射数据解析实际上游模型；行缺失时按映射缺失
+        // 关闭该成员，不把其他账号的模型目标套到该账号上。
+        let row = match self
+            .state
+            .app()
+            .list_pool_key_candidate_rows_for_group_key_ids(
+                &StoredPoolKeyCandidateRowsByKeyIdsQuery {
+                    api_format: self.group.candidate.endpoint_api_format.clone(),
+                    provider_id: self.group.candidate.provider_id.clone(),
+                    endpoint_id: self.group.candidate.endpoint_id.clone(),
+                    model_id: self.group.candidate.model_id.clone(),
+                    selected_provider_model_name: self
+                        .group
+                        .candidate
+                        .selected_provider_model_name
+                        .clone(),
+                    key_ids: vec![key.id.clone()],
+                },
+            )
+            .await
+        {
+            Ok(rows) => rows.into_iter().find(|row| row.key_id == key.id),
+            Err(err) => {
+                warn!(
+                    event_name = "pool_group_sticky_key_row_load_failed",
+                    log_type = "event",
+                    provider_id = %self.group.candidate.provider_id,
+                    endpoint_id = %self.group.candidate.endpoint_id,
+                    model_id = %self.group.candidate.model_id,
+                    key_id = %key.id,
+                    error = ?err,
+                    "gateway pool scheduler failed to read sticky pool key model row"
+                );
+                None
+            }
+        };
+        let Some(row) = row else {
+            self.seen_key_ids.insert(key.id.clone());
+            self.record_skip_reason("mapped_model_missing");
+            return None;
+        };
+        let member_model = self.pool_member_model_for_row(&row);
+        let Some(member_model) = member_model else {
+            self.seen_key_ids.insert(key.id.clone());
+            self.record_skip_reason("key_model_disabled");
+            return None;
+        };
+
         if pool_config.reserve_minimum_quota
             && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
                 &key,
                 self.group.candidate.provider_type.as_str(),
-                Some(self.group.candidate.selected_provider_model_name.as_str()),
+                Some(member_model.0.as_str()),
             )
         {
             self.seen_key_ids.insert(key.id.clone());
             self.record_skip_reason(POOL_ACCOUNT_EXHAUSTED_SKIP_REASON);
             self.skipped_candidates
                 .push(SkippedLocalExecutionCandidate {
-                    candidate: pool_candidate_from_catalog_key(&self.group, key),
+                    candidate: pool_candidate_from_catalog_key(&self.group, key, member_model),
                     skip_reason: POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
                     transport: None,
                     ranking: self.group.ranking.clone(),
@@ -1126,14 +1198,13 @@ impl<'a> PoolKeyCursor<'a> {
             return None;
         }
 
-        let candidate = pool_candidate_from_catalog_key(&self.group, key);
+        let candidate = pool_candidate_from_catalog_key(&self.group, key, member_model);
         let candidate = self.build_eligible_candidate(candidate).await?;
         let (mut scheduled, mut skipped) = schedule_pool_page_candidates(
             self.state,
             vec![candidate],
             self.sticky_session_token.as_deref(),
             self.effective_pool_config.as_ref(),
-            Some(self.group.candidate.selected_provider_model_name.as_str()),
         )
         .await;
         self.record_skipped_candidates(&skipped);
@@ -1141,7 +1212,7 @@ impl<'a> PoolKeyCursor<'a> {
         scheduled.pop()
     }
 
-    /// 分页补充候选队列，并用当前 Pool 组的实际 Provider 模型执行同一组共享过滤。
+    /// 分页补充候选队列，并用每个成员自己的实际 Provider 模型执行同一组共享过滤。
     async fn refill_queued_candidates(&mut self) -> bool {
         let refill_target = self.window_size.max(1) as usize;
 
@@ -1164,7 +1235,6 @@ impl<'a> PoolKeyCursor<'a> {
                 candidates,
                 self.sticky_session_token.as_deref(),
                 self.effective_pool_config.as_ref(),
-                Some(self.group.candidate.selected_provider_model_name.as_str()),
             )
             .await;
             self.record_skipped_candidates(&skipped);
@@ -1433,12 +1503,39 @@ impl<'a> PoolKeyCursor<'a> {
     ) -> Vec<EligibleLocalExecutionCandidate> {
         let mut candidates = Vec::with_capacity(rows.len());
         for row in rows {
-            let candidate = pool_candidate_from_row(&self.group, row);
+            let member_model = self.pool_member_model_for_row(&row);
+            let Some(member_model) = member_model else {
+                // 显式账号模型清单与本次请求无交集或为空：在 transport 门禁之前
+                // 以模型禁用语义拒绝整个成员，避免无清单账号的模型目标污染受限账号。
+                if self.seen_key_ids.insert(row.key_id.clone()) {
+                    self.record_skip_reason("key_model_disabled");
+                }
+                continue;
+            };
+            let candidate = pool_candidate_from_row(&self.group, row, member_model);
             if let Some(candidate) = self.build_eligible_candidate(candidate).await {
                 candidates.push(candidate);
             }
         }
         candidates
+    }
+
+    /// 解析该账号行的实际发送模型名；显式清单被拒绝时返回空。
+    /// 解析输入是构建时固定的指令路由模型快照；未附带时沿用请求模型，
+    /// 请求未声明模型时沿用组的解析全局名。
+    fn pool_member_model_for_row(
+        &self,
+        row: &StoredMinimalCandidateSelectionRow,
+    ) -> Option<(String, Option<String>)> {
+        pool_member_model_resolution(
+            &self.group,
+            row,
+            self.routing_model
+                .as_deref()
+                .or(self.requested_model.as_deref())
+                .unwrap_or(self.group.candidate.global_model_name.as_str()),
+            self.request_operation.as_deref(),
+        )
     }
 
     async fn build_eligible_candidate(
@@ -1536,10 +1633,34 @@ fn pool_candidate_transport_policy_facts(
     }
 }
 
-/// 将数据库候选行还原为当前 Pool 组的精确 Provider、Endpoint 与模型候选。
+/// 按调度核心映射规则解析成员实际发送的上游模型名。
+///
+/// 所有成员统一走同一解析器：无账号模型清单时保持行自身的默认/映射模型名并保留
+/// Endpoint 与操作范围，不继承其他账号的模型目标；显式清单（含空清单）必须与请求
+/// 模型或全局映射产生交集，否则整行拒绝。`requested_model_name` 必须是与预选一致的
+/// 路由模型（指令基座或原始请求名），`enable_model_directives` 固定关闭以复用预选的
+/// 指令语义，绝不比枚举更宽松。
+fn pool_member_model_resolution(
+    group: &EligibleLocalExecutionCandidate,
+    row: &StoredMinimalCandidateSelectionRow,
+    requested_model_name: &str,
+    request_operation: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    aether_scheduler_core::resolve_provider_model_name_with_model_directives_and_request_operation(
+        row,
+        requested_model_name,
+        group.candidate.endpoint_api_format.as_str(),
+        false,
+        request_operation,
+    )
+}
+
+/// 将数据库候选行还原为当前 Pool 组的精确 Provider、Endpoint 与模型候选，
+/// 并应用该账号自己的上游模型解析结果。
 fn pool_candidate_from_row(
     group: &EligibleLocalExecutionCandidate,
     row: StoredMinimalCandidateSelectionRow,
+    member_model: (String, Option<String>),
 ) -> aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate {
     let mut candidate = group.candidate.clone();
     candidate.key_id = row.key_id;
@@ -1555,13 +1676,17 @@ fn pool_candidate_from_row(
         .flatten();
     candidate.key_capabilities = row.key_capabilities;
     candidate.routing_facts = row.routing_facts;
+    candidate.selected_provider_model_name = member_model.0;
+    candidate.mapping_matched_model = member_model.1;
     candidate
 }
 
-/// 用强读得到的目录 Key 替换 Pool 占位候选，同时保留精确 Endpoint 与模型绑定。
+/// 用强读得到的目录 Key 替换 Pool 占位候选，同时保留精确 Endpoint 与模型绑定，
+/// 并应用该账号自己的上游模型解析结果。
 fn pool_candidate_from_catalog_key(
     group: &EligibleLocalExecutionCandidate,
     key: StoredProviderCatalogKey,
+    member_model: (String, Option<String>),
 ) -> aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate {
     let mut candidate = group.candidate.clone();
     candidate.key_id = key.id;
@@ -1576,15 +1701,16 @@ fn pool_candidate_from_catalog_key(
         .ok()
         .flatten();
     candidate.key_capabilities = key.capabilities;
+    candidate.selected_provider_model_name = member_model.0;
+    candidate.mapping_matched_model = member_model.1;
     candidate
 }
 
 /// 强读候选 Key 的目录事实并构建调度上下文；读取失败或缺项时显式标记不可用以关闭候选。
-/// 请求模型只交给 Provider 额度适配器，不改变目录缺失时的 fail-closed 行为。
+/// 每个成员自己解析出的模型名只交给 Provider 额度适配器，不改变目录缺失时的 fail-closed 行为。
 async fn read_pool_catalog_key_contexts_by_id(
     state: PlannerAppState<'_>,
     candidates: &[EligibleLocalExecutionCandidate],
-    provider_model_name: Option<&str>,
     effective_pool_config: Option<&AdminProviderPoolConfig>,
 ) -> (
     BTreeMap<String, PoolCatalogKeyContext>,
@@ -1592,6 +1718,7 @@ async fn read_pool_catalog_key_contexts_by_id(
 ) {
     let mut key_ids = Vec::new();
     let mut provider_type_by_key_id = BTreeMap::<String, String>::new();
+    let mut model_name_by_key_id = BTreeMap::<String, String>::new();
     let mut reserve_minimum_quota_key_ids = BTreeSet::new();
 
     for candidate in candidates {
@@ -1607,6 +1734,10 @@ async fn read_pool_catalog_key_contexts_by_id(
         }
         if let Entry::Vacant(entry) = provider_type_by_key_id.entry(key_id.clone()) {
             entry.insert(candidate.transport.provider.provider_type.clone());
+            model_name_by_key_id.insert(
+                key_id.clone(),
+                candidate.candidate.selected_provider_model_name.clone(),
+            );
             key_ids.push(key_id);
         }
     }
@@ -1667,6 +1798,8 @@ async fn read_pool_catalog_key_contexts_by_id(
         let Some(provider_type) = provider_type_by_key_id.get(&key.id) else {
             continue;
         };
+        // 混合账号允许不同映射模型；额度窗口与保底额度按各自实际发送的模型判定。
+        let provider_model_name = model_name_by_key_id.get(&key.id).map(String::as_str);
         let mut context = build_pool_catalog_key_context(
             state,
             &provider_pool_service,
@@ -5283,6 +5416,7 @@ mod tests {
             None,
             Some("gpt-5"),
             None,
+            None,
         )
         .await;
 
@@ -5382,6 +5516,7 @@ mod tests {
             vec![group_a, group_b],
             None,
             Some("gpt-5"),
+            None,
             None,
         )
         .await;
@@ -5833,6 +5968,164 @@ mod tests {
                     vec![key],
                 )),
             ))
+    }
+
+    /// 逐账号模型解析边界：无清单也走解析器并保留行默认与操作范围；显式空清单或
+    /// 无交集拒绝；清单变体经全局映射正则取带后缀名；操作范围映射只在请求操作
+    /// 命中时替换默认名。
+    #[test]
+    fn pool_member_model_resolution_tracks_account_scope_and_denials() {
+        let group = sample_codex_pool_group("provider-pool", "endpoint-1", 0, None);
+        let mut row = large_pool_fixture(1, None).3.remove(0);
+        row.endpoint_api_format = "openai:responses".to_string();
+
+        // 无账号模型清单：解析行自身的默认/映射模型名，不继承其他账号目标。
+        row.key_allowed_models = None;
+        assert_eq!(
+            super::pool_member_model_resolution(&group, &row, "gpt-5", None),
+            Some(("gpt-5".to_string(), None)),
+        );
+
+        // 显式空清单与无交集清单都必须整行拒绝。
+        row.key_allowed_models = Some(Vec::new());
+        assert_eq!(
+            super::pool_member_model_resolution(&group, &row, "gpt-5", None),
+            None
+        );
+        row.key_allowed_models = Some(vec!["other-model".to_string()]);
+        assert_eq!(
+            super::pool_member_model_resolution(&group, &row, "gpt-5", None),
+            None
+        );
+
+        // 账号清单里的变体经全局映射正则解析为该账号实际上游模型名。
+        row.global_model_mappings = Some(vec!["gpt-5-(high|low|medium|tiered)".to_string()]);
+        row.key_allowed_models = Some(vec![
+            "gpt-5-high".to_string(),
+            "gpt-5-low".to_string(),
+            "gpt-5-medium".to_string(),
+            "gpt-5-tiered".to_string(),
+        ]);
+        assert_eq!(
+            super::pool_member_model_resolution(&group, &row, "gpt-5", None),
+            Some(("gpt-5-high".to_string(), Some("gpt-5-high".to_string()))),
+        );
+
+        // 操作范围映射只在请求操作命中时替换默认模型名，范围外保持默认。
+        row.key_allowed_models = None;
+        row.global_model_mappings = None;
+        row.model_provider_model_mappings = Some(vec![
+            aether_data_contracts::repository::candidate_selection::StoredProviderModelMapping {
+                name: "gpt-5-compact".to_string(),
+                priority: 0,
+                api_formats: None,
+                endpoint_ids: None,
+                operations: Some(vec!["compact".to_string()]),
+            },
+        ]);
+        assert_eq!(
+            super::pool_member_model_resolution(&group, &row, "gpt-5", Some("compact")),
+            Some(("gpt-5-compact".to_string(), None)),
+        );
+        assert_eq!(
+            super::pool_member_model_resolution(&group, &row, "gpt-5", None),
+            Some(("gpt-5".to_string(), None)),
+        );
+    }
+
+    /// 路由模型（指令基座）是逐账号解析输入：基座命中账号清单时可用；
+    /// 未收敛的指令原名不得自行剥离后缀而比枚举更宽松地命中。
+    #[test]
+    fn pool_member_model_resolution_uses_routing_model_without_suffix_guessing() {
+        let group = sample_codex_pool_group("provider-pool", "endpoint-1", 0, None);
+        let mut row = large_pool_fixture(1, None).3.remove(0);
+        row.endpoint_api_format = "openai:responses".to_string();
+        row.key_allowed_models = Some(vec!["gpt-5.6-sol".to_string()]);
+        assert_eq!(
+            super::pool_member_model_resolution(&group, &row, "gpt-5.6-sol", None),
+            Some(("gpt-5".to_string(), None)),
+        );
+        assert_eq!(
+            super::pool_member_model_resolution(&group, &row, "gpt-5.6-sol-high", None),
+            None,
+        );
+    }
+
+    /// 失败回归（真实 cursor 展开）：受限账号清单持有自定义后缀原始模型名时，raw 语义
+    /// （指令路由关闭、路由模型为空）必须让该成员可调度；一旦路由模型被指令基座替换，
+    /// 同一受限成员会被错误拒绝——这正是从全局策略推断指令语义导致的 P2 行为。
+    #[tokio::test]
+    async fn pool_cursor_raw_routing_model_keeps_restricted_custom_suffix_member_schedulable() {
+        let provider_config = Some(json!({ "pool_advanced": {} }));
+        let (provider, endpoint, mut keys, mut rows) =
+            large_pool_fixture(2, provider_config.clone());
+        // 噪声成员：清单与请求无交集，两种语义下都必须被拒绝。
+        rows[0].key_allowed_models = Some(vec!["unrelated-model".to_string()]);
+        keys[0].allowed_models = Some(json!(["unrelated-model"]));
+        // 受限成员：账号清单只允许自定义后缀的原始模型名；目录 Key 与行保持一致。
+        rows[1].key_allowed_models = Some(vec!["gpt-5-boost".to_string()]);
+        keys[1].allowed_models = Some(json!(["gpt-5-boost"]));
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    keys,
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+
+        // raw 语义（image/video/files 等显式关闭指令的调用方传 None）：
+        // 原始请求名命中受限清单，成员保持可调度。
+        let mut raw_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            sample_eligible_candidate(
+                "provider-pool",
+                "endpoint-1",
+                "pool-group",
+                10,
+                provider_config.clone(),
+            ),
+            None,
+            Some("gpt-5-boost"),
+            None,
+        )
+        .with_routing_model(None);
+        let raw_member = raw_cursor
+            .next_key()
+            .await
+            .expect("raw routing model must keep the restricted custom-suffix member schedulable");
+        assert_eq!(raw_member.candidate.key_id, "key-00001");
+        assert!(raw_cursor.next_key().await.is_none());
+
+        // 冻结策略收敛出的指令基座路由模型：基座不再命中该受限清单，成员被拒绝。
+        let mut base_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            sample_eligible_candidate(
+                "provider-pool",
+                "endpoint-1",
+                "pool-group",
+                10,
+                provider_config,
+            ),
+            None,
+            Some("gpt-5-boost"),
+            None,
+        )
+        .with_routing_model(Some("gpt-5"));
+        assert!(
+            base_cursor.next_key().await.is_none(),
+            "suffix-stripped base must not silently schedule or leak the restricted member"
+        );
+        assert_eq!(
+            base_cursor.skip_reason_counts.get("key_model_disabled"),
+            Some(&2),
+            "both restricted members must be rejected once the custom suffix is stripped"
+        );
     }
 
     fn large_pool_fixture(

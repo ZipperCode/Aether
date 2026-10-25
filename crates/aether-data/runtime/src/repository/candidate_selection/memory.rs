@@ -25,14 +25,12 @@ impl InMemoryMinimalCandidateSelectionReadRepository {
             rows: RwLock::new(rows.into_iter().collect()),
         }
     }
-}
 
-#[async_trait]
-impl MinimalCandidateSelectionReadRepository for InMemoryMinimalCandidateSelectionReadRepository {
-    async fn list_for_exact_api_format(
+    /// 未折叠的原始候选行；Pool 组成员展开（`list_pool_key_rows_for_group*`）需要全部真实 Key 行。
+    async fn list_all_for_exact_api_format(
         &self,
         api_format: &str,
-    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+    ) -> Vec<StoredMinimalCandidateSelectionRow> {
         let api_format = api_format.trim();
         let mut rows = self
             .rows
@@ -60,7 +58,60 @@ impl MinimalCandidateSelectionReadRepository for InMemoryMinimalCandidateSelecti
                 .then(left.key_id.cmp(&right.key_id))
                 .then(left.model_id.cmp(&right.model_id))
         });
-        Ok(rows)
+        rows
+    }
+}
+
+/// 与 PostgreSQL 的 `pool_rows` CTE 保持一致：候选枚举对 Pool 提供商每个
+/// (provider_id, endpoint_id, model_id) 只保留一个代表 Key 行（`key_internal_priority`、
+/// `key_id` 最小者）；真实成员仍由 `list_pool_key_rows_for_group*` 展开。
+fn collapse_pool_representative_rows(
+    rows: Vec<StoredMinimalCandidateSelectionRow>,
+) -> Vec<StoredMinimalCandidateSelectionRow> {
+    use std::collections::{btree_map::Entry, BTreeMap};
+
+    let mut representative_index_by_group = BTreeMap::<(String, String, String), usize>::new();
+    let mut collapsed = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !row.routing_facts.provider_pool_enabled {
+            collapsed.push(row);
+            continue;
+        }
+        let group = (
+            row.provider_id.clone(),
+            row.endpoint_id.clone(),
+            row.model_id.clone(),
+        );
+        match representative_index_by_group.entry(group) {
+            Entry::Vacant(entry) => {
+                entry.insert(collapsed.len());
+                collapsed.push(row);
+            }
+            Entry::Occupied(entry) => {
+                let index = *entry.get();
+                let replaces_current = (row.key_internal_priority, row.key_id.as_str())
+                    < (
+                        collapsed[index].key_internal_priority,
+                        collapsed[index].key_id.as_str(),
+                    );
+                if replaces_current {
+                    collapsed[index] = row;
+                }
+            }
+        }
+    }
+    collapsed
+}
+
+#[async_trait]
+impl MinimalCandidateSelectionReadRepository for InMemoryMinimalCandidateSelectionReadRepository {
+    async fn list_for_exact_api_format(
+        &self,
+        api_format: &str,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+        Ok(collapse_pool_representative_rows(
+            self.list_all_for_exact_api_format(api_format).await,
+        ))
     }
 
     async fn list_for_exact_api_format_page(
@@ -137,8 +188,8 @@ impl MinimalCandidateSelectionReadRepository for InMemoryMinimalCandidateSelecti
         query: &StoredPoolKeyCandidateRowsQuery,
     ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
         let mut rows = self
-            .list_for_exact_api_format(&query.api_format)
-            .await?
+            .list_all_for_exact_api_format(&query.api_format)
+            .await
             .into_iter()
             .filter(|row| {
                 row.provider_id == query.provider_id
@@ -168,8 +219,8 @@ impl MinimalCandidateSelectionReadRepository for InMemoryMinimalCandidateSelecti
             .map(|(index, key_id)| (key_id.as_str(), index))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut rows = self
-            .list_for_exact_api_format(&query.api_format)
-            .await?
+            .list_all_for_exact_api_format(&query.api_format)
+            .await
             .into_iter()
             .filter(|row| {
                 row.provider_id == query.provider_id
@@ -381,6 +432,8 @@ fn key_auth_channel_matches(row: &StoredMinimalCandidateSelectionRow, api_format
 #[cfg(test)]
 mod tests {
     use super::InMemoryMinimalCandidateSelectionReadRepository;
+    use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateRoutingFacts;
+
     use crate::repository::candidate_selection::{
         MinimalCandidateSelectionReadRepository, StoredApiFormatCandidateRowsQuery,
         StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateOrder,
@@ -939,6 +992,65 @@ mod tests {
                 .map(|row| row.key_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["key-2", "key-3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_rows_collapse_to_representative_for_listing_but_stay_expanded_for_pool_groups() {
+        // 与 PostgreSQL 的 pool_rows CTE 对齐：枚举列表每个 Pool 组只保留一个代表
+        // Key 行（key_internal_priority、key_id 最小），成员展开仍返回全部真实 Key 行。
+        let mut rows = Vec::new();
+        for (key_id, key_internal_priority) in [("key-b", 1), ("key-a", 5), ("key-c", 5)] {
+            let mut row = sample_row("provider-pool", "openai:chat", "gpt-5", 10);
+            row.endpoint_id = "endpoint-pool".to_string();
+            row.model_id = "model-pool".to_string();
+            row.key_id = key_id.to_string();
+            row.key_internal_priority = key_internal_priority;
+            row.routing_facts = StoredMinimalCandidateRoutingFacts {
+                provider_pool_enabled: true,
+                ..Default::default()
+            };
+            rows.push(row);
+        }
+        rows.push(sample_row("provider-plain", "openai:chat", "gpt-5", 20));
+        let repository = InMemoryMinimalCandidateSelectionReadRepository::seed(rows);
+
+        let listed = repository
+            .list_for_exact_api_format("openai:chat")
+            .await
+            .expect("list should succeed");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|row| (row.provider_id.as_str(), row.key_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("provider-pool", "key-b"),
+                ("provider-plain", "key-provider-plain")
+            ],
+            "pool rows must collapse to the lowest-priority representative during listing"
+        );
+
+        let expanded = repository
+            .list_pool_key_rows_for_group(&StoredPoolKeyCandidateRowsQuery {
+                api_format: "openai:chat".to_string(),
+                provider_id: "provider-pool".to_string(),
+                endpoint_id: "endpoint-pool".to_string(),
+                model_id: "model-pool".to_string(),
+                selected_provider_model_name: "gpt-5".to_string(),
+                order: StoredPoolKeyCandidateOrder::InternalPriority,
+                offset: 0,
+                limit: 10,
+            })
+            .await
+            .expect("pool key rows should load");
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|row| row.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-b", "key-a", "key-c"],
+            "pool member expansion must keep every real key row"
         );
     }
 }

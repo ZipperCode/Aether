@@ -231,7 +231,20 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
     }
 }
 
-fn resolve_model_directive_routing_models(
+/// 单格式指令路由模型：仅在指令策略对该格式生效时返回基座模型。
+/// 映射构建与池组逐账号解析共用这一实现。
+pub(super) fn resolve_model_directive_routing_model(
+    policy: &crate::system_features::ModelDirectivePolicySnapshot,
+    api_format: &str,
+    requested_model: &str,
+) -> Option<String> {
+    policy
+        .resolve_reasoning(api_format, Some(requested_model))
+        .base_model()
+        .map(str::to_owned)
+}
+
+pub(super) fn resolve_model_directive_routing_models(
     policy: &crate::system_features::ModelDirectivePolicySnapshot,
     candidate_api_formats: &[String],
     requested_model: &str,
@@ -240,10 +253,8 @@ fn resolve_model_directive_routing_models(
         .iter()
         .filter_map(|api_format| {
             let api_format = crate::ai_serving::normalize_api_format_alias(api_format);
-            let resolution = policy.resolve_reasoning(&api_format, Some(requested_model));
-            resolution
-                .base_model()
-                .map(|base_model| (api_format, base_model.to_string()))
+            resolve_model_directive_routing_model(policy, &api_format, requested_model)
+                .map(|base_model| (api_format, base_model))
         })
         .collect()
 }

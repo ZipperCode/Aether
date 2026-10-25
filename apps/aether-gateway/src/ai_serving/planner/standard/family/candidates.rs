@@ -171,6 +171,7 @@ pub(super) async fn materialize_local_standard_candidate_attempts(
         } else {
             LocalCandidateResolutionMode::Standard
         },
+        Some(&input.model_directive_policy),
         |eligible| {
             let provider_api_format = eligible.provider_api_format.clone();
             let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(

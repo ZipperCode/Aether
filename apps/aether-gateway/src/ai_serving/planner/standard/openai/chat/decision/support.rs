@@ -155,6 +155,7 @@ pub(crate) async fn materialize_local_openai_chat_candidate_attempts(
         candidates,
         preselection_skipped,
         LocalCandidateResolutionMode::Standard,
+        Some(&input.model_directive_policy),
         |eligible| {
             let provider_api_format = eligible.provider_api_format.clone();
             let (execution_strategy, conversion_mode) =
@@ -241,6 +242,7 @@ pub(crate) async fn build_local_openai_chat_candidate_attempt_source<'a>(
         candidates,
         preselection_skipped,
         LocalCandidateResolutionMode::Standard,
+        Some(&input.model_directive_policy),
         |eligible| {
             let provider_api_format = eligible.provider_api_format.clone();
             let (execution_strategy, conversion_mode) =

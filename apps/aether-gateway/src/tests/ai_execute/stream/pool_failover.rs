@@ -9,7 +9,7 @@ use aether_data::repository::{
     usage::InMemoryUsageReadRepository,
 };
 use aether_data_contracts::repository::{
-    candidate_selection::StoredMinimalCandidateSelectionRow,
+    candidate_selection::{StoredMinimalCandidateRoutingFacts, StoredMinimalCandidateSelectionRow},
     candidates::{RequestCandidateReadRepository, RequestCandidateStatus},
     provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -60,6 +60,8 @@ async fn responses_pool_key_concurrency_skip_stays_distinct_from_execution_exhau
 const FIRST_KEY_SECRET: &str = "pool-first-upstream-secret-1008";
 const SECOND_KEY_SECRET: &str = "pool-second-upstream-secret-1008";
 const POOL_CONCURRENCY_SKIP_REASON: &str = "provider_key_concurrency_limit_reached";
+/// 第二个账号清单经全局映射正则解析出的实际上游模型名。
+const ACCOUNT_MAPPED_SUFFIX_MODEL: &str = "gpt-5-high";
 
 /// 共用真实 HTTP 上游的号池回归夹具。
 ///
@@ -67,10 +69,17 @@ const POOL_CONCURRENCY_SKIP_REASON: &str = "provider_key_concurrency_limit_reach
 /// - failover：第一个 Key 的凭证被上游以 401 拒绝，第二个 Key 成功；
 /// - all_bad：两个 Key 都被 401 拒绝，请求耗尽；
 /// - concurrency：两个 Key 的并发额度被前两个请求占满，第三个请求必须在
-///   未执行任何 Key 的情况下给出具体的并发跳过诊断。
+///   未执行任何 Key 的情况下给出具体的并发跳过诊断；
+/// - mixed_model：首个 Key 无账号模型清单（allowed_models=NULL），第二个 Key 只允许
+///   抓取到的带后缀变体；请求使用裸模型名，上游对第二个 Key 只服务其映射后的
+///   `gpt-5-high`，其余目标真实 404，未知凭证 401；
+/// - empty_model_list：第二个 Key 的账号模型清单显式为空，必须整 Key 拒绝且不发上游。
 async fn run_pool_responses_scenario(mode: &'static str) {
     let all_bad = mode == "all_bad";
     let concurrency = mode == "concurrency";
+    let mixed_model = mode == "mixed_model";
+    let empty_model_list = mode == "empty_model_list";
+    let account_model_mode = mixed_model || empty_model_list;
     let mut state = AppState::new().unwrap().with_data_state_for_tests(
         crate::data::GatewayDataState::disabled()
             .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
@@ -100,10 +109,15 @@ async fn run_pool_responses_scenario(mode: &'static str) {
     let first_hits = Arc::new(AtomicUsize::new(0));
     let second_hits = Arc::new(AtomicUsize::new(0));
     let released = Arc::new(AtomicBool::new(false));
+    // 账号模型场景记录上游每次尝试实际收到的模型名。
+    let first_models = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let second_models = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     // 在闭包捕获边界克隆：move 闭包只能拿走副本，测试尾部仍可读取计数器并释放。
     let upstream_first_hits = Arc::clone(&first_hits);
     let upstream_second_hits = Arc::clone(&second_hits);
     let upstream_released = Arc::clone(&released);
+    let upstream_first_models = Arc::clone(&first_models);
+    let upstream_second_models = Arc::clone(&second_models);
     let upstream_success_chunks = success_chunks.clone();
     let app = Router::new().route(
         "/responses",
@@ -111,6 +125,8 @@ async fn run_pool_responses_scenario(mode: &'static str) {
             let first_hits = Arc::clone(&upstream_first_hits);
             let second_hits = Arc::clone(&upstream_second_hits);
             let released = Arc::clone(&upstream_released);
+            let first_models = Arc::clone(&upstream_first_models);
+            let second_models = Arc::clone(&upstream_second_models);
             let success_chunks = upstream_success_chunks.clone();
             async move {
                 let bearer = request
@@ -119,11 +135,58 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                let is_first = bearer.contains(FIRST_KEY_SECRET);
+                let token = bearer.strip_prefix("bearer ").unwrap_or(bearer.as_str());
+                let is_first = if account_model_mode {
+                    token == FIRST_KEY_SECRET
+                } else {
+                    bearer.contains(FIRST_KEY_SECRET)
+                };
+                let body = axum::body::to_bytes(request.into_body(), 64 * 1024).await.unwrap();
+                let model = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("model")
+                            .and_then(|model| model.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
                 if is_first {
                     first_hits.fetch_add(1, Ordering::SeqCst);
+                    first_models.lock().unwrap().push(model);
+                    if account_model_mode {
+                        // 首个账号没有可用的裸模型记录：初始与同 Key 重试都必须被真实 404。
+                        return Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                "{\"error\":{\"message\":\"model not found\",\"type\":\"invalid_request_error\",\"code\":\"model_not_found\"}}",
+                            ))
+                            .unwrap();
+                    }
                 } else {
+                    // 账号模型场景要求凭证精确命中第二个 Key；未知凭证不得混入观测。
+                    if account_model_mode && token != SECOND_KEY_SECRET {
+                        return Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                "{\"error\":{\"message\":\"invalid pool api key\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}}",
+                            ))
+                            .unwrap();
+                    }
                     second_hits.fetch_add(1, Ordering::SeqCst);
+                    second_models.lock().unwrap().push(model.clone());
+                    // 第二个账号只服务其清单映射出的带后缀模型；其他目标必须真实 404。
+                    if account_model_mode && model != ACCOUNT_MAPPED_SUFFIX_MODEL {
+                        return Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                "{\"error\":{\"message\":\"model not found\",\"type\":\"invalid_request_error\",\"code\":\"model_not_found\"}}",
+                            ))
+                            .unwrap();
+                    }
                 }
                 // 未能识别的凭证按第二个 Key 处理；若网关不是以 Bearer 传递 Key，
                 // failover 场景会因 first_hits 断言失败而立即暴露。
@@ -239,7 +302,19 @@ async fn run_pool_responses_scenario(mode: &'static str) {
         None,
         None,
         None,
-        None,
+        // 账号模型清单必须同时体现在目录 Key 上，transport 门禁才与事故语义一致。
+        if empty_model_list {
+            Some(json!([]))
+        } else if mixed_model {
+            Some(json!([
+                "gpt-5-high",
+                "gpt-5-low",
+                "gpt-5-medium",
+                "gpt-5-tiered"
+            ]))
+        } else {
+            None
+        },
         None,
         None,
         None,
@@ -253,7 +328,10 @@ async fn run_pool_responses_scenario(mode: &'static str) {
     }
     let keys = vec![first_key, second_key];
 
-    let pool_row = |key_id: String, key_name: &str, key_internal_priority: i32| {
+    let pool_row = |key_id: String,
+                    key_name: &str,
+                    key_internal_priority: i32,
+                    key_allowed_models: Option<Vec<String>>| {
         StoredMinimalCandidateSelectionRow {
             provider_id: provider_id.clone(),
             provider_name: "openai".into(),
@@ -270,15 +348,26 @@ async fn run_pool_responses_scenario(mode: &'static str) {
             key_auth_type: "api_key".into(),
             key_is_active: true,
             key_api_formats: Some(vec!["openai:responses".into()]),
-            key_allowed_models: None,
+            key_allowed_models,
             key_capabilities: None,
             key_internal_priority,
             key_global_priority_by_format: None,
-            routing_facts: Default::default(),
+            routing_facts: if account_model_mode {
+                // 与 PostgreSQL 投影一致：Pool 提供商的候选行携带池标志，
+                // 枚举列表每个 Pool 组只保留一个代表 Key 行。
+                StoredMinimalCandidateRoutingFacts {
+                    provider_pool_enabled: true,
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            },
             model_id: model_id.clone(),
             global_model_id: "global-pool-responses".into(),
             global_model_name: "gpt-5".into(),
-            global_model_mappings: None,
+            // 全局映射正则覆盖带后缀变体，账号清单里的变体经它映射为实际上游模型名。
+            global_model_mappings: account_model_mode
+                .then(|| vec!["gpt-5-(high|low|medium|tiered)".to_string()]),
             global_model_supports_streaming: Some(true),
             model_provider_model_name: "gpt-5".into(),
             model_provider_model_mappings: None,
@@ -288,8 +377,25 @@ async fn run_pool_responses_scenario(mode: &'static str) {
         }
     };
     let rows = vec![
-        pool_row(first_key_id.clone(), "first", 0),
-        pool_row(second_key_id.clone(), "second", 1),
+        // 首个账号是 Pool 代表（内部优先级更低），组的进入模型目标因此是裸名。
+        pool_row(first_key_id.clone(), "first", 0, None),
+        pool_row(
+            second_key_id.clone(),
+            "second",
+            1,
+            if empty_model_list {
+                Some(Vec::new())
+            } else if mixed_model {
+                Some(vec![
+                    "gpt-5-high".to_string(),
+                    "gpt-5-low".to_string(),
+                    "gpt-5-medium".to_string(),
+                    "gpt-5-tiered".to_string(),
+                ])
+            } else {
+                None
+            },
+        ),
     ];
 
     let auth_snapshot_for = |suffix: &str| {
@@ -490,7 +596,85 @@ async fn run_pool_responses_scenario(mode: &'static str) {
             .iter()
             .map(|candidate| candidate.key_id.as_deref().unwrap_or_default())
             .collect();
-        if all_bad {
+        let first_models = first_models.lock().unwrap().clone();
+        let second_models = second_models.lock().unwrap().clone();
+        if account_model_mode {
+            if empty_model_list {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+                assert_eq!(
+                    miss_reason.as_deref(),
+                    Some("execution_runtime_candidates_exhausted"),
+                    "status={status}, body={body}, candidates={stored:#?}"
+                );
+                // 无清单回退语义保持不变：首个账号仍收到进入组的裸模型名。
+                assert_eq!(
+                    first_models,
+                    vec!["gpt-5".to_string(), "gpt-5".to_string()],
+                    "unrestricted first account must keep the incoming bare model target: {stored:#?}"
+                );
+                assert!(
+                    second_models.is_empty(),
+                    "explicit empty account model list must stay denied without an upstream send: {second_models:?}"
+                );
+                assert!(
+                    attempted.iter().all(|candidate| {
+                        candidate.key_id.as_deref() == Some(first_key_id.as_str())
+                            && candidate.status == RequestCandidateStatus::Failed
+                            && candidate.status_code == Some(404)
+                    }),
+                    "only the unrestricted first account may leave attempted candidates: {stored:#?}"
+                );
+                assert!(
+                    !attempted
+                        .iter()
+                        .any(|candidate| candidate.status == RequestCandidateStatus::Success),
+                    "the denied account must not be recorded as a success: {stored:#?}"
+                );
+            } else {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body, expected_success_body);
+                // 首个账号：初始 + 同 Key 重试共 2 次 404，均使用无清单回退的裸模型名。
+                assert_eq!(
+                    first_models,
+                    vec!["gpt-5".to_string(), "gpt-5".to_string()],
+                    "first account must keep the incoming bare model target across its retry: {stored:#?}"
+                );
+                // 回退必须把第二个账号自己清单里的带后缀映射模型发给上游，而不是拒绝该账号。
+                assert_eq!(
+                    second_models,
+                    vec![ACCOUNT_MAPPED_SUFFIX_MODEL.to_string()],
+                    "failover must send the second account's mapped suffixed model: {stored:#?}"
+                );
+                let first_key_attempts: Vec<_> = attempted
+                    .iter()
+                    .filter(|candidate| candidate.key_id.as_deref() == Some(first_key_id.as_str()))
+                    .collect();
+                assert_eq!(
+                    first_key_attempts.len(),
+                    2,
+                    "first key must leave its initial attempt plus one same-key retry row: {stored:#?}"
+                );
+                assert!(first_key_attempts.iter().all(|candidate| {
+                    candidate.status == RequestCandidateStatus::Failed
+                        && candidate.status_code == Some(404)
+                        && candidate.finished_at_unix_ms.is_some()
+                }));
+                let second_key_attempts: Vec<_> = attempted
+                    .iter()
+                    .filter(|candidate| candidate.key_id.as_deref() == Some(second_key_id.as_str()))
+                    .collect();
+                assert_eq!(
+                    second_key_attempts.len(),
+                    1,
+                    "second key must be attempted instead of being skipped: {stored:#?}"
+                );
+                assert_eq!(
+                    second_key_attempts[0].status,
+                    RequestCandidateStatus::Success
+                );
+                assert_eq!(second_key_attempts[0].status_code, Some(200));
+            }
+        } else if all_bad {
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
             // 真实候选被尝试且全部失败后，不能再用 no_local_stream_plans 掩盖运行时耗尽。
             assert_eq!(
@@ -590,4 +774,22 @@ async fn wait_for_counter(counter: &AtomicUsize, target: usize) {
         "counter did not reach {target} within 6s: {}",
         counter.load(Ordering::SeqCst)
     );
+}
+
+/// 混合账号模型解析回归：首个账号没有账号模型清单（allowed_models=NULL，对应
+/// 关闭账号模型抓取的事故账号），第二个账号只允许抓取到的带后缀变体。请求使用
+/// 裸模型名，且首个账号是 Pool 代表（内部优先级更低），因此组的进入模型目标是
+/// 裸名。首个账号被上游真实 404（含同 Key 重试共 2 次）后，回退必须把第二个账号
+/// 自己清单里的带后缀映射模型发给上游并成功交付，而不是以 key_model_disabled
+/// 拒绝其余账号。
+#[tokio::test]
+async fn responses_pool_mixed_account_model_failover_sends_account_mapped_suffix() {
+    run_pool_responses_scenario("mixed_model").await;
+}
+
+/// 显式空的账号模型清单必须保持拒绝：第二个账号不允许被发送任何上游请求，
+/// 请求以真实执行耗尽结束，首个账号的两次 404 尝试仍然使用无清单回退的裸模型名。
+#[tokio::test]
+async fn responses_pool_empty_account_model_list_stays_denied() {
+    run_pool_responses_scenario("empty_model_list").await;
 }

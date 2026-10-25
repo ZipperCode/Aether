@@ -504,6 +504,8 @@ struct GatewayLocalCandidateMaterializationPort<'a, F, G> {
     request_auth_channel: Option<&'a str>,
     persistence_policy: LocalCandidatePersistencePolicy<'a>,
     resolution_mode: LocalCandidateResolutionMode,
+    /// 调用方冻结的指令策略语义：Some 表示按该快照解析指令基座，None 表示不做指令路由。
+    model_directive_policy: Option<&'a crate::system_features::ModelDirectivePolicySnapshot>,
     scheduler_cache_affinity_enabled: bool,
     build_available_extra_data: F,
     decorate_skipped_candidate: G,
@@ -605,6 +607,8 @@ where
             self.client_api_format,
             self.sticky_session_token,
             self.requested_model,
+            self.request_operation,
+            self.model_directive_policy,
             self.request_auth_channel,
             &self.build_available_extra_data,
         )
@@ -765,6 +769,7 @@ pub(crate) async fn materialize_local_execution_candidates_with_serving<F, G>(
     candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
     preselection_skipped: Vec<SkippedLocalExecutionCandidate>,
     resolution_mode: LocalCandidateResolutionMode,
+    model_directive_policy: Option<&crate::system_features::ModelDirectivePolicySnapshot>,
     build_available_extra_data: F,
     decorate_skipped_candidate: G,
 ) -> AiCandidateMaterializationOutcome<LocalExecutionCandidateAttempt>
@@ -796,6 +801,7 @@ where
         request_auth_channel,
         persistence_policy,
         resolution_mode,
+        model_directive_policy,
         scheduler_cache_affinity_enabled,
         build_available_extra_data,
         decorate_skipped_candidate,
@@ -825,6 +831,7 @@ pub(crate) async fn build_local_execution_candidate_attempt_source_with_serving<
     candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
     preselection_skipped: Vec<SkippedLocalExecutionCandidate>,
     resolution_mode: LocalCandidateResolutionMode,
+    model_directive_policy: Option<&crate::system_features::ModelDirectivePolicySnapshot>,
     build_available_extra_data: F,
     decorate_skipped_candidate: G,
 ) -> (LocalExecutionCandidateAttemptSource<'a>, usize)
@@ -832,6 +839,8 @@ where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync,
     G: Fn(SkippedLocalExecutionCandidate) -> SkippedLocalExecutionCandidate + Send + Sync,
 {
+    // 逐账号模型解析使用调用方冻结的指令策略语义；显式关闭指令的静态路径传 None，
+    // 保持原始请求名，绝不从全局配置推断。
     let scheduler_cache_affinity_enabled =
         scheduler_cache_affinity_enabled(state, routing_policy).await;
     let _ = build_available_extra_data;
@@ -897,6 +906,8 @@ where
         persistence_policy.skipped.record_runtime_miss_diagnostic,
         sticky_session_token,
         requested_model,
+        request_operation,
+        model_directive_policy,
         request_auth_channel,
         routing_policy,
         Some(PoolGroupExhaustionPersistenceContext::new(
@@ -929,6 +940,21 @@ where
     )
 }
 
+/// 与预选同源的指令路由模型：复用 `resolve_model_directive_routing_model` 的单一实现，
+/// 仅在指令策略对该格式生效时返回基座模型；策略关闭或非指令名返回空，调用方沿用
+/// 原始请求名，绝不自行剥离后缀。
+fn model_directive_routing_model_for(
+    policy: &crate::system_features::ModelDirectivePolicySnapshot,
+    candidate_api_format: &str,
+    requested_model: &str,
+) -> Option<String> {
+    super::candidate_source::resolve_model_directive_routing_model(
+        policy,
+        candidate_api_format,
+        requested_model,
+    )
+}
+
 fn build_logical_candidate_items<'a>(
     state: PlannerAppState<'a>,
     candidates: Vec<EligibleLocalExecutionCandidate>,
@@ -937,6 +963,8 @@ fn build_logical_candidate_items<'a>(
     record_runtime_miss_diagnostic: bool,
     sticky_session_token: Option<&str>,
     requested_model: Option<&str>,
+    request_operation: Option<&str>,
+    model_directive_policy: Option<&crate::system_features::ModelDirectivePolicySnapshot>,
     request_auth_channel: Option<&str>,
     routing_policy: Option<&ResolvedRoutingPolicy>,
     pool_exhaustion_persistence: Option<PoolGroupExhaustionPersistenceContext>,
@@ -959,6 +987,16 @@ fn build_logical_candidate_items<'a>(
                 }
             }
             LocalExecutionCandidateKind::PoolGroup => {
+                // 逐账号模型解析使用与预选一致的指令路由模型快照（每组格式各自解析）。
+                let routing_model = model_directive_policy.zip(requested_model).and_then(
+                    |(policy, requested_model)| {
+                        model_directive_routing_model_for(
+                            policy,
+                            candidate.candidate.endpoint_api_format.as_str(),
+                            requested_model,
+                        )
+                    },
+                );
                 let cursor = PoolKeyCursor::new_with_routing_policy(
                     state,
                     candidate,
@@ -966,7 +1004,9 @@ fn build_logical_candidate_items<'a>(
                     requested_model,
                     request_auth_channel,
                     routing_policy,
-                );
+                )
+                .with_request_operation(request_operation)
+                .with_routing_model(routing_model.as_deref());
                 let cursor = if let Some(trace_id) = trace_id {
                     cursor.with_runtime_miss_diagnostic(trace_id, record_runtime_miss_diagnostic)
                 } else {
@@ -1060,6 +1100,7 @@ where
         record_runtime_miss_diagnostic,
         resolution_mode,
         decorate_skipped_candidate,
+        model_directive_policy: model_directive_policy.clone(),
         page_cursor,
         pending_ranked_candidates: VecDeque::new(),
         pending_items: VecDeque::new(),
@@ -1134,6 +1175,8 @@ struct RequestedModelAttemptPageCursor<'a> {
     record_runtime_miss_diagnostic: bool,
     resolution_mode: LocalCandidateResolutionMode,
     decorate_skipped_candidate: DecorateSkippedCandidateFn<'a>,
+    /// 惰性源构建时固定的指令策略快照；池组逐账号模型解析使用它，不逐页重读。
+    model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot,
     page_cursor: LocalCandidatePreselectionPageCursor<'a>,
     /// 全局排序后的轻量候选；仅弹出当前项后才允许 hydration。
     pending_ranked_candidates: VecDeque<PendingRankedLocalExecutionCandidate>,
@@ -1279,6 +1322,8 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
             self.record_runtime_miss_diagnostic,
             self.sticky_session_token.as_deref(),
             Some(&self.requested_model),
+            self.page_cursor.resolved_page_cache_request_operation(),
+            Some(&self.model_directive_policy),
             self.request_auth_channel.as_deref(),
             self.routing_policy.as_ref(),
             Some(PoolGroupExhaustionPersistenceContext {
@@ -1893,6 +1938,8 @@ async fn materialize_logical_local_execution_candidate_attempts<F>(
     client_api_format: &str,
     sticky_session_token: Option<&str>,
     requested_model: Option<&str>,
+    request_operation: Option<&str>,
+    model_directive_policy: Option<&crate::system_features::ModelDirectivePolicySnapshot>,
     request_auth_channel: Option<&str>,
     build_extra_data: &F,
 ) -> Vec<LocalExecutionCandidateAttempt>
@@ -1920,6 +1967,17 @@ where
                 );
             }
             LocalExecutionCandidateKind::PoolGroup => {
+                // 逐账号模型解析使用调用方冻结的指令策略语义（每组格式各自解析）；
+                // None 表示不做指令路由，保持原始请求名。
+                let routing_model = model_directive_policy.zip(requested_model).and_then(
+                    |(policy, requested_model)| {
+                        model_directive_routing_model_for(
+                            policy,
+                            candidate.candidate.endpoint_api_format.as_str(),
+                            requested_model,
+                        )
+                    },
+                );
                 let mut cursor = PoolKeyCursor::new_with_routing_policy(
                     state,
                     candidate,
@@ -1928,6 +1986,8 @@ where
                     request_auth_channel,
                     routing_policy,
                 )
+                .with_request_operation(request_operation)
+                .with_routing_model(routing_model.as_deref())
                 .with_runtime_miss_diagnostic(trace_id, record_runtime_miss_diagnostic);
                 let attempt_count_before_pool = attempts.len();
                 while let Some(candidate) = cursor.next_key().await {
@@ -3174,6 +3234,7 @@ mod tests {
             record_runtime_miss_diagnostic: false,
             resolution_mode: LocalCandidateResolutionMode::Standard,
             decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
+            model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot::default(),
             page_cursor,
             pending_ranked_candidates: VecDeque::new(),
             pending_items: VecDeque::new(),
@@ -3290,6 +3351,7 @@ mod tests {
                 },
             },
             resolution_mode: LocalCandidateResolutionMode::Standard,
+            model_directive_policy: None,
             scheduler_cache_affinity_enabled: false,
             build_available_extra_data: no_extra_data,
             decorate_skipped_candidate: identity_skipped_candidate,
@@ -3353,6 +3415,7 @@ mod tests {
             record_runtime_miss_diagnostic: false,
             resolution_mode: LocalCandidateResolutionMode::Standard,
             decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
+            model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot::default(),
             page_cursor,
             pending_ranked_candidates: VecDeque::new(),
             pending_items: VecDeque::new(),
@@ -3424,6 +3487,7 @@ mod tests {
             client_session_affinity: Some(ClientSessionAffinity::from_session_key(
                 "chat-session-1",
             )),
+            model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot::default(),
             page_cursor,
             sticky_session_token: None,
             ..sticky_cursor
@@ -3487,6 +3551,7 @@ mod tests {
             record_runtime_miss_diagnostic: false,
             resolution_mode: LocalCandidateResolutionMode::Standard,
             decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
+            model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot::default(),
             page_cursor,
             pending_ranked_candidates: VecDeque::new(),
             pending_items: VecDeque::new(),
@@ -3550,6 +3615,8 @@ mod tests {
             "openai:chat",
             None,
             Some("gpt-5"),
+            None,
+            None,
             None,
             &|_| None,
         )
@@ -3775,6 +3842,46 @@ mod tests {
             .expect("stopped source should remain readable")
             .is_none());
         assert_eq!(body_build_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// 指令路由模型必须与预选同源（复用 `resolve_model_directive_routing_models`）：
+    /// 仅指令策略生效时收敛基座，策略关闭或非指令名返回空，绝不自行剥离后缀。
+    #[test]
+    fn model_directive_routing_model_follows_policy_snapshot() {
+        let settings = json!({
+            "reasoning_effort": {
+                "api_formats": {
+                    "openai:chat": {
+                        "suffixes": ["high"],
+                        "mappings": {
+                            "high": {"reasoning_effort": "low", "stream": false}
+                        }
+                    }
+                }
+            }
+        });
+        let enabled = crate::system_features::ModelDirectivePolicySnapshot::from_config_values(
+            Some(&json!(true)),
+            Some(&settings),
+        );
+        assert_eq!(
+            super::model_directive_routing_model_for(&enabled, "openai:chat", "gpt-5.6-sol-high"),
+            Some("gpt-5.6-sol".to_string()),
+        );
+        assert_eq!(
+            super::model_directive_routing_model_for(&enabled, "openai:chat", "gpt-5.6-sol"),
+            None,
+        );
+
+        // 策略关闭时不得比枚举更宽松：指令原名保持原样，基座不得被自行剥离。
+        let disabled = crate::system_features::ModelDirectivePolicySnapshot::from_config_values(
+            Some(&json!(false)),
+            Some(&settings),
+        );
+        assert_eq!(
+            super::model_directive_routing_model_for(&disabled, "openai:chat", "gpt-5.6-sol-high"),
+            None,
+        );
     }
 
     #[tokio::test]

@@ -183,6 +183,7 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
             })
             .collect(),
         LocalCandidateResolutionMode::Standard,
+        Some(&input.model_directive_policy),
         |eligible| {
             let provider_api_format = eligible.provider_api_format.clone();
             let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(

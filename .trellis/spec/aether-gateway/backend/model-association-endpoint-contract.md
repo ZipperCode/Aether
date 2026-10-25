@@ -25,6 +25,10 @@
 - Every newly selected model exposes manual association, even when discovery is empty or failed. In **手动指定模型与 Endpoint**, prefill the Global Model name, allow editing the real upstream name, and require explicit selection of at least one Provider Endpoint. Never infer support from a model-name prefix or select all Endpoints automatically.
 - Manual entries call `createModel` with the trimmed name and selected `endpoint_ids`, never batch inference. Discovery refresh cannot overwrite manual names or bindings. Deselecting a row, closing/reopening, or changing Providers discards its manual state.
 - Endpoint loading is session-fenced separately from manual input resets; synchronizing existing associations must not erase freshly loaded Endpoint choices. Manual-mode select values must not collide with real upstream model IDs.
+- Runtime pool expansion must resolve `selected_provider_model_name` and `mapping_matched_model` for each account row through `resolve_provider_model_name_with_model_directives_and_request_operation`, before transport permission checks and payload construction. A representative account's selected target is not a pool-wide fact.
+- Reuse the request's existing per-format directive routing model and request operation. Preserve provider mapping priority and Endpoint/operation scope; do not reload directive policy on each pool page or enable directives unconditionally.
+- `provider_api_keys.allowed_models=NULL` preserves the row's configured default/provider-mapped target without account restrictions; an explicit empty list denies the account. Global regex matching selects only actual account-list entries, never fabricated suffixes. Disabling automatic model fetching on one account must not disable mapped alternatives on other accounts.
+- Score, ordinary-page, routing-allowlist and sticky-account hydration share account-local resolution. Model quota windows and reserve thresholds use the resolved account target. Memory candidate listing mirrors PostgreSQL's one-representative-per-pool projection; pool member reads remain expanded.
 
 ## 4. Validation & Error Matrix
 
@@ -42,6 +46,9 @@
 | 额度刷新发现可路由或内部模型 | 保留上游额度元数据，不写模型目录 |
 | 删除全局模型后再次刷新额度 | 不恢复全局模型、提供商模型或 Endpoint 绑定 |
 | 用户显式导入模型 | 按原导入流程创建目录记录，保留准确 Endpoint 证据 |
+| First account has no model list; later account lists a regex-matched variant | Later account resolves its own actual variant and remains eligible after first-account failure |
+| Pool member has an explicit empty model list | No upstream send for that member; preserve model-disabled semantics |
+| Pool account uses an operation-scoped provider mapping | Apply the original request operation and directive policy snapshot before permission/quota checks |
 
 ## 5. Good / Base / Bad Cases
 
@@ -61,6 +68,10 @@
 - Manual precedence/session isolation: Key refresh cannot replace manual edits; deselection, reopen, Provider switches, and stale Endpoint responses cannot leak bindings.
 - Select collision: a discovered model literally named `__manual__` remains a discovered model, not the manual-mode control.
 - 管理端额度路径：通过真实刷新接口验证额度与发现元数据正常持久化、既有模型及手动绑定不变；删除全局模型后再次刷新仍无目录记录。另保留显式导入成功与失败清理的行为测试。
+- `responses_pool_mixed_account_model_failover_sends_account_mapped_suffix`: real loopback HTTP, first account receives its bare configured target twice and returns404; second receives exactly its account-listed mapped target and returns200. Assert concrete candidate identities/statuses and final content.
+- `responses_pool_empty_account_model_list_stays_denied`: explicit empty account list prevents any upstream send despite a preceding unrestricted member.
+- `pool_member_model_resolution_tracks_account_scope_and_denials` and directive-policy coverage preserve mapping/operation scope, no-intersection denials and policy-disabled behavior. Memory projection parity must preserve all group-member rows while listing one logical pool representative.
+- `pool_cursor_raw_routing_model_keeps_restricted_custom_suffix_member_schedulable`: exercise `next_key` with a restricted raw custom-suffix model; callers that disable directive routing retain the eligible account, while an explicitly supplied base-routing context observes its own restrictions.
 
 ## 7. Wrong vs Correct
 
@@ -73,3 +84,7 @@ Test only a hidden or optional Key-selection path, then assume the normal “sel
 Load aggregate upstream evidence on the default path, guard saving until it settles, and keep manual Key selection only as an explicit refresh or disambiguation tool.
 
 Do not ask users to select an Endpoint without exposing that action in the normal association dialog. Keep both discovered evidence and explicit manual association reachable.
+
+Wrong: clone a pool representative, replace only its Key fields, then reject other accounts against the representative's upstream model name.
+
+Correct: re-resolve the account row with the request's mapping context, then check permissions, quotas and construct that account's request.
