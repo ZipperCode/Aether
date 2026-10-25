@@ -73,9 +73,9 @@ pub fn build_antigravity_pool_quota_request(
     headers.insert("authorization".to_string(), authorization.1);
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("accept".to_string(), "application/json".to_string());
-    headers
-        .entry("user-agent".to_string())
-        .or_insert_with(|| "antigravity".to_string());
+    headers.entry("user-agent".to_string()).or_insert_with(|| {
+        aether_provider_transport::antigravity::antigravity_client_identity(None).user_agent
+    });
 
     let json_body =
         aether_provider_transport::antigravity::build_antigravity_fetch_available_models_body(
@@ -112,9 +112,9 @@ pub fn build_antigravity_pool_quota_summary_request(
     headers.insert("authorization".to_string(), authorization.1);
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("accept".to_string(), "application/json".to_string());
-    headers
-        .entry("user-agent".to_string())
-        .or_insert_with(|| "antigravity".to_string());
+    headers.entry("user-agent".to_string()).or_insert_with(|| {
+        aether_provider_transport::antigravity::antigravity_client_identity(None).user_agent
+    });
 
     let json_body = project_id
         .map(str::trim)
@@ -217,6 +217,25 @@ mod tests {
                 "project": "project-1",
                 "entitlement": { "userTier": "g1-pro-tier" }
             }))
+        );
+    }
+
+    #[test]
+    fn quota_identity_falls_back_to_the_antigravity_cli_user_agent() {
+        let request = build_antigravity_pool_quota_summary_request(
+            "key-1",
+            "https://daily-cloudcode-pa.googleapis.com/",
+            ("authorization".to_string(), "Bearer token".to_string()),
+            None,
+            BTreeMap::new(),
+        );
+
+        let fallback_user_agent =
+            aether_provider_transport::antigravity::antigravity_client_identity(None).user_agent;
+        assert!(fallback_user_agent.starts_with("antigravity/cli/"));
+        assert_eq!(
+            request.headers.get("user-agent").map(String::as_str),
+            Some(fallback_user_agent.as_str())
         );
     }
 }

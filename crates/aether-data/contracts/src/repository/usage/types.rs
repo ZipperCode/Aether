@@ -3895,7 +3895,6 @@ mod tests {
             "project": "aicode-consumers",
             "requestId": "req-1",
             "requestType": "agent",
-            "userAgent": "vscode/1.X.X (Antigravity/4.3.0)",
             "request": {
                 "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
                 "generationConfig": {

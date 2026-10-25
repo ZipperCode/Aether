@@ -1954,7 +1954,14 @@ async fn gateway_executes_openai_chat_antigravity_cross_format_sync_via_local_fi
         "Bearer imported-antigravity-chat-token"
     );
     assert_eq!(seen_execution_runtime_request.x_client_name, "antigravity");
-    assert_eq!(seen_execution_runtime_request.x_client_version, "4.3.0");
+    assert_eq!(seen_execution_runtime_request.x_client_version, "1.2.3");
+    assert!(
+        seen_execution_runtime_request
+            .user_agent
+            .starts_with("antigravity/cli/1.2.3 "),
+        "user_agent should carry the account client_version: {}",
+        seen_execution_runtime_request.user_agent
+    );
     assert_eq!(
         seen_execution_runtime_request.x_vscode_sessionid,
         "sess-antigravity-chat-local-123"
@@ -1972,10 +1979,6 @@ async fn gateway_executes_openai_chat_antigravity_cross_format_sync_via_local_fi
         "trace-openai-chat-antigravity-sync-123"
     );
     assert_eq!(seen_execution_runtime_request.model, "claude-sonnet-4-5");
-    assert_eq!(
-        seen_execution_runtime_request.user_agent,
-        aether_provider_transport::antigravity::ANTIGRAVITY_REQUEST_USER_AGENT
-    );
     assert_eq!(seen_execution_runtime_request.request_type, "");
     assert_eq!(seen_execution_runtime_request.contents_len, 1);
     assert!(!seen_execution_runtime_request.request_has_model);

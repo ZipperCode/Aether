@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/aether-model-fetch/backend/quality-guidelines.md", "reason": "Preserve account evidence and upstream-only discovery"}
+{"file": ".trellis/spec/aether-gateway/backend/model-association-endpoint-contract.md", "reason": "Preserve account-local model mapping and exact endpoint evidence"}

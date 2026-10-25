@@ -31,10 +31,6 @@ pub const GEMINI_CLI: PinnedClientIdentity = PinnedClientIdentity {
 // Legacy standard-models fallback; dedicated Kiro requests use OAuth SDK identity.
 pub const KIRO_MODELS_LEGACY_USER_AGENT: &str = "claude-code/1.0.1";
 
-pub const ANTIGRAVITY: PinnedClientIdentity = PinnedClientIdentity {
-    version: "4.3.0",
-    user_agent: "vscode/1.X.X (Antigravity/4.3.0)",
-};
 pub const WINDSURF: PinnedClientIdentity = PinnedClientIdentity {
     version: "1.9600.41",
     user_agent: "windsurf/1.9600.41",
@@ -58,7 +54,7 @@ mod tests {
     use super::*;
     #[test]
     fn pinned_headers_and_body_versions_are_calibrated_together() {
-        for identity in [ANTIGRAVITY, WINDSURF] {
+        for identity in [WINDSURF] {
             assert!(identity.user_agent.contains(identity.version));
         }
     }

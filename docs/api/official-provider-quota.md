@@ -63,6 +63,9 @@
 - 缺项目账号可在配额详情中选择“初始化伴生项目”，确认后调用管理员接口 `POST /api/admin/provider-oauth/keys/{key_id}/initialize-project`。已有配置项目仅同步观察，不重复初始化；普通聊天、额度刷新和后台发现不执行 `onboardUser`。
 - 初始化先走生产端 `loadCodeAssist`，必要时向配置的允许源站发送 `onboardUser`；仅显式 pending 状态继续轮询，最多 5 次、总工作流 15 秒。硬拒绝立即停止；项目创建完成后立即保存，后续查询失败不会删除项目。
 - 账号观察通过 Antigravity 命名空间 CAS 合并，保留并发更新的套餐、项目、额度及其他命名空间；模型发现失败仍保存本次账号观察，但不修改模型白名单或上次成功目录。
+- Antigravity 模型目录按请求范围逐 Key 读取并聚合：不同账号的权益差异不能由首个成功账号代表；提供商级目录只作为响应投影，不回写任何账号的 `allowed_models`。显式 Key 选择仍只返回所选账号的真实目录，单 Key 查询不借用其他账号模型。
+- 上游模型条目携带 `disabled: true` 时不进入模型或 `quota_by_model` 投影；未知但启用的模型 ID 原样保留。目录不从配额组、静态快照或模型别名补充 Gemini 4。
+- Antigravity 出站身份统一使用官方 CLI 家族 `antigravity/cli/<version> <os>/<arch>`；默认版本为官方 CLI `1.4.7`，账号级 `client_version` 覆盖只作用于当前账号的初始化、模型发现、额度和生成请求。官方支持范围与账号权益见 https://antigravity.google/docs/models。
 
 ## 只读联调范围
 

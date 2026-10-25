@@ -2688,11 +2688,8 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
     );
     assert_eq!(fetch_models_request.authorization, "Bearer ya29.ant-token");
-    assert_eq!(
-        fetch_models_request.user_agent,
-        "vscode/1.X.X (Antigravity/4.3.0)"
-    );
-    assert_eq!(fetch_models_request.x_client_version, "4.3.0");
+    // 账号级 client_version 覆盖必须落到实际请求（含无 project 的 loadCodeAssist）。
+    assert_eq!(fetch_models_request.x_client_version, "1.18.4");
     assert_eq!(
         fetch_models_request.provider_api_format,
         "antigravity:fetch_available_models"
@@ -2722,14 +2719,11 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
     );
     assert_eq!(grouped_without_project.url, grouped_with_project.url);
     assert_eq!(grouped_without_project.request_body, Some(json!({})));
-    assert!(seen_execution_runtime_requests
-        .iter()
-        .filter(|request| request.provider_api_format != "antigravity:load_code_assist")
-        .all(|request| {
-            request.authorization == "Bearer ya29.ant-token"
-                && request.user_agent == "vscode/1.X.X (Antigravity/4.3.0)"
-                && request.x_client_version == "4.3.0"
-        }));
+    assert!(seen_execution_runtime_requests.iter().all(|request| {
+        request.authorization == "Bearer ya29.ant-token"
+            && request.x_client_version == "1.18.4"
+            && request.user_agent.starts_with("antigravity/cli/1.18.4 ")
+    }));
 
     let reloaded = provider_catalog_repository
         .list_keys_by_ids(&["key-antigravity-a".to_string()])

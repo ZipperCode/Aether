@@ -96,7 +96,6 @@ const ADMIN_PROVIDER_QUERY_NO_ACTIVE_TEST_CANDIDATE_DETAIL: &str =
     "No active endpoint or API key found";
 const ADMIN_PROVIDER_QUERY_INVALID_MAPPED_MODEL_DETAIL: &str =
     "mapped_model_name is not valid for the selected model and endpoint";
-const ANTIGRAVITY_PROVIDER_CACHE_KEY_PREFIX: &str = "upstream_models_provider:";
 const DEFAULT_PROVIDER_QUERY_TEST_MESSAGE: &str = "Hello! This is a test message.";
 static PROVIDER_QUERY_POOL_LOAD_BALANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -106,7 +105,6 @@ struct ProviderQueryKeyFetchResult {
     error: Option<String>,
     warning: Option<String>,
     from_cache: bool,
-    has_success: bool,
     native_catalog: bool,
 }
 
@@ -320,7 +318,6 @@ fn provider_query_codex_preset_fallback(
             "Codex 动态模型目录不可用，已使用内置模型卡：{fetch_error}"
         )),
         from_cache: false,
-        has_success: true,
         native_catalog: false,
     })
 }
@@ -419,42 +416,6 @@ async fn provider_query_read_cached_models(
     (!models.is_empty()).then_some(models)
 }
 
-async fn provider_query_read_provider_cached_models(
-    state: &AdminAppState<'_>,
-    provider_id: &str,
-) -> Option<Vec<Value>> {
-    let cache_key = format!("{ANTIGRAVITY_PROVIDER_CACHE_KEY_PREFIX}{provider_id}");
-    let raw = state.runtime_state().kv_get(&cache_key).await.ok()??;
-    let parsed = serde_json::from_str::<Vec<Value>>(&raw).ok()?;
-    let models = aggregate_models_for_cache(&parsed);
-    (!models.is_empty()).then_some(models)
-}
-
-async fn provider_query_write_provider_cached_models(
-    state: &AdminAppState<'_>,
-    provider_id: &str,
-    models: &[Value],
-) {
-    let models = aggregate_models_for_cache(models);
-    if models.is_empty() {
-        return;
-    }
-    let Ok(serialized) = serde_json::to_string(&models) else {
-        return;
-    };
-    let cache_key = format!("{ANTIGRAVITY_PROVIDER_CACHE_KEY_PREFIX}{provider_id}");
-    let _ = state
-        .runtime_state()
-        .kv_set(
-            &cache_key,
-            serialized,
-            Some(std::time::Duration::from_secs(
-                aether_model_fetch::model_fetch_interval_minutes().saturating_mul(60),
-            )),
-        )
-        .await;
-}
-
 fn provider_query_antigravity_tier_weight(raw_auth_config: Option<&str>) -> i32 {
     raw_auth_config
         .and_then(|value| serde_json::from_str::<Value>(value).ok())
@@ -528,7 +489,6 @@ async fn provider_query_fetch_discovered_models_for_key(
                     error,
                     warning: None,
                     from_cache: false,
-                    has_success: true,
                     // 后台已按真实目录来源完成投影，不能把旧式 data 列表重新认作原生目录。
                     native_catalog: false,
                 });
@@ -547,7 +507,6 @@ async fn provider_query_fetch_discovered_models_for_key(
                 error: Some(error),
                 warning: None,
                 from_cache: false,
-                has_success: false,
                 native_catalog: false,
             });
         }
@@ -587,7 +546,6 @@ async fn provider_query_fetch_discovered_models_for_key(
                 error: None,
                 warning: None,
                 from_cache: true,
-                has_success: true,
                 native_catalog: is_codex,
             });
         }
@@ -604,7 +562,6 @@ async fn provider_query_fetch_discovered_models_for_key(
                 error: None,
                 warning: None,
                 from_cache: false,
-                has_success: true,
                 native_catalog: false,
             });
         }
@@ -613,7 +570,6 @@ async fn provider_query_fetch_discovered_models_for_key(
             error: Some(ADMIN_PROVIDER_QUERY_NO_ACTIVE_ENDPOINT_DETAIL.to_string()),
             warning: None,
             from_cache: false,
-            has_success: false,
             native_catalog: false,
         });
     }
@@ -641,7 +597,6 @@ async fn provider_query_fetch_discovered_models_for_key(
             error: Some(all_errors.join("; ")),
             warning: None,
             from_cache: false,
-            has_success: false,
             native_catalog: false,
         });
     }
@@ -672,7 +627,6 @@ async fn provider_query_fetch_discovered_models_for_key(
                     error: Some(all_errors.join("; ")),
                     warning: None,
                     from_cache: false,
-                    has_success: false,
                     native_catalog: false,
                 });
             }
@@ -734,7 +688,6 @@ async fn provider_query_fetch_discovered_models_for_key(
         error,
         warning,
         from_cache: false,
-        has_success: outcome.has_success,
         native_catalog: outcome.native_codex_catalog,
     })
 }
@@ -884,33 +837,6 @@ pub(crate) async fn build_admin_provider_query_models_response(
     }
     let query_key_count = query_keys.len();
 
-    if selected_key_ids.is_none()
-        && provider
-            .provider_type
-            .trim()
-            .eq_ignore_ascii_case("antigravity")
-        && !force_refresh
-    {
-        if let Some(models) = provider_query_read_provider_cached_models(state, &provider.id).await
-        {
-            let models = provider_query_attach_model_test_capabilities(&provider, models);
-            return Ok(Json(json!({
-                "success": !models.is_empty(),
-                "data": {
-                    "models": models,
-                    "error": serde_json::Value::Null,
-                    "warning": serde_json::Value::Null,
-                    "from_cache": true,
-                    "keys_total": query_key_count,
-                    "keys_cached": query_key_count,
-                    "keys_fetched": 0,
-                },
-                "provider": provider_query_provider_payload(&provider),
-            }))
-            .into_response());
-        }
-    }
-
     let ordered_keys = if provider
         .provider_type
         .trim()
@@ -956,26 +882,9 @@ pub(crate) async fn build_admin_provider_query_models_response(
         } else {
             fetch_count += 1;
         }
-        if provider
-            .provider_type
-            .trim()
-            .eq_ignore_ascii_case("antigravity")
-            && result.has_success
-        {
-            break;
-        }
     }
 
     let models = aggregate_models_for_cache(&all_models);
-    if selected_key_ids.is_none()
-        && provider
-            .provider_type
-            .trim()
-            .eq_ignore_ascii_case("antigravity")
-        && !models.is_empty()
-    {
-        provider_query_write_provider_cached_models(state, &provider.id, &models).await;
-    }
     let success = !models.is_empty();
     let mut all_issues = all_errors;
     all_issues.extend(all_warnings);

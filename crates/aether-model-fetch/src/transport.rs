@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot, RequestBody};
 use aether_provider_transport::antigravity::{
     build_antigravity_fetch_available_models_body, build_antigravity_static_client_headers,
-    build_antigravity_static_identity_headers, resolve_local_antigravity_request_auth,
-    AntigravityRequestAuthSupport, ANTIGRAVITY_REQUEST_USER_AGENT,
+    build_antigravity_static_identity_headers, resolve_antigravity_identity_fields,
+    resolve_local_antigravity_request_auth, AntigravityRequestAuthSupport,
 };
 use aether_provider_transport::auth::{
     ensure_upstream_auth_header, resolve_local_gemini_auth, resolve_local_openai_bearer_auth,
@@ -237,9 +237,6 @@ pub async fn build_antigravity_fetch_available_models_plan(
     headers.insert(authorization.0.clone(), authorization.1.clone());
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("accept".to_string(), "application/json".to_string());
-    headers
-        .entry("user-agent".to_string())
-        .or_insert_with(|| ANTIGRAVITY_REQUEST_USER_AGENT.to_string());
     let protected_headers = vec![authorization.0];
     headers = apply_fetch_header_rules(transport, headers, &protected_headers)?;
 
@@ -278,13 +275,14 @@ pub async fn build_antigravity_load_code_assist_plan(
             "Antigravity loadCodeAssist requires OAuth authorization header".to_string()
         })?;
 
-    let mut headers = build_antigravity_static_client_headers(None, None);
+    // Projectless account request: the account's `client_version` / `session_id` must still
+    // shape the identity so load matches every other request from the same account.
+    let (client_version, session_id) = resolve_antigravity_identity_fields(transport);
+    let mut headers =
+        build_antigravity_static_client_headers(client_version.as_deref(), session_id.as_deref());
     headers.insert(authorization.0.clone(), authorization.1.clone());
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("accept".to_string(), "application/json".to_string());
-    headers
-        .entry("user-agent".to_string())
-        .or_insert_with(|| ANTIGRAVITY_REQUEST_USER_AGENT.to_string());
     let protected_headers = vec![authorization.0];
     headers = apply_fetch_header_rules(transport, headers, &protected_headers)?;
 
@@ -808,7 +806,7 @@ mod tests {
         build_kiro_list_available_models_plan, build_models_fetch_execution_plan,
         build_models_fetch_execution_plan_for_client_version,
         build_standard_models_fetch_execution_plan, build_vertex_models_fetch_execution_plan,
-        ModelFetchTransportRuntime, ANTIGRAVITY_REQUEST_USER_AGENT,
+        ModelFetchTransportRuntime,
     };
 
     struct TestRuntime {
@@ -1237,10 +1235,6 @@ mod tests {
             Some(&json!("g1-pro-tier"))
         );
         assert_eq!(
-            plan.headers.get("user-agent").map(String::as_str),
-            Some(ANTIGRAVITY_REQUEST_USER_AGENT)
-        );
-        assert_eq!(
             plan.headers.get("x-client-name").map(String::as_str),
             Some("antigravity")
         );
@@ -1250,7 +1244,7 @@ mod tests {
         );
         assert_eq!(
             plan.headers.get("x-client-version").map(String::as_str),
-            Some("4.3.0")
+            Some("1.2.3")
         );
         assert_eq!(
             plan.headers.get("x-vscode-sessionid").map(String::as_str),
@@ -1285,16 +1279,21 @@ mod tests {
             Some("Bearer oauth-token")
         );
         assert_eq!(
-            plan.headers.get("user-agent").map(String::as_str),
-            Some(ANTIGRAVITY_REQUEST_USER_AGENT)
-        );
-        assert_eq!(
             plan.headers.get("x-client-name").map(String::as_str),
             Some("antigravity")
         );
         assert_eq!(
             plan.headers.get("x-goog-api-client").map(String::as_str),
             Some("gl-node/18.18.2 fire/0.8.6 grpc/1.10.x")
+        );
+        // 无 project 的 load 也必须携带账号级 client_version / session_id 覆盖。
+        assert_eq!(
+            plan.headers.get("x-client-version").map(String::as_str),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            plan.headers.get("x-vscode-sessionid").map(String::as_str),
+            Some("sess-1")
         );
     }
 

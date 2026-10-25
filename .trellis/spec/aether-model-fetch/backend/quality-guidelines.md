@@ -11,8 +11,7 @@ Document your project's quality standards here.
 
 Questions to answer:
 - What patterns are forbidden?
-- What linting rules do you enforce?
-- What are your testing requirements?
+- What linting and testing rules do you enforce?
 - What code review standards apply?
 -->
 
@@ -73,7 +72,7 @@ Questions to answer:
 - 自动刷新继续执行 `apply_model_filters`；手工白名单与停用绑定不被覆盖，`None` 模型白名单保持无限制语义，显式 `[]` 在管理测试和正式调用中都禁止。
 - 保持每 Provider 一次可用性协调和轻量 Key 投影；只增加所需认证类型标量，不扫描完整 Key、认证材料或状态快照。
 - 图片配置映射的 `api_formats: []` 与 `endpoint_ids: []` 沿用正式候选的拒绝语义；`operations: []` 经既有持久层规范化表示继承，不能把两者混同。
-- 强制刷新返回已经完成的管理投影，不根据“存在模型抓取 Endpoint”将兼容 `data[]` 目录重新认定为原生 Codex cards。
+- 强制刷新返回已经完成的管理投影，不根据“存在模型抓取 Endpoint”将兼容 `data[]` 目录重新认定为原生 Codex cards。预设元数据先形成再补全。
 - 无文本抓取 Endpoint 的预设路径中，如果 Codex OAuth 已配置可用图片模型且 metadata 没有套餐事实，只在现有维护许可内读取一个选中图片 transport 的认证声明；不发出上游请求，不扩大批量轻量读取，并继续隔离损坏的旧凭据。
 
 ### 4. Validation & Error Matrix
@@ -129,6 +128,9 @@ Required when changing Antigravity account hydration, quota refresh, model disco
 - Success (including unknown tier) has a 900-second refresh TTL; failures have a 60-second cooldown. Future timestamps are stale. Explicit quota refresh always attempts discovery.
 - Antigravity namespace updates shallow-merge old fields absent from incoming updates. Explicit null clears old evidence. Replacing `quota_by_model` still drops removed models and preserves a returned model's missing reset time.
 - Both discovery paths try observed paid ID, current ID, then no entitlement; exclude free-tier, legacy-tier and duplicates. A 400 `INVALID_ARGUMENT` from a request carrying an entitlement is a bounded compatibility rejection and advances the candidate; 400 project errors without an entitlement reference remain terminal. A 412 `FAILED_PRECONDITION` still requires explicit tier evidence. Independent model host failover is not entitlement fallback.
+- Admin provider-wide model queries iterate every selected account and union only the account-local discovered rows. Provider-wide output is a response projection; it must never be copied into any account's `allowed_models` or used to authorize another account.
+- Upstream `disabled: true` entries are excluded before both model and quota projections. Unknown enabled IDs remain discoverable. No static catalog, entitlement label, quota bucket or alias may add an Antigravity model.
+- Antigravity discovery and generation share the account-local CLI identity `antigravity/cli/<version> <os>/<arch>`; a `client_version` override applies only to that account and must not be silently discarded.
 
 ### 4. Validation & Error Matrix
 
@@ -140,20 +142,23 @@ Required when changing Antigravity account hydration, quota refresh, model disco
 | 401/403/429 or transport failure | Do not switch entitlement candidate |
 | Invalid entitlement parameter | Advance bounded candidate list |
 | Model metadata refresh | Preserve account evidence and other namespaces |
+| First account succeeds, later account has exclusive model | Continue and include the later account's model in provider response |
+| One account fails, another succeeds | Preserve successful rows and surface the failed account as warning |
+| Upstream `disabled:true` row | Exclude the row and its quota metadata |
 
 ### 5. Good / Base / Bad Cases
 
-Good: an old project-only account acquires Pro, paid entitlement rejection falls back to current entitlement. Base: free account sends project without entitlement. Bad: a failure patch replaces the entire Antigravity namespace, deleting the project and last successful tier.
+Good: an old project-only account acquires Pro, paid entitlement rejection falls back to current entitlement. Base: free account sends project without entitlement. Bad: a failure patch replaces the entire Antigravity namespace, deleting the project and last successful tier. Good: mixed-tier accounts expose the union only at provider-query projection while each account remains isolated. Bad: stop after the first successful account or synthesize Gemini 4 from a quota bucket.
 
 ### 6. Tests Required
 
 - Shared parsing precedence, raw-ID versus display-name distinction, candidate deduplication/exclusion and TTL boundaries.
 - Real model-fetch execution sequence, authentication/throttle/transport non-fallback and cached evidence on discovery failure.
 - Namespace merge failure preservation and explicit-null clearing; local HTTP smoke must inspect actual request bodies and returned metadata.
+- Provider-query loopback coverage for later-account-only models, empty first success, mixed tiers, partial failures, duplicate endpoint evidence, selected-account isolation, stale provider-cache bypass and disabled/quota projection.
 
 ### 7. Wrong vs Correct
 
-Wrong: return early solely because project_id exists, or infer `g1-pro-tier` from a UI label.
+Wrong: return early solely because project_id exists, or infer `g1-pro-tier` from a UI label. Wrong: treat one successful account as the provider's complete model list.
 
-Correct: use the shared observation freshness and raw-entitlement policy, and merge field patches without erasing successful evidence.
-
+Correct: use the shared observation freshness and raw-entitlement policy, merge field patches without erasing successful evidence, iterate every requested account, and keep the provider union separate from account-local authorization.

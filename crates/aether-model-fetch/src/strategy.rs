@@ -1572,7 +1572,8 @@ fn model_fetch_format_label(api_format: &str) -> &'static str {
     }
 }
 
-/// 解析 Antigravity 模型与额度，并通过共享谓词排除空 ID 和内部不可路由模型。
+/// 解析 Antigravity 模型与额度，并通过共享谓词排除空 ID 和内部不可路由模型；
+/// 上游条目显式携带 `disabled: true` 时不进入模型行与额度投影，未声明该字段的未知启用 ID 保持可发现。
 fn parse_antigravity_models_response(body: &Value) -> Result<(Vec<Value>, Option<Value>), String> {
     let models_object = body
         .get("models")
@@ -1584,6 +1585,9 @@ fn parse_antigravity_models_response(body: &Value) -> Result<(Vec<Value>, Option
     for (model_id, model_data) in models_object {
         let model_id = model_id.trim();
         if !antigravity_model_id_is_routable(model_id) {
+            continue;
+        }
+        if model_data.get("disabled").and_then(Value::as_bool) == Some(true) {
             continue;
         }
         let model_object = model_data.as_object().cloned().unwrap_or_default();
@@ -4514,6 +4518,83 @@ mod tests {
         assert_eq!(
             antigravity["quota_by_model"]["gemini-3.7-flash-low"]["used_percent"],
             json!(100.0)
+        );
+    }
+
+    #[test]
+    fn antigravity_models_exclude_explicit_disabled_entries_from_model_projection() {
+        let (models, _metadata) = parse_antigravity_models_response(&json!({
+            "models": {
+                "gemini-3.7-flash-live": {
+                    "displayName": "Gemini 3.7 Flash"
+                },
+                "gemini-3.7-flash-off": {
+                    "displayName": "Gemini 3.7 Flash Off",
+                    "disabled": true
+                },
+                "gemini-4-argon-unlisted": {
+                    "displayName": "Gemini 4 Argon"
+                },
+                "gemini-3.7-flash-flag-false": {
+                    "displayName": "Gemini 3.7 Flash Flag",
+                    "disabled": false
+                }
+            }
+        }))
+        .expect("Antigravity models should parse");
+
+        let ids = models
+            .iter()
+            .filter_map(|model| model.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        // 显式 disabled:true 不进入目录；未声明该字段的未知启用 ID 保持可发现，且不得凭空补模型。
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from([
+                "gemini-3.7-flash-flag-false".to_string(),
+                "gemini-3.7-flash-live".to_string(),
+                "gemini-4-argon-unlisted".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn antigravity_models_exclude_explicit_disabled_entries_from_quota_projection() {
+        let (_models, metadata) = parse_antigravity_models_response(&json!({
+            "models": {
+                "gemini-3.7-flash-live": {
+                    "displayName": "Gemini 3.7 Flash",
+                    "quotaInfo": {
+                        "remainingFraction": 0.5
+                    }
+                },
+                "gemini-3.7-flash-off": {
+                    "displayName": "Gemini 3.7 Flash Off",
+                    "disabled": true,
+                    "quotaInfo": {
+                        "remainingFraction": 0.1
+                    }
+                }
+            }
+        }))
+        .expect("Antigravity models should parse");
+
+        let metadata = metadata.expect("quota metadata should parse");
+        let quota_by_model = metadata["antigravity"]["quota_by_model"]
+            .as_object()
+            .expect("quota_by_model should be an object");
+        // 额度投影与模型投影同步排除 disabled:true，旧条目的额度不得保留。
+        assert_eq!(
+            quota_by_model
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["gemini-3.7-flash-live"]
+        );
+        assert_eq!(
+            quota_by_model["gemini-3.7-flash-live"]["remaining_fraction"],
+            json!(0.5)
         );
     }
 

@@ -2749,7 +2749,7 @@ mod tests {
                 .provider_request_headers
                 .get("x-client-version")
                 .map(String::as_str),
-            Some("4.3.0")
+            Some("1.2.3")
         );
         assert_eq!(
             payload
@@ -2767,10 +2767,6 @@ mod tests {
             "trace-openai-chat-antigravity"
         );
         assert_eq!(payload.provider_request_body["model"], "gemini-2.5-pro");
-        assert_eq!(
-            payload.provider_request_body["userAgent"],
-            "vscode/1.X.X (Antigravity/4.3.0)"
-        );
         assert!(payload.provider_request_body.get("requestType").is_none());
         assert!(payload.provider_request_body.get("contents").is_none());
         assert!(payload.provider_request_body["request"]

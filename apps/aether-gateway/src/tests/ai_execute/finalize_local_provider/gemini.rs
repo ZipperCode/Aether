@@ -2133,7 +2133,14 @@ async fn gateway_executes_antigravity_gemini_cli_sync_upstream_stream_via_local_
     );
     assert_eq!(
         seen_remote_execution_runtime_request.x_client_version,
-        "4.3.0"
+        "1.2.3"
+    );
+    assert!(
+        seen_remote_execution_runtime_request
+            .user_agent
+            .starts_with("antigravity/cli/1.2.3 "),
+        "user_agent should carry the account client_version: {}",
+        seen_remote_execution_runtime_request.user_agent
     );
     assert_eq!(
         seen_remote_execution_runtime_request.x_vscode_sessionid,
@@ -2154,10 +2161,6 @@ async fn gateway_executes_antigravity_gemini_cli_sync_upstream_stream_via_local_
     assert_eq!(
         seen_remote_execution_runtime_request.model,
         "claude-sonnet-4-5"
-    );
-    assert_eq!(
-        seen_remote_execution_runtime_request.user_agent,
-        aether_provider_transport::antigravity::ANTIGRAVITY_REQUEST_USER_AGENT
     );
     assert_eq!(seen_remote_execution_runtime_request.request_type, "");
     assert_eq!(seen_remote_execution_runtime_request.contents_len, 0);

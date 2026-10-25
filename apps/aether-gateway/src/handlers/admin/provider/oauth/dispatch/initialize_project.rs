@@ -14,10 +14,10 @@ use aether_admin::provider::redaction::admin_provider_upstream_metadata_safe_jso
 use aether_contracts::{ExecutionPlan, RequestBody};
 use aether_model_fetch::build_antigravity_load_code_assist_plan;
 use aether_provider_transport::antigravity::{
-    antigravity_account_observation_update, build_antigravity_static_client_headers,
-    parse_antigravity_code_assist_response, resolve_local_antigravity_request_auth,
+    antigravity_account_observation_update, antigravity_client_identity,
+    build_antigravity_static_client_headers, parse_antigravity_code_assist_response,
+    resolve_antigravity_identity_fields, resolve_local_antigravity_request_auth,
     AntigravityCodeAssistInfo, AntigravityRequestAuthSupport, ANTIGRAVITY_PROVIDER_TYPE,
-    ANTIGRAVITY_REQUEST_USER_AGENT,
 };
 use axum::{
     body::Body,
@@ -438,20 +438,21 @@ async fn execute_single_onboard_user(
     authorization: &(String, String),
     tier_id: &str,
 ) -> Result<Option<String>, String> {
-    let mut headers = build_antigravity_static_client_headers(None, None);
+    // Onboard initialization is a projectless account request: carry the same account-local
+    // identity (client_version / session_id) as every other request from this account.
+    let (client_version, session_id) = resolve_antigravity_identity_fields(transport);
+    let mut headers =
+        build_antigravity_static_client_headers(client_version.as_deref(), session_id.as_deref());
     headers.insert(authorization.0.clone(), authorization.1.clone());
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("accept".to_string(), "application/json".to_string());
-    headers
-        .entry("user-agent".to_string())
-        .or_insert_with(|| ANTIGRAVITY_REQUEST_USER_AGENT.to_string());
     force_provider_quota_redirects_disabled(&mut headers);
 
     let body_json = json!({
         "tier_id": tier_id,
         "metadata": {
             "ide_type": "ANTIGRAVITY",
-            "ide_version": aether_provider_transport::client_identity::ANTIGRAVITY.version,
+            "ide_version": antigravity_client_identity(client_version.as_deref()).version,
             "ide_name": "antigravity",
         }
     });

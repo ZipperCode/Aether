@@ -1,6 +1,6 @@
 use serde_json::{Map, Value};
 
-use super::auth::{AntigravityRequestAuth, ANTIGRAVITY_REQUEST_USER_AGENT};
+use super::auth::{antigravity_client_identity, AntigravityRequestAuth};
 use super::schema::{normalize_claude_unions, normalize_tool_parameters, SchemaBudget};
 
 /// 只识别真实 HTTP 400 的 Gemini 签名拒绝；调用方还必须确认 Antigravity 适配身份。
@@ -256,8 +256,14 @@ pub fn build_antigravity_safe_v1internal_request(
             );
         }
         let request_id = non_empty_string_field(source, "requestId").unwrap_or(request_id);
-        let user_agent =
-            non_empty_string_field(source, "userAgent").unwrap_or(ANTIGRAVITY_REQUEST_USER_AGENT);
+        // Pre-enveloped v1internal bodies keep their explicit `userAgent` byte-for-byte so
+        // passthrough callers stay wire-compatible; only a missing one falls back to the
+        // account CLI identity.
+        let user_agent = non_empty_string_field(source, "userAgent")
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                antigravity_client_identity(auth.client_version.as_deref()).user_agent
+            });
         let existing_request_type = existing_v1internal_request_type(source);
 
         let mut envelope = serde_json::json!({
@@ -292,7 +298,7 @@ pub fn build_antigravity_safe_v1internal_request(
         "requestId": request_id,
         "request": Value::Object(inner_request),
         "model": model,
-        "userAgent": ANTIGRAVITY_REQUEST_USER_AGENT,
+        "userAgent": antigravity_client_identity(auth.client_version.as_deref()).user_agent,
     });
     if request_type != AntigravityEnvelopeRequestType::Agent {
         envelope["requestType"] = Value::String(request_type.as_str().to_string());
@@ -432,7 +438,6 @@ mod tests {
         AntigravityRequestAuth, AntigravityRequestEnvelopeSupport,
         AntigravityThoughtSignatureRejection,
     };
-    use crate::antigravity::ANTIGRAVITY_REQUEST_USER_AGENT;
     use crate::same_format_provider::{
         build_same_format_provider_request_body, SameFormatProviderFamily,
         SameFormatProviderRequestBodyInput,
@@ -1457,7 +1462,6 @@ mod tests {
         assert_eq!(envelope["project"], "project-ant-123");
         assert_eq!(envelope["requestId"], "request-ant-agent-123");
         assert_eq!(envelope["model"], "gemini-3.5-flash-low");
-        assert_eq!(envelope["userAgent"], ANTIGRAVITY_REQUEST_USER_AGENT);
         assert!(envelope.get("requestType").is_none());
         assert!(envelope["request"].get("model").is_none());
         assert!(envelope["request"].get("safetySettings").is_none());
@@ -1628,6 +1632,44 @@ mod tests {
                     "mode": "MODE_UNSPECIFIED"
                 }
             })
+        );
+    }
+
+    /// 生成分支的 envelope `userAgent` 必须来自账号级 `client_version` 覆盖，而不是固定模板。
+    #[test]
+    fn envelope_user_agent_follows_the_account_client_version_override() {
+        let request_body = json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "text": "override identity" }
+                    ]
+                }
+            ]
+        });
+        let mut auth = sample_auth();
+        auth.client_version = Some("1.5.2".to_string());
+
+        let envelope = match build_antigravity_safe_v1internal_request(
+            &auth,
+            "request-ant-override-123",
+            "gemini-3.5-flash-low",
+            &request_body,
+            AntigravityEnvelopeRequestType::Agent,
+        ) {
+            AntigravityRequestEnvelopeSupport::Supported(envelope) => envelope,
+            AntigravityRequestEnvelopeSupport::Unsupported(reason) => {
+                panic!("override envelope should be supported: {reason:?}")
+            }
+        };
+
+        let user_agent = envelope["userAgent"]
+            .as_str()
+            .expect("userAgent should be a string");
+        assert!(
+            user_agent.starts_with("antigravity/cli/1.5.2 "),
+            "envelope userAgent should carry the account client_version override: {user_agent}"
         );
     }
 

@@ -3,12 +3,62 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::super::snapshot::GatewayProviderTransportSnapshot;
+use crate::client_identity::VersionedClientIdentity;
 
 pub const ANTIGRAVITY_PROVIDER_TYPE: &str = "antigravity";
-pub const ANTIGRAVITY_CLIENT_VERSION: &str = crate::client_identity::ANTIGRAVITY.version;
-pub const ANTIGRAVITY_REQUEST_USER_AGENT: &str = crate::client_identity::ANTIGRAVITY.user_agent;
 const ANTIGRAVITY_CLIENT_NAME: &str = "antigravity";
 const ANTIGRAVITY_GOOG_API_CLIENT: &str = "gl-node/18.18.2 fire/0.8.6 grpc/1.10.x";
+
+// Official Antigravity CLI identity family: `antigravity/cli/<version> <os>/<arch>`, the wire
+// identity of the official `agy` binary (public release channel
+// `google-antigravity/antigravity-cli`). Pinned baseline 1.4.7 = official release 2026-10-24.
+// A per-account `client_version` (auth config / upstream metadata) overrides the baseline for
+// that account's requests only; absent or wire-invalid overrides fall back to the baseline.
+// Identity is resolved per account and never published as global state.
+const ANTIGRAVITY_CLI_BUILTIN_VERSION: &str = "1.4.7";
+const ANTIGRAVITY_CLI_AGENT: &str = "antigravity/cli";
+
+/// Platform tokens match the official binary's Go-style GOOS/GOARCH (`darwin|linux|windows`,
+/// `arm64|amd64`), derived from the compile target.
+fn antigravity_cli_platform_suffix() -> String {
+    let os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    format!(" {os}/{arch}")
+}
+
+/// Central Antigravity client identity for headers, envelopes, loadCodeAssist/onboardUser and
+/// quota fallbacks. `client_version` is the per-account override; wire-invalid values (see
+/// `VersionedClientIdentity`) silently fall back to the pinned baseline instead of failing the
+/// request or leaking the raw value onto the wire.
+pub fn antigravity_client_identity(client_version: Option<&str>) -> VersionedClientIdentity {
+    client_version
+        .and_then(|version| {
+            VersionedClientIdentity::new(
+                version,
+                ANTIGRAVITY_CLI_AGENT,
+                &antigravity_cli_platform_suffix(),
+            )
+            .ok()
+        })
+        .unwrap_or_else(|| {
+            VersionedClientIdentity::new(
+                ANTIGRAVITY_CLI_BUILTIN_VERSION,
+                ANTIGRAVITY_CLI_AGENT,
+                &antigravity_cli_platform_suffix(),
+            )
+            .expect("builtin Antigravity CLI version is wire-safe")
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AntigravityRequestAuth {
@@ -35,40 +85,10 @@ pub enum AntigravityRequestAuthUnsupportedReason {
 pub fn resolve_local_antigravity_request_auth(
     transport: &GatewayProviderTransportSnapshot,
 ) -> AntigravityRequestAuthSupport {
-    if !transport
-        .provider
-        .provider_type
-        .trim()
-        .eq_ignore_ascii_case(ANTIGRAVITY_PROVIDER_TYPE)
-    {
-        return AntigravityRequestAuthSupport::Unsupported(
-            AntigravityRequestAuthUnsupportedReason::WrongProviderType,
-        );
-    }
-
-    let Some(raw_auth_config) = transport
-        .key
-        .decrypted_auth_config
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return AntigravityRequestAuthSupport::Unsupported(
-            AntigravityRequestAuthUnsupportedReason::MissingAuthConfig,
-        );
+    let auth_config = match resolve_antigravity_auth_config(transport) {
+        Ok(auth_config) => auth_config,
+        Err(reason) => return AntigravityRequestAuthSupport::Unsupported(reason),
     };
-
-    let Ok(auth_config) = serde_json::from_str::<Value>(raw_auth_config) else {
-        return AntigravityRequestAuthSupport::Unsupported(
-            AntigravityRequestAuthUnsupportedReason::InvalidAuthConfigJson,
-        );
-    };
-
-    if contains_blocked_auth_fields(&auth_config) {
-        return AntigravityRequestAuthSupport::Unsupported(
-            AntigravityRequestAuthUnsupportedReason::ComplexDynamicAuthConfig,
-        );
-    }
 
     let upstream_metadata = transport.key.upstream_metadata.as_ref();
     let Some(project_id) = find_antigravity_string(
@@ -80,23 +100,60 @@ pub fn resolve_local_antigravity_request_auth(
             AntigravityRequestAuthUnsupportedReason::MissingProjectId,
         );
     };
-
-    let client_version = find_antigravity_string(
-        upstream_metadata,
-        &auth_config,
-        ANTIGRAVITY_CLIENT_VERSION_PATHS,
-    );
-    let session_id = find_antigravity_string(
-        upstream_metadata,
-        &auth_config,
-        ANTIGRAVITY_SESSION_ID_PATHS,
-    );
+    let (client_version, session_id) =
+        find_antigravity_identity_fields(upstream_metadata, &auth_config);
 
     AntigravityRequestAuthSupport::Supported(AntigravityRequestAuth {
         project_id,
         client_version,
         session_id,
     })
+}
+
+/// Account-local identity fields for every account request, including projectless calls
+/// (loadCodeAssist / onboardUser). Resolution failures yield `None` fields so requests fall
+/// back to the pinned baseline identity instead of failing.
+pub fn resolve_antigravity_identity_fields(
+    transport: &GatewayProviderTransportSnapshot,
+) -> (Option<String>, Option<String>) {
+    resolve_antigravity_auth_config(transport)
+        .map(|auth_config| {
+            find_antigravity_identity_fields(transport.key.upstream_metadata.as_ref(), &auth_config)
+        })
+        .unwrap_or((None, None))
+}
+
+fn resolve_antigravity_auth_config(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<Value, AntigravityRequestAuthUnsupportedReason> {
+    if !transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case(ANTIGRAVITY_PROVIDER_TYPE)
+    {
+        return Err(AntigravityRequestAuthUnsupportedReason::WrongProviderType);
+    }
+
+    let Some(raw_auth_config) = transport
+        .key
+        .decrypted_auth_config
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(AntigravityRequestAuthUnsupportedReason::MissingAuthConfig);
+    };
+
+    let Ok(auth_config) = serde_json::from_str::<Value>(raw_auth_config) else {
+        return Err(AntigravityRequestAuthUnsupportedReason::InvalidAuthConfigJson);
+    };
+
+    if contains_blocked_auth_fields(&auth_config) {
+        return Err(AntigravityRequestAuthUnsupportedReason::ComplexDynamicAuthConfig);
+    }
+
+    Ok(auth_config)
 }
 
 pub fn build_antigravity_static_identity_headers(
@@ -109,9 +166,10 @@ pub fn build_antigravity_static_identity_headers(
 }
 
 pub fn build_antigravity_static_client_headers(
-    _client_version: Option<&str>,
+    client_version: Option<&str>,
     session_id: Option<&str>,
 ) -> BTreeMap<String, String> {
+    let identity = antigravity_client_identity(client_version);
     let mut headers = BTreeMap::from([
         (
             String::from("x-client-name"),
@@ -121,14 +179,8 @@ pub fn build_antigravity_static_client_headers(
             String::from("x-goog-api-client"),
             String::from(ANTIGRAVITY_GOOG_API_CLIENT),
         ),
-        (
-            String::from("user-agent"),
-            String::from(ANTIGRAVITY_REQUEST_USER_AGENT),
-        ),
-        (
-            String::from("x-client-version"),
-            String::from(ANTIGRAVITY_CLIENT_VERSION),
-        ),
+        (String::from("user-agent"), identity.user_agent),
+        (String::from("x-client-version"), identity.version),
     ]);
 
     if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) {
@@ -180,6 +232,20 @@ const ANTIGRAVITY_SESSION_ID_PATHS: &[&[&str]] = &[
     &["metadata", "session_id"],
     &["metadata", "sessionId"],
 ];
+
+fn find_antigravity_identity_fields(
+    upstream_metadata: Option<&Value>,
+    auth_config: &Value,
+) -> (Option<String>, Option<String>) {
+    (
+        find_antigravity_string(
+            upstream_metadata,
+            auth_config,
+            ANTIGRAVITY_CLIENT_VERSION_PATHS,
+        ),
+        find_antigravity_string(upstream_metadata, auth_config, ANTIGRAVITY_SESSION_ID_PATHS),
+    )
+}
 
 fn find_antigravity_string(
     upstream_metadata: Option<&Value>,
@@ -270,9 +336,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        antigravity_cli_platform_suffix, antigravity_client_identity,
         build_antigravity_static_client_headers, resolve_local_antigravity_request_auth,
-        AntigravityRequestAuth, AntigravityRequestAuthSupport, ANTIGRAVITY_CLIENT_VERSION,
-        ANTIGRAVITY_REQUEST_USER_AGENT,
+        AntigravityRequestAuth, AntigravityRequestAuthSupport,
     };
     use crate::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -382,24 +448,72 @@ mod tests {
     }
 
     #[test]
-    fn static_client_headers_pin_the_known_good_antigravity_identity() {
-        let headers = build_antigravity_static_client_headers(Some("1.0.16"), Some("session-abc"));
+    fn client_identity_falls_back_to_the_pinned_cli_baseline() {
+        let builtin = antigravity_client_identity(None);
+        assert_eq!(builtin.version, "1.4.7");
+        assert_eq!(
+            builtin.user_agent,
+            format!("antigravity/cli/1.4.7{}", antigravity_cli_platform_suffix())
+        );
+
+        // Wire-invalid overrides never reach the wire; they fall back to the baseline.
+        for invalid in ["", "1.0 0", "1.0\r\nx: y"] {
+            let fallback = antigravity_client_identity(Some(invalid));
+            assert_eq!(fallback.version, "1.4.7");
+            assert_eq!(fallback.user_agent, builtin.user_agent);
+        }
+    }
+
+    #[test]
+    fn account_client_version_override_applies_without_leaking_across_accounts() {
+        let headers = build_antigravity_static_client_headers(Some("1.5.2"), Some("session-abc"));
 
         assert_eq!(
+            headers.get("x-client-version").map(String::as_str),
+            Some("1.5.2")
+        );
+        let expected_user_agent =
+            format!("antigravity/cli/1.5.2{}", antigravity_cli_platform_suffix());
+        assert_eq!(
             headers.get("user-agent").map(String::as_str),
-            Some(ANTIGRAVITY_REQUEST_USER_AGENT)
+            Some(expected_user_agent.as_str())
         );
         assert_eq!(
             headers.get("x-client-name").map(String::as_str),
             Some("antigravity")
         );
         assert_eq!(
-            headers.get("x-client-version").map(String::as_str),
-            Some(ANTIGRAVITY_CLIENT_VERSION)
+            headers.get("x-goog-api-client").map(String::as_str),
+            Some("gl-node/18.18.2 fire/0.8.6 grpc/1.10.x")
         );
         assert_eq!(
             headers.get("x-vscode-sessionid").map(String::as_str),
             Some("session-abc")
+        );
+
+        // The override is account-local: other accounts still resolve the pinned baseline.
+        let default_headers = build_antigravity_static_client_headers(None, None);
+        assert_eq!(
+            default_headers.get("x-client-version").map(String::as_str),
+            Some("1.4.7")
+        );
+        assert_eq!(
+            antigravity_client_identity(None).user_agent,
+            format!("antigravity/cli/1.4.7{}", antigravity_cli_platform_suffix())
+        );
+    }
+
+    #[test]
+    fn invalid_account_client_version_override_falls_back_on_the_wire() {
+        let headers = build_antigravity_static_client_headers(Some("1.0 0"), None);
+
+        assert_eq!(
+            headers.get("x-client-version").map(String::as_str),
+            Some("1.4.7")
+        );
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some(format!("antigravity/cli/1.4.7{}", antigravity_cli_platform_suffix()).as_str())
         );
     }
 }

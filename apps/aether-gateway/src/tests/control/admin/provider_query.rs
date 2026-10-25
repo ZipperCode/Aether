@@ -12,7 +12,7 @@ use aether_data_contracts::repository::global_models::{
     AdminProviderModelListQuery, GlobalModelReadRepository, StoredModelEndpointBinding,
 };
 use aether_data_contracts::repository::provider_catalog::{
-    ProviderCatalogReadRepository, StoredProviderCatalogEndpoint,
+    ProviderCatalogReadRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
 use axum::body::Body;
 use axum::routing::any;
@@ -1847,6 +1847,891 @@ async fn gateway_handles_admin_provider_query_models_aggregating_active_keys_imp
     assert_eq!(
         *execution_runtime_hits.lock().expect("mutex should lock"),
         2
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+fn sample_antigravity_models_key(
+    id: &str,
+    name: &str,
+    tier: Option<&str>,
+    project_id: &str,
+) -> StoredProviderCatalogKey {
+    let observation_checked_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after epoch")
+        .as_secs()
+        .saturating_sub(10);
+    let mut auth_config = json!({
+        "project_id": project_id,
+        "client_version": "1.2.3",
+        "session_id": format!("session-{id}"),
+    });
+    if let Some(tier) = tier {
+        auth_config["tier"] = json!(tier);
+    }
+    let mut key = sample_bound_key(
+        id,
+        "provider-antigravity",
+        "gemini:generate_content",
+        "ya29.ant-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.name = name.to_string();
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        "provider-antigravity",
+        id,
+        &auth_config.to_string(),
+    ));
+    // 账户观察保持新鲜且逐账号携带自己的 project_id：模型查询直接为每个账号执行
+    // fetchAvailableModels，不再触发 loadCodeAssist，行为完全由逐账号响应决定。
+    key.upstream_metadata = Some(json!({
+        "antigravity": {
+            "account_info_status": "success",
+            "account_info_checked_at": observation_checked_at,
+            "project_id": project_id,
+        }
+    }));
+    key
+}
+
+fn antigravity_models_execution_runtime(
+    responses: std::collections::BTreeMap<&'static str, (u16, serde_json::Value)>,
+    fetched_key_ids: Arc<Mutex<Vec<String>>>,
+) -> Router {
+    let responses = Arc::new(responses);
+    Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let responses = Arc::clone(&responses);
+            let fetched_key_ids = Arc::clone(&fetched_key_ids);
+            async move {
+                assert_eq!(
+                    plan.provider_api_format, "antigravity:fetch_available_models",
+                    "模型查询链路只应执行 fetchAvailableModels"
+                );
+                fetched_key_ids
+                    .lock()
+                    .expect("mutex should lock")
+                    .push(plan.key_id.clone());
+                let (status_code, json_body) = responses
+                    .get(plan.key_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "unexpected antigravity models fetch for key {}",
+                            plan.key_id
+                        )
+                    });
+                Json(json!({
+                    "request_id": plan.request_id,
+                    "status_code": status_code,
+                    "headers": {
+                        "content-type": "application/json"
+                    },
+                    "body": {
+                        "json_body": json_body
+                    }
+                }))
+            }
+        }),
+    )
+}
+
+async fn post_provider_query_models(
+    gateway_url: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/provider-query/models"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&payload)
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.json().await.expect("json body should parse")
+}
+
+fn provider_query_model_ids(payload: &serde_json::Value) -> Vec<String> {
+    payload["data"]["models"]
+        .as_array()
+        .expect("models should be an array")
+        .iter()
+        .map(|model| {
+            model["id"]
+                .as_str()
+                .expect("model id should be a string")
+                .to_string()
+        })
+        .collect()
+}
+
+/// 全账号模型查询必须聚合每个选中账号：首个账号成功后仍要继续，后账号独占模型进入 Union；
+/// 遗留的 Provider 级缓存不得遮蔽后续账号；重复模型合并为一条；逐账号缓存与选择隔离保持不变，
+/// Union 只是响应投影，不得写回任何账号的 allowed_models。
+#[test]
+fn gateway_antigravity_model_query_unions_all_accounts_after_first_success() {
+    run_provider_query_test(
+        "gateway_antigravity_model_query_unions_all_accounts_after_first_success",
+        gateway_antigravity_model_query_unions_all_accounts_after_first_success_impl,
+    );
+}
+
+async fn gateway_antigravity_model_query_unions_all_accounts_after_first_success_impl() {
+    let fetched_key_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+    let execution_runtime = antigravity_models_execution_runtime(
+        std::collections::BTreeMap::from([
+            (
+                "key-ant-a",
+                (
+                    200u16,
+                    json!({
+                        "models": {
+                            "model-a": { "displayName": "Model A" },
+                            "model-shared": { "displayName": "Shared" }
+                        }
+                    }),
+                ),
+            ),
+            (
+                "key-ant-b",
+                (400u16, json!({ "error": { "message": "bad request" } })),
+            ),
+            (
+                "key-ant-c",
+                (
+                    200u16,
+                    json!({
+                        "models": {
+                            "model-c": { "displayName": "Model C" },
+                            "model-shared": { "displayName": "Shared" }
+                        }
+                    }),
+                ),
+            ),
+        ]),
+        Arc::clone(&fetched_key_ids),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-antigravity", "Antigravity", 10);
+    provider.provider_type = "antigravity".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-antigravity-chat",
+            "provider-antigravity",
+            "gemini:generate_content",
+            "https://daily-cloudcode-pa.googleapis.com",
+        )],
+        vec![
+            // tier 排序只影响请求顺序：ultra 账号先成功也不能截断后续账号。
+            sample_antigravity_models_key("key-ant-a", "account-a", Some("ultra"), "project-a"),
+            sample_antigravity_models_key("key-ant-b", "account-b", Some("pro"), "project-b"),
+            sample_antigravity_models_key("key-ant-c", "account-c", None, "project-c"),
+        ],
+    ));
+    let allowed_models_before = provider_catalog_repository
+        .list_keys_by_ids(&[
+            "key-ant-a".to_string(),
+            "key-ant-b".to_string(),
+            "key-ant-c".to_string(),
+        ])
+        .await
+        .expect("keys should read before queries")
+        .into_iter()
+        .map(|key| (key.id, key.allowed_models))
+        .collect::<Vec<_>>();
+
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository.clone(),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    // 升级前遗留的 Provider 级缓存含幻影模型；它不得遮蔽任何账号的真实目录。
+    state
+        .runtime_state()
+        .kv_set(
+            "upstream_models_provider:provider-antigravity",
+            json!([{ "id": "phantom-model" }]).to_string(),
+            None,
+        )
+        .await
+        .expect("legacy provider cache should seed");
+    let gateway = build_router_with_state(state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-antigravity" }),
+    )
+    .await;
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(payload["data"]["error"], serde_json::Value::Null);
+    assert_eq!(payload["data"]["from_cache"], json!(false));
+    assert_eq!(payload["data"]["keys_total"], json!(3));
+    assert_eq!(payload["data"]["keys_cached"], json!(0));
+    assert_eq!(payload["data"]["keys_fetched"], json!(3));
+    // 精确集合断言：后账号独占模型必须出现，不得出现幻影或虚构模型。
+    assert_eq!(
+        provider_query_model_ids(&payload),
+        vec!["model-a", "model-c", "model-shared"]
+    );
+    let shared_rows = payload["data"]["models"]
+        .as_array()
+        .expect("models should be an array")
+        .iter()
+        .filter(|model| model["id"] == "model-shared")
+        .count();
+    assert_eq!(shared_rows, 1, "跨账号重复模型必须合并为一条");
+    let mut fetched = fetched_key_ids.lock().expect("mutex should lock").clone();
+    fetched.sort();
+    assert_eq!(
+        fetched,
+        vec!["key-ant-a", "key-ant-b", "key-ant-c"],
+        "每个选中账号都必须被查询"
+    );
+
+    // 逐账号缓存继续生效：成功账号命中缓存、失败账号重试；Provider 级缓存不再参与。
+    let cached_payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-antigravity" }),
+    )
+    .await;
+    assert_eq!(cached_payload["success"], json!(true));
+    assert_eq!(
+        provider_query_model_ids(&cached_payload),
+        vec!["model-a", "model-c", "model-shared"]
+    );
+    assert_eq!(cached_payload["data"]["keys_cached"], json!(2));
+    assert_eq!(cached_payload["data"]["keys_fetched"], json!(1));
+
+    // 单账号查询只返回该账号自己的模型，Union 不得泄漏进账号列表。
+    let single_payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-antigravity", "api_key_id": "key-ant-c" }),
+    )
+    .await;
+    assert_eq!(single_payload["success"], json!(true));
+    assert_eq!(
+        provider_query_model_ids(&single_payload),
+        vec!["model-c", "model-shared"]
+    );
+    assert_eq!(single_payload["data"]["from_cache"], json!(true));
+
+    let allowed_models_after = provider_catalog_repository
+        .list_keys_by_ids(&[
+            "key-ant-a".to_string(),
+            "key-ant-b".to_string(),
+            "key-ant-c".to_string(),
+        ])
+        .await
+        .expect("keys should read after queries")
+        .into_iter()
+        .map(|key| (key.id, key.allowed_models))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        allowed_models_after, allowed_models_before,
+        "provider union must never be persisted into account allowed_models"
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+/// 首个账号“成功但目录为空”不能终止聚合：后续账号的独占模型必须出现在结果里。
+#[test]
+fn gateway_antigravity_model_query_continues_after_empty_first_account_success() {
+    run_provider_query_test(
+        "gateway_antigravity_model_query_continues_after_empty_first_account_success",
+        gateway_antigravity_model_query_continues_after_empty_first_account_success_impl,
+    );
+}
+
+async fn gateway_antigravity_model_query_continues_after_empty_first_account_success_impl() {
+    let fetched_key_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+    let execution_runtime = antigravity_models_execution_runtime(
+        std::collections::BTreeMap::from([
+            ("key-ant-empty", (200u16, json!({ "models": {} }))),
+            (
+                "key-ant-later",
+                (
+                    200u16,
+                    json!({ "models": { "model-later": { "displayName": "Later" } } }),
+                ),
+            ),
+        ]),
+        Arc::clone(&fetched_key_ids),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-antigravity", "Antigravity", 10);
+    provider.provider_type = "antigravity".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-antigravity-chat",
+            "provider-antigravity",
+            "gemini:generate_content",
+            "https://daily-cloudcode-pa.googleapis.com",
+        )],
+        vec![
+            // ultra 权重保证空目录账号固定排在最前，稳定复现“首个账号空成功”的截断回归。
+            sample_antigravity_models_key(
+                "key-ant-empty",
+                "account-empty",
+                Some("ultra"),
+                "project-empty",
+            ),
+            sample_antigravity_models_key("key-ant-later", "account-later", None, "project-later"),
+        ],
+    ));
+
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository,
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    let gateway = build_router_with_state(state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-antigravity" }),
+    )
+    .await;
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(payload["data"]["error"], serde_json::Value::Null);
+    assert_eq!(
+        provider_query_model_ids(&payload),
+        vec!["model-later"],
+        "空目录的首个账号不得遮蔽后续账号的独占模型"
+    );
+    assert_eq!(payload["data"]["keys_total"], json!(2));
+    assert_eq!(payload["data"]["keys_fetched"], json!(2));
+    let warning = payload["data"]["warning"]
+        .as_str()
+        .expect("empty account should surface as warning");
+    assert!(
+        warning.contains("account-empty"),
+        "warning should name the empty account: {warning}"
+    );
+    let mut fetched = fetched_key_ids.lock().expect("mutex should lock").clone();
+    fetched.sort();
+    assert_eq!(fetched, vec!["key-ant-empty", "key-ant-later"]);
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+/// 部分失败不丢成功结果：失败账号只进入 warning；仅选择失败账号时结果为空且归入 error。
+#[test]
+fn gateway_antigravity_model_query_keeps_successful_accounts_on_partial_failure() {
+    run_provider_query_test(
+        "gateway_antigravity_model_query_keeps_successful_accounts_on_partial_failure",
+        gateway_antigravity_model_query_keeps_successful_accounts_on_partial_failure_impl,
+    );
+}
+
+async fn gateway_antigravity_model_query_keeps_successful_accounts_on_partial_failure_impl() {
+    let fetched_key_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+    let execution_runtime = antigravity_models_execution_runtime(
+        std::collections::BTreeMap::from([
+            (
+                "key-ant-bad",
+                (
+                    401u16,
+                    json!({ "error": { "message": "account unauthorized" } }),
+                ),
+            ),
+            (
+                "key-ant-ok",
+                (
+                    200u16,
+                    json!({ "models": { "model-ok": { "displayName": "OK" } } }),
+                ),
+            ),
+        ]),
+        Arc::clone(&fetched_key_ids),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-antigravity", "Antigravity", 10);
+    provider.provider_type = "antigravity".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-antigravity-chat",
+            "provider-antigravity",
+            "gemini:generate_content",
+            "https://daily-cloudcode-pa.googleapis.com",
+        )],
+        vec![
+            // 失败账号排在最前：首账号失败不得丢弃后续成功账号的结果。
+            sample_antigravity_models_key(
+                "key-ant-bad",
+                "account-bad",
+                Some("ultra"),
+                "project-bad",
+            ),
+            sample_antigravity_models_key("key-ant-ok", "account-ok", None, "project-ok"),
+        ],
+    ));
+
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository,
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    let gateway = build_router_with_state(state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-antigravity" }),
+    )
+    .await;
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(payload["data"]["error"], serde_json::Value::Null);
+    assert_eq!(provider_query_model_ids(&payload), vec!["model-ok"]);
+    assert_eq!(payload["data"]["keys_total"], json!(2));
+    assert_eq!(payload["data"]["keys_fetched"], json!(2));
+    let warning = payload["data"]["warning"]
+        .as_str()
+        .expect("partial failure should surface as warning");
+    assert!(
+        warning.contains("account-bad"),
+        "warning should name the failed account: {warning}"
+    );
+
+    // 仅选择失败账号：结果为空，失败信息归入 error 而不是 warning。
+    let failed_only_payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-antigravity", "api_key_ids": ["key-ant-bad"] }),
+    )
+    .await;
+    assert_eq!(failed_only_payload["success"], json!(false));
+    assert_eq!(
+        provider_query_model_ids(&failed_only_payload),
+        Vec::<String>::new()
+    );
+    assert!(failed_only_payload["data"]["error"].as_str().is_some());
+    assert!(failed_only_payload["data"]["warning"].is_null());
+
+    // 全部请求共 3 次抓取：首轮 bad+ok 各一次，仅选失败账号时再次重试 bad。
+    let mut fetched = fetched_key_ids.lock().expect("mutex should lock").clone();
+    fetched.sort();
+    assert_eq!(fetched, vec!["key-ant-bad", "key-ant-bad", "key-ant-ok"]);
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+/// 混合套餐账号不受 tier 排序截断：各账号独占模型全部进入 Union；显式选择与单账号查询保持隔离。
+#[test]
+fn gateway_antigravity_model_query_unions_mixed_tiers_and_isolates_account_selection() {
+    run_provider_query_test(
+        "gateway_antigravity_model_query_unions_mixed_tiers_and_isolates_account_selection",
+        gateway_antigravity_model_query_unions_mixed_tiers_and_isolates_account_selection_impl,
+    );
+}
+
+async fn gateway_antigravity_model_query_unions_mixed_tiers_and_isolates_account_selection_impl() {
+    let fetched_key_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+    let execution_runtime = antigravity_models_execution_runtime(
+        std::collections::BTreeMap::from([
+            (
+                "key-ant-free",
+                (
+                    200u16,
+                    json!({ "models": { "model-free": { "displayName": "Free" } } }),
+                ),
+            ),
+            (
+                "key-ant-ultra",
+                (
+                    200u16,
+                    json!({ "models": { "model-ultra": { "displayName": "Ultra" } } }),
+                ),
+            ),
+        ]),
+        Arc::clone(&fetched_key_ids),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-antigravity", "Antigravity", 10);
+    provider.provider_type = "antigravity".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-antigravity-chat",
+            "provider-antigravity",
+            "gemini:generate_content",
+            "https://daily-cloudcode-pa.googleapis.com",
+        )],
+        vec![
+            sample_antigravity_models_key(
+                "key-ant-free",
+                "account-free",
+                Some("free"),
+                "project-free",
+            ),
+            sample_antigravity_models_key(
+                "key-ant-ultra",
+                "account-ultra",
+                Some("ultra"),
+                "project-ultra",
+            ),
+        ],
+    ));
+
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository,
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    let gateway = build_router_with_state(state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    // ultra 排序在前：free 账号的独占模型仍必须进入 Union。
+    let payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-antigravity" }),
+    )
+    .await;
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(
+        provider_query_model_ids(&payload),
+        vec!["model-free", "model-ultra"]
+    );
+    assert_eq!(payload["data"]["keys_total"], json!(2));
+    assert_eq!(payload["data"]["keys_fetched"], json!(2));
+
+    // 显式选择只看选中账号的逐账号结果。
+    let selected_payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-antigravity", "api_key_ids": ["key-ant-free"] }),
+    )
+    .await;
+    assert_eq!(selected_payload["success"], json!(true));
+    assert_eq!(
+        provider_query_model_ids(&selected_payload),
+        vec!["model-free"]
+    );
+    assert_eq!(selected_payload["data"]["keys_total"], json!(1));
+
+    let single_payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-antigravity", "api_key_id": "key-ant-ultra" }),
+    )
+    .await;
+    assert_eq!(single_payload["success"], json!(true));
+    assert_eq!(
+        provider_query_model_ids(&single_payload),
+        vec!["model-ultra"]
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+/// 同一模型 ID 跨账号/跨 Endpoint 重复出现时只保留一条，并合并其 Endpoint 证据。
+#[test]
+fn gateway_provider_model_query_unions_duplicate_models_with_merged_endpoint_evidence() {
+    run_provider_query_test(
+        "gateway_provider_model_query_unions_duplicate_models_with_merged_endpoint_evidence",
+        gateway_provider_model_query_unions_duplicate_models_with_merged_endpoint_evidence_impl,
+    );
+}
+
+async fn gateway_provider_model_query_unions_duplicate_models_with_merged_endpoint_evidence_impl() {
+    let execution_runtime_hits = Arc::new(Mutex::new(0usize));
+    let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let execution_runtime_hits_inner = Arc::clone(&execution_runtime_hits_clone);
+            async move {
+                *execution_runtime_hits_inner
+                    .lock()
+                    .expect("mutex should lock") += 1;
+                let authorization = plan
+                    .headers
+                    .get("authorization")
+                    .map(String::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let shared_format = match plan.endpoint_id.as_str() {
+                    "endpoint-dedupe-chat" => "openai:chat",
+                    "endpoint-dedupe-responses" => "openai:responses",
+                    unexpected => panic!("unexpected endpoint {unexpected}"),
+                };
+                let mut data = vec![json!({
+                    "id": "gpt-shared",
+                    "api_formats": [shared_format],
+                    "object": "model",
+                    "owned_by": "system",
+                    "created": 1732517497u64
+                })];
+                if shared_format == "openai:chat" || shared_format == "openai:responses" {
+                    let exclusive_id = match authorization.as_str() {
+                        "Bearer sk-dedupe-1" => "gpt-1",
+                        "Bearer sk-dedupe-2" => "gpt-2",
+                        unexpected => panic!("unexpected authorization {unexpected}"),
+                    };
+                    data.push(json!({
+                        "id": exclusive_id,
+                        "api_formats": [shared_format],
+                        "object": "model",
+                        "owned_by": "system",
+                        "created": 1732517497u64
+                    }));
+                }
+                Json(json!({
+                    "request_id": format!("req-dedupe-{authorization}-{shared_format}"),
+                    "status_code": 200,
+                    "headers": {
+                        "content-type": "application/json"
+                    },
+                    "body": {
+                        "json_body": { "data": data }
+                    }
+                }))
+            }
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-openai-dedupe", "OpenAI Dedupe", 10);
+    provider.provider_type = "openai".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![
+            sample_endpoint(
+                "endpoint-dedupe-chat",
+                "provider-openai-dedupe",
+                "openai:chat",
+                "https://api.chat.example/v1",
+            ),
+            sample_endpoint(
+                "endpoint-dedupe-responses",
+                "provider-openai-dedupe",
+                "openai:responses",
+                "https://api.responses.example/v1",
+            ),
+        ],
+        vec![
+            {
+                let mut key = sample_bound_key(
+                    "key-dedupe-1",
+                    "provider-openai-dedupe",
+                    "openai:chat",
+                    "sk-dedupe-1",
+                );
+                key.api_formats = Some(json!(["openai:chat"]));
+                key
+            },
+            {
+                let mut key = sample_bound_key(
+                    "key-dedupe-2",
+                    "provider-openai-dedupe",
+                    "openai:chat",
+                    "sk-dedupe-2",
+                );
+                key.api_formats = Some(json!(["openai:responses"]));
+                key
+            },
+        ],
+    ));
+
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
+                provider_catalog_repository,
+                DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-openai-dedupe" }),
+    )
+    .await;
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(
+        provider_query_model_ids(&payload),
+        vec!["gpt-1", "gpt-2", "gpt-shared"]
+    );
+    assert_eq!(payload["data"]["keys_total"], json!(2));
+    assert_eq!(payload["data"]["keys_fetched"], json!(2));
+    let shared_rows = payload["data"]["models"]
+        .as_array()
+        .expect("models should be an array")
+        .iter()
+        .filter(|model| model["id"] == "gpt-shared")
+        .collect::<Vec<_>>();
+    assert_eq!(shared_rows.len(), 1, "重复模型必须合并为一条");
+    let shared = shared_rows[0];
+    let mut endpoint_ids = shared["endpoint_ids"]
+        .as_array()
+        .expect("endpoint_ids should be an array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("endpoint id should be a string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    endpoint_ids.sort();
+    assert_eq!(
+        endpoint_ids,
+        vec![
+            "endpoint-dedupe-chat".to_string(),
+            "endpoint-dedupe-responses".to_string()
+        ],
+        "重复模型必须合并全部 Endpoint 证据"
+    );
+    let mut api_formats = shared["api_formats"]
+        .as_array()
+        .expect("api_formats should be an array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("api format should be a string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    api_formats.sort();
+    assert_eq!(
+        api_formats,
+        vec!["openai:chat".to_string(), "openai:responses".to_string()]
+    );
+    assert_eq!(
+        *execution_runtime_hits.lock().expect("mutex should lock"),
+        2
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+/// 上游显式 disabled:true 的条目不得进入模型响应与额度元数据；未知启用 ID 保持可发现且不虚构模型。
+#[test]
+fn gateway_antigravity_model_query_excludes_upstream_disabled_models_and_quota() {
+    run_provider_query_test(
+        "gateway_antigravity_model_query_excludes_upstream_disabled_models_and_quota",
+        gateway_antigravity_model_query_excludes_upstream_disabled_models_and_quota_impl,
+    );
+}
+
+async fn gateway_antigravity_model_query_excludes_upstream_disabled_models_and_quota_impl() {
+    let fetched_key_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+    let execution_runtime = antigravity_models_execution_runtime(
+        std::collections::BTreeMap::from([(
+            "key-ant-live",
+            (
+                200u16,
+                json!({
+                    "models": {
+                        "model-live": {
+                            "displayName": "Live",
+                            "quotaInfo": {
+                                "remainingFraction": 0.5
+                            }
+                        },
+                        "model-off": {
+                            "displayName": "Off",
+                            "disabled": true,
+                            "quotaInfo": {
+                                "remainingFraction": 0.1
+                            }
+                        },
+                        "model-unknown-next": {
+                            "displayName": "Next"
+                        }
+                    }
+                }),
+            ),
+        )]),
+        Arc::clone(&fetched_key_ids),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-antigravity", "Antigravity", 10);
+    provider.provider_type = "antigravity".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-antigravity-chat",
+            "provider-antigravity",
+            "gemini:generate_content",
+            "https://daily-cloudcode-pa.googleapis.com",
+        )],
+        vec![sample_antigravity_models_key(
+            "key-ant-live",
+            "account-live",
+            None,
+            "project-live",
+        )],
+    ));
+
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository.clone(),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    let gateway = build_router_with_state(state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let payload = post_provider_query_models(
+        &gateway_url,
+        json!({ "provider_id": "provider-antigravity" }),
+    )
+    .await;
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(
+        provider_query_model_ids(&payload),
+        vec!["model-live", "model-unknown-next"],
+        "disabled:true 条目不得出现，未知启用 ID 保持可发现"
+    );
+
+    // 额度投影与模型投影同步排除 disabled:true：旧的 disabled 额度条目不得保留。
+    let keys = provider_catalog_repository
+        .list_keys_by_ids(&["key-ant-live".to_string()])
+        .await
+        .expect("key should read after discovery");
+    let quota_by_model = keys[0]
+        .upstream_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/antigravity/quota_by_model"))
+        .and_then(serde_json::Value::as_object)
+        .expect("quota_by_model should persist after discovery");
+    assert_eq!(
+        quota_by_model
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["model-live"],
+        "disabled:true 条目的额度不得进入额度投影"
     );
 
     gateway_handle.abort();
@@ -5591,6 +6476,20 @@ async fn gateway_handles_antigravity_endpoint_test_model_locally_impl() {
             assert_eq!(plan.provider_id, "provider-antigravity");
             assert_eq!(plan.endpoint_id, "endpoint-antigravity-gemini");
             assert_eq!(plan.key_id, "key-antigravity-gemini");
+            if plan.provider_api_format == "antigravity:load_code_assist" {
+                return Json(json!({
+                    "request_id": plan.request_id,
+                    "candidate_id": plan.candidate_id,
+                    "status_code": 200,
+                    "headers": { "content-type": "application/json" },
+                    "body": {
+                        "json_body": {
+                            "cloudaicompanionProject": { "id": "project-ant-123" },
+                            "currentTier": { "id": "free" }
+                        }
+                    }
+                }));
+            }
             assert_eq!(plan.provider_api_format, "gemini:generate_content");
             assert_eq!(
                 plan.url,

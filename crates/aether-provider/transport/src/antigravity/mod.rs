@@ -12,10 +12,10 @@ pub use account::{
     AntigravityCodeAssistInfo,
 };
 pub use auth::{
-    build_antigravity_static_client_headers, build_antigravity_static_identity_headers,
+    antigravity_client_identity, build_antigravity_static_client_headers,
+    build_antigravity_static_identity_headers, resolve_antigravity_identity_fields,
     resolve_local_antigravity_request_auth, AntigravityRequestAuth, AntigravityRequestAuthSupport,
     AntigravityRequestAuthUnsupportedReason, ANTIGRAVITY_PROVIDER_TYPE,
-    ANTIGRAVITY_REQUEST_USER_AGENT,
 };
 pub use policy::{
     classify_local_antigravity_request_support, is_antigravity_provider_transport,
