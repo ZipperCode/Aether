@@ -607,6 +607,7 @@ impl<'a> AdminAppState<'a> {
         api_formats: &[String],
         proxy: Option<serde_json::Value>,
         expires_at_unix_secs: Option<u64>,
+        auto_fetch_models: bool,
     ) -> Result<
         Option<aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey>,
         GatewayError,
@@ -621,6 +622,7 @@ impl<'a> AdminAppState<'a> {
             api_formats,
             proxy,
             expires_at_unix_secs,
+            auto_fetch_models,
         )
         .await
     }

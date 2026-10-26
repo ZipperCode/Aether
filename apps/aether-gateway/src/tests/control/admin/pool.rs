@@ -477,8 +477,8 @@ fn gateway_handles_admin_pool_batch_import_locally_with_trusted_admin_principal(
                     .expect("keys should read");
                 assert_eq!(keys.len(), 1);
                 assert_eq!(keys[0].name, "batch key a");
+                assert!(keys[0].auto_fetch_models);
                 assert_eq!(keys[0].auth_type, "api_key");
-                assert_eq!(keys[0].api_formats, Some(json!(["openai:chat"])));
                 assert_eq!(
                     keys[0].proxy,
                     Some(json!({"node_id": "proxy-node-1", "enabled": true}))

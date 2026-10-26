@@ -214,7 +214,46 @@ describe('ProviderKeyBatchImportDialog 批量导入', () => {
     expect(dialogLayer()).toBeNull()
   })
 
-  it('开启自动获取上游模型后，设置随导入 payload 持久化', async () => {
+  it('默认开启自动获取上游模型', async () => {
+    poolMocks.batchImportPoolKeys.mockResolvedValue({
+      imported: 1,
+      skipped: 0,
+      errors: [],
+      model_sync: { requested: 1, attempted: 1, succeeded: 1, failed: 0, skipped: 0 },
+    })
+
+    mountDialog()
+    await settle()
+    await fillInputText('alpha----sk-alpha')
+    await clickPrimary('下一步：统一配置')
+    await clickPrimary('下一步：逐项确认')
+    await clickPrimary('导入 1 个 Key')
+
+    const body = poolMocks.batchImportPoolKeys.mock.calls[0][1] as PoolBatchImportRequest
+    expect(body.settings?.auto_fetch_models).toBe(true)
+  })
+
+  it('关闭自动获取上游模型后随导入 payload 持久化 false', async () => {
+    poolMocks.batchImportPoolKeys.mockResolvedValue({
+      imported: 1,
+      skipped: 0,
+      errors: [],
+      model_sync: null,
+    })
+
+    mountDialog()
+    await settle()
+    await fillInputText('alpha----sk-alpha')
+    await clickPrimary('下一步：统一配置')
+    await toggleImportSwitch()
+    await clickPrimary('下一步：逐项确认')
+    await clickPrimary('导入 1 个 Key')
+
+    const body = poolMocks.batchImportPoolKeys.mock.calls[0][1] as PoolBatchImportRequest
+    expect(body.settings?.auto_fetch_models).toBe(false)
+  })
+
+  it('开启自动获取上游模型后，规则设置随导入 payload 持久化', async () => {
     poolMocks.batchImportPoolKeys.mockResolvedValue({
       imported: 1,
       skipped: 0,
@@ -227,9 +266,6 @@ describe('ProviderKeyBatchImportDialog 批量导入', () => {
     await fillInputText('alpha----sk-alpha')
     await clickPrimary('下一步：统一配置')
 
-    await toggleImportSwitch()
-
-    // 开关通过 label[for] 与文本关联（可访问性）
     const switchEl = importSwitch()
     expect(switchEl).not.toBeNull()
     const label = dialogLayer()!.querySelector(`label[for="${switchEl!.id}"]`)

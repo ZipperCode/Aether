@@ -1275,6 +1275,24 @@ mod tests {
     }
 
     #[test]
+    fn batch_import_key_record_defaults_to_auto_fetch_models() {
+        let record = build_admin_pool_batch_import_key_record(
+            "key-import-default".to_string(),
+            "provider-1".to_string(),
+            "batch key".to_string(),
+            "api_key".to_string(),
+            vec!["openai:chat".to_string()],
+            "encrypted-secret".to_string(),
+            None,
+            None,
+            100,
+        )
+        .expect("record should build");
+
+        assert!(record.auto_fetch_models);
+    }
+
+    #[test]
     fn batch_import_key_record_persists_auto_fetch_models_settings() {
         let record = build_admin_pool_batch_import_key_record(
             "key-import-1".to_string(),
@@ -1296,6 +1314,24 @@ mod tests {
         assert!(record.auto_fetch_models);
         assert_eq!(record.model_include_patterns, Some(json!(["gpt-*"])));
         assert_eq!(record.model_exclude_patterns, Some(json!(["*-beta"])));
+    }
+
+    #[test]
+    fn batch_import_key_record_respects_explicit_auto_fetch_models_disable() {
+        let record = build_admin_pool_batch_import_key_record(
+            "key-import-disabled".to_string(),
+            "provider-1".to_string(),
+            "batch key".to_string(),
+            "api_key".to_string(),
+            vec!["openai:chat".to_string()],
+            "encrypted-secret".to_string(),
+            None,
+            Some(&json!({ "auto_fetch_models": false })),
+            100,
+        )
+        .expect("record should build");
+
+        assert!(!record.auto_fetch_models);
     }
 
     #[test]
@@ -1544,6 +1580,8 @@ pub fn build_admin_pool_batch_import_key_record(
 ) -> Result<StoredProviderCatalogKey, String> {
     let mut record = StoredProviderCatalogKey::new(id, provider_id, name, auth_type, None, true)
         .map_err(|err| err.to_string())?;
+    // 批量导入默认进入模型发现链路；显式 settings.auto_fetch_models=false 仍由导入配置覆盖。
+    record.auto_fetch_models = true;
     record = record
         .with_transport_fields(
             Some(json!(api_formats)),

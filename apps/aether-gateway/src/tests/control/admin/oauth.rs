@@ -3452,6 +3452,7 @@ async fn gateway_batch_imports_chatgpt_web_access_tokens_with_pool_hints_impl() 
         .await
         .expect("keys should load");
     let persisted = reloaded.first().expect("persisted key should exist");
+    assert!(persisted.auto_fetch_models);
     assert_eq!(persisted.expires_at_unix_secs, Some(2_100_000_000));
     let decrypted_api_key = decrypt_persisted_provider_api_key(persisted);
     assert_eq!(decrypted_api_key, "chatgpt-web-batch-access-token");
@@ -3628,6 +3629,7 @@ async fn gateway_starts_admin_provider_oauth_batch_import_task_locally_with_trus
         .await
         .expect("keys should load");
     assert_eq!(keys.len(), 1);
+    assert!(keys[0].auto_fetch_models);
 
     gateway_handle.abort();
     token_handle.abort();
@@ -4669,6 +4671,8 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_locally_with_trusted
         persisted.proxy,
         Some(json!({"node_id": "proxy-node-codex-import", "enabled": true}))
     );
+    // Duplicate replacement preserves the existing discovery choice.
+    assert!(!persisted.auto_fetch_models);
     let decrypted_api_key = decrypt_persisted_provider_api_key(persisted);
     assert_eq!(decrypted_api_key, "imported-codex-access-token");
     let decrypted_auth_config = decrypt_persisted_provider_auth_config(persisted);
@@ -4770,6 +4774,7 @@ async fn gateway_imports_codex_access_token_without_refresh_token_as_temporary_a
         .await
         .expect("keys should load");
     let persisted = reloaded.first().expect("persisted key should exist");
+    assert!(persisted.auto_fetch_models);
     assert_eq!(persisted.expires_at_unix_secs, Some(2_000_000_000));
     let decrypted_api_key = decrypt_persisted_provider_api_key(persisted);
     assert_eq!(decrypted_api_key, access_token);

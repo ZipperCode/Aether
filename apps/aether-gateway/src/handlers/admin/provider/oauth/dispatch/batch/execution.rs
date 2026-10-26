@@ -711,6 +711,7 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
                 &api_formats,
                 key_proxy.clone(),
                 expires_at,
+                true,
             )
             .await;
             match create_result {

@@ -50,6 +50,7 @@ impl ProviderOAuthRepository {
         api_formats: &[String],
         proxy: Option<serde_json::Value>,
         expires_at_unix_secs: Option<u64>,
+        auto_fetch_models: bool,
     ) -> Result<Option<StoredProviderCatalogKey>, GatewayError> {
         create_provider_oauth_catalog_key(
             state,
@@ -61,6 +62,7 @@ impl ProviderOAuthRepository {
             api_formats,
             proxy,
             expires_at_unix_secs,
+            auto_fetch_models,
         )
         .await
     }

@@ -283,6 +283,7 @@ async fn persist_xai_device_authorization(
                 &api_formats,
                 key_proxy,
                 expires_at,
+                false,
             )
             .await?
         {

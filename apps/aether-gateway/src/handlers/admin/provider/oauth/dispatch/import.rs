@@ -1170,6 +1170,7 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
                 &api_formats,
                 key_proxy.clone(),
                 expires_at,
+                true,
             )
             .await
     };

@@ -544,7 +544,7 @@ function createDefaultSettings(): ImportSettings {
     is_active: true,
     note: '',
     proxy_node_id: '',
-    auto_fetch_models: false,
+    auto_fetch_models: true,
     model_include_patterns_text: '',
     model_exclude_patterns_text: '',
   }

@@ -239,6 +239,7 @@ pub(crate) async fn provision_provider_oauth_token_payload_for_provider(
                 &api_formats,
                 key_proxy,
                 expires_at,
+                false,
             )
             .await
         {
@@ -352,6 +353,7 @@ pub(crate) async fn create_provider_oauth_catalog_key(
     api_formats: &[String],
     proxy: Option<serde_json::Value>,
     expires_at_unix_secs: Option<u64>,
+    auto_fetch_models: bool,
 ) -> Result<Option<StoredProviderCatalogKey>, GatewayError> {
     let key_id = Uuid::new_v4().to_string();
     let Ok(encrypted_api_key) =
@@ -396,7 +398,7 @@ pub(crate) async fn create_provider_oauth_catalog_key(
         grok_oauth_catalog_key_fingerprint(provider_type, auth_config),
     )
     .map_err(|err| GatewayError::Internal(err.to_string()))?;
-    record.internal_priority = 50;
+    record.auto_fetch_models = auto_fetch_models;
     record.cache_ttl_minutes = 5;
     record.max_probe_interval_minutes = 32;
     record.request_count = Some(0);
