@@ -202,3 +202,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 9: 修复全局 Gemini 关联与号池代表账号预选
+
+**Date**: 2026-10-26
+**Task**: 修复全局 Gemini 关联与号池代表账号预选
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+通过正常管理员 API 修复两个 Opus4.6 全局名的 Antigravity Gemini 关联，实际浏览器确认 thinking 链路；修复逻辑号池预选误用代表账号模型权限，保持实际成员严格校验。105 个调度测试、7 个真实 loopback HTTP 场景、2 个成员权限回归、Clippy 与格式检查通过。代码未部署，未调用真实上游生成。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8901d5604` | (see git log) |
+
+### Status
+
+[OK] **Completed**
