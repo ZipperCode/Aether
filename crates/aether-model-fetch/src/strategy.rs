@@ -296,6 +296,7 @@ async fn execute_model_fetch_strategy(
     outcome.used_preset_catalog = used_preset_catalog;
     if requires_fallback_endpoint_evidence {
         attach_fallback_endpoint_id(&mut outcome.cached_models, first_transport);
+        attach_fallback_endpoint_id(&mut outcome.legacy_models, first_transport);
         if outcome.has_success && outcome.successful_endpoint_ids.is_empty() {
             outcome.successful_endpoint_ids = outcome
                 .cached_models
@@ -2836,6 +2837,15 @@ mod tests {
             shared_model.get("endpoint_ids"),
             Some(&json!(["endpoint-chat", "endpoint-responses"]))
         );
+        let shared_legacy_model = outcome
+            .legacy_models
+            .iter()
+            .find(|model| model.get("id").and_then(Value::as_str) == Some("shared-model"))
+            .expect("shared model should be projected into the legacy cache");
+        assert_eq!(
+            shared_legacy_model.get("endpoint_ids"),
+            Some(&json!(["endpoint-chat", "endpoint-responses"]))
+        );
         let responses_only = outcome
             .cached_models
             .iter()
@@ -3956,6 +3966,10 @@ mod tests {
 
         assert!(outcome.has_success);
         assert_eq!(outcome.fetched_model_ids, vec!["chat_model"]);
+        assert_eq!(
+            outcome.legacy_models[0]["endpoint_ids"],
+            json!(["endpoint-1"])
+        );
 
         let plans = executed_plans.lock().expect("lock");
         assert_eq!(plans.len(), 3);
@@ -4654,6 +4668,10 @@ mod tests {
             json!(["claude:messages"])
         );
         assert_eq!(
+            outcome.legacy_models[1]["endpoint_ids"],
+            json!(["endpoint-1"])
+        );
+        assert_eq!(
             outcome.upstream_metadata.as_ref().and_then(|value| {
                 value
                     .get("kiro")
@@ -4708,6 +4726,10 @@ mod tests {
         assert_eq!(
             outcome.cached_models[0]["api_formats"],
             json!(["openai:chat", "openai:responses", "claude:messages"])
+        );
+        assert_eq!(
+            outcome.legacy_models[0]["endpoint_ids"],
+            json!(["endpoint-1"])
         );
         assert_eq!(
             outcome.upstream_metadata.as_ref().and_then(|value| {

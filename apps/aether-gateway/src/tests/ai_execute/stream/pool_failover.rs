@@ -9,7 +9,10 @@ use aether_data::repository::{
     usage::InMemoryUsageReadRepository,
 };
 use aether_data_contracts::repository::{
-    candidate_selection::{StoredMinimalCandidateRoutingFacts, StoredMinimalCandidateSelectionRow},
+    candidate_selection::{
+        StoredMinimalCandidateRoutingFacts, StoredMinimalCandidateSelectionRow,
+        StoredProviderModelMapping,
+    },
     candidates::{RequestCandidateReadRepository, RequestCandidateStatus},
     provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -60,7 +63,9 @@ async fn responses_pool_key_concurrency_skip_stays_distinct_from_execution_exhau
 const FIRST_KEY_SECRET: &str = "pool-first-upstream-secret-1008";
 const SECOND_KEY_SECRET: &str = "pool-second-upstream-secret-1008";
 const POOL_CONCURRENCY_SKIP_REASON: &str = "provider_key_concurrency_limit_reached";
-/// 第二个账号清单经全局映射正则解析出的实际上游模型名。
+const ACCOUNT_MODEL_A: &str = "claude-opus-4-6-thinking";
+const ACCOUNT_MODEL_B: &str = "claude-opus-5-5";
+/// 第二个账号清单经显式 Provider Model mapping 解析出的实际上游模型名。
 const ACCOUNT_MAPPED_SUFFIX_MODEL: &str = "gpt-5-high";
 
 /// 共用真实 HTTP 上游的号池回归夹具。
@@ -74,6 +79,9 @@ const ACCOUNT_MAPPED_SUFFIX_MODEL: &str = "gpt-5-high";
 ///   抓取到的带后缀变体；请求使用裸模型名，上游对第二个 Key 只服务其映射后的
 ///   `gpt-5-high`，其余目标真实 404，未知凭证 401；
 /// - empty_model_list：第二个 Key 的账号模型清单显式为空，必须整 Key 拒绝且不发上游；
+/// - account_model_a / account_model_b：同一 Provider/Endpoint 下两个 Key 分别只允许
+///   `claude-opus-4-6-thinking` 与 `claude-opus-5-5`；分别请求两个模型时，只有对应
+///   Key 收到精确模型请求，另一个 Key 零上游请求；
 /// - incompatible_representative：代表账号（内部优先级更低的首个 Key）的显式清单
 ///   与请求不兼容，不得在枚举阶段否决整个组；代表自身零上游发送，兄弟账号以
 ///   自己清单映射出的 `gpt-5-high` 成功交付；
@@ -84,10 +92,21 @@ async fn run_pool_responses_scenario(mode: &'static str) {
     let concurrency = mode == "concurrency";
     let mixed_model = mode == "mixed_model";
     let empty_model_list = mode == "empty_model_list";
+    let account_model_a = mode == "account_model_a";
+    let account_model_b = mode == "account_model_b";
     let incompatible_representative = mode == "incompatible_representative";
     let all_incompatible = mode == "all_incompatible";
-    let account_model_mode =
-        mixed_model || empty_model_list || incompatible_representative || all_incompatible;
+    let account_model_mode = mixed_model
+        || empty_model_list
+        || account_model_a
+        || account_model_b
+        || incompatible_representative
+        || all_incompatible;
+    let account_model_is_bidirectional = account_model_a || account_model_b;
+    let requested_account_model = account_model_a
+        .then_some(ACCOUNT_MODEL_A)
+        .or_else(|| account_model_b.then_some(ACCOUNT_MODEL_B));
+    let uses_explicit_suffix_mapping = mixed_model || incompatible_representative;
     let mut state = AppState::new().unwrap().with_data_state_for_tests(
         crate::data::GatewayDataState::disabled()
             .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
@@ -166,9 +185,19 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                     .unwrap_or_default();
                 if is_first {
                     first_hits.fetch_add(1, Ordering::SeqCst);
-                    first_models.lock().unwrap().push(model);
-                    if account_model_mode {
-                        // 首个账号没有可用的裸模型记录：初始与同 Key 重试都必须被真实 404。
+                    first_models.lock().unwrap().push(model.clone());
+                    if account_model_is_bidirectional {
+                        if requested_account_model != Some(ACCOUNT_MODEL_A) || model != ACCOUNT_MODEL_A {
+                            return Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .header("content-type", "application/json")
+                                .body(Body::from(
+                                    "{\"error\":{\"message\":\"model not found\",\"type\":\"invalid_request_error\",\"code\":\"model_not_found\"}}",
+                                ))
+                                .unwrap();
+                        }
+                    } else if account_model_mode {
+                        // 其他账号模型场景的首个账号没有可用裸模型记录。
                         return Response::builder()
                             .status(StatusCode::NOT_FOUND)
                             .header("content-type", "application/json")
@@ -190,8 +219,17 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                     }
                     second_hits.fetch_add(1, Ordering::SeqCst);
                     second_models.lock().unwrap().push(model.clone());
-                    // 第二个账号只服务其清单映射出的带后缀模型；其他目标必须真实 404。
-                    if account_model_mode && model != ACCOUNT_MAPPED_SUFFIX_MODEL {
+                    if account_model_is_bidirectional {
+                        if requested_account_model != Some(ACCOUNT_MODEL_B) || model != ACCOUNT_MODEL_B {
+                            return Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .header("content-type", "application/json")
+                                .body(Body::from(
+                                    "{\"error\":{\"message\":\"model not found\",\"type\":\"invalid_request_error\",\"code\":\"model_not_found\"}}",
+                                ))
+                                .unwrap();
+                        }
+                    } else if account_model_mode && model != ACCOUNT_MAPPED_SUFFIX_MODEL {
                         return Response::builder()
                             .status(StatusCode::NOT_FOUND)
                             .header("content-type", "application/json")
@@ -203,7 +241,7 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                 }
                 // 未能识别的凭证按第二个 Key 处理；若网关不是以 Bearer 传递 Key，
                 // failover 场景会因 first_hits 断言失败而立即暴露。
-                if !concurrency && (is_first || all_bad) {
+                if !concurrency && !account_model_is_bidirectional && (is_first || all_bad) {
                     return Response::builder()
                         .status(StatusCode::UNAUTHORIZED)
                         .header("content-type", "application/json")
@@ -276,13 +314,20 @@ async fn run_pool_responses_scenario(mode: &'static str) {
     .unwrap()];
     // 账号模型场景的显式清单：目录 Key 与候选行必须保持一致，transport 门禁才与
     // 事故语义一致。不兼容场景的代表账号只支持与请求无交集的模型。
-    let first_allowed_models: Option<Vec<String>> =
-        if incompatible_representative || all_incompatible {
-            Some(vec!["gpt-6".to_string()])
-        } else {
-            None
-        };
-    let second_allowed_models: Option<Vec<String>> = if empty_model_list {
+    let first_allowed_models: Option<Vec<String>> = if account_model_a {
+        Some(vec![ACCOUNT_MODEL_A.to_string()])
+    } else if account_model_b {
+        Some(vec![ACCOUNT_MODEL_A.to_string()])
+    } else if incompatible_representative || all_incompatible {
+        Some(vec!["gpt-6".to_string()])
+    } else {
+        None
+    };
+    let second_allowed_models: Option<Vec<String>> = if account_model_a {
+        Some(vec![ACCOUNT_MODEL_B.to_string()])
+    } else if account_model_b {
+        Some(vec![ACCOUNT_MODEL_B.to_string()])
+    } else if empty_model_list {
         Some(Vec::new())
     } else if mixed_model || incompatible_representative {
         Some(vec![
@@ -359,6 +404,11 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                     key_name: &str,
                     key_internal_priority: i32,
                     key_allowed_models: Option<Vec<String>>| {
+        let has_suffix_mapping = key_allowed_models.as_ref().is_some_and(|models| {
+            models
+                .iter()
+                .any(|model| model == ACCOUNT_MAPPED_SUFFIX_MODEL)
+        });
         StoredMinimalCandidateSelectionRow {
             provider_id: provider_id.clone(),
             provider_name: "openai".into(),
@@ -380,8 +430,6 @@ async fn run_pool_responses_scenario(mode: &'static str) {
             key_internal_priority,
             key_global_priority_by_format: None,
             routing_facts: if account_model_mode {
-                // 与 PostgreSQL 投影一致：Pool 提供商的候选行携带池标志，
-                // 枚举列表每个 Pool 组只保留一个代表 Key 行。
                 StoredMinimalCandidateRoutingFacts {
                     provider_pool_enabled: true,
                     ..Default::default()
@@ -391,13 +439,21 @@ async fn run_pool_responses_scenario(mode: &'static str) {
             },
             model_id: model_id.clone(),
             global_model_id: "global-pool-responses".into(),
-            global_model_name: "gpt-5".into(),
-            // 全局映射正则覆盖带后缀变体，账号清单里的变体经它映射为实际上游模型名。
-            global_model_mappings: account_model_mode
+            global_model_name: requested_account_model.unwrap_or("gpt-5").into(),
+            global_model_mappings: uses_explicit_suffix_mapping
                 .then(|| vec!["gpt-5-(high|low|medium|tiered)".to_string()]),
             global_model_supports_streaming: Some(true),
-            model_provider_model_name: "gpt-5".into(),
-            model_provider_model_mappings: None,
+            model_provider_model_name: requested_account_model.unwrap_or("gpt-5").into(),
+            model_provider_model_mappings: (uses_explicit_suffix_mapping && has_suffix_mapping)
+                .then(|| {
+                    vec![StoredProviderModelMapping {
+                        name: ACCOUNT_MAPPED_SUFFIX_MODEL.to_string(),
+                        priority: 1,
+                        api_formats: Some(vec!["openai:responses".to_string()]),
+                        endpoint_ids: None,
+                        operations: None,
+                    }]
+                }),
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
@@ -510,6 +566,7 @@ async fn run_pool_responses_scenario(mode: &'static str) {
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap();
+    let request_model = requested_account_model.unwrap_or("gpt-5");
     let send_request = |trace_id: String, bearer: &'static str| {
         let client = client.clone();
         let url = format!("{gateway_url}/v1/responses");
@@ -518,7 +575,7 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                 .post(url)
                 .bearer_auth(bearer)
                 .header(super::TRACE_ID_HEADER, &trace_id)
-                .json(&json!({"model":"gpt-5","input":[],"stream":true}))
+                .json(&json!({"model":request_model,"input":[],"stream":true}))
                 .send()
                 .await
                 .unwrap()
@@ -537,7 +594,7 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                     .post(url)
                     .bearer_auth(bearer)
                     .header(super::TRACE_ID_HEADER, &trace_id)
-                    .json(&json!({"model":"gpt-5","input":[],"stream":true}))
+                    .json(&json!({"model":request_model,"input":[],"stream":true}))
                     .send()
                     .await
                     .unwrap();
@@ -651,6 +708,31 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                         .any(|candidate| candidate.status == RequestCandidateStatus::Success),
                     "the denied account must not be recorded as a success: {stored:#?}"
                 );
+            } else if account_model_is_bidirectional {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body, expected_success_body);
+                let expected_model = requested_account_model.expect("account model scenario");
+                if account_model_a {
+                    assert_eq!(first_models, vec![expected_model.to_string()]);
+                    assert!(
+                        second_models.is_empty(),
+                        "wrong key received upstream request: {second_models:?}"
+                    );
+                } else {
+                    assert!(
+                        first_models.is_empty(),
+                        "wrong key received upstream request: {first_models:?}"
+                    );
+                    assert_eq!(second_models, vec![expected_model.to_string()]);
+                }
+                assert_eq!(total_hits.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    attempted.len(),
+                    1,
+                    "only matching account may be attempted: {stored:#?}"
+                );
+                assert_eq!(attempted[0].status, RequestCandidateStatus::Success);
+                assert_eq!(attempted[0].status_code, Some(200));
             } else if incompatible_representative {
                 assert_eq!(status, StatusCode::OK, "{body}");
                 assert_eq!(body, expected_success_body);
@@ -883,6 +965,18 @@ async fn responses_pool_mixed_account_model_failover_sends_account_mapped_suffix
 #[tokio::test]
 async fn responses_pool_empty_account_model_list_stays_denied() {
     run_pool_responses_scenario("empty_model_list").await;
+}
+
+/// 两个账号模型清单互斥时，请求模型 A 只能发送给 Key A，且 Key B 不得收到上游请求。
+#[tokio::test]
+async fn responses_pool_account_model_a_stays_on_matching_key() {
+    run_pool_responses_scenario("account_model_a").await;
+}
+
+/// 两个账号模型清单互斥时，反向请求模型 B 只能发送给 Key B，且 Key A 不得收到上游请求。
+#[tokio::test]
+async fn responses_pool_account_model_b_stays_on_matching_key() {
+    run_pool_responses_scenario("account_model_b").await;
 }
 
 /// 代表账号模型清单与请求不兼容的回归：枚举阶段不得用代表的清单否决整个号池组。

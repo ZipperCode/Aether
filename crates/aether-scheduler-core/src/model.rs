@@ -320,15 +320,6 @@ pub(crate) fn resolve_provider_model_name_with_prepared_allowed_models(
         }
     }
 
-    let global_model_mappings = row.global_model_mappings.as_ref()?;
-    let compiled_global_model_mappings = compiled_model_mappings(global_model_mappings);
-    for allowed_model in sorted_allowed_models.iter().map(String::as_str) {
-        if compiled_global_model_mappings.matches_any(allowed_model) {
-            let allowed_model = allowed_model.to_owned();
-            return Some((allowed_model.clone(), Some(allowed_model)));
-        }
-    }
-
     None
 }
 
@@ -670,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn regex_allowed_model_replaces_selected_provider_model_name() {
+    fn global_regex_does_not_replace_unmatched_requested_model() {
         let mut row = sample_row("gpt-5", "gpt-5-upstream");
         row.key_allowed_models = Some(vec!["gpt-5.4".to_string()]);
         row.global_model_mappings = Some(vec!["gpt-5(?:\\.\\d+)?".to_string()]);
@@ -682,11 +673,25 @@ mod tests {
             operations: None,
         }]);
 
-        let resolved = resolve_provider_model_name(&row, "gpt-5", "openai:chat")
-            .expect("regex-matched allowed model should allow the key");
+        assert!(resolve_provider_model_name(&row, "gpt-5", "openai:chat").is_none());
+    }
 
-        assert_eq!(resolved.0, "gpt-5.4");
-        assert_eq!(resolved.1.as_deref(), Some("gpt-5.4"));
+    #[test]
+    fn explicit_provider_mapping_can_match_an_allowed_account_model() {
+        let mut row = sample_row("gpt-5", "gpt-5-upstream");
+        row.key_allowed_models = Some(vec!["gpt-5.4".to_string()]);
+        row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+            name: "gpt-5.4".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:chat".to_string()]),
+            endpoint_ids: None,
+            operations: None,
+        }]);
+
+        assert_eq!(
+            resolve_provider_model_name(&row, "gpt-5", "openai:chat"),
+            Some(("gpt-5.4".to_string(), Some("gpt-5.4".to_string())))
+        );
     }
 
     #[test]

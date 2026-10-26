@@ -3025,3 +3025,87 @@ async fn same_priority_candidates_use_aggregate_health_score_when_api_format_spe
     assert_eq!(selected.provider_id, "provider-b");
     assert_eq!(selected.key_id, "key-b");
 }
+
+#[tokio::test]
+async fn ordinary_provider_keys_are_isolated_by_api_format() {
+    let mut chat_row = sample_row_without_model_mappings();
+    chat_row.provider_id = "provider-shared".to_string();
+    chat_row.provider_name = "shared".to_string();
+    chat_row.endpoint_id = "endpoint-chat".to_string();
+    chat_row.endpoint_api_format = "openai:chat".to_string();
+    chat_row.key_id = "key-chat".to_string();
+    chat_row.key_name = "chat-key".to_string();
+    chat_row.key_api_formats = Some(vec!["openai:chat".to_string()]);
+    chat_row.key_global_priority_by_format = Some(json!({"openai:chat": 1}));
+
+    let mut responses_row = chat_row.clone();
+    responses_row.endpoint_id = "endpoint-responses".to_string();
+    responses_row.endpoint_api_format = "openai:responses".to_string();
+    responses_row.key_id = "key-responses".to_string();
+    responses_row.key_name = "responses-key".to_string();
+    responses_row.key_api_formats = Some(vec!["openai:responses".to_string()]);
+    responses_row.key_global_priority_by_format = Some(json!({"openai:responses": 1}));
+
+    let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed([
+        chat_row,
+        responses_row,
+    ]));
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-shared", None)],
+        Vec::new(),
+        vec![
+            sample_key("key-chat", "provider-shared", Some(10)),
+            sample_key("key-responses", "provider-shared", Some(10)),
+        ],
+    ));
+    let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![]));
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_candidate_selection_provider_catalog_quota_and_request_candidates_for_tests(
+                candidates,
+                provider_catalog,
+                quotas,
+                request_candidates,
+            ),
+        );
+
+    let chat_candidates = collect_selectable_candidates(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        100,
+    )
+    .await
+    .expect("chat selection should succeed");
+    assert_eq!(
+        chat_candidates
+            .iter()
+            .map(|candidate| (candidate.key_id.as_str(), candidate.endpoint_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("key-chat", "endpoint-chat")]
+    );
+
+    let response_candidates = collect_selectable_candidates(
+        state.data.as_ref(),
+        &state,
+        "openai:responses",
+        "gpt-4.1",
+        false,
+        None,
+        100,
+    )
+    .await
+    .expect("Responses selection should succeed");
+    assert_eq!(
+        response_candidates
+            .iter()
+            .map(|candidate| (candidate.key_id.as_str(), candidate.endpoint_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("key-responses", "endpoint-responses")]
+    );
+}
