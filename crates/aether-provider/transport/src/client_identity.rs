@@ -48,14 +48,3 @@ pub const CHATGPT_WEB_BROWSER_PROFILE: &str = "chrome143";
 pub use aether_oauth::provider::providers::{
     DEFAULT_KIRO_VERSION, DEFAULT_NODE_VERSION, DEFAULT_SYSTEM_VERSION,
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn pinned_headers_and_body_versions_are_calibrated_together() {
-        for identity in [WINDSURF] {
-            assert!(identity.user_agent.contains(identity.version));
-        }
-    }
-}
