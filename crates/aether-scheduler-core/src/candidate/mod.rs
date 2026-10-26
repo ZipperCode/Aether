@@ -24,7 +24,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use aether_data_contracts::repository::candidate_selection::{
-        StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
+        StoredMinimalCandidateRoutingFacts, StoredMinimalCandidateSelectionRow,
+        StoredProviderModelMapping,
     };
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, StoredRequestCandidate,
@@ -214,6 +215,159 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].provider_id, "provider-1");
         assert_eq!(candidates[0].selected_provider_model_name, "gpt-5-canary-1");
+    }
+
+    #[test]
+    fn pool_representative_model_list_denial_does_not_reject_logical_group() {
+        // 逻辑号池组在枚举列表里只带一个代表 Key 行；代表账号的显式模型清单
+        // （与请求不兼容或显式为空）不得在成员展开存在之前否决整个组。
+        for allowed_models in [Some(vec!["gpt-6".to_string()]), Some(Vec::new())] {
+            let mut representative = sample_row("pool");
+            representative.routing_facts = StoredMinimalCandidateRoutingFacts {
+                provider_pool_enabled: true,
+                ..Default::default()
+            };
+            representative.key_allowed_models = allowed_models;
+
+            let candidates = super::enumerate_minimal_candidate_selection(
+                EnumerateMinimalCandidateSelectionInput {
+                    rows: vec![representative],
+                    normalized_api_format: "openai:chat",
+                    request_operation: None,
+                    requested_model_name: "gpt-5",
+                    resolved_global_model_name: "gpt-5",
+                    require_streaming: false,
+                    required_capabilities: None,
+                    auth_constraints: None,
+                },
+            )
+            .expect("pool group enumeration should build");
+
+            assert_eq!(candidates.len(), 1);
+            // 回退只忽略代表的模型清单限制；上游目标仍是该行作用域内的
+            // 配置/默认模型名，不产生任何新的模型名。
+            assert_eq!(
+                candidates[0].selected_provider_model_name, "gpt-5-canary-pool",
+                "fallback must keep the scoped configured/default upstream target"
+            );
+            assert_eq!(candidates[0].mapping_matched_model, None);
+        }
+    }
+
+    #[test]
+    fn non_pool_account_model_list_denial_stays_strict() {
+        for allowed_models in [Some(vec!["gpt-6".to_string()]), Some(Vec::new())] {
+            let mut row = sample_row("strict");
+            row.key_allowed_models = allowed_models;
+
+            let candidates = super::enumerate_minimal_candidate_selection(
+                EnumerateMinimalCandidateSelectionInput {
+                    rows: vec![row],
+                    normalized_api_format: "openai:chat",
+                    request_operation: None,
+                    requested_model_name: "gpt-5",
+                    resolved_global_model_name: "gpt-5",
+                    require_streaming: false,
+                    required_capabilities: None,
+                    auth_constraints: None,
+                },
+            )
+            .expect("candidate enumeration should build");
+
+            assert!(
+                candidates.is_empty(),
+                "non-pool account model denial must stay strict"
+            );
+        }
+
+        // NULL 清单保持不受限。
+        let candidates =
+            super::enumerate_minimal_candidate_selection(EnumerateMinimalCandidateSelectionInput {
+                rows: vec![sample_row("null")],
+                normalized_api_format: "openai:chat",
+                request_operation: None,
+                requested_model_name: "gpt-5",
+                resolved_global_model_name: "gpt-5",
+                require_streaming: false,
+                required_capabilities: None,
+                auth_constraints: None,
+            })
+            .expect("candidate enumeration should build");
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn pool_representative_mapping_scope_mismatch_stays_denied() {
+        // 代表回退只忽略模型清单限制，不允许越过 Endpoint / API 格式作用域。
+        for mapping in [
+            StoredProviderModelMapping {
+                name: "gpt-5-elsewhere".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["openai:chat".to_string()]),
+                endpoint_ids: Some(vec!["endpoint-elsewhere".to_string()]),
+                operations: None,
+            },
+            StoredProviderModelMapping {
+                name: "gpt-5-elsewhere".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["openai:responses".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+            },
+        ] {
+            let mut representative = sample_row("scope");
+            representative.routing_facts = StoredMinimalCandidateRoutingFacts {
+                provider_pool_enabled: true,
+                ..Default::default()
+            };
+            representative.key_allowed_models = Some(vec!["gpt-6".to_string()]);
+            representative.model_provider_model_mappings = Some(vec![mapping]);
+
+            let candidates = super::enumerate_minimal_candidate_selection(
+                EnumerateMinimalCandidateSelectionInput {
+                    rows: vec![representative],
+                    normalized_api_format: "openai:chat",
+                    request_operation: None,
+                    requested_model_name: "gpt-5",
+                    resolved_global_model_name: "gpt-5",
+                    require_streaming: false,
+                    required_capabilities: None,
+                    auth_constraints: None,
+                },
+            )
+            .expect("candidate enumeration should build");
+
+            assert!(
+                candidates.is_empty(),
+                "pool representative fallback must respect mapping endpoint/format scope"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_model_resolution_stays_strict_for_pool_member_rows() {
+        // 成员行展开后仍带 pool 标志，通用解析器必须保持严格：显式清单
+        // （含空清单）与请求无交集即拒绝，绝不能命中代表回退。
+        for allowed_models in [Some(vec!["gpt-6".to_string()]), Some(Vec::new())] {
+            let mut member = sample_row("member");
+            member.routing_facts = StoredMinimalCandidateRoutingFacts {
+                provider_pool_enabled: true,
+                ..Default::default()
+            };
+            member.key_allowed_models = allowed_models;
+
+            assert!(
+                crate::model::resolve_provider_model_name_with_model_directives_and_request_operation(
+                    &member,
+                    "gpt-5",
+                    "openai:chat",
+                    false,
+                    None,
+                )
+                .is_none(),
+                "generic resolver must keep strict account model denial for pool member rows"
+            );
+        }
     }
 
     #[test]

@@ -340,7 +340,7 @@ pub fn select_provider_model_name(
         .unwrap_or_else(|| row.model_provider_model_name.clone())
 }
 
-fn resolve_selected_provider_model_name(
+pub(super) fn resolve_selected_provider_model_name(
     row: &StoredMinimalCandidateSelectionRow,
     api_format: &str,
     request_operation: Option<&str>,

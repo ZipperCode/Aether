@@ -84,7 +84,7 @@ fn enumerate_minimal_candidate_selection_inner(
         } else {
             None
         };
-        let Some((selected_provider_model_name, mapping_matched_model)) =
+        let resolved_provider_model =
             crate::model::resolve_provider_model_name_with_prepared_allowed_models(
                 &row,
                 requested_model_name,
@@ -93,6 +93,24 @@ fn enumerate_minimal_candidate_selection_inner(
                 request_operation,
                 prepared_allowed_models,
             )
+            .or_else(|| {
+                // 逻辑号池组：枚举列表里每个 Pool 组只有一个代表 Key 行，代表账号
+                // 的显式模型清单（与请求不兼容或显式为空）不得在成员展开存在之前
+                // 否决整个组。这里只忽略代表的模型清单限制，Endpoint/操作作用域仍
+                // 由 scoped 配置/默认目标解析严格保持，也不会产生新的上游模型名；
+                // 真实成员水合仍逐账号严格校验（含空清单拒绝）。通用解析器不做此
+                // 回退，因为展开后的成员行同样带 pool 标志。
+                if !row.routing_facts.provider_pool_enabled {
+                    return None;
+                }
+                crate::model::resolve_selected_provider_model_name(
+                    &row,
+                    normalized_api_format,
+                    request_operation,
+                )
+                .map(|selected_provider_model_name| (selected_provider_model_name, None))
+            });
+        let Some((selected_provider_model_name, mapping_matched_model)) = resolved_provider_model
         else {
             continue;
         };

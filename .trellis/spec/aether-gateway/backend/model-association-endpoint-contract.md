@@ -25,6 +25,8 @@
 - Every newly selected model exposes manual association, even when discovery is empty or failed. In **手动指定模型与 Endpoint**, prefill the Global Model name, allow editing the real upstream name, and require explicit selection of at least one Provider Endpoint. Never infer support from a model-name prefix or select all Endpoints automatically.
 - Manual entries call `createModel` with the trimmed name and selected `endpoint_ids`, never batch inference. Discovery refresh cannot overwrite manual names or bindings. Deselecting a row, closing/reopening, or changing Providers discards its manual state.
 - Endpoint loading is session-fenced separately from manual input resets; synchronizing existing associations must not erase freshly loaded Endpoint choices. Manual-mode select values must not collide with real upstream model IDs.
+- `models` enforces `UNIQUE(provider_id, provider_model_name)` and one `global_model_id` per row. To preserve two explicitly requested Global Model names without changing cardinality, use distinct configured rows with an unconditional `provider_model_mappings` target equal to the real discovered upstream ID; bind the exact Endpoint explicitly. Never send the configured alias as an invented upstream ID or add it to account model lists. Preserve exact-global precedence; regex mappings do not merge globals or their Endpoint lists.
+- Logical pool-group enumeration must not reject a group because its representative's `allowed_models` is empty or incompatible. If normal representative resolution fails, resolve only the scoped configured/provider-mapped target for the group. Actual member hydration still applies its own model list; keep this fallback out of generic resolvers because expanded member rows also carry `provider_pool_enabled=true`.
 - Runtime pool expansion must resolve `selected_provider_model_name` and `mapping_matched_model` for each account row through `resolve_provider_model_name_with_model_directives_and_request_operation`, before transport permission checks and payload construction. A representative account's selected target is not a pool-wide fact.
 - Reuse the request's existing per-format directive routing model and request operation. Preserve provider mapping priority and Endpoint/operation scope; do not reload directive policy on each pool page or enable directives unconditionally.
 - `provider_api_keys.allowed_models=NULL` preserves the row's configured default/provider-mapped target without account restrictions; an explicit empty list denies the account. Global regex matching selects only actual account-list entries, never fabricated suffixes. Disabling automatic model fetching on one account must not disable mapped alternatives on other accounts.
@@ -49,6 +51,9 @@
 | First account has no model list; later account lists a regex-matched variant | Later account resolves its own actual variant and remains eligible after first-account failure |
 | Pool member has an explicit empty model list | No upstream send for that member; preserve model-disabled semantics |
 | Pool account uses an operation-scoped provider mapping | Apply the original request operation and directive policy snapshot before permission/quota checks |
+| Pool representative list excludes the requested model or is empty | Keep the logical group; evaluate actual member lists before any upstream send |
+| All pool members exclude the requested model | Exhaust the pool with zero upstream sends; never weaken member permissions |
+| Two Global Models need the same real upstream target | Preserve distinct configured identities and explicit real-target mappings; do not reassign the only route away from the existing global |
 
 ## 5. Good / Base / Bad Cases
 
@@ -72,6 +77,8 @@
 - `responses_pool_empty_account_model_list_stays_denied`: explicit empty account list prevents any upstream send despite a preceding unrestricted member.
 - `pool_member_model_resolution_tracks_account_scope_and_denials` and directive-policy coverage preserve mapping/operation scope, no-intersection denials and policy-disabled behavior. Memory projection parity must preserve all group-member rows while listing one logical pool representative.
 - `pool_cursor_raw_routing_model_keeps_restricted_custom_suffix_member_schedulable`: exercise `next_key` with a restricted raw custom-suffix model; callers that disable directive routing retain the eligible account, while an explicitly supplied base-routing context observes its own restrictions.
+- `pool_representative_model_list_denial_does_not_reject_logical_group`, `non_pool_account_model_list_denial_stays_strict`, `pool_representative_mapping_scope_mismatch_stays_denied`, and `generic_model_resolution_stays_strict_for_pool_member_rows` lock the group/member boundary, explicit-empty semantics and Endpoint/operation scope.
+- `responses_pool_incompatible_representative_never_sends_and_sibling_serves_actual_model` and `responses_pool_all_incompatible_account_models_send_nothing` exercise real loopback HTTP: only the supporting sibling may receive the actual mapped model, and all-incompatible pools send nothing.
 
 ## 7. Wrong vs Correct
 
@@ -88,3 +95,7 @@ Do not ask users to select an Endpoint without exposing that action in the norma
 Wrong: clone a pool representative, replace only its Key fields, then reject other accounts against the representative's upstream model name.
 
 Correct: re-resolve the account row with the request's mapping context, then check permissions, quotas and construct that account's request.
+
+Wrong: apply a representative account's model list to the whole logical pool, or bypass generic account checks whenever a pool flag is present.
+
+Correct: defer only representative-list denial during group enumeration, then strictly resolve each actual account before sending.

@@ -73,13 +73,21 @@ const ACCOUNT_MAPPED_SUFFIX_MODEL: &str = "gpt-5-high";
 /// - mixed_model：首个 Key 无账号模型清单（allowed_models=NULL），第二个 Key 只允许
 ///   抓取到的带后缀变体；请求使用裸模型名，上游对第二个 Key 只服务其映射后的
 ///   `gpt-5-high`，其余目标真实 404，未知凭证 401；
-/// - empty_model_list：第二个 Key 的账号模型清单显式为空，必须整 Key 拒绝且不发上游。
+/// - empty_model_list：第二个 Key 的账号模型清单显式为空，必须整 Key 拒绝且不发上游；
+/// - incompatible_representative：代表账号（内部优先级更低的首个 Key）的显式清单
+///   与请求不兼容，不得在枚举阶段否决整个组；代表自身零上游发送，兄弟账号以
+///   自己清单映射出的 `gpt-5-high` 成功交付；
+/// - all_incompatible：两个账号的显式清单都与本次请求无交集，必须零上游发送并以
+///   503 结束，成员留下 key_model_disabled 的具体诊断。
 async fn run_pool_responses_scenario(mode: &'static str) {
     let all_bad = mode == "all_bad";
     let concurrency = mode == "concurrency";
     let mixed_model = mode == "mixed_model";
     let empty_model_list = mode == "empty_model_list";
-    let account_model_mode = mixed_model || empty_model_list;
+    let incompatible_representative = mode == "incompatible_representative";
+    let all_incompatible = mode == "all_incompatible";
+    let account_model_mode =
+        mixed_model || empty_model_list || incompatible_representative || all_incompatible;
     let mut state = AppState::new().unwrap().with_data_state_for_tests(
         crate::data::GatewayDataState::disabled()
             .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
@@ -108,6 +116,8 @@ async fn run_pool_responses_scenario(mode: &'static str) {
 
     let first_hits = Arc::new(AtomicUsize::new(0));
     let second_hits = Arc::new(AtomicUsize::new(0));
+    // 入口即计数：未知凭证的请求也必须计入，零上游发送断言才无漏洞。
+    let total_hits = Arc::new(AtomicUsize::new(0));
     let released = Arc::new(AtomicBool::new(false));
     // 账号模型场景记录上游每次尝试实际收到的模型名。
     let first_models = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -115,6 +125,7 @@ async fn run_pool_responses_scenario(mode: &'static str) {
     // 在闭包捕获边界克隆：move 闭包只能拿走副本，测试尾部仍可读取计数器并释放。
     let upstream_first_hits = Arc::clone(&first_hits);
     let upstream_second_hits = Arc::clone(&second_hits);
+    let upstream_total_hits = Arc::clone(&total_hits);
     let upstream_released = Arc::clone(&released);
     let upstream_first_models = Arc::clone(&first_models);
     let upstream_second_models = Arc::clone(&second_models);
@@ -124,11 +135,13 @@ async fn run_pool_responses_scenario(mode: &'static str) {
         post(move |request: Request| {
             let first_hits = Arc::clone(&upstream_first_hits);
             let second_hits = Arc::clone(&upstream_second_hits);
+            let total_hits = Arc::clone(&upstream_total_hits);
             let released = Arc::clone(&upstream_released);
             let first_models = Arc::clone(&upstream_first_models);
             let second_models = Arc::clone(&upstream_second_models);
             let success_chunks = upstream_success_chunks.clone();
             async move {
+                total_hits.fetch_add(1, Ordering::SeqCst);
                 let bearer = request
                     .headers()
                     .get(AUTHORIZATION)
@@ -261,6 +274,31 @@ async fn run_pool_responses_scenario(mode: &'static str) {
     .unwrap()
     .with_transport_fields(upstream_url, None, None, Some(2), None, None, None, None)
     .unwrap()];
+    // 账号模型场景的显式清单：目录 Key 与候选行必须保持一致，transport 门禁才与
+    // 事故语义一致。不兼容场景的代表账号只支持与请求无交集的模型。
+    let first_allowed_models: Option<Vec<String>> =
+        if incompatible_representative || all_incompatible {
+            Some(vec!["gpt-6".to_string()])
+        } else {
+            None
+        };
+    let second_allowed_models: Option<Vec<String>> = if empty_model_list {
+        Some(Vec::new())
+    } else if mixed_model || incompatible_representative {
+        Some(vec![
+            "gpt-5-high".to_string(),
+            "gpt-5-low".to_string(),
+            "gpt-5-medium".to_string(),
+            "gpt-5-tiered".to_string(),
+        ])
+    } else if all_incompatible {
+        Some(vec!["gpt-7".to_string()])
+    } else {
+        None
+    };
+    let first_allowed_models_json = first_allowed_models.clone().map(|models| json!(models));
+    let second_allowed_models_json = second_allowed_models.clone().map(|models| json!(models));
+
     let mut first_key = StoredProviderCatalogKey::new(
         first_key_id.clone(),
         provider_id.clone(),
@@ -278,7 +316,7 @@ async fn run_pool_responses_scenario(mode: &'static str) {
         None,
         None,
         None,
-        None,
+        first_allowed_models_json.clone(),
         None,
         None,
         None,
@@ -303,18 +341,7 @@ async fn run_pool_responses_scenario(mode: &'static str) {
         None,
         None,
         // 账号模型清单必须同时体现在目录 Key 上，transport 门禁才与事故语义一致。
-        if empty_model_list {
-            Some(json!([]))
-        } else if mixed_model {
-            Some(json!([
-                "gpt-5-high",
-                "gpt-5-low",
-                "gpt-5-medium",
-                "gpt-5-tiered"
-            ]))
-        } else {
-            None
-        },
+        second_allowed_models_json.clone(),
         None,
         None,
         None,
@@ -378,23 +405,17 @@ async fn run_pool_responses_scenario(mode: &'static str) {
     };
     let rows = vec![
         // 首个账号是 Pool 代表（内部优先级更低），组的进入模型目标因此是裸名。
-        pool_row(first_key_id.clone(), "first", 0, None),
+        pool_row(
+            first_key_id.clone(),
+            "first",
+            0,
+            first_allowed_models.clone(),
+        ),
         pool_row(
             second_key_id.clone(),
             "second",
             1,
-            if empty_model_list {
-                Some(Vec::new())
-            } else if mixed_model {
-                Some(vec![
-                    "gpt-5-high".to_string(),
-                    "gpt-5-low".to_string(),
-                    "gpt-5-medium".to_string(),
-                    "gpt-5-tiered".to_string(),
-                ])
-            } else {
-                None
-            },
+            second_allowed_models.clone(),
         ),
     ];
 
@@ -630,6 +651,76 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                         .any(|candidate| candidate.status == RequestCandidateStatus::Success),
                     "the denied account must not be recorded as a success: {stored:#?}"
                 );
+            } else if incompatible_representative {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body, expected_success_body);
+                // 不兼容的代表账号在成员水合阶段即被拒绝：整个请求只允许兄弟账号
+                // 发出一次真实上游请求，且携带兄弟账号自己解析出的实际上游模型名。
+                assert_eq!(
+                    total_hits.load(Ordering::SeqCst),
+                    1,
+                    "exactly one upstream send is allowed: first_models={first_models:?}, second_models={second_models:?}"
+                );
+                assert!(
+                    first_models.is_empty(),
+                    "the incompatible representative must never reach the upstream: {first_models:?}"
+                );
+                assert_eq!(
+                    second_models,
+                    vec![ACCOUNT_MAPPED_SUFFIX_MODEL.to_string()],
+                    "the supporting sibling must send its own resolved upstream model: {stored:#?}"
+                );
+                assert!(
+                    !attempted
+                        .iter()
+                        .any(|candidate| candidate.key_id.as_deref() == Some(first_key_id.as_str())),
+                    "the incompatible representative must be skipped, not attempted: {stored:#?}"
+                );
+                let second_key_attempts: Vec<_> = attempted
+                    .iter()
+                    .filter(|candidate| candidate.key_id.as_deref() == Some(second_key_id.as_str()))
+                    .collect();
+                assert_eq!(
+                    second_key_attempts.len(),
+                    1,
+                    "the supporting sibling must be attempted exactly once: {stored:#?}"
+                );
+                assert_eq!(
+                    second_key_attempts[0].status,
+                    RequestCandidateStatus::Success
+                );
+                assert_eq!(second_key_attempts[0].status_code, Some(200));
+            } else if all_incompatible {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+                // 无可用成员：任何账号都不得发出上游请求，也不允许落成真实执行耗尽。
+                assert_eq!(
+                    total_hits.load(Ordering::SeqCst),
+                    0,
+                    "no upstream send is allowed when every account model list is incompatible: first_models={first_models:?}, second_models={second_models:?}"
+                );
+                assert!(
+                    first_models.is_empty() && second_models.is_empty(),
+                    "no model may reach the upstream: first_models={first_models:?}, second_models={second_models:?}"
+                );
+                assert_ne!(
+                    miss_reason.as_deref(),
+                    Some("execution_runtime_candidates_exhausted"),
+                    "status={status}, body={body}, candidates={stored:#?}"
+                );
+                assert!(
+                    attempted.is_empty(),
+                    "no account may be attempted: {stored:#?}"
+                );
+                // 号池组必须进入成员展开，成员的模型禁用跳过必须留下具体诊断。
+                let diagnostics = format!("{stored:?}");
+                assert!(
+                    diagnostics.contains("key_model_disabled"),
+                    "each pool member must persist its model-disabled skip: {diagnostics}"
+                );
+                assert!(
+                    diagnostics.contains("pool_group_exhaustion"),
+                    "pool group exhaustion must keep its aggregated diagnostic payload: {diagnostics}"
+                );
             } else {
                 assert_eq!(status, StatusCode::OK, "{body}");
                 assert_eq!(body, expected_success_body);
@@ -792,4 +883,21 @@ async fn responses_pool_mixed_account_model_failover_sends_account_mapped_suffix
 #[tokio::test]
 async fn responses_pool_empty_account_model_list_stays_denied() {
     run_pool_responses_scenario("empty_model_list").await;
+}
+
+/// 代表账号模型清单与请求不兼容的回归：枚举阶段不得用代表的清单否决整个号池组。
+/// 组进入成员展开后，代表自身必须以 key_model_disabled 跳过且零上游发送，支持该
+/// 模型的兄弟账号以自己清单映射出的实际上游模型名成功交付 200，不得发明任何
+/// 上游模型 ID。
+#[tokio::test]
+async fn responses_pool_incompatible_representative_never_sends_and_sibling_serves_actual_model() {
+    run_pool_responses_scenario("incompatible_representative").await;
+}
+
+/// 号池组内所有账号的显式模型清单都与请求无交集时的回归：组必须进入成员展开并
+/// 把每个成员以 key_model_disabled 拒绝，不得发送任何上游请求，请求以 503 结束，
+/// 且不允许落成真实执行耗尽。
+#[tokio::test]
+async fn responses_pool_all_incompatible_account_models_send_nothing() {
+    run_pool_responses_scenario("all_incompatible").await;
 }
