@@ -2410,3 +2410,6 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
     refresh_handle.abort();
     upstream_handle.abort();
 }
+
+#[path = "antigravity_quota_refresh.rs"]
+mod antigravity_quota_refresh;

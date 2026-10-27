@@ -196,8 +196,20 @@ fn provider_pool_quota_reaches_reserve(
     reserve_ratio: f64,
 ) -> Option<bool> {
     let is_codex = provider_type.trim().eq_ignore_ascii_case("codex");
-    let requested = provider_model_name.map(provider_pool_identifier_tokens);
-    if reserve_ratio <= 0.0 && requested.as_ref().is_some_and(|tokens| tokens.is_empty()) {
+    let is_antigravity = provider_type.trim().eq_ignore_ascii_case("antigravity");
+    if is_antigravity
+        && reserve_ratio <= 0.0
+        && provider_model_name.is_some_and(|model| model.trim().is_empty())
+    {
+        return None;
+    }
+    let requested = (!is_antigravity)
+        .then(|| provider_model_name.map(provider_pool_identifier_tokens))
+        .flatten();
+    if !is_antigravity
+        && reserve_ratio <= 0.0
+        && requested.as_ref().is_some_and(|tokens| tokens.is_empty())
+    {
         return None;
     }
 
@@ -217,7 +229,7 @@ fn provider_pool_quota_reaches_reserve(
         let account_signal = (is_codex && reserve_ratio <= 0.0)
             .then(|| provider_pool_codex_account_quota_signal(source, observed_at))
             .flatten();
-        let mut windows = provider_pool_collect_quota_windows(source);
+        let mut windows = provider_pool_collect_quota_windows(source, is_antigravity);
         if is_codex {
             // Raw refresh metadata can be newer than the materialized windows.
             // Include all four legacy slots before selecting the model bucket.
@@ -267,11 +279,16 @@ fn provider_pool_quota_reaches_reserve(
             .iter()
             .filter(|window| {
                 provider_model_name.is_some_and(|model| {
-                    provider_pool_window_explicitly_matches_model(window, model)
+                    provider_pool_window_explicitly_matches_model(window, model, is_antigravity)
                 })
             })
             .collect::<Vec<_>>();
-        if !model_matches.is_empty() {
+        if !model_matches.is_empty()
+            && (!is_antigravity
+                || model_matches
+                    .iter()
+                    .any(|window| provider_pool_quota_window_has_observation(window)))
+        {
             let exhausted = if reserve_ratio > 0.0 {
                 // Reserving quota protects every applicable rate-limit window,
                 // including short and weekly limits for an explicit model.
@@ -280,7 +297,7 @@ fn provider_pool_quota_reaches_reserve(
                 provider_pool_explicit_model_windows_exhausted(model_matches, observed_at)
             };
             if resolved.is_none()
-                || (is_codex && !resolved_specific_bucket)
+                || ((is_codex || is_antigravity) && !resolved_specific_bucket)
                 || provider_pool_should_replace_model_quota_resolution(
                     resolved.as_ref().and_then(|(observed_at, _)| *observed_at),
                     observed_at,
@@ -292,37 +309,39 @@ fn provider_pool_quota_reaches_reserve(
             continue;
         }
 
-        // Legacy snapshots may not carry a model field.  Match an opaque
-        // family token (the prefix before `_`/`:` in `code`, or an explicit
-        // family key) against the model's tokens.  This keeps independent
-        // windows isolated without baking in names such as "spark".
-        let family_matches = windows
-            .iter()
-            .filter(|window| {
-                requested
-                    .as_ref()
-                    .is_some_and(|tokens| provider_pool_window_family_matches_model(window, tokens))
-            })
-            .collect::<Vec<_>>();
-        if !family_matches.is_empty() {
-            let exhausted =
-                provider_pool_any_window_exhausted(family_matches, observed_at, reserve_ratio);
-            if resolved.is_none()
-                || (is_codex && !resolved_specific_bucket)
-                || provider_pool_should_replace_model_quota_resolution(
-                    resolved.as_ref().and_then(|(observed_at, _)| *observed_at),
-                    observed_at,
-                )
-            {
-                resolved = Some((observed_at, exhausted));
-                resolved_specific_bucket = true;
+        if !is_antigravity {
+            // Legacy snapshots may not carry a model field.  Match an opaque
+            // family token (the prefix before `_`/`:` in `code`, or an explicit
+            // family key) against the model's tokens.  This keeps independent
+            // windows isolated without baking in names such as "spark".
+            let family_matches = windows
+                .iter()
+                .filter(|window| {
+                    requested.as_ref().is_some_and(|tokens| {
+                        provider_pool_window_family_matches_model(window, tokens)
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !family_matches.is_empty() {
+                let exhausted =
+                    provider_pool_any_window_exhausted(family_matches, observed_at, reserve_ratio);
+                if resolved.is_none()
+                    || (is_codex && !resolved_specific_bucket)
+                    || provider_pool_should_replace_model_quota_resolution(
+                        resolved.as_ref().and_then(|(observed_at, _)| *observed_at),
+                        observed_at,
+                    )
+                {
+                    resolved = Some((observed_at, exhausted));
+                    resolved_specific_bucket = true;
+                }
+                continue;
             }
-            continue;
         }
 
         // A newer account observation does not update an independent model
         // bucket. Only compare freshness between applicable model sources.
-        if is_codex && resolved_specific_bucket {
+        if (is_codex || is_antigravity) && resolved_specific_bucket {
             continue;
         }
 
@@ -333,7 +352,12 @@ fn provider_pool_quota_reaches_reserve(
         // accidentally make an unrelated model look schedulable.
         let generic_matches = windows
             .iter()
-            .filter(|window| provider_pool_window_is_generic(window))
+            .filter(|window| {
+                provider_pool_window_is_generic(window)
+                    && (!is_antigravity
+                        || (!provider_pool_window_is_quota_group_scoped(window)
+                            && provider_pool_quota_window_has_observation(window)))
+            })
             .collect::<Vec<_>>();
         if !generic_matches.is_empty() {
             let exhausted = account_signal.unwrap_or_else(|| {
@@ -471,7 +495,7 @@ fn provider_pool_quota_window_has_observation(window: &Map<String, Value>) -> bo
 pub(crate) fn provider_pool_source_account_quota_exhausted(
     source: &Map<String, Value>,
 ) -> Option<bool> {
-    let windows = provider_pool_collect_quota_windows(source);
+    let windows = provider_pool_collect_quota_windows(source, false);
     let account_windows = windows
         .iter()
         .filter(|window| provider_pool_window_is_generic(window))
@@ -599,7 +623,35 @@ fn provider_pool_window_is_generic(window: &Map<String, Value>) -> bool {
 fn provider_pool_window_explicitly_matches_model(
     window: &Map<String, Value>,
     requested_model: &str,
+    exact_only: bool,
 ) -> bool {
+    if exact_only {
+        let requested = requested_model.trim();
+        if requested.is_empty() {
+            return false;
+        }
+        return [
+            "model",
+            "model_name",
+            "model_id",
+            "quota_model",
+            "quota_model_name",
+            "target_model",
+            "limit_name",
+            "models",
+            "model_ids",
+        ]
+        .iter()
+        .filter_map(|key| window.get(*key))
+        .any(|value| match value {
+            Value::String(value) => requested.eq_ignore_ascii_case(value.trim()),
+            Value::Array(values) => values
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|value| requested.eq_ignore_ascii_case(value.trim())),
+            _ => false,
+        });
+    }
     let requested = provider_pool_normalize_identifier(requested_model);
     let requested_tokens = provider_pool_identifier_tokens(requested_model);
     if requested.is_empty() {
@@ -783,7 +835,10 @@ fn provider_pool_identifier_tokens(value: &str) -> std::collections::BTreeSet<St
 /// key retained as the model identity.  Keeping this normalization here means
 /// provider adapters do not need to grow model-specific quota code whenever an
 /// upstream introduces another independent bucket.
-fn provider_pool_collect_quota_windows(source: &Map<String, Value>) -> Vec<Map<String, Value>> {
+fn provider_pool_collect_quota_windows(
+    source: &Map<String, Value>,
+    first_model_map_only: bool,
+) -> Vec<Map<String, Value>> {
     let mut windows = Vec::new();
     for key in ["windows", "additional_quota_windows"] {
         if let Some(values) = source.get(key).and_then(Value::as_array) {
@@ -809,6 +864,9 @@ fn provider_pool_collect_quota_windows(source: &Map<String, Value>) -> Vec<Map<S
                 .entry("code".to_string())
                 .or_insert_with(|| json!(format!("model:{model_name}")));
             windows.push(window);
+        }
+        if first_model_map_only {
+            break;
         }
     }
     windows
@@ -952,12 +1010,15 @@ fn provider_pool_reset_deadline_unix_secs(
 ) -> Option<u64> {
     provider_pool_timestamp_unix_secs(item.get("reset_at"))
         .or_else(|| provider_pool_timestamp_unix_secs(item.get("next_reset_at")))
+        .or_else(|| provider_pool_timestamp_unix_secs(item.get("reset_time")))
+        .or_else(|| provider_pool_timestamp_unix_secs(item.get("next_reset_time")))
         .or_else(|| {
             let reset_seconds = provider_pool_json_f64(item.get("reset_seconds"))
-                .or_else(|| provider_pool_json_f64(item.get("reset_after_seconds")))?;
-            if reset_seconds < 0.0 {
-                return None;
-            }
+                .filter(|value| *value >= 0.0)
+                .or_else(|| {
+                    provider_pool_json_f64(item.get("reset_after_seconds"))
+                        .filter(|value| *value >= 0.0)
+                })?;
             let base = provider_pool_timestamp_unix_secs(item.get("observed_at"))
                 .or_else(|| provider_pool_timestamp_unix_secs(item.get("updated_at")))
                 .or(fallback_observed_at)?;
@@ -967,10 +1028,10 @@ fn provider_pool_reset_deadline_unix_secs(
 
 /// Whether the quota window's reset deadline has already passed.
 ///
-/// The deadline is taken from `reset_at`/`next_reset_at` when present, otherwise
-/// derived from `reset_seconds`/`reset_after_seconds` anchored at the window (or
-/// fallback) observation time. Scheduling ignores exhausted windows once this is
-/// true; read paths can reuse the same predicate so the displayed quota matches
+/// The deadline is taken from `reset_at`/`next_reset_at`/`reset_time`/`next_reset_time`
+/// when present, otherwise derived from `reset_seconds`/`reset_after_seconds` anchored at
+/// the window (or fallback) observation time. Scheduling ignores exhausted windows once
+/// this is true; read paths can reuse the same predicate so the displayed quota matches
 /// the scheduling decision after a reset.
 pub fn provider_pool_reset_deadline_elapsed(
     item: &Map<String, Value>,
@@ -1029,6 +1090,17 @@ fn provider_pool_window_is_model_scoped(window: &Map<String, Value>) -> bool {
         .and_then(Value::as_str)
         .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("model"))
         || provider_pool_window_has_explicit_model(window)
+}
+
+fn provider_pool_window_is_quota_group_scoped(window: &Map<String, Value>) -> bool {
+    window
+        .get("scope")
+        .and_then(Value::as_str)
+        .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("quota_group"))
+        || window
+            .get("quota_group")
+            .and_then(Value::as_str)
+            .is_some_and(|group| !group.trim().is_empty())
 }
 
 fn provider_pool_quota_snapshot_matches_provider(
@@ -1118,6 +1190,7 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
     {
         return Some(false);
     }
+    let is_antigravity = provider_type.trim().eq_ignore_ascii_case("antigravity");
     let exhausted = provider_pool_json_bool(quota_snapshot.get("exhausted"))?;
     if exhausted {
         let now_unix_secs = provider_pool_current_unix_secs();
@@ -1125,14 +1198,18 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
             provider_pool_timestamp_unix_secs(quota_snapshot.get("observed_at"))
                 .or_else(|| provider_pool_timestamp_unix_secs(quota_snapshot.get("updated_at")));
 
-        let materialized_windows = provider_pool_collect_quota_windows(quota_snapshot);
+        let materialized_windows =
+            provider_pool_collect_quota_windows(quota_snapshot, is_antigravity);
         if !materialized_windows.is_empty() {
             // Model-scoped windows are evaluated only when the request model
             // is known.  They must not turn the account-level fallback into
             // an exhausted state for unrelated models.
             let account_scoped_windows = materialized_windows
                 .iter()
-                .filter(|window| !provider_pool_window_is_model_scoped(window))
+                .filter(|window| {
+                    !(provider_pool_window_is_model_scoped(window)
+                        || is_antigravity && provider_pool_window_is_quota_group_scoped(window))
+                })
                 .collect::<Vec<_>>();
             // A snapshot containing only model-scoped buckets has no
             // account-wide signal to apply when the caller did not provide a

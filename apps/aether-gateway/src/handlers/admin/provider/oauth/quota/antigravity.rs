@@ -509,6 +509,8 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
         }
 
         if status == "success" {
+            // 仅已落库的模型额度更新重算候选；失败和套餐观察不恢复账号，亲和映射保持不变。
+            state.app().invalidate_provider_quota_candidate_caches();
             success_count += 1;
         } else {
             failed_count += 1;

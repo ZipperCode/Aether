@@ -4726,6 +4726,396 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_key_cursor_antigravity_quota_refresh_recovers() {
+        use crate::handlers::shared::sync_provider_key_quota_status_snapshot;
+        use crate::scheduler::candidate::{
+            list_selectable_candidates_with_skip_reasons, CandidateSchedulingContext,
+        };
+        use crate::scheduler::config::SchedulerOrderingConfig;
+        use aether_admin::provider::quota::parse_antigravity_usage_response;
+        use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+        use aether_data::repository::quota::InMemoryProviderQuotaRepository;
+        use aether_data_contracts::repository::provider_catalog::{
+            ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogReadRepository,
+        };
+        use aether_pool_core::POOL_KEY_QUOTA_EXHAUSTED_SKIP_REASON;
+        use aether_provider_pool::provider_pool_key_runtime_quota_blocked;
+
+        fn build_antigravity_quota_state(
+            sonnet_45_fraction: f64,
+            updated_at_unix_secs: u64,
+            reset_at_unix_secs: u64,
+            existing_snapshot: Option<&serde_json::Value>,
+        ) -> (serde_json::Value, serde_json::Value) {
+            let antigravity_metadata = parse_antigravity_usage_response(
+                &json!({
+                    "models": {
+                        "claude-sonnet-4-5": {
+                            "displayName": "Claude Sonnet 4.5",
+                            "quotaInfo": {
+                                "remainingFraction": sonnet_45_fraction,
+                                "resetTime": reset_at_unix_secs
+                            }
+                        },
+                        "claude-sonnet-4-5-thinking": {
+                            "displayName": "Claude Sonnet 4.5 Thinking",
+                            "quotaInfo": {
+                                "remainingFraction": 0.8,
+                                "resetTime": reset_at_unix_secs
+                            }
+                        },
+                        "claude-sonnet-4-6": {
+                            "displayName": "Claude Sonnet 4.6",
+                            "quotaInfo": {
+                                "remainingFraction": 0.8,
+                                "resetTime": reset_at_unix_secs
+                            }
+                        }
+                    }
+                }),
+                updated_at_unix_secs,
+            )
+            .expect("antigravity usage response should parse");
+            let upstream_metadata = json!({ "antigravity": antigravity_metadata.clone() });
+            let status_snapshot = sync_provider_key_quota_status_snapshot(
+                existing_snapshot,
+                "antigravity",
+                Some(&upstream_metadata),
+                "refresh_api",
+            )
+            .expect("antigravity quota status snapshot should materialize");
+            (antigravity_metadata, status_snapshot)
+        }
+
+        async fn refresh_antigravity_key_quota(
+            app: &AppState,
+            key_id: &str,
+            sonnet_45_fraction: f64,
+            updated_at_unix_secs: u64,
+            reset_at_unix_secs: u64,
+        ) {
+            let key_id_owned = key_id.to_string();
+            let existing = app
+                .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(&key_id_owned))
+                .await
+                .expect("strong key read should succeed")
+                .into_iter()
+                .next()
+                .expect("catalog key should exist");
+            let expected_antigravity = existing
+                .upstream_metadata
+                .as_ref()
+                .and_then(|value| value.get("antigravity"))
+                .cloned();
+            let (antigravity_metadata, status_snapshot) = build_antigravity_quota_state(
+                sonnet_45_fraction,
+                updated_at_unix_secs,
+                reset_at_unix_secs,
+                existing.status_snapshot.as_ref(),
+            );
+            let quota_value = status_snapshot
+                .get("quota")
+                .cloned()
+                .expect("materialized quota field should exist");
+            let update = ProviderCatalogKeyRuntimeMetadataUpdate {
+                key_id: key_id_owned,
+                namespace: "antigravity".to_string(),
+                expected_upstream_metadata_value: expected_antigravity,
+                upstream_metadata_value: antigravity_metadata,
+                status_snapshot_patch: json!({ "quota": quota_value }),
+                updated_at_unix_secs: Some(updated_at_unix_secs),
+            };
+            let updated = app
+                .update_provider_catalog_key_runtime_metadata(&update)
+                .await
+                .expect("runtime metadata update should succeed");
+            assert!(updated);
+            app.invalidate_provider_quota_candidate_caches();
+        }
+
+        for ignore_exhausted_accounts in [false, true] {
+            let provider_config = Some(json!({
+                "pool_advanced": {
+                    "ignore_exhausted_accounts": ignore_exhausted_accounts,
+                    "scheduling_presets": [
+                        {"preset": "cache_affinity", "enabled": true},
+                        {"preset": "priority_first", "enabled": true}
+                    ],
+                    "score_top_n": 64,
+                    "score_fallback_scan_limit": 64
+                }
+            }));
+            let (mut provider, mut endpoint, mut keys, mut rows) =
+                large_pool_fixture(18, provider_config.clone());
+            provider.provider_type = "antigravity".to_string();
+            endpoint.api_format = "gemini:generate_content".to_string();
+            endpoint.api_family = Some("gemini".to_string());
+            endpoint.endpoint_kind = Some("generate_content".to_string());
+            endpoint.base_url = "https://antigravity.googleapis.com".to_string();
+
+            let now_unix_secs = crate::clock::current_unix_secs();
+            let initial_updated_at = now_unix_secs.saturating_sub(30);
+            let future_reset_at = now_unix_secs + 3_600;
+            let allowed_models = vec![
+                "claude-sonnet-4-5".to_string(),
+                "claude-sonnet-4-5-thinking".to_string(),
+                "claude-sonnet-4-6".to_string(),
+            ];
+
+            for (index, key) in keys.iter_mut().enumerate() {
+                key.auth_type = "oauth".to_string();
+                key.api_formats = Some(json!(["gemini:generate_content"]));
+                key.allowed_models = Some(json!(allowed_models));
+                key.expires_at_unix_secs = Some(4_102_444_800);
+                key.internal_priority = if index == 0 { 0 } else { 10 };
+                let fraction = if index < 17 { 0.0 } else { 0.8 };
+                let (antigravity_metadata, status_snapshot) = build_antigravity_quota_state(
+                    fraction,
+                    initial_updated_at,
+                    future_reset_at,
+                    None,
+                );
+                key.upstream_metadata = Some(json!({ "antigravity": antigravity_metadata }));
+                key.status_snapshot = Some(status_snapshot);
+                assert!(!provider_pool_key_runtime_quota_blocked(key));
+            }
+
+            for (index, row) in rows.iter_mut().enumerate() {
+                row.provider_type = "antigravity".to_string();
+                row.endpoint_api_format = "gemini:generate_content".to_string();
+                row.endpoint_api_family = Some("gemini".to_string());
+                row.endpoint_kind = Some("generate_content".to_string());
+                row.key_auth_type = "oauth".to_string();
+                row.key_api_formats = Some(vec!["gemini:generate_content".to_string()]);
+                row.key_allowed_models = Some(allowed_models.clone());
+                row.key_internal_priority = if index == 0 { 0 } else { 10 };
+                row.routing_facts.provider_pool_enabled = true;
+                row.global_model_name = "claude-sonnet-4-5".to_string();
+                row.model_provider_model_name = "claude-sonnet-4-5".to_string();
+            }
+
+            let sibling_rows = rows
+                .iter()
+                .cloned()
+                .map(|mut row| {
+                    row.model_id = "model-sibling".to_string();
+                    row.global_model_id = "global-model-sibling".to_string();
+                    row.global_model_name = "claude-sonnet-4-6".to_string();
+                    row.model_provider_model_name = "claude-sonnet-4-6".to_string();
+                    row
+                })
+                .collect::<Vec<_>>();
+            let representative_rows =
+                GatewayDataState::with_minimal_candidate_selection_reader_for_tests(Arc::new(
+                    InMemoryMinimalCandidateSelectionReadRepository::seed(vec![rows[0].clone()]),
+                ));
+            let mut all_rows = rows;
+            all_rows.extend(sibling_rows);
+
+            let catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                vec![provider],
+                vec![endpoint],
+                keys,
+            ));
+            let catalog_reader: Arc<dyn ProviderCatalogReadRepository> = catalog_repository.clone();
+            let data_state = GatewayDataState::with_candidate_selection_provider_catalog_quota_and_request_candidates_for_tests(
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(all_rows)),
+                catalog_reader,
+                Arc::new(InMemoryProviderQuotaRepository::seed(Vec::new())),
+                Arc::new(InMemoryRequestCandidateRepository::seed(Vec::new())),
+            )
+            .attach_provider_catalog_repository_for_tests(catalog_repository)
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+            let app = AppState::new()
+                .expect("state should build")
+                .with_data_state_for_tests(data_state);
+
+            let (selected, skipped) = list_selectable_candidates_with_skip_reasons(
+                &representative_rows,
+                &app,
+                "gemini:generate_content",
+                "claude-sonnet-4-5",
+                false,
+                None,
+                None,
+                None,
+                CandidateSchedulingContext {
+                    now_unix_secs,
+                    load_balance_seed: 17,
+                },
+                false,
+                SchedulerOrderingConfig::default(),
+            )
+            .await
+            .expect("representative selection should succeed");
+            assert_eq!(selected.len(), 1);
+            assert!(skipped.is_empty());
+
+            let mut group = sample_eligible_candidate(
+                "provider-pool",
+                "endpoint-1",
+                "key-00000",
+                0,
+                provider_config,
+            );
+            group.kind = LocalExecutionCandidateKind::PoolGroup;
+            group.candidate = selected[0].clone();
+            group.provider_api_format = "gemini:generate_content".to_string();
+            let transport = Arc::make_mut(&mut group.transport);
+            transport.provider.provider_type = "antigravity".to_string();
+            transport.endpoint.api_format = "gemini:generate_content".to_string();
+            transport.endpoint.api_family = Some("gemini".to_string());
+            transport.endpoint.endpoint_kind = Some("generate_content".to_string());
+            transport.endpoint.base_url = "https://antigravity.googleapis.com".to_string();
+            transport.key.auth_type = "oauth".to_string();
+            transport.key.api_formats = Some(vec!["gemini:generate_content".to_string()]);
+
+            let mut sibling_group = group.clone();
+            sibling_group.candidate.model_id = "model-sibling".to_string();
+            sibling_group.candidate.global_model_id = "global-model-sibling".to_string();
+            sibling_group.candidate.global_model_name = "claude-sonnet-4-6".to_string();
+            sibling_group.candidate.selected_provider_model_name = "claude-sonnet-4-6".to_string();
+
+            let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+            assert_eq!(
+                pool_config.skip_exhausted_accounts,
+                !ignore_exhausted_accounts
+            );
+            record_admin_provider_pool_success(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                "key-00000",
+                &pool_config,
+                Some("session-antigravity-quota"),
+                0,
+                None,
+            )
+            .await;
+
+            for session in [None, Some("session-antigravity-quota")] {
+                let mut cursor = PoolKeyCursor::new(
+                    PlannerAppState::new(&app),
+                    group.clone(),
+                    session,
+                    Some("claude-sonnet-4-5"),
+                    None,
+                );
+                let candidate = cursor
+                    .next_key()
+                    .await
+                    .expect("available tail account should survive exhausted window");
+                assert_eq!(candidate.candidate.key_id, "key-00017");
+                assert_eq!(candidate.orchestration.pool_key_index, Some(0));
+                assert!(cursor.next_key().await.is_none());
+                let rejected = cursor.take_skipped_candidates();
+                assert_eq!(rejected.len(), 17);
+                assert!(rejected
+                    .iter()
+                    .all(|item| item.skip_reason == POOL_ACCOUNT_EXHAUSTED_SKIP_REASON));
+                assert!(rejected
+                    .iter()
+                    .all(|item| item.skip_reason != POOL_KEY_QUOTA_EXHAUSTED_SKIP_REASON));
+                assert!(rejected
+                    .iter()
+                    .any(|item| item.candidate.key_id == "key-00000"));
+
+                let mut sibling_cursor = PoolKeyCursor::new(
+                    PlannerAppState::new(&app),
+                    sibling_group.clone(),
+                    session,
+                    Some("claude-sonnet-4-6"),
+                    None,
+                );
+                let sibling_first = sibling_cursor
+                    .next_key()
+                    .await
+                    .expect("sibling model with remaining quota must stay schedulable");
+                assert_eq!(sibling_first.candidate.key_id, "key-00000");
+            }
+
+            refresh_antigravity_key_quota(
+                &app,
+                "key-00000",
+                0.5,
+                now_unix_secs.saturating_sub(20),
+                future_reset_at,
+            )
+            .await;
+
+            for session in [None, Some("session-antigravity-quota")] {
+                let mut cursor = PoolKeyCursor::new(
+                    PlannerAppState::new(&app),
+                    group.clone(),
+                    session,
+                    Some("claude-sonnet-4-5"),
+                    None,
+                );
+                let first = cursor
+                    .next_key()
+                    .await
+                    .expect("refreshed account should immediately recover");
+                assert_eq!(first.candidate.key_id, "key-00000");
+                assert_eq!(first.orchestration.pool_key_index, Some(0));
+                let second = cursor
+                    .next_key()
+                    .await
+                    .expect("remaining eligible account should follow");
+                assert_eq!(second.candidate.key_id, "key-00017");
+                assert_eq!(second.orchestration.pool_key_index, Some(1));
+                assert!(cursor.next_key().await.is_none());
+                let rejected = cursor.take_skipped_candidates();
+                assert_eq!(rejected.len(), 16);
+                assert!(rejected
+                    .iter()
+                    .all(|item| item.skip_reason == POOL_ACCOUNT_EXHAUSTED_SKIP_REASON));
+            }
+
+            refresh_antigravity_key_quota(
+                &app,
+                "key-00017",
+                0.0,
+                now_unix_secs.saturating_sub(10),
+                future_reset_at,
+            )
+            .await;
+            refresh_antigravity_key_quota(&app, "key-00000", 0.0, now_unix_secs, future_reset_at)
+                .await;
+
+            for session in [None, Some("session-antigravity-quota")] {
+                let mut cursor = PoolKeyCursor::new(
+                    PlannerAppState::new(&app),
+                    group.clone(),
+                    session,
+                    Some("claude-sonnet-4-5"),
+                    None,
+                );
+                assert!(cursor.next_key().await.is_none());
+                let rejected = cursor.take_skipped_candidates();
+                assert_eq!(rejected.len(), 18);
+                assert!(rejected
+                    .iter()
+                    .all(|item| item.skip_reason == POOL_ACCOUNT_EXHAUSTED_SKIP_REASON));
+                assert!(rejected
+                    .iter()
+                    .all(|item| item.skip_reason != POOL_KEY_QUOTA_EXHAUSTED_SKIP_REASON));
+
+                let mut sibling_cursor = PoolKeyCursor::new(
+                    PlannerAppState::new(&app),
+                    sibling_group.clone(),
+                    session,
+                    Some("claude-sonnet-4-6"),
+                    None,
+                );
+                let sibling_first = sibling_cursor
+                    .next_key()
+                    .await
+                    .expect("sibling model must remain available when target model is exhausted");
+                assert_eq!(sibling_first.candidate.key_id, "key-00000");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn pool_key_cursor_continues_after_exhausted_window() {
         let provider_config = Some(json!({
             "pool_advanced": {

@@ -46,6 +46,11 @@ impl ProviderPoolAdapter for AntigravityProviderPoolAdapter {
             })
     }
 
+    /// 可重置模型额度不可被历史忽略开关放行；刷新或 reset 后随同一判定自动恢复。
+    fn quota_hard_blocked(&self, input: &ProviderPoolMemberInput<'_>) -> bool {
+        self.quota_exhausted(input)
+    }
+
     fn quota_refresh_endpoint(
         &self,
         endpoints: &[StoredProviderCatalogEndpoint],

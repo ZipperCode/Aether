@@ -1631,7 +1631,10 @@ mod tests {
             service.member_signals("antigravity", &key, None, Some("gemini-3-flash-agent"));
 
         assert!(exhausted.quota_exhausted);
+        assert!(exhausted.quota_hard_blocked);
+        assert!(!exhausted.runtime_quota_hard_blocked);
         assert!(!available.quota_exhausted);
+        assert!(!available.quota_hard_blocked);
     }
 
     #[test]
@@ -1692,6 +1695,1101 @@ mod tests {
 
         assert!(!signals.quota_exhausted);
         assert!(!signals.quota_hard_blocked);
+    }
+
+    /// 验证同系列可用兄弟模型不会掩盖目标 Antigravity 模型的耗尽状态，且正反方向均成立。
+    #[test]
+    fn antigravity_sibling_model_does_not_mask_exhausted_target_model() {
+        let service = ProviderPoolService::with_builtin_adapters();
+        for (first_model, second_model) in [
+            ("claude-sonnet-4-5", "claude-sonnet-4-6"),
+            ("claude-sonnet-4-5", "claude-sonnet-4-5-thinking"),
+            ("gemini-3.7-pro-tiered", "gemini-3.7-flash-tiered"),
+        ] {
+            for (first_remaining, second_remaining) in [(0.0_f64, 0.8_f64), (0.8_f64, 0.0_f64)] {
+                let mut snapshot_key = sample_key(None);
+                snapshot_key.status_snapshot = Some(json!({
+                    "quota": {
+                        "version": 2,
+                        "provider_type": "antigravity",
+                        "exhausted": false,
+                        "windows": [
+                            {
+                                "code": format!("model:{first_model}"),
+                                "scope": "model",
+                                "model": first_model,
+                                "remaining_ratio": first_remaining,
+                                "used_ratio": 1.0 - first_remaining,
+                                "is_exhausted": first_remaining <= 0.0
+                            },
+                            {
+                                "code": format!("model:{second_model}"),
+                                "scope": "model",
+                                "model": second_model,
+                                "remaining_ratio": second_remaining,
+                                "used_ratio": 1.0 - second_remaining,
+                                "is_exhausted": second_remaining <= 0.0
+                            }
+                        ]
+                    }
+                }));
+                let first_signals =
+                    service.member_signals("antigravity", &snapshot_key, None, Some(first_model));
+                let second_signals =
+                    service.member_signals("antigravity", &snapshot_key, None, Some(second_model));
+                assert_eq!(first_signals.quota_exhausted, first_remaining <= 0.0);
+                assert_eq!(first_signals.quota_hard_blocked, first_remaining <= 0.0);
+                assert!(!first_signals.runtime_quota_hard_blocked);
+                assert_eq!(
+                    provider_pool_key_model_quota_hard_blocked(
+                        &snapshot_key,
+                        "antigravity",
+                        first_model
+                    ),
+                    first_remaining <= 0.0
+                );
+                assert_eq!(second_signals.quota_exhausted, second_remaining <= 0.0);
+                assert_eq!(second_signals.quota_hard_blocked, second_remaining <= 0.0);
+                assert!(!second_signals.runtime_quota_hard_blocked);
+                assert_eq!(
+                    provider_pool_key_model_quota_hard_blocked(
+                        &snapshot_key,
+                        "antigravity",
+                        second_model
+                    ),
+                    second_remaining <= 0.0
+                );
+
+                let metadata_key = sample_key(Some(json!({
+                    "antigravity": {
+                        "updated_at": 1_700_000_000_u64,
+                        "quota_by_model": {
+                            (first_model): {
+                                "remaining_fraction": first_remaining,
+                                "used_percent": (1.0 - first_remaining) * 100.0
+                            },
+                            (second_model): {
+                                "remaining_fraction": second_remaining,
+                                "used_percent": (1.0 - second_remaining) * 100.0
+                            }
+                        }
+                    }
+                })));
+                let first_meta =
+                    service.member_signals("antigravity", &metadata_key, None, Some(first_model));
+                let second_meta =
+                    service.member_signals("antigravity", &metadata_key, None, Some(second_model));
+                assert_eq!(first_meta.quota_exhausted, first_remaining <= 0.0);
+                assert_eq!(first_meta.quota_hard_blocked, first_remaining <= 0.0);
+                assert_eq!(
+                    provider_pool_key_model_quota_hard_blocked(
+                        &metadata_key,
+                        "antigravity",
+                        first_model
+                    ),
+                    first_remaining <= 0.0
+                );
+                assert_eq!(second_meta.quota_exhausted, second_remaining <= 0.0);
+                assert_eq!(second_meta.quota_hard_blocked, second_remaining <= 0.0);
+                assert_eq!(
+                    provider_pool_key_model_quota_hard_blocked(
+                        &metadata_key,
+                        "antigravity",
+                        second_model
+                    ),
+                    second_remaining <= 0.0
+                );
+            }
+        }
+
+        // Trimmed case-insensitive exact match succeeds; punctuation-stripped or substring forms do not.
+        let exact_key = sample_key(Some(json!({
+            "antigravity": {
+                "updated_at": 1_700_000_000_u64,
+                "quota_by_model": {
+                    "  Claude-Sonnet-4-5  ": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0
+                    }
+                }
+            }
+        })));
+        let exact_signals = service.member_signals(
+            "antigravity",
+            &exact_key,
+            None,
+            Some("  claude-sonnet-4-5 "),
+        );
+        assert!(exact_signals.quota_exhausted);
+        assert!(exact_signals.quota_hard_blocked);
+        for non_exact in ["claudesonnet45", "sonnet-4-5", "claude-sonnet"] {
+            assert_eq!(
+                provider_pool_key_model_quota_exhausted(&exact_key, "antigravity", non_exact),
+                None,
+                "non-exact identifier {non_exact} must not match"
+            );
+            let non_exact_signals =
+                service.member_signals("antigravity", &exact_key, None, Some(non_exact));
+            assert!(!non_exact_signals.quota_exhausted);
+            assert!(!non_exact_signals.quota_hard_blocked);
+        }
+
+        // Every explicit model alias supports both scalar strings and string arrays in exact mode.
+        for field in [
+            "model",
+            "model_name",
+            "model_id",
+            "quota_model",
+            "quota_model_name",
+            "target_model",
+            "limit_name",
+            "models",
+            "model_ids",
+        ] {
+            for field_value in [
+                json!(" Claude-Sonnet-4-5 "),
+                json!(["other-model", " Claude-Sonnet-4-5 "]),
+            ] {
+                let mut window = serde_json::Map::new();
+                window.insert("code".to_string(), json!("custom_window"));
+                window.insert("scope".to_string(), json!("model"));
+                window.insert(field.to_string(), field_value);
+                window.insert("used_ratio".to_string(), json!(1.0));
+                window.insert("is_exhausted".to_string(), json!(true));
+
+                let mut alias_key = sample_key(None);
+                alias_key.status_snapshot = Some(json!({
+                    "quota": {
+                        "version": 2,
+                        "provider_type": "antigravity",
+                        "exhausted": false,
+                        "windows": [Value::Object(window)]
+                    }
+                }));
+                assert_eq!(
+                    provider_pool_key_model_quota_exhausted(
+                        &alias_key,
+                        "antigravity",
+                        "claude-sonnet-4-5"
+                    ),
+                    Some(true),
+                    "field={field}"
+                );
+                assert_eq!(
+                    provider_pool_key_model_quota_exhausted(
+                        &alias_key,
+                        "antigravity",
+                        "claude-sonnet-4-6"
+                    ),
+                    None,
+                    "field={field}"
+                );
+                assert!(
+                    provider_pool_key_model_quota_hard_blocked(
+                        &alias_key,
+                        "antigravity",
+                        "claude-sonnet-4-5"
+                    ),
+                    "field={field}"
+                );
+                assert!(
+                    !provider_pool_key_model_quota_hard_blocked(
+                        &alias_key,
+                        "antigravity",
+                        "claude-sonnet-4-6"
+                    ),
+                    "field={field}"
+                );
+            }
+        }
+
+        // Multiple exact windows for the same model preserve existing `all` semantics.
+        let mut multi_window_key = sample_key(None);
+        multi_window_key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "antigravity",
+                "exhausted": false,
+                "windows": [
+                    {
+                        "code": "short",
+                        "scope": "model",
+                        "model": "claude-sonnet-4-5",
+                        "used_ratio": 1.0,
+                        "is_exhausted": true
+                    },
+                    {
+                        "code": "weekly",
+                        "scope": "model",
+                        "model": "claude-sonnet-4-5",
+                        "used_ratio": 0.4,
+                        "is_exhausted": false
+                    }
+                ]
+            }
+        }));
+        let partial_signals = service.member_signals(
+            "antigravity",
+            &multi_window_key,
+            None,
+            Some("claude-sonnet-4-5"),
+        );
+        assert!(!partial_signals.quota_exhausted);
+        assert!(!partial_signals.quota_hard_blocked);
+        multi_window_key.status_snapshot.as_mut().unwrap()["quota"]["windows"][1]["used_ratio"] =
+            json!(1.0);
+        multi_window_key.status_snapshot.as_mut().unwrap()["quota"]["windows"][1]["is_exhausted"] =
+            json!(true);
+        let all_exhausted_signals = service.member_signals(
+            "antigravity",
+            &multi_window_key,
+            None,
+            Some("claude-sonnet-4-5"),
+        );
+        assert!(all_exhausted_signals.quota_exhausted);
+        assert!(all_exhausted_signals.quota_hard_blocked);
+    }
+
+    /// 验证同一精确模型同时存在已知 0 额度（未来 reset）与未知/格式错误窗口时保持 `all`/fail-open 放行，而全未知窗口保持 `None`。
+    #[test]
+    fn antigravity_known_exhausted_plus_unknown_exact_window_preserves_fail_open_all_semantics() {
+        let service = ProviderPoolService::with_builtin_adapters();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
+        let future_unix = now.saturating_add(3600);
+        let future_rfc3339 = chrono::DateTime::<chrono::Utc>::from_timestamp(future_unix as i64, 0)
+            .expect("future unix timestamp should be valid")
+            .to_rfc3339();
+
+        let known_snapshot_window = json!({
+            "code": "model:claude-sonnet-4-5:short",
+            "scope": "model",
+            "model": "claude-sonnet-4-5",
+            "remaining_ratio": 0.0,
+            "used_ratio": 1.0,
+            "reset_at": future_unix,
+            "is_exhausted": true
+        });
+        let known_raw_entry = json!({
+            "remaining_fraction": 0.0,
+            "used_percent": 100.0,
+            "reset_time": future_rfc3339.as_str()
+        });
+        let known_raw_window = json!({
+            "code": "extra:claude-sonnet-4-5",
+            "scope": "model",
+            "model": "claude-sonnet-4-5",
+            "remaining_fraction": 0.0,
+            "used_percent": 100.0,
+            "reset_time": future_rfc3339.as_str()
+        });
+
+        let unknown_payload_shapes = [
+            ("empty", json!({})),
+            (
+                "display_and_reset_only",
+                json!({
+                    "display_name": "Claude Sonnet 4.5",
+                    "reset_time": future_rfc3339
+                }),
+            ),
+            (
+                "malformed_bool_and_ratios",
+                json!({
+                    "is_exhausted": "maybe",
+                    "exhausted": "unknown",
+                    "used_ratio": "not-a-number",
+                    "usage_ratio": "bad",
+                    "used_percent": "NaN",
+                    "remaining_ratio": "bad",
+                    "remaining_fraction": "not-a-number",
+                    "remaining_percent": "bad"
+                }),
+            ),
+            ("missing_limit", json!({ "remaining": 0.0 })),
+            ("missing_total", json!({ "remaining_value": 0.0 })),
+            ("zero_limit", json!({ "remaining": 0.0, "limit": 0.0 })),
+            (
+                "negative_total",
+                json!({ "remaining_value": 0.0, "total": -10.0 }),
+            ),
+        ];
+
+        let assert_fail_open = |key: &StoredProviderCatalogKey, context: &str| {
+            assert_eq!(
+                provider_pool_key_model_quota_exhausted(key, "antigravity", "claude-sonnet-4-5"),
+                Some(false),
+                "{context}"
+            );
+            let signals =
+                service.member_signals("antigravity", key, None, Some("claude-sonnet-4-5"));
+            assert!(!signals.quota_exhausted, "{context}");
+            assert!(!signals.quota_hard_blocked, "{context}");
+            assert!(
+                !provider_pool_key_model_quota_hard_blocked(
+                    key,
+                    "antigravity",
+                    "claude-sonnet-4-5"
+                ),
+                "{context}"
+            );
+        };
+
+        for (shape_name, unknown_payload) in &unknown_payload_shapes {
+            let mut unknown_window_map = unknown_payload
+                .as_object()
+                .expect("unknown payload should be object")
+                .clone();
+            unknown_window_map.insert("code".to_string(), json!("model:claude-sonnet-4-5:weekly"));
+            unknown_window_map.insert("scope".to_string(), json!("model"));
+            unknown_window_map.insert("model".to_string(), json!("claude-sonnet-4-5"));
+            let unknown_window = Value::Object(unknown_window_map);
+
+            // Materialized snapshot `windows` in both orders.
+            for (order_label, windows) in [
+                (
+                    "known_then_unknown",
+                    json!([known_snapshot_window.clone(), unknown_window.clone()]),
+                ),
+                (
+                    "unknown_then_known",
+                    json!([unknown_window.clone(), known_snapshot_window.clone()]),
+                ),
+            ] {
+                let mut snapshot_key = sample_key(None);
+                snapshot_key.status_snapshot = Some(json!({
+                    "quota": {
+                        "version": 2,
+                        "provider_type": "antigravity",
+                        "observed_at": now,
+                        "exhausted": false,
+                        "windows": windows
+                    }
+                }));
+                assert_fail_open(
+                    &snapshot_key,
+                    &format!("snapshot windows shape={shape_name} order={order_label}"),
+                );
+            }
+
+            // Raw metadata: known `quota_by_model` + unknown `windows` or `additional_quota_windows`.
+            for array_field in ["windows", "additional_quota_windows"] {
+                let raw_key = sample_key(Some(json!({
+                    "antigravity": {
+                        "updated_at": now,
+                        "quota_by_model": {
+                            "claude-sonnet-4-5": known_raw_entry.clone()
+                        },
+                        (array_field): [unknown_window.clone()]
+                    }
+                })));
+                assert_fail_open(
+                    &raw_key,
+                    &format!("raw quota_by_model + {array_field} shape={shape_name}"),
+                );
+            }
+
+            // Raw metadata: unknown `quota_by_model` + known `additional_quota_windows`.
+            let reverse_raw_key = sample_key(Some(json!({
+                "antigravity": {
+                    "updated_at": now,
+                    "quota_by_model": {
+                        "claude-sonnet-4-5": unknown_payload.clone()
+                    },
+                    "additional_quota_windows": [known_raw_window.clone()]
+                }
+            })));
+            assert_fail_open(
+                &reverse_raw_key,
+                &format!("raw unknown quota_by_model + known additional shape={shape_name}"),
+            );
+
+            // Raw metadata: case/whitespace-distinct exact keys in `quota_by_model`.
+            let case_variant_key = sample_key(Some(json!({
+                "antigravity": {
+                    "updated_at": now,
+                    "quota_by_model": {
+                        "claude-sonnet-4-5": known_raw_entry.clone(),
+                        " Claude-Sonnet-4-5 ": unknown_payload.clone()
+                    }
+                }
+            })));
+            assert_fail_open(
+                &case_variant_key,
+                &format!("raw case-variant quota_by_model shape={shape_name}"),
+            );
+
+            // Legacy `models` map + unknown `additional_quota_windows`.
+            let legacy_raw_key = sample_key(Some(json!({
+                "antigravity": {
+                    "updated_at": now,
+                    "models": {
+                        "claude-sonnet-4-5": known_raw_entry.clone()
+                    },
+                    "additional_quota_windows": [unknown_window.clone()]
+                }
+            })));
+            assert_fail_open(
+                &legacy_raw_key,
+                &format!("legacy models + unknown additional shape={shape_name}"),
+            );
+
+            // All-unknown multi-window combinations must retain `None` rather than inventing `Some(false)`.
+            let mut all_unknown_snapshot = sample_key(None);
+            all_unknown_snapshot.status_snapshot = Some(json!({
+                "quota": {
+                    "version": 2,
+                    "provider_type": "antigravity",
+                    "observed_at": now,
+                    "exhausted": false,
+                    "windows": [
+                        unknown_window.clone(),
+                        {
+                            "code": "account",
+                            "scope": "account"
+                        }
+                    ],
+                    "quota_by_model": {
+                        "claude-sonnet-4-5": unknown_payload.clone()
+                    }
+                }
+            }));
+            assert_eq!(
+                provider_pool_key_model_quota_exhausted(
+                    &all_unknown_snapshot,
+                    "antigravity",
+                    "claude-sonnet-4-5"
+                ),
+                None,
+                "all-unknown snapshot shape={shape_name}"
+            );
+            let all_unknown_signals = service.member_signals(
+                "antigravity",
+                &all_unknown_snapshot,
+                None,
+                Some("claude-sonnet-4-5"),
+            );
+            assert!(
+                !all_unknown_signals.quota_exhausted,
+                "all-unknown snapshot shape={shape_name}"
+            );
+            assert!(
+                !all_unknown_signals.quota_hard_blocked,
+                "all-unknown snapshot shape={shape_name}"
+            );
+        }
+
+        // Unknown explicit-alias windows (scalar and array) paired with a known exhausted window also fail open.
+        for field in [
+            "model",
+            "model_name",
+            "model_id",
+            "quota_model",
+            "quota_model_name",
+            "target_model",
+            "limit_name",
+            "models",
+            "model_ids",
+        ] {
+            for field_value in [
+                json!(" Claude-Sonnet-4-5 "),
+                json!(["other-model", " Claude-Sonnet-4-5 "]),
+            ] {
+                let mut alias_unknown = serde_json::Map::new();
+                alias_unknown.insert("code".to_string(), json!("alias_unknown"));
+                alias_unknown.insert("scope".to_string(), json!("model"));
+                alias_unknown.insert(field.to_string(), field_value);
+
+                let mut alias_key = sample_key(None);
+                alias_key.status_snapshot = Some(json!({
+                    "quota": {
+                        "version": 2,
+                        "provider_type": "antigravity",
+                        "observed_at": now,
+                        "exhausted": false,
+                        "windows": [
+                            known_snapshot_window.clone(),
+                            Value::Object(alias_unknown)
+                        ]
+                    }
+                }));
+                assert_fail_open(&alias_key, &format!("alias unknown field={field}"));
+            }
+        }
+    }
+
+    /// 验证缺失、空模型名、无效观测保持未知放行，且展示分组不会反向推断模型或账号耗尽。
+    #[test]
+    fn antigravity_missing_malformed_and_group_windows_do_not_guess_or_block_models() {
+        let service = ProviderPoolService::with_builtin_adapters();
+        let mut key = sample_key(Some(json!({
+            "antigravity": {
+                "updated_at": 1_700_000_000_u64,
+                "quota_by_model": {
+                    "gemini-3-flash": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0
+                    },
+                    "empty-entry": {},
+                    "display-only": {
+                        "display_name": "Display Only Model"
+                    },
+                    "malformed-fraction": {
+                        "remaining_fraction": "not-a-number"
+                    },
+                    "missing-limit": {
+                        "remaining": 0.0
+                    },
+                    "zero-limit": {
+                        "remaining": 0.0,
+                        "limit": 0.0
+                    }
+                }
+            }
+        })));
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "antigravity",
+                "observed_at": 1_700_000_000_u64,
+                "updated_at": 1_700_000_000_u64,
+                "exhausted": true,
+                "windows": [
+                    {
+                        "code": "model:gemini-3-flash",
+                        "scope": "model",
+                        "model": "gemini-3-flash",
+                        "used_ratio": 1.0,
+                        "is_exhausted": true
+                    },
+                    {
+                        "code": "group:0:3p-5h",
+                        "scope": "quota_group",
+                        "quota_group": "claude",
+                        "quota_group_label": "Claude and GPT models",
+                        "bucket_id": "3p-5h",
+                        "used_ratio": 1.0,
+                        "is_exhausted": true
+                    }
+                ]
+            }
+        }));
+
+        let flash_signals =
+            service.member_signals("antigravity", &key, None, Some("gemini-3-flash"));
+        assert!(flash_signals.quota_exhausted);
+        assert!(flash_signals.quota_hard_blocked);
+        for unknown_model in [
+            "",
+            "   ",
+            "claude-sonnet-4-5",
+            "empty-entry",
+            "display-only",
+            "malformed-fraction",
+            "missing-limit",
+            "zero-limit",
+        ] {
+            assert_eq!(
+                provider_pool_key_model_quota_exhausted(&key, "antigravity", unknown_model),
+                None,
+                "model={unknown_model:?}"
+            );
+            let unknown_signals =
+                service.member_signals("antigravity", &key, None, Some(unknown_model));
+            assert!(!unknown_signals.quota_exhausted, "model={unknown_model:?}");
+            assert!(
+                !unknown_signals.quota_hard_blocked,
+                "model={unknown_model:?}"
+            );
+        }
+        assert!(!provider_pool_key_account_quota_exhausted(
+            &key,
+            "antigravity"
+        ));
+        assert!(!provider_pool_key_quota_hard_blocked(&key, "antigravity"));
+
+        // Explicit structural account windows and windowless account snapshots still apply.
+        let mut generic_account_key = sample_key(None);
+        generic_account_key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "antigravity",
+                "exhausted": true,
+                "windows": [{
+                    "code": "account",
+                    "scope": "account",
+                    "used_ratio": 1.0,
+                    "is_exhausted": true
+                }]
+            }
+        }));
+        let generic_signals = service.member_signals(
+            "antigravity",
+            &generic_account_key,
+            None,
+            Some("unlisted-model"),
+        );
+        assert!(generic_signals.quota_exhausted);
+        assert!(generic_signals.quota_hard_blocked);
+        assert!(provider_pool_key_account_quota_exhausted(
+            &generic_account_key,
+            "antigravity"
+        ));
+        assert!(provider_pool_key_quota_hard_blocked(
+            &generic_account_key,
+            "antigravity"
+        ));
+
+        let mut snapshot_fallback_key = sample_key(None);
+        snapshot_fallback_key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "antigravity",
+                "exhausted": true
+            }
+        }));
+        let fallback_signals = service.member_signals(
+            "antigravity",
+            &snapshot_fallback_key,
+            None,
+            Some("unlisted-model"),
+        );
+        assert!(fallback_signals.quota_exhausted);
+        assert!(fallback_signals.quota_hard_blocked);
+    }
+
+    /// 验证权威 `quota_by_model`（含空对象）优先于历史 `models`/`model_quotas`，同时保留仅含历史字段的兼容读取。
+    #[test]
+    fn antigravity_authoritative_quota_by_model_precedes_legacy_maps_without_resurrection() {
+        let service = ProviderPoolService::with_builtin_adapters();
+        let conflicting = sample_key(Some(json!({
+            "antigravity": {
+                "updated_at": 1_700_000_000_u64,
+                "quota_by_model": {
+                    "claude-sonnet-4-5": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0
+                    },
+                    "claude-sonnet-4-6": {
+                        "remaining_fraction": 0.8,
+                        "used_percent": 20.0
+                    }
+                },
+                "models": {
+                    "claude-sonnet-4-5": {
+                        "remaining_fraction": 0.9,
+                        "used_percent": 10.0
+                    },
+                    "claude-sonnet-4-6": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0
+                    },
+                    "legacy-only-model": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0
+                    }
+                },
+                "model_quotas": {
+                    "claude-sonnet-4-6": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0
+                    }
+                },
+                "additional_quota_windows": [{
+                    "code": "extra:gemini-2.5-pro",
+                    "scope": "model",
+                    "model": "gemini-2.5-pro",
+                    "used_ratio": 1.0,
+                    "is_exhausted": true
+                }]
+            }
+        })));
+        let conflicting_target =
+            service.member_signals("antigravity", &conflicting, None, Some("claude-sonnet-4-5"));
+        assert!(conflicting_target.quota_exhausted);
+        assert!(conflicting_target.quota_hard_blocked);
+        let conflicting_available =
+            service.member_signals("antigravity", &conflicting, None, Some("claude-sonnet-4-6"));
+        assert!(!conflicting_available.quota_exhausted);
+        assert!(!conflicting_available.quota_hard_blocked);
+        assert_eq!(
+            provider_pool_key_model_quota_exhausted(
+                &conflicting,
+                "antigravity",
+                "legacy-only-model"
+            ),
+            None
+        );
+        let conflicting_legacy =
+            service.member_signals("antigravity", &conflicting, None, Some("legacy-only-model"));
+        assert!(!conflicting_legacy.quota_exhausted);
+        assert!(!conflicting_legacy.quota_hard_blocked);
+        let conflicting_extra =
+            service.member_signals("antigravity", &conflicting, None, Some("gemini-2.5-pro"));
+        assert!(conflicting_extra.quota_exhausted);
+        assert!(conflicting_extra.quota_hard_blocked);
+
+        // An empty authoritative `quota_by_model` object must not resurrect legacy maps.
+        let mut empty_authoritative = sample_key(Some(json!({
+            "antigravity": {
+                "updated_at": 1_700_000_000_u64,
+                "quota_by_model": {},
+                "models": {
+                    "claude-sonnet-4-5": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0
+                    }
+                },
+                "model_quotas": {
+                    "claude-sonnet-4-5": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0
+                    }
+                }
+            }
+        })));
+        empty_authoritative.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "antigravity",
+                "observed_at": 1_700_000_000_u64,
+                "exhausted": false,
+                "quota_by_model": {},
+                "models": {
+                    "claude-sonnet-4-5": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0
+                    }
+                }
+            }
+        }));
+        assert_eq!(
+            provider_pool_key_model_quota_exhausted(
+                &empty_authoritative,
+                "antigravity",
+                "claude-sonnet-4-5"
+            ),
+            None
+        );
+        let empty_signals = service.member_signals(
+            "antigravity",
+            &empty_authoritative,
+            None,
+            Some("claude-sonnet-4-5"),
+        );
+        assert!(!empty_signals.quota_exhausted);
+        assert!(!empty_signals.quota_hard_blocked);
+
+        // Legacy `models`-only input (or non-object `quota_by_model`) remains supported.
+        let legacy_models_only = sample_key(Some(json!({
+            "antigravity": {
+                "updated_at": 1_700_000_000_u64,
+                "quota_by_model": Value::Null,
+                "models": {
+                    "claude-sonnet-4-5": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0
+                    },
+                    "claude-sonnet-4-6": {
+                        "remaining_fraction": 0.8,
+                        "used_percent": 20.0
+                    }
+                }
+            }
+        })));
+        let legacy_exhausted = service.member_signals(
+            "antigravity",
+            &legacy_models_only,
+            None,
+            Some("claude-sonnet-4-5"),
+        );
+        assert!(legacy_exhausted.quota_exhausted);
+        assert!(legacy_exhausted.quota_hard_blocked);
+        let legacy_available = service.member_signals(
+            "antigravity",
+            &legacy_models_only,
+            None,
+            Some("claude-sonnet-4-6"),
+        );
+        assert!(!legacy_available.quota_exhausted);
+        assert!(!legacy_available.quota_hard_blocked);
+
+        // Non-Antigravity providers retain merged legacy model maps.
+        let mut non_antigravity = sample_key(None);
+        non_antigravity.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "grok",
+                "exhausted": false,
+                "quota_by_model": {
+                    "vendor-alpha": { "remaining": 5.0, "total": 10.0 }
+                },
+                "models": {
+                    "vendor-beta": { "remaining": 0.0, "total": 10.0 }
+                }
+            }
+        }));
+        assert!(
+            !service
+                .member_signals("grok", &non_antigravity, None, Some("vendor-alpha"))
+                .quota_exhausted
+        );
+        assert!(
+            service
+                .member_signals("grok", &non_antigravity, None, Some("vendor-beta"))
+                .quota_exhausted
+        );
+    }
+
+    /// 验证 `reset_time`/`next_reset_time`（Unix 与 RFC3339）、快照与原始元数据同时间戳一致性、非法重置时间保留耗尽及新观测恢复/阻断切换。
+    #[test]
+    fn antigravity_reset_aliases_timestamps_and_freshness_transitions_match_materialized_state() {
+        let service = ProviderPoolService::with_builtin_adapters();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
+        let past_unix = now.saturating_sub(3600);
+        let future_unix = now.saturating_add(3600);
+        let observed_unix = now.saturating_sub(7200);
+        let past_rfc3339 = chrono::DateTime::<chrono::Utc>::from_timestamp(past_unix as i64, 0)
+            .expect("past unix timestamp should be valid")
+            .to_rfc3339();
+        let future_rfc3339 = chrono::DateTime::<chrono::Utc>::from_timestamp(future_unix as i64, 0)
+            .expect("future unix timestamp should be valid")
+            .to_rfc3339();
+
+        for alias in ["reset_time", "next_reset_time"] {
+            for (deadline_value, expected_exhausted, materialized_reset_at) in [
+                (json!(future_unix), true, future_unix),
+                (json!(future_unix.to_string()), true, future_unix),
+                (json!(future_rfc3339.clone()), true, future_unix),
+                (json!(past_unix), false, past_unix),
+                (json!(past_unix.to_string()), false, past_unix),
+                (json!(past_rfc3339.clone()), false, past_unix),
+            ] {
+                let raw_only = sample_key(Some(json!({
+                    "antigravity": {
+                        "updated_at": observed_unix,
+                        "quota_by_model": {
+                            "claude-sonnet-4-5": {
+                                "remaining_fraction": 0.0,
+                                "used_percent": 100.0,
+                                (alias): deadline_value.clone()
+                            }
+                        }
+                    }
+                })));
+                let raw_signals = service.member_signals(
+                    "antigravity",
+                    &raw_only,
+                    None,
+                    Some("claude-sonnet-4-5"),
+                );
+                assert_eq!(
+                    raw_signals.quota_exhausted, expected_exhausted,
+                    "raw alias={alias}, deadline={deadline_value}"
+                );
+                assert_eq!(
+                    raw_signals.quota_hard_blocked, expected_exhausted,
+                    "raw alias={alias}, deadline={deadline_value}"
+                );
+                assert_eq!(
+                    provider_pool_key_model_quota_hard_blocked(
+                        &raw_only,
+                        "antigravity",
+                        "claude-sonnet-4-5"
+                    ),
+                    expected_exhausted,
+                    "raw alias={alias}, deadline={deadline_value}"
+                );
+
+                // Materialized snapshot and raw metadata at the exact same timestamp must agree.
+                let mut synced = raw_only.clone();
+                synced.status_snapshot = Some(json!({
+                    "quota": {
+                        "version": 2,
+                        "provider_type": "antigravity",
+                        "observed_at": observed_unix,
+                        "updated_at": observed_unix,
+                        "exhausted": true,
+                        "windows": [{
+                            "code": "model:claude-sonnet-4-5",
+                            "scope": "model",
+                            "model": "claude-sonnet-4-5",
+                            "remaining_ratio": 0.0,
+                            "used_ratio": 1.0,
+                            "reset_at": materialized_reset_at,
+                            "is_exhausted": true
+                        }]
+                    }
+                }));
+                let synced_signals =
+                    service.member_signals("antigravity", &synced, None, Some("claude-sonnet-4-5"));
+                assert_eq!(
+                    synced_signals.quota_exhausted, expected_exhausted,
+                    "synced alias={alias}, deadline={deadline_value}"
+                );
+                assert_eq!(
+                    synced_signals.quota_hard_blocked, expected_exhausted,
+                    "synced alias={alias}, deadline={deadline_value}"
+                );
+                assert_eq!(
+                    provider_pool_key_model_quota_hard_blocked(
+                        &synced,
+                        "antigravity",
+                        "claude-sonnet-4-5"
+                    ),
+                    expected_exhausted,
+                    "synced alias={alias}, deadline={deadline_value}"
+                );
+            }
+        }
+
+        // Invalid earlier reset aliases fall through to valid later fields without fabricating defaults.
+        let fallthrough_past = sample_key(Some(json!({
+            "antigravity": {
+                "updated_at": observed_unix,
+                "quota_by_model": {
+                    "claude-sonnet-4-5": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0,
+                        "reset_at": "invalid-timestamp",
+                        "next_reset_at": 0,
+                        "reset_time": "",
+                        "next_reset_time": past_rfc3339
+                    }
+                }
+            }
+        })));
+        let fallthrough_past_signals = service.member_signals(
+            "antigravity",
+            &fallthrough_past,
+            None,
+            Some("claude-sonnet-4-5"),
+        );
+        assert!(!fallthrough_past_signals.quota_exhausted);
+        assert!(!fallthrough_past_signals.quota_hard_blocked);
+
+        let fallthrough_relative = sample_key(Some(json!({
+            "antigravity": {
+                "updated_at": observed_unix,
+                "quota_by_model": {
+                    "claude-sonnet-4-5": {
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0,
+                        "reset_time": "not-rfc3339",
+                        "next_reset_time": -10,
+                        "reset_seconds": -5,
+                        "reset_after_seconds": 60
+                    }
+                }
+            }
+        })));
+        let fallthrough_relative_signals = service.member_signals(
+            "antigravity",
+            &fallthrough_relative,
+            None,
+            Some("claude-sonnet-4-5"),
+        );
+        assert!(!fallthrough_relative_signals.quota_exhausted);
+        assert!(!fallthrough_relative_signals.quota_hard_blocked);
+
+        // Malformed reset deadlines with zero remaining quota retain exhaustion.
+        for invalid_reset in [
+            json!("not-a-timestamp"),
+            json!(""),
+            json!(0),
+            json!(-3600),
+            json!({}),
+            Value::Null,
+        ] {
+            let malformed_key = sample_key(Some(json!({
+                "antigravity": {
+                    "updated_at": now,
+                    "quota_by_model": {
+                        "claude-sonnet-4-5": {
+                            "remaining_fraction": 0.0,
+                            "used_percent": 100.0,
+                            "reset_time": invalid_reset.clone(),
+                            "next_reset_time": invalid_reset.clone()
+                        }
+                    }
+                }
+            })));
+            let malformed_signals = service.member_signals(
+                "antigravity",
+                &malformed_key,
+                None,
+                Some("claude-sonnet-4-5"),
+            );
+            assert!(
+                malformed_signals.quota_exhausted,
+                "invalid_reset={invalid_reset}"
+            );
+            assert!(
+                malformed_signals.quota_hard_blocked,
+                "invalid_reset={invalid_reset}"
+            );
+        }
+
+        // Latest valid observation transitions: 0 -> 0.5 recovers, and 0.5 -> 0 blocks.
+        for (older_remaining, newer_remaining, expected_exhausted) in
+            [(0.0_f64, 0.5_f64, false), (0.5_f64, 0.0_f64, true)]
+        {
+            let mut key = sample_key(Some(json!({
+                "antigravity": {
+                    "updated_at": now,
+                    "quota_by_model": {
+                        "claude-sonnet-4-5": {
+                            "remaining_fraction": newer_remaining,
+                            "used_percent": (1.0 - newer_remaining) * 100.0,
+                            "reset_time": future_rfc3339.clone()
+                        }
+                    }
+                }
+            })));
+            key.status_snapshot = Some(json!({
+                "quota": {
+                    "version": 2,
+                    "provider_type": "antigravity",
+                    "observed_at": now.saturating_sub(60),
+                    "updated_at": now.saturating_sub(60),
+                    "exhausted": older_remaining <= 0.0,
+                    "windows": [{
+                        "code": "model:claude-sonnet-4-5",
+                        "scope": "model",
+                        "model": "claude-sonnet-4-5",
+                        "remaining_ratio": older_remaining,
+                        "used_ratio": 1.0 - older_remaining,
+                        "reset_at": future_unix,
+                        "is_exhausted": older_remaining <= 0.0
+                    }]
+                }
+            }));
+            let transition_signals =
+                service.member_signals("antigravity", &key, None, Some("claude-sonnet-4-5"));
+            assert_eq!(
+                transition_signals.quota_exhausted, expected_exhausted,
+                "transition {older_remaining} -> {newer_remaining}"
+            );
+            assert_eq!(
+                transition_signals.quota_hard_blocked, expected_exhausted,
+                "transition {older_remaining} -> {newer_remaining}"
+            );
+            assert!(!transition_signals.runtime_quota_hard_blocked);
+            assert_eq!(
+                provider_pool_key_model_quota_hard_blocked(
+                    &key,
+                    "antigravity",
+                    "claude-sonnet-4-5"
+                ),
+                expected_exhausted,
+                "transition {older_remaining} -> {newer_remaining}"
+            );
+        }
     }
 
     /// 验证 Codex 标准与 Spark 模型族只消费各自匹配的额度窗口。

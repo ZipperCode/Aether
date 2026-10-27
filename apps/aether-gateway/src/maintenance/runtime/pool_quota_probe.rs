@@ -3279,4 +3279,273 @@ mod tests {
             Some(1_700_000_000)
         );
     }
+
+    #[tokio::test]
+    async fn antigravity_exhausted_keys_remain_eligible_for_quota_probe_while_manual_ban_is_excluded(
+    ) {
+        use crate::handlers::shared::sync_provider_key_quota_status_snapshot;
+        use aether_admin::provider::quota::parse_antigravity_usage_response;
+        use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
+        use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+        use aether_provider_pool::{
+            provider_pool_key_model_quota_exhausted, provider_pool_key_model_quota_hard_blocked,
+        };
+
+        fn antigravity_key(
+            id: &str,
+            sonnet_45_fraction: f64,
+            sonnet_46_fraction: f64,
+            updated_at_unix_secs: u64,
+            reset_at_unix_secs: u64,
+        ) -> StoredProviderCatalogKey {
+            let antigravity_metadata = parse_antigravity_usage_response(
+                &json!({
+                    "models": {
+                        "claude-sonnet-4-5": {
+                            "displayName": "Claude Sonnet 4.5",
+                            "quotaInfo": {
+                                "remainingFraction": sonnet_45_fraction,
+                                "resetTime": reset_at_unix_secs
+                            }
+                        },
+                        "claude-sonnet-4-6": {
+                            "displayName": "Claude Sonnet 4.6",
+                            "quotaInfo": {
+                                "remainingFraction": sonnet_46_fraction,
+                                "resetTime": reset_at_unix_secs
+                            }
+                        }
+                    }
+                }),
+                updated_at_unix_secs,
+            )
+            .expect("antigravity usage response should parse");
+            let upstream_metadata = json!({ "antigravity": antigravity_metadata });
+            let status_snapshot = sync_provider_key_quota_status_snapshot(
+                None,
+                "antigravity",
+                Some(&upstream_metadata),
+                "refresh_api",
+            )
+            .expect("antigravity status snapshot should materialize");
+            let mut built = key(id, "provider-1", Some(upstream_metadata));
+            built.status_snapshot = Some(status_snapshot);
+            built
+        }
+
+        assert!(provider_supports_quota_probe("antigravity"));
+        let now_ts = crate::clock::current_unix_secs();
+        let stale_updated_at = now_ts.saturating_sub(1_200);
+        let future_reset_at = now_ts + 3_600;
+
+        let key_model_exhausted = antigravity_key(
+            "key-model-exhausted",
+            0.0,
+            0.8,
+            stale_updated_at,
+            future_reset_at,
+        );
+        assert_eq!(
+            provider_pool_key_model_quota_exhausted(
+                &key_model_exhausted,
+                "antigravity",
+                "claude-sonnet-4-5",
+            ),
+            Some(true)
+        );
+        assert!(provider_pool_key_model_quota_hard_blocked(
+            &key_model_exhausted,
+            "antigravity",
+            "claude-sonnet-4-5",
+        ));
+        assert!(!provider_pool_key_model_quota_hard_blocked(
+            &key_model_exhausted,
+            "antigravity",
+            "claude-sonnet-4-6",
+        ));
+        assert!(!provider_pool_key_runtime_quota_blocked(
+            &key_model_exhausted
+        ));
+
+        let key_all_exhausted = antigravity_key(
+            "key-all-exhausted",
+            0.0,
+            0.0,
+            stale_updated_at,
+            future_reset_at,
+        );
+        for model in ["claude-sonnet-4-5", "claude-sonnet-4-6"] {
+            assert_eq!(
+                provider_pool_key_model_quota_exhausted(&key_all_exhausted, "antigravity", model),
+                Some(true)
+            );
+            assert!(provider_pool_key_model_quota_hard_blocked(
+                &key_all_exhausted,
+                "antigravity",
+                model,
+            ));
+        }
+        assert!(!provider_pool_key_runtime_quota_blocked(&key_all_exhausted));
+
+        let mut key_manual_ban = antigravity_key(
+            "key-manual-ban",
+            0.8,
+            0.8,
+            stale_updated_at,
+            future_reset_at,
+        );
+        key_manual_ban
+            .status_snapshot
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("status snapshot should be an object")
+            .insert(
+                "scheduling".to_string(),
+                json!({
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "requires_manual_recovery": true
+                }),
+            );
+        assert!(provider_pool_key_runtime_quota_blocked(&key_manual_ban));
+
+        let stale_selected = select_pool_quota_probe_key_ids(
+            &[key_model_exhausted.clone(), key_all_exhausted.clone()],
+            "antigravity",
+            now_ts,
+            600,
+            &BTreeMap::new(),
+            10,
+        );
+        assert_eq!(
+            stale_selected,
+            vec![
+                "key-all-exhausted".to_string(),
+                "key-model-exhausted".to_string(),
+            ]
+        );
+
+        let mut provider = StoredProviderCatalogProvider::new(
+            "provider-1".to_string(),
+            "provider-1".to_string(),
+            None,
+            "antigravity".to_string(),
+        )
+        .expect("provider should build");
+        provider.config = Some(json!({
+            "pool_advanced": {
+                "probing_enabled": true,
+                "probe_concurrency": 4
+            }
+        }));
+        let pool_config = admin_provider_pool_config(&provider).expect("pool config should parse");
+        let worker_config = PoolQuotaProbeWorkerConfig {
+            scan_interval: Duration::from_secs(60),
+            max_keys_per_provider: 10,
+            global_concurrency: 4,
+        };
+
+        let burst_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider.clone()],
+            Vec::new(),
+            vec![
+                key_model_exhausted,
+                key_all_exhausted.clone(),
+                key_manual_ban.clone(),
+            ],
+        ));
+        let burst_scores = Arc::new(InMemoryPoolMemberScoreRepository::seed([score(
+            "key-all-exhausted",
+            PoolMemberHardState::QuotaExhausted,
+            PoolMemberProbeStatus::Ok,
+            Some(stale_updated_at),
+            Some(stale_updated_at),
+        )]));
+        let burst_state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_repository_for_tests(
+                    burst_catalog,
+                )
+                .with_pool_score_repository_for_tests(burst_scores)
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let active_set_key = admin_provider_pool_quota_probe_active_members_key("provider-1");
+        burst_state
+            .runtime_state
+            .set_add(&active_set_key, "key-manual-ban")
+            .await
+            .expect("manual ban test seed should insert");
+
+        let PoolQuotaProbeSelectionOutcome::Selected(burst_selected) = select_keys_for_provider(
+            &burst_state,
+            burst_state.runtime_state.as_ref(),
+            &provider,
+            &pool_config,
+            worker_config,
+            PoolQuotaProbeMode::Burst,
+            now_ts,
+            true,
+        )
+        .await
+        .expect("burst quota probe selection should succeed") else {
+            panic!("exhausted Antigravity keys must remain selectable for burst quota probe");
+        };
+        let burst_ids = burst_selected
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            burst_ids,
+            BTreeSet::from(["key-all-exhausted", "key-model-exhausted"])
+        );
+        assert!(burst_state
+            .runtime_state
+            .set_members(&active_set_key)
+            .await
+            .expect("active probe set should read")
+            .is_empty());
+
+        let base_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider.clone()],
+            Vec::new(),
+            vec![key_all_exhausted, key_manual_ban],
+        ));
+        let base_scores = Arc::new(InMemoryPoolMemberScoreRepository::seed([score(
+            "key-all-exhausted",
+            PoolMemberHardState::QuotaExhausted,
+            PoolMemberProbeStatus::Ok,
+            Some(stale_updated_at),
+            Some(stale_updated_at),
+        )]));
+        let base_state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_repository_for_tests(
+                    base_catalog,
+                )
+                .with_pool_score_repository_for_tests(base_scores)
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+
+        let PoolQuotaProbeSelectionOutcome::Selected(base_selected) = select_keys_for_provider(
+            &base_state,
+            base_state.runtime_state.as_ref(),
+            &provider,
+            &pool_config,
+            worker_config,
+            PoolQuotaProbeMode::Base,
+            now_ts,
+            true,
+        )
+        .await
+        .expect("base quota probe selection should succeed") else {
+            panic!("exhausted Antigravity key must remain selectable for base quota probe");
+        };
+        let base_ids = base_selected
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(base_ids, vec!["key-all-exhausted"]);
+    }
 }

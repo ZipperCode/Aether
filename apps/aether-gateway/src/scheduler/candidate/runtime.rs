@@ -31,7 +31,7 @@ pub(super) struct CandidateRuntimeSelectionSnapshot {
     pub(super) pool_provider_ids: BTreeSet<String>,
     provider_quota_blocks_requests: BTreeMap<String, bool>,
     key_quota_hard_blocked: BTreeMap<String, bool>,
-    key_account_quota_exhausted: BTreeMap<String, bool>,
+    key_account_quota_exhausted: BTreeMap<String, BTreeMap<String, bool>>,
     /// 真实 Key 的标准余额是否明确低于内部调度下限。
     key_balance_below_minimum: BTreeMap<String, bool>,
     key_oauth_invalid: BTreeMap<String, bool>,
@@ -264,6 +264,7 @@ pub(super) fn current_candidate_runtime_skip_reason(
             && snapshot
                 .key_account_quota_exhausted
                 .get(candidate.key_id.as_str())
+                .and_then(|models| models.get(candidate.selected_provider_model_name.as_str()))
                 .copied()
                 .unwrap_or(false),
         balance_below_minimum: !pool_group
@@ -412,48 +413,77 @@ fn read_key_account_quota_exhaustion_map(
     candidates: &[SchedulerMinimalCandidateSelectionCandidate],
     provider_key_rpm_states: &BTreeMap<String, StoredProviderCatalogKey>,
     provider_pool_state: &BTreeMap<String, ProviderPoolState>,
-) -> BTreeMap<String, bool> {
-    candidates
-        .iter()
-        .map(|candidate| {
-            let exhausted = provider_key_rpm_states
-                .get(candidate.key_id.as_str())
-                .is_some_and(|key| {
-                    let account_exhausted =
-                        admin_provider_pool_pure::admin_pool_key_model_quota_exhausted(
-                            key,
-                            candidate.provider_type.as_str(),
-                            candidate.selected_provider_model_name.as_str(),
-                        )
-                        .unwrap_or_else(|| {
-                            admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(
-                                key,
-                                candidate.provider_type.as_str(),
-                            )
-                        });
-                    let hard_blocked =
-                        admin_provider_pool_pure::admin_pool_key_model_quota_hard_blocked(
-                            key,
-                            candidate.provider_type.as_str(),
-                            candidate.selected_provider_model_name.as_str(),
-                        );
-                    let pool_state = provider_pool_state
-                        .get(candidate.provider_id.as_str())
-                        .copied()
-                        .unwrap_or_default();
-                    let reserve_reached = pool_state.reserve_minimum_quota
-                        && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
-                            key,
-                            candidate.provider_type.as_str(),
-                            Some(candidate.selected_provider_model_name.as_str()),
-                        );
-                    hard_blocked
-                        || reserve_reached
-                        || (pool_state.skip_exhausted_accounts && account_exhausted)
+) -> BTreeMap<String, BTreeMap<String, bool>> {
+    let mut exhausted_by_key = BTreeMap::<String, BTreeMap<String, bool>>::new();
+    for candidate in candidates {
+        if let Some(models) = exhausted_by_key.get_mut(candidate.key_id.as_str()) {
+            if models.contains_key(candidate.selected_provider_model_name.as_str()) {
+                continue;
+            }
+            models
+                .entry(candidate.selected_provider_model_name.clone())
+                .or_insert_with(|| {
+                    candidate_account_quota_exhausted(
+                        candidate,
+                        provider_key_rpm_states,
+                        provider_pool_state,
+                    )
                 });
-            (candidate.key_id.clone(), exhausted)
+            continue;
+        }
+        exhausted_by_key
+            .entry(candidate.key_id.clone())
+            .or_default()
+            .entry(candidate.selected_provider_model_name.clone())
+            .or_insert_with(|| {
+                candidate_account_quota_exhausted(
+                    candidate,
+                    provider_key_rpm_states,
+                    provider_pool_state,
+                )
+            });
+    }
+    exhausted_by_key
+}
+
+fn candidate_account_quota_exhausted(
+    candidate: &SchedulerMinimalCandidateSelectionCandidate,
+    provider_key_rpm_states: &BTreeMap<String, StoredProviderCatalogKey>,
+    provider_pool_state: &BTreeMap<String, ProviderPoolState>,
+) -> bool {
+    provider_key_rpm_states
+        .get(candidate.key_id.as_str())
+        .is_some_and(|key| {
+            let account_exhausted = admin_provider_pool_pure::admin_pool_key_model_quota_exhausted(
+                key,
+                candidate.provider_type.as_str(),
+                candidate.selected_provider_model_name.as_str(),
+            )
+            .unwrap_or_else(|| {
+                admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(
+                    key,
+                    candidate.provider_type.as_str(),
+                )
+            });
+            let hard_blocked = admin_provider_pool_pure::admin_pool_key_model_quota_hard_blocked(
+                key,
+                candidate.provider_type.as_str(),
+                candidate.selected_provider_model_name.as_str(),
+            );
+            let pool_state = provider_pool_state
+                .get(candidate.provider_id.as_str())
+                .copied()
+                .unwrap_or_default();
+            let reserve_reached = pool_state.reserve_minimum_quota
+                && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
+                    key,
+                    candidate.provider_type.as_str(),
+                    Some(candidate.selected_provider_model_name.as_str()),
+                );
+            hard_blocked
+                || reserve_reached
+                || (pool_state.skip_exhausted_accounts && account_exhausted)
         })
-        .collect()
 }
 
 fn read_key_quota_hard_blocked_map(
@@ -790,6 +820,296 @@ mod tests {
             assert!(!is_candidate_selectable(&candidate, &snapshot, 100));
         }
     }
+
+    #[test]
+    fn antigravity_same_key_multi_model_quota_preserves_each_model_across_orders_and_switches() {
+        let mut first_account_candidate = sample_candidate();
+        first_account_candidate.provider_type = "antigravity".to_string();
+        first_account_candidate.endpoint_api_format = "gemini:generate_content".to_string();
+        first_account_candidate.key_id = "key-0".to_string();
+        first_account_candidate.key_name = "key-0".to_string();
+        first_account_candidate.global_model_name = "gemini-cli".to_string();
+        first_account_candidate.selected_provider_model_name = "gemini-2.5-flash".to_string();
+
+        let mut exhausted_candidate = first_account_candidate.clone();
+        exhausted_candidate.key_id = "key-1".to_string();
+        exhausted_candidate.key_name = "key-1".to_string();
+        exhausted_candidate.model_id = "model-sonnet-4-5".to_string();
+        exhausted_candidate.selected_provider_model_name = "claude-sonnet-4-5".to_string();
+
+        let mut duplicate_exhausted_candidate = exhausted_candidate.clone();
+        duplicate_exhausted_candidate.endpoint_id = "endpoint-2".to_string();
+
+        let mut available_candidate = exhausted_candidate.clone();
+        available_candidate.model_id = "model-sonnet-4-6".to_string();
+        available_candidate.selected_provider_model_name = "claude-sonnet-4-6".to_string();
+
+        let mut first_key = low_balance_key();
+        first_key.id = "key-0".to_string();
+        first_key.name = "key-0".to_string();
+        first_key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "antigravity",
+                "exhausted": false,
+                "windows": [{
+                    "code": "model:gemini-2.5-flash",
+                    "scope": "model",
+                    "model": "gemini-2.5-flash",
+                    "remaining_ratio": 0.0,
+                    "used_ratio": 1.0,
+                    "is_exhausted": true,
+                    "reset_at": 4_102_444_800u64
+                }]
+            }
+        }));
+
+        let quota_payload = json!({
+            "version": 2,
+            "provider_type": "antigravity",
+            "exhausted": false,
+            "windows": [
+                {
+                    "code": "model:claude-sonnet-4-5",
+                    "scope": "model",
+                    "model": "claude-sonnet-4-5",
+                    "remaining_ratio": 0.0,
+                    "used_ratio": 1.0,
+                    "is_exhausted": true,
+                    "reset_at": 4_102_444_800u64
+                },
+                {
+                    "code": "model:claude-sonnet-4-6",
+                    "scope": "model",
+                    "model": "claude-sonnet-4-6",
+                    "remaining_ratio": 0.8,
+                    "used_ratio": 0.2,
+                    "is_exhausted": false,
+                    "reset_at": 4_102_444_800u64
+                }
+            ]
+        });
+
+        for ignore_exhausted_accounts in [false, true] {
+            let pool_state = BTreeMap::from([(
+                exhausted_candidate.provider_id.clone(),
+                ProviderPoolState {
+                    pool_enabled: false,
+                    skip_exhausted_accounts: !ignore_exhausted_accounts,
+                    reserve_minimum_quota: false,
+                },
+            )]);
+            for candidates in [
+                vec![
+                    first_account_candidate.clone(),
+                    exhausted_candidate.clone(),
+                    duplicate_exhausted_candidate.clone(),
+                    available_candidate.clone(),
+                ],
+                vec![
+                    first_account_candidate.clone(),
+                    available_candidate.clone(),
+                    exhausted_candidate.clone(),
+                    duplicate_exhausted_candidate.clone(),
+                ],
+            ] {
+                let mut key = low_balance_key();
+                key.status_snapshot = Some(json!({"quota": quota_payload.clone()}));
+                let provider_key_rpm_states = BTreeMap::from([
+                    (first_key.id.clone(), first_key.clone()),
+                    (key.id.clone(), key.clone()),
+                ]);
+                let key_account_quota_exhausted = read_key_account_quota_exhaustion_map(
+                    &candidates,
+                    &provider_key_rpm_states,
+                    &pool_state,
+                );
+                let key_models = key_account_quota_exhausted
+                    .get("key-1")
+                    .expect("key-1 model map should exist");
+                assert_eq!(key_models.len(), 2);
+                assert_eq!(key_models.get("claude-sonnet-4-5"), Some(&true));
+                assert_eq!(key_models.get("claude-sonnet-4-6"), Some(&false));
+                assert!(!key_models.contains_key("gemini-cli"));
+                assert!(!key_models.contains_key("gemini-2.5-flash"));
+
+                let mut snapshot = CandidateRuntimeSelectionSnapshot {
+                    recent_candidates: Vec::new(),
+                    provider_concurrent_limits: BTreeMap::new(),
+                    provider_key_rpm_states,
+                    pool_provider_ids: BTreeSet::new(),
+                    provider_quota_blocks_requests: BTreeMap::new(),
+                    key_quota_hard_blocked: BTreeMap::new(),
+                    key_account_quota_exhausted,
+                    key_balance_below_minimum: BTreeMap::new(),
+                    key_oauth_invalid: BTreeMap::new(),
+                    provider_key_rpm_reset_ats: BTreeMap::new(),
+                };
+
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(&exhausted_candidate, &snapshot, 100),
+                    Some("account_quota_exhausted")
+                );
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(
+                        &duplicate_exhausted_candidate,
+                        &snapshot,
+                        100,
+                    ),
+                    Some("account_quota_exhausted")
+                );
+                assert!(!is_candidate_selectable(
+                    &exhausted_candidate,
+                    &snapshot,
+                    100
+                ));
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(&available_candidate, &snapshot, 100),
+                    None
+                );
+                assert!(is_candidate_selectable(
+                    &available_candidate,
+                    &snapshot,
+                    100
+                ));
+
+                snapshot
+                    .pool_provider_ids
+                    .insert(exhausted_candidate.provider_id.clone());
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(&exhausted_candidate, &snapshot, 100),
+                    None
+                );
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(&available_candidate, &snapshot, 100),
+                    None
+                );
+
+                let mut manually_blocked_key = key;
+                manually_blocked_key.status_snapshot = Some(json!({
+                    "scheduling": {
+                        "code": "quota_exhausted",
+                        "blocked": true,
+                        "requires_manual_recovery": true
+                    },
+                    "quota": quota_payload.clone()
+                }));
+                let manual_rpm_states = BTreeMap::from([
+                    (first_key.id.clone(), first_key.clone()),
+                    (manually_blocked_key.id.clone(), manually_blocked_key),
+                ]);
+                snapshot.key_quota_hard_blocked =
+                    read_key_quota_hard_blocked_map(&candidates, &manual_rpm_states);
+                snapshot.key_account_quota_exhausted = read_key_account_quota_exhaustion_map(
+                    &candidates,
+                    &manual_rpm_states,
+                    &pool_state,
+                );
+                snapshot.provider_key_rpm_states = manual_rpm_states;
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(&exhausted_candidate, &snapshot, 100),
+                    None
+                );
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(&available_candidate, &snapshot, 100),
+                    None
+                );
+
+                snapshot.pool_provider_ids.clear();
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(&exhausted_candidate, &snapshot, 100),
+                    Some("key_quota_exhausted")
+                );
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(&available_candidate, &snapshot, 100),
+                    Some("key_quota_exhausted")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_antigravity_same_key_multi_model_quota_honors_ignore_exhausted_switch() {
+        let mut exhausted_candidate = sample_candidate();
+        exhausted_candidate.global_model_name = "client-alias".to_string();
+        exhausted_candidate.selected_provider_model_name = "vendor-alpha".to_string();
+
+        let mut available_candidate = exhausted_candidate.clone();
+        available_candidate.model_id = "model-2".to_string();
+        available_candidate.selected_provider_model_name = "omega-sibling".to_string();
+
+        let mut key = low_balance_key();
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "deepseek",
+                "exhausted": false,
+                "windows": [
+                    {
+                        "code": "model:vendor-alpha",
+                        "scope": "model",
+                        "model": "vendor-alpha",
+                        "remaining_ratio": 0.0,
+                        "used_ratio": 1.0,
+                        "is_exhausted": true,
+                        "reset_at": 4_102_444_800u64
+                    },
+                    {
+                        "code": "model:omega-sibling",
+                        "scope": "model",
+                        "model": "omega-sibling",
+                        "remaining_ratio": 0.8,
+                        "used_ratio": 0.2,
+                        "is_exhausted": false,
+                        "reset_at": 4_102_444_800u64
+                    }
+                ]
+            }
+        }));
+        let provider_key_rpm_states = BTreeMap::from([(key.id.clone(), key)]);
+
+        for ignore_exhausted_accounts in [false, true] {
+            let pool_state = BTreeMap::from([(
+                exhausted_candidate.provider_id.clone(),
+                ProviderPoolState {
+                    pool_enabled: false,
+                    skip_exhausted_accounts: !ignore_exhausted_accounts,
+                    reserve_minimum_quota: false,
+                },
+            )]);
+            for candidates in [
+                vec![exhausted_candidate.clone(), available_candidate.clone()],
+                vec![available_candidate.clone(), exhausted_candidate.clone()],
+            ] {
+                let snapshot = CandidateRuntimeSelectionSnapshot {
+                    recent_candidates: Vec::new(),
+                    provider_concurrent_limits: BTreeMap::new(),
+                    provider_key_rpm_states: provider_key_rpm_states.clone(),
+                    pool_provider_ids: BTreeSet::new(),
+                    provider_quota_blocks_requests: BTreeMap::new(),
+                    key_quota_hard_blocked: BTreeMap::new(),
+                    key_account_quota_exhausted: read_key_account_quota_exhaustion_map(
+                        &candidates,
+                        &provider_key_rpm_states,
+                        &pool_state,
+                    ),
+                    key_balance_below_minimum: BTreeMap::new(),
+                    key_oauth_invalid: BTreeMap::new(),
+                    provider_key_rpm_reset_ats: BTreeMap::new(),
+                };
+                let expected_exhausted_reason =
+                    (!ignore_exhausted_accounts).then_some("account_quota_exhausted");
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(&exhausted_candidate, &snapshot, 100),
+                    expected_exhausted_reason
+                );
+                assert_eq!(
+                    current_candidate_runtime_skip_reason(&available_candidate, &snapshot, 100),
+                    None
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -846,8 +1166,13 @@ mod reserve_minimum_quota_tests {
                     )]),
                 );
                 assert_eq!(
-                    exhausted.get(&key.id),
-                    Some(&(reserve_enabled && used_percent >= 99.0))
+                    exhausted
+                        .get(key.id.as_str())
+                        .and_then(|models| {
+                            models.get(candidate.selected_provider_model_name.as_str())
+                        })
+                        .copied(),
+                    Some(reserve_enabled && used_percent >= 99.0)
                 );
             }
         }
