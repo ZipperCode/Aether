@@ -284,3 +284,38 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 12: 修复 Antigravity 逐账号模型准入误放行
+
+**Date**: 2026-10-27
+**Task**: 修复 Antigravity 逐账号模型准入误放行
+**Package**: aether-provider-pool
+**Branch**: `master`
+
+### Summary
+
+为普通候选和真实 Pool/sticky 成员统一应用账号已发现模型准入，避免 null allowlist 覆盖上游目录限制；不改额度、重试或生产配置。
+
+### Main Changes
+
+- 共用 allocation-free 目录检查，保留精确模型身份、权威空目录、发现前回退和其他 Provider 行为。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e186ae342` | (see git log) |
+
+### Testing
+
+- [OK] 真实 localhost HTTP 修复前复现2次不支持账号生成；修复后普通/Pool 同步与原生SSE200/STOP、目录刷新sticky重绑、全不支持503均通过，不支持账号生成次数0。
+- [OK] preflight通过：fmt、Gateway Clippy、5709项Gateway测试通过/3跳过；Provider Pool135项通过/0跳过及all-targets Clippy通过。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 192.168.2.212尚未部署；需单独授权生产部署。
