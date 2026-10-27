@@ -66,9 +66,10 @@ pub use quota::{
     provider_pool_key_balance_below_minimum, provider_pool_key_minimum_quota_reached,
     provider_pool_key_model_quota_exhausted, provider_pool_key_model_quota_hard_blocked,
     provider_pool_key_quota_hard_blocked, provider_pool_key_runtime_quota_blocked,
-    provider_pool_key_scheduling_label, provider_pool_member_quota_snapshot,
-    provider_pool_quota_metadata_provider_type, provider_pool_quota_metadata_updated_at,
-    provider_pool_quota_snapshot_updated_at, provider_pool_reset_deadline_elapsed,
+    provider_pool_key_scheduling_label, provider_pool_key_supports_discovered_model,
+    provider_pool_member_quota_snapshot, provider_pool_quota_metadata_provider_type,
+    provider_pool_quota_metadata_updated_at, provider_pool_quota_snapshot_updated_at,
+    provider_pool_reset_deadline_elapsed,
 };
 pub use quota_refresh::{
     official_balance_backoff_secs, official_balance_backoff_with_jitter_secs,
@@ -2541,6 +2542,148 @@ mod tests {
                 .member_signals("grok", &non_antigravity, None, Some("vendor-beta"))
                 .quota_exhausted
         );
+    }
+
+    /// 逐账号模型准入只消费该账号自身的发现事实：权威映射精确匹配，缺失映射保留发现前行为。
+    #[test]
+    fn antigravity_discovered_model_admission_uses_exact_account_evidence() {
+        // 事故形态：自动抓取关闭、无账号 allowlist，发现映射只包含一个无关/禁用占位模型。
+        let incident_key = sample_key(Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-4-argon-disabled": {
+                        "remaining_fraction": 1.0
+                    }
+                }
+            }
+        })));
+        assert!(!incident_key.auto_fetch_models);
+        assert_eq!(incident_key.allowed_models, None);
+        assert!(!provider_pool_key_supports_discovered_model(
+            &incident_key,
+            "antigravity",
+            "gemini-4-argon-high"
+        ));
+        assert!(!provider_pool_key_supports_discovered_model(
+            &incident_key,
+            "Antigravity",
+            "gemini-4-argon"
+        ));
+
+        let exact_key = sample_key(Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-4-argon-high": {},
+                    "gemini-4-flash": {}
+                }
+            }
+        })));
+        assert!(provider_pool_key_supports_discovered_model(
+            &exact_key,
+            "antigravity",
+            " Gemini-4-Argon-High "
+        ));
+        // 兄弟模型、前缀和后缀变体都不得由精确身份推断出来。
+        assert!(!provider_pool_key_supports_discovered_model(
+            &exact_key,
+            "antigravity",
+            "gemini-4-argon"
+        ));
+        assert!(!provider_pool_key_supports_discovered_model(
+            &exact_key,
+            "antigravity",
+            "gemini-4-argon-high-thinking"
+        ));
+
+        // 显式 disabled:true 的同名条目不算可用。
+        let disabled_key = sample_key(Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-4-argon-high": { "disabled": true }
+                }
+            }
+        })));
+        assert!(!provider_pool_key_supports_discovered_model(
+            &disabled_key,
+            "antigravity",
+            "gemini-4-argon-high"
+        ));
+
+        // 权威空对象优先于历史回退映射，不得复活旧模型列表。
+        let empty_authoritative = sample_key(Some(json!({
+            "antigravity": {
+                "quota_by_model": {},
+                "models": {
+                    "gemini-4-argon-high": {}
+                }
+            }
+        })));
+        assert!(!provider_pool_key_supports_discovered_model(
+            &empty_authoritative,
+            "antigravity",
+            "gemini-4-argon-high"
+        ));
+
+        // 缺失或格式不正确的模型映射保留发现前的既有行为。
+        assert!(provider_pool_key_supports_discovered_model(
+            &sample_key(None),
+            "antigravity",
+            "gemini-4-argon-high"
+        ));
+        let malformed_maps = sample_key(Some(json!({
+            "antigravity": {
+                "quota_by_model": [],
+                "models": "gemini-4-argon-high",
+                "model_quotas": 1
+            }
+        })));
+        assert!(provider_pool_key_supports_discovered_model(
+            &malformed_maps,
+            "antigravity",
+            "gemini-4-argon-high"
+        ));
+        let legacy_models = sample_key(Some(json!({
+            "antigravity": {
+                "models": {
+                    "gemini-4-argon-high": {}
+                }
+            }
+        })));
+        assert!(provider_pool_key_supports_discovered_model(
+            &legacy_models,
+            "antigravity",
+            "gemini-4-argon-high"
+        ));
+        let legacy_model_quotas = sample_key(Some(json!({
+            "antigravity": {
+                "models": [],
+                "model_quotas": {
+                    "gemini-4-argon-high": {}
+                }
+            }
+        })));
+        assert!(provider_pool_key_supports_discovered_model(
+            &legacy_model_quotas,
+            "antigravity",
+            "gemini-4-argon-high"
+        ));
+
+        // 其他 Provider 类型不使用该发现约束。
+        let codex_key = sample_key(Some(json!({
+            "codex": {
+                "quota_by_model": {
+                    "gpt-5": {}
+                }
+            }
+        })));
+        assert!(provider_pool_key_supports_discovered_model(
+            &codex_key, "codex", "gpt-5.4"
+        ));
+        assert!(provider_pool_key_supports_discovered_model(
+            &codex_key,
+            "antigravity",
+            "gemini-4-argon-high"
+        ));
     }
 
     /// 验证 `reset_time`/`next_reset_time`（Unix 与 RFC3339）、快照与原始元数据同时间戳一致性、非法重置时间保留耗尽及新观测恢复/阻断切换。

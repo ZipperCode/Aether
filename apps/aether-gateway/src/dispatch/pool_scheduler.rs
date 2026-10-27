@@ -24,7 +24,7 @@ use aether_pool_core::{
     POOL_COST_LIMIT_REACHED_SKIP_REASON, POOL_KEY_QUOTA_EXHAUSTED_SKIP_REASON,
     POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON,
 };
-use aether_provider_pool::ProviderPoolService;
+use aether_provider_pool::{provider_pool_key_supports_discovered_model, ProviderPoolService};
 use aether_routing_core::{RankingOverlay, ResolvedRoutingPolicy};
 use aether_scheduler_core::{
     candidate_runtime_skip_reason_with_state, effective_provider_key_rpm_limit,
@@ -184,6 +184,16 @@ async fn schedule_pool_page_candidates(
                         rpm_reset_at: state
                             .app()
                             .provider_key_rpm_reset_at(&candidate.candidate.key_id, now_unix_secs),
+                    })
+                    .or_else(|| {
+                        // 每个真实成员只按自己强读到的发现目录判定模型准入。
+                        let key = keys_by_id.get(candidate.candidate.key_id.as_str())?;
+                        (!provider_pool_key_supports_discovered_model(
+                            key,
+                            candidate.candidate.provider_type.as_str(),
+                            candidate.candidate.selected_provider_model_name.as_str(),
+                        ))
+                        .then_some("key_model_disabled")
                     })
                 }
                 Err(_) => Some(POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON),
@@ -4722,6 +4732,127 @@ mod tests {
                     "key-00000"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_filters_antigravity_undiscovered_model_before_window_truncation() {
+        // 事故形态：代表账号发现映射只有无关占位模型，仍需继续扫描精确支持的兄弟账号。
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "scheduling_presets": [{"preset": "cache_affinity", "enabled": true}],
+                "score_top_n": 8,
+                "score_fallback_scan_limit": 8
+            }
+        }));
+        let (mut provider, mut endpoint, mut keys, mut rows) =
+            large_pool_fixture(2, provider_config.clone());
+        provider.provider_type = "antigravity".to_string();
+        endpoint.api_format = "gemini:generate_content".to_string();
+        endpoint.api_family = Some("gemini".to_string());
+        endpoint.endpoint_kind = Some("generate_content".to_string());
+        endpoint.base_url = "https://antigravity.googleapis.com".to_string();
+
+        let discovered_model = "gemini-4-argon-high";
+        for key in keys.iter_mut() {
+            key.auth_type = "oauth".to_string();
+            key.api_formats = Some(json!(["gemini:generate_content"]));
+            key.auto_fetch_models = false;
+            key.allowed_models = None;
+        }
+        keys[0].upstream_metadata = Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-4-argon-disabled": {}
+                }
+            }
+        }));
+        keys[1].upstream_metadata = Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-4-argon-high": {}
+                }
+            }
+        }));
+
+        for row in rows.iter_mut() {
+            row.provider_type = "antigravity".to_string();
+            row.endpoint_api_format = "gemini:generate_content".to_string();
+            row.endpoint_api_family = Some("gemini".to_string());
+            row.endpoint_kind = Some("generate_content".to_string());
+            row.key_auth_type = "oauth".to_string();
+            row.key_api_formats = Some(vec!["gemini:generate_content".to_string()]);
+            row.key_allowed_models = None;
+            row.routing_facts.provider_pool_enabled = true;
+            row.global_model_name = discovered_model.to_string();
+            row.model_provider_model_name = discovered_model.to_string();
+        }
+
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    keys,
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+
+        let mut group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-00000",
+            0,
+            provider_config.clone(),
+        );
+        group.kind = LocalExecutionCandidateKind::PoolGroup;
+        group.provider_api_format = "gemini:generate_content".to_string();
+        group.candidate.provider_type = "antigravity".to_string();
+        group.candidate.endpoint_api_format = "gemini:generate_content".to_string();
+        group.candidate.global_model_name = discovered_model.to_string();
+        group.candidate.selected_provider_model_name = discovered_model.to_string();
+        let transport = Arc::make_mut(&mut group.transport);
+        transport.provider.provider_type = "antigravity".to_string();
+        transport.endpoint.api_format = "gemini:generate_content".to_string();
+        transport.endpoint.api_family = Some("gemini".to_string());
+        transport.endpoint.endpoint_kind = Some("generate_content".to_string());
+        transport.endpoint.base_url = "https://antigravity.googleapis.com".to_string();
+        transport.key.auth_type = "oauth".to_string();
+        transport.key.api_formats = Some(vec!["gemini:generate_content".to_string()]);
+
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        record_admin_provider_pool_success(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            "key-00000",
+            &pool_config,
+            Some("session-model-admission"),
+            0,
+            None,
+        )
+        .await;
+
+        // 普通分页与 sticky 单例都必须拒绝未发现模型的真实账号。
+        for session in [None, Some("session-model-admission")] {
+            let mut cursor = PoolKeyCursor::new(
+                PlannerAppState::new(&app),
+                group.clone(),
+                session,
+                None,
+                None,
+            );
+            let candidate = cursor
+                .next_key()
+                .await
+                .expect("supported sibling should survive discovered-model filtering");
+            assert_eq!(candidate.candidate.key_id, "key-00001");
+            assert!(cursor.take_skipped_candidates().iter().any(|item| {
+                item.candidate.key_id == "key-00000" && item.skip_reason == "key_model_disabled"
+            }));
         }
     }
 

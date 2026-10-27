@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/aether-provider-pool/backend/key-admission-affinity-model-quota-contract.md", "reason": "Preserve per-account model identity, quota separation, strong Pool reads, and refresh invalidation"}
+{"file": ".trellis/spec/aether-gateway/backend/index.md", "reason": "Gateway ownership boundaries and native HTTP integration conventions"}

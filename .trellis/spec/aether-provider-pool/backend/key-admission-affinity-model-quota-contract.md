@@ -4,9 +4,9 @@
 
 Use this contract when changing Provider Key `concurrent_limit`, runtime
 semaphores, sync/stream/WebSocket admission, Pool cache affinity, model quota
-windows, Antigravity quota projection, Codex reset-credit state, or quota-driven
-model discovery. It keeps every transport on the same atomic Key capacity and
-prevents one model's exhausted window from blocking a different model.
+windows, Antigravity discovered-model admission and quota projection, Codex
+reset-credit state, or quota-driven model discovery. It keeps every transport
+on the same atomic Key capacity and separates model availability from quota.
 
 ## 2. Signatures
 
@@ -28,6 +28,12 @@ pub(crate) enum ProviderPoolInFlightAdmission {
     Acquired(Option<ProviderPoolInFlightGuard>),
     Saturated { limit: usize },
 }
+
+pub fn provider_pool_key_supports_discovered_model(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    provider_model_name: &str,
+) -> bool;
 ```
 
 Relevant persisted/admin JSON shapes are:
@@ -88,6 +94,22 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
 - Cache-affinity sticky hits remain first. On a miss, mode `single_account`
   concentrates work using reverse-LRU behavior; mode `lru` rotates to the
   least-recently-used Key. Unknown/missing mode uses `single_account`.
+- Antigravity discovered-model admission supplements, never replaces, existing
+  account allowlists and scoped Provider mappings. Strongly read the actual Key
+  and require the selected upstream model to match a key in its authoritative
+  `upstream_metadata.antigravity` model map. Use the same first-object precedence
+  as quota projection (`quota_by_model`, `models`, `model_quotas`), including empty
+  maps; ignore stale lower-priority maps and explicitly disabled entries.
+  Missing/malformed model maps preserve pre-discovery behavior; other Provider
+  types are unchanged. A null allowlist or disabled automatic fetching cannot
+  override a discovered catalog excluding the target. Do not infer subscription
+  privileges, model families, suffixes, or another account's model availability.
+- Ordinary candidates and actual Pool/sticky members share the borrowed
+  `provider_pool_key_supports_discovered_model` decision and emit
+  `key_model_disabled` after existing higher-priority runtime denials. PoolGroup
+  representative discovery never removes the logical group; filter real members
+  before hot-pool fallback/window truncation. Model absence is not exhausted
+  quota and never writes a persistent scheduling ban.
 - Model quota is resolved against each serving account's actual upstream model,
   not a client alias or another account's model list. Candidate snapshots use
   `BTreeMap<key_id, BTreeMap<selected_provider_model_name, bool>>` so one account's
@@ -171,6 +193,12 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
 | `fetchAvailableModels` fails but `loadCodeAssist` succeeds | Preserve old quota and never restore an exhausted model from the account observation. |
 | Positive refresh with manual ban or disabled Key | Keep the Key ineligible. |
 | All Antigravity target-model accounts exhausted | HTTP 503 and zero generation requests; background probes remain eligible. |
+| Antigravity null allowlist and fetched map excludes target | Skip that actual Key with `key_model_disabled`; zero generation requests. |
+| Map contains only `gemini-4-argon-disabled`, target is `gemini-4-argon-high` | No family inference; reject that account and continue eligible siblings. |
+| Authoritative model map is empty or exact entry is disabled | Reject target without changing quota state or importing models. |
+| Model maps are absent/malformed, or Provider is not Antigravity | Preserve existing pre-discovery/allowlist behavior. |
+| Sticky account loses target after successful discovery refresh | Re-evaluate strong Key evidence, skip old binding and serve/rebind an eligible sibling. |
+| All accounts exclude target in discovery | HTTP 503 and zero upstream generation requests. |
 | Antigravity 额度刷新发现模型 | 保留发现元数据，不写模型目录。 |
 | 用户删除全局模型后再次刷新额度 | 不恢复该模型及关联记录。 |
 | 用户显式导入模型 | 使用准确的发现 Endpoint 证据，沿用现有导入校验。 |
@@ -195,6 +223,11 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   quota detail without changing Pool ranking.
 - Bad: `allowedTiers` contains Pro, or a Claude model exists, so classifying the
   account as Pro; neither proves an active subscription.
+- Good: a null-allowlist account exposes only a disabled Argon placeholder and is
+  skipped, while a sibling exposing the exact mapped `-high` model serves native
+  Gemini even when its automatic model-fetch toggle is disabled.
+- Bad: treating unknown quota as proof of model entitlement, or allowing a null
+  allowlist to erase an account's fetched model restriction.
 
 ## 6. Tests Required
 
@@ -227,6 +260,17 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   counts for warm A, exhausted A -> B, refreshed A/B exhausted -> A, failed quota
   fetch, manual ban, disable/re-enable and all-exhausted HTTP 503. No restart,
   TTL wait, production credentials or external Google/database service.
+- `antigravity_discovered_model_admission_uses_exact_account_evidence` covers
+  exact identities, disabled flags, authoritative empty-map precedence, missing
+  discovery fallback, and unchanged non-Antigravity behavior.
+- `runtime_antigravity_discovered_model_denies_real_key_but_not_pool_group_representative`
+  and `pool_key_cursor_filters_antigravity_undiscovered_model_before_window_truncation`
+  cover ordinary denial, representative isolation, normal/sticky member scans,
+  eligible members beyond the frozen window, and existing skip-reason priority.
+- `gateway_antigravity_account_scoped_argon_admission` exercises real localhost
+  sync and public `streamGenerateContent?alt=sse` HTTP in ordinary/Pool modes.
+  Assert zero unsupported generations, exact mapped model, native SSE `STOP`,
+  refreshed discovery rebinding, and all-unsupported HTTP 503 with no generation.
 
 - Runtime-state: keyed resources isolate capacity and permits release correctly.
 - Gateway: sync, stream, Responses WS, and Live admission/release; saturation
@@ -285,3 +329,9 @@ map, match `candidate.trim().eq_ignore_ascii_case(requested.trim())`, preserve
 unknown exact windows in the `all` decision, and index the actual key/model pair.
 After a successful persisted model refresh, invalidate candidate pages, not
 affinity or independent manual-recovery scheduling state.
+
+For discovered-model admission, wrong: `allowed_models == null` therefore any
+Provider mapping is valid for that account. Correct: keep existing mapping and
+allowlist rules, then apply the shared discovered-model guard to the actual
+Key and selected upstream model. Preserve absent-discovery fallback; never
+reinterpret missing quota as a model permission or persist model absence as a ban.

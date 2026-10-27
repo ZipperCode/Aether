@@ -124,6 +124,49 @@ pub fn provider_pool_key_model_quota_hard_blocked(
     })
 }
 
+/// 判断 Antigravity Key 的已发现模型是否包含指定上游模型。
+///
+/// 该判断只补充账号级模型发现事实，不替代 scheduler 现有的 allowlist 与映射规则。
+/// 只读取 `upstream_metadata.antigravity` 中首个对象形式的模型映射
+/// （`quota_by_model`、`models`、`model_quotas`），空对象同样权威；显式
+/// `disabled: true` 的同名条目不算可用。模型标识按 trim 后的完整
+/// `eq_ignore_ascii_case` 匹配，不做模型族或后缀推断。映射缺失或格式不符时保留
+/// 发现前的既有行为，其他 Provider 类型始终不受影响。
+pub fn provider_pool_key_supports_discovered_model(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    provider_model_name: &str,
+) -> bool {
+    if !provider_type.trim().eq_ignore_ascii_case("antigravity") {
+        return true;
+    }
+    let Some(bucket) = key
+        .upstream_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("antigravity"))
+        .and_then(Value::as_object)
+    else {
+        return true;
+    };
+    let Some(models) = provider_pool_authoritative_model_maps(bucket, true).next() else {
+        return true;
+    };
+    let requested = provider_model_name.trim();
+    models.iter().any(|(model_name, entry)| {
+        let model_name = model_name.trim();
+        !model_name.is_empty()
+            && model_name.eq_ignore_ascii_case(requested)
+            && !provider_pool_model_entry_disabled(entry)
+    })
+}
+
+fn provider_pool_model_entry_disabled(entry: &Value) -> bool {
+    entry
+        .as_object()
+        .is_some_and(|object| provider_pool_json_bool(object.get("disabled")) == Some(true))
+}
+
 /// 判断运行时错误分类是否为当前 Key 写入了需管理员恢复的持久额度阻断。
 ///
 /// 该状态属于 Key 级强事实，不随请求模型切换而解除。
@@ -829,6 +872,18 @@ fn provider_pool_identifier_tokens(value: &str) -> std::collections::BTreeSet<St
         .collect()
 }
 
+/// 依次借用 `quota_by_model`、`models`、`model_quotas` 中对象形式的模型映射；
+/// `first_model_map_only` 只取首个对象（空对象也算），用于权威映射选择。
+fn provider_pool_authoritative_model_maps<'a>(
+    source: &'a Map<String, Value>,
+    first_model_map_only: bool,
+) -> impl Iterator<Item = &'a Map<String, Value>> + 'a {
+    ["quota_by_model", "models", "model_quotas"]
+        .into_iter()
+        .filter_map(move |key| source.get(key).and_then(Value::as_object))
+        .take(if first_model_map_only { 1 } else { usize::MAX })
+}
+
 /// Materialize quota windows from the small set of shapes emitted by current
 /// and legacy adapters.  Model maps (`quota_by_model`/`models`) are converted
 /// to the same window representation used by status snapshots, with the map
@@ -845,10 +900,7 @@ fn provider_pool_collect_quota_windows(
             windows.extend(values.iter().filter_map(Value::as_object).cloned());
         }
     }
-    for key in ["quota_by_model", "models", "model_quotas"] {
-        let Some(models) = source.get(key).and_then(Value::as_object) else {
-            continue;
-        };
+    for models in provider_pool_authoritative_model_maps(source, first_model_map_only) {
         for (model_name, item) in models {
             let Some(item) = item.as_object() else {
                 continue;
@@ -864,9 +916,6 @@ fn provider_pool_collect_quota_windows(
                 .entry("code".to_string())
                 .or_insert_with(|| json!(format!("model:{model_name}")));
             windows.push(window);
-        }
-        if first_model_map_only {
-            break;
         }
     }
     windows
@@ -959,11 +1008,16 @@ pub(crate) fn provider_pool_metadata_bucket<'a>(
 pub(crate) fn provider_pool_json_bool(value: Option<&Value>) -> Option<bool> {
     match value {
         Some(Value::Bool(value)) => Some(*value),
-        Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" => Some(true),
-            "false" | "0" => Some(false),
-            _ => None,
-        },
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.eq_ignore_ascii_case("true") || value == "1" {
+                Some(true)
+            } else if value.eq_ignore_ascii_case("false") || value == "0" {
+                Some(false)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }

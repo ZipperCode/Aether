@@ -8,6 +8,7 @@ use aether_data_contracts::repository::candidates::StoredRequestCandidate;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_provider_pool::{
     provider_pool_key_balance_below_minimum, provider_pool_key_runtime_quota_blocked,
+    provider_pool_key_supports_discovered_model,
 };
 use aether_scheduler_core::{
     auth_api_key_concurrency_limit_reached, build_provider_concurrent_limit_map,
@@ -242,7 +243,7 @@ pub(super) fn current_candidate_runtime_skip_reason(
         .flatten();
     let empty_key_runtime_states = BTreeMap::new();
 
-    candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {
+    let reason = candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {
         candidate,
         recent_candidates: &snapshot.recent_candidates,
         provider_concurrent_limits: &snapshot.provider_concurrent_limits,
@@ -281,7 +282,26 @@ pub(super) fn current_candidate_runtime_skip_reason(
                 .unwrap_or(false),
         enforce_key_circuit_breaker: !pool_group,
         rpm_reset_at,
-    })
+    });
+    if reason.is_some() {
+        return reason;
+    }
+    // 账号发现目录属于该 Key 自身的准入事实；代表 Key 不得据此淘汰整个 PoolGroup。
+    if !pool_group
+        && snapshot
+            .provider_key_rpm_states
+            .get(candidate.key_id.as_str())
+            .is_some_and(|key| {
+                !provider_pool_key_supports_discovered_model(
+                    key,
+                    candidate.provider_type.as_str(),
+                    candidate.selected_provider_model_name.as_str(),
+                )
+            })
+    {
+        return Some("key_model_disabled");
+    }
+    None
 }
 
 pub(super) async fn read_provider_concurrent_limits(
@@ -730,6 +750,84 @@ mod tests {
         assert_eq!(
             current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
             None
+        );
+    }
+
+    #[test]
+    fn runtime_antigravity_discovered_model_denies_real_key_but_not_pool_group_representative() {
+        // 事故形态：自动抓取关闭、无 allowlist，发现映射只有无关占位模型。
+        let mut candidate = sample_candidate();
+        candidate.provider_type = "antigravity".to_string();
+        candidate.endpoint_api_format = "gemini:generate_content".to_string();
+        candidate.selected_provider_model_name = "gemini-4-argon-high".to_string();
+
+        let mut key = low_balance_key();
+        key.status_snapshot = None;
+        key.auto_fetch_models = false;
+        key.allowed_models = None;
+        key.upstream_metadata = Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-4-argon-disabled": {}
+                }
+            }
+        }));
+
+        let mut snapshot = CandidateRuntimeSelectionSnapshot {
+            recent_candidates: Vec::new(),
+            provider_concurrent_limits: BTreeMap::new(),
+            provider_key_rpm_states: BTreeMap::from([(key.id.clone(), key.clone())]),
+            pool_provider_ids: BTreeSet::new(),
+            provider_quota_blocks_requests: BTreeMap::new(),
+            key_quota_hard_blocked: BTreeMap::new(),
+            key_account_quota_exhausted: BTreeMap::new(),
+            key_balance_below_minimum: BTreeMap::new(),
+            key_oauth_invalid: BTreeMap::new(),
+            provider_key_rpm_reset_ats: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+            Some("key_model_disabled")
+        );
+        assert!(!is_candidate_selectable(&candidate, &snapshot, 100));
+
+        // PoolGroup 代表 Key 不得因发现约束淘汰整组，真实成员在展开后检查。
+        snapshot
+            .pool_provider_ids
+            .insert(candidate.provider_id.clone());
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+            None
+        );
+        assert!(is_candidate_selectable(&candidate, &snapshot, 100));
+        snapshot.pool_provider_ids.clear();
+
+        // 精确发现同名上游模型后恢复正常准入。
+        snapshot
+            .provider_key_rpm_states
+            .get_mut("key-1")
+            .expect("key snapshot should exist")
+            .upstream_metadata = Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-4-argon-high": {}
+                }
+            }
+        }));
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+            None
+        );
+
+        // 既有强运行态诊断保持优先，模型禁用不会覆盖健康/额度原因。
+        key.health_by_format = Some(json!({
+            "gemini:generate_content": { "health_score": 0.0 }
+        }));
+        snapshot.provider_key_rpm_states.insert(key.id.clone(), key);
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+            Some("key_health_score_zero")
         );
     }
 
