@@ -5971,8 +5971,9 @@ mod tests {
     }
 
     /// 逐账号模型解析边界：无清单也走解析器并保留行默认与操作范围；显式空清单或
-    /// 无交集拒绝；清单变体经全局映射正则取带后缀名；操作范围映射只在请求操作
-    /// 命中时替换默认名。
+    /// 无交集拒绝；仅凭全局映射正则不得越过显式 Provider 映射替换请求模型，
+    /// 显式作用域 Provider 映射与账号清单交集才解析出带后缀模型名；操作范围映射
+    /// 只在请求操作命中时替换默认名。
     #[test]
     fn pool_member_model_resolution_tracks_account_scope_and_denials() {
         let group = sample_codex_pool_group("provider-pool", "endpoint-1", 0, None);
@@ -5998,13 +5999,27 @@ mod tests {
             None
         );
 
-        // 账号清单里的变体经全局映射正则解析为该账号实际上游模型名。
+        // 仅凭全局映射正则不得将未配置在 Provider 映射中的变体替换成上游模型；
+        // 显式作用域 Provider 映射与账号清单产生交集后，才解析为该账号实际上游模型名。
         row.global_model_mappings = Some(vec!["gpt-5-(high|low|medium|tiered)".to_string()]);
         row.key_allowed_models = Some(vec![
             "gpt-5-high".to_string(),
             "gpt-5-low".to_string(),
             "gpt-5-medium".to_string(),
             "gpt-5-tiered".to_string(),
+        ]);
+        assert_eq!(
+            super::pool_member_model_resolution(&group, &row, "gpt-5", None),
+            None,
+        );
+        row.model_provider_model_mappings = Some(vec![
+            aether_data_contracts::repository::candidate_selection::StoredProviderModelMapping {
+                name: "gpt-5-high".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["openai:responses".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+            },
         ]);
         assert_eq!(
             super::pool_member_model_resolution(&group, &row, "gpt-5", None),

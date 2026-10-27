@@ -84,6 +84,25 @@ fn resolves_mapping_matched_model_from_global_regex_mapping() {
     let mut row = sample_row();
     row.key_allowed_models = Some(vec!["gpt-4.1-variant".to_string()]);
 
+    assert!(resolve_provider_model_name(&row, "gpt-4.1", "openai:chat").is_none());
+
+    row.model_provider_model_mappings = Some(vec![
+        StoredProviderModelMapping {
+            name: "gpt-4.1-variant".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:chat".to_string()]),
+            endpoint_ids: None,
+            operations: None,
+        },
+        StoredProviderModelMapping {
+            name: "gpt-4.1-responses".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:responses".to_string()]),
+            endpoint_ids: None,
+            operations: None,
+        },
+    ]);
+
     let resolved = resolve_provider_model_name(&row, "gpt-4.1", "openai:chat")
         .expect("candidate should resolve");
 

@@ -841,7 +841,7 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
             global_model_supports_streaming: Some(true),
             model_provider_model_name: "gpt-5-upstream".to_string(),
             model_provider_model_mappings: Some(vec![StoredProviderModelMapping {
-                name: "gpt-5-canonical-upstream".to_string(),
+                name: "gpt-5.4".to_string(),
                 priority: 1,
                 api_formats: Some(vec!["openai:chat".to_string()]),
                 endpoint_ids: None,
@@ -981,8 +981,14 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
             "user-openai-regex-mapping-1",
         ),
     )]));
+    let mut unmatched_regex_candidate_row = sample_candidate_row();
+    unmatched_regex_candidate_row.key_id = "key-openai-regex-mapping-unmatched".to_string();
+    unmatched_regex_candidate_row.key_name = "unmatched".to_string();
+    unmatched_regex_candidate_row.key_internal_priority = 1;
+    unmatched_regex_candidate_row.key_allowed_models = Some(vec!["gpt-5.2".to_string()]);
     let candidate_selection_repository =
         Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            unmatched_regex_candidate_row,
             sample_candidate_row(),
         ]));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
@@ -1046,6 +1052,10 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
+    assert_eq!(
+        stored_candidates[0].key_id.as_deref(),
+        Some("key-openai-regex-mapping-1")
+    );
     assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Success);
 
     gateway_handle.abort();

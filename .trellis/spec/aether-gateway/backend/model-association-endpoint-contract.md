@@ -29,7 +29,7 @@
 - Logical pool-group enumeration must not reject a group because its representative's `allowed_models` is empty or incompatible. If normal representative resolution fails, resolve only the scoped configured/provider-mapped target for the group. Actual member hydration still applies its own model list; keep this fallback out of generic resolvers because expanded member rows also carry `provider_pool_enabled=true`.
 - Runtime pool expansion must resolve `selected_provider_model_name` and `mapping_matched_model` for each account row through `resolve_provider_model_name_with_model_directives_and_request_operation`, before transport permission checks and payload construction. A representative account's selected target is not a pool-wide fact.
 - Reuse the request's existing per-format directive routing model and request operation. Preserve provider mapping priority and Endpoint/operation scope; do not reload directive policy on each pool page or enable directives unconditionally.
-- `provider_api_keys.allowed_models=NULL` preserves the row's configured default/provider-mapped target without account restrictions; an explicit empty list denies the account. Global regex matching selects only actual account-list entries, never fabricated suffixes. Disabling automatic model fetching on one account must not disable mapped alternatives on other accounts.
+- `provider_api_keys.allowed_models=NULL` preserves the row's configured default/provider-mapped target without account restrictions; an explicit empty list denies the account. Account-listed variants must match the configured default or a Provider mapping valid for the current API format, Endpoint and operation. A global regex routes inbound names to a Global Model; it cannot authorize an unconfigured outbound variant. Disabling automatic model fetching on one account must not disable mapped alternatives on other accounts.
 - Score, ordinary-page, routing-allowlist and sticky-account hydration share account-local resolution. Model quota windows and reserve thresholds use the resolved account target. Memory candidate listing mirrors PostgreSQL's one-representative-per-pool projection; pool member reads remain expanded.
 
 ## 4. Validation & Error Matrix
@@ -48,7 +48,8 @@
 | 额度刷新发现可路由或内部模型 | 保留上游额度元数据，不写模型目录 |
 | 删除全局模型后再次刷新额度 | 不恢复全局模型、提供商模型或 Endpoint 绑定 |
 | 用户显式导入模型 | 按原导入流程创建目录记录，保留准确 Endpoint 证据 |
-| First account has no model list; later account lists a regex-matched variant | Later account resolves its own actual variant and remains eligible after first-account failure |
+| First account has no model list; later account lists an explicitly scoped Provider-mapped variant | Later account resolves its own actual variant and remains eligible after first-account failure |
+| Account variant matches only a global regex, not a scoped Provider model | Reject the account; do not synthesize an upstream target from its model list |
 | Pool member has an explicit empty model list | No upstream send for that member; preserve model-disabled semantics |
 | Pool account uses an operation-scoped provider mapping | Apply the original request operation and directive policy snapshot before permission/quota checks |
 | Pool representative list excludes the requested model or is empty | Keep the logical group; evaluate actual member lists before any upstream send |
@@ -79,6 +80,7 @@
 - `pool_cursor_raw_routing_model_keeps_restricted_custom_suffix_member_schedulable`: exercise `next_key` with a restricted raw custom-suffix model; callers that disable directive routing retain the eligible account, while an explicitly supplied base-routing context observes its own restrictions.
 - `pool_representative_model_list_denial_does_not_reject_logical_group`, `non_pool_account_model_list_denial_stays_strict`, `pool_representative_mapping_scope_mismatch_stays_denied`, and `generic_model_resolution_stays_strict_for_pool_member_rows` lock the group/member boundary, explicit-empty semantics and Endpoint/operation scope.
 - `responses_pool_incompatible_representative_never_sends_and_sibling_serves_actual_model` and `responses_pool_all_incompatible_account_models_send_nothing` exercise real loopback HTTP: only the supporting sibling may receive the actual mapped model, and all-incompatible pools send nothing.
+- Model-resolution fixtures must configure scoped Provider mappings for positive account-variant cases and retain a regex-only rejection case. Keep core `global_regex_does_not_replace_unmatched_requested_model` intact when migrating caller tests.
 
 ## 7. Wrong vs Correct
 

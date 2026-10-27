@@ -832,6 +832,14 @@ async fn data_state_reads_minimal_candidate_selection_with_auth_filters() {
             StoredMinimalCandidateSelectionRow {
                 key_global_priority_by_format: Some(serde_json::json!({"openai:chat": 4})),
                 key_allowed_models: Some(vec!["gpt-4.1-edge".to_string()]),
+                // 账号清单只约束能力；可调用的上游名仍须属于当前端点的显式映射。
+                model_provider_model_mappings: Some(vec![StoredProviderModelMapping {
+                    name: "gpt-4.1-edge".to_string(),
+                    priority: 1,
+                    api_formats: Some(vec!["openai:chat".to_string()]),
+                    endpoint_ids: Some(vec!["endpoint-provider-1".to_string()]),
+                    operations: None,
+                }]),
                 ..sample_minimal_candidate_selection_row(
                     "provider-1",
                     "OpenAI",
