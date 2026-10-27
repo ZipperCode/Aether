@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/aether-provider-pool/backend/key-admission-affinity-model-quota-contract.md", "reason": "Preserve exact model quota scope, strong reads, reset recovery and cache invalidation"}
+{"file": ".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md", "reason": "Separate transient model exhaustion from administrator-recoverable account bans and credential fences"}

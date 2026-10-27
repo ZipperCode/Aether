@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/aether-provider-pool/backend/key-admission-affinity-model-quota-contract.md", "reason": "Review cross-family isolation and ordinary/Pool/sticky parity"}
+{"file": ".trellis/spec/aether-provider-pool/backend/runtime-quota-block-contract.md", "reason": "Review no downgrade of auth/manual bans and no collateral health/adaptive effects"}
