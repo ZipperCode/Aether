@@ -262,3 +262,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Next Steps
 
 - 推送 master；确认新 SHA 的 GitHub Rust CI 全绿后创建并推送 v0.7.49。
+
+
+## Session 11: 修复 Antigravity 模型额度调度与自动恢复
+
+**Date**: 2026-10-27
+**Task**: 修复 Antigravity 模型额度调度与自动恢复
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+精确模型额度匹配、权威模型 map/reset 别名；Antigravity 可恢复 hard block；候选账号/实际模型双层索引；成功持久化刷新失效候选缓存。Provider Pool 134/134、Gateway 相关91/91、架构与调度7/7、fmt与Gateway Clippy通过；真实HTTP普通和Pool模式含sticky A→B→A、失败保留、人工禁用/封禁和全耗尽503通过。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2fbaff53b` | (see git log) |
+
+### Status
+
+[OK] **Completed**

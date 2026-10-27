@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 10
+- **Total Sessions**: 11
 - **Last Active**: 2026-10-27
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~264 | Active |
+| `journal-1.md` | ~286 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 11 | 2026-10-27 | 修复 Antigravity 模型额度调度与自动恢复 | `2fbaff53b` | `master` |
 | 10 | 2026-10-27 | 导入凭据模型发现与发布前 CI 修复 | `9059e178e`, `9683b5ee8` | `master` |
 | 9 | 2026-10-26 | 修复全局 Gemini 关联与号池代表账号预选 | `8901d5604` | `master` |
 | 8 | 2026-10-26 | 修复 Antigravity 逐账号模型发现 | `71e2ad824` | `master` |
