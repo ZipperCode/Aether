@@ -8,7 +8,20 @@ use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
 use aether_scheduler_core::SchedulerAffinityTarget;
 use async_trait::async_trait;
 
+use crate::orchestration::AntigravityModelQuotaCandidate;
 use crate::GatewayError;
+
+/// Domain outcome for one candidate's scoped runtime model quota state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchedulerModelQuotaState {
+    /// No active scoped runtime model quota fact.
+    Available,
+    /// Active exact-model runtime quota fact for this candidate credential.
+    Blocked,
+    /// This candidate's credential/config could not be read; its state is
+    /// unknown and must not be reported as exhausted.
+    StateUnavailable,
+}
 
 #[async_trait]
 pub(crate) trait SchedulerRuntimeState {
@@ -34,6 +47,18 @@ pub(crate) trait SchedulerRuntimeState {
         &self,
         key_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogKey>, GatewayError>;
+
+    /// Reads the shared, key/model-scoped Antigravity runtime quota facts in one
+    /// batched backend round trip. Results keep the descriptor order. A single
+    /// candidate whose credential/config cannot be read reports
+    /// `StateUnavailable` without erasing valid siblings. A returned error means
+    /// the shared backend failed for the whole batch and must never be reported
+    /// as an exhausted model quota.
+    async fn read_antigravity_model_quota_blocked(
+        &self,
+        candidates: &[AntigravityModelQuotaCandidate<'_>],
+        now_unix_secs: u64,
+    ) -> Result<Vec<SchedulerModelQuotaState>, GatewayError>;
 
     async fn read_recent_request_candidates(
         &self,

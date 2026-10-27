@@ -81,6 +81,7 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use tracing::warn;
 use uuid::Uuid;
 
 pub(crate) const ADMIN_PROVIDER_QUERY_LOCAL_TEST_MODEL_MESSAGE: &str =
@@ -608,6 +609,44 @@ async fn provider_query_fetch_discovered_models_for_key(
             .map(|catalog| catalog.client_version.as_str())
             .unwrap_or(dynamic_client_version.as_str())
     });
+    // Capture scoped runtime model-quota facts immediately before the direct
+    // online fetch; a positive persisted refresh restores only this subset.
+    let quota_refresh_capture = if provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("antigravity")
+    {
+        let serving_transport = transports.iter().find(|transport| {
+            transport
+                .provider
+                .provider_type
+                .trim()
+                .eq_ignore_ascii_case("antigravity")
+                && transport.key.id == key.id
+        });
+        match serving_transport {
+            Some(transport) => match crate::orchestration::capture_antigravity_model_quota_refresh(
+                state.app(),
+                transport,
+            )
+            .await
+            {
+                Ok(capture) => capture,
+                Err(error) => {
+                    warn!(
+                        provider_id = %provider.id,
+                        key_id = %key.id,
+                        error = ?error,
+                        "admin provider model query skipped runtime quota capture"
+                    );
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
     let outcome =
         match fetch_models_from_transports_for_management(state.app(), &transports, client_version)
             .await
@@ -657,6 +696,26 @@ async fn provider_query_fetch_discovered_models_for_key(
     }
     if let Some(upstream_metadata) = outcome.upstream_metadata.as_ref() {
         provider_query_persist_upstream_metadata(state, key, upstream_metadata).await?;
+        // Only a successful fetch reconciles, and only the byte-identical
+        // capture taken before this request; a newer fact survives.
+        if outcome.has_success {
+            if let Some(capture) = quota_refresh_capture.as_ref() {
+                if let Err(error) = crate::orchestration::reconcile_antigravity_model_quota_refresh(
+                    state.app(),
+                    capture,
+                    Some(upstream_metadata),
+                )
+                .await
+                {
+                    warn!(
+                        provider_id = %provider.id,
+                        key_id = %key.id,
+                        error = ?error,
+                        "admin provider model query failed to reconcile runtime quota refresh"
+                    );
+                }
+            }
+        }
     }
 
     if unique_models.is_empty() && !all_errors.is_empty() {

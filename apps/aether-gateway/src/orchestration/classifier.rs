@@ -361,11 +361,15 @@ pub(crate) fn classify_local_failover(
     policy: &LocalFailoverPolicy,
     input: LocalFailoverInput<'_>,
 ) -> LocalFailoverClassification {
-    classify_local_failover_with_quota_evidence(
-        policy,
-        input,
-        classify_local_quota_exhaustion(policy, input),
-    )
+    let quota_exhaustion = classify_local_quota_exhaustion(policy, input);
+    let scoped_model_quota = quota_exhaustion.is_none()
+        && super::antigravity_model_quota::classify_antigravity_model_quota_exhaustion(
+            &policy.provider_type,
+            input.status_code,
+            input.response_text,
+        )
+        .is_some();
+    classify_local_failover_with_quota_evidence(policy, input, quota_exhaustion, scoped_model_quota)
 }
 
 pub(crate) fn classify_local_quota_exhaustion(
@@ -438,11 +442,13 @@ pub(crate) fn classify_local_quota_exhaustion(
 }
 
 /// 先执行全局终止规则，再按既有提供商规则和持久额度证据决定重试范围。
-fn classify_local_failover_with_quota_evidence(
+pub(crate) fn classify_local_failover_with_quota_evidence(
     policy: &LocalFailoverPolicy,
     input: LocalFailoverInput<'_>,
     quota_evidence: Option<LocalQuotaExhaustionEvidence>,
+    scoped_model_quota: bool,
 ) -> LocalFailoverClassification {
+    let quota_retry = quota_evidence.is_some() || scoped_model_quota;
     if input.status_code >= 400
         && policy.routing_rules.error_stop_patterns.iter().any(|rule| {
             failover_pattern_matches(
@@ -470,7 +476,7 @@ fn classify_local_failover_with_quota_evidence(
             })
     {
         // 全局成功规则可要求重试，但不能把已识别的额度耗尽降为同凭据候选重试。
-        return if quota_evidence.is_some() {
+        return if quota_retry {
             LocalFailoverClassification::RetryQuotaExhausted
         } else {
             LocalFailoverClassification::RetrySuccessPattern
@@ -495,7 +501,7 @@ fn classify_local_failover_with_quota_evidence(
         return LocalFailoverClassification::StopErrorPattern;
     }
 
-    if quota_evidence.is_some() {
+    if quota_retry {
         return LocalFailoverClassification::RetryQuotaExhausted;
     }
 

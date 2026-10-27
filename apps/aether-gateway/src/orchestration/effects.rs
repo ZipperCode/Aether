@@ -27,14 +27,15 @@ use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
+use super::antigravity_model_quota::antigravity_model_quota_deadline_unix_secs;
 use super::{
     classify_failure_disposition, local_failover_error_message, local_quota_exhaustion_error_code,
     project_local_adaptive_rate_limit, project_local_adaptive_success,
     project_local_failure_health, project_local_key_circuit_closed,
     project_local_key_circuit_failure, project_local_success_health,
-    resolve_local_failover_analysis_for_attempt, FailureScope, LocalFailoverAnalysis,
-    LocalFailoverClassification, LocalQuotaExhaustionConfidence, LocalQuotaExhaustionEvidence,
-    PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD,
+    resolve_local_failover_analysis_for_attempt, AntigravityModelQuotaEvidence, FailureScope,
+    LocalFailoverAnalysis, LocalFailoverClassification, LocalQuotaExhaustionConfidence,
+    LocalQuotaExhaustionEvidence, PROVIDER_KEY_CREDENTIAL_FINGERPRINT_REPORT_FIELD,
 };
 use crate::ai_serving::extract_pool_sticky_session_token;
 use crate::client_session_affinity::{
@@ -237,6 +238,11 @@ pub(crate) struct LocalSchedulingStateEffect<'a> {
     pub(crate) status_code: u16,
     pub(crate) response_text: Option<&'a str>,
     pub(crate) quota_exhaustion: Option<LocalQuotaExhaustionEvidence>,
+    /// Narrow, resettable Antigravity per-model evidence.  When present without
+    /// account-level quota evidence, only the scoped runtime observation is
+    /// written; the account scheduling snapshot is left untouched.
+    pub(crate) antigravity_model_quota_exhaustion: Option<AntigravityModelQuotaEvidence>,
+    pub(crate) headers: Option<&'a BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -511,7 +517,15 @@ pub(crate) async fn apply_local_stream_failure_effects(
     } else {
         analysis.quota_exhaustion
     };
-    if effect.stream_timeout && quota_exhaustion.is_none() {
+    let antigravity_model_quota_exhaustion = if effect.transport_error {
+        None
+    } else {
+        analysis.antigravity_model_quota_exhaustion
+    };
+    if effect.stream_timeout
+        && quota_exhaustion.is_none()
+        && antigravity_model_quota_exhaustion.is_none()
+    {
         apply_local_execution_effect(state, context, LocalExecutionEffect::PoolStreamTimeout).await;
     }
     apply_local_execution_effect(
@@ -531,11 +545,13 @@ pub(crate) async fn apply_local_stream_failure_effects(
                 status_code: effect.status_code,
                 response_text: effect.response_text,
                 quota_exhaustion,
+                antigravity_model_quota_exhaustion,
+                headers: Some(effect.headers),
             }),
         )
         .await;
     }
-    if quota_exhaustion.is_none() {
+    if quota_exhaustion.is_none() && antigravity_model_quota_exhaustion.is_none() {
         apply_local_execution_effect(
             state,
             context,
@@ -726,6 +742,17 @@ async fn record_scheduling_state_effect(
     };
 
     if effect.quota_exhaustion.is_none() {
+        if let Some(evidence) = effect.antigravity_model_quota_exhaustion {
+            record_antigravity_model_quota_scheduling_effect(
+                state,
+                context,
+                effect,
+                evidence,
+                expected_fingerprint,
+            )
+            .await;
+            return;
+        }
         // Clearing a suspicion cannot downgrade a confirmed block and the CAS
         // linearizes safely against a concurrent second weak signal. Avoid the
         // distributed Pool projection lock on this common response path.
@@ -760,6 +787,165 @@ async fn record_scheduling_state_effect(
     state
         .release_provider_key_quota_projection_lock(projection_lock)
         .await;
+}
+
+async fn record_antigravity_model_quota_scheduling_effect(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    effect: LocalSchedulingStateEffect<'_>,
+    _evidence: AntigravityModelQuotaEvidence,
+    expected_fingerprint: &str,
+) {
+    let observed_at = current_unix_secs();
+    let Some(current_key) = state
+        .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(&context.plan.key_id))
+        .await
+        .ok()
+        .and_then(|mut keys| keys.drain(..).next())
+        .filter(|key| key.provider_id == context.plan.provider_id)
+    else {
+        return;
+    };
+    let decrypted_auth_config = state
+        .decrypt_provider_catalog_key_auth_config(&current_key)
+        .ok()
+        .flatten();
+    if let Some(expected_account_generation) =
+        report_context_string_field(context.report_context, "antigravity_account_generation")
+    {
+        // Stable credential fence: the refresh-token hash survives routine
+        // OAuth access-token rotation and changes on credential replacement.
+        if super::antigravity_key_account_generation(&current_key, decrypted_auth_config.as_deref())
+            .as_deref()
+            != Some(expected_account_generation)
+        {
+            return;
+        }
+    } else {
+        // Access-token-only credentials have no report generation.  They also
+        // cannot auto-refresh, so the existing full credential fingerprint is
+        // an appropriate replacement fence.
+        let Some(current_endpoint) = state
+            .read_provider_catalog_endpoints_by_ids(std::slice::from_ref(&context.plan.endpoint_id))
+            .await
+            .ok()
+            .and_then(|mut endpoints| endpoints.drain(..).next())
+        else {
+            return;
+        };
+        let current_fingerprint =
+            match aether_provider_transport::provider_catalog_key_credential_fingerprint(
+                &current_key,
+                &current_endpoint,
+                state.encryption_key().unwrap_or_default(),
+            ) {
+                Ok(fingerprint) => fingerprint,
+                Err(err) => {
+                    warn!(
+                        provider_id = %context.plan.provider_id,
+                        key_id = %context.plan.key_id,
+                        error = ?err,
+                        "gateway antigravity model quota effect could not verify credential fence"
+                    );
+                    return;
+                }
+            };
+        if current_fingerprint != expected_fingerprint {
+            return;
+        }
+    }
+    let Some(transport) = state
+        .read_provider_transport_snapshot(
+            &context.plan.provider_id,
+            &context.plan.endpoint_id,
+            &context.plan.key_id,
+        )
+        .await
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let provider_type = transport.provider.provider_type.as_str();
+    if !provider_type.trim().eq_ignore_ascii_case("antigravity") {
+        return;
+    }
+    let selected_model = report_context_string_field(context.report_context, "mapped_model")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            context
+                .plan
+                .model_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+    let Some(selected_model) = selected_model else {
+        return;
+    };
+    let model = match super::antigravity_quota_upstream_model(effect.response_text) {
+        Some(named) if named.trim().eq_ignore_ascii_case(selected_model) => {
+            selected_model.to_string()
+        }
+        Some(_) => {
+            // The upstream error names a different model; this candidate's
+            // selected model must not be poisoned by that fact.
+            return;
+        }
+        None => selected_model.to_string(),
+    };
+    let configured_cooldown_seconds =
+        admin_provider_pool_config_from_config_value(transport.provider.config.as_ref())
+            .map(|config| config.rate_limit_cooldown_seconds)
+            .unwrap_or(0);
+    let deadline_unix_secs = antigravity_model_quota_deadline_unix_secs(
+        effect.headers,
+        effect.response_text,
+        configured_cooldown_seconds,
+        observed_at,
+    );
+    // Linearize with quota-refresh capture/clear under the same Provider/Key
+    // projection lock so a refresh cannot clear a fact written after it
+    // captured its pre-request snapshot.
+    let Ok(projection_lock) = state
+        .acquire_provider_key_quota_projection_lock(&context.plan.provider_id, &context.plan.key_id)
+        .await
+    else {
+        return;
+    };
+    let record_outcome = super::record_antigravity_model_quota_exhaustion_with_auth_config(
+        state.runtime_state.as_ref(),
+        &current_key,
+        decrypted_auth_config.as_deref(),
+        provider_type,
+        &model,
+        deadline_unix_secs,
+        observed_at,
+        "runtime_upstream_model_quota",
+    )
+    .await;
+    state
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
+    match record_outcome {
+        Ok(true) => {
+            // Current-process candidate caches must observe the learned model
+            // restriction on the immediate failover/fallback attempt.
+            state.invalidate_provider_quota_candidate_caches();
+            state.invalidate_scheduler_affinity_cache();
+        }
+        Ok(false) => {}
+        Err(err) => {
+            warn!(
+                provider_id = %context.plan.provider_id,
+                key_id = %context.plan.key_id,
+                model = %model,
+                error = ?err,
+                "gateway antigravity model quota effect could not persist scoped observation"
+            );
+        }
+    }
 }
 
 async fn record_scheduling_state_effect_cas(
@@ -1737,6 +1923,8 @@ async fn record_health_success_effect(
             status_code: 200,
             response_text: None,
             quota_exhaustion: None,
+            antigravity_model_quota_exhaustion: None,
+            headers: None,
         },
     )
     .await;

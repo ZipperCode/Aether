@@ -9,6 +9,9 @@ Pool score projection, administrator recovery, and the two management views.
 
 The runtime block is independent from `is_active`, `status_snapshot.quota`,
 OAuth invalidation, health/circuit state, and resettable rate-limit cooldowns.
+Resettable Antigravity runtime model quota uses the separate shared-KV contract
+in [Key Admission, Affinity, and Model Quota](./key-admission-affinity-model-quota-contract.md).
+It must not create this administrator-recoverable account block.
 
 ## 2. Signatures
 
@@ -54,11 +57,16 @@ quota_exhaustion_patterns?: FailoverRuleItem[]
 - Administrator patterns are evaluated first. HTTP 402 and exact built-in
   non-resettable quota codes remain strong evidence even when an intermediary
   also attaches a reset header or field. A reset deadline suppresses only weak
-  or otherwise ambiguous quota text; transient rate-limit codes remain in the
-  existing cooldown path.
+  or otherwise ambiguous quota text. Resettable Antigravity model-quota evidence
+  uses the scoped RuntimeState path; generic rate/RPM limits retain cooldown.
 - Confirmed state is never cleared by success, quota refresh, credential edit,
   restart, health recovery, or cache rebuild. Only the administrator endpoint
   clears it.
+- Administrator quota patterns, HTTP 402 and exact non-resettable codes take
+  precedence over Antigravity model-quota classification. Scoped model-quota
+  errors never write `status_snapshot.scheduling`, account Pool `QuotaExhausted`,
+  cooldown, health/circuit or adaptive-RPM penalties. A positive model refresh
+  may clear matching captured scoped observations, never this confirmed block.
 - The scheduling CAS must compare the encrypted API key, encrypted auth config,
   auth type, and previously observed scheduling object. Implement it for
   memory and PostgreSQL; retired MySQL/SQLite adapters must not be resurrected.
@@ -126,6 +134,10 @@ quota_exhaustion_patterns?: FailoverRuleItem[]
 | non-quota HTTP terminal after suspicion | clear suspicion |
 | transport error after suspicion | leave suspicion unchanged |
 | weak/ambiguous signal with reset deadline | no scheduling state; use cooldown |
+| Antigravity structured model-quota 429 without stronger account evidence | shared-KV exact-model guard; no manual block or account-wide penalties |
+| same response matching an administrator quota rule | keep configured account block and manual-recovery semantics |
+| Antigravity explicit per-minute/RPM rate limit | preserve account cooldown/health/adaptive/Pool behavior |
+| positive model refresh with confirmed manual block | clear only eligible scoped observations; account remains blocked |
 | stale response from replaced credential | CAS/fingerprint miss; no write |
 | clear endpoint for missing Key | HTTP 404 |
 | clear endpoint with no quota state | HTTP 200, `cleared = false` |
@@ -154,6 +166,9 @@ quota_exhaustion_patterns?: FailoverRuleItem[]
   score rebuild, and credential-scope current-request filtering.
 - Recovery assertions: idempotency, Pool score rebuild, cache invalidation, and
   preservation of manual disablement/OAuth/cooldown/health state.
+- Antigravity boundary assertions: structured model quota versus generic rate
+  limits, configured-rule precedence, no collateral account effects, scoped
+  refresh recovery and preservation of confirmed/manual account restrictions.
 - Frontend assertions: confirmed and suspected labels plus confirmation-gated
   recovery actions in Provider Detail and Pool Management.
 
@@ -175,3 +190,8 @@ score.hard_state = PoolMemberHardState::QuotaExhausted;
 let blocked = provider_pool_key_runtime_quota_blocked(key);
 signals.runtime_quota_hard_blocked = blocked;
 ```
+
+Wrong: treat Antigravity model-quota `RESOURCE_EXHAUSTED` as proof of
+non-resettable account exhaustion. Correct: classify explicit model-quota
+evidence separately, enforce its exact Key/model deadline through shared KV,
+and reserve this persisted manual block for strong account evidence.

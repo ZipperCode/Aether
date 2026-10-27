@@ -682,6 +682,47 @@ async fn fetch_and_persist_key_models(
     } else {
         None
     };
+    // The actual same-key transport that will perform this request; capture
+    // rejects a credential replacement between materialization and capture.
+    let serving_transport = transports.iter().find(|transport| {
+        transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("antigravity")
+            && transport.key.id == target.key.id
+    });
+    // Capture the scoped runtime model-quota facts immediately before the
+    // upstream request; a positive persisted refresh later restores only this
+    // captured subset. Non-Antigravity providers never reach this call.
+    let quota_refresh_capture = if target
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("antigravity")
+    {
+        match serving_transport {
+            Some(transport) => match state
+                .capture_antigravity_model_quota_refresh(transport)
+                .await
+            {
+                Ok(capture) => capture,
+                Err(error) if is_nonfatal_legacy_credential_error(&error) => {
+                    warn!(
+                        provider_id = %target.provider.id,
+                        key_id = %target.key.id,
+                        reason = "invalid_stored_credential",
+                        "gateway model fetch skipped runtime quota capture for an invalid stored credential"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
     let result = match fetch_models_from_transports_for_management(
         state,
         &transports,
@@ -789,6 +830,21 @@ async fn fetch_and_persist_key_models(
         result.upstream_metadata.as_ref(),
     )
     .await?;
+    // Only an actual successful fetch reconciles, and only the byte-identical
+    // capture taken before this request. Failures above never reach this point.
+    if let Some(capture) = quota_refresh_capture.as_ref() {
+        if let Err(error) = state
+            .reconcile_antigravity_model_quota_refresh(capture, result.upstream_metadata.as_ref())
+            .await
+        {
+            warn!(
+                provider_id = %target.provider.id,
+                key_id = %target.key.id,
+                error = ?error,
+                "gateway model fetch failed to reconcile positive runtime model quota refresh"
+            );
+        }
+    }
     state
         .write_upstream_models_cache(&target.provider.id, &target.key.id, &association_models)
         .await;
@@ -1473,6 +1529,22 @@ mod tests {
                 observation_patch,
             ));
             key.updated_at_unix_secs = Some(now_unix_secs);
+            Ok(())
+        }
+
+        async fn capture_antigravity_model_quota_refresh(
+            &self,
+            _transport: &GatewayProviderTransportSnapshot,
+        ) -> Result<Option<crate::orchestration::AntigravityModelQuotaRefreshCapture>, GatewayError>
+        {
+            Ok(None)
+        }
+
+        async fn reconcile_antigravity_model_quota_refresh(
+            &self,
+            _capture: &crate::orchestration::AntigravityModelQuotaRefreshCapture,
+            _positive_metadata: Option<&Value>,
+        ) -> Result<(), GatewayError> {
             Ok(())
         }
 

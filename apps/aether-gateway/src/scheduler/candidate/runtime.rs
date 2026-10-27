@@ -17,11 +17,19 @@ use aether_scheduler_core::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
+use tracing::warn;
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;
+use crate::orchestration::AntigravityModelQuotaCandidate;
+use crate::scheduler::state::SchedulerModelQuotaState;
 use crate::GatewayError;
 
 use super::{SchedulerMinimalCandidateSelectionCandidate, SchedulerRuntimeState};
+
+const ANTIGRAVITY_PROVIDER_TYPE: &str = "antigravity";
+
+/// 运行时模型额度事实的共享后端读取失败；它是状态不可用，不是额度耗尽。
+pub(super) const KEY_QUOTA_STATE_UNAVAILABLE_SKIP_REASON: &str = "key_quota_state_unavailable";
 
 pub(super) use aether_scheduler_core::should_skip_provider_quota;
 
@@ -33,6 +41,10 @@ pub(super) struct CandidateRuntimeSelectionSnapshot {
     provider_quota_blocks_requests: BTreeMap<String, bool>,
     key_quota_hard_blocked: BTreeMap<String, bool>,
     key_account_quota_exhausted: BTreeMap<String, BTreeMap<String, bool>>,
+    /// 共享运行态上报的精确模型额度耗尽，只索引候选自身上游模型名。
+    key_runtime_model_quota_blocked: BTreeMap<String, BTreeSet<String>>,
+    /// 共享运行态读取失败：该 Key/模型按状态不可用处理，绝不伪造成额度耗尽。
+    key_runtime_model_quota_state_unavailable: BTreeMap<String, BTreeSet<String>>,
     /// 真实 Key 的标准余额是否明确低于内部调度下限。
     key_balance_below_minimum: BTreeMap<String, bool>,
     key_oauth_invalid: BTreeMap<String, bool>,
@@ -53,6 +65,16 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         .filter_map(|(provider_id, state)| state.pool_enabled.then_some(provider_id.clone()))
         .collect::<BTreeSet<_>>();
     let provider_key_rpm_states = read_provider_key_rpm_states(state, candidates).await?;
+    // 强读目录事实之后再批量读取共享运行态事实；非 Antigravity 与 PoolGroup
+    // 代表候选不构建描述符，也不触发额外后端读取。
+    let runtime_model_quota = read_runtime_model_quota_facts(
+        state,
+        candidates,
+        &provider_key_rpm_states,
+        &pool_provider_ids,
+        now_unix_secs,
+    )
+    .await;
     let recent_candidates = if runtime_snapshot_requires_recent_candidates(
         auth_snapshot,
         &provider_concurrent_limits,
@@ -87,6 +109,8 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         provider_quota_blocks_requests,
         key_quota_hard_blocked,
         key_account_quota_exhausted,
+        key_runtime_model_quota_blocked: runtime_model_quota.blocked,
+        key_runtime_model_quota_state_unavailable: runtime_model_quota.state_unavailable,
         key_balance_below_minimum,
         key_oauth_invalid,
         provider_key_rpm_reset_ats,
@@ -241,6 +265,16 @@ pub(super) fn current_candidate_runtime_skip_reason(
                 .flatten()
         })
         .flatten();
+    let runtime_model_quota_blocked = !pool_group
+        && snapshot
+            .key_runtime_model_quota_blocked
+            .get(candidate.key_id.as_str())
+            .is_some_and(|models| models.contains(candidate.selected_provider_model_name.trim()));
+    let runtime_model_quota_state_unavailable = !pool_group
+        && snapshot
+            .key_runtime_model_quota_state_unavailable
+            .get(candidate.key_id.as_str())
+            .is_some_and(|models| models.contains(candidate.selected_provider_model_name.trim()));
     let empty_key_runtime_states = BTreeMap::new();
 
     let reason = candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {
@@ -262,12 +296,13 @@ pub(super) fn current_candidate_runtime_skip_reason(
                 .copied()
                 .unwrap_or(false),
         account_quota_exhausted: !pool_group
-            && snapshot
-                .key_account_quota_exhausted
-                .get(candidate.key_id.as_str())
-                .and_then(|models| models.get(candidate.selected_provider_model_name.as_str()))
-                .copied()
-                .unwrap_or(false),
+            && (runtime_model_quota_blocked
+                || snapshot
+                    .key_account_quota_exhausted
+                    .get(candidate.key_id.as_str())
+                    .and_then(|models| models.get(candidate.selected_provider_model_name.as_str()))
+                    .copied()
+                    .unwrap_or(false)),
         balance_below_minimum: !pool_group
             && snapshot
                 .key_balance_below_minimum
@@ -301,7 +336,132 @@ pub(super) fn current_candidate_runtime_skip_reason(
     {
         return Some("key_model_disabled");
     }
+    // 读取失败只表示无法确认该模型的运行态事实；报告状态不可用，绝不推断额度耗尽。
+    if runtime_model_quota_state_unavailable {
+        return Some(KEY_QUOTA_STATE_UNAVAILABLE_SKIP_REASON);
+    }
     None
+}
+
+#[derive(Debug, Default)]
+struct RuntimeModelQuotaFacts {
+    blocked: BTreeMap<String, BTreeSet<String>>,
+    state_unavailable: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// 只读取真正会消费该事实的候选：非 Antigravity 与非 PoolGroup 代表候选既不构建
+/// 描述符也不读取共享后端。结果按描述符顺序与身份一一对应。
+async fn read_runtime_model_quota_facts(
+    state: &(impl SchedulerRuntimeState + ?Sized),
+    candidates: &[SchedulerMinimalCandidateSelectionCandidate],
+    provider_key_rpm_states: &BTreeMap<String, StoredProviderCatalogKey>,
+    pool_provider_ids: &BTreeSet<String>,
+    now_unix_secs: u64,
+) -> RuntimeModelQuotaFacts {
+    let mut identities = Vec::<(String, String)>::new();
+    let mut seen = BTreeSet::<(&str, &str)>::new();
+    let mut descriptors = Vec::<AntigravityModelQuotaCandidate<'_>>::new();
+
+    for candidate in candidates {
+        if pool_provider_ids.contains(candidate.provider_id.as_str())
+            || !candidate
+                .provider_type
+                .trim()
+                .eq_ignore_ascii_case(ANTIGRAVITY_PROVIDER_TYPE)
+            || candidate.selected_provider_model_name.trim().is_empty()
+        {
+            continue;
+        }
+        let Some(key) = provider_key_rpm_states.get(candidate.key_id.as_str()) else {
+            continue;
+        };
+        let model = candidate.selected_provider_model_name.trim();
+        if !seen.insert((candidate.key_id.as_str(), model)) {
+            continue;
+        }
+        identities.push((candidate.key_id.clone(), model.to_string()));
+        descriptors.push(AntigravityModelQuotaCandidate {
+            key,
+            provider_type: candidate.provider_type.as_str(),
+            model,
+        });
+    }
+
+    if descriptors.is_empty() {
+        return RuntimeModelQuotaFacts::default();
+    }
+
+    let read = match state
+        .read_antigravity_model_quota_blocked(&descriptors, now_unix_secs)
+        .await
+    {
+        Ok(values) => Ok(values),
+        Err(err) => {
+            warn!(
+                error = ?err,
+                candidate_count = identities.len(),
+                "failed to read antigravity runtime model quota state"
+            );
+            Err(())
+        }
+    };
+    runtime_model_quota_facts_from_read(&identities, read)
+}
+
+/// Consumes one aligned batch result. `StateUnavailable` entries are per
+/// candidate (for example one malformed ciphertext) and must not remove valid
+/// siblings; `Err` means the shared backend failed for the whole batch.
+fn runtime_model_quota_facts_from_read(
+    identities: &[(String, String)],
+    read: Result<Vec<SchedulerModelQuotaState>, ()>,
+) -> RuntimeModelQuotaFacts {
+    let Ok(values) = read else {
+        return unavailable_runtime_model_quota_facts(identities);
+    };
+    if values.len() != identities.len() {
+        warn!(
+            expected = identities.len(),
+            received = values.len(),
+            "antigravity runtime model quota read returned a mismatched batch"
+        );
+        return unavailable_runtime_model_quota_facts(identities);
+    }
+
+    let mut facts = RuntimeModelQuotaFacts::default();
+    for ((key_id, model), state) in identities.iter().zip(values) {
+        match state {
+            SchedulerModelQuotaState::Blocked => {
+                facts
+                    .blocked
+                    .entry(key_id.clone())
+                    .or_default()
+                    .insert(model.clone());
+            }
+            SchedulerModelQuotaState::Available => {}
+            SchedulerModelQuotaState::StateUnavailable => {
+                facts
+                    .state_unavailable
+                    .entry(key_id.clone())
+                    .or_default()
+                    .insert(model.clone());
+            }
+        }
+    }
+    facts
+}
+
+fn unavailable_runtime_model_quota_facts(
+    identities: &[(String, String)],
+) -> RuntimeModelQuotaFacts {
+    let mut facts = RuntimeModelQuotaFacts::default();
+    for (key_id, model) in identities {
+        facts
+            .state_unavailable
+            .entry(key_id.clone())
+            .or_default()
+            .insert(model.clone());
+    }
+    facts
 }
 
 pub(super) async fn read_provider_concurrent_limits(
@@ -735,6 +895,8 @@ mod tests {
             provider_quota_blocks_requests: BTreeMap::new(),
             key_quota_hard_blocked: BTreeMap::new(),
             key_account_quota_exhausted: BTreeMap::new(),
+            key_runtime_model_quota_blocked: BTreeMap::new(),
+            key_runtime_model_quota_state_unavailable: BTreeMap::new(),
             key_balance_below_minimum,
             key_oauth_invalid: BTreeMap::new(),
             provider_key_rpm_reset_ats: BTreeMap::new(),
@@ -781,6 +943,8 @@ mod tests {
             provider_quota_blocks_requests: BTreeMap::new(),
             key_quota_hard_blocked: BTreeMap::new(),
             key_account_quota_exhausted: BTreeMap::new(),
+            key_runtime_model_quota_blocked: BTreeMap::new(),
+            key_runtime_model_quota_state_unavailable: BTreeMap::new(),
             key_balance_below_minimum: BTreeMap::new(),
             key_oauth_invalid: BTreeMap::new(),
             provider_key_rpm_reset_ats: BTreeMap::new(),
@@ -880,6 +1044,8 @@ mod tests {
                 provider_quota_blocks_requests: BTreeMap::new(),
                 key_quota_hard_blocked: BTreeMap::new(),
                 key_account_quota_exhausted: BTreeMap::new(),
+                key_runtime_model_quota_blocked: BTreeMap::new(),
+                key_runtime_model_quota_state_unavailable: BTreeMap::new(),
                 key_balance_below_minimum: BTreeMap::new(),
                 key_oauth_invalid: BTreeMap::new(),
                 provider_key_rpm_reset_ats: BTreeMap::new(),
@@ -1039,6 +1205,8 @@ mod tests {
                     provider_quota_blocks_requests: BTreeMap::new(),
                     key_quota_hard_blocked: BTreeMap::new(),
                     key_account_quota_exhausted,
+                    key_runtime_model_quota_blocked: BTreeMap::new(),
+                    key_runtime_model_quota_state_unavailable: BTreeMap::new(),
                     key_balance_below_minimum: BTreeMap::new(),
                     key_oauth_invalid: BTreeMap::new(),
                     provider_key_rpm_reset_ats: BTreeMap::new(),
@@ -1191,6 +1359,8 @@ mod tests {
                         &provider_key_rpm_states,
                         &pool_state,
                     ),
+                    key_runtime_model_quota_blocked: BTreeMap::new(),
+                    key_runtime_model_quota_state_unavailable: BTreeMap::new(),
                     key_balance_below_minimum: BTreeMap::new(),
                     key_oauth_invalid: BTreeMap::new(),
                     provider_key_rpm_reset_ats: BTreeMap::new(),
@@ -1274,5 +1444,181 @@ mod reserve_minimum_quota_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_model_quota_tests {
+    use super::*;
+
+    fn antigravity_candidate(
+        key_id: &str,
+        model: &str,
+    ) -> SchedulerMinimalCandidateSelectionCandidate {
+        SchedulerMinimalCandidateSelectionCandidate {
+            provider_id: "provider-antigravity".to_string(),
+            provider_name: "antigravity".to_string(),
+            provider_type: ANTIGRAVITY_PROVIDER_TYPE.to_string(),
+            provider_priority: 0,
+            endpoint_id: "endpoint-gemini".to_string(),
+            endpoint_api_format: "gemini:generate_content".to_string(),
+            key_id: key_id.to_string(),
+            key_name: key_id.to_string(),
+            key_auth_type: "oauth".to_string(),
+            key_internal_priority: 0,
+            key_global_priority_for_format: None,
+            key_capabilities: None,
+            routing_facts: Default::default(),
+            model_id: format!("model-{model}"),
+            global_model_id: format!("global-{model}"),
+            global_model_name: model.to_string(),
+            selected_provider_model_name: model.to_string(),
+            supports_streaming: true,
+            mapping_matched_model: None,
+        }
+    }
+
+    fn runtime_snapshot() -> CandidateRuntimeSelectionSnapshot {
+        CandidateRuntimeSelectionSnapshot {
+            recent_candidates: Vec::new(),
+            provider_concurrent_limits: BTreeMap::new(),
+            provider_key_rpm_states: BTreeMap::new(),
+            pool_provider_ids: BTreeSet::new(),
+            provider_quota_blocks_requests: BTreeMap::new(),
+            key_quota_hard_blocked: BTreeMap::new(),
+            key_account_quota_exhausted: BTreeMap::new(),
+            key_runtime_model_quota_blocked: BTreeMap::new(),
+            key_runtime_model_quota_state_unavailable: BTreeMap::new(),
+            key_balance_below_minimum: BTreeMap::new(),
+            key_oauth_invalid: BTreeMap::new(),
+            provider_key_rpm_reset_ats: BTreeMap::new(),
+        }
+    }
+
+    fn block(snapshot: &mut CandidateRuntimeSelectionSnapshot, key_id: &str, model: &str) {
+        snapshot
+            .key_runtime_model_quota_blocked
+            .entry(key_id.to_string())
+            .or_default()
+            .insert(model.to_string());
+    }
+
+    fn mark_state_unavailable(
+        snapshot: &mut CandidateRuntimeSelectionSnapshot,
+        key_id: &str,
+        model: &str,
+    ) {
+        snapshot
+            .key_runtime_model_quota_state_unavailable
+            .entry(key_id.to_string())
+            .or_default()
+            .insert(model.to_string());
+    }
+
+    #[test]
+    fn runtime_model_quota_blocks_only_the_exact_model_and_key() {
+        let gemini = antigravity_candidate("key-a", "gemini-3-pro");
+        let claude = antigravity_candidate("key-a", "claude-sonnet-4-5");
+        let sibling_account_gemini = antigravity_candidate("key-b", "gemini-3-pro");
+        let mut snapshot = runtime_snapshot();
+        block(&mut snapshot, "key-a", "gemini-3-pro");
+
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&gemini, &snapshot, 100),
+            Some("account_quota_exhausted")
+        );
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&claude, &snapshot, 100),
+            None,
+            "an exhausted model quota must not become an account-wide limit"
+        );
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&sibling_account_gemini, &snapshot, 100),
+            None,
+            "another account's quota must not be borrowed for the same model"
+        );
+    }
+
+    #[test]
+    fn runtime_model_quota_does_not_restrict_pool_group_representative() {
+        let gemini = antigravity_candidate("key-a", "gemini-3-pro");
+        let mut snapshot = runtime_snapshot();
+        block(&mut snapshot, "key-a", "gemini-3-pro");
+        snapshot
+            .pool_provider_ids
+            .insert(gemini.provider_id.clone());
+
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&gemini, &snapshot, 100),
+            None,
+            "the representative Key defers model quota filtering to expanded real Keys"
+        );
+    }
+
+    #[test]
+    fn runtime_model_quota_read_failure_is_state_unavailable_not_exhaustion() {
+        let gemini = antigravity_candidate("key-a", "gemini-3-pro");
+        let claude = antigravity_candidate("key-a", "claude-sonnet-4-5");
+        let mut snapshot = runtime_snapshot();
+        mark_state_unavailable(&mut snapshot, "key-a", "gemini-3-pro");
+
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&gemini, &snapshot, 100),
+            Some(KEY_QUOTA_STATE_UNAVAILABLE_SKIP_REASON)
+        );
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&claude, &snapshot, 100),
+            None,
+            "state unavailability for one model must not restrict sibling models"
+        );
+    }
+
+    #[test]
+    fn runtime_model_quota_preserves_stronger_runtime_restriction_priority() {
+        let gemini = antigravity_candidate("key-a", "gemini-3-pro");
+        let mut snapshot = runtime_snapshot();
+        block(&mut snapshot, "key-a", "gemini-3-pro");
+        snapshot
+            .key_quota_hard_blocked
+            .insert("key-a".to_string(), true);
+
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&gemini, &snapshot, 100),
+            Some("key_quota_exhausted"),
+            "an administrator-recoverable permanent block keeps its own diagnostic"
+        );
+    }
+
+    #[test]
+    fn runtime_model_quota_per_candidate_credential_failure_keeps_siblings_available() {
+        // 单个账号的凭据无法解密时只让该 (Key, 模型) 状态不可用，
+        // 同批次其他有效账号仍按共享事实调度。
+        let identities = vec![
+            ("key-a".to_string(), "gemini-3-pro".to_string()),
+            ("key-b".to_string(), "gemini-3-pro".to_string()),
+        ];
+        let facts = runtime_model_quota_facts_from_read(
+            &identities,
+            Ok(vec![
+                SchedulerModelQuotaState::StateUnavailable,
+                SchedulerModelQuotaState::Blocked,
+            ]),
+        );
+
+        assert!(facts
+            .state_unavailable
+            .get("key-a")
+            .is_some_and(|models| models.contains("gemini-3-pro")));
+        assert!(facts
+            .blocked
+            .get("key-b")
+            .is_some_and(|models| models.contains("gemini-3-pro")));
+        assert!(!facts.blocked.contains_key("key-a"));
+        assert!(!facts.state_unavailable.contains_key("key-b"));
+
+        // 共享后端失败继续按整批状态不可用处理。
+        let failed = runtime_model_quota_facts_from_read(&identities, Err(()));
+        assert!(failed.blocked.is_empty());
+        assert_eq!(failed.state_unavailable.len(), 2);
     }
 }

@@ -16,6 +16,8 @@ pub(crate) const ROUTING_EXECUTION_POLICY_REPORT_FIELD: &str = "routing_executio
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalFailoverPolicy {
+    /// Serving Provider type used by Provider-specific scoped failover rules.
+    pub(crate) provider_type: String,
     pub(crate) routing_rules: RoutingFailoverRules,
     pub(crate) max_retries: Option<u64>,
     pub(crate) max_transfer_count: u64,
@@ -33,6 +35,7 @@ pub(crate) struct LocalFailoverPolicy {
 impl Default for LocalFailoverPolicy {
     fn default() -> Self {
         Self {
+            provider_type: String::new(),
             routing_rules: RoutingFailoverRules::default(),
             max_retries: None,
             max_transfer_count: 0,
@@ -134,6 +137,7 @@ pub(crate) fn local_failover_policy_from_transport(
         });
 
     LocalFailoverPolicy {
+        provider_type: transport.provider.provider_type.clone(),
         routing_rules: RoutingFailoverRules::default(),
         max_retries,
         max_transfer_count: provider_config
@@ -200,6 +204,11 @@ pub(crate) fn local_failover_policy_from_report_context(
         .as_object()?;
 
     Some(LocalFailoverPolicy {
+        provider_type: object
+            .get("provider_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         routing_rules: object
             .get("routing_rules")
             .and_then(|value| serde_json::from_value(value.clone()).ok())
@@ -260,6 +269,28 @@ pub(crate) fn append_local_failover_policy_to_value(
         .provider
         .provider_type
         .trim()
+        .eq_ignore_ascii_case("antigravity")
+    {
+        // Account-stable generation captured with the request so an in-flight
+        // OAuth rotation does not drop a real quota fact, while a different
+        // account replacement cannot project onto the new credential.
+        if let Some(generation) = crate::orchestration::antigravity_account_generation(
+            &transport.provider.id,
+            &transport.key.id,
+            &transport.key.auth_type,
+            transport.key.upstream_metadata.as_ref(),
+            transport.key.decrypted_auth_config.as_deref(),
+        ) {
+            object.insert(
+                "antigravity_account_generation".to_string(),
+                Value::String(generation),
+            );
+        }
+    }
+    if transport
+        .provider
+        .provider_type
+        .trim()
         .eq_ignore_ascii_case("codex")
     {
         let codex = transport
@@ -294,6 +325,7 @@ fn parse_status_code_list(value: &Value) -> BTreeSet<u16> {
 
 fn local_failover_policy_to_value(policy: &LocalFailoverPolicy) -> Value {
     json!({
+        "provider_type": policy.provider_type,
         "routing_rules": policy.routing_rules,
         "max_retries": policy.max_retries,
         "max_transfer_count": policy.max_transfer_count,
@@ -554,6 +586,7 @@ mod tests {
         assert_eq!(
             local_failover_policy_from_report_context(Some(&report_context)),
             Some(LocalFailoverPolicy {
+                provider_type: "llm".to_string(),
                 routing_rules: Default::default(),
                 max_retries: Some(2),
                 max_transfer_count: 10,

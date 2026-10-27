@@ -81,7 +81,7 @@ fn oauth_cache_key(key_id: &str) -> String {
     format!("provider_oauth_token_cache:{key_id}")
 }
 
-fn parse_retry_after_seconds(headers: Option<&BTreeMap<String, String>>) -> Option<u64> {
+pub(crate) fn parse_retry_after_seconds(headers: Option<&BTreeMap<String, String>>) -> Option<u64> {
     let raw = headers.and_then(|headers| {
         headers
             .iter()
@@ -125,7 +125,7 @@ fn parse_google_quota_duration_seconds(raw: &serde_json::Value) -> Option<u64> {
     }
 }
 
-fn parse_google_quota_cooldown_seconds_at(
+pub(crate) fn parse_google_quota_cooldown_seconds_at(
     error_body: Option<&str>,
     now_unix_secs: u64,
 ) -> Option<u64> {

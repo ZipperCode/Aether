@@ -21,8 +21,9 @@ use tokio::sync::Notify;
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;
 use crate::data::candidate_selection::MinimalCandidateSelectionRowSource;
+use crate::orchestration::AntigravityModelQuotaCandidate;
 use crate::scheduler::config::SchedulerOrderingConfig;
-use crate::scheduler::state::SchedulerRuntimeState;
+use crate::scheduler::state::{SchedulerModelQuotaState, SchedulerRuntimeState};
 use crate::GatewayError;
 
 use super::super::{
@@ -260,6 +261,14 @@ impl SchedulerRuntimeState for CountingState {
             self.poll_observed.notify_one();
         }
         Ok(self.recent.lock().unwrap().clone())
+    }
+
+    async fn read_antigravity_model_quota_blocked(
+        &self,
+        candidates: &[AntigravityModelQuotaCandidate<'_>],
+        _now_unix_secs: u64,
+    ) -> Result<Vec<SchedulerModelQuotaState>, GatewayError> {
+        Ok(vec![SchedulerModelQuotaState::Available; candidates.len()])
     }
 
     fn provider_key_rpm_reset_at(&self, _key_id: &str, _now_unix_secs: u64) -> Option<u64> {

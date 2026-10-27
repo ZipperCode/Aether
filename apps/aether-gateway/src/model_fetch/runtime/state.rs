@@ -11,6 +11,7 @@ use aether_model_fetch::{ModelFetchAssociationStore, ModelFetchTransportRuntime}
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::orchestration::AntigravityModelQuotaRefreshCapture;
 use crate::provider_transport::{GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth};
 use crate::{AppState, GatewayError};
 
@@ -96,6 +97,25 @@ pub(crate) trait ModelFetchRuntimeState:
         key_id: &str,
         observation_patch: &Value,
         now_unix_secs: u64,
+    ) -> Result<(), GatewayError>;
+
+    /// Captures the scoped Antigravity runtime model-quota facts immediately
+    /// before an upstream model request. `transport` must be the actual
+    /// same-key transport that will perform the request, so capture rejects a
+    /// credential replacement between materialization and capture. `None`
+    /// means non-Antigravity or an unbindable/mismatched credential.
+    async fn capture_antigravity_model_quota_refresh(
+        &self,
+        transport: &GatewayProviderTransportSnapshot,
+    ) -> Result<Option<AntigravityModelQuotaRefreshCapture>, GatewayError>;
+
+    /// Restores eligibility only for captured observations that are still
+    /// byte-identical and whose exact model bucket is positive in the freshly
+    /// persisted metadata. A fact learned after the capture survives.
+    async fn reconcile_antigravity_model_quota_refresh(
+        &self,
+        capture: &AntigravityModelQuotaRefreshCapture,
+        positive_metadata: Option<&Value>,
     ) -> Result<(), GatewayError>;
 
     async fn write_upstream_models_cache(

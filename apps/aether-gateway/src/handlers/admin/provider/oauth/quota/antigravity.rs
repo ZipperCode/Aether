@@ -2,9 +2,10 @@ use super::shared::{
     build_provider_quota_execution_plan, build_quota_snapshot_payload, coerce_json_f64,
     coerce_json_string, execute_provider_quota_plan, extract_execution_error_message,
     force_provider_quota_redirects_disabled, merge_upstream_metadata,
-    oauth_refresh_auto_removed_result, persist_provider_quota_refresh_state,
-    quota_key_auto_removed, quota_refresh_success_invalid_state,
-    resolve_provider_quota_execution_timeouts, ProviderQuotaExecutionOutcome,
+    oauth_refresh_auto_removed_result, persist_credential_fenced_provider_quota_refresh_state,
+    persist_provider_quota_refresh_state, quota_key_auto_removed,
+    quota_refresh_success_invalid_state, resolve_provider_quota_execution_timeouts,
+    ProviderQuotaExecutionOutcome,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::GatewayError;
@@ -332,6 +333,16 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
             continue;
         };
 
+        // 在真实上游额度请求前捕获当前精确模型事实；成功后仅清理仍为同一观察的
+        // 正向模型。失败、CAS 冲突或凭据替换都不会清理。
+        let expected_credential_fence = state
+            .app()
+            .capture_provider_transport_credential_fence(&transport)
+            .await?;
+        let captured_quota =
+            crate::orchestration::capture_antigravity_model_quota_refresh(state.app(), &transport)
+                .await?;
+
         // 按 raw paid tier -> raw current tier -> None 逐级尝试；仅在明确的权益拒绝时降级重试。
         let candidates =
             antigravity_entitlement_candidates(transport.key.upstream_metadata.as_ref());
@@ -488,16 +499,29 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
                 }
             }
         }
-        if !persist_provider_quota_refresh_state(
-            state,
-            &key.id,
-            metadata_update.as_ref(),
-            oauth_invalid_at_unix_secs,
-            oauth_invalid_reason,
-            None,
-        )
-        .await?
-        {
+        let persisted = if let Some(fence) = expected_credential_fence.as_ref() {
+            persist_credential_fenced_provider_quota_refresh_state(
+                state,
+                &key.id,
+                metadata_update.as_ref(),
+                oauth_invalid_at_unix_secs,
+                oauth_invalid_reason,
+                None,
+                fence,
+            )
+            .await?
+        } else {
+            persist_provider_quota_refresh_state(
+                state,
+                &key.id,
+                metadata_update.as_ref(),
+                oauth_invalid_at_unix_secs,
+                oauth_invalid_reason,
+                None,
+            )
+            .await?
+        };
+        if !persisted {
             failed_count += 1;
             results.push(json!({
                 "key_id": key.id,
@@ -509,6 +533,23 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
         }
 
         if status == "success" {
+            // Only positive exact models from this persisted refresh clear facts,
+            // and only when the captured observation is still byte-identical.
+            if let Some(captured) = captured_quota.as_ref() {
+                if let Err(err) = crate::orchestration::reconcile_antigravity_model_quota_refresh(
+                    state.app(),
+                    captured,
+                    metadata_update.as_ref(),
+                )
+                .await
+                {
+                    warn!(
+                        key_id = %key.id,
+                        error = ?err,
+                        "Antigravity quota refresh could not reconcile scoped model facts"
+                    );
+                }
+            }
             // 仅已落库的模型额度更新重算候选；失败和套餐观察不恢复账号，亲和映射保持不变。
             state.app().invalidate_provider_quota_candidate_caches();
             success_count += 1;

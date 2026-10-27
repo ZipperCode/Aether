@@ -441,6 +441,9 @@ async fn record_stream_sync_failure(
     )
     .await;
     if failure_analysis.quota_exhaustion.is_none()
+        && failure_analysis
+            .antigravity_model_quota_exhaustion
+            .is_none()
         && matches!(error_type, "first_byte_timeout" | "read_timeout")
     {
         apply_local_execution_effect(
@@ -476,11 +479,18 @@ async fn record_stream_sync_failure(
                 status_code: payload.status_code,
                 response_text: error_body.as_deref(),
                 quota_exhaustion: failure_analysis.quota_exhaustion,
+                antigravity_model_quota_exhaustion: failure_analysis
+                    .antigravity_model_quota_exhaustion,
+                headers: Some(&payload.headers),
             }),
         )
         .await;
     }
-    if failure_analysis.quota_exhaustion.is_none() {
+    if failure_analysis.quota_exhaustion.is_none()
+        && failure_analysis
+            .antigravity_model_quota_exhaustion
+            .is_none()
+    {
         apply_local_execution_effect(
             state,
             LocalExecutionEffectContext {

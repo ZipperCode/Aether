@@ -29,12 +29,13 @@ use tracing::{debug, warn};
 use super::{AppState, GatewayError};
 use crate::clock::current_unix_secs;
 use crate::model_fetch::{safe_model_fetch_error, CodexCatalogRuntime, ModelFetchRuntimeState};
+use crate::orchestration::{AntigravityModelQuotaCandidate, AntigravityModelQuotaRefreshCapture};
 use crate::provider_transport::{GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth};
 use crate::request_candidate_runtime::{
     RequestCandidateRuntimeCapabilityReader, RequestCandidateRuntimeReader,
     RequestCandidateRuntimeWriter,
 };
-use crate::scheduler::state::SchedulerRuntimeState;
+use crate::scheduler::state::{SchedulerModelQuotaState, SchedulerRuntimeState};
 use crate::{execution_runtime, provider_transport};
 
 const MODEL_FETCH_RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
@@ -664,6 +665,26 @@ impl ModelFetchRuntimeState for AppState {
         Ok(())
     }
 
+    async fn capture_antigravity_model_quota_refresh(
+        &self,
+        transport: &GatewayProviderTransportSnapshot,
+    ) -> Result<Option<AntigravityModelQuotaRefreshCapture>, GatewayError> {
+        crate::orchestration::capture_antigravity_model_quota_refresh(self, transport).await
+    }
+
+    async fn reconcile_antigravity_model_quota_refresh(
+        &self,
+        capture: &AntigravityModelQuotaRefreshCapture,
+        positive_metadata: Option<&Value>,
+    ) -> Result<(), GatewayError> {
+        crate::orchestration::reconcile_antigravity_model_quota_refresh(
+            self,
+            capture,
+            positive_metadata,
+        )
+        .await
+    }
+
     async fn write_upstream_models_cache(
         &self,
         provider_id: &str,
@@ -885,6 +906,66 @@ impl SchedulerRuntimeState for AppState {
         key_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogKey>, GatewayError> {
         AppState::list_provider_catalog_keys_by_ids_strong(self, key_ids).await
+    }
+
+    async fn read_antigravity_model_quota_blocked(
+        &self,
+        candidates: &[AntigravityModelQuotaCandidate<'_>],
+        now_unix_secs: u64,
+    ) -> Result<Vec<SchedulerModelQuotaState>, GatewayError> {
+        // The scoped fact is keyed by the account-stable refresh-token
+        // generation, so the reader decrypts the same credential the writer
+        // observed. A malformed/legacy ciphertext on one account must not hide
+        // valid siblings: only that candidate reports state unavailable and it
+        // is excluded from the shared lookup instead of falling back to a
+        // weaker identity or failing the whole batch.
+        let mut readable = Vec::with_capacity(candidates.len());
+        let mut auth_configs = Vec::with_capacity(candidates.len());
+        let mut result = vec![SchedulerModelQuotaState::StateUnavailable; candidates.len()];
+        for (index, candidate) in candidates.iter().enumerate() {
+            match self.decrypt_provider_catalog_key_auth_config(candidate.key) {
+                Ok(auth_config) => {
+                    readable.push((index, *candidate));
+                    auth_configs.push(auth_config);
+                }
+                Err(err) => {
+                    warn!(
+                        error = ?err,
+                        provider_id = %candidate.key.provider_id,
+                        key_id = %candidate.key.id,
+                        "failed to decrypt antigravity key auth config for runtime model quota read"
+                    );
+                }
+            }
+        }
+        if readable.is_empty() {
+            return Ok(result);
+        }
+        let descriptors = readable
+            .iter()
+            .map(|(_, candidate)| *candidate)
+            .collect::<Vec<_>>();
+        let auth_config_refs = auth_configs
+            .iter()
+            .map(Option::as_deref)
+            .collect::<Vec<_>>();
+        // Always the configured shared backend: another gateway instance may
+        // have learned the scoped fact after this process cached its catalog.
+        let blocked = crate::orchestration::antigravity_model_quota_blocked_many_with_auth_configs(
+            self.runtime_state.as_ref(),
+            &descriptors,
+            &auth_config_refs,
+            now_unix_secs,
+        )
+        .await?;
+        for ((index, _), blocked) in readable.into_iter().zip(blocked) {
+            result[index] = if blocked {
+                SchedulerModelQuotaState::Blocked
+            } else {
+                SchedulerModelQuotaState::Available
+            };
+        }
+        Ok(result)
     }
 
     async fn read_recent_request_candidates(
@@ -1133,6 +1214,345 @@ mod tests {
         assert!(
             hydrated.is_none(),
             "missing companion project cannot return usable transport on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_model_quota_credential_failure_does_not_poison_healthy_siblings() {
+        use crate::data::GatewayDataState;
+        use crate::scheduler::state::SchedulerModelQuotaState;
+        use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+        use std::sync::Arc;
+
+        const AUTH_CONFIG: &str = r#"{"refresh_token":"fixture-integrations-good"}"#;
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    InMemoryProviderCatalogReadRepository::seed(vec![], vec![], vec![]),
+                ))
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+
+        let sealed = app
+            .seal_provider_catalog_key_auth_config("provider-a", "key-good", AUTH_CONFIG)
+            .expect("auth config should seal");
+        let mut good = StoredProviderCatalogKey::new(
+            "key-good".to_string(),
+            "provider-a".to_string(),
+            "good".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("good key should build");
+        good.encrypted_auth_config = Some(sealed);
+        let mut bad = StoredProviderCatalogKey::new(
+            "key-bad".to_string(),
+            "provider-a".to_string(),
+            "bad".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("bad key should build");
+        bad.encrypted_auth_config = Some("malformed-provider-catalog-credential".to_string());
+        let free = StoredProviderCatalogKey::new(
+            "key-free".to_string(),
+            "provider-a".to_string(),
+            "free".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("free key should build");
+
+        let now_unix_secs = current_unix_secs();
+        crate::orchestration::record_antigravity_model_quota_exhaustion_with_auth_config(
+            app.runtime_state.as_ref(),
+            &good,
+            Some(AUTH_CONFIG),
+            "antigravity",
+            "gemini-3-pro",
+            now_unix_secs + 3_600,
+            now_unix_secs,
+            "test",
+        )
+        .await
+        .expect("runtime model quota fact should record");
+
+        let candidates = [
+            AntigravityModelQuotaCandidate {
+                key: &good,
+                provider_type: "antigravity",
+                model: "gemini-3-pro",
+            },
+            AntigravityModelQuotaCandidate {
+                key: &bad,
+                provider_type: "antigravity",
+                model: "gemini-3-pro",
+            },
+            AntigravityModelQuotaCandidate {
+                key: &free,
+                provider_type: "antigravity",
+                model: "gemini-3-pro",
+            },
+        ];
+        let states = app
+            .read_antigravity_model_quota_blocked(&candidates, now_unix_secs)
+            .await
+            .expect("one malformed credential must not fail the whole batch");
+        assert_eq!(
+            states,
+            vec![
+                SchedulerModelQuotaState::Blocked,
+                SchedulerModelQuotaState::StateUnavailable,
+                SchedulerModelQuotaState::Available,
+            ]
+        );
+    }
+
+    async fn model_fetch_model_state(
+        app: &AppState,
+        key: &StoredProviderCatalogKey,
+        model: &str,
+    ) -> SchedulerModelQuotaState {
+        let candidates = [AntigravityModelQuotaCandidate {
+            key,
+            provider_type: "antigravity",
+            model,
+        }];
+        <AppState as SchedulerRuntimeState>::read_antigravity_model_quota_blocked(
+            app,
+            &candidates,
+            current_unix_secs(),
+        )
+        .await
+        .expect("model quota read should succeed")
+        .into_iter()
+        .next()
+        .expect("one candidate")
+    }
+
+    #[tokio::test]
+    async fn model_fetch_positive_refresh_clears_captured_fact_but_stale_capture_keeps() {
+        use crate::data::GatewayDataState;
+        use crate::orchestration::AntigravityModelQuotaCandidate;
+        use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+        use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
+        use std::sync::Arc;
+
+        const AUTH_CONFIG: &str = r#"{"refresh_token":"fixture-model-fetch-refresh"}"#;
+        const MODEL: &str = "gemini-3-pro";
+
+        let sealer = AppState::new()
+            .expect("sealer state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    InMemoryProviderCatalogReadRepository::seed(vec![], vec![], vec![]),
+                ))
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let sealed = sealer
+            .seal_provider_catalog_key_auth_config("provider-fetch", "key-fetch", AUTH_CONFIG)
+            .expect("auth config should seal");
+        let mut key = StoredProviderCatalogKey::new(
+            "key-fetch".to_string(),
+            "provider-fetch".to_string(),
+            "fetch".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.encrypted_auth_config = Some(sealed);
+        key.upstream_metadata = Some(json!({
+            "antigravity": {
+                "project_id": "project-fetch",
+                "quota_by_model": {
+                    "gemini-3-pro": {"remaining_fraction": 0.0}
+                }
+            }
+        }));
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![],
+            vec![],
+            vec![key.clone()],
+        ));
+        let catalog_reader: Arc<dyn ProviderCatalogReadRepository> = repository.clone();
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(catalog_reader)
+                    .attach_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+
+        let serving_transport = GatewayProviderTransportSnapshot {
+            provider: GatewayProviderTransportProvider {
+                id: "provider-fetch".to_string(),
+                name: "fetch".to_string(),
+                provider_type: "antigravity".to_string(),
+                website: None,
+                is_active: true,
+                keep_priority_on_conversion: false,
+                enable_format_conversion: false,
+                concurrent_limit: None,
+                max_retries: None,
+                proxy: None,
+                request_timeout_secs: None,
+                stream_first_byte_timeout_secs: None,
+                config: None,
+            },
+            endpoint: GatewayProviderTransportEndpoint {
+                id: "endpoint-fetch".to_string(),
+                provider_id: "provider-fetch".to_string(),
+                api_format: "gemini:generate_content".to_string(),
+                api_family: Some("gemini".to_string()),
+                endpoint_kind: Some("generate_content".to_string()),
+                is_active: true,
+                base_url: "https://integrations.invalid".to_string(),
+                header_rules: None,
+                body_rules: None,
+                max_retries: None,
+                custom_path: None,
+                config: None,
+                format_acceptance_config: None,
+                proxy: None,
+            },
+            key: GatewayProviderTransportKey {
+                id: "key-fetch".to_string(),
+                provider_id: "provider-fetch".to_string(),
+                name: "fetch".to_string(),
+                auth_type: "oauth".to_string(),
+                is_active: true,
+                api_formats: Some(vec!["gemini:generate_content".to_string()]),
+                auth_type_by_format: None,
+                allow_auth_channel_mismatch_formats: None,
+                allowed_models: None,
+                capabilities: None,
+                rate_multipliers: None,
+                global_priority_by_format: None,
+                expires_at_unix_secs: None,
+                proxy: None,
+                fingerprint: None,
+                upstream_metadata: key.upstream_metadata.clone(),
+                decrypted_api_key: "fetch-token".to_string(),
+                decrypted_auth_config: Some(AUTH_CONFIG.to_string()),
+            },
+        };
+
+        let now_unix_secs = current_unix_secs();
+        crate::orchestration::record_antigravity_model_quota_exhaustion_with_auth_config(
+            app.runtime_state.as_ref(),
+            &key,
+            Some(AUTH_CONFIG),
+            "antigravity",
+            MODEL,
+            now_unix_secs + 3_600,
+            now_unix_secs,
+            "test",
+        )
+        .await
+        .expect("fact should record");
+        let capture =
+            <AppState as ModelFetchRuntimeState>::capture_antigravity_model_quota_refresh(
+                &app,
+                &serving_transport,
+            )
+            .await
+            .expect("capture should not fail")
+            .expect("antigravity key should capture");
+        assert_eq!(
+            model_fetch_model_state(&app, &key, MODEL).await,
+            SchedulerModelQuotaState::Blocked
+        );
+
+        let positive_bucket = json!({
+            "project_id": "project-fetch",
+            "quota_by_model": {
+                "gemini-3-pro": {"remaining_fraction": 0.8}
+            }
+        });
+        // The reconcile reads positivity from the strongly persisted Key state.
+        let updated = app
+            .update_provider_catalog_key_runtime_metadata(
+                &ProviderCatalogKeyRuntimeMetadataUpdate {
+                    key_id: key.id.clone(),
+                    namespace: "antigravity".to_string(),
+                    expected_upstream_metadata_value: key
+                        .upstream_metadata
+                        .as_ref()
+                        .and_then(|value| value.get("antigravity"))
+                        .cloned(),
+                    upstream_metadata_value: positive_bucket.clone(),
+                    status_snapshot_patch: json!({}),
+                    updated_at_unix_secs: Some(now_unix_secs),
+                },
+            )
+            .await
+            .expect("positive metadata should persist");
+        assert!(updated, "positive metadata CAS should match the seeded key");
+        // Production callers pass the metadata document that was just persisted;
+        // reconcile intersects it with the strongly persisted positive buckets.
+        let incoming_positive = json!({ "antigravity": positive_bucket.clone() });
+        <AppState as ModelFetchRuntimeState>::reconcile_antigravity_model_quota_refresh(
+            &app,
+            &capture,
+            Some(&incoming_positive),
+        )
+        .await
+        .expect("positive refresh should reconcile");
+        assert_eq!(
+            model_fetch_model_state(&app, &key, MODEL).await,
+            SchedulerModelQuotaState::Available
+        );
+
+        // A fact learned after the capture is not byte-identical, so a positive
+        // refresh with a stale capture must keep it.
+        crate::orchestration::record_antigravity_model_quota_exhaustion_with_auth_config(
+            app.runtime_state.as_ref(),
+            &key,
+            Some(AUTH_CONFIG),
+            "antigravity",
+            MODEL,
+            now_unix_secs + 7_200,
+            now_unix_secs,
+            "test",
+        )
+        .await
+        .expect("fact should record");
+        let stale_capture =
+            <AppState as ModelFetchRuntimeState>::capture_antigravity_model_quota_refresh(
+                &app,
+                &serving_transport,
+            )
+            .await
+            .expect("capture should not fail")
+            .expect("antigravity key should capture");
+        crate::orchestration::record_antigravity_model_quota_exhaustion_with_auth_config(
+            app.runtime_state.as_ref(),
+            &key,
+            Some(AUTH_CONFIG),
+            "antigravity",
+            MODEL,
+            now_unix_secs + 10_800,
+            now_unix_secs,
+            "test",
+        )
+        .await
+        .expect("newer fact should record");
+        <AppState as ModelFetchRuntimeState>::reconcile_antigravity_model_quota_refresh(
+            &app,
+            &stale_capture,
+            Some(&incoming_positive),
+        )
+        .await
+        .expect("stale capture reconcile should be a no-op");
+        assert_eq!(
+            model_fetch_model_state(&app, &key, MODEL).await,
+            SchedulerModelQuotaState::Blocked,
+            "a fact written after the capture must survive a positive refresh"
         );
     }
 }

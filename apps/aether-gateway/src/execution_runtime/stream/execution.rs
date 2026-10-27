@@ -6500,6 +6500,8 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     status_code,
                     response_text: error_response_text.as_deref(),
                     quota_exhaustion: None,
+                    antigravity_model_quota_exhaustion: None,
+                    headers: None,
                 }),
             )
             .await;
@@ -6608,10 +6610,17 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 status_code,
                 response_text: error_response_text.as_deref(),
                 quota_exhaustion: failover_analysis.quota_exhaustion,
+                antigravity_model_quota_exhaustion: failover_analysis
+                    .antigravity_model_quota_exhaustion,
+                headers: Some(&headers),
             }),
         )
         .await;
-        if failover_analysis.quota_exhaustion.is_none() {
+        if failover_analysis.quota_exhaustion.is_none()
+            && failover_analysis
+                .antigravity_model_quota_exhaustion
+                .is_none()
+        {
             apply_local_execution_effect(
                 state,
                 LocalExecutionEffectContext {

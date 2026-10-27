@@ -103,6 +103,7 @@ pub(crate) async fn analyze_local_candidate_failover_sync(
         .is_some_and(execution_error_is_transport)
     {
         analysis.quota_exhaustion = None;
+        analysis.antigravity_model_quota_exhaustion = None;
         if matches!(
             analysis.classification,
             LocalFailoverClassification::RetryQuotaExhausted
@@ -114,6 +115,7 @@ pub(crate) async fn analyze_local_candidate_failover_sync(
                     classification: LocalFailoverClassification::RetryUpstreamFailure,
                     decision: LocalFailoverDecision::RetryNextCandidate,
                     quota_exhaustion: None,
+                    antigravity_model_quota_exhaustion: None,
                 },
             );
         }
@@ -128,6 +130,7 @@ pub(crate) async fn analyze_local_candidate_failover_sync(
                 classification: LocalFailoverClassification::StopExecutionError,
                 decision: LocalFailoverDecision::StopLocalFailover,
                 quota_exhaustion: analysis.quota_exhaustion,
+                antigravity_model_quota_exhaustion: analysis.antigravity_model_quota_exhaustion,
             };
         }
     }
@@ -136,7 +139,9 @@ pub(crate) async fn analyze_local_candidate_failover_sync(
         // Mutating cancel/delete operations must never be replayed on another
         // credential. Preserve quota evidence for scheduling, while the
         // request-level terminal rule remains authoritative.
-        return if analysis.quota_exhaustion.is_some() {
+        return if analysis.quota_exhaustion.is_some()
+            || analysis.antigravity_model_quota_exhaustion.is_some()
+        {
             LocalFailoverAnalysis {
                 decision: LocalFailoverDecision::StopLocalFailover,
                 ..analysis
@@ -1136,6 +1141,7 @@ mod tests {
         assert_eq!(
             policy,
             LocalFailoverPolicy {
+                provider_type: "custom".to_string(),
                 max_retries: Some(1),
                 routing_rules: Default::default(),
                 max_transfer_count: 0,

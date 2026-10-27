@@ -1480,6 +1480,14 @@ where
                         .cloned(),
                 }
             });
+        // The CAS patch replaces the whole namespace, so it must carry the
+        // already-merged namespace value rather than the raw observation-only
+        // update (which would drop fields such as quota_by_model).
+        let upstream_metadata_patch = metadata_updates.first().map(|(namespace, value)| {
+            let mut patch = serde_json::Map::with_capacity(1);
+            patch.insert(namespace.clone(), value.clone());
+            serde_json::Value::Object(patch)
+        });
         return state
             .app()
             .compare_and_update_provider_catalog_key_oauth_runtime_state(
@@ -1497,7 +1505,7 @@ where
                     expires_at_unix_secs_update: None,
                     oauth_invalid_at_unix_secs: latest_key.oauth_invalid_at_unix_secs,
                     oauth_invalid_reason: latest_key.oauth_invalid_reason.clone(),
-                    upstream_metadata_patch: metadata_update.cloned(),
+                    upstream_metadata_patch,
                     upstream_metadata_namespace_to_remove: None,
                     status_snapshot_patch: status_patch,
                     reset_error_count: false,
@@ -3316,6 +3324,160 @@ mod tests {
         assert_eq!(
             stored.upstream_metadata.as_ref().unwrap()["codex"],
             json!({"remaining":4})
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_fenced_observation_update_preserves_merged_namespace_and_honors_cas() {
+        let provider_id = "provider-antigravity-fenced-observation";
+        let key_id = "key-antigravity-fenced-observation";
+        let bootstrap = AppState::new()
+            .expect("bootstrap app should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let encrypted_auth_config = bootstrap
+            .seal_provider_catalog_key_auth_config(
+                provider_id,
+                key_id,
+                r#"{"refresh_token":"rt-1","access_token":"at-1"}"#,
+            )
+            .expect("auth config should seal");
+        let mut key = StoredProviderCatalogKey::new(
+            key_id.to_string(),
+            provider_id.to_string(),
+            "Antigravity fenced observation".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.encrypted_auth_config = Some(encrypted_auth_config.clone());
+        let quota_by_model = json!({
+            "gemini-3-pro-preview": {
+                "remaining_fraction": 0.0,
+                "percent_used": 100.0,
+                "reset_time": "2030-01-01T00:00:00Z",
+                "source_updated_at_unix_secs": 100u64
+            }
+        });
+        key.upstream_metadata = Some(json!({
+            "antigravity": {
+                "project_id": "proj-1",
+                "quota_by_model": quota_by_model,
+                "updated_at": 100u64
+            },
+            "codex": {"remaining": 7}
+        }));
+        key.status_snapshot = Some(json!({"quota": {"exhausted": true}}));
+        let provider = StoredProviderCatalogProvider::new(
+            provider_id.to_string(),
+            "Antigravity Fenced Observation".to_string(),
+            None,
+            "antigravity".to_string(),
+        )
+        .expect("provider should build");
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            vec![],
+            vec![key],
+        ));
+        let app = AppState::new()
+            .expect("app should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                    &repository,
+                ))
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let admin_state = AdminAppState::new(&app);
+        let credential_fence = ProviderTransportCredentialFence {
+            encrypted_auth_config: encrypted_auth_config.clone(),
+            credential: ProviderCatalogKeyOAuthCredentialFence {
+                encrypted_api_key: None,
+                auth_type: "oauth".to_string(),
+                provider_id: provider_id.to_string(),
+                provider_type: "antigravity".to_string(),
+            },
+        };
+
+        let observation_update = json!({"antigravity": {"account_email": "a@example.com"}});
+        let persisted = persist_provider_quota_refresh_state_after_read(
+            &admin_state,
+            key_id,
+            Some(&observation_update),
+            None,
+            None,
+            None,
+            Some(&credential_fence),
+            std::future::ready(()),
+        )
+        .await
+        .expect("fenced observation persistence should complete");
+        assert!(
+            persisted,
+            "credential-fenced observation update should persist"
+        );
+
+        let stored = repository
+            .list_keys_by_ids(&[key_id.to_string()])
+            .await
+            .expect("key should reload")
+            .pop()
+            .expect("key should remain");
+        let antigravity = &stored.upstream_metadata.as_ref().unwrap()["antigravity"];
+        assert_eq!(antigravity["project_id"], json!("proj-1"));
+        assert_eq!(antigravity["quota_by_model"], quota_by_model);
+        assert_eq!(antigravity["account_email"], json!("a@example.com"));
+        assert_eq!(
+            stored.upstream_metadata.as_ref().unwrap()["codex"],
+            json!({"remaining": 7}),
+            "unrelated namespace must survive the observation update"
+        );
+
+        // A concurrent namespace write wins: the stale merged patch must not
+        // overwrite it, and the call reports the CAS conflict.
+        let expected_namespace = antigravity.clone();
+        let concurrent_repository = Arc::clone(&repository);
+        let stale_observation = json!({"antigravity": {"account_email": "b@example.com"}});
+        let persisted = persist_provider_quota_refresh_state_after_read(
+            &admin_state,
+            key_id,
+            Some(&stale_observation),
+            None,
+            None,
+            None,
+            Some(&credential_fence),
+            async move {
+                assert!(concurrent_repository
+                    .update_key_runtime_metadata(&ProviderCatalogKeyRuntimeMetadataUpdate {
+                        key_id: key_id.to_string(),
+                        namespace: "antigravity".to_string(),
+                        expected_upstream_metadata_value: Some(expected_namespace),
+                        upstream_metadata_value: json!({"account_email": "concurrent"}),
+                        status_snapshot_patch: json!({}),
+                        updated_at_unix_secs: Some(150),
+                    })
+                    .await
+                    .expect("concurrent metadata update should execute"));
+            },
+        )
+        .await
+        .expect("CAS conflict should not error");
+        assert!(
+            !persisted,
+            "stale merged namespace must report a CAS conflict"
+        );
+        let stored = repository
+            .list_keys_by_ids(&[key_id.to_string()])
+            .await
+            .expect("key should reload")
+            .pop()
+            .expect("key should remain");
+        assert_eq!(
+            stored.upstream_metadata.as_ref().unwrap()["antigravity"],
+            json!({"account_email": "concurrent"})
         );
     }
 

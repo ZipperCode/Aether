@@ -1,9 +1,11 @@
+use super::antigravity_model_quota::classify_antigravity_model_quota_exhaustion;
 use super::classifier::{
-    classify_failure_disposition, classify_local_failover, classify_local_quota_exhaustion,
-    classify_local_transport_error, FailureRetryAction, LocalFailoverClassification,
-    LocalFailoverInput, LocalQuotaExhaustionEvidence, LocalTransportFailoverClassification,
+    classify_failure_disposition, classify_local_failover_with_quota_evidence,
+    classify_local_quota_exhaustion, classify_local_transport_error, FailureRetryAction,
+    LocalFailoverClassification, LocalFailoverInput, LocalQuotaExhaustionEvidence,
+    LocalTransportFailoverClassification,
 };
-use super::LocalFailoverPolicy;
+use super::{AntigravityModelQuotaEvidence, LocalFailoverPolicy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalFailoverDecision {
@@ -27,6 +29,8 @@ pub(crate) struct LocalFailoverAnalysis {
     pub(crate) classification: LocalFailoverClassification,
     pub(crate) decision: LocalFailoverDecision,
     pub(crate) quota_exhaustion: Option<LocalQuotaExhaustionEvidence>,
+    /// Resettable Antigravity per-model quota evidence.  Never account-wide.
+    pub(crate) antigravity_model_quota_exhaustion: Option<AntigravityModelQuotaEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +45,7 @@ impl LocalFailoverAnalysis {
             classification: LocalFailoverClassification::UseDefault,
             decision: LocalFailoverDecision::UseDefault,
             quota_exhaustion: None,
+            antigravity_model_quota_exhaustion: None,
         }
     }
 }
@@ -49,11 +54,31 @@ pub(crate) fn analyze_local_failover(
     policy: &LocalFailoverPolicy,
     input: LocalFailoverInput<'_>,
 ) -> LocalFailoverAnalysis {
-    let classification = classify_local_failover(policy, input);
+    let quota_exhaustion = classify_local_quota_exhaustion(policy, input);
+    // Administrator-configured and account-level quota evidence keeps
+    // precedence; only otherwise-unclassified responses can become a scoped
+    // Antigravity model fact.
+    let antigravity_model_quota_exhaustion = quota_exhaustion
+        .is_none()
+        .then(|| {
+            classify_antigravity_model_quota_exhaustion(
+                &policy.provider_type,
+                input.status_code,
+                input.response_text,
+            )
+        })
+        .flatten();
+    let classification = classify_local_failover_with_quota_evidence(
+        policy,
+        input,
+        quota_exhaustion,
+        antigravity_model_quota_exhaustion.is_some(),
+    );
     LocalFailoverAnalysis {
         classification,
         decision: decision_from_classification(classification),
-        quota_exhaustion: classify_local_quota_exhaustion(policy, input),
+        quota_exhaustion,
+        antigravity_model_quota_exhaustion,
     }
 }
 
@@ -104,6 +129,7 @@ pub(crate) fn apply_provider_failure_disposition(
         classification: analysis.classification,
         decision,
         quota_exhaustion: analysis.quota_exhaustion,
+        antigravity_model_quota_exhaustion: analysis.antigravity_model_quota_exhaustion,
     }
 }
 

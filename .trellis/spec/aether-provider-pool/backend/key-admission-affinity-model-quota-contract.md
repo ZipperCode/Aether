@@ -4,9 +4,10 @@
 
 Use this contract when changing Provider Key `concurrent_limit`, runtime
 semaphores, sync/stream/WebSocket admission, Pool cache affinity, model quota
-windows, Antigravity discovered-model admission and quota projection, Codex
-reset-credit state, or quota-driven model discovery. It keeps every transport
-on the same atomic Key capacity and separates model availability from quota.
+windows, Antigravity discovered-model admission, runtime quota feedback and
+quota projection, Codex reset-credit state, or quota-driven model discovery.
+It keeps every transport on the same atomic Key capacity and separates model
+availability from quota.
 
 ## 2. Signatures
 
@@ -34,6 +35,24 @@ pub fn provider_pool_key_supports_discovered_model(
     provider_type: &str,
     provider_model_name: &str,
 ) -> bool;
+
+pub(crate) async fn antigravity_model_quota_blocked_many_with_auth_configs(
+    runtime: &RuntimeState,
+    candidates: &[AntigravityModelQuotaCandidate<'_>],
+    auth_configs: &[Option<&str>],
+    now_unix_secs: u64,
+) -> Result<Vec<bool>, GatewayError>;
+
+pub(crate) async fn capture_antigravity_model_quota_refresh(
+    state: &AppState,
+    serving_transport: &GatewayProviderTransportSnapshot,
+) -> Result<Option<AntigravityModelQuotaRefreshCapture>, GatewayError>;
+
+pub(crate) async fn reconcile_antigravity_model_quota_refresh(
+    state: &AppState,
+    capture: &AntigravityModelQuotaRefreshCapture,
+    upstream_metadata: Option<&serde_json::Value>,
+) -> Result<(), GatewayError>;
 ```
 
 Relevant persisted/admin JSON shapes are:
@@ -142,6 +161,48 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   same real-Key guards. Failed fetch, `no_metadata`, account-only observations,
   CAS conflicts and persistence errors do not claim quota recovery. Manual
   scheduling bans, disablement, OAuth, health and cooldown remain independent.
+- Runtime Antigravity quota observations use shared RuntimeState namespace
+  `aether:antigravity:model-quota:v1`, indexed by hashed Provider/actual Key,
+  credential generation and exact upstream model. The internal record contains
+  `version`, `provider_id`, `key_id`, `credential_generation`, `model`,
+  `deadline_unix_secs`, unique `observation_id` and `source`; no API/schema change.
+  OAuth refresh-token identity survives access-token rotation; credential
+  replacement fences out old observations. Access-token-only credentials use
+  the existing full credential fence.
+- Only Antigravity HTTP 429 with structured `QUOTA_EXHAUSTED`/`QUOTA_EXCEEDED`
+  detail reasons or quota-reset metadata enters this model-only path. Generic
+  `RESOURCE_EXHAUSTED`, explicit rate/RPM evidence, account/auth failures and
+  other Providers retain existing behavior. Administrator quota rules take
+  precedence. An explicitly named model must match the selected upstream model
+  after trimming and ASCII case-insensitive comparison; a mismatch records no
+  scoped fact. Missing model metadata uses the actual selected model, never a
+  family, client alias or another account's catalog.
+- Deadlines prefer parsed upstream reset metadata, then numeric `Retry-After`,
+  then configured quota cooldown (300 seconds when zero), bounded to 1 second
+  through 31 days. Ordinary/Pool/sticky admission reads the shared fact even
+  with cached candidates, before fallback/window truncation. Use existing
+  `account_quota_exhausted` / `pool_account_exhausted` reasons for the affected
+  pair; backend errors use `key_quota_state_unavailable` /
+  `pool_key_state_unavailable`. One credential decryption failure affects only
+  its descriptors. PoolGroup representatives do not consume real-Key facts.
+- Scoped errors retain failed-attempt diagnostics and release Pool leases, but
+  never write account cooldown, Pool `QuotaExhausted`, health/circuit, adaptive
+  RPM, OAuth invalidation or manual-recovery scheduling bans. Recording
+  invalidates local candidate pages and affinity cache; positive refresh keeps
+  affinity mappings and independent manual restrictions intact.
+- Capture scoped observations before a quota fetch. After successful persisted
+  refresh, strongly re-read the credential and positive exact-model metadata
+  under the Provider/Key quota projection lock; clear only captured records
+  still byte-identical and positive in both incoming and durable metadata.
+  Unique observation IDs preserve newer same-second failures. Failed fetch,
+  observation-only patches, CAS conflicts, stale refresh and unrelated model
+  success do not clear an active fact. Elapsed deadlines release only this
+  resettable guard; replacement credentials cannot match the old generation.
+- Credential-fenced quota persistence sends the already-merged provider
+  namespace, not the raw observation-only patch: memory/PostgreSQL perform a
+  top-level namespace merge. A failed-fetch account observation must preserve
+  existing `quota_by_model`, project and unrelated namespaces; retain namespace
+  CAS conflict detection and credential fencing.
 - Antigravity 额度刷新仅保存额度与上游模型发现元数据，不调用模型目录导入，不创建或修改 GlobalModel、ProviderModel 和 Endpoint 绑定。该边界适用于 OAuth 更新后、后台探测与手动刷新，避免已删除模型被自动恢复。
 - 模型目录由管理员显式导入；导入仍使用发现结果中的准确 `endpoint_ids`，不以额度刷新代替用户确认。
 - Antigravity OAuth exchange resolves Google userinfo through the same selected
@@ -190,6 +251,15 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
 | Exact model has exhausted and unknown independent windows | Preserve fail-open `all` semantics; do not discard the unknown window. |
 | Raw `reset_time` / `next_reset_time` elapsed | Same recovery as the materialized snapshot without waiting for cache TTL. |
 | Successful persisted model refresh, exhausted to available | Recompute candidate and resolved pages on the next selection; preserve affinity. |
+| Antigravity structured `QUOTA_EXHAUSTED`/`QUOTA_EXCEEDED` or quota-reset 429 | Record only the actual Key and selected upstream model in shared RuntimeState; skip that exact pair on the next ordinary/Pool/sticky selection. |
+| Antigravity generic `RATE_LIMIT_EXCEEDED`, per-minute or RPM 429 | Preserve account-level cooldown, health, adaptive RPM and existing Pool feedback; do not create a model-only fact. |
+| Scoped model-quota fact active with a sibling model on the same Key | Keep the sibling model eligible immediately; do not reuse account-wide cooldown or Pool `QuotaExhausted`. |
+| Scoped model-quota fact active with the same model on another Key | Continue with the eligible Key/account. |
+| Runtime quota state read fails or returns a malformed batch | Mark the affected Key/model state unavailable; never report it as exhausted or generate against a known blocked pair. |
+| Credential generation changes before effect persistence | Reject the stale observation; do not block the replacement credential. |
+| Failed or unrelated quota refresh | Retain the active exact-model fact and continue unrelated model serving. |
+| Matching persisted refresh succeeds or the scoped deadline elapses | Release only the exact Key/model guard; preserve independent manual bans/cooldowns. Positive refresh preserves affinity. |
+| All eligible accounts have the requested exact-model fact active | Return HTTP 503 with zero generation attempts for that model; background quota probes remain eligible. |
 | `fetchAvailableModels` fails but `loadCodeAssist` succeeds | Preserve old quota and never restore an exhausted model from the account observation. |
 | Positive refresh with manual ban or disabled Key | Keep the Key ineligible. |
 | All Antigravity target-model accounts exhausted | HTTP 503 and zero generation requests; background probes remain eligible. |
@@ -260,6 +330,19 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   counts for warm A, exhausted A -> B, refreshed A/B exhausted -> A, failed quota
   fetch, manual ban, disable/re-enable and all-exhausted HTTP 503. No restart,
   TTL wait, production credentials or external Google/database service.
+- `gateway_antigravity_runtime_quota_isolation` runs real localhost ordinary and
+  Pool/cache-affinity sync/native-SSE flows in both directions. Assert real
+  upstream quota 429, zero repeated generation on the affected Key/model,
+  sibling-model serving on the same Key, affected-model fallback to another
+  account, positive-refresh recovery, failed-refresh retention, native SSE
+  `STOP`/exact text/model identity and zero account-wide penalties.
+- `gateway_antigravity_generic_rate_limit_remains_account_scoped` asserts
+  explicit `RATE_LIMIT_EXCEEDED` retains cooldown, health, adaptive RPM and
+  Pool feedback rather than becoming model-only quota evidence.
+- Runtime regressions assert expiry, OAuth rotation/replacement fences,
+  same-second refresh/failure ordering, positive exact-model intersection,
+  per-account decryption-error isolation, batch-read failure diagnostics and
+  ordinary/Pool/sticky filtering before truncation.
 - `antigravity_discovered_model_admission_uses_exact_account_evidence` covers
   exact identities, disabled flags, authoritative empty-map precedence, missing
   discovery fallback, and unchanged non-Antigravity behavior.
@@ -317,6 +400,13 @@ let ProviderPoolInFlightAdmission::Acquired(guard) = admission else {
 };
 // Keep `guard` alive for the complete execution/turn lifetime.
 ```
+
+For runtime Antigravity quota, wrong: turn every `RESOURCE_EXHAUSTED` into
+account-wide cooldown or Pool `QuotaExhausted`. Correct: require structured
+model-quota evidence, store a finite Provider/Key/credential/model fact, and
+consume it in ordinary/Pool/sticky admission. Clear only captured matching
+positive refresh observations or let the deadline expire; keep generic rate
+limits and administrator-recoverable account bans independent.
 
 For account tier display, wrong: `quota.plan_type = subscription_tier` (changes
 Pool scoring). Correct: persist `antigravity.subscription_tier` and render it

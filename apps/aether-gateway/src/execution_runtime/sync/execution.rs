@@ -3133,6 +3133,8 @@ async fn execute_execution_runtime_sync_impl(
                 status_code: result.status_code,
                 response_text: local_failover_response_text.as_deref(),
                 quota_exhaustion: None,
+                antigravity_model_quota_exhaustion: None,
+                headers: None,
             }),
         )
         .await;
@@ -3169,6 +3171,9 @@ async fn execute_execution_runtime_sync_impl(
                 status_code: result.status_code,
                 response_text: local_failover_response_text.as_deref(),
                 quota_exhaustion: local_failover_analysis.quota_exhaustion,
+                antigravity_model_quota_exhaustion: local_failover_analysis
+                    .antigravity_model_quota_exhaustion,
+                headers: Some(&headers),
             }),
         )
         .await;
@@ -3193,7 +3198,11 @@ async fn execute_execution_runtime_sync_impl(
             }),
         )
         .await;
-        if local_failover_analysis.quota_exhaustion.is_none() {
+        if local_failover_analysis.quota_exhaustion.is_none()
+            && local_failover_analysis
+                .antigravity_model_quota_exhaustion
+                .is_none()
+        {
             apply_local_execution_effect(
                 state,
                 LocalExecutionEffectContext {

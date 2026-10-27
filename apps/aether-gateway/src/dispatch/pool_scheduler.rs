@@ -54,7 +54,7 @@ use crate::handlers::shared::provider_pool::{
 };
 use crate::handlers::shared::{parse_catalog_auth_config_json, provider_key_health_summary};
 use crate::maintenance::spawn_pool_quota_probe_replenish_for_request;
-use crate::orchestration::LocalExecutionCandidateMetadata;
+use crate::orchestration::{AntigravityModelQuotaCandidate, LocalExecutionCandidateMetadata};
 use crate::stage_metrics::observe_gateway_stage_ms;
 
 static LOAD_BALANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -65,8 +65,12 @@ const ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON: &str = "routing_profile_disall
 const POOL_SCORE_SCHEDULE_INTEREST_CONCURRENCY: usize = 4;
 const POOL_SCORE_SCHEDULE_INTEREST_MAX_PER_BATCH: usize = 16;
 const POOL_SCORE_SCHEDULE_INTEREST_MIN_INTERVAL_SECS: u64 = 60;
+/// 只有该 Provider 的候选会消费精确模型的运行时额度事实。
+const POOL_RUNTIME_MODEL_QUOTA_PROVIDER_TYPE: &str = "antigravity";
 
 type PoolCatalogKeyContext = PoolMemberSignals;
+/// 精确到实际上游模型名的运行时跳过原因；同 Key 的其他模型不受影响。
+type PoolModelRuntimeSkipReasons = BTreeMap<String, BTreeMap<String, &'static str>>;
 
 /// 展开请求中的 Pool 组候选并收集跳过事实；普通候选保持原顺序进入后续执行。
 #[allow(clippy::too_many_arguments)]
@@ -201,7 +205,10 @@ async fn schedule_pool_page_candidates(
             Some((candidate.candidate.key_id.clone(), reason))
         })
         .collect::<BTreeMap<_, _>>();
-
+    // 实际成员的精确模型额度事实必须在冻结窗口和热池回退之前生效；只读取 Antigravity
+    // 候选，读取失败只报告状态不可用，绝不伪造成额度耗尽。
+    let model_runtime_skip_reasons =
+        read_pool_model_runtime_skip_reasons(state, &candidates, &keys_by_id, now_unix_secs).await;
     let mut runtime_by_provider = BTreeMap::new();
     let mut pool_config_by_provider = BTreeMap::new();
     let mut burst_provider_ids = BTreeSet::<String>::new();
@@ -257,6 +264,7 @@ async fn schedule_pool_page_candidates(
         &key_context_by_id,
         &effective_pool_config_by_provider,
         &key_runtime_skip_reasons,
+        &model_runtime_skip_reasons,
     );
     let scheduled = outcome.candidates;
     let skipped = outcome.skipped;
@@ -1716,6 +1724,200 @@ fn pool_candidate_from_catalog_key(
     candidate
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PoolRuntimeModelQuotaFacts {
+    /// 已确认耗尽的 (Key, 实际上游模型) 事实。
+    blocked: BTreeMap<String, BTreeSet<String>>,
+    /// 读取失败的 (Key, 实际上游模型)；只能报告状态不可用。
+    state_unavailable: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl PoolRuntimeModelQuotaFacts {
+    /// 按描述符顺序消费批量读取结果；长度不一致按状态不可用处理。
+    fn from_read(
+        identities: &[(&StoredProviderCatalogKey, &str, &str)],
+        blocked: Option<Vec<bool>>,
+    ) -> Self {
+        let Some(blocked) = blocked.filter(|blocked| blocked.len() == identities.len()) else {
+            return Self::unavailable(identities);
+        };
+        let mut facts = Self::default();
+        for ((key, _, model), blocked) in identities.iter().zip(blocked) {
+            if blocked {
+                facts
+                    .blocked
+                    .entry(key.id.clone())
+                    .or_default()
+                    .insert((*model).to_string());
+            }
+        }
+        facts
+    }
+
+    fn unavailable(identities: &[(&StoredProviderCatalogKey, &str, &str)]) -> Self {
+        let mut facts = Self::default();
+        for (key, _, model) in identities {
+            facts
+                .state_unavailable
+                .entry(key.id.clone())
+                .or_default()
+                .insert((*model).to_string());
+        }
+        facts
+    }
+}
+
+/// 收集会消费运行时模型额度事实的真实成员：只有 Antigravity、已强读目录、且实际
+/// 上游模型名非空的候选才参与，其他候选不产生任何描述符或后端读取。
+fn pool_model_runtime_quota_identities<'a>(
+    candidates: &'a [EligibleLocalExecutionCandidate],
+    keys_by_id: &'a BTreeMap<String, StoredProviderCatalogKey>,
+) -> Vec<(&'a StoredProviderCatalogKey, &'a str, &'a str)> {
+    let mut identities = Vec::new();
+    let mut seen = BTreeSet::<(&str, &str)>::new();
+    for candidate in candidates {
+        let provider_type = candidate.transport.provider.provider_type.as_str();
+        if !provider_type
+            .trim()
+            .eq_ignore_ascii_case(POOL_RUNTIME_MODEL_QUOTA_PROVIDER_TYPE)
+        {
+            continue;
+        }
+        let model = candidate.candidate.selected_provider_model_name.trim();
+        if model.is_empty() {
+            continue;
+        }
+        let Some(key) = keys_by_id.get(candidate.candidate.key_id.as_str()) else {
+            continue;
+        };
+        if !seen.insert((key.id.as_str(), model)) {
+            continue;
+        }
+        identities.push((key, provider_type, model));
+    }
+    identities
+}
+
+/// 读取同一页真实成员的精确模型额度事实，并投影为带模型边界的跳过原因。
+async fn read_pool_model_runtime_skip_reasons(
+    state: PlannerAppState<'_>,
+    candidates: &[EligibleLocalExecutionCandidate],
+    keys_by_id: &BTreeMap<String, StoredProviderCatalogKey>,
+    now_unix_secs: u64,
+) -> PoolModelRuntimeSkipReasons {
+    let identities = pool_model_runtime_quota_identities(candidates, keys_by_id);
+    if identities.is_empty() {
+        return PoolModelRuntimeSkipReasons::new();
+    }
+    let app = state.app();
+    // The shared fact is keyed by the account-stable refresh-token generation;
+    // decrypt the same credentials the writer observed. A malformed/legacy
+    // ciphertext on one account only marks that (key, model) unavailable and is
+    // excluded from the shared lookup so valid siblings keep serving.
+    let mut descriptors = Vec::with_capacity(identities.len());
+    let mut readable_identities = Vec::with_capacity(identities.len());
+    let mut auth_configs = Vec::with_capacity(identities.len());
+    let mut unresolved = Vec::new();
+    for &(key, provider_type, model) in &identities {
+        match app.decrypt_provider_catalog_key_auth_config(key) {
+            Ok(auth_config) => {
+                readable_identities.push((key, provider_type, model));
+                descriptors.push(AntigravityModelQuotaCandidate {
+                    key,
+                    provider_type,
+                    model,
+                });
+                auth_configs.push(auth_config);
+            }
+            Err(err) => {
+                warn!(
+                    error = ?err,
+                    provider_id = %key.provider_id,
+                    key_id = %key.id,
+                    "gateway pool scheduler: failed to decrypt antigravity key auth config"
+                );
+                unresolved.push((key.id.clone(), model.to_string()));
+            }
+        }
+    }
+    let read = if descriptors.is_empty() {
+        Ok(Vec::new())
+    } else {
+        let auth_config_refs = auth_configs
+            .iter()
+            .map(Option::as_deref)
+            .collect::<Vec<_>>();
+        crate::orchestration::antigravity_model_quota_blocked_many_with_auth_configs(
+            app.runtime_state.as_ref(),
+            &descriptors,
+            &auth_config_refs,
+            now_unix_secs,
+        )
+        .await
+        .map_err(|err| {
+            warn!(
+                error = ?err,
+                candidate_count = identities.len(),
+                "gateway pool scheduler: failed to read antigravity runtime model quota state"
+            );
+        })
+    };
+    let mut facts = PoolRuntimeModelQuotaFacts::from_read(&readable_identities, read.ok());
+    for (key_id, model) in unresolved {
+        facts
+            .state_unavailable
+            .entry(key_id)
+            .or_default()
+            .insert(model);
+    }
+    pool_model_runtime_skip_reasons(candidates, &facts)
+}
+
+/// 将运行时事实投影为 Pool 既有诊断：耗尽复用账号额度原因，读取失败复用状态不可用
+/// 原因。原因以实际上游模型名为边界，同 Key 的其他模型保持可调度。
+fn pool_model_runtime_skip_reasons(
+    candidates: &[EligibleLocalExecutionCandidate],
+    facts: &PoolRuntimeModelQuotaFacts,
+) -> PoolModelRuntimeSkipReasons {
+    let mut reasons = PoolModelRuntimeSkipReasons::new();
+    for candidate in candidates {
+        if !candidate
+            .transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case(POOL_RUNTIME_MODEL_QUOTA_PROVIDER_TYPE)
+        {
+            continue;
+        }
+        let key_id = candidate.candidate.key_id.as_str();
+        let model = candidate.candidate.selected_provider_model_name.trim();
+        let reason = if facts
+            .state_unavailable
+            .get(key_id)
+            .is_some_and(|models| models.contains(model))
+        {
+            Some(POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON)
+        } else if facts
+            .blocked
+            .get(key_id)
+            .is_some_and(|models| models.contains(model))
+        {
+            Some(POOL_ACCOUNT_EXHAUSTED_SKIP_REASON)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            reasons
+                .entry(key_id.to_string())
+                .or_default()
+                .entry(model.to_string())
+                .or_insert(reason);
+        }
+    }
+    reasons
+}
+
 /// 强读候选 Key 的目录事实并构建调度上下文；读取失败或缺项时显式标记不可用以关闭候选。
 /// 每个成员自己解析出的模型名只交给 Provider 额度适配器，不改变目录缺失时的 fail-closed 行为。
 async fn read_pool_catalog_key_contexts_by_id(
@@ -1956,6 +2158,7 @@ fn apply_local_execution_pool_scheduler_with_runtime_map_outcome(
         key_context_by_id,
         &BTreeMap::new(),
         &BTreeMap::new(),
+        &PoolModelRuntimeSkipReasons::new(),
     )
 }
 
@@ -1965,6 +2168,7 @@ fn apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs(
     key_context_by_id: &BTreeMap<String, PoolCatalogKeyContext>,
     effective_pool_config_by_provider: &BTreeMap<String, AdminProviderPoolConfig>,
     key_runtime_skip_reasons: &BTreeMap<String, &'static str>,
+    model_runtime_skip_reasons: &PoolModelRuntimeSkipReasons,
 ) -> PoolSchedulerApplyOutcome {
     let (scheduled, skipped) = run_local_execution_pool_scheduler_with_runtime_map(
         candidates.clone(),
@@ -1972,6 +2176,7 @@ fn apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs(
         key_context_by_id,
         effective_pool_config_by_provider,
         key_runtime_skip_reasons,
+        model_runtime_skip_reasons,
         true,
     );
     let mut active_probe_evicted_members_by_provider =
@@ -2001,6 +2206,7 @@ fn apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs(
         key_context_by_id,
         effective_pool_config_by_provider,
         key_runtime_skip_reasons,
+        model_runtime_skip_reasons,
         false,
     );
     merge_active_probe_evictions(
@@ -2069,6 +2275,7 @@ fn run_local_execution_pool_scheduler_with_runtime_map(
     key_context_by_id: &BTreeMap<String, PoolCatalogKeyContext>,
     effective_pool_config_by_provider: &BTreeMap<String, AdminProviderPoolConfig>,
     key_runtime_skip_reasons: &BTreeMap<String, &'static str>,
+    model_runtime_skip_reasons: &PoolModelRuntimeSkipReasons,
     enforce_active_probe_seal: bool,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
@@ -2147,11 +2354,22 @@ fn run_local_execution_pool_scheduler_with_runtime_map(
         .filter_map(|scheduled| {
             let candidate = scheduled.candidate;
             // 在冻结窗口和热池回退判定之前过滤真实 Key，同时保留前面 Pool 硬过滤的原因。
-            if let Some(&skip_reason) = key_runtime_skip_reasons.get(&candidate.candidate.key_id) {
+            let model_skip_reason = model_runtime_skip_reasons
+                .get(candidate.candidate.key_id.as_str())
+                .and_then(|models| {
+                    models.get(candidate.candidate.selected_provider_model_name.trim())
+                })
+                .copied();
+            let skip_reason = key_runtime_skip_reasons
+                .get(&candidate.candidate.key_id)
+                .copied()
+                .or(model_skip_reason);
+            if let Some(skip_reason) = skip_reason {
                 debug!(
                     event_name = "pool_candidate_runtime_skipped",
                     provider_id = %candidate.candidate.provider_id,
                     key_id = %candidate.candidate.key_id,
+                    selected_provider_model_name = %candidate.candidate.selected_provider_model_name,
                     skip_reason,
                     "gateway pool scheduler skipped key during runtime selectability resolution"
                 );
@@ -2370,10 +2588,12 @@ mod tests {
         apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs,
         build_pool_catalog_key_context, effective_pool_config_for_group, pool_config_for_candidate,
         pool_key_candidate_order_for_group, pool_key_requires_reauth_for_scheduling,
+        pool_model_runtime_quota_identities, pool_model_runtime_skip_reasons,
         pool_skip_reason_releases_scan_budget,
         prune_unschedulable_active_probe_members_for_request,
         remove_active_probe_members_for_request, should_trigger_active_probe_burst_for_request,
-        PoolCatalogKeyContext, PoolKeyCursor, POOL_ACTIVE_PROBE_SEALED_SKIP_REASON,
+        PoolCatalogKeyContext, PoolKeyCursor, PoolModelRuntimeSkipReasons,
+        PoolRuntimeModelQuotaFacts, POOL_ACTIVE_PROBE_SEALED_SKIP_REASON,
         ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON,
     };
     use crate::ai_serving::{
@@ -2404,7 +2624,7 @@ mod tests {
     };
     use aether_pool_core::{
         PoolMemberSignals, PoolSchedulingPreset, POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
-        POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON,
+        POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON, POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON,
     };
     use aether_provider_pool::ProviderPoolService;
     use aether_provider_transport::snapshot::{
@@ -3855,6 +4075,7 @@ mod tests {
             &key_context_by_id,
             &effective_configs,
             &BTreeMap::new(),
+            &PoolModelRuntimeSkipReasons::new(),
         );
 
         assert!(outcome.skipped.is_empty());
@@ -4511,6 +4732,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &reasons,
+            &PoolModelRuntimeSkipReasons::new(),
         );
         assert_eq!(outcome.candidates.len(), 1);
         assert_eq!(outcome.candidates[0].candidate.key_id, "key-cold");
@@ -4527,6 +4749,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &reasons,
+            &PoolModelRuntimeSkipReasons::new(),
         );
         assert!(outcome.candidates.is_empty());
         assert_eq!(outcome.skipped.len(), 2);
@@ -4552,6 +4775,7 @@ mod tests {
             &contexts,
             &BTreeMap::new(),
             &reasons,
+            &PoolModelRuntimeSkipReasons::new(),
         );
         assert!(outcome.candidates.is_empty());
         assert!(outcome
@@ -4564,6 +4788,352 @@ mod tests {
             .iter()
             .any(|item| item.candidate.key_id == "key-cold"
                 && item.skip_reason == "pool_key_state_unavailable"));
+    }
+
+    fn antigravity_pool_candidate(key_id: &str, model: &str) -> EligibleLocalExecutionCandidate {
+        let mut candidate =
+            sample_eligible_candidate("provider-antigravity", "endpoint-gemini", key_id, 10, None);
+        candidate.candidate.provider_type = "antigravity".to_string();
+        candidate.candidate.endpoint_api_format = "gemini:generate_content".to_string();
+        candidate.candidate.global_model_name = model.to_string();
+        candidate.candidate.selected_provider_model_name = model.to_string();
+        candidate.provider_api_format = "gemini:generate_content".to_string();
+        let transport = Arc::make_mut(&mut candidate.transport);
+        transport.provider.provider_type = "antigravity".to_string();
+        transport.endpoint.api_format = "gemini:generate_content".to_string();
+        transport.endpoint.api_family = Some("gemini".to_string());
+        transport.endpoint.endpoint_kind = Some("generate_content".to_string());
+        transport.key.auth_type = "oauth".to_string();
+        candidate
+    }
+
+    fn runtime_quota_facts(
+        blocked: &[(&str, &str)],
+        unavailable: &[(&str, &str)],
+    ) -> PoolRuntimeModelQuotaFacts {
+        let mut facts = PoolRuntimeModelQuotaFacts::default();
+        for (key_id, model) in blocked {
+            facts
+                .blocked
+                .entry((*key_id).to_string())
+                .or_default()
+                .insert((*model).to_string());
+        }
+        for (key_id, model) in unavailable {
+            facts
+                .state_unavailable
+                .entry((*key_id).to_string())
+                .or_default()
+                .insert((*model).to_string());
+        }
+        facts
+    }
+
+    #[test]
+    fn pool_runtime_model_quota_scopes_skip_to_actual_upstream_model() {
+        // 同一 Key 的实际上游模型互为独立额度桶；另一个账号的同名模型也不得被牵连。
+        let gemini = antigravity_pool_candidate("key-a", "gemini-3-pro");
+        let claude = antigravity_pool_candidate("key-a", "claude-sonnet-4-5");
+        let other_account_gemini = antigravity_pool_candidate("key-b", "gemini-3-pro");
+        let facts = runtime_quota_facts(&[("key-a", "gemini-3-pro")], &[]);
+        let reasons =
+            pool_model_runtime_skip_reasons(&[gemini, claude, other_account_gemini], &facts);
+
+        assert_eq!(
+            reasons
+                .get("key-a")
+                .and_then(|models| models.get("gemini-3-pro")),
+            Some(&POOL_ACCOUNT_EXHAUSTED_SKIP_REASON)
+        );
+        assert!(!reasons
+            .get("key-a")
+            .is_some_and(|models| models.contains_key("claude-sonnet-4-5")));
+        assert!(!reasons.contains_key("key-b"));
+        assert_eq!(reasons.len(), 1);
+    }
+
+    #[test]
+    fn pool_runtime_model_quota_read_failure_is_state_unavailable_for_scoped_model() {
+        let gemini = antigravity_pool_candidate("key-a", "gemini-3-pro");
+        let claude = antigravity_pool_candidate("key-a", "claude-sonnet-4-5");
+        let codex = sample_eligible_candidate("provider-pool", "endpoint-1", "key-a", 10, None);
+        let key = StoredProviderCatalogKey::new(
+            "key-a".to_string(),
+            "provider-antigravity".to_string(),
+            "key-a".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        let keys_by_id = BTreeMap::from([("key-a".to_string(), key)]);
+
+        // 非 Antigravity 候选不构建身份，也不触发额外后端读取。
+        assert!(pool_model_runtime_quota_identities(&[codex], &keys_by_id).is_empty());
+
+        let scoped_candidates = [gemini.clone(), claude.clone()];
+        let identities = pool_model_runtime_quota_identities(&scoped_candidates, &keys_by_id);
+        assert_eq!(identities.len(), 2);
+        let failed = PoolRuntimeModelQuotaFacts::from_read(&identities, None);
+        assert!(failed.blocked.is_empty());
+        assert_eq!(failed.state_unavailable.len(), 1);
+        assert_eq!(
+            failed
+                .state_unavailable
+                .get("key-a")
+                .map(|models| models.len()),
+            Some(2)
+        );
+        // 批量结果长度不一致同样只能视为状态不可用。
+        let mismatched = PoolRuntimeModelQuotaFacts::from_read(&identities, Some(vec![true]));
+        assert!(mismatched.blocked.is_empty());
+        assert_eq!(mismatched.state_unavailable, failed.state_unavailable);
+
+        let facts = runtime_quota_facts(&[], &[("key-a", "gemini-3-pro")]);
+        let reasons = pool_model_runtime_skip_reasons(&[gemini, claude], &facts);
+        assert_eq!(
+            reasons
+                .get("key-a")
+                .and_then(|models| models.get("gemini-3-pro")),
+            Some(&POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON)
+        );
+        assert!(!reasons
+            .get("key-a")
+            .is_some_and(|models| models.contains_key("claude-sonnet-4-5")));
+    }
+
+    #[test]
+    fn pool_runtime_model_quota_filters_before_window_truncation_without_shared_account_limit() {
+        let blocked = antigravity_pool_candidate("key-a", "gemini-3-pro");
+        let sibling_model = antigravity_pool_candidate("key-a", "claude-sonnet-4-5");
+        let sibling_account = antigravity_pool_candidate("key-b", "gemini-3-pro");
+        let facts = runtime_quota_facts(&[("key-a", "gemini-3-pro")], &[]);
+        let model_reasons = pool_model_runtime_skip_reasons(
+            &[blocked.clone(), sibling_model.clone(), sibling_account],
+            &facts,
+        );
+        let outcome = apply_local_execution_pool_scheduler_with_runtime_map_outcome_and_configs(
+            vec![blocked, sibling_model],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &model_reasons,
+        );
+
+        assert_eq!(outcome.skipped.len(), 1);
+        assert_eq!(outcome.skipped[0].candidate.key_id, "key-a");
+        assert_eq!(
+            outcome.skipped[0].candidate.selected_provider_model_name,
+            "gemini-3-pro"
+        );
+        assert_eq!(
+            outcome.skipped[0].skip_reason,
+            POOL_ACCOUNT_EXHAUSTED_SKIP_REASON
+        );
+        assert_eq!(outcome.candidates.len(), 1);
+        assert_eq!(outcome.candidates[0].candidate.key_id, "key-a");
+        assert_eq!(
+            outcome.candidates[0].candidate.selected_provider_model_name,
+            "claude-sonnet-4-5"
+        );
+        // 与目录额度耗尽同一诊断，不占用游标扫描预算，因此可以继续扫描窗口之外。
+        assert!(pool_skip_reason_releases_scan_budget(
+            POOL_ACCOUNT_EXHAUSTED_SKIP_REASON
+        ));
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_skips_runtime_model_quota_beyond_window_and_keeps_sibling_model() {
+        use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+        use aether_data::repository::quota::InMemoryProviderQuotaRepository;
+        use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
+
+        const TEST_AUTH_CONFIG: &str = r#"{"refresh_token":"fixture-runtime-quota-refresh"}"#;
+
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "cache_affinity", "enabled": true},
+                    {"preset": "priority_first", "enabled": true}
+                ],
+                "score_top_n": 64,
+                "score_fallback_scan_limit": 64
+            }
+        }));
+        let (mut provider, mut endpoint, mut keys, mut rows) =
+            large_pool_fixture(3, provider_config.clone());
+        provider.provider_type = "antigravity".to_string();
+        endpoint.api_format = "gemini:generate_content".to_string();
+        endpoint.api_family = Some("gemini".to_string());
+        endpoint.endpoint_kind = Some("generate_content".to_string());
+        endpoint.base_url = "https://antigravity.googleapis.com".to_string();
+
+        let allowed_models = vec!["gemini-3-pro".to_string(), "claude-sonnet-4-5".to_string()];
+        // 事实身份绑定解密后的凭据；给首个 Key 封装同一份 auth config，
+        // 使读取端解密后与写入端的 generation 一致。
+        let sealer = AppState::new()
+            .expect("sealer state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_reader_for_tests(Arc::new(
+                    InMemoryProviderCatalogReadRepository::seed(vec![], vec![], vec![]),
+                ))
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let sealed_auth_config = sealer
+            .seal_provider_catalog_key_auth_config("provider-pool", "key-00000", TEST_AUTH_CONFIG)
+            .expect("auth config should seal");
+        for (index, key) in keys.iter_mut().enumerate() {
+            key.auth_type = "oauth".to_string();
+            key.api_formats = Some(json!(["gemini:generate_content"]));
+            key.allowed_models = Some(json!(allowed_models));
+            key.expires_at_unix_secs = Some(4_102_444_800);
+            key.internal_priority = if index == 0 { 0 } else { 10 };
+            if index == 0 {
+                key.encrypted_auth_config = Some(sealed_auth_config.clone());
+            }
+        }
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.provider_type = "antigravity".to_string();
+            row.endpoint_api_format = "gemini:generate_content".to_string();
+            row.endpoint_api_family = Some("gemini".to_string());
+            row.endpoint_kind = Some("generate_content".to_string());
+            row.key_auth_type = "oauth".to_string();
+            row.key_api_formats = Some(vec!["gemini:generate_content".to_string()]);
+            row.key_allowed_models = Some(allowed_models.clone());
+            row.key_internal_priority = if index == 0 { 0 } else { 10 };
+            row.routing_facts.provider_pool_enabled = true;
+            row.global_model_name = "gemini-3-pro".to_string();
+            row.model_provider_model_name = "gemini-3-pro".to_string();
+        }
+        let sibling_rows = rows
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.model_id = "model-sibling".to_string();
+                row.global_model_id = "global-model-sibling".to_string();
+                row.global_model_name = "claude-sonnet-4-5".to_string();
+                row.model_provider_model_name = "claude-sonnet-4-5".to_string();
+                row
+            })
+            .collect::<Vec<_>>();
+        let blocked_key = keys[0].clone();
+        let mut all_rows = rows;
+        all_rows.extend(sibling_rows);
+
+        let catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            vec![endpoint],
+            keys,
+        ));
+        let catalog_reader: Arc<dyn ProviderCatalogReadRepository> = catalog_repository.clone();
+        let data_state =
+            GatewayDataState::with_candidate_selection_provider_catalog_quota_and_request_candidates_for_tests(
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(all_rows)),
+                catalog_reader,
+                Arc::new(InMemoryProviderQuotaRepository::seed(Vec::new())),
+                Arc::new(InMemoryRequestCandidateRepository::seed(Vec::new())),
+            )
+            .attach_provider_catalog_repository_for_tests(catalog_repository)
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+
+        let now_unix_secs = crate::clock::current_unix_secs();
+        crate::orchestration::record_antigravity_model_quota_exhaustion_with_auth_config(
+            app.runtime_state.as_ref(),
+            &blocked_key,
+            Some(TEST_AUTH_CONFIG),
+            "antigravity",
+            "gemini-3-pro",
+            now_unix_secs + 3_600,
+            now_unix_secs,
+            "test",
+        )
+        .await
+        .expect("runtime model quota fact should record");
+
+        let mut group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-00000",
+            0,
+            provider_config.clone(),
+        );
+        group.kind = LocalExecutionCandidateKind::PoolGroup;
+        group.candidate.provider_type = "antigravity".to_string();
+        group.candidate.endpoint_api_format = "gemini:generate_content".to_string();
+        group.candidate.global_model_name = "gemini-3-pro".to_string();
+        group.candidate.selected_provider_model_name = "gemini-3-pro".to_string();
+        group.provider_api_format = "gemini:generate_content".to_string();
+        let transport = Arc::make_mut(&mut group.transport);
+        transport.provider.provider_type = "antigravity".to_string();
+        transport.endpoint.api_format = "gemini:generate_content".to_string();
+        transport.endpoint.api_family = Some("gemini".to_string());
+        transport.endpoint.endpoint_kind = Some("generate_content".to_string());
+        transport.endpoint.base_url = "https://antigravity.googleapis.com".to_string();
+        transport.key.auth_type = "oauth".to_string();
+        transport.key.api_formats = Some(vec!["gemini:generate_content".to_string()]);
+
+        let mut sibling_group = group.clone();
+        sibling_group.candidate.model_id = "model-sibling".to_string();
+        sibling_group.candidate.global_model_id = "global-model-sibling".to_string();
+        sibling_group.candidate.global_model_name = "claude-sonnet-4-5".to_string();
+        sibling_group.candidate.selected_provider_model_name = "claude-sonnet-4-5".to_string();
+
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        // 普通分页与 sticky 单例都必须越过被模型额度限制的窗口继续扫描。
+        for session in [None, Some("session-runtime-quota")] {
+            if let Some(session) = session {
+                record_admin_provider_pool_success(
+                    app.runtime_state.as_ref(),
+                    "provider-pool",
+                    "key-00000",
+                    &pool_config,
+                    Some(session),
+                    0,
+                    None,
+                )
+                .await;
+            }
+            let mut cursor = PoolKeyCursor::new(
+                PlannerAppState::new(&app),
+                group.clone(),
+                session,
+                Some("gemini-3-pro"),
+                None,
+            );
+            cursor.window_size = 1;
+            cursor.page_size = 1;
+            let candidate = cursor
+                .next_key()
+                .await
+                .expect("another account must serve after the scoped quota skip");
+            assert_eq!(candidate.candidate.key_id, "key-00001");
+            let rejected = cursor.take_skipped_candidates();
+            assert!(rejected
+                .iter()
+                .any(|item| item.candidate.key_id == "key-00000"
+                    && item.skip_reason == POOL_ACCOUNT_EXHAUSTED_SKIP_REASON));
+            assert!(rejected
+                .iter()
+                .all(|item| item.skip_reason != "pool_key_quota_exhausted"));
+        }
+
+        // 同账号另一模型不继承共享账号限额，直接在该账号上调度。
+        let mut sibling_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            sibling_group,
+            None,
+            Some("claude-sonnet-4-5"),
+            None,
+        );
+        let sibling = sibling_cursor
+            .next_key()
+            .await
+            .expect("sibling model must remain schedulable on the same account");
+        assert_eq!(sibling.candidate.key_id, "key-00000");
     }
 
     #[tokio::test]

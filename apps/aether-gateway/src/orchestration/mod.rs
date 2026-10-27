@@ -5,6 +5,7 @@ use serde_json::{json, Map, Value};
 use crate::AppState;
 
 mod adaptive;
+mod antigravity_model_quota;
 mod attempt;
 mod classifier;
 mod codex_quota_breaker;
@@ -18,6 +19,17 @@ mod report_effects;
 pub(crate) use self::adaptive::{
     project_local_adaptive_rate_limit, project_local_adaptive_success,
     LocalAdaptiveRateLimitProjection, LocalAdaptiveSuccessProjection,
+};
+pub(crate) use self::antigravity_model_quota::{
+    antigravity_account_generation, antigravity_capture_subset, antigravity_key_account_generation,
+    antigravity_model_quota_blocked_many_with_auth_configs,
+    antigravity_model_quota_deadline_unix_secs, antigravity_positive_quota_models,
+    antigravity_quota_model_names, antigravity_quota_upstream_model,
+    capture_antigravity_model_quota_records, capture_antigravity_model_quota_refresh,
+    classify_antigravity_model_quota_exhaustion, clear_captured_antigravity_model_quota_records,
+    reconcile_antigravity_model_quota_refresh,
+    record_antigravity_model_quota_exhaustion_with_auth_config, AntigravityModelQuotaCandidate,
+    AntigravityModelQuotaEvidence, AntigravityModelQuotaRefreshCapture,
 };
 pub(crate) use self::attempt::{
     attempt_identity_from_report_context, insert_pool_key_lease_report_context_fields,
