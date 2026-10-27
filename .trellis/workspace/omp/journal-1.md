@@ -224,3 +224,41 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 10: 导入凭据模型发现与发布前 CI 修复
+
+**Date**: 2026-10-27
+**Task**: 导入凭据模型发现与发布前 CI 修复
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+批量 Key 与 OAuth 导入默认开启模型发现，修正账号模型隔离后四处旧测试夹具，保留全局正则不得授权未配置上游名的约束。
+
+### Main Changes
+
+- 批量 Key 导入默认启用自动发现，显式 false 仍生效；OAuth 新导入启用，重复替换保留既有设置。
+- 迁移 data、pool scheduler、candidate 与 HTTP 执行夹具为显式作用域 Provider 映射，保留 regex-only 账号拒绝和成功账号身份断言。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9059e178e` | (see git log) |
+| `9683b5ee8` | (see git log) |
+
+### Testing
+
+- [OK] cargo fmt --all --check 与 Gateway Clippy 通过；核心 model 19 项通过。
+- [OK] 安装本机 PostgreSQL 17 与 cargo-nextest 后通过标准 tools/ci.py gateway：5701 passed，3 skipped。初始 cargo test 因 PostgreSQL 缺失及进程共享权限状态未全绿，标准进程隔离检查通过。
+- [OK] frontend type-check、266 文件 / 2231 项 Vitest、生产构建通过；aether-admin 344 项与 aether-oauth 74 项通过；交叉审查无阻塞项。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 推送 master；确认新 SHA 的 GitHub Rust CI 全绿后创建并推送 v0.7.49。
