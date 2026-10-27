@@ -23,8 +23,8 @@ Push the current `master` commit, obtain a green GitHub CI run for that exact co
 
 - [x] Frontend lint and type/build checks pass for the changed component; full existing suite passed 266 files / 2231 tests. Actual dialog browser smoke saved a changed reference with a frozen model prop, preserved unrelated config, and emitted `saved` once.
 - [x] Real local PostgreSQL smoke passed all four live fixture regressions, including forced bind collision and fixed-endpoint restart; full `responses_websocket_e2e` passed 13 tests. `cargo fmt --all --check` and targeted all-target Clippy with `-D warnings` passed.
-- [ ] GitHub CI required checks are successful for the exact commit tagged for release.
-- [ ] Remote `v0.7.50` resolves to that exact commit and no tag is created before the green CI gate.
+- [x] GitHub Rust CI run [40604103970](https://github.com/ZipperCode/Aether/actions/runs/40604103970) completed successfully: all 19 jobs passed for `9d5a5b2c25f43d0ded1eab6fbbbdb5870d19cc57`.
+- [x] Annotated remote tag `v0.7.50` was created only after that CI result and resolves to `9d5a5b2c25f43d0ded1eab6fbbbdb5870d19cc57`; tag-push Release Aether run [40605507824](https://github.com/ZipperCode/Aether/actions/runs/40605507824) started.
 
 ## Out of Scope
 
