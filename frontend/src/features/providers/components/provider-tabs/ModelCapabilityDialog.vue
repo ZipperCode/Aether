@@ -808,14 +808,13 @@ async function saveReferenceIfNeeded() {
     api_key_id: referenceKeyId.value,
   }
   if (JSON.stringify(next) === JSON.stringify(savedReference.value)) return
-  const updated = await updateModel(props.provider.id, props.model.id, {
+  await updateModel(props.provider.id, props.model.id, {
     config: {
       ...(props.model.config ?? {}),
       capability_test_reference: next,
     },
   })
   savedReference.value = next
-  if (updated.config) props.model.config = updated.config
   emit('saved')
 }
 

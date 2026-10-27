@@ -1,0 +1,30 @@
+{
+  "id": "release-v0.7.50-ci",
+  "name": "release-v0.7.50-ci",
+  "title": "修复发布 CI 阻塞并发布 v0.7.50",
+  "description": "Fix the observed Vue prop-mutation and local PostgreSQL bind-race CI blockers, push master, then publish v0.7.50 only after exact-commit GitHub CI succeeds.",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": "aether-testkit",
+  "priority": "P2",
+  "creator": "omp",
+  "assignee": "omp",
+  "createdAt": "2026-10-28",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "crates/aether-testing/testkit/src/postgres.rs",
+    "frontend/src/features/providers/components/provider-tabs/ModelCapabilityDialog.vue",
+    ".trellis/spec/aether-testkit/backend/quality-guidelines.md"
+  ],
+  "notes": "",
+  "meta": {}
+}
