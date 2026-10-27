@@ -341,3 +341,37 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 14: 推送代码、CI 通过后发布 v0.7.50
+
+**Date**: 2026-10-28
+**Task**: 推送代码、CI 通过后发布 v0.7.50
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+修复 PostgreSQL 测试端口竞争和能力检测组件 prop 修改；推送 master，19 个 GitHub CI 作业全通过后发布 annotated v0.7.50，标签固定于 9d5a5b2c25f43d0ded1eab6fbbbdb5870d19cc57。
+
+### Main Changes
+
+- PostgreSQL 仅初始 bind 冲突换端口重试；restart 保持端点并核对自有 data_directory。
+- 能力检测保存配置不再修改输入 prop，保留合并保存和 saved 刷新事件。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9d5a5b2c2` | (see git log) |
+
+### Testing
+
+- [OK] Frontend: 266 files / 2231 tests passed; source lint 0 errors, type-check/build passed; actual dialog browser smoke passed with frozen prop.
+- [OK] Rust: fmt check and targeted Clippy passed; 4 real PostgreSQL fixture tests and 13 WebSocket e2e tests passed.
+- [OK] GitHub Rust CI 40604103970: success, all 19 jobs passed on tagged commit.
+- [OK] Remote v0.7.50 dereferenced to exact verified commit; Release Aether 40605507824 triggered.
+
+### Status
+
+[OK] **Completed**
