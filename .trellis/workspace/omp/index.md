@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 12
-- **Last Active**: 2026-10-27
+- **Total Sessions**: 13
+- **Last Active**: 2026-10-28
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~321 | Active |
+| `journal-1.md` | ~343 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 13 | 2026-10-28 | 修复 Antigravity 运行时模型额度隔离 | `bfcdce55a` | `master` |
 | 12 | 2026-10-27 | 修复 Antigravity 逐账号模型准入误放行 | `e186ae342` | `master` |
 | 11 | 2026-10-27 | 修复 Antigravity 模型额度调度与自动恢复 | `2fbaff53b` | `master` |
 | 10 | 2026-10-27 | 导入凭据模型发现与发布前 CI 修复 | `9059e178e`, `9683b5ee8` | `master` |

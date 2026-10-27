@@ -319,3 +319,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Next Steps
 
 - 192.168.2.212尚未部署；需单独授权生产部署。
+
+
+## Session 13: 修复 Antigravity 运行时模型额度隔离
+
+**Date**: 2026-10-28
+**Task**: 修复 Antigravity 运行时模型额度隔离
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+修复运行时模型额度 429 污染整账号调度：按实际账号、凭证代际、精确上游模型记录共享可重置事实，普通/Pool/sticky 同步与原生 SSE 统一消费；正向额度刷新和到期恢复，失败刷新与新旧并发观察保留正确隔离。修复凭证围栏观察更新覆盖 quota_by_model 的合并错误。修复前真实 HTTP 回归复现健康/RPM 错误惩罚；修复后 HTTP 与 24 项定向回归通过，preflight 通过：5735 passed、3 skipped。契约已更新，修复提交已推送；未部署生产或修改远端业务数据。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `bfcdce55a` | (see git log) |
+
+### Status
+
+[OK] **Completed**
