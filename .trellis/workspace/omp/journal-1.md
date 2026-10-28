@@ -428,3 +428,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 17: 修复 Responses 兼容审核回归
+
+**Date**: 2026-10-28
+**Task**: 修复 Responses 兼容审核回归
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+修复13项审核问题及真实续接回放拒绝：推理块身份/签名回放、单次失败终态、Vertex歧义关闭与Unicode路径、工具发现及API-key作用域身份快照。格式库1201与传输层17测试通过，网关preflight 5745通过/3跳过，Clippy与格式/覆盖检查通过。公共API可执行smoke和真实HTTP两轮续接/跨key拒绝通过；文档与规格同步，未push。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d8502465e` | (see git log) |
+
+### Status
+
+[OK] **Completed**
