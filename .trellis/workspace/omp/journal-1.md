@@ -406,3 +406,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 16: Responses 跨协议兼容闭环
+
+**Date**: 2026-10-28
+**Task**: Responses 跨协议兼容闭环
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+完成完整 Responses 失败终态、Claude 签名与隐藏推理同步/SSE回放、Vertex partialArgs 增量参数、Chat/Claude 客户端工具发现及延迟加载；原生同格式透传保持。1171格式测试、17传输测试、Clippy、网关编译、格式与覆盖矩阵检查通过；真实转换和SSE分片/工具历史链路smoke通过，未访问真实上游。协议规范同步；任务已归档。未push。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `308ed7ba4` | (see git log) |
+
+### Status
+
+[OK] **Completed**

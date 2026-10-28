@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 15
+- **Total Sessions**: 16
 - **Last Active**: 2026-10-28
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~408 | Active |
+| `journal-1.md` | ~430 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 16 | 2026-10-28 | Responses 跨协议兼容闭环 | `308ed7ba4` | `master` |
 | 15 | 2026-10-28 | Antigravity 按账号动态选择思考档位 | `a9f024872` | `master` |
 | 14 | 2026-10-28 | 推送代码、CI 通过后发布 v0.7.50 | `9d5a5b2c2` | `master` |
 | 13 | 2026-10-28 | 修复 Antigravity 运行时模型额度隔离 | `bfcdce55a` | `master` |
