@@ -375,3 +375,34 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 15: Antigravity 按账号动态选择思考档位
+
+**Date**: 2026-10-28
+**Task**: Antigravity 按账号动态选择思考档位
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+在普通、号池与 sticky 选路前按账号发现目录解析 effort，兼容 xhigh/max 并守住模型白名单与额度隔离。
+
+### Main Changes
+
+- 动态解析实际账号模型，统一最终 envelope/model/usage/quota 身份；更新合同与 HTTP 回归
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a9f024872` | (see git log) |
+
+### Testing
+
+- [OK] fmt 和 gateway Clippy 通过；5744 gateway tests passed，3 skipped；731 transport/pool tests passed
+- [OK] 修改前 low 返回 high 已复现；外部 localhost HTTP smoke 五次 200，低/高/中/高/低精确匹配
+
+### Status
+
+[OK] **Completed**
