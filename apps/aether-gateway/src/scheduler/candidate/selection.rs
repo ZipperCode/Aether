@@ -73,6 +73,7 @@ pub(super) async fn select_minimal_candidate(
         auth_snapshot,
         enable_model_directives,
         None,
+        None,
     )
     .await?;
     Ok(collect_selectable_enumerated_candidates_with_skip_reasons(
@@ -90,6 +91,7 @@ pub(super) async fn select_minimal_candidate(
             client_session_affinity,
             ordering_config.scheduling_mode,
         ),
+        None,
     )
     .await?
     .0
@@ -126,6 +128,7 @@ pub(super) async fn collect_selectable_candidates(
             enable_model_directives,
             None,
             ordering_config,
+            None,
         )
         .await?
         .0,
@@ -167,6 +170,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
         enable_model_directives,
         request_operation,
         SchedulerOrderingConfig::default(),
+        None,
     )
     .await
 }
@@ -186,6 +190,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ordering
     enable_model_directives: bool,
     request_operation: Option<&str>,
     ordering_config: SchedulerOrderingConfig,
+    thinking: Option<super::SchedulerThinkingSelection<'_>>,
 ) -> Result<
     (
         Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -207,6 +212,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ordering
         auth_snapshot,
         enable_model_directives,
         request_operation,
+        thinking,
     )
     .await?;
     collect_selectable_enumerated_candidates_with_skip_reasons(
@@ -220,6 +226,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ordering
         scheduling_context,
         ordering_config,
         priority_affinity_key,
+        thinking,
     )
     .await
 }
@@ -237,6 +244,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
     scheduling_context: CandidateSchedulingContext,
     ordering_config: SchedulerOrderingConfig,
     priority_affinity_key: Option<&str>,
+    thinking: Option<super::SchedulerThinkingSelection<'_>>,
 ) -> Result<
     (
         Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -244,11 +252,12 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
     ),
     GatewayError,
 > {
-    let runtime_snapshot = read_candidate_runtime_selection_snapshot(
+    let (runtime_snapshot, mut thinking_skipped) = read_candidate_runtime_selection_snapshot(
         runtime_state,
-        &candidates,
+        &mut candidates,
         auth_snapshot,
         scheduling_context.now_unix_secs,
+        thinking,
     )
     .await?;
     let affinity_cache_key = build_scheduler_affinity_cache_key(
@@ -282,23 +291,26 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
             cached_affinity_target.as_ref(),
             scheduling_context.load_balance_seed,
         );
-        return Ok((
-            Vec::new(),
+        let mut skipped = thinking_skipped;
+        skipped.extend(
             candidates
                 .into_iter()
                 .map(|candidate| SchedulerSkippedCandidate {
                     candidate,
                     skip_reason: API_KEY_CONCURRENCY_LIMIT_SKIP_REASON,
-                })
-                .collect(),
-        ));
+                }),
+        );
+        return Ok((Vec::new(), skipped));
     }
 
-    let (mut selected, skipped) = resolve_scheduler_candidate_selectability(
+    let (mut selected, mut skipped) = resolve_scheduler_candidate_selectability(
         candidates,
         &runtime_snapshot,
         scheduling_context.now_unix_secs,
     );
+    if !thinking_skipped.is_empty() {
+        skipped.append(&mut thinking_skipped);
+    }
     rank_scheduler_candidates(
         &mut selected,
         &runtime_snapshot,

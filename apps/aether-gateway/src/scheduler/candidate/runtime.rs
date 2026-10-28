@@ -8,7 +8,7 @@ use aether_data_contracts::repository::candidates::StoredRequestCandidate;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_provider_pool::{
     provider_pool_key_balance_below_minimum, provider_pool_key_runtime_quota_blocked,
-    provider_pool_key_supports_discovered_model,
+    provider_pool_key_supports_discovered_model, resolve_provider_pool_key_thinking_model,
 };
 use aether_scheduler_core::{
     auth_api_key_concurrency_limit_reached, build_provider_concurrent_limit_map,
@@ -24,6 +24,8 @@ use crate::orchestration::AntigravityModelQuotaCandidate;
 use crate::scheduler::state::SchedulerModelQuotaState;
 use crate::GatewayError;
 
+use super::selection::SchedulerSkippedCandidate;
+use super::SchedulerThinkingSelection;
 use super::{SchedulerMinimalCandidateSelectionCandidate, SchedulerRuntimeState};
 
 const ANTIGRAVITY_PROVIDER_TYPE: &str = "antigravity";
@@ -52,19 +54,35 @@ pub(super) struct CandidateRuntimeSelectionSnapshot {
 }
 
 /// 一次性读取候选准入所需运行态，确保排序和最终诊断消费同一余额事实。
+///
+/// thinking 选择在强读 Key 之后、任何模型级额度/发现过滤之前解析实际上游模型；
+/// 缺失请求档位的账号在这里被提前拒绝，不会以默认档位进入额度快照。
 pub(super) async fn read_candidate_runtime_selection_snapshot(
     state: &(impl SchedulerRuntimeState + ?Sized),
-    candidates: &[SchedulerMinimalCandidateSelectionCandidate],
+    candidates: &mut Vec<SchedulerMinimalCandidateSelectionCandidate>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     now_unix_secs: u64,
-) -> Result<CandidateRuntimeSelectionSnapshot, GatewayError> {
+    thinking: Option<SchedulerThinkingSelection<'_>>,
+) -> Result<
+    (
+        CandidateRuntimeSelectionSnapshot,
+        Vec<SchedulerSkippedCandidate>,
+    ),
+    GatewayError,
+> {
+    // 强读目录事实必须先于模型解析：发现目录是账号级事实，缓存读取会污染档位选择。
+    let provider_key_rpm_states = read_provider_key_rpm_states(state, candidates).await?;
+    let thinking_skipped = thinking
+        .map(|thinking| {
+            resolve_candidate_thinking_models(candidates, &provider_key_rpm_states, thinking)
+        })
+        .unwrap_or_default();
     let provider_concurrent_limits = read_provider_concurrent_limits(state, candidates).await?;
     let provider_pool_state = read_provider_pool_state_map(state, candidates).await?;
     let pool_provider_ids = provider_pool_state
         .iter()
         .filter_map(|(provider_id, state)| state.pool_enabled.then_some(provider_id.clone()))
         .collect::<BTreeSet<_>>();
-    let provider_key_rpm_states = read_provider_key_rpm_states(state, candidates).await?;
     // 强读目录事实之后再批量读取共享运行态事实；非 Antigravity 与 PoolGroup
     // 代表候选不构建描述符，也不触发额外后端读取。
     let runtime_model_quota = read_runtime_model_quota_facts(
@@ -101,20 +119,80 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
     let provider_key_rpm_reset_ats =
         read_provider_key_rpm_reset_at_map(state, candidates, now_unix_secs);
 
-    Ok(CandidateRuntimeSelectionSnapshot {
-        recent_candidates,
-        provider_concurrent_limits,
-        provider_key_rpm_states,
-        pool_provider_ids,
-        provider_quota_blocks_requests,
-        key_quota_hard_blocked,
-        key_account_quota_exhausted,
-        key_runtime_model_quota_blocked: runtime_model_quota.blocked,
-        key_runtime_model_quota_state_unavailable: runtime_model_quota.state_unavailable,
-        key_balance_below_minimum,
-        key_oauth_invalid,
-        provider_key_rpm_reset_ats,
-    })
+    Ok((
+        CandidateRuntimeSelectionSnapshot {
+            recent_candidates,
+            provider_concurrent_limits,
+            provider_key_rpm_states,
+            pool_provider_ids,
+            provider_quota_blocks_requests,
+            key_quota_hard_blocked,
+            key_account_quota_exhausted,
+            key_runtime_model_quota_blocked: runtime_model_quota.blocked,
+            key_runtime_model_quota_state_unavailable: runtime_model_quota.state_unavailable,
+            key_balance_below_minimum,
+            key_oauth_invalid,
+            provider_key_rpm_reset_ats,
+        },
+        thinking_skipped,
+    ))
+}
+
+/// 在额度快照之前按账号强读到的发现目录解析实际上游模型。
+///
+/// PoolGroup 代表候选只持有占位模型，必须等真实成员展开后各自解析，因此这里跳过。
+/// 缺少请求档位的账号以 `key_model_disabled` 拒绝；真实 Key 强读缺失以
+/// `key_quota_state_unavailable` 跳过（状态不可用，不是额度耗尽或模型禁用），
+/// 都不会回退到默认档位或其他账号。
+fn resolve_candidate_thinking_models(
+    candidates: &mut Vec<SchedulerMinimalCandidateSelectionCandidate>,
+    keys: &BTreeMap<String, StoredProviderCatalogKey>,
+    thinking: SchedulerThinkingSelection<'_>,
+) -> Vec<SchedulerSkippedCandidate> {
+    let mut skipped = Vec::new();
+    candidates.retain_mut(|candidate| {
+        if candidate.routing_facts.provider_pool_enabled {
+            return true;
+        }
+        // 只有 Antigravity 候选消费该档位选择；其他 Provider 保持既有模型名且不查目录。
+        if !candidate
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case(ANTIGRAVITY_PROVIDER_TYPE)
+        {
+            return true;
+        }
+        let Some(key) = keys.get(candidate.key_id.as_str()) else {
+            // 强读目录缺失真实 Antigravity Key：报告状态不可用，绝不猜测额度或模型档位，
+            // 并立即跳过该候选，避免无解析结果的候选进入 transport/执行准入而饿死兄弟账号。
+            skipped.push(SchedulerSkippedCandidate {
+                candidate: candidate.clone(),
+                skip_reason: KEY_QUOTA_STATE_UNAVAILABLE_SKIP_REASON,
+            });
+            return false;
+        };
+        match resolve_provider_pool_key_thinking_model(
+            key,
+            candidate.provider_type.as_str(),
+            thinking.requested_model,
+            candidate.selected_provider_model_name.as_str(),
+            Some(thinking.level),
+        ) {
+            Some(model) if model == candidate.selected_provider_model_name.as_str() => true,
+            Some(model) => {
+                candidate.selected_provider_model_name = model.to_string();
+                true
+            }
+            None => {
+                skipped.push(SchedulerSkippedCandidate {
+                    candidate: candidate.clone(),
+                    skip_reason: "key_model_disabled",
+                });
+                false
+            }
+        }
+    });
+    skipped
 }
 
 fn runtime_snapshot_requires_recent_candidates(
@@ -827,6 +905,7 @@ fn read_provider_key_rpm_reset_at_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether_provider_transport::antigravity::AntigravityThinkingLevel;
     use serde_json::json;
 
     /// 构造覆盖普通候选与 PoolGroup 代表候选的最小调度事实。
@@ -992,6 +1071,169 @@ mod tests {
         assert_eq!(
             current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
             Some("key_health_score_zero")
+        );
+    }
+
+    #[test]
+    fn thinking_selection_resolves_ordinary_variant_and_rejects_missing_tier() {
+        // 客户端未显式选择后缀时，正文档位必须在该账号自己的实际模型上生效。
+        let mut candidate = sample_candidate();
+        candidate.provider_type = "antigravity".to_string();
+        candidate.endpoint_api_format = "gemini:generate_content".to_string();
+        candidate.global_model_name = "gemini-3-flash".to_string();
+        candidate.selected_provider_model_name = "gemini-3-flash-high".to_string();
+
+        let mut key = low_balance_key();
+        key.status_snapshot = None;
+        key.upstream_metadata = Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-3-flash-low": {},
+                    "gemini-3-flash-medium": {},
+                    "gemini-3-flash-high": {}
+                }
+            }
+        }));
+        let keys = BTreeMap::from([(key.id.clone(), key)]);
+        let selection = SchedulerThinkingSelection {
+            requested_model: "gemini-3-flash",
+            level: AntigravityThinkingLevel::Low,
+        };
+
+        let mut candidates = vec![candidate.clone()];
+        let skipped = resolve_candidate_thinking_models(&mut candidates, &keys, selection);
+        assert!(skipped.is_empty());
+        assert_eq!(
+            candidates[0].selected_provider_model_name,
+            "gemini-3-flash-low"
+        );
+
+        // 缺少请求档位的账号必须被拒绝，而不是回退默认 high。
+        let mut missing_key = keys.get("key-1").expect("key should exist").clone();
+        missing_key.upstream_metadata = Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-3-flash-high": {}
+                }
+            }
+        }));
+        let missing_keys = BTreeMap::from([(missing_key.id.clone(), missing_key)]);
+        let mut missing_candidates = vec![candidate.clone()];
+        let skipped =
+            resolve_candidate_thinking_models(&mut missing_candidates, &missing_keys, selection);
+        assert!(missing_candidates.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].skip_reason, "key_model_disabled");
+
+        // PoolGroup 代表候选只保留占位模型，真实成员展开后才解析。
+        let mut pool_candidate = candidate;
+        pool_candidate.routing_facts.provider_pool_enabled = true;
+        let mut pool_candidates = vec![pool_candidate];
+        let skipped = resolve_candidate_thinking_models(&mut pool_candidates, &keys, selection);
+        assert!(skipped.is_empty());
+        assert_eq!(
+            pool_candidates[0].selected_provider_model_name,
+            "gemini-3-flash-high"
+        );
+    }
+
+    #[test]
+    fn thinking_selection_respects_key_allowed_models_for_resolved_variant() {
+        // 只允许 low 的账号：low 请求命中自身变体，high 请求不得沿用默认 high。
+        let mut candidate = sample_candidate();
+        candidate.provider_type = "antigravity".to_string();
+        candidate.endpoint_api_format = "gemini:generate_content".to_string();
+        candidate.global_model_name = "gemini-3-flash".to_string();
+        candidate.selected_provider_model_name = "gemini-3-flash-high".to_string();
+
+        let mut key = low_balance_key();
+        key.status_snapshot = None;
+        key.allowed_models = Some(json!(["gemini-3-flash-low"]));
+        key.upstream_metadata = Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-3-flash-low": {},
+                    "gemini-3-flash-high": {}
+                }
+            }
+        }));
+        let keys = BTreeMap::from([(key.id.clone(), key)]);
+
+        let mut low_candidates = vec![candidate.clone()];
+        let skipped = resolve_candidate_thinking_models(
+            &mut low_candidates,
+            &keys,
+            SchedulerThinkingSelection {
+                requested_model: "gemini-3-flash",
+                level: AntigravityThinkingLevel::Low,
+            },
+        );
+        assert!(skipped.is_empty());
+        assert_eq!(
+            low_candidates[0].selected_provider_model_name,
+            "gemini-3-flash-low"
+        );
+
+        let mut high_candidates = vec![candidate];
+        let skipped = resolve_candidate_thinking_models(
+            &mut high_candidates,
+            &keys,
+            SchedulerThinkingSelection {
+                requested_model: "gemini-3-flash",
+                level: AntigravityThinkingLevel::High,
+            },
+        );
+        assert!(high_candidates.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].skip_reason, "key_model_disabled");
+    }
+
+    #[test]
+    fn thinking_selection_skips_missing_strong_key_without_starving_sibling() {
+        // 首选 Antigravity Key 强读缺失时只能以状态不可用跳过；兄弟账号必须保留。
+        let mut missing = sample_candidate();
+        missing.provider_type = "antigravity".to_string();
+        missing.endpoint_api_format = "gemini:generate_content".to_string();
+        missing.global_model_name = "gemini-3-flash".to_string();
+        missing.selected_provider_model_name = "gemini-3-flash-high".to_string();
+        missing.key_id = "key-missing".to_string();
+
+        let mut sibling = missing.clone();
+        sibling.key_id = "key-sibling".to_string();
+
+        let mut sibling_key = low_balance_key();
+        sibling_key.id = "key-sibling".to_string();
+        sibling_key.status_snapshot = None;
+        sibling_key.upstream_metadata = Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-3-flash-high": {}
+                }
+            }
+        }));
+        let keys = BTreeMap::from([(sibling_key.id.clone(), sibling_key)]);
+
+        let mut candidates = vec![missing, sibling];
+        let skipped = resolve_candidate_thinking_models(
+            &mut candidates,
+            &keys,
+            SchedulerThinkingSelection {
+                requested_model: "gemini-3-flash",
+                level: AntigravityThinkingLevel::High,
+            },
+        );
+
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].candidate.key_id, "key-missing");
+        assert_eq!(
+            skipped[0].skip_reason,
+            KEY_QUOTA_STATE_UNAVAILABLE_SKIP_REASON
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].key_id, "key-sibling");
+        assert_eq!(
+            candidates[0].selected_provider_model_name,
+            "gemini-3-flash-high"
         );
     }
 

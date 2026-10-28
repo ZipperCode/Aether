@@ -5,6 +5,7 @@ use crate::data::candidate_selection::{
     enumerate_minimal_candidate_selection_with_required_capabilities_for_request_operation,
     MinimalCandidateSelectionRowSource,
 };
+use crate::scheduler::candidate::SchedulerThinkingSelection;
 use crate::GatewayError;
 
 pub(super) async fn enumerate_scheduler_candidates(
@@ -16,6 +17,7 @@ pub(super) async fn enumerate_scheduler_candidates(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     enable_model_directives: bool,
     request_operation: Option<&str>,
+    thinking: Option<SchedulerThinkingSelection<'_>>,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
     enumerate_minimal_candidate_selection_with_required_capabilities_for_request_operation(
         selection_row_source,
@@ -26,6 +28,7 @@ pub(super) async fn enumerate_scheduler_candidates(
         required_capabilities,
         enable_model_directives,
         request_operation,
+        thinking.map(|thinking| thinking.level),
     )
     .await
     .map_err(|err| GatewayError::Internal(err.to_string()))

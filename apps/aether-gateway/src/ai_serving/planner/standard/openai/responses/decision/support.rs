@@ -221,6 +221,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
         input.client_session_affinity.as_ref(),
         true,
         LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+        input.antigravity_thinking_level,
     )
     .await?;
     let outcome = materialize_local_execution_candidates_with_serving(
@@ -241,6 +242,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
         preselection.skipped_candidates,
         LocalCandidateResolutionMode::Standard,
         Some(&input.model_directive_policy),
+        input.antigravity_thinking_level,
         |eligible| {
             let provider_api_format = eligible.provider_api_format.clone();
             let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
@@ -342,6 +344,7 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
             false,
             LocalCandidateResolutionMode::Standard,
+            input.antigravity_thinking_level,
             move |eligible| {
                 let provider_api_format = eligible.provider_api_format.clone();
                 let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
@@ -426,6 +429,7 @@ pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<
         true,
         LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
         vec!["openai:image".to_string()],
+        input.antigravity_thinking_level,
     )
     .await?;
 
@@ -447,6 +451,7 @@ pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<
         preselection.skipped_candidates,
         LocalCandidateResolutionMode::WithoutTransportPairGate,
         Some(&input.model_directive_policy),
+        input.antigravity_thinking_level,
         move |eligible| {
             let provider_api_format = eligible.provider_api_format.clone();
             let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(

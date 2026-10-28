@@ -7,6 +7,7 @@ use aether_ai_serving::{
     AiCandidatePreselectionOutcome, AiSkippedCandidatePersistencePort,
 };
 use aether_dispatch_core::{DispatchSequence, DispatchSequenceItem};
+use aether_provider_transport::antigravity::AntigravityThinkingLevel;
 use aether_routing_core::{
     rank_vector_for_candidate, CandidateKind, ResolvedRoutingPolicy, RoutingCandidateFacts,
     RoutingCandidateTrace, RoutingDecisionTrace, RoutingExecutionPolicy,
@@ -506,6 +507,8 @@ struct GatewayLocalCandidateMaterializationPort<'a, F, G> {
     resolution_mode: LocalCandidateResolutionMode,
     /// 调用方冻结的指令策略语义：Some 表示按该快照解析指令基座，None 表示不做指令路由。
     model_directive_policy: Option<&'a crate::system_features::ModelDirectivePolicySnapshot>,
+    /// 请求级 Antigravity thinking 档位；Pool 成员必须逐账号解析。
+    thinking_level: Option<AntigravityThinkingLevel>,
     scheduler_cache_affinity_enabled: bool,
     build_available_extra_data: F,
     decorate_skipped_candidate: G,
@@ -609,6 +612,7 @@ where
             self.requested_model,
             self.request_operation,
             self.model_directive_policy,
+            self.thinking_level,
             self.request_auth_channel,
             &self.build_available_extra_data,
         )
@@ -770,6 +774,7 @@ pub(crate) async fn materialize_local_execution_candidates_with_serving<F, G>(
     preselection_skipped: Vec<SkippedLocalExecutionCandidate>,
     resolution_mode: LocalCandidateResolutionMode,
     model_directive_policy: Option<&crate::system_features::ModelDirectivePolicySnapshot>,
+    thinking_level: Option<AntigravityThinkingLevel>,
     build_available_extra_data: F,
     decorate_skipped_candidate: G,
 ) -> AiCandidateMaterializationOutcome<LocalExecutionCandidateAttempt>
@@ -802,6 +807,7 @@ where
         persistence_policy,
         resolution_mode,
         model_directive_policy,
+        thinking_level,
         scheduler_cache_affinity_enabled,
         build_available_extra_data,
         decorate_skipped_candidate,
@@ -832,6 +838,7 @@ pub(crate) async fn build_local_execution_candidate_attempt_source_with_serving<
     preselection_skipped: Vec<SkippedLocalExecutionCandidate>,
     resolution_mode: LocalCandidateResolutionMode,
     model_directive_policy: Option<&crate::system_features::ModelDirectivePolicySnapshot>,
+    thinking_level: Option<AntigravityThinkingLevel>,
     build_available_extra_data: F,
     decorate_skipped_candidate: G,
 ) -> (LocalExecutionCandidateAttemptSource<'a>, usize)
@@ -908,6 +915,7 @@ where
         requested_model,
         request_operation,
         model_directive_policy,
+        thinking_level,
         request_auth_channel,
         routing_policy,
         Some(PoolGroupExhaustionPersistenceContext::new(
@@ -965,6 +973,7 @@ fn build_logical_candidate_items<'a>(
     requested_model: Option<&str>,
     request_operation: Option<&str>,
     model_directive_policy: Option<&crate::system_features::ModelDirectivePolicySnapshot>,
+    thinking_level: Option<AntigravityThinkingLevel>,
     request_auth_channel: Option<&str>,
     routing_policy: Option<&ResolvedRoutingPolicy>,
     pool_exhaustion_persistence: Option<PoolGroupExhaustionPersistenceContext>,
@@ -1006,7 +1015,8 @@ fn build_logical_candidate_items<'a>(
                     routing_policy,
                 )
                 .with_request_operation(request_operation)
-                .with_routing_model(routing_model.as_deref());
+                .with_routing_model(routing_model.as_deref())
+                .with_thinking_level(thinking_level);
                 let cursor = if let Some(trace_id) = trace_id {
                     cursor.with_runtime_miss_diagnostic(trace_id, record_runtime_miss_diagnostic)
                 } else {
@@ -1049,6 +1059,7 @@ pub(crate) async fn build_lazy_requested_model_execution_candidate_attempt_sourc
     key_mode: LocalCandidatePreselectionKeyMode,
     same_format_only: bool,
     resolution_mode: LocalCandidateResolutionMode,
+    thinking_level: Option<AntigravityThinkingLevel>,
     build_available_extra_data: F,
     decorate_skipped_candidate: G,
 ) -> (LocalExecutionCandidateAttemptSource<'a>, usize)
@@ -1078,7 +1089,8 @@ where
         sticky_session_token.is_none(),
         Some(trace_id),
     )
-    .await;
+    .await
+    .with_thinking_level(thinking_level);
     if same_format_only {
         page_cursor.restrict_to_client_api_format();
     }
@@ -1101,6 +1113,7 @@ where
         resolution_mode,
         decorate_skipped_candidate,
         model_directive_policy: model_directive_policy.clone(),
+        thinking_level,
         page_cursor,
         pending_ranked_candidates: VecDeque::new(),
         pending_items: VecDeque::new(),
@@ -1177,6 +1190,8 @@ struct RequestedModelAttemptPageCursor<'a> {
     decorate_skipped_candidate: DecorateSkippedCandidateFn<'a>,
     /// 惰性源构建时固定的指令策略快照；池组逐账号模型解析使用它，不逐页重读。
     model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot,
+    /// 请求级 thinking 档位；档位敏感请求绕过解析页缓存。
+    thinking_level: Option<AntigravityThinkingLevel>,
     page_cursor: LocalCandidatePreselectionPageCursor<'a>,
     /// 全局排序后的轻量候选；仅弹出当前项后才允许 hydration。
     pending_ranked_candidates: VecDeque<PendingRankedLocalExecutionCandidate>,
@@ -1324,6 +1339,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
             Some(&self.requested_model),
             self.page_cursor.resolved_page_cache_request_operation(),
             Some(&self.model_directive_policy),
+            self.thinking_level,
             self.request_auth_channel.as_deref(),
             self.routing_policy.as_ref(),
             Some(PoolGroupExhaustionPersistenceContext {
@@ -1850,7 +1866,9 @@ async fn resolve_candidate_page_snapshot(
 fn should_cache_resolved_candidate_page(cursor: &RequestedModelAttemptPageCursor<'_>) -> bool {
     // 路由聚合页包含按请求动态计算的全局排序与后备链，继续按合同绕过 resolved-page 缓存；
     // 无路由策略时缓存值也只包含未 hydration 的轻量候选。
-    cursor.routing_policy.is_none()
+    // 动态档位请求的候选模型随账号变化，缓存会跨档位泄漏，因此同样绕过。
+    cursor.thinking_level.is_none()
+        && cursor.routing_policy.is_none()
         && cursor.sticky_session_token.is_none()
         && cursor
             .page_cursor
@@ -1940,6 +1958,7 @@ async fn materialize_logical_local_execution_candidate_attempts<F>(
     requested_model: Option<&str>,
     request_operation: Option<&str>,
     model_directive_policy: Option<&crate::system_features::ModelDirectivePolicySnapshot>,
+    thinking_level: Option<AntigravityThinkingLevel>,
     request_auth_channel: Option<&str>,
     build_extra_data: &F,
 ) -> Vec<LocalExecutionCandidateAttempt>
@@ -1988,6 +2007,7 @@ where
                 )
                 .with_request_operation(request_operation)
                 .with_routing_model(routing_model.as_deref())
+                .with_thinking_level(thinking_level)
                 .with_runtime_miss_diagnostic(trace_id, record_runtime_miss_diagnostic);
                 let attempt_count_before_pool = attempts.len();
                 while let Some(candidate) = cursor.next_key().await {
@@ -3098,6 +3118,7 @@ mod tests {
                 LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
                 false,
                 LocalCandidateResolutionMode::Standard,
+                None,
                 no_extra_data,
                 identity_skipped_candidate,
             )
@@ -3235,6 +3256,7 @@ mod tests {
             resolution_mode: LocalCandidateResolutionMode::Standard,
             decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
             model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot::default(),
+            thinking_level: None,
             page_cursor,
             pending_ranked_candidates: VecDeque::new(),
             pending_items: VecDeque::new(),
@@ -3352,6 +3374,7 @@ mod tests {
             },
             resolution_mode: LocalCandidateResolutionMode::Standard,
             model_directive_policy: None,
+            thinking_level: None,
             scheduler_cache_affinity_enabled: false,
             build_available_extra_data: no_extra_data,
             decorate_skipped_candidate: identity_skipped_candidate,
@@ -3416,6 +3439,7 @@ mod tests {
             resolution_mode: LocalCandidateResolutionMode::Standard,
             decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
             model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot::default(),
+            thinking_level: None,
             page_cursor,
             pending_ranked_candidates: VecDeque::new(),
             pending_items: VecDeque::new(),
@@ -3552,6 +3576,7 @@ mod tests {
             resolution_mode: LocalCandidateResolutionMode::Standard,
             decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
             model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot::default(),
+            thinking_level: None,
             page_cursor,
             pending_ranked_candidates: VecDeque::new(),
             pending_items: VecDeque::new(),
@@ -3615,6 +3640,7 @@ mod tests {
             "openai:chat",
             None,
             Some("gpt-5"),
+            None,
             None,
             None,
             None,
@@ -4422,6 +4448,7 @@ mod tests {
                 LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
                 false,
                 LocalCandidateResolutionMode::Standard,
+                None,
                 no_extra_data,
                 identity_skipped_candidate,
             )

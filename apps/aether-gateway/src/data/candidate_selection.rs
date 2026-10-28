@@ -3,6 +3,7 @@ use aether_data_contracts::repository::candidate_selection::{
     StoredApiFormatCandidateRowsQuery, StoredMinimalCandidateSelectionRow,
     StoredPoolKeyCandidateRowsQuery, StoredRequestedModelCandidateRowsQuery,
 };
+use aether_provider_transport::antigravity::AntigravityThinkingLevel;
 use aether_scheduler_core::{
     auth_constraints_allow_api_format, collect_global_model_names_for_required_capability,
     enumerate_minimal_candidate_selection_with_model_directives, normalize_api_format,
@@ -303,6 +304,51 @@ pub(crate) async fn read_api_format_rows_fallback_page(
     })
 }
 
+/// 该行是否属于 effort 敏感且可能动态换模型的 Antigravity Gemini 账号。
+///
+/// 只有全部候选静态模型都在 gemini 族内时才放开清单，避免把非 Gemini 模型的
+/// 管理员限制绕过强解析器的适用范围。
+pub(crate) fn row_is_dynamic_thinking_antigravity(
+    row: &StoredMinimalCandidateSelectionRow,
+) -> bool {
+    fn is_gemini(model: &str) -> bool {
+        model
+            .trim()
+            .get(.."gemini-".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gemini-"))
+    }
+
+    row.provider_type.trim().eq_ignore_ascii_case("antigravity")
+        && normalize_api_format(row.endpoint_api_format.as_str()) == "gemini:generate_content"
+        && is_gemini(row.model_provider_model_name.as_str())
+        && row
+            .model_provider_model_mappings
+            .as_ref()
+            .is_none_or(|mappings| {
+                mappings
+                    .iter()
+                    .all(|mapping| is_gemini(mapping.name.as_str()))
+            })
+}
+
+/// 动态 thinking 请求的 Antigravity/Gemini 行在进入静态映射解析前放开账号模型清单。
+///
+/// 静态映射会先选默认（可能是 high），只允许 low 的账号会在这一步被错误淘汰；真正
+/// 的模型清单约束由后续按强读 Key 的发现目录解析器执行。其他 Provider 或格式不变。
+pub(crate) fn relax_dynamic_thinking_row_allowed_models(
+    rows: &mut [StoredMinimalCandidateSelectionRow],
+    thinking_level: Option<AntigravityThinkingLevel>,
+) {
+    if thinking_level.is_none() {
+        return;
+    }
+    for row in rows {
+        if row_is_dynamic_thinking_antigravity(row) {
+            row.key_allowed_models = None;
+        }
+    }
+}
+
 pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabilities(
     state: &(impl MinimalCandidateSelectionRowSource + Sync),
     api_format: &str,
@@ -321,6 +367,7 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
         required_capabilities,
         enable_model_directives,
         None,
+        None,
     )
     .await
 }
@@ -334,6 +381,7 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
     required_capabilities: Option<&serde_json::Value>,
     enable_model_directives: bool,
     request_operation: Option<&str>,
+    thinking_level: Option<AntigravityThinkingLevel>,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, DataLayerError> {
     let normalized_api_format = normalize_api_format(api_format);
     if normalized_api_format.is_empty() {
@@ -347,7 +395,7 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
         return Ok(Vec::new());
     }
 
-    let Some((resolved_global_model_name, rows)) = read_requested_model_rows(
+    let Some((resolved_global_model_name, mut rows)) = read_requested_model_rows(
         state,
         &normalized_api_format,
         requested_model_name,
@@ -357,6 +405,8 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
     else {
         return Ok(Vec::new());
     };
+    // 静态映射可能落在默认高档；只允许低档的账号必须留给强读 Key 的动态解析判定。
+    relax_dynamic_thinking_row_allowed_models(&mut rows, thinking_level);
     let auth_constraints = auth_snapshot.map(auth_snapshot_constraints);
     enumerate_minimal_candidate_selection_with_model_directives(
         EnumerateMinimalCandidateSelectionInput {

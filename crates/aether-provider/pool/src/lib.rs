@@ -69,7 +69,7 @@ pub use quota::{
     provider_pool_key_scheduling_label, provider_pool_key_supports_discovered_model,
     provider_pool_member_quota_snapshot, provider_pool_quota_metadata_provider_type,
     provider_pool_quota_metadata_updated_at, provider_pool_quota_snapshot_updated_at,
-    provider_pool_reset_deadline_elapsed,
+    provider_pool_reset_deadline_elapsed, resolve_provider_pool_key_thinking_model,
 };
 pub use quota_refresh::{
     official_balance_backoff_secs, official_balance_backoff_with_jitter_secs,
@@ -90,6 +90,7 @@ mod tests {
     use crate::quota::provider_pool_quota_snapshot_exhausted_decision;
     use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
     use aether_pool_core::PoolSchedulingPreset;
+    use aether_provider_transport::antigravity::AntigravityThinkingLevel;
     use serde_json::{json, Value};
 
     fn sample_key(upstream_metadata: Option<Value>) -> StoredProviderCatalogKey {
@@ -2684,6 +2685,494 @@ mod tests {
             "antigravity",
             "gemini-4-argon-high"
         ));
+    }
+
+    fn antigravity_thinking_key(models: Value) -> StoredProviderCatalogKey {
+        sample_key(Some(json!({
+            "antigravity": { "quota_by_model": models }
+        })))
+    }
+
+    fn resolve_antigravity_thinking<'a>(
+        key: &'a StoredProviderCatalogKey,
+        selected: &'a str,
+        requested: &str,
+        level: Option<AntigravityThinkingLevel>,
+    ) -> Option<&'a str> {
+        resolve_provider_pool_key_thinking_model(key, "antigravity", requested, selected, level)
+    }
+
+    /// 账号隔离、权威首映射、空映射与禁用条目都由解析器直接消费。
+    #[test]
+    fn antigravity_thinking_model_resolution_uses_only_authoritative_account_map() {
+        let selected = "gemini-4-argon-high";
+        let low_account = antigravity_thinking_key(json!({
+            "gemini-4-argon-low": {},
+            "gemini-4-argon-high": {}
+        }));
+        let medium_account = antigravity_thinking_key(json!({
+            "gemini-4-argon-medium": {},
+            "gemini-4-argon-high": {}
+        }));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &low_account,
+                selected,
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            Some("gemini-4-argon-low")
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &medium_account,
+                selected,
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Medium)
+            ),
+            Some("gemini-4-argon-medium")
+        );
+        // 另一账号没有的档位必须拒绝，不能借用本账号模型。
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &low_account,
+                selected,
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Medium)
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &medium_account,
+                selected,
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            None
+        );
+
+        // 首个对象映射权威：空对象优先于后续 models，且空映射拒绝一切模型。
+        let authoritative_empty = sample_key(Some(json!({
+            "antigravity": {
+                "quota_by_model": {},
+                "models": { "gemini-4-argon-low": {} }
+            }
+        })));
+        for level in [None, Some(AntigravityThinkingLevel::Low)] {
+            assert_eq!(
+                resolve_antigravity_thinking(
+                    &authoritative_empty,
+                    selected,
+                    "gemini-4-argon",
+                    level
+                ),
+                None
+            );
+        }
+        let first_map_wins = sample_key(Some(json!({
+            "antigravity": {
+                "quota_by_model": { "gemini-4-argon-high": {} },
+                "models": { "gemini-4-argon-low": {} }
+            }
+        })));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &first_map_wins,
+                selected,
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            None
+        );
+        // 首个对象缺失时继续使用后续模型映射。
+        let legacy_models = sample_key(Some(json!({
+            "antigravity": { "models": { "gemini-4-argon-low": {} } }
+        })));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &legacy_models,
+                selected,
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            Some("gemini-4-argon-low")
+        );
+
+        // 已存在但禁用的目标档位拒绝；不能被其他档位替代。
+        let disabled = antigravity_thinking_key(json!({
+            "gemini-4-argon-low": { "disabled": true },
+            "gemini-4-argon-high": {}
+        }));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &disabled,
+                selected,
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &disabled,
+                selected,
+                "gemini-4-argon-low",
+                Some(AntigravityThinkingLevel::High)
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &disabled,
+                selected,
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::High)
+            ),
+            Some("gemini-4-argon-high")
+        );
+    }
+
+    /// thinking 变体只在剥离已识别终结后缀后完全相同的模型族/版本内选择。
+    #[test]
+    fn antigravity_thinking_model_resolution_preserves_family_and_version_boundaries() {
+        let key = antigravity_thinking_key(json!({
+            "gemini-4-argon-2-low": {},
+            "gemini-4.1-argon-low": {},
+            "gemini-4-argon-ultra-low": {},
+            "gemini-4-argon-low": {}
+        }));
+        let low = Some(AntigravityThinkingLevel::Low);
+        assert_eq!(
+            resolve_antigravity_thinking(&key, "gemini-4-argon-high", "gemini-4-argon", low),
+            Some("gemini-4-argon-low")
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(&key, "gemini-4-argon-2-high", "gemini-4-argon", low),
+            Some("gemini-4-argon-2-low")
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(&key, "gemini-4-argon-ultra-high", "gemini-4-argon", low),
+            Some("gemini-4-argon-ultra-low")
+        );
+        // 同版本不同族/缺失版本都不跨边界借用。
+        assert_eq!(
+            resolve_antigravity_thinking(&key, "gemini-4.2-argon-high", "gemini-4-argon", low),
+            None
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(&key, "gemini-4-argon-pro-high", "gemini-4-argon", low),
+            None
+        );
+        // 未识别的后缀属于模型身份本身，仍按完整族匹配。
+        let identity_key = antigravity_thinking_key(json!({
+            "gemini-4-argon-thinking-low": {}
+        }));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &identity_key,
+                "gemini-4-argon-thinking-high",
+                "gemini-4-argon",
+                low
+            ),
+            Some("gemini-4-argon-thinking-low")
+        );
+    }
+
+    /// 显式客户端后缀优先于请求体 effort，无 effort 保留默认映射。
+    #[test]
+    fn antigravity_thinking_model_resolution_honors_client_suffix_and_defaults() {
+        let key = antigravity_thinking_key(json!({
+            "gemini-4-argon-low": {},
+            "gemini-4-argon-medium": {},
+            "gemini-4-argon-high": {}
+        }));
+        let selected = "gemini-4-argon-high";
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &key,
+                selected,
+                "gemini-4-argon-low",
+                Some(AntigravityThinkingLevel::High)
+            ),
+            Some("gemini-4-argon-low")
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &key,
+                selected,
+                "gemini-4-argon-xhigh",
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            Some("gemini-4-argon-high")
+        );
+        // 显式后缀的目标档位缺失时拒绝，不静默回退到请求体档位。
+        let missing = antigravity_thinking_key(json!({
+            "gemini-4-argon-medium": {},
+            "gemini-4-argon-high": {}
+        }));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &missing,
+                selected,
+                "gemini-4-argon-low",
+                Some(AntigravityThinkingLevel::High)
+            ),
+            None
+        );
+        // 无 effort 保留默认映射，即使该默认模型未被本账号发现。
+        let default_only = antigravity_thinking_key(json!({ "gemini-4-argon-low": {} }));
+        assert_eq!(
+            resolve_antigravity_thinking(&default_only, selected, "gemini-4-argon", None),
+            Some(selected)
+        );
+        // 精确命中的已发现身份保留其原始键。
+        let cased = antigravity_thinking_key(json!({ "Gemini-4-Argon-High": {} }));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &cased,
+                "gemini-4-argon-high",
+                "gemini-4-argon-high",
+                None
+            ),
+            Some("Gemini-4-Argon-High")
+        );
+        // 基础模型 + 已发现兄弟：有 effort 时按档位动态选择。
+        let base_family = antigravity_thinking_key(json!({
+            "gemini-4-argon": {},
+            "gemini-4-argon-low": {}
+        }));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &base_family,
+                "gemini-4-argon",
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            Some("gemini-4-argon-low")
+        );
+        // 无已发现变体族的基础模型保持既有行为；带后缀的默认映射则缺少兄弟。
+        let base_only = antigravity_thinking_key(json!({ "gemini-4-argon": {} }));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &base_only,
+                "gemini-4-argon",
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::High)
+            ),
+            Some("gemini-4-argon")
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &base_only,
+                "gemini-4-argon-high",
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::High)
+            ),
+            None
+        );
+    }
+
+    /// xhigh/max/extra 归一化为 high，minimal 优先已发现档位并保留禁用语义。
+    #[test]
+    fn antigravity_thinking_model_resolution_normalizes_extended_efforts_and_minimal() {
+        let key = antigravity_thinking_key(json!({
+            "gemini-4-argon-extra-low": {},
+            "gemini-4-argon-low": {},
+            "gemini-4-argon-high": {}
+        }));
+        let selected = "gemini-4-argon-high";
+        for effort in ["xhigh", "max", "extra", "HIGH"] {
+            let level = AntigravityThinkingLevel::parse(effort)
+                .unwrap_or_else(|| panic!("effort {effort} should normalize"));
+            assert_eq!(
+                resolve_antigravity_thinking(&key, selected, "gemini-4-argon", Some(level)),
+                Some("gemini-4-argon-high"),
+                "effort={effort}"
+            );
+        }
+        let minimal = AntigravityThinkingLevel::parse("minimal").expect("minimal should parse");
+        assert_eq!(
+            resolve_antigravity_thinking(&key, selected, "gemini-4-argon", Some(minimal)),
+            Some("gemini-4-argon-extra-low")
+        );
+        let low_only = antigravity_thinking_key(json!({ "gemini-4-argon-low": {} }));
+        assert_eq!(
+            resolve_antigravity_thinking(&low_only, selected, "gemini-4-argon", Some(minimal)),
+            Some("gemini-4-argon-low")
+        );
+        // 已存在的禁用 minimal 不得为 low 让路。
+        let disabled_minimal = antigravity_thinking_key(json!({
+            "gemini-4-argon-minimal": { "disabled": true },
+            "gemini-4-argon-low": {}
+        }));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &disabled_minimal,
+                selected,
+                "gemini-4-argon",
+                Some(minimal)
+            ),
+            None
+        );
+
+        // 缺失发现与非 Antigravity/非 Gemini 模型保持既有选择。
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &sample_key(None),
+                selected,
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            Some(selected)
+        );
+        let malformed = sample_key(Some(json!({
+            "antigravity": {
+                "quota_by_model": [],
+                "models": "gemini-4-argon-low",
+                "model_quotas": 1
+            }
+        })));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &malformed,
+                selected,
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            Some(selected)
+        );
+        assert_eq!(
+            resolve_provider_pool_key_thinking_model(
+                &key,
+                "codex",
+                "gemini-4-argon",
+                selected,
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            Some(selected)
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &key,
+                "claude-4",
+                "gemini-4-argon",
+                Some(AntigravityThinkingLevel::Low)
+            ),
+            Some("claude-4")
+        );
+    }
+
+    /// effort 敏感 Antigravity 选型的新目标或未变默认 high 仍须通过强 allowlist：
+    /// 解析目标本身或显式客户端别名；其他 Provider/非 effort 请求保持枚举语义。
+    #[test]
+    fn antigravity_thinking_model_resolution_respects_strong_key_allowlists() {
+        let selected = "gemini-4-argon-high";
+        let key = antigravity_thinking_key(json!({
+            "gemini-4-argon-low": {},
+            "gemini-4-argon-high": {}
+        }));
+        let low = Some(AntigravityThinkingLevel::Low);
+
+        // 只授权 high 的 Key 不得被 low 请求借用。
+        let mut high_only = key.clone();
+        high_only.allowed_models = Some(json!(["gemini-4-argon-high"]));
+        assert_eq!(
+            resolve_antigravity_thinking(&high_only, selected, "gemini-4-argon", low),
+            None
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &high_only,
+                selected,
+                "gemini-4-argon-low",
+                Some(AntigravityThinkingLevel::High)
+            ),
+            None
+        );
+        // 未改变默认模型时沿用既有枚举结果。
+        assert_eq!(
+            resolve_antigravity_thinking(&high_only, selected, "gemini-4-argon", None),
+            Some(selected)
+        );
+
+        // 客户端显式别名本身被允许时，可授权其映射出的低档变体。
+        let mut alias_listed = key.clone();
+        alias_listed.allowed_models = Some(json!(["gemini-4-argon"]));
+        assert_eq!(
+            resolve_antigravity_thinking(&alias_listed, selected, "gemini-4-argon", low),
+            Some("gemini-4-argon-low")
+        );
+
+        // 解析目标本身被允许（low-only Key）。
+        let mut low_only = key.clone();
+        low_only.allowed_models = Some(json!(["gemini-4-argon-low"]));
+        assert_eq!(
+            resolve_antigravity_thinking(&low_only, selected, "gemini-4-argon", low),
+            Some("gemini-4-argon-low")
+        );
+
+        // 延迟行级 allowlist 的 effort 请求即使仍解析为默认 high，也必须由目标或
+        // 显式别名授权；low-only 必须拒绝 high。
+        let high = Some(AntigravityThinkingLevel::High);
+        assert_eq!(
+            resolve_antigravity_thinking(&low_only, selected, "gemini-4-argon", high),
+            None
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(&alias_listed, selected, "gemini-4-argon", high),
+            Some(selected)
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(&high_only, selected, "gemini-4-argon", high),
+            Some(selected)
+        );
+        // 非 effort 请求的未改变结果继续沿用枚举语义。
+        assert_eq!(
+            resolve_antigravity_thinking(&low_only, selected, "gemini-4-argon", None),
+            Some(selected)
+        );
+
+        // 历史内嵌 JSON 字符串形态保持同样的列表语义。
+        let mut embedded_alias = key.clone();
+        embedded_alias.allowed_models = Some(json!("[\"gemini-4-argon\"]"));
+        assert_eq!(
+            resolve_antigravity_thinking(&embedded_alias, selected, "gemini-4-argon", low),
+            Some("gemini-4-argon-low")
+        );
+
+        // 空列表在 effort 敏感路径拒绝；非 effort 请求仍交由既有枚举处理。
+        let mut empty_list = key.clone();
+        empty_list.allowed_models = Some(json!([]));
+        assert_eq!(
+            resolve_antigravity_thinking(&empty_list, selected, "gemini-4-argon", low),
+            None
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(&empty_list, selected, "gemini-4-argon", None),
+            Some(selected)
+        );
+        // 其他 Provider 与非 Gemini 模型的既有选择完全不受该 allowlist 复核影响。
+        assert_eq!(
+            resolve_provider_pool_key_thinking_model(
+                &empty_list,
+                "codex",
+                "gemini-4-argon",
+                selected,
+                low
+            ),
+            Some(selected)
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(&empty_list, "claude-4", "gemini-4-argon", low),
+            Some("claude-4")
+        );
+        let mut unrestricted = key.clone();
+        unrestricted.allowed_models = None;
+        assert_eq!(
+            resolve_antigravity_thinking(&unrestricted, selected, "gemini-4-argon", low),
+            Some("gemini-4-argon-low")
+        );
     }
 
     /// 验证 `reset_time`/`next_reset_time`（Unix 与 RFC3339）、快照与原始元数据同时间戳一致性、非法重置时间保留耗尽及新观测恢复/阻断切换。

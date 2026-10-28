@@ -2,6 +2,7 @@ use aether_ai_serving::{
     run_ai_candidate_preselection, AiCandidatePreselectionOutcome, AiCandidatePreselectionPort,
 };
 use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
+use aether_provider_transport::antigravity::AntigravityThinkingLevel;
 use aether_routing_core::ResolvedRoutingPolicy;
 use aether_runtime::ConcurrencyPermit;
 use aether_scheduler_core::{
@@ -30,11 +31,13 @@ use crate::cache::{
 use crate::clock::{current_unix_secs, request_distribution_seed};
 use crate::data::candidate_selection::{
     read_api_format_rows_fallback_page, read_requested_model_rows_fast_path_page,
-    requested_model_candidate_names, MinimalCandidateSelectionRowSource,
-    RequestedModelCandidateRowsPage, REQUESTED_MODEL_CANDIDATE_PAGE_SIZE,
-    REQUESTED_MODEL_MAX_SCANNED_ROWS,
+    relax_dynamic_thinking_row_allowed_models, requested_model_candidate_names,
+    MinimalCandidateSelectionRowSource, RequestedModelCandidateRowsPage,
+    REQUESTED_MODEL_CANDIDATE_PAGE_SIZE, REQUESTED_MODEL_MAX_SCANNED_ROWS,
 };
-use crate::scheduler::candidate::{CandidateSchedulingContext, SchedulerSkippedCandidate};
+use crate::scheduler::candidate::{
+    CandidateSchedulingContext, SchedulerSkippedCandidate, SchedulerThinkingSelection,
+};
 use crate::scheduler::config::{SchedulerOrderingConfig, SchedulerSchedulingMode};
 use crate::stage_metrics::observe_gateway_stage_ms;
 use crate::GatewayError;
@@ -69,6 +72,8 @@ struct GatewayLocalCandidatePreselectionPort<'a> {
     key_mode: LocalCandidatePreselectionKeyMode,
     candidate_api_formats: Vec<String>,
     model_directive_routing_models: BTreeMap<String, String>,
+    /// 请求级 Antigravity thinking 档位；Some 时候选解析必须按账号动态选模型。
+    thinking_level: Option<AntigravityThinkingLevel>,
     /// 当前预选批次固定使用的真实时间与负载均衡种子。
     scheduling_context: CandidateSchedulingContext,
 }
@@ -85,6 +90,13 @@ impl GatewayLocalCandidatePreselectionPort<'_> {
     fn routing_model(&self, candidate_api_format: &str) -> &str {
         self.model_directive_base_model(candidate_api_format)
             .unwrap_or(self.requested_model)
+    }
+
+    fn thinking_selection(&self) -> Option<SchedulerThinkingSelection<'_>> {
+        self.thinking_level.map(|level| SchedulerThinkingSelection {
+            requested_model: self.requested_model,
+            level,
+        })
     }
 }
 
@@ -178,6 +190,7 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
                 super::candidate_ranking::scheduler_ordering_config_for_routing_policy(
                     self.routing_policy,
                 ),
+                self.thinking_selection(),
             )
             .await?;
 
@@ -274,6 +287,7 @@ pub(crate) async fn preselect_local_execution_candidates_with_serving(
     client_session_affinity: Option<&ClientSessionAffinity>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
+    thinking_level: Option<AntigravityThinkingLevel>,
 ) -> Result<
     AiCandidatePreselectionOutcome<
         SchedulerMinimalCandidateSelectionCandidate,
@@ -300,6 +314,7 @@ pub(crate) async fn preselect_local_execution_candidates_with_serving(
         use_api_format_alias_match,
         key_mode,
         candidate_api_formats,
+        thinking_level,
     )
     .await
 }
@@ -320,6 +335,7 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
     candidate_api_formats: Vec<String>,
+    thinking_level: Option<AntigravityThinkingLevel>,
 ) -> Result<
     AiCandidatePreselectionOutcome<
         SchedulerMinimalCandidateSelectionCandidate,
@@ -351,6 +367,7 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
         key_mode,
         candidate_api_formats,
         model_directive_routing_models,
+        thinking_level,
         scheduling_context: CandidateSchedulingContext {
             now_unix_secs: current_unix_secs(),
             load_balance_seed: request_distribution_seed(),
@@ -379,6 +396,8 @@ pub(crate) struct LocalCandidatePreselectionPageCursor<'a> {
     candidate_api_formats: Vec<String>,
     model_directive_routing_models: BTreeMap<String, String>,
     model_directive_policy_cache_key: String,
+    /// 请求级 Antigravity thinking 档位；游标生命周期内固定，缓存必须让位于动态解析。
+    thinking_level: Option<AntigravityThinkingLevel>,
     ordering_config: SchedulerOrderingConfig,
     /// 游标生命周期内固定的负载均衡种子，等待或翻页不得更新。
     load_balance_seed: u64,
@@ -416,6 +435,13 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
     fn routing_model(&self, candidate_api_format: &str) -> &str {
         self.model_directive_base_model(candidate_api_format)
             .unwrap_or(&self.requested_model)
+    }
+
+    fn thinking_selection(&self) -> Option<SchedulerThinkingSelection<'_>> {
+        self.thinking_level.map(|level| SchedulerThinkingSelection {
+            requested_model: &self.requested_model,
+            level,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -469,6 +495,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             candidate_api_formats,
             model_directive_routing_models,
             model_directive_policy_cache_key: model_directive_policy.cache_key().to_string(),
+            thinking_level: None,
             ordering_config,
             load_balance_seed: request_distribution_seed(),
             priority_page_emitted: false,
@@ -489,6 +516,15 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
     /// 将尚未开始的游标收窄为客户端同格式，供原生 passthrough 路径复用分页加载。
     pub(crate) fn restrict_to_client_api_format(&mut self) {
         self.candidate_api_formats = vec![self.client_api_format.clone()];
+    }
+
+    /// 固定本次请求的 thinking 档位；解析页缓存对档位敏感请求一律让位。
+    pub(crate) fn with_thinking_level(
+        mut self,
+        thinking_level: Option<AntigravityThinkingLevel>,
+    ) -> Self {
+        self.thinking_level = thinking_level;
+        self
     }
 
     pub(crate) async fn next_page(
@@ -625,6 +661,10 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
     }
 
     fn should_cache_current_priority_page(&self) -> bool {
+        // 动态档位请求的候选模型随账号变化，复用解析页会把一个档位的结果送给另一个档位。
+        if self.thinking_level.is_some() {
+            return false;
+        }
         self.allow_priority_page_cache && self.should_cache_current_priority_resolved_page()
     }
 
@@ -1309,6 +1349,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         if rows.is_empty() {
             return Ok(None);
         }
+        relax_dynamic_thinking_row_allowed_models(&mut rows, self.thinking_level);
 
         let auth_constraints = matches_client_api_format(
             self.use_api_format_alias_match,
@@ -1378,6 +1419,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                     load_balance_seed: self.load_balance_seed,
                 },
                 self.ordering_config,
+                self.thinking_selection(),
             )
             .await?;
         let skipped_candidates = skipped_candidates

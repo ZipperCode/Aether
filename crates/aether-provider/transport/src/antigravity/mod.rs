@@ -3,6 +3,7 @@ mod auth;
 mod policy;
 mod request;
 mod schema;
+mod thinking;
 mod url;
 
 pub use account::{
@@ -28,6 +29,10 @@ pub use request::{
     repair_antigravity_thought_signature_rejection, repair_antigravity_thought_signatures,
     AntigravityEnvelopeRequestType, AntigravityRequestEnvelopeSupport,
     AntigravityRequestEnvelopeUnsupportedReason, AntigravityThoughtSignatureRejection,
+};
+pub use thinking::{
+    antigravity_model_thinking_variant, antigravity_request_thinking_level,
+    AntigravityThinkingLevel,
 };
 pub use url::{
     build_antigravity_v1internal_url, AntigravityRequestUrlAction,

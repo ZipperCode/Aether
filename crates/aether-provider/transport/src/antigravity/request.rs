@@ -2,6 +2,7 @@ use serde_json::{Map, Value};
 
 use super::auth::{antigravity_client_identity, AntigravityRequestAuth};
 use super::schema::{normalize_claude_unions, normalize_tool_parameters, SchemaBudget};
+use super::thinking::normalize_antigravity_gemini_thinking_level;
 
 /// 只识别真实 HTTP 400 的 Gemini 签名拒绝；调用方还必须确认 Antigravity 适配身份。
 pub fn is_antigravity_corrupted_thought_signature(status_code: u16, body: &Value) -> bool {
@@ -255,6 +256,7 @@ pub fn build_antigravity_safe_v1internal_request(
                 AntigravityRequestEnvelopeUnsupportedReason::ToolSchemaBudgetExceeded,
             );
         }
+        normalize_antigravity_gemini_thinking_level(&mut inner_request, model);
         let request_id = non_empty_string_field(source, "requestId").unwrap_or(request_id);
         // Pre-enveloped v1internal bodies keep their explicit `userAgent` byte-for-byte so
         // passthrough callers stay wire-compatible; only a missing one falls back to the
@@ -292,6 +294,7 @@ pub fn build_antigravity_safe_v1internal_request(
             AntigravityRequestEnvelopeUnsupportedReason::ToolSchemaBudgetExceeded,
         );
     }
+    normalize_antigravity_gemini_thinking_level(&mut inner_request, model);
 
     let mut envelope = serde_json::json!({
         "project": auth.project_id,
@@ -595,9 +598,16 @@ mod tests {
                     output["request"]["contents"], expected,
                     "{model} wrapped={wrapped}"
                 );
+                let expected_generation = if model.starts_with("claude-") {
+                    body["generationConfig"].clone()
+                } else {
+                    let mut expected = body["generationConfig"].clone();
+                    expected["thinkingConfig"]["thinkingLevel"] = json!("high");
+                    expected
+                };
                 assert_eq!(
-                    output["request"]["generationConfig"],
-                    body["generationConfig"]
+                    output["request"]["generationConfig"], expected_generation,
+                    "{model} wrapped={wrapped}"
                 );
                 assert_eq!(input, original, "do not mutate caller-owned input");
                 let rebuilt = build_antigravity_safe_v1internal_request(

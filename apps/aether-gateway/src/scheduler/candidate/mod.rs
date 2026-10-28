@@ -60,6 +60,13 @@ pub(crate) struct CandidateSchedulingContext {
     pub(crate) load_balance_seed: u64,
 }
 
+/// 请求级 Antigravity thinking 选择：原始客户端模型用于后缀优先级，档位用于档位选择。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SchedulerThinkingSelection<'a> {
+    pub(crate) requested_model: &'a str,
+    pub(crate) level: aether_provider_transport::antigravity::AntigravityThinkingLevel,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequiredCapabilityMatchMode {
     Compatible,
@@ -138,6 +145,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons(
         enable_model_directives,
         None,
         ordering_config,
+        None,
     )
     .await
 }
@@ -157,6 +165,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons_for_request_ope
     enable_model_directives: bool,
     request_operation: Option<&str>,
     ordering_config: SchedulerOrderingConfig,
+    thinking: Option<SchedulerThinkingSelection<'_>>,
 ) -> Result<
     (
         Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -177,6 +186,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons_for_request_ope
         enable_model_directives,
         request_operation,
         ordering_config,
+        thinking,
     )
     .await
 }
@@ -193,6 +203,7 @@ pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
     client_session_affinity: Option<&ClientSessionAffinity>,
     scheduling_context: CandidateSchedulingContext,
     ordering_config: SchedulerOrderingConfig,
+    thinking: Option<SchedulerThinkingSelection<'_>>,
 ) -> Result<
     (
         Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -216,6 +227,7 @@ pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
         scheduling_context,
         ordering_config,
         priority_affinity_key,
+        thinking,
     )
     .await
 }
@@ -309,6 +321,7 @@ pub(crate) async fn list_selectable_candidates_for_required_capability_without_r
                 false,
                 None,
                 ordering_config,
+                None,
             )
             .await?;
         all_attempts_blocked_by_auth_limit &=

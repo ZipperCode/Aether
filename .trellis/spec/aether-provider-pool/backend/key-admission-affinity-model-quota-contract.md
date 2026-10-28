@@ -4,10 +4,10 @@
 
 Use this contract when changing Provider Key `concurrent_limit`, runtime
 semaphores, sync/stream/WebSocket admission, Pool cache affinity, model quota
-windows, Antigravity discovered-model admission, runtime quota feedback and
-quota projection, Codex reset-credit state, or quota-driven model discovery.
-It keeps every transport on the same atomic Key capacity and separates model
-availability from quota.
+windows, Antigravity discovered-model admission and dynamic thinking variants,
+runtime quota feedback and quota projection, Codex reset-credit state, or
+quota-driven model discovery.
+It keeps every transport on the same atomic Key capacity and separates model availability from quota.
 
 ## 2. Signatures
 
@@ -35,6 +35,22 @@ pub fn provider_pool_key_supports_discovered_model(
     provider_type: &str,
     provider_model_name: &str,
 ) -> bool;
+
+pub enum AntigravityThinkingLevel { Minimal, Low, Medium, High }
+pub fn antigravity_request_thinking_level(
+    api_format: &str,
+    body: &serde_json::Value,
+) -> Option<AntigravityThinkingLevel>;
+pub fn antigravity_model_thinking_variant(
+    model: &str,
+) -> Option<(&str, AntigravityThinkingLevel)>;
+pub fn resolve_provider_pool_key_thinking_model<'a>(
+    key: &'a StoredProviderCatalogKey,
+    provider_type: &str,
+    requested_model: &str,
+    selected_provider_model: &'a str,
+    thinking_level: Option<AntigravityThinkingLevel>,
+) -> Option<&'a str>;
 
 pub(crate) async fn antigravity_model_quota_blocked_many_with_auth_configs(
     runtime: &RuntimeState,
@@ -122,7 +138,9 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   Missing/malformed model maps preserve pre-discovery behavior; other Provider
   types are unchanged. A null allowlist or disabled automatic fetching cannot
   override a discovered catalog excluding the target. Do not infer subscription
-  privileges, model families, suffixes, or another account's model availability.
+  privileges or another account's model availability. Dynamic thinking selection
+  below is the only recognized-suffix family operation; discovery/quota admission
+  still compares the resulting complete identity exactly.
 - Ordinary candidates and actual Pool/sticky members share the borrowed
   `provider_pool_key_supports_discovered_model` decision and emit
   `key_model_disabled` after existing higher-priority runtime denials. PoolGroup
@@ -137,6 +155,33 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   across explicit scalar/array model aliases. Versions, thinking suffixes and
   Pro/Flash names are independent; no token, punctuation or family inference.
   Other providers retain their existing matching rules.
+- Antigravity dynamic thinking is resolved from each serving Key's first
+  authoritative map before discovery/quota snapshots and Pool windows. Decode
+  native Gemini `generationConfig.thinkingConfig.thinkingLevel`, Chat
+  `reasoning_effort`, or Responses `reasoning.effort` after client routing
+  mutations. `xhigh/max/extra` normalize to high; `none/minimal/extra-low` prefer
+  a discovered minimal variant, using low only when no minimal variant exists.
+  Never bypass a disabled minimal variant or approximate missing medium/high.
+- Only `gemini-` terminal effort suffixes form variant families; preserve exact
+  family/version identity. Explicit client suffix takes precedence over body
+  effort; a mapped default suffix is not a client choice. Return the actual
+  discovered ID, never synthesize catalog entries. No effort keeps static
+  mapping; absent discovery and base models without variants retain prior
+  behavior. Claude and unrelated providers remain unchanged.
+- Static mapping cannot pre-reject a low-only Key against a default-high alias.
+  Defer row `key_allowed_models` only for effort-sensitive Antigravity Gemini
+  rows whose possible mapping targets are all Gemini. Then the unavoidable
+  strong-Key resolver authorizes the actual target or explicitly allowed client
+  alias, including unchanged targets. Null is unrestricted; empty denies all.
+  Ordinary missing-Key snapshots skip with `key_quota_state_unavailable`, not
+  model-disabled/exhausted, so an eligible sibling can continue.
+- Re-resolve on every account change, including sticky before reserve-minimum
+  quota. Effort-bearing requests bypass resolved-page caches; source-row caches
+  remain shared. Keep selected candidate, plan, usage and quota attribution on
+  the same exact upstream model. The private-envelope boundary canonicalizes
+  Gemini thinking level from that model in fresh/pre-enveloped bodies while
+  retaining numeric budgets and unrelated fields; native format still bypasses
+  conversion.
 - Multiple exact-model windows retain `all` exhaustion semantics. An unknown
   applicable window prevents a known exhausted sibling window from proving
   exhaustion; all-unknown windows alone remain unresolved. Missing, empty and
@@ -269,6 +314,11 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
 | Model maps are absent/malformed, or Provider is not Antigravity | Preserve existing pre-discovery/allowlist behavior. |
 | Sticky account loses target after successful discovery refresh | Re-evaluate strong Key evidence, skip old binding and serve/rebind an eligible sibling. |
 | All accounts exclude target in discovery | HTTP 503 and zero upstream generation requests. |
+| Alias defaults to high, client requests low | Select that Key's discovered low before quota filtering; high exhaustion must not block low. |
+| Requested tier missing/disabled on an account | `key_model_disabled`; continue another account, never silently choose another tier. |
+| A allows only high, B only low; alias defaults high and effort is low | Reject A, defer static permission on B, authorize B's resolved low and serve/rebind B. |
+| Client exact low model conflicts with body high | Keep discovered low identity and canonical low thinking level. |
+| Strong ordinary Key is absent during effort selection | `key_quota_state_unavailable`; continue eligible siblings without cached-default execution. |
 | Antigravity 额度刷新发现模型 | 保留发现元数据，不写模型目录。 |
 | 用户删除全局模型后再次刷新额度 | 不恢复该模型及关联记录。 |
 | 用户显式导入模型 | 使用准确的发现 Endpoint 证据，沿用现有导入校验。 |
@@ -298,6 +348,10 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   Gemini even when its automatic model-fetch toggle is disabled.
 - Bad: treating unknown quota as proof of model entitlement, or allowing a null
   allowlist to erase an account's fetched model restriction.
+- Good: a stable `gemini-3.8-flash` alias maps to high by default; low effort
+  selects the serving account's discovered low while xhigh/max select high.
+- Bad: rewrite only the envelope after default-high quota admission, or clear
+  a row allowlist without enforcing the actual strong-Key target afterward.
 
 ## 6. Tests Required
 
@@ -354,6 +408,14 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   sync and public `streamGenerateContent?alt=sse` HTTP in ordinary/Pool modes.
   Assert zero unsupported generations, exact mapped model, native SSE `STOP`,
   refreshed discovery rebinding, and all-unsupported HTTP 503 with no generation.
+- `gateway_antigravity_dynamic_effort_*` exercises ordinary/Pool HTTP for native
+  Gemini sync/SSE and converted Chat/Responses: alternating tiers with warm
+  caches, explicit suffix priority, canonical xhigh/max, missing tiers, scoped
+  high quota feedback, default-high exhaustion/missing discovery with low still
+  available, and high-only/low-only Key allowlists. Assert completion text,
+  exact envelope model/level, preserved native custom fields and no unsupported
+  upstream calls. Runtime unit coverage retains an eligible sibling when the
+  preferred Key is absent from the strong snapshot.
 
 - Runtime-state: keyed resources isolate capacity and permits release correctly.
 - Gateway: sync, stream, Responses WS, and Live admission/release; saturation
@@ -425,3 +487,8 @@ Provider mapping is valid for that account. Correct: keep existing mapping and
 allowlist rules, then apply the shared discovered-model guard to the actual
 Key and selected upstream model. Preserve absent-discovery fallback; never
 reinterpret missing quota as a model permission or persist model absence as a ban.
+
+For dynamic effort, wrong: admit/quota-filter static high and later rewrite the
+envelope to low. Correct: resolve a discovered model for the actual account,
+authorize that target or client alias, then read exact-model quota and build
+the envelope. Keep family matching out of discovery and quota guards.

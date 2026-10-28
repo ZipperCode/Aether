@@ -6,7 +6,9 @@ use crate::clock::request_distribution_seed;
 use crate::constants::{
     API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS, API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS,
 };
-use crate::scheduler::candidate::{CandidateSchedulingContext, SchedulerSkippedCandidate};
+use crate::scheduler::candidate::{
+    CandidateSchedulingContext, SchedulerSkippedCandidate, SchedulerThinkingSelection,
+};
 use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::GatewayError;
 
@@ -76,6 +78,7 @@ impl<'a> PlannerAppState<'a> {
             enable_model_directives,
             None,
             ordering_config,
+            None,
         )
         .await
     }
@@ -94,6 +97,7 @@ impl<'a> PlannerAppState<'a> {
         enable_model_directives: bool,
         request_operation: Option<&str>,
         ordering_config: SchedulerOrderingConfig,
+        thinking: Option<SchedulerThinkingSelection<'_>>,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -129,6 +133,7 @@ impl<'a> PlannerAppState<'a> {
                 enable_model_directives,
                 request_operation,
                 ordering_config,
+                thinking,
             )
             .await?;
 
@@ -153,6 +158,7 @@ impl<'a> PlannerAppState<'a> {
         client_session_affinity: Option<&ClientSessionAffinity>,
         scheduling_context: CandidateSchedulingContext,
         ordering_config: SchedulerOrderingConfig,
+        thinking: Option<SchedulerThinkingSelection<'_>>,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -170,6 +176,7 @@ impl<'a> PlannerAppState<'a> {
             client_session_affinity,
             scheduling_context,
             ordering_config,
+            thinking,
         )
         .await
     }

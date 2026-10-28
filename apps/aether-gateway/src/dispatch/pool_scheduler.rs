@@ -24,7 +24,11 @@ use aether_pool_core::{
     POOL_COST_LIMIT_REACHED_SKIP_REASON, POOL_KEY_QUOTA_EXHAUSTED_SKIP_REASON,
     POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON,
 };
-use aether_provider_pool::{provider_pool_key_supports_discovered_model, ProviderPoolService};
+use aether_provider_pool::{
+    provider_pool_key_supports_discovered_model, resolve_provider_pool_key_thinking_model,
+    ProviderPoolService,
+};
+use aether_provider_transport::antigravity::AntigravityThinkingLevel;
 use aether_routing_core::{RankingOverlay, ResolvedRoutingPolicy};
 use aether_scheduler_core::{
     candidate_runtime_skip_reason_with_state, effective_provider_key_rpm_limit,
@@ -41,6 +45,9 @@ use crate::ai_serving::{
     SkippedLocalExecutionCandidate,
 };
 use crate::clock::current_unix_ms;
+use crate::data::candidate_selection::{
+    relax_dynamic_thinking_row_allowed_models, row_is_dynamic_thinking_antigravity,
+};
 use crate::handlers::shared::provider_pool::{
     admin_provider_pool_cache_affinity_enabled, admin_provider_pool_config_from_config_value,
 };
@@ -81,6 +88,7 @@ pub(crate) async fn apply_local_execution_pool_scheduler(
     requested_model: Option<&str>,
     request_operation: Option<&str>,
     request_auth_channel: Option<&str>,
+    thinking_level: Option<AntigravityThinkingLevel>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
@@ -104,6 +112,7 @@ pub(crate) async fn apply_local_execution_pool_scheduler(
                 requested_model,
                 request_operation,
                 request_auth_channel,
+                thinking_level,
             )
             .await;
             scheduled.append(&mut expanded.0);
@@ -122,9 +131,11 @@ pub(crate) async fn apply_local_execution_pool_scheduler(
 /// 仅收窄可恢复的模型额度窗口；目录缺失、余额下限和管理员恢复型阻断仍保持 Key 级语义。
 async fn schedule_pool_page_candidates(
     state: PlannerAppState<'_>,
-    candidates: Vec<EligibleLocalExecutionCandidate>,
+    mut candidates: Vec<EligibleLocalExecutionCandidate>,
     sticky_session_token: Option<&str>,
     effective_pool_config: Option<&AdminProviderPoolConfig>,
+    requested_model: Option<&str>,
+    thinking_level: Option<AntigravityThinkingLevel>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
@@ -148,8 +159,18 @@ async fn schedule_pool_page_candidates(
         entry.1.insert(candidate.candidate.key_id.clone());
     }
 
-    let (key_context_by_id, keys_by_id) =
-        read_pool_catalog_key_contexts_by_id(state, &candidates, effective_pool_config).await;
+    let (key_context_by_id, keys_by_id, mut resolution_skipped) =
+        read_pool_catalog_key_contexts_by_id(
+            state,
+            &mut candidates,
+            effective_pool_config,
+            requested_model,
+            thinking_level,
+        )
+        .await;
+    if candidates.is_empty() {
+        return (Vec::new(), resolution_skipped);
+    }
     let now_unix_secs = crate::clock::current_unix_secs();
     // 复用普通 Key 的计数窗口和 RPM 重置水位；实际执行仍由原子并发准入兜住竞争。
     let recent_candidates = if keys_by_id.values().any(|key| {
@@ -267,7 +288,8 @@ async fn schedule_pool_page_candidates(
         &model_runtime_skip_reasons,
     );
     let scheduled = outcome.candidates;
-    let skipped = outcome.skipped;
+    let mut skipped = outcome.skipped;
+    skipped.append(&mut resolution_skipped);
     burst_provider_ids.extend(outcome.active_probe_seal_fallback_provider_ids);
     spawn_active_probe_member_evictions_for_request(
         state,
@@ -416,6 +438,7 @@ async fn expand_pool_group_candidate(
     requested_model: Option<&str>,
     request_operation: Option<&str>,
     request_auth_channel: Option<&str>,
+    thinking_level: Option<AntigravityThinkingLevel>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
@@ -427,7 +450,8 @@ async fn expand_pool_group_candidate(
         requested_model,
         request_auth_channel,
     )
-    .with_request_operation(request_operation);
+    .with_request_operation(request_operation)
+    .with_thinking_level(thinking_level);
     let mut scheduled = Vec::new();
     let mut skipped = Vec::new();
 
@@ -451,6 +475,8 @@ pub(crate) struct PoolKeyCursor<'a> {
     request_operation: Option<String>,
     /// 与预选同源的指令路由模型快照（指令基座）；解析输入缺失时沿用原始请求名。
     routing_model: Option<String>,
+    /// 请求级 Antigravity thinking 档位；sticky 与分页成员在各自强读 Key 后解析。
+    thinking_level: Option<AntigravityThinkingLevel>,
     request_auth_channel: Option<String>,
     routing_overlay: Option<RankingOverlay>,
     routing_allowed_key_ids: Option<Vec<String>>,
@@ -555,6 +581,7 @@ impl<'a> PoolKeyCursor<'a> {
             requested_model: requested_model.map(str::to_string),
             request_operation: None,
             routing_model: None,
+            thinking_level: None,
             request_auth_channel: request_auth_channel.map(str::to_string),
             routing_overlay,
             routing_allowed_key_ids,
@@ -614,6 +641,15 @@ impl<'a> PoolKeyCursor<'a> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        self
+    }
+
+    /// 附加请求级 thinking 档位；每个真实成员在强读目录后按自己的发现目录解析模型。
+    pub(crate) fn with_thinking_level(
+        mut self,
+        thinking_level: Option<AntigravityThinkingLevel>,
+    ) -> Self {
+        self.thinking_level = thinking_level;
         self
     }
 
@@ -1184,13 +1220,19 @@ impl<'a> PoolKeyCursor<'a> {
                 None
             }
         };
-        let Some(row) = row else {
+        let Some(mut row) = row else {
             self.seen_key_ids.insert(key.id.clone());
             self.record_skip_reason("mapped_model_missing");
             return None;
         };
-        let member_model = self.pool_member_model_for_row(&row);
+        let member_model = self.pool_member_model_for_row(&mut row);
         let Some(member_model) = member_model else {
+            self.seen_key_ids.insert(key.id.clone());
+            self.record_skip_reason("key_model_disabled");
+            return None;
+        };
+        // Sticky 的真实成员同样先按自己的发现目录解析档位，再进入保底额度判定。
+        let Some(member_model) = self.resolve_pool_member_thinking_model(&key, member_model) else {
             self.seen_key_ids.insert(key.id.clone());
             self.record_skip_reason("key_model_disabled");
             return None;
@@ -1223,6 +1265,8 @@ impl<'a> PoolKeyCursor<'a> {
             vec![candidate],
             self.sticky_session_token.as_deref(),
             self.effective_pool_config.as_ref(),
+            self.requested_model.as_deref(),
+            self.thinking_level,
         )
         .await;
         self.record_skipped_candidates(&skipped);
@@ -1253,6 +1297,8 @@ impl<'a> PoolKeyCursor<'a> {
                 candidates,
                 self.sticky_session_token.as_deref(),
                 self.effective_pool_config.as_ref(),
+                self.requested_model.as_deref(),
+                self.thinking_level,
             )
             .await;
             self.record_skipped_candidates(&skipped);
@@ -1517,18 +1563,73 @@ impl<'a> PoolKeyCursor<'a> {
 
     async fn build_page_eligible_candidates(
         &mut self,
-        rows: Vec<StoredMinimalCandidateSelectionRow>,
+        mut rows: Vec<StoredMinimalCandidateSelectionRow>,
     ) -> Vec<EligibleLocalExecutionCandidate> {
+        // effort 敏感行必须在 transport 的模型清单独裁前拿到强读 Key 的已解析档位；
+        // 静态映射可能落在默认 high，只允许请求档位的账号会被 pre-gate 误杀。
+        let key_by_id = if self.thinking_level.is_some() {
+            let key_ids = rows
+                .iter()
+                .filter(|row| row_is_dynamic_thinking_antigravity(row))
+                .map(|row| row.key_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if key_ids.is_empty() {
+                BTreeMap::new()
+            } else {
+                match self
+                    .state
+                    .app()
+                    .list_provider_catalog_keys_by_ids_strong(&key_ids)
+                    .await
+                {
+                    Ok(keys) => keys
+                        .into_iter()
+                        .map(|key| (key.id.clone(), key))
+                        .collect::<BTreeMap<_, _>>(),
+                    Err(err) => {
+                        // 读取失败保持既有 fail-closed 路径；后续调度读取会报告状态不可用。
+                        warn!(
+                            event_name = "pool_group_page_key_load_failed",
+                            log_type = "event",
+                            provider_id = %self.group.candidate.provider_id,
+                            endpoint_id = %self.group.candidate.endpoint_id,
+                            model_id = %self.group.candidate.model_id,
+                            key_count = key_ids.len(),
+                            error = ?err,
+                            "gateway pool scheduler failed to read page keys for dynamic thinking"
+                        );
+                        BTreeMap::new()
+                    }
+                }
+            }
+        } else {
+            BTreeMap::new()
+        };
         let mut candidates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let member_model = self.pool_member_model_for_row(&row);
-            let Some(member_model) = member_model else {
+        for mut row in rows {
+            let Some(member_model) = self.pool_member_model_for_row(&mut row) else {
                 // 显式账号模型清单与本次请求无交集或为空：在 transport 门禁之前
                 // 以模型禁用语义拒绝整个成员，避免无清单账号的模型目标污染受限账号。
                 if self.seen_key_ids.insert(row.key_id.clone()) {
                     self.record_skip_reason("key_model_disabled");
                 }
                 continue;
+            };
+            let member_model = match key_by_id.get(row.key_id.as_str()) {
+                Some(key) => {
+                    let Some(member_model) =
+                        self.resolve_pool_member_thinking_model(key, member_model)
+                    else {
+                        if self.seen_key_ids.insert(row.key_id.clone()) {
+                            self.record_skip_reason("key_model_disabled");
+                        }
+                        continue;
+                    };
+                    member_model
+                }
+                None => member_model,
             };
             let candidate = pool_candidate_from_row(&self.group, row, member_model);
             if let Some(candidate) = self.build_eligible_candidate(candidate).await {
@@ -1543,8 +1644,10 @@ impl<'a> PoolKeyCursor<'a> {
     /// 请求未声明模型时沿用组的解析全局名。
     fn pool_member_model_for_row(
         &self,
-        row: &StoredMinimalCandidateSelectionRow,
+        row: &mut StoredMinimalCandidateSelectionRow,
     ) -> Option<(String, Option<String>)> {
+        // 静态映射可能选默认 high；effort 敏感行先放开清单，最终清单由强读 Key 解析器执行。
+        relax_dynamic_thinking_row_allowed_models(std::slice::from_mut(row), self.thinking_level);
         pool_member_model_resolution(
             &self.group,
             row,
@@ -1554,6 +1657,45 @@ impl<'a> PoolKeyCursor<'a> {
                 .unwrap_or(self.group.candidate.global_model_name.as_str()),
             self.request_operation.as_deref(),
         )
+    }
+
+    /// 按真实成员 Key 自己的发现目录把映射模型解析为请求档位变体。
+    ///
+    /// 返回空表示该账号缺少请求档位（或目录为空/禁用），成员必须跳过而不是回退默认档位。
+    /// 后缀优先级使用原始客户端模型，而不是组默认映射产生的后缀。
+    fn resolve_pool_member_thinking_model(
+        &self,
+        key: &StoredProviderCatalogKey,
+        member_model: (String, Option<String>),
+    ) -> Option<(String, Option<String>)> {
+        let Some(level) = self.thinking_level else {
+            return Some(member_model);
+        };
+        if !self
+            .group
+            .candidate
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("antigravity")
+        {
+            return Some(member_model);
+        }
+        let requested_model = self
+            .requested_model
+            .as_deref()
+            .unwrap_or(self.group.candidate.global_model_name.as_str());
+        let mapping_matched_model = member_model.1;
+        let resolved_model = resolve_provider_pool_key_thinking_model(
+            key,
+            self.group.candidate.provider_type.as_str(),
+            requested_model,
+            member_model.0.as_str(),
+            Some(level),
+        )?;
+        if resolved_model == member_model.0.as_str() {
+            return Some((member_model.0, mapping_matched_model));
+        }
+        Some((resolved_model.to_string(), mapping_matched_model))
     }
 
     async fn build_eligible_candidate(
@@ -1922,18 +2064,20 @@ fn pool_model_runtime_skip_reasons(
 /// 每个成员自己解析出的模型名只交给 Provider 额度适配器，不改变目录缺失时的 fail-closed 行为。
 async fn read_pool_catalog_key_contexts_by_id(
     state: PlannerAppState<'_>,
-    candidates: &[EligibleLocalExecutionCandidate],
+    candidates: &mut Vec<EligibleLocalExecutionCandidate>,
     effective_pool_config: Option<&AdminProviderPoolConfig>,
+    requested_model: Option<&str>,
+    thinking_level: Option<AntigravityThinkingLevel>,
 ) -> (
     BTreeMap<String, PoolCatalogKeyContext>,
     BTreeMap<String, StoredProviderCatalogKey>,
+    Vec<SkippedLocalExecutionCandidate>,
 ) {
     let mut key_ids = Vec::new();
     let mut provider_type_by_key_id = BTreeMap::<String, String>::new();
-    let mut model_name_by_key_id = BTreeMap::<String, String>::new();
     let mut reserve_minimum_quota_key_ids = BTreeSet::new();
 
-    for candidate in candidates {
+    for candidate in candidates.iter() {
         let Some(pool_config) = effective_pool_config
             .cloned()
             .or_else(|| pool_config_for_candidate(candidate))
@@ -1946,16 +2090,12 @@ async fn read_pool_catalog_key_contexts_by_id(
         }
         if let Entry::Vacant(entry) = provider_type_by_key_id.entry(key_id.clone()) {
             entry.insert(candidate.transport.provider.provider_type.clone());
-            model_name_by_key_id.insert(
-                key_id.clone(),
-                candidate.candidate.selected_provider_model_name.clone(),
-            );
             key_ids.push(key_id);
         }
     }
 
     if key_ids.is_empty() {
-        return (BTreeMap::new(), BTreeMap::new());
+        return (BTreeMap::new(), BTreeMap::new(), Vec::new());
     }
 
     let keys = match state
@@ -1985,9 +2125,70 @@ async fn read_pool_catalog_key_contexts_by_id(
                     )
                 })
                 .collect();
-            return (contexts, BTreeMap::new());
+            return (contexts, BTreeMap::new(), Vec::new());
         }
     };
+
+    let keys_by_id = keys
+        .into_iter()
+        .map(|key| (key.id.clone(), key))
+        .collect::<BTreeMap<_, _>>();
+
+    // 真实成员在目录强读之后、任何额度/发现/余额判定之前解析自己的档位模型；
+    // 缺少请求档位（或空目录/禁用项）的成员在这里被拒绝，绝不回退默认档位。
+    let mut resolution_skipped = Vec::new();
+    if let Some(level) = thinking_level {
+        let requested_model = requested_model.unwrap_or_default();
+        candidates.retain_mut(|candidate| {
+            // 只有 Antigravity 真实成员消费档位选择；其他 Provider 保持原模型名。
+            if !candidate
+                .candidate
+                .provider_type
+                .trim()
+                .eq_ignore_ascii_case("antigravity")
+            {
+                return true;
+            }
+            let Some(key) = keys_by_id.get(candidate.candidate.key_id.as_str()) else {
+                // 目录 Key 缺失由既有 fail-closed 路径处理，这里不改变其优先级。
+                return true;
+            };
+            match resolve_provider_pool_key_thinking_model(
+                key,
+                candidate.candidate.provider_type.as_str(),
+                requested_model,
+                candidate.candidate.selected_provider_model_name.as_str(),
+                Some(level),
+            ) {
+                Some(model)
+                    if model == candidate.candidate.selected_provider_model_name.as_str() =>
+                {
+                    true
+                }
+                Some(model) => {
+                    candidate.candidate.selected_provider_model_name = model.to_string();
+                    true
+                }
+                None => {
+                    resolution_skipped.push(SkippedLocalExecutionCandidate {
+                        candidate: candidate.candidate.clone(),
+                        skip_reason: "key_model_disabled",
+                        transport: Some(candidate.transport.clone()),
+                        ranking: candidate.ranking.clone(),
+                        extra_data: None,
+                    });
+                    false
+                }
+            }
+        });
+    }
+
+    let mut model_name_by_key_id = BTreeMap::<String, String>::new();
+    for candidate in candidates.iter() {
+        model_name_by_key_id
+            .entry(candidate.candidate.key_id.clone())
+            .or_insert_with(|| candidate.candidate.selected_provider_model_name.clone());
+    }
 
     let provider_pool_service = ProviderPoolService::with_builtin_adapters();
     let mut contexts = key_ids
@@ -2001,10 +2202,6 @@ async fn read_pool_catalog_key_contexts_by_id(
                 },
             )
         })
-        .collect::<BTreeMap<_, _>>();
-    let keys_by_id = keys
-        .into_iter()
-        .map(|key| (key.id.clone(), key))
         .collect::<BTreeMap<_, _>>();
     for key in keys_by_id.values() {
         let Some(provider_type) = provider_type_by_key_id.get(&key.id) else {
@@ -2029,7 +2226,7 @@ async fn read_pool_catalog_key_contexts_by_id(
         context.quota_hard_blocked |= reserve_reached;
         contexts.insert(key.id.clone(), context);
     }
-    (contexts, keys_by_id)
+    (contexts, keys_by_id, resolution_skipped)
 }
 
 /// 将单个持久化 Key 投影为 Pool 调度信号，并保持余额、永久阻断和模型额度的边界。
@@ -2590,7 +2787,7 @@ mod tests {
         pool_key_candidate_order_for_group, pool_key_requires_reauth_for_scheduling,
         pool_model_runtime_quota_identities, pool_model_runtime_skip_reasons,
         pool_skip_reason_releases_scan_budget,
-        prune_unschedulable_active_probe_members_for_request,
+        prune_unschedulable_active_probe_members_for_request, read_pool_catalog_key_contexts_by_id,
         remove_active_probe_members_for_request, should_trigger_active_probe_burst_for_request,
         PoolCatalogKeyContext, PoolKeyCursor, PoolModelRuntimeSkipReasons,
         PoolRuntimeModelQuotaFacts, POOL_ACTIVE_PROBE_SEALED_SKIP_REASON,
@@ -2627,6 +2824,7 @@ mod tests {
         POOL_BALANCE_BELOW_MINIMUM_SKIP_REASON, POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON,
     };
     use aether_provider_pool::ProviderPoolService;
+    use aether_provider_transport::antigravity::AntigravityThinkingLevel;
     use aether_provider_transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
         GatewayProviderTransportProvider,
@@ -5817,6 +6015,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_member_thinking_model_resolves_against_strong_account_catalog() {
+        // Pool 成员必须在强读自己的目录之后、额度/发现判定之前解析请求档位。
+        let provider_config = Some(json!({
+            "pool_advanced": { "skip_exhausted_accounts": true }
+        }));
+        let (provider, endpoint, mut keys, rows) = large_pool_fixture(1, provider_config.clone());
+        let mut key = keys.pop().expect("fixture key should exist");
+        key.upstream_metadata = Some(json!({
+            "antigravity": {
+                "quota_by_model": {
+                    "gemini-3-flash-low": {},
+                    "gemini-3-flash-high": {}
+                }
+            }
+        }));
+        let key_id = key.id.clone();
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    vec![key],
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+
+        let mut candidate = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            key_id.as_str(),
+            10,
+            provider_config,
+        );
+        candidate.candidate.provider_type = "antigravity".to_string();
+        candidate.candidate.endpoint_api_format = "gemini:generate_content".to_string();
+        candidate.candidate.global_model_name = "gemini-3-flash".to_string();
+        candidate.candidate.selected_provider_model_name = "gemini-3-flash-high".to_string();
+        Arc::make_mut(&mut candidate.transport)
+            .provider
+            .provider_type = "antigravity".to_string();
+
+        let mut candidates = vec![candidate];
+        let (contexts, keys_by_id, skipped) = read_pool_catalog_key_contexts_by_id(
+            PlannerAppState::new(&app),
+            &mut candidates,
+            None,
+            Some("gemini-3-flash"),
+            Some(AntigravityThinkingLevel::Low),
+        )
+        .await;
+
+        assert!(skipped.is_empty());
+        assert_eq!(
+            candidates[0].candidate.selected_provider_model_name,
+            "gemini-3-flash-low"
+        );
+        assert!(keys_by_id.contains_key(key_id.as_str()));
+        assert!(contexts.contains_key(key_id.as_str()));
+    }
+
+    #[tokio::test]
     async fn pool_key_cursor_continues_after_exhausted_window() {
         let provider_config = Some(json!({
             "pool_advanced": {
@@ -6508,6 +6771,7 @@ mod tests {
             Some("gpt-5"),
             None,
             None,
+            None,
         )
         .await;
 
@@ -6607,6 +6871,7 @@ mod tests {
             vec![group_a, group_b],
             None,
             Some("gpt-5"),
+            None,
             None,
             None,
         )

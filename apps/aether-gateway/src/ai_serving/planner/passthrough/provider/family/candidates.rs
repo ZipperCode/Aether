@@ -28,6 +28,7 @@ use crate::ai_serving::{
 use crate::client_session_affinity::client_session_affinity_from_api_request;
 use crate::clock::{current_unix_secs, request_distribution_seed};
 use crate::scheduler::candidate::CandidateSchedulingContext;
+use crate::scheduler::candidate::SchedulerThinkingSelection;
 use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::{AppState, GatewayError};
 
@@ -155,6 +156,10 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
             crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
                 input.routing_policy.as_ref(),
             ),
+            input.antigravity_thinking_level.map(|level| SchedulerThinkingSelection {
+                requested_model: &input.requested_model,
+                level,
+            }),
         )
         .await?;
     let outcome = materialize_local_execution_candidates_with_serving(
@@ -184,6 +189,7 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
             .collect(),
         LocalCandidateResolutionMode::Standard,
         Some(&input.model_directive_policy),
+        input.antigravity_thinking_level,
         |eligible| {
             let provider_api_format = eligible.provider_api_format.clone();
             let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
@@ -268,6 +274,7 @@ pub(crate) async fn build_local_same_format_provider_candidate_attempt_source<'a
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
             true,
             LocalCandidateResolutionMode::Standard,
+            input.antigravity_thinking_level,
             |eligible| {
                 let provider_api_format = eligible.provider_api_format.clone();
                 let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(

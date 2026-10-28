@@ -145,6 +145,7 @@ pub(super) async fn materialize_local_gemini_files_candidate_attempts(
         Vec::new(),
         LocalCandidateResolutionMode::WithoutTransportPairGate,
         None,
+        input.antigravity_thinking_level,
         |eligible| {
             let mut extra_fields = serde_json::Map::new();
             extra_fields.insert(
@@ -228,6 +229,7 @@ pub(super) async fn build_local_gemini_files_candidate_attempt_source<'a>(
         Vec::new(),
         LocalCandidateResolutionMode::WithoutTransportPairGate,
         None,
+        input.antigravity_thinking_level,
         |eligible| {
             let mut extra_fields = serde_json::Map::new();
             extra_fields.insert(

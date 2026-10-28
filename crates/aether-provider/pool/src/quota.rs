@@ -1,6 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
+use aether_provider_transport::antigravity::{
+    antigravity_model_thinking_variant, AntigravityThinkingLevel,
+};
 use serde_json::{json, Map, Value};
 
 use crate::provider::ProviderPoolMemberInput;
@@ -165,6 +168,246 @@ fn provider_pool_model_entry_disabled(entry: &Value) -> bool {
     entry
         .as_object()
         .is_some_and(|object| provider_pool_json_bool(object.get("disabled")) == Some(true))
+}
+
+/// 按账号权威模型映射，把默认选中的 Antigravity 模型解析为请求 thinking 档位对应的
+/// 实际已发现模型。
+///
+/// 只读取当前 Key `upstream_metadata.antigravity` 的首个对象形式模型映射
+/// （`quota_by_model`、`models`、`model_quotas`），空对象同样权威；显式
+/// `disabled: true` 的条目不算可用。客户端模型名上的已识别 thinking 后缀优先于
+/// 请求体 effort，只有与选中模型族完全相同的精确已发现身份才直接沿用；其余情况
+/// 只在该族内选择请求档位，缺失档位时拒绝，绝不跨账号、跨族或自造模型标识。
+/// 无 effort 时保留默认映射；映射缺失或格式不符时保留既有基础模型行为。
+/// 解析结果一旦改变默认上游模型，还必须仍被该 Key 的强 `allowed_models` 允许
+/// （或客户端显式请求的别名本身就被允许），避免只授权 high 的 Key 被低档请求借用；
+/// 对网关延迟行级 allowlist 的 effort 敏感 Gemini 请求，即使解析结果仍是默认映射，
+/// 也必须命中解析目标或显式别名。非 effort 敏感请求及其他 Provider 保持枚举语义。
+pub fn resolve_provider_pool_key_thinking_model<'a>(
+    key: &'a StoredProviderCatalogKey,
+    provider_type: &str,
+    requested_model: &str,
+    selected_provider_model: &'a str,
+    thinking_level: Option<AntigravityThinkingLevel>,
+) -> Option<&'a str> {
+    let resolved = provider_pool_resolve_thinking_model(
+        key,
+        provider_type,
+        requested_model,
+        selected_provider_model,
+        thinking_level,
+    )?;
+    // 网关只为 Antigravity 的 Gemini thinking 请求延迟行级 allowlist，因此这些
+    // 请求必须由这里的强 Key allowlist 做最终判定；其余路径沿用枚举结果。
+    let effort_sensitive = provider_type.trim().eq_ignore_ascii_case("antigravity")
+        && provider_pool_antigravity_thinking_model(selected_provider_model.trim())
+        && (thinking_level.is_some()
+            || antigravity_model_thinking_variant(requested_model.trim()).is_some());
+    if !effort_sensitive {
+        // 非 effort 敏感请求仍由既有枚举负责 allowlist；其他 Provider 不受影响。
+        return Some(resolved);
+    }
+    provider_pool_key_allows_resolved_thinking_model(key, requested_model, resolved)
+        .then_some(resolved)
+}
+
+fn provider_pool_resolve_thinking_model<'a>(
+    key: &'a StoredProviderCatalogKey,
+    provider_type: &str,
+    requested_model: &str,
+    selected_provider_model: &'a str,
+    thinking_level: Option<AntigravityThinkingLevel>,
+) -> Option<&'a str> {
+    if !provider_type.trim().eq_ignore_ascii_case("antigravity") {
+        return Some(selected_provider_model);
+    }
+    let Some(bucket) = provider_pool_metadata_bucket(key.upstream_metadata.as_ref(), provider_type)
+    else {
+        return Some(selected_provider_model);
+    };
+    // 缺失或格式不正确的映射保留发现前的既有行为。
+    let Some(models) = provider_pool_authoritative_model_maps(bucket, true).next() else {
+        return Some(selected_provider_model);
+    };
+
+    let selected = selected_provider_model.trim();
+    if !provider_pool_antigravity_thinking_model(selected) {
+        return Some(selected_provider_model);
+    }
+    // 权威空映射没有可服务的模型。
+    if models.is_empty() {
+        return None;
+    }
+
+    let selected_variant = antigravity_model_thinking_variant(selected);
+    let family = selected_variant.map(|(base, _)| base).unwrap_or(selected);
+    let client_variant = antigravity_model_thinking_variant(requested_model.trim());
+
+    // 客户端显式后缀命中同族完整身份时直接沿用该身份，包括其禁用状态。
+    let exact_client_variant = client_variant
+        .filter(|(base, _)| base.eq_ignore_ascii_case(family))
+        .and_then(|_| {
+            models.iter().find(|(model_name, _)| {
+                model_name
+                    .trim()
+                    .eq_ignore_ascii_case(requested_model.trim())
+            })
+        });
+    if let Some((model_name, entry)) = exact_client_variant {
+        return (!provider_pool_model_entry_disabled(entry)).then_some(model_name.trim());
+    }
+
+    // 只有客户端显式后缀才覆盖请求体 effort；默认映射上的后缀不是客户端选择。
+    let Some(target) = client_variant.map(|(_, level)| level).or(thinking_level) else {
+        return Some(selected_provider_model);
+    };
+
+    let variants_exist = provider_pool_antigravity_has_thinking_variants(models, family);
+    if !variants_exist {
+        // 基础模型既无映射后缀也无已发现同族变体时保留既有行为；带后缀的默认
+        // 映射缺少任何已发现兄弟时，该账号不满足请求。
+        return selected_variant
+            .is_none()
+            .then_some(selected_provider_model);
+    }
+
+    match target {
+        // minimal 先取已发现 minimal；没有 minimal 时才使用 low 兼容档，
+        // 已存在但禁用的 minimal 不得被绕过。
+        AntigravityThinkingLevel::Minimal => {
+            match provider_pool_pick_thinking_variant(
+                models,
+                family,
+                AntigravityThinkingLevel::Minimal,
+            ) {
+                Some(found) => found,
+                None => provider_pool_pick_thinking_variant(
+                    models,
+                    family,
+                    AntigravityThinkingLevel::Low,
+                )
+                .flatten(),
+            }
+        }
+        AntigravityThinkingLevel::Low
+        | AntigravityThinkingLevel::Medium
+        | AntigravityThinkingLevel::High => {
+            provider_pool_pick_thinking_variant(models, family, target).flatten()
+        }
+    }
+}
+
+/// Antigravity effort 敏感请求的解析目标必须被 Key 的强 `allowed_models` 允许。
+/// 未限制（`None`）放行；空策略列表拒绝全部；非空名单中的解析目标本身或客户端
+/// 显式请求的别名任一命中即可，保留“别名授权映射模型”的既有语义。
+fn provider_pool_key_allows_resolved_thinking_model(
+    key: &StoredProviderCatalogKey,
+    requested_model: &str,
+    resolved_model: &str,
+) -> bool {
+    let Some(allowed_models) = key.allowed_models.as_ref() else {
+        return true;
+    };
+    provider_pool_allowed_model_list_decision(allowed_models, resolved_model, requested_model)
+        == Some(true)
+}
+
+/// 返回 `None` 表示策略列表没有任何有效条目（空列表，拒绝全部）；
+/// `Some(true/false)` 表示列表非空且解析目标或显式客户端别名是否命中。
+fn provider_pool_allowed_model_list_decision(
+    allowed_models: &Value,
+    resolved_model: &str,
+    requested_model: &str,
+) -> Option<bool> {
+    let resolved_model = resolved_model.trim();
+    let requested_model = requested_model.trim();
+    let mut saw_item = false;
+    let matched = provider_pool_allowed_model_list_any(allowed_models, &mut |candidate| {
+        saw_item = true;
+        (!resolved_model.is_empty() && candidate == resolved_model)
+            || (!requested_model.is_empty() && candidate == requested_model)
+    });
+    if matched {
+        Some(true)
+    } else if saw_item {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// 遍历 Key 策略列表的既有输入形态：字符串数组、历史内嵌 JSON 字符串，以及无法
+/// 解码时作为单一模型名。空字符串条目不参与匹配。
+fn provider_pool_allowed_model_list_any<F>(allowed_models: &Value, predicate: &mut F) -> bool
+where
+    F: FnMut(&str) -> bool,
+{
+    match allowed_models {
+        Value::Array(items) => items.iter().any(|item| {
+            item.as_str().is_some_and(|candidate| {
+                let candidate = candidate.trim();
+                !candidate.is_empty() && predicate(candidate)
+            })
+        }),
+        Value::String(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return false;
+            }
+            if let Ok(decoded) = serde_json::from_str::<Value>(raw) {
+                return match decoded {
+                    Value::Array(_) | Value::String(_) => {
+                        provider_pool_allowed_model_list_any(&decoded, &mut *predicate)
+                    }
+                    _ => false,
+                };
+            }
+            predicate(raw)
+        }
+        _ => false,
+    }
+}
+
+/// Antigravity 只有 `gemini-` 模型标识带可识别的 thinking 后缀。
+fn provider_pool_antigravity_thinking_model(model: &str) -> bool {
+    model
+        .get(.."gemini-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gemini-"))
+}
+
+/// 是否存在仅剥离已识别终结后缀后与目标族完全相同的已发现 thinking 变体。
+fn provider_pool_antigravity_has_thinking_variants(
+    models: &Map<String, Value>,
+    family: &str,
+) -> bool {
+    models.keys().any(|model_name| {
+        antigravity_model_thinking_variant(model_name.trim())
+            .is_some_and(|(base, _)| base.eq_ignore_ascii_case(family))
+    })
+}
+
+/// 在已发现同族变体中选择指定档位：`None` 表示该档位不存在，`Some(None)` 表示
+/// 存在但全部被禁用（调用方必须拒绝，不得回退到其他档位）。
+fn provider_pool_pick_thinking_variant<'a>(
+    models: &'a Map<String, Value>,
+    family: &str,
+    level: AntigravityThinkingLevel,
+) -> Option<Option<&'a str>> {
+    let mut present = false;
+    for (model_name, entry) in models {
+        let model_name = model_name.trim();
+        let Some((base, candidate_level)) = antigravity_model_thinking_variant(model_name) else {
+            continue;
+        };
+        if !base.eq_ignore_ascii_case(family) || candidate_level != level {
+            continue;
+        }
+        present = true;
+        if !provider_pool_model_entry_disabled(entry) {
+            return Some(Some(model_name));
+        }
+    }
+    present.then_some(None)
 }
 
 /// 判断运行时错误分类是否为当前 Key 写入了需管理员恢复的持久额度阻断。

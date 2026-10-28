@@ -86,7 +86,12 @@ struct QuotaRuntimeMockState {
     generation_errors: BTreeMap<(bool, String), AntigravityUpstreamErrorFixture>,
     /// 每个账号+上游模型收到的生成计划次数。
     generation_counts: BTreeMap<(bool, String), usize>,
+    /// sync/stream 两条执行运行时路径共享的计划校验点捕获的最终上游 envelope。
+    /// 有界保存，供动态档位测试断实际 `model` 与规范化后的 thinkingLevel。
+    generation_plans: Vec<serde_json::Value>,
 }
+
+const ANTIGRAVITY_CAPTURED_PLAN_LIMIT: usize = 256;
 
 fn antigravity_quota_error_body(model: &str, retry_after_seconds: u64) -> serde_json::Value {
     json!({
@@ -418,6 +423,8 @@ fn build_antigravity_candidate_row(
 struct AntigravityHttpConfig {
     mode_label: String,
     pool_enabled: bool,
+    /// Provider 级跨格式转换开关；原生 Gemini 用例保持关闭。
+    enable_format_conversion: bool,
     provider_id: String,
     endpoint_id: String,
     model_id: String,
@@ -636,6 +643,106 @@ impl AntigravityHttpHarness {
             .expect("mock state should lock")
             .generation_counts
             .clone()
+    }
+
+    fn captured_generation_plans(&self) -> Vec<serde_json::Value> {
+        self.mock_state
+            .lock()
+            .expect("mock state should lock")
+            .generation_plans
+            .clone()
+    }
+
+    async fn send_generate_body(
+        &self,
+        global_model_name: &str,
+        body: &serde_json::Value,
+        step: &str,
+    ) -> reqwest::Response {
+        self.client
+            .post(format!(
+                "{}/v1beta/models/{}:generateContent",
+                self.gateway_url, global_model_name
+            ))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header("user-agent", "GeminiCLI/1.0")
+            .header("x-goog-api-key", self.client_api_key.as_str())
+            .header("session-id", self.client_session_id.as_str())
+            .header(
+                TRACE_ID_HEADER,
+                format!("trace-{}-{}", self.provider_id, step),
+            )
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("gemini generateContent HTTP request should complete")
+    }
+
+    async fn send_stream_generate_body(
+        &self,
+        global_model_name: &str,
+        body: &serde_json::Value,
+        step: &str,
+    ) -> reqwest::Response {
+        self.client
+            .post(format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                self.gateway_url, global_model_name
+            ))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header("user-agent", "GeminiCLI/1.0")
+            .header("x-goog-api-key", self.client_api_key.as_str())
+            .header("session-id", self.client_session_id.as_str())
+            .header(
+                TRACE_ID_HEADER,
+                format!("trace-stream-{}-{}", self.provider_id, step),
+            )
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("gemini streamGenerateContent HTTP request should complete")
+    }
+
+    async fn send_chat_completion_body(
+        &self,
+        body: &serde_json::Value,
+        step: &str,
+    ) -> reqwest::Response {
+        self.client
+            .post(format!("{}/v1/chat/completions", self.gateway_url))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", self.client_api_key),
+            )
+            .header("session-id", self.client_session_id.as_str())
+            .header(
+                TRACE_ID_HEADER,
+                format!("trace-chat-{}-{}", self.provider_id, step),
+            )
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("openai chat completions HTTP request should complete")
+    }
+
+    async fn send_responses_body(&self, body: &serde_json::Value, step: &str) -> reqwest::Response {
+        self.client
+            .post(format!("{}/v1/responses", self.gateway_url))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", self.client_api_key),
+            )
+            .header("session-id", self.client_session_id.as_str())
+            .header(
+                TRACE_ID_HEADER,
+                format!("trace-responses-{}-{}", self.provider_id, step),
+            )
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("openai responses HTTP request should complete")
     }
 
     fn model_generation_counts(
@@ -918,7 +1025,7 @@ fn antigravity_generation_plan_supported(
         .as_ref()
         .expect("generation request should carry json_body");
     let (plan_model, supported) = {
-        let guard = mock_state.lock().expect("mock state should lock");
+        let mut guard = mock_state.lock().expect("mock state should lock");
         let policy = if is_account_a {
             &guard.account_a
         } else {
@@ -934,6 +1041,9 @@ fn antigravity_generation_plan_supported(
             "upstream generation model {plan_model} must be a mapped provider model"
         );
         let supported = policy.models.contains_key(plan_model.as_str());
+        if guard.generation_plans.len() < ANTIGRAVITY_CAPTURED_PLAN_LIMIT {
+            guard.generation_plans.push(body_json.clone());
+        }
         (plan_model, supported)
     };
     assert_eq!(
@@ -953,6 +1063,7 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
     let AntigravityHttpConfig {
         mode_label,
         pool_enabled,
+        enable_format_conversion,
         provider_id,
         endpoint_id,
         model_id,
@@ -972,6 +1083,11 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
     let mut generation_models = BTreeSet::from([provider_model_name.clone()]);
     if let Some(secondary_provider_model_name) = secondary_provider_model_name.as_ref() {
         generation_models.insert(secondary_provider_model_name.clone());
+    }
+    // 动态档位会在同一客户端别名下解析到账号自己发现的档位模型；执行计划只允许
+    // 携带配置映射或账号权威目录中真实存在的模型。
+    for key in [&key_a, &key_b] {
+        generation_models.extend(key.models.keys().cloned());
     }
 
     let token_a = key_a.access_token.clone();
@@ -1009,6 +1125,7 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
         },
         generation_errors: BTreeMap::new(),
         generation_counts: BTreeMap::new(),
+        generation_plans: Vec::new(),
     }));
 
     let refresh_router = Router::new().route(
@@ -1554,7 +1671,7 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
     .with_transport_fields(
         true,
         false,
-        false,
+        enable_format_conversion,
         None,
         Some(1),
         None,
@@ -1759,6 +1876,7 @@ async fn run_antigravity_quota_refresh_serving_mode(pool_enabled: bool) {
     let harness = start_antigravity_http_harness(AntigravityHttpConfig {
         mode_label: mode_label.to_string(),
         pool_enabled,
+        enable_format_conversion: false,
         provider_id: format!("provider-antigravity-quota-{mode_label}"),
         endpoint_id: format!("endpoint-antigravity-quota-{mode_label}"),
         model_id: format!("model-antigravity-quota-{mode_label}"),
@@ -2195,6 +2313,7 @@ async fn run_antigravity_argon_admission_mode(pool_enabled: bool) {
     let harness = start_antigravity_http_harness(AntigravityHttpConfig {
         mode_label: mode_label.to_string(),
         pool_enabled,
+        enable_format_conversion: false,
         provider_id: format!("provider-antigravity-argon-{mode_label}"),
         endpoint_id: format!("endpoint-antigravity-argon-{mode_label}"),
         model_id: format!("model-antigravity-argon-{mode_label}"),
@@ -2808,6 +2927,7 @@ fn antigravity_runtime_quota_http_config(
     AntigravityHttpConfig {
         mode_label: mode_label.to_string(),
         pool_enabled,
+        enable_format_conversion: false,
         provider_id: format!("provider-antigravity-runtime-quota-{mode_label}"),
         endpoint_id: format!("endpoint-antigravity-runtime-quota-{mode_label}"),
         model_id: format!("model-antigravity-runtime-quota-{mode_label}"),
@@ -3367,3 +3487,6 @@ async fn gateway_antigravity_generic_rate_limit_remains_account_scoped_impl() {
         "{mode_label}/step3-secondary-account-blocked: no eligible account may serve the unrelated model under an account-wide rate limit"
     );
 }
+
+#[path = "antigravity_quota_refresh/dynamic_effort.rs"]
+mod dynamic_effort;
