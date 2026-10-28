@@ -1,0 +1,28 @@
+{
+  "id": "antigravity-dynamic-effort",
+  "name": "antigravity-dynamic-effort",
+  "title": "Antigravity 按客户端 effort 动态选择账号模型",
+  "description": "Select discovered Antigravity model variants per serving account before admission/quota, normalize client efforts including xhigh/max, and preserve native/converted request behavior.",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": "aether-gateway",
+  "priority": "P2",
+  "creator": "omp",
+  "assignee": "omp",
+  "createdAt": "2026-10-28",
+  "completedAt": "2026-10-28",
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "validation": "Baseline low->high mismatch reproduced; final fmt + gateway Clippy passed; 5744 gateway tests passed (3 skipped); 731 transport/pool tests passed; external localhost HTTP smoke 5/5 200 with exact model/level; temporary scaffolding removed."
+  }
+}
