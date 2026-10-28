@@ -185,7 +185,7 @@ async fn gateway_executes_openai_responses_compact_as_unary_request_impl() {
     }
 
     fn sample_provider_catalog_key() -> StoredProviderCatalogKey {
-        StoredProviderCatalogKey::new(
+        let mut key = StoredProviderCatalogKey::new(
             "key-openai-compact-local-1".to_string(),
             "provider-openai-compact-local-1".to_string(),
             "prod".to_string(),
@@ -215,7 +215,13 @@ async fn gateway_executes_openai_responses_compact_as_unary_request_impl() {
             Some(serde_json::json!({"enabled": true, "node_id":"proxy-node-openai-compact-local"})),
             Some(serde_json::json!({"transport_profile":"chrome_136"})),
         )
-        .expect("key transport should build")
+        .expect("key transport should build");
+        key.upstream_metadata = Some(serde_json::json!({
+            "codex_model_discovery": {
+                "model_ids": ["deployment-production"]
+            }
+        }));
+        key
     }
 
     let seen_execution_runtime = Arc::new(Mutex::new(None::<SeenExecutionRuntimeStreamRequest>));

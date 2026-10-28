@@ -3515,6 +3515,22 @@ async fn provider_query_execute_standard_test_candidate(
             "Provider request body violates the OpenAI provider contract",
         ));
     }
+    let final_provider_model = provider_request_body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if let Some(reason) = crate::provider_transport::codex_oauth_discovered_model_skip_reason(
+        transport.provider.provider_type.as_str(),
+        transport.key.auth_type.as_str(),
+        provider_api_format,
+        final_provider_model,
+        transport.key.upstream_metadata.as_ref(),
+    ) {
+        return Ok(provider_query_skipped_execution_outcome(
+            original_request_body,
+            reason,
+        ));
+    }
     if crate::provider_transport::is_gemini_cli_provider_transport(&transport)
         && normalized_provider_api_format == "gemini:generate_content"
     {

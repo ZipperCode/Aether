@@ -2310,6 +2310,9 @@ async fn keeps_request_failed_oauth_candidate_selectable() {
             key.auth_type = "oauth".to_string();
             key.oauth_invalid_at_unix_secs = Some(1_710_000_000);
             key.oauth_invalid_reason = Some("[REQUEST_FAILED] 账号状态检查失败".to_string());
+            key.upstream_metadata = Some(json!({
+                "codex_model_discovery": {"model_ids": ["gpt-4.1-responses"]}
+            }));
             key
         }],
     ));
@@ -2369,6 +2372,9 @@ async fn keeps_codex_candidate_selectable_when_oauth_token_is_expired() {
             key.auth_type = "oauth".to_string();
             key.oauth_invalid_at_unix_secs = Some(1_710_000_000);
             key.oauth_invalid_reason = Some("[OAUTH_EXPIRED] session expired".to_string());
+            key.upstream_metadata = Some(json!({
+                "codex_model_discovery": {"model_ids": ["gpt-4.1-responses"]}
+            }));
             key
         }],
     ));

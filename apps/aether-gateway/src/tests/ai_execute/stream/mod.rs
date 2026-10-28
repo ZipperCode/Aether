@@ -25,6 +25,7 @@ use super::{
 };
 
 mod chat_failover;
+mod codex_model_discovery;
 mod decision;
 mod image;
 mod pii_redaction;

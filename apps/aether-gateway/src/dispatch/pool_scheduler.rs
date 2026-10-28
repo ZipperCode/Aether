@@ -62,6 +62,7 @@ use crate::handlers::shared::provider_pool::{
 use crate::handlers::shared::{parse_catalog_auth_config_json, provider_key_health_summary};
 use crate::maintenance::spawn_pool_quota_probe_replenish_for_request;
 use crate::orchestration::{AntigravityModelQuotaCandidate, LocalExecutionCandidateMetadata};
+use crate::provider_transport::codex_oauth_discovered_model_skip_reason;
 use crate::stage_metrics::observe_gateway_stage_ms;
 
 static LOAD_BALANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -213,12 +214,21 @@ async fn schedule_pool_page_candidates(
                     .or_else(|| {
                         // 每个真实成员只按自己强读到的发现目录判定模型准入。
                         let key = keys_by_id.get(candidate.candidate.key_id.as_str())?;
-                        (!provider_pool_key_supports_discovered_model(
-                            key,
+                        codex_oauth_discovered_model_skip_reason(
                             candidate.candidate.provider_type.as_str(),
+                            key.auth_type.as_str(),
+                            candidate.candidate.endpoint_api_format.as_str(),
                             candidate.candidate.selected_provider_model_name.as_str(),
-                        ))
-                        .then_some("key_model_disabled")
+                            key.upstream_metadata.as_ref(),
+                        )
+                        .or_else(|| {
+                            (!provider_pool_key_supports_discovered_model(
+                                key,
+                                candidate.candidate.provider_type.as_str(),
+                                candidate.candidate.selected_provider_model_name.as_str(),
+                            ))
+                            .then_some("key_model_disabled")
+                        })
                     })
                 }
                 Err(_) => Some(POOL_KEY_STATE_UNAVAILABLE_SKIP_REASON),
@@ -6182,6 +6192,7 @@ mod tests {
                         }
                     }));
                     reserved.upstream_metadata = Some(json!({
+                        "codex_model_discovery": {"model_ids": ["gpt-5"]},
                         "codex": {
                             "updated_at": 200,
                             "primary_used_percent": used_percent,
@@ -7726,6 +7737,9 @@ mod tests {
         )
         .expect("key transport should build");
         key.internal_priority = 10;
+        key.upstream_metadata = Some(json!({
+            "codex_model_discovery": {"model_ids": ["gpt-5"]}
+        }));
         key
     }
 
@@ -7976,5 +7990,295 @@ mod tests {
                 },
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn codex_model_discovery_pool_key_cursor_filters_pages_sticky_and_frozen_window() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "probing_enabled": true,
+                "skip_exhausted_accounts": true,
+                "scheduling_presets": [{
+                    "preset": "cache_affinity",
+                    "enabled": true,
+                    "mode": "single_account"
+                }]
+            }
+        }));
+        let provider = sample_codex_pool_provider("provider-pool", 0, provider_config.clone());
+        let endpoint = sample_codex_pool_endpoint("provider-pool", "endpoint-1");
+
+        let mut free_key = sample_codex_pool_key("provider-pool", "key-free");
+        free_key.internal_priority = 0;
+        free_key.allowed_models = Some(json!(["gpt-5", "gpt-basic-test"]));
+        free_key.upstream_metadata = Some(json!({
+            "codex_model_discovery": {
+                "model_ids": ["gpt-basic-test"]
+            }
+        }));
+
+        let mut missing_key = sample_codex_pool_key("provider-pool", "key-missing");
+        missing_key.internal_priority = 5;
+        missing_key.upstream_metadata = None;
+
+        let mut paid_key = sample_codex_pool_key("provider-pool", "key-paid");
+        paid_key.internal_priority = 10;
+        paid_key.upstream_metadata = Some(json!({
+            "codex_model_discovery": {
+                "model_ids": ["gpt-basic-test", "gpt-5"]
+            }
+        }));
+
+        let mut rows = Vec::new();
+        for (key_id, priority) in [("key-free", 0), ("key-missing", 5), ("key-paid", 10)] {
+            let mut adv_row = sample_codex_pool_row("provider-pool", "endpoint-1", key_id, 0);
+            adv_row.key_internal_priority = priority;
+            adv_row.routing_facts.provider_pool_enabled = true;
+            rows.push(adv_row);
+
+            let mut basic_row = sample_codex_pool_row("provider-pool", "endpoint-1", key_id, 0);
+            basic_row.key_internal_priority = priority;
+            basic_row.routing_facts.provider_pool_enabled = true;
+            basic_row.model_id = "model-basic".to_string();
+            basic_row.global_model_id = "global-model-basic".to_string();
+            basic_row.global_model_name = "gpt-basic-test".to_string();
+            basic_row.model_provider_model_name = "gpt-basic-test".to_string();
+            rows.push(basic_row);
+        }
+
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    vec![free_key, missing_key, paid_key],
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+
+        let active_set_key = admin_provider_pool_quota_probe_active_members_key("provider-pool");
+        app.runtime_state
+            .set_add(&active_set_key, "key-free")
+            .await
+            .expect("active probe member should insert");
+
+        let group = sample_codex_pool_group("provider-pool", "endpoint-1", 0, provider_config);
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        record_admin_provider_pool_success(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            "key-free",
+            &pool_config,
+            Some("codex-discovery-session"),
+            0,
+            None,
+        )
+        .await;
+
+        for page_size in [1, 3] {
+            for sticky in [false, true] {
+                let sticky_token = sticky.then_some("codex-discovery-session");
+                let mut cursor = PoolKeyCursor::new(
+                    PlannerAppState::new(&app),
+                    group.clone(),
+                    sticky_token,
+                    Some("gpt-5"),
+                    None,
+                );
+                cursor.window_size = 1;
+                cursor.page_size = page_size;
+                let mut returned = Vec::new();
+                while let Some(candidate) = cursor.next_key().await {
+                    returned.push(candidate.candidate.key_id);
+                }
+                assert_eq!(
+                    returned,
+                    vec!["key-paid".to_string()],
+                    "page_size={page_size}, sticky={sticky}"
+                );
+                assert!(
+                    cursor
+                        .skip_reason_counts
+                        .get("key_model_disabled")
+                        .copied()
+                        .unwrap_or(0)
+                        >= 2,
+                    "page_size={page_size}, sticky={sticky}"
+                );
+            }
+        }
+
+        let active_members = app
+            .runtime_state
+            .set_members(&active_set_key)
+            .await
+            .expect("active probe set should read");
+        assert!(active_members.contains(&"key-free".to_string()));
+
+        let mut basic_group = group;
+        basic_group.candidate.model_id = "model-basic".to_string();
+        basic_group.candidate.global_model_id = "global-model-basic".to_string();
+        basic_group.candidate.global_model_name = "gpt-basic-test".to_string();
+        basic_group.candidate.selected_provider_model_name = "gpt-basic-test".to_string();
+        let mut basic_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            basic_group,
+            Some("codex-discovery-session"),
+            Some("gpt-basic-test"),
+            None,
+        );
+        basic_cursor.window_size = 1;
+        basic_cursor.page_size = 1;
+        let first_basic = basic_cursor
+            .next_key()
+            .await
+            .expect("free account should still serve basic model");
+        assert_eq!(first_basic.candidate.key_id, "key-free");
+    }
+
+    #[tokio::test]
+    async fn codex_model_discovery_pool_page_strong_read_falls_back_from_hot_and_keeps_priority() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "probing_enabled": true,
+                "skip_exhausted_accounts": true,
+                "scheduling_presets": [
+                    {"preset": "single_account", "enabled": true}
+                ]
+            }
+        }));
+        let provider = sample_codex_pool_provider("provider-pool", 0, provider_config.clone());
+        let endpoint = sample_codex_pool_endpoint("provider-pool", "endpoint-1");
+
+        let basic_only_discovery = json!({
+            "codex_model_discovery": {
+                "model_ids": ["gpt-basic-test"]
+            }
+        });
+        let mut key_oauth_blocked = sample_codex_pool_key("provider-pool", "key-a-oauth-blocked");
+        key_oauth_blocked.internal_priority = 0;
+        key_oauth_blocked.oauth_invalid_at_unix_secs = Some(1_710_000_000);
+        key_oauth_blocked.oauth_invalid_reason =
+            Some("[OAUTH_EXPIRED] token invalidated".to_string());
+        key_oauth_blocked.upstream_metadata = Some(basic_only_discovery.clone());
+
+        let mut key_exhausted = sample_codex_pool_key("provider-pool", "key-b-exhausted");
+        key_exhausted.internal_priority = 1;
+        key_exhausted.status_snapshot = Some(json!({
+            "quota": {
+                "provider_type": "codex",
+                "exhausted": true,
+                "usage_ratio": 1.0,
+                "windows": [{
+                    "code": "daily",
+                    "used_ratio": 1.0,
+                    "remaining_ratio": 0.0
+                }]
+            }
+        }));
+        key_exhausted.upstream_metadata = Some(basic_only_discovery.clone());
+
+        let mut key_hot_free = sample_codex_pool_key("provider-pool", "key-c-hot-free");
+        key_hot_free.internal_priority = 2;
+        key_hot_free.upstream_metadata = Some(basic_only_discovery);
+
+        let mut key_cold_paid = sample_codex_pool_key("provider-pool", "key-d-cold-paid");
+        key_cold_paid.internal_priority = 3;
+        key_cold_paid.upstream_metadata = Some(json!({
+            "codex_model_discovery": {
+                "model_ids": ["gpt-basic-test", "gpt-5"]
+            }
+        }));
+
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    vec![
+                        key_oauth_blocked,
+                        key_exhausted,
+                        key_hot_free,
+                        key_cold_paid,
+                    ],
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(
+                    Vec::new(),
+                )),
+            )
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+
+        let active_set_key = admin_provider_pool_quota_probe_active_members_key("provider-pool");
+        app.runtime_state
+            .set_add(&active_set_key, "key-c-hot-free")
+            .await
+            .expect("hot free member should insert");
+
+        let page_candidates = [
+            ("key-a-oauth-blocked", 0),
+            ("key-b-exhausted", 1),
+            ("key-c-hot-free", 2),
+            ("key-d-cold-paid", 3),
+        ]
+        .into_iter()
+        .map(|(key_id, priority)| {
+            let mut candidate =
+                sample_codex_pool_group("provider-pool", "endpoint-1", 0, provider_config.clone());
+            candidate.kind = LocalExecutionCandidateKind::SingleKey;
+            candidate.candidate.key_id = key_id.to_string();
+            candidate.candidate.key_name = key_id.to_string();
+            candidate.candidate.key_internal_priority = priority;
+            let transport = Arc::make_mut(&mut candidate.transport);
+            transport.key.id = key_id.to_string();
+            transport.key.name = key_id.to_string();
+            transport.key.upstream_metadata = Some(json!({
+                "codex_model_discovery": {
+                    "model_ids": ["gpt-basic-test", "gpt-5"]
+                }
+            }));
+            candidate
+        })
+        .collect::<Vec<_>>();
+        let pool_config =
+            pool_config_for_candidate(&page_candidates[0]).expect("pool config should parse");
+
+        let (scheduled, skipped) = super::schedule_pool_page_candidates(
+            PlannerAppState::new(&app),
+            page_candidates,
+            None,
+            Some(&pool_config),
+            Some("gpt-5"),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            scheduled
+                .iter()
+                .map(|item| item.candidate.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-d-cold-paid"]
+        );
+        let skipped_pairs = skipped
+            .iter()
+            .map(|item| (item.candidate.key_id.as_str(), item.skip_reason))
+            .collect::<Vec<_>>();
+        assert!(skipped_pairs.contains(&("key-a-oauth-blocked", "pool_account_blocked")));
+        assert!(skipped_pairs.contains(&("key-b-exhausted", POOL_ACCOUNT_EXHAUSTED_SKIP_REASON)));
+        assert!(skipped_pairs.contains(&("key-c-hot-free", "key_model_disabled")));
+
+        let active_members = app
+            .runtime_state
+            .set_members(&active_set_key)
+            .await
+            .expect("active probe set should read");
+        assert!(active_members.contains(&"key-c-hot-free".to_string()));
     }
 }

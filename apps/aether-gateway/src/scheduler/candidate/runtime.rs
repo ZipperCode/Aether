@@ -21,6 +21,7 @@ use tracing::warn;
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;
 use crate::orchestration::AntigravityModelQuotaCandidate;
+use crate::provider_transport::codex_oauth_discovered_model_skip_reason;
 use crate::scheduler::state::SchedulerModelQuotaState;
 use crate::GatewayError;
 
@@ -400,19 +401,25 @@ pub(super) fn current_candidate_runtime_skip_reason(
         return reason;
     }
     // 账号发现目录属于该 Key 自身的准入事实；代表 Key 不得据此淘汰整个 PoolGroup。
-    if !pool_group
-        && snapshot
-            .provider_key_rpm_states
-            .get(candidate.key_id.as_str())
-            .is_some_and(|key| {
-                !provider_pool_key_supports_discovered_model(
-                    key,
-                    candidate.provider_type.as_str(),
-                    candidate.selected_provider_model_name.as_str(),
-                )
-            })
-    {
-        return Some("key_model_disabled");
+    if !pool_group {
+        if let Some(key) = snapshot.provider_key_rpm_states.get(&candidate.key_id) {
+            if let Some(reason) = codex_oauth_discovered_model_skip_reason(
+                candidate.provider_type.as_str(),
+                key.auth_type.as_str(),
+                candidate.endpoint_api_format.as_str(),
+                candidate.selected_provider_model_name.as_str(),
+                key.upstream_metadata.as_ref(),
+            ) {
+                return Some(reason);
+            }
+            if !provider_pool_key_supports_discovered_model(
+                key,
+                candidate.provider_type.as_str(),
+                candidate.selected_provider_model_name.as_str(),
+            ) {
+                return Some("key_model_disabled");
+            }
+        }
     }
     // 读取失败只表示无法确认该模型的运行态事实；报告状态不可用，绝不推断额度耗尽。
     if runtime_model_quota_state_unavailable {
@@ -991,6 +998,78 @@ mod tests {
         assert_eq!(
             current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
             None
+        );
+    }
+
+    #[test]
+    fn codex_model_discovery_runtime_checks_real_key_without_rejecting_pool_representative() {
+        let mut candidate = sample_candidate();
+        candidate.provider_type = "codex".to_string();
+        candidate.key_auth_type = "oauth".to_string();
+        candidate.endpoint_api_format = "openai:responses".to_string();
+        candidate.global_model_name = "client-alias".to_string();
+        candidate.selected_provider_model_name = "gpt-6.1-sol".to_string();
+
+        let mut key = low_balance_key();
+        key.auth_type = "oauth".to_string();
+        key.status_snapshot = None;
+        key.allowed_models = Some(json!(["client-alias", "gpt-6.1-sol"]));
+        let mut snapshot = CandidateRuntimeSelectionSnapshot {
+            recent_candidates: Vec::new(),
+            provider_concurrent_limits: BTreeMap::new(),
+            provider_key_rpm_states: BTreeMap::from([(key.id.clone(), key)]),
+            pool_provider_ids: BTreeSet::new(),
+            provider_quota_blocks_requests: BTreeMap::new(),
+            key_quota_hard_blocked: BTreeMap::new(),
+            key_account_quota_exhausted: BTreeMap::new(),
+            key_runtime_model_quota_blocked: BTreeMap::new(),
+            key_runtime_model_quota_state_unavailable: BTreeMap::new(),
+            key_balance_below_minimum: BTreeMap::new(),
+            key_oauth_invalid: BTreeMap::new(),
+            provider_key_rpm_reset_ats: BTreeMap::new(),
+        };
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+            Some("key_model_disabled")
+        );
+
+        snapshot
+            .pool_provider_ids
+            .insert(candidate.provider_id.clone());
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+            None
+        );
+        snapshot.pool_provider_ids.clear();
+        snapshot
+            .provider_key_rpm_states
+            .get_mut("key-1")
+            .unwrap()
+            .upstream_metadata =
+            Some(json!({"codex_model_discovery": {"model_ids": ["gpt-basic-test"]}}));
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+            Some("key_model_disabled")
+        );
+
+        snapshot
+            .provider_key_rpm_states
+            .get_mut("key-1")
+            .unwrap()
+            .upstream_metadata =
+            Some(json!({"codex_model_discovery": {"model_ids": ["gpt-6.1-sol"]}}));
+        assert!(is_candidate_selectable(&candidate, &snapshot, 100));
+        snapshot
+            .key_oauth_invalid
+            .insert(candidate.key_id.clone(), true);
+        snapshot
+            .provider_key_rpm_states
+            .get_mut("key-1")
+            .unwrap()
+            .upstream_metadata = None;
+        assert_eq!(
+            current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
+            Some("oauth_invalid")
         );
     }
 

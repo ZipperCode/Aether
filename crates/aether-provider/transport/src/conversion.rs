@@ -292,7 +292,17 @@ pub fn candidate_common_transport_skip_reason(
     }
 
     // 所有正式候选（含号池展开后的实际 Key）共用套餐准入，避免图片同步/流式分叉。
-    crate::codex_oauth_transport_capability_skip_reason(transport)
+    if let Some(skip_reason) = crate::codex_oauth_transport_capability_skip_reason(transport) {
+        return Some(skip_reason);
+    }
+
+    crate::codex_oauth_discovered_model_skip_reason(
+        &transport.provider.provider_type,
+        &transport.key.auth_type,
+        endpoint_api_format,
+        candidate.selected_provider_model_name,
+        transport.key.upstream_metadata.as_ref(),
+    )
 }
 
 pub fn candidate_transport_pair_skip_reason(
@@ -958,6 +968,11 @@ mod tests {
     fn fixed_provider_oauth_keys_inherit_endpoint_api_formats_for_candidate_policy() {
         let mut transport = transport_snapshot("codex", "openai:responses", "oauth", true, None);
         transport.key.api_formats = Some(vec!["openai:image".to_string()]);
+        transport.key.upstream_metadata = Some(json!({
+            "codex_model_discovery": {
+                "model_ids": ["provider-gpt-4.1"]
+            }
+        }));
 
         assert_eq!(
             candidate_common_transport_skip_reason(
@@ -1010,6 +1025,126 @@ mod tests {
         assert_eq!(
             candidate_transport_pair_skip_reason(&enabled_transport, "openai:chat"),
             None
+        );
+    }
+
+    #[test]
+    fn codex_model_discovery_gates_oauth_text_final_models_beyond_alias_whitelist() {
+        let mut transport = transport_snapshot("codex", "openai:responses", "oauth", true, None);
+        let advanced_candidate = CandidateTransportPolicyFacts {
+            endpoint_api_format: "openai:responses",
+            global_model_name: "codex-pro-alias",
+            selected_provider_model_name: "gpt-6.1-sol",
+            mapping_matched_model: Some("codex-pro-alias"),
+        };
+        let basic_candidate = CandidateTransportPolicyFacts {
+            endpoint_api_format: "openai:responses",
+            global_model_name: "gpt-basic-test",
+            selected_provider_model_name: "gpt-basic-test",
+            mapping_matched_model: None,
+        };
+
+        assert_eq!(
+            candidate_common_transport_skip_reason(
+                &transport,
+                advanced_candidate,
+                Some("codex-pro-alias"),
+            ),
+            Some("key_model_disabled")
+        );
+
+        for text_format in ["openai:responses:compact", "openai:search"] {
+            let text_transport = transport_snapshot("codex", text_format, "oauth", true, None);
+            assert_eq!(
+                candidate_common_transport_skip_reason(
+                    &text_transport,
+                    CandidateTransportPolicyFacts {
+                        endpoint_api_format: text_format,
+                        global_model_name: "gpt-basic-test",
+                        selected_provider_model_name: "gpt-basic-test",
+                        mapping_matched_model: None,
+                    },
+                    Some("gpt-basic-test"),
+                ),
+                Some("key_model_disabled")
+            );
+        }
+
+        for (bypass_format, auth_type) in [
+            ("openai:responses", "bearer"),
+            ("openai:image", "oauth"),
+            ("codex:live", "oauth"),
+        ] {
+            let bypass_transport =
+                transport_snapshot("codex", bypass_format, auth_type, true, None);
+            assert_eq!(
+                candidate_common_transport_skip_reason(
+                    &bypass_transport,
+                    CandidateTransportPolicyFacts {
+                        endpoint_api_format: bypass_format,
+                        global_model_name: "gpt-basic-test",
+                        selected_provider_model_name: "gpt-basic-test",
+                        mapping_matched_model: None,
+                    },
+                    Some("gpt-basic-test"),
+                ),
+                None
+            );
+        }
+
+        transport.key.allowed_models = Some(vec![
+            "codex-pro-alias".to_string(),
+            "gpt-basic-test".to_string(),
+        ]);
+        transport.key.upstream_metadata = Some(json!({
+            "codex_model_discovery": {
+                "model_ids": ["gpt-basic-test"]
+            }
+        }));
+        assert_eq!(
+            candidate_common_transport_skip_reason(
+                &transport,
+                advanced_candidate,
+                Some("codex-pro-alias"),
+            ),
+            Some("key_model_disabled")
+        );
+        assert_eq!(
+            candidate_common_transport_skip_reason(
+                &transport,
+                basic_candidate,
+                Some("gpt-basic-test"),
+            ),
+            None
+        );
+
+        transport.key.upstream_metadata = Some(json!({
+            "codex_model_discovery": {
+                "model_ids": ["gpt-basic-test", "gpt-6.1-sol"]
+            }
+        }));
+        assert_eq!(
+            candidate_common_transport_skip_reason(
+                &transport,
+                advanced_candidate,
+                Some("codex-pro-alias"),
+            ),
+            None
+        );
+
+        let cased_candidate = CandidateTransportPolicyFacts {
+            endpoint_api_format: "openai:responses",
+            global_model_name: "codex-pro-alias",
+            selected_provider_model_name: "GPT-6.1-SOL",
+            mapping_matched_model: Some("codex-pro-alias"),
+        };
+        assert_eq!(
+            candidate_common_transport_skip_reason(
+                &transport,
+                cased_candidate,
+                Some("codex-pro-alias"),
+            ),
+            Some("key_model_disabled")
         );
     }
 }

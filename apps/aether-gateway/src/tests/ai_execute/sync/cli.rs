@@ -3851,7 +3851,7 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
             r#"{"provider_type":"codex","refresh_token":"rt-codex-local-123"}"#,
         )
         .expect("auth config should encrypt");
-        StoredProviderCatalogKey::new(
+        let mut key = StoredProviderCatalogKey::new(
             "key-codex-cli-local-1".to_string(),
             "provider-codex-cli-local-1".to_string(),
             "oauth".to_string(),
@@ -3872,7 +3872,13 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
             None,
             None,
         )
-        .expect("key transport should build")
+        .expect("key transport should build");
+        key.upstream_metadata = Some(serde_json::json!({
+            "codex_model_discovery": {
+                "model_ids": ["gpt-5.4"]
+            }
+        }));
+        key
     }
 
     let seen_execution_runtime = Arc::new(Mutex::new(None::<SeenExecutionRuntimeSyncRequest>));

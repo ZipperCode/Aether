@@ -1125,7 +1125,8 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        perform_model_fetch_once_with_state, safe_model_fetch_error, state::ModelFetchRuntimeState,
+        perform_model_fetch_for_keys_with_state, perform_model_fetch_once_with_state,
+        safe_model_fetch_error, state::ModelFetchRuntimeState,
     };
     use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot};
     use aether_data_contracts::repository::global_models::{
@@ -1142,7 +1143,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use serde_json::{json, Value};
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{BTreeSet, HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use crate::provider_transport::LocalResolvedOAuthRequestAuth;
@@ -2161,9 +2162,11 @@ mod tests {
             .upstream_metadata_updates
             .lock()
             .expect("metadata updates mutex");
-        assert_eq!(metadata_updates.len(), 1);
-        assert_eq!(metadata_updates[0].1, "codex_models");
-        let catalog_cards = metadata_updates[0].2["cards"]
+        let codex_catalog_update = metadata_updates
+            .iter()
+            .find(|update| update.1 == "codex_models")
+            .expect("codex catalog metadata update should be present");
+        let catalog_cards = codex_catalog_update.2["cards"]
             .as_object()
             .expect("codex catalog cards should be an object");
         assert!(catalog_cards.contains_key("gpt-5.4"));
@@ -3326,5 +3329,417 @@ mod tests {
                 && !*replace
         }));
         assert!(syncs.iter().all(|(_, _, replace, _)| !*replace));
+    }
+
+    #[tokio::test]
+    async fn codex_model_discovery_persists_raw_hidden_ids_without_enrichment() {
+        let provider = sample_provider("provider-codex", "codex");
+        let endpoints = vec![
+            sample_endpoint(
+                "endpoint-codex-responses",
+                "provider-codex",
+                "openai:responses",
+            ),
+            sample_endpoint("endpoint-codex-image", "provider-codex", "openai:image"),
+        ];
+        let mut key = sample_key(
+            "key-codex",
+            "provider-codex",
+            "oauth",
+            &["openai:responses", "openai:image"],
+        );
+        key.locked_models = Some(json!(["gpt-6.1-sol"]));
+        key.upstream_metadata = Some(json!({
+            "codex": {
+                "plan_type": "plus"
+            }
+        }));
+        let transport = sample_transport(
+            "codex",
+            "provider-codex",
+            "endpoint-codex-responses",
+            "key-codex",
+            "openai:responses",
+            "oauth",
+            Some(r#"{"provider_type":"codex","plan_type":"plus"}"#),
+        );
+        let state = TestState::new(
+            vec![provider],
+            endpoints,
+            vec![key],
+            HashMap::from([(
+                (
+                    "provider-codex".to_string(),
+                    "endpoint-codex-responses".to_string(),
+                    "key-codex".to_string(),
+                ),
+                transport,
+            )]),
+            vec![execution_result(json!({
+                "models": [
+                    {
+                        "slug": "gpt-basic-hidden",
+                        "display_name": "GPT Basic Hidden",
+                        "visibility": "hide"
+                    }
+                ]
+            }))],
+        )
+        .with_provider_models(vec![sample_provider_model(
+            "provider-model-image",
+            "provider-codex",
+            "gpt-image-2",
+        )])
+        .with_model_bindings(vec![StoredModelEndpointBinding::new(
+            "provider-model-image".to_string(),
+            "endpoint-codex-image".to_string(),
+            "discovered".to_string(),
+            true,
+            None,
+            None,
+        )
+        .expect("image binding should build")]);
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("codex hidden catalog fetch should succeed");
+        assert_eq!(summary.succeeded, 1);
+
+        let updated = state.key("key-codex");
+        assert_eq!(
+            updated.allowed_models,
+            Some(json!(["gpt-6.1-sol", "gpt-basic-hidden", "gpt-image-2"]))
+        );
+        let metadata = updated
+            .upstream_metadata
+            .as_ref()
+            .expect("upstream metadata should persist");
+        assert_eq!(metadata["codex"]["plan_type"], json!("plus"));
+        let catalog_cards = metadata["codex_models"]["cards"]
+            .as_object()
+            .expect("codex_models cards should exist");
+        assert!(catalog_cards.contains_key("gpt-basic-hidden"));
+        assert!(
+            catalog_cards.contains_key("gpt-5.4"),
+            "hidden-only catalog still populates bundled execution cards"
+        );
+        assert!(!catalog_cards.contains_key("gpt-image-2"));
+        assert_eq!(
+            metadata.get("codex_model_discovery"),
+            Some(&json!({
+                "model_ids": ["gpt-basic-hidden"]
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_model_discovery_replaces_removed_models_and_preserves_lkg_on_errors() {
+        let provider = sample_provider("provider-codex", "codex");
+        let endpoint = sample_endpoint(
+            "endpoint-codex-responses",
+            "provider-codex",
+            "openai:responses",
+        );
+        let mut key = sample_key(
+            "key-codex",
+            "provider-codex",
+            "oauth",
+            &["openai:responses"],
+        );
+        key.locked_models = Some(json!(["gpt-6.1-sol"]));
+        let transport = sample_transport(
+            "codex",
+            "provider-codex",
+            "endpoint-codex-responses",
+            "key-codex",
+            "openai:responses",
+            "oauth",
+            None,
+        );
+        let state = TestState::new(
+            vec![provider],
+            vec![endpoint],
+            vec![key],
+            HashMap::from([(
+                (
+                    "provider-codex".to_string(),
+                    "endpoint-codex-responses".to_string(),
+                    "key-codex".to_string(),
+                ),
+                transport,
+            )]),
+            vec![
+                execution_result(json!({
+                    "models": [
+                        {"slug": "gpt-basic-test"},
+                        {"slug": "gpt-6.1-sol"}
+                    ]
+                })),
+                execution_error_result(500, json!({"error": {"message": "upstream failure"}})),
+                execution_result(json!({
+                    "models": [
+                        {"slug": "gpt-basic-test"}
+                    ]
+                })),
+                execution_result(json!({
+                    "models": []
+                })),
+            ],
+        );
+
+        let initial = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("initial codex fetch should succeed");
+        assert_eq!(initial.succeeded, 1);
+        let after_initial = state.key("key-codex");
+        assert_eq!(
+            after_initial.allowed_models,
+            Some(json!(["gpt-6.1-sol", "gpt-basic-test"]))
+        );
+        assert_eq!(
+            after_initial
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codex_model_discovery")),
+            Some(&json!({
+                "model_ids": ["gpt-basic-test", "gpt-6.1-sol"]
+            }))
+        );
+
+        let http_failure = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("failed codex fetch should complete cycle");
+        assert_eq!(http_failure.failed, 1);
+        let after_http_failure = state.key("key-codex");
+        assert_eq!(
+            after_http_failure.last_models_fetch_error.as_deref(),
+            Some("Upstream models fetch failed (status 500)")
+        );
+        assert_eq!(
+            after_http_failure.allowed_models,
+            Some(json!(["gpt-6.1-sol", "gpt-basic-test"]))
+        );
+        assert_eq!(
+            after_http_failure
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codex_model_discovery")),
+            Some(&json!({
+                "model_ids": ["gpt-basic-test", "gpt-6.1-sol"]
+            }))
+        );
+
+        let replacement = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("replacement codex fetch should succeed");
+        assert_eq!(replacement.succeeded, 1);
+        let after_replacement = state.key("key-codex");
+        assert_eq!(after_replacement.last_models_fetch_error, None);
+        assert_eq!(
+            after_replacement.allowed_models,
+            Some(json!(["gpt-6.1-sol", "gpt-basic-test"]))
+        );
+        assert_eq!(
+            after_replacement
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codex_model_discovery")),
+            Some(&json!({
+                "model_ids": ["gpt-basic-test"]
+            }))
+        );
+
+        let empty_native = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("empty native models array should record fetch failure");
+        assert_eq!(empty_native.failed, 1);
+        let after_empty_native = state.key("key-codex");
+        assert_eq!(
+            after_empty_native.allowed_models,
+            Some(json!(["gpt-6.1-sol", "gpt-basic-test"]))
+        );
+        assert_eq!(
+            after_empty_native
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codex_model_discovery")),
+            Some(&json!({
+                "model_ids": ["gpt-basic-test"]
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_model_discovery_clears_on_empty_data_and_skips_no_endpoint_presets() {
+        let preset_provider = sample_provider("provider-codex-preset", "codex");
+        let preset_key = sample_key(
+            "key-preset-no-endpoint",
+            "provider-codex-preset",
+            "oauth",
+            &["openai:responses"],
+        );
+
+        let provider = sample_provider("provider-codex", "codex");
+        let endpoints = vec![
+            sample_endpoint(
+                "endpoint-codex-responses",
+                "provider-codex",
+                "openai:responses",
+            ),
+            sample_endpoint("endpoint-codex-image", "provider-codex", "openai:image"),
+        ];
+        let image_only_preset_key = sample_key(
+            "key-preset-image-only",
+            "provider-codex",
+            "oauth",
+            &["openai:image"],
+        );
+        let mut remote_key = sample_key(
+            "key-remote",
+            "provider-codex",
+            "oauth",
+            &["openai:responses"],
+        );
+        remote_key.locked_models = Some(json!(["gpt-locked"]));
+
+        let image_transport = sample_transport(
+            "codex",
+            "provider-codex",
+            "endpoint-codex-image",
+            "key-preset-image-only",
+            "openai:image",
+            "oauth",
+            Some(r#"{"provider_type":"codex","plan_type":"plus"}"#),
+        );
+        let remote_transport = sample_transport(
+            "codex",
+            "provider-codex",
+            "endpoint-codex-responses",
+            "key-remote",
+            "openai:responses",
+            "oauth",
+            None,
+        );
+        let state = TestState::new(
+            vec![preset_provider, provider],
+            endpoints,
+            vec![preset_key, image_only_preset_key, remote_key],
+            HashMap::from([
+                (
+                    (
+                        "provider-codex".to_string(),
+                        "endpoint-codex-image".to_string(),
+                        "key-preset-image-only".to_string(),
+                    ),
+                    image_transport,
+                ),
+                (
+                    (
+                        "provider-codex".to_string(),
+                        "endpoint-codex-responses".to_string(),
+                        "key-remote".to_string(),
+                    ),
+                    remote_transport,
+                ),
+            ]),
+            vec![
+                execution_result(json!({
+                    "models": [
+                        {"slug": "gpt-basic-test"}
+                    ]
+                })),
+                execution_result(json!({
+                    "data": []
+                })),
+            ],
+        )
+        .with_provider_models(vec![sample_provider_model(
+            "provider-model-image",
+            "provider-codex",
+            "gpt-image-2",
+        )])
+        .with_model_bindings(vec![StoredModelEndpointBinding::new(
+            "provider-model-image".to_string(),
+            "endpoint-codex-image".to_string(),
+            "discovered".to_string(),
+            true,
+            None,
+            None,
+        )
+        .expect("image binding should build")]);
+
+        let first_batch = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("preset and remote codex batch should succeed");
+        assert_eq!(first_batch.succeeded, 3);
+
+        let updated_no_endpoint = state.key("key-preset-no-endpoint");
+        let no_endpoint_allowed =
+            aether_model_fetch::json_string_list(updated_no_endpoint.allowed_models.as_ref());
+        assert!(no_endpoint_allowed.contains(&"gpt-5.4".to_string()));
+        assert!(updated_no_endpoint
+            .upstream_metadata
+            .as_ref()
+            .and_then(|metadata| metadata["codex_models"]["cards"].as_object())
+            .is_some());
+        assert_eq!(
+            updated_no_endpoint
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codex_model_discovery")),
+            None
+        );
+
+        let updated_image_only = state.key("key-preset-image-only");
+        let image_only_allowed =
+            aether_model_fetch::json_string_list(updated_image_only.allowed_models.as_ref());
+        assert!(image_only_allowed.contains(&"gpt-5.4".to_string()));
+        assert!(image_only_allowed.contains(&"gpt-image-2".to_string()));
+        assert_eq!(
+            updated_image_only
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codex_model_discovery")),
+            None
+        );
+
+        let updated_remote = state.key("key-remote");
+        assert_eq!(
+            updated_remote
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codex_model_discovery")),
+            Some(&json!({
+                "model_ids": ["gpt-basic-test"]
+            }))
+        );
+
+        let target_keys = BTreeSet::from(["key-remote".to_string()]);
+        let empty_compatible =
+            perform_model_fetch_for_keys_with_state(&state, "provider-codex", &target_keys)
+                .await
+                .expect("compatible empty data fetch should succeed");
+        assert_eq!(empty_compatible.succeeded, 1);
+
+        let after_empty_compatible = state.key("key-remote");
+        assert_eq!(after_empty_compatible.last_models_fetch_error, None);
+        assert_eq!(
+            after_empty_compatible.allowed_models,
+            Some(json!(["gpt-locked"]))
+        );
+        assert!(after_empty_compatible
+            .upstream_metadata
+            .as_ref()
+            .and_then(|metadata| metadata["codex_models"]["cards"].get("gpt-5.4"))
+            .is_some());
+        assert_eq!(
+            after_empty_compatible
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("codex_model_discovery")),
+            Some(&json!({
+                "model_ids": []
+            }))
+        );
     }
 }

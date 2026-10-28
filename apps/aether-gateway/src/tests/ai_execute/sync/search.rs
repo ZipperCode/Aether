@@ -169,7 +169,7 @@ fn key() -> StoredProviderCatalogKey {
         r#"{"provider_type":"codex","account_id":"account-search-1","is_fedramp":true}"#,
     )
     .expect("auth config should encrypt");
-    StoredProviderCatalogKey::new(
+    let mut key = StoredProviderCatalogKey::new(
         "key-codex-search-1".to_string(),
         "provider-codex-search-1".to_string(),
         "oauth".to_string(),
@@ -190,7 +190,13 @@ fn key() -> StoredProviderCatalogKey {
         None,
         None,
     )
-    .expect("key transport should build")
+    .expect("key transport should build");
+    key.upstream_metadata = Some(json!({
+        "codex_model_discovery": {
+            "model_ids": ["gpt-5.6-sol"]
+        }
+    }));
+    key
 }
 
 #[test]
@@ -397,9 +403,11 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
             let mut primary = key();
             if real_http {
                 // deferred tool discovery 的 false 不代表 Alpha Search 不可用。
-                primary.upstream_metadata = Some(json!({"codex_models": {"cards": {
+                let mut metadata = primary.upstream_metadata.unwrap_or_else(|| json!({}));
+                metadata["codex_models"] = json!({"cards": {
                     "gpt-5.6-sol": {"slug": "gpt-5.6-sol", "supports_search_tool": false}
-                }}}));
+                }});
+                primary.upstream_metadata = Some(metadata);
                 // 账号覆盖与端点规则之后仍须遵守 Search JSON 协议，不能泄漏 Responses 状态。
                 primary.encrypted_auth_config = Some(
                     encrypt_python_fernet_plaintext(

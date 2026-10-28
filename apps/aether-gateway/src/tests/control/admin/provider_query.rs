@@ -689,10 +689,12 @@ async fn gateway_recovers_codex_slug_only_models_from_a_stale_legacy_cache_impl(
     ));
 
     let state = build_state_with_execution_runtime_override(execution_runtime_url)
-        .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
-            provider_catalog_repository,
-            DEVELOPMENT_ENCRYPTION_KEY.to_string(),
-        ));
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                &provider_catalog_repository,
+            ))
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
     state
         .runtime_state()
         .kv_set(
@@ -768,6 +770,26 @@ async fn gateway_recovers_codex_slug_only_models_from_a_stale_legacy_cache_impl(
             } else {
                 "Future Dynamic"
             }
+        );
+        let persisted_key = provider_catalog_repository
+            .list_keys_by_ids(&["key-codex-dynamic".to_string()])
+            .await
+            .expect("dynamic codex key should load")
+            .into_iter()
+            .next()
+            .expect("dynamic codex key should exist");
+        assert!(
+            !persisted_key.auto_fetch_models,
+            "admin force_refresh must not mutate auto_fetch_models"
+        );
+        assert_eq!(
+            persisted_key
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| {
+                    metadata.get(aether_provider_transport::CODEX_MODEL_DISCOVERY_NAMESPACE)
+                }),
+            Some(&json!({"model_ids": ["gpt-future-dynamic"]}))
         );
         if request_index == 0 {
             let context = crate::model_fetch::read_codex_management_catalog(
@@ -4660,6 +4682,11 @@ async fn gateway_executes_codex_search_admin_pool_model_test_with_search_contrac
         "key-codex-search",
         r#"{"provider_type":"codex","account_id":"account-search-admin","is_fedramp":true}"#,
     ));
+    key.upstream_metadata = Some(json!({
+        aether_provider_transport::CODEX_MODEL_DISCOVERY_NAMESPACE: {
+            "model_ids": ["gpt-5.6-sol"]
+        }
+    }));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![endpoint],

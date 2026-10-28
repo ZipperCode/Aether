@@ -16,7 +16,7 @@ use aether_provider_transport::vertex::{
 };
 use aether_provider_transport::{
     is_vertex_api_key_transport_context, resolve_transport_execution_timeouts,
-    resolve_transport_profile, GatewayProviderTransportSnapshot,
+    resolve_transport_profile, GatewayProviderTransportSnapshot, CODEX_MODEL_DISCOVERY_NAMESPACE,
 };
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
@@ -399,8 +399,20 @@ async fn fetch_standard_models(
         aggregate_models_for_cache(&all_models)
     };
     let codex_model_ids = is_codex.then(|| collect_codex_model_ids(&merged_models));
-    let upstream_metadata =
+    let mut upstream_metadata =
         crate::logic::model_catalog_upstream_metadata(provider_type, &merged_models);
+    if is_codex && has_success {
+        if let Some(model_ids) = codex_model_ids.as_ref() {
+            let discovery = json!({ "model_ids": model_ids.as_slice() });
+            if let Some(metadata) = upstream_metadata.as_mut().and_then(Value::as_object_mut) {
+                metadata.insert(CODEX_MODEL_DISCOVERY_NAMESPACE.to_string(), discovery);
+            } else {
+                let mut metadata = serde_json::Map::with_capacity(1);
+                metadata.insert(CODEX_MODEL_DISCOVERY_NAMESPACE.to_string(), discovery);
+                upstream_metadata = Some(Value::Object(metadata));
+            }
+        }
+    }
     let mut outcome = build_success_outcome(merged_models, upstream_metadata, has_success);
     outcome.native_codex_catalog = native_codex_catalog && has_success;
     if let Some(model_ids) = codex_model_ids {
@@ -3681,6 +3693,410 @@ mod tests {
         assert_eq!(outcome.etag, None);
         assert_eq!(outcome.errors.len(), 1);
         assert!(outcome.errors[0].contains("HTTP 503: temporarily unavailable"));
+    }
+
+    #[tokio::test]
+    async fn codex_model_discovery_hidden_only_cards_record_raw_ids_separate_from_bundled_cards() {
+        let runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!({
+                "models": [
+                    {
+                        "id": "gpt-hidden-shadowed-id",
+                        "slug": "gpt-hidden-raw-alpha",
+                        "visibility": "hide",
+                        "default_reasoning_level": "high"
+                    },
+                    {
+                        "id": "gpt-Hidden-Id-Only-Beta",
+                        "visibility": "none"
+                    },
+                    {
+                        "slug": "gpt-hidden-id-only-beta",
+                        "visibility": "hide"
+                    }
+                ]
+            }),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+
+        let outcome = fetch_models_from_transports_for_client_version(
+            &runtime,
+            &[sample_codex_transport()],
+            Some("0.145.2"),
+        )
+        .await
+        .expect("hidden-only Codex catalog should fetch");
+
+        assert!(outcome.has_success);
+        assert!(outcome.native_codex_catalog);
+        assert_eq!(
+            outcome.fetched_model_ids,
+            vec![
+                "gpt-hidden-raw-alpha",
+                "gpt-Hidden-Id-Only-Beta",
+                "gpt-hidden-id-only-beta"
+            ]
+        );
+        let metadata = outcome
+            .upstream_metadata
+            .as_ref()
+            .expect("Codex upstream_metadata should exist");
+        let effective_cards = metadata["codex_models"]["cards"]
+            .as_object()
+            .expect("codex_models.cards object");
+        assert!(
+            effective_cards.contains_key("gpt-5.4"),
+            "effective execution cards still backfill bundled models when remote cards are hidden-only"
+        );
+        assert!(effective_cards.contains_key("gpt-hidden-raw-alpha"));
+        assert!(effective_cards.contains_key("gpt-Hidden-Id-Only-Beta"));
+        assert!(effective_cards.contains_key("gpt-hidden-id-only-beta"));
+        assert_eq!(
+            metadata.get("codex_model_discovery"),
+            Some(&json!({
+                "model_ids": [
+                    "gpt-hidden-raw-alpha",
+                    "gpt-Hidden-Id-Only-Beta",
+                    "gpt-hidden-id-only-beta"
+                ]
+            }))
+        );
+        assert!(
+            crate::logic::model_catalog_upstream_metadata("codex", &outcome.cached_models)
+                .as_ref()
+                .and_then(|value| value.get("codex_model_discovery"))
+                .is_none(),
+            "display/execution card projection helper must never synthesize codex_model_discovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_model_discovery_compatible_data_and_array_retain_exact_case_identities() {
+        let data_runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!({
+                "data": [
+                    {"id": "gpt-Compat-Data-Exact"},
+                    {"id": "gpt-compat-data-exact"},
+                    {"id": "gpt-compat-id-fallback", "slug": "gpt-compat-slug-preferred"}
+                ]
+            }),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+
+        let data_outcome = crate::fetch_models_from_transports_for_management(
+            &data_runtime,
+            &[sample_codex_transport()],
+            Some("0.153.3"),
+        )
+        .await
+        .expect("management fetch should accept compatible data response");
+        assert!(data_outcome.has_success);
+        assert!(!data_outcome.native_codex_catalog);
+        let data_metadata = data_outcome
+            .upstream_metadata
+            .as_ref()
+            .expect("Codex upstream_metadata should exist");
+        assert!(data_metadata["codex_models"]["cards"]
+            .as_object()
+            .expect("codex_models.cards object")
+            .contains_key("gpt-5.4"));
+        assert_eq!(
+            data_metadata.get("codex_model_discovery"),
+            Some(&json!({
+                "model_ids": [
+                    "gpt-Compat-Data-Exact",
+                    "gpt-compat-data-exact",
+                    "gpt-compat-slug-preferred"
+                ]
+            }))
+        );
+
+        let array_runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!([
+                {"id": "gpt-Array-Exact"},
+                {"slug": "gpt-array-slug-only"},
+                "gpt-array-string-item"
+            ]),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+        let array_outcome =
+            fetch_models_from_transports(&array_runtime, &[sample_codex_transport()])
+                .await
+                .expect("unversioned fetch should accept compatible top-level array");
+        assert!(array_outcome.has_success);
+        assert!(!array_outcome.native_codex_catalog);
+        assert_eq!(
+            array_outcome
+                .upstream_metadata
+                .as_ref()
+                .and_then(|value| value.get("codex_model_discovery")),
+            Some(&json!({
+                "model_ids": [
+                    "gpt-Array-Exact",
+                    "gpt-array-slug-only",
+                    "gpt-array-string-item"
+                ]
+            }))
+        );
+
+        let versioned_rejected = fetch_models_from_transports_for_client_version(
+            &data_runtime,
+            &[sample_codex_transport()],
+            Some("0.145.2"),
+        )
+        .await
+        .expect("versioned client fetch returns observable failure outcome");
+        assert!(!versioned_rejected.has_success);
+        assert!(versioned_rejected
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("codex_model_discovery"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_model_discovery_aggregates_duplicate_endpoints_and_replaces_prior_namespace() {
+        let shared_card = json!({
+            "id": "gpt-shared-raw",
+            "slug": "gpt-shared-raw",
+            "visibility": "hide"
+        });
+        let responses_only_card = json!({
+            "slug": "gpt-responses-only-raw",
+            "visibility": "hide"
+        });
+        let compact_only_card = json!({
+            "id": "gpt-Compact-Only-Raw",
+            "visibility": "hide"
+        });
+        let runtime = RoutingTestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            routes: vec![
+                (
+                    "responses.example.com/backend-api/codex/models".to_string(),
+                    Ok((
+                        200,
+                        json!({"models": [shared_card.clone(), responses_only_card]}),
+                    )),
+                ),
+                (
+                    "compact.example.com/backend-api/codex/models".to_string(),
+                    Ok((
+                        200,
+                        json!({"models": [shared_card.clone(), compact_only_card]}),
+                    )),
+                ),
+                (
+                    "chat.example.com/backend-api/codex/models".to_string(),
+                    Err("chat endpoint unavailable".to_string()),
+                ),
+            ],
+        };
+        let responses = sample_codex_transport_for_base(
+            "endpoint-responses",
+            "https://responses.example.com/backend-api/codex",
+        );
+        let mut compact = sample_codex_transport_for_base(
+            "endpoint-compact",
+            "https://compact.example.com/backend-api/codex",
+        );
+        compact.endpoint.api_format = "openai:responses:compact".to_string();
+        let mut chat = sample_codex_transport_for_base(
+            "endpoint-chat",
+            "https://chat.example.com/backend-api/codex",
+        );
+        chat.endpoint.api_format = "openai:chat".to_string();
+
+        let outcome = fetch_models_from_transports_for_client_version(
+            &runtime,
+            &[responses, compact, chat],
+            Some("0.145.2"),
+        )
+        .await
+        .expect("partial endpoint success should aggregate raw discovery IDs");
+
+        assert!(outcome.has_success);
+        assert_eq!(outcome.errors.len(), 1);
+        let metadata = outcome
+            .upstream_metadata
+            .as_ref()
+            .expect("Codex upstream_metadata should exist");
+        assert!(metadata["codex_models"]["cards"]
+            .as_object()
+            .expect("codex_models.cards object")
+            .contains_key("gpt-5.4"));
+        assert_eq!(
+            metadata.get("codex_model_discovery"),
+            Some(&json!({
+                "model_ids": [
+                    "gpt-shared-raw",
+                    "gpt-responses-only-raw",
+                    "gpt-Compact-Only-Raw"
+                ]
+            }))
+        );
+
+        let shrunk_runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!({"models": [shared_card]}),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+        let shrunk_outcome = fetch_models_from_transports_for_client_version(
+            &shrunk_runtime,
+            &[sample_codex_transport()],
+            Some("0.145.2"),
+        )
+        .await
+        .expect("shrunk Codex catalog should fetch");
+        let shrunk_metadata = shrunk_outcome
+            .upstream_metadata
+            .as_ref()
+            .expect("shrunk Codex upstream_metadata should exist");
+        let replaced = crate::logic::merge_upstream_metadata(Some(metadata), shrunk_metadata);
+        assert_eq!(
+            replaced.get("codex_model_discovery"),
+            Some(&json!({
+                "model_ids": ["gpt-shared-raw"]
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_model_discovery_compatible_empty_records_empty_ids_while_failures_and_presets_omit_namespace(
+    ) {
+        let empty_data_runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!({"data": []}),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+        let empty_data_outcome = crate::fetch_models_from_transports_for_management(
+            &empty_data_runtime,
+            &[sample_codex_transport()],
+            Some("0.153.3"),
+        )
+        .await
+        .expect("compatible empty data array should parse as an empty catalog");
+        assert!(empty_data_outcome.has_success);
+        assert!(!empty_data_outcome.native_codex_catalog);
+        assert!(empty_data_outcome.fetched_model_ids.is_empty());
+        let empty_data_metadata = empty_data_outcome
+            .upstream_metadata
+            .as_ref()
+            .expect("Codex upstream_metadata should exist");
+        assert!(
+            empty_data_metadata["codex_models"]["cards"]
+                .as_object()
+                .expect("codex_models.cards object")
+                .contains_key("gpt-5.4"),
+            "bundled execution cards must not leak into empty discovery evidence"
+        );
+        assert_eq!(
+            empty_data_metadata.get("codex_model_discovery"),
+            Some(&json!({"model_ids": []}))
+        );
+
+        let empty_array_runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!([]),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+        let empty_array_outcome =
+            fetch_models_from_transports(&empty_array_runtime, &[sample_codex_transport()])
+                .await
+                .expect("compatible empty top-level array should parse as an empty catalog");
+        assert!(empty_array_outcome.has_success);
+        assert_eq!(
+            empty_array_outcome
+                .upstream_metadata
+                .as_ref()
+                .and_then(|value| value.get("codex_model_discovery")),
+            Some(&json!({"model_ids": []}))
+        );
+
+        let native_empty_runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!({"models": []}),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+        let native_empty_outcome = fetch_models_from_transports_for_client_version(
+            &native_empty_runtime,
+            &[sample_codex_transport()],
+            Some("0.145.2"),
+        )
+        .await
+        .expect("native empty models array returns observable failed outcome");
+        assert!(!native_empty_outcome.has_success);
+        assert!(native_empty_outcome
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("codex_model_discovery"))
+            .is_none());
+
+        let failed_runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!({"error": {"message": "upstream failure"}}),
+            status_code: 503,
+            response_headers: BTreeMap::new(),
+        };
+        let failed_outcome = crate::fetch_models_from_transports_for_management(
+            &failed_runtime,
+            &[sample_codex_transport()],
+            Some("0.153.3"),
+        )
+        .await
+        .expect("upstream 503 returns observable failed outcome");
+        assert!(!failed_outcome.has_success);
+        assert!(failed_outcome
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("codex_model_discovery"))
+            .is_none());
+
+        let mut claude_code = sample_custom_aiplatform_transport();
+        claude_code.provider.provider_type = "claude_code".to_string();
+        claude_code.endpoint.api_format = "claude:messages".to_string();
+        let preset_outcome = fetch_models_from_transports(&empty_data_runtime, &[claude_code])
+            .await
+            .expect("preset catalog fetch should succeed");
+        assert!(preset_outcome.used_preset_catalog);
+        assert!(preset_outcome
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("codex_model_discovery"))
+            .is_none());
+
+        let openai_runtime = TestRuntime {
+            executed_urls: Arc::new(Mutex::new(Vec::new())),
+            response_body: json!({"data": [{"id": "gpt-4.1"}]}),
+            status_code: 200,
+            response_headers: BTreeMap::new(),
+        };
+        let openai_outcome = fetch_models_from_transports(
+            &openai_runtime,
+            &[sample_openai_transport(
+                "endpoint-openai",
+                "openai:responses",
+                "https://api.openai.com/v1",
+            )],
+        )
+        .await
+        .expect("non-Codex standard transport fetch should succeed");
+        assert!(openai_outcome.has_success);
+        assert!(openai_outcome
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("codex_model_discovery"))
+            .is_none());
     }
 
     #[tokio::test]

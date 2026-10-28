@@ -623,7 +623,7 @@ async fn gateway_executes_openai_chat_stream_via_local_openai_responses_cross_fo
     }
 
     fn sample_provider_catalog_key() -> StoredProviderCatalogKey {
-        StoredProviderCatalogKey::new(
+        let mut key = StoredProviderCatalogKey::new(
             "key-openai-chat-cli-local-1".to_string(),
             "provider-openai-chat-cli-local-1".to_string(),
             "prod".to_string(),
@@ -647,7 +647,13 @@ async fn gateway_executes_openai_chat_stream_via_local_openai_responses_cross_fo
             None,
             None,
         )
-        .expect("key transport should build")
+        .expect("key transport should build");
+        key.upstream_metadata = Some(serde_json::json!({
+            "codex_model_discovery": {
+                "model_ids": ["gpt-5.4"]
+            }
+        }));
+        key
     }
 
     let seen_execution_runtime = Arc::new(Mutex::new(None::<SeenExecutionRuntimeStreamRequest>));

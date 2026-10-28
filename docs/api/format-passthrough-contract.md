@@ -143,6 +143,9 @@ Codex 文本 `/models` 目录不是完整图片目录。Aether 从该提供商�
 - Key 的显式 API 格式权限、include/exclude/locked 规则继续生效。旧迁移将文本型号关联图片 Endpoint 的记录，不会因此自动变成图片模型。
 - 已知 Free Codex OAuth 不允许生图，返回独立原因 `codex_plan_image_generation_unsupported`。Plus、Pro、ProLite、ProMax 和未知套餐不被固定套餐名单额外排除；每个型号的实际权限和额度仍由原有规则与上游决定。官方 [图片能力判定](https://github.com/openai/codex/blob/75e0e0aad97a86138b8b1ec87d9b544b4a35ecbf/codex-rs/core/src/tools/spec_plan.rs#L727) 明确区分 Free，不能将套餐展示名称当作原始身份。
 - 启用自动模型获取的旧 Key，需要强制刷新一次或等待自动刷新，才能修复持久化白名单与 Endpoint 关联；只查看发现列表不会改写手工白名单。手工白名单仍需显式允许目标型号，显式空列表表示禁止。
+- Codex OAuth 的 Responses、Compact、Search 按每个账号成功远端抓取的 `codex_model_discovery.model_ids` 检查最终上游模型，完整名称区分大小写。`allowed_models`、客户端别名、`locked_models`、预设和内置能力卡均不能补充这份能力证据；图片与 Live 不消费文本发现证据。
+- 首次成功发现前不接文本请求，候选原因是 `key_model_disabled`。刷新失败保留最近成功目录；成功刷新完整替换目录，移除型号立即退出调度。该限制不标记整号禁用、OAuth 失效或额度耗尽，账号仍可服务其已发现的其他型号。
+- 升级接流量前逐账号执行管理员强刷：`POST /api/admin/provider-query/models`，正文 `{"provider_id":"<id>","api_key_id":"<id>","force_refresh":true}`。使用正式管理员认证；关闭自动获取的账号也可显式强刷建立证据，不修改开关。公开 `/v1/models?client_version=...` 仍可引导拉取原生目录，但只写版本化缓存，不建立数据库准入证据。
 
 | Endpoint | 发现与调用边界 |
 | --- | --- |

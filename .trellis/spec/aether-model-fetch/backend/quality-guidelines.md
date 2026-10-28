@@ -108,6 +108,58 @@ Wrong：默认型号就是全部支持范围，或者把模型卡上含有 searc
 
 Correct：配置/真实发现生成可路由模型和 Endpoint，已核实的 Free 限制独立执行，其余实际权限由既有策略与上游确定。官方依据见任务研究记录及 [Codex image generation guard](https://github.com/openai/codex/blob/75e0e0aad97a86138b8b1ec87d9b544b4a35ecbf/codex-rs/core/src/tools/spec_plan.rs#L727)、[standalone search selection](https://github.com/openai/codex/blob/75e0e0aad97a86138b8b1ec87d9b544b4a35ecbf/codex-rs/core/src/tools/spec_plan.rs#L1038)。
 
+## Codex account-scoped text discovery eligibility
+
+### 1. Scope / Trigger
+
+Required when changing Codex OAuth discovery, account model permissions, pool membership, ordinary runtime selection, Responses WebSocket turns or pinned admin model execution.
+
+### 2. Signatures
+
+- Shared namespace: `aether_provider_transport::CODEX_MODEL_DISCOVERY_NAMESPACE = "codex_model_discovery"`.
+- Shared gate: `codex_oauth_discovered_model_skip_reason(provider_type: &str, auth_type: &str, api_format: &str, selected_provider_model_name: &str, upstream_metadata: Option<&Value>) -> Option<&'static str>`.
+- Persisted value: `{"codex_model_discovery":{"model_ids":["exact-remote-id"]}}`; reuse existing namespace persistence and routing-cache invalidation, without schema changes.
+- Explicit per-account refresh: `POST /api/admin/provider-query/models` with `provider_id`, `api_key_id`, `force_refresh=true` and real administrator authentication.
+
+### 3. Contracts
+
+- Only successful remote `fetch_standard_models` creates evidence, collecting slug-first/id-second exact identities from raw merged cards. Serialize borrowed IDs before moving them into the fetch outcome. Hidden cards remain evidence; bundled execution cards, presets, locked/include/exclude results and local image enrichment never become evidence.
+- Aggregate successful endpoints for the same account; conflicting identities fail without replacing evidence. Native `models:[]` retains its existing parse error; compatible successful empty `data`/array replaces discovery with `model_ids:[]`.
+- Background success and direct admin refresh persist all namespaces. Successful discovery replaces, never unions, prior IDs; errors/presets/cache-only reads preserve last success. `auto_fetch_models=false` permits explicit direct refresh without changing the switch.
+- The gate applies only to trimmed case-insensitive `codex` + `oauth` with alias-equivalent Responses, Compact or Search. Compare `selected_provider_model_name.trim()` by exact case-sensitive identity. No wildcard, client alias, family name, global mapping or tier label authorizes a model.
+- Reject missing/non-object namespace, non-array/empty IDs, empty requested model, and any non-string, blank or edge-whitespace entry anywhere in the array, including after a matching entry. Scan borrowed values without sets, auth parsing or request-path I/O.
+- Configuration permissions remain additional constraints: `allowed_models=None` is unrestricted configuration; `[]` denies all. Neither permissions nor locked models bypass discovery. Do not disable the account, invalidate OAuth or mark quota exhaustion when a model is absent.
+- Common transport checks actual members after existing capability/permission checks. Ordinary runtime checks strong-read real Keys, never a PoolGroup representative. Strong-read pool-page checks run before hot-pool fallback/window truncation, preserving existing quota/auth/cooldown priorities. Sticky and later pages use actual account evidence. Pinned admin text tests gate final request models before auth refresh/send; images and Live bypass text discovery.
+- Public versioned `/v1/models` remains a bootstrap/display path writing only scoped KV catalogs, never database authorization. No evidence TTL is added. Upgrade traffic requires each account to complete background or explicit administrator refresh first.
+
+### 4. Validation & Error Matrix
+
+| Condition | Result |
+| --- | --- |
+| Legacy cards/permissions but no discovery | `key_model_disabled`, zero text upstream sends |
+| Alias/locked advanced model absent remotely | Skip that account; retain its basic-model service |
+| Case-distinct IDs | Exact identity only |
+| Failed refresh after success | Last successful model remains eligible |
+| Successful removal/re-addition | Immediate denial/recovery through existing cache invalidation |
+| Compatible empty / native empty | Explicit empty evidence / error preserving LKG |
+| Image, Live, non-OAuth or non-Codex | Existing independent behavior |
+| Pool representative lacks target | Expand and inspect real members, not whole-group rejection |
+
+### 5. Good / Base / Bad Cases
+
+Good: free serves only its fetched basic model while paid handles the advanced model. Base: a failed refresh preserves the successful directory. Bad: effective bundled cards or provider-wide unions authorize an unfetched account.
+
+### 6. Tests Required
+
+- Names include `codex_model_discovery`: strict helper malformed-array/case/bypass matrix and alias-whitelist final-target denial.
+- Raw hidden/compatible/multi-endpoint/empty provenance; background locked/image/preset separation, LKG and successful replacement; real independently authenticated two-account model fetch.
+- Dedicated loopback gateway fixture: free representative, locked/alias, basic/free + sticky, first-fetch rejection/recovery, remove/re-add invalidation, ordinary sync/SSE, real two-turn WebSocket, pinned admin and versioned bootstrap. Pool cursor paging/frozen-window/hot fallback preserves account-level isolation and existing reason priorities.
+- Independent curl streaming smoke observes advanced `free=0, paid=1`, then successful basic free traffic; all credentials synthetic and loopback only. Remove temporary launchers after proof. Production account behavior requires separately authorized real-account validation.
+
+### 7. Wrong vs Correct
+
+Wrong: treat `codex_models.cards` or a permissive alias whitelist as account entitlement. Correct: intersect independent raw remote evidence with configured permissions using the final sending account/model on every execution candidate.
+
 ## Antigravity account evidence and model discovery
 
 ### 1. Scope / Trigger

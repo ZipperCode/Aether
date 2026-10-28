@@ -1140,3 +1140,280 @@ async fn codex_image_model_fetch_without_image_permission_or_endpoint_does_not_e
     assert_eq!(allowed_models, Some(json!(["gpt-5.4-codex"])));
     assert!(!image_available);
 }
+
+fn codex_oauth_sample_key(
+    key_id: &str,
+    provider_id: &str,
+    api_formats: &[&str],
+    access_token: &str,
+    auth_config: serde_json::Value,
+) -> StoredProviderCatalogKey {
+    let raw_auth_config = auth_config.to_string();
+    let encrypted_api_key =
+        encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, access_token)
+            .expect("oauth access token should encrypt");
+    let encrypted_auth_config =
+        encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, &raw_auth_config)
+            .expect("oauth auth config should encrypt");
+    let mut key = StoredProviderCatalogKey::new(
+        key_id.to_string(),
+        provider_id.to_string(),
+        key_id.to_string(),
+        "oauth".to_string(),
+        None,
+        true,
+    )
+    .expect("codex oauth key should build")
+    .with_transport_fields(
+        Some(json!(api_formats)),
+        encrypted_api_key,
+        Some(encrypted_auth_config),
+        None,
+        None,
+        None,
+        Some(4_102_444_800),
+        None,
+        None,
+    )
+    .expect("codex oauth key transport should build");
+    key.auto_fetch_models = true;
+    key
+}
+
+#[tokio::test]
+async fn codex_model_discovery_fetches_account_specific_oauth_catalogs() {
+    let observed_requests = Arc::new(Mutex::new(Vec::<(Option<String>, Option<String>)>::new()));
+    let upstream_observed = Arc::clone(&observed_requests);
+    let upstream = Router::new().route(
+        "/backend-api/codex/models",
+        any(move |request: Request| {
+            let upstream_observed = Arc::clone(&upstream_observed);
+            async move {
+                let authorization = request
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let account_id = request
+                    .headers()
+                    .get("chatgpt-account-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                upstream_observed
+                    .lock()
+                    .expect("observed requests mutex")
+                    .push((authorization.clone(), account_id.clone()));
+                match (authorization.as_deref(), account_id.as_deref()) {
+                    (Some("Bearer synthetic-codex-oauth-free"), Some("acct-codex-free")) => (
+                        axum::http::StatusCode::OK,
+                        Json(json!({
+                            "models": [
+                                {
+                                    "slug": "gpt-basic-test",
+                                    "family": "gpt-basic",
+                                    "display_name": "GPT Basic Test",
+                                    "visibility": "list"
+                                }
+                            ]
+                        })),
+                    ),
+                    (Some("Bearer synthetic-codex-oauth-paid"), Some("acct-codex-paid")) => (
+                        axum::http::StatusCode::OK,
+                        Json(json!({
+                            "models": [
+                                {
+                                    "slug": "gpt-basic-test",
+                                    "family": "gpt-basic",
+                                    "display_name": "GPT Basic Test",
+                                    "visibility": "list"
+                                },
+                                {
+                                    "slug": "gpt-6.1-sol",
+                                    "family": "gpt-6.1",
+                                    "display_name": "GPT-6.1 Sol",
+                                    "visibility": "list"
+                                }
+                            ]
+                        })),
+                    ),
+                    _ => (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        Json(json!({
+                            "error": {
+                                "message": "unexpected synthetic codex oauth credentials"
+                            }
+                        })),
+                    ),
+                }
+            }
+        }),
+    );
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let base_url = format!("{}/backend-api/codex", upstream_url.trim_end_matches('/'));
+    let provider = codex_image_sample_provider("provider-codex-discovery");
+    let endpoints = vec![
+        codex_image_sample_endpoint(
+            "endpoint-codex-responses",
+            "provider-codex-discovery",
+            "openai:responses",
+            &base_url,
+        ),
+        codex_image_sample_endpoint(
+            "endpoint-codex-image",
+            "provider-codex-discovery",
+            "openai:image",
+            &base_url,
+        ),
+    ];
+    let mut free_key = codex_oauth_sample_key(
+        "key-codex-free",
+        "provider-codex-discovery",
+        &["openai:responses", "openai:image"],
+        "synthetic-codex-oauth-free",
+        json!({
+            "provider_type": "codex",
+            "account_id": "acct-codex-free",
+            "plan_type": "free",
+            "expires_at": 4_102_444_800u64
+        }),
+    );
+    free_key.locked_models = Some(json!(["gpt-6.1-sol"]));
+    let paid_key = codex_oauth_sample_key(
+        "key-codex-paid",
+        "provider-codex-discovery",
+        &["openai:responses", "openai:image"],
+        "synthetic-codex-oauth-paid",
+        json!({
+            "provider_type": "codex",
+            "account_id": "acct-codex-paid",
+            "plan_type": "plus",
+            "expires_at": 4_102_444_800u64
+        }),
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        endpoints,
+        vec![free_key, paid_key],
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![
+                sample_global_model(
+                    "global-model-image",
+                    "gpt-image-next-release",
+                    &["gpt-image-next-release"],
+                ),
+                sample_global_model("global-model-basic", "gpt-basic-test", &["gpt-basic-test"]),
+                sample_global_model("global-model-sol", "gpt-6.1-sol", &["gpt-6.1-sol"]),
+            ])
+            .with_admin_provider_models(vec![sample_provider_model(
+                "provider-model-image",
+                "provider-codex-discovery",
+                "global-model-image",
+                "gpt-image-next-release",
+                "gpt-image-next-release",
+                &["gpt-image-next-release"],
+            )])
+            .with_model_endpoint_bindings([StoredModelEndpointBinding::new(
+                "provider-model-image".to_string(),
+                "endpoint-codex-image".to_string(),
+                "discovered".to_string(),
+                true,
+                None,
+                None,
+            )
+            .expect("image binding should build")])
+            .with_endpoint_provider_ids([
+                ("endpoint-codex-responses", "provider-codex-discovery"),
+                ("endpoint-codex-image", "provider-codex-discovery"),
+            ]),
+    );
+    let data_state = crate::data::GatewayDataState::disabled()
+        .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))
+        .with_global_model_repository_for_tests(Arc::clone(&global_model_repository))
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data_state);
+
+    let summary = perform_model_fetch_once(&state)
+        .await
+        .expect("codex oauth model fetch batch should succeed");
+    upstream_handle.abort();
+
+    assert_eq!(
+        summary,
+        ModelFetchRunSummary {
+            attempted: 2,
+            succeeded: 2,
+            failed: 0,
+            skipped: 0,
+        }
+    );
+
+    let observed = observed_requests
+        .lock()
+        .expect("observed requests mutex")
+        .clone();
+    assert_eq!(observed.len(), 2);
+    assert!(observed.contains(&(
+        Some("Bearer synthetic-codex-oauth-free".to_string()),
+        Some("acct-codex-free".to_string()),
+    )));
+    assert!(observed.contains(&(
+        Some("Bearer synthetic-codex-oauth-paid".to_string()),
+        Some("acct-codex-paid".to_string()),
+    )));
+
+    let updated_keys = provider_catalog_repository
+        .list_keys_by_ids(&["key-codex-free".to_string(), "key-codex-paid".to_string()])
+        .await
+        .expect("updated keys should load");
+    let updated_free = updated_keys
+        .iter()
+        .find(|key| key.id == "key-codex-free")
+        .expect("free key should exist");
+    assert_eq!(
+        updated_free.allowed_models,
+        Some(json!(["gpt-6.1-sol", "gpt-basic-test"]))
+    );
+    assert_eq!(
+        updated_free
+            .upstream_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("codex_model_discovery")),
+        Some(&json!({
+            "model_ids": ["gpt-basic-test"]
+        }))
+    );
+
+    let updated_paid = updated_keys
+        .iter()
+        .find(|key| key.id == "key-codex-paid")
+        .expect("paid key should exist");
+    assert_eq!(
+        updated_paid.allowed_models,
+        Some(json!([
+            "gpt-6.1-sol",
+            "gpt-basic-test",
+            "gpt-image-next-release"
+        ]))
+    );
+    let paid_cards = updated_paid
+        .upstream_metadata
+        .as_ref()
+        .and_then(|metadata| metadata["codex_models"]["cards"].as_object())
+        .expect("paid codex_models cards should persist");
+    assert!(paid_cards.contains_key("gpt-basic-test"));
+    assert!(paid_cards.contains_key("gpt-6.1-sol"));
+    assert!(!paid_cards.contains_key("gpt-image-next-release"));
+    assert_eq!(
+        updated_paid
+            .upstream_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("codex_model_discovery")),
+        Some(&json!({
+            "model_ids": ["gpt-basic-test", "gpt-6.1-sol"]
+        }))
+    );
+}

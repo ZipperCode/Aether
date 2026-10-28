@@ -3077,8 +3077,14 @@ mod tests {
                 codex.clone(),
                 custom_chat.clone(),
             ]));
+        let mut codex_catalog = provider_catalog_for_standard_row(&codex, false);
+        codex_catalog.2.upstream_metadata = Some(serde_json::json!({
+            "codex_model_discovery": {
+                "model_ids": ["gpt-5.4-mini"]
+            }
+        }));
         let catalog_items = [
-            provider_catalog_for_standard_row(&codex, false),
+            codex_catalog,
             provider_catalog_for_standard_row(&custom_chat, false),
         ];
         let provider_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(

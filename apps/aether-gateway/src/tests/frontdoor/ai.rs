@@ -1221,7 +1221,7 @@ async fn run_versioned_codex_model_cards_frontdoor_scenario() {
         "Codex catalog transport must be available even when auto_fetch_models is disabled"
     );
 
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_state(state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
 
@@ -1491,6 +1491,15 @@ async fn run_versioned_codex_model_cards_frontdoor_scenario() {
         .await
         .expect("candidate rows should load after request");
     assert_eq!(rows_after, rows_before);
+    state
+        .upsert_provider_catalog_key_upstream_metadata_namespace(
+            CATALOG_KEY_ID,
+            aether_provider_transport::CODEX_MODEL_DISCOVERY_NAMESPACE,
+            &json!({"model_ids": ["gpt-future-dynamic"]}),
+            Some(1_700_000_000),
+        )
+        .await
+        .expect("Codex model discovery evidence should seed before Responses inference");
 
     let inference_response = client
         .post(format!("{gateway_url}/v1/responses"))
