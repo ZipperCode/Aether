@@ -91,6 +91,81 @@ pub(crate) fn decode_gemini_tool_signature_carrier(
         .then_some((signature, direction))
 }
 
+/// Aether 自有 Claude thinking 回放 carrier 前缀；与上游密文命名空间完全隔离。
+const CLAUDE_REASONING_CARRIER_PREFIX: &str = "aether-claude-reasoning-carrier-v1:";
+/// 单个 Claude 签名/redacted 数据的字节上界；编码前后都校验。
+const MAX_CLAUDE_REASONING_CARRIER_LEN: usize = 32 * 1024 * 1024;
+const MAX_CLAUDE_REASONING_CARRIER_ENCODED_LEN: usize =
+    MAX_CLAUDE_REASONING_CARRIER_LEN.div_ceil(3) * 4;
+
+/// Claude thinking 回放的原始块语义，不包含展示文本（文本仍在 reasoning content）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClaudeReasoningCarrier {
+    /// 有签名的 thinking 块；签名原样字节。
+    Signature(String),
+    /// redacted_thinking 块的不透明数据。
+    Redacted(String),
+}
+
+/// 无上限的原始 carrier 编码：仅做前缀与 Base64,任何 UTF-8 输入都可表示。
+pub(crate) fn encode_claude_reasoning_carrier_raw(kind: &str, payload: &str) -> String {
+    format!(
+        "{CLAUDE_REASONING_CARRIER_PREFIX}{kind}:{}",
+        STANDARD_NO_PAD.encode(payload)
+    )
+}
+
+/// 审计边界使用的 carrier 载荷约束：非空、限长、非嵌套前缀。
+pub(crate) fn claude_reasoning_carrier_payload_is_valid(payload: &str) -> bool {
+    !payload.is_empty()
+        && payload.len() <= MAX_CLAUDE_REASONING_CARRIER_LEN
+        && !payload.starts_with(CLAUDE_REASONING_CARRIER_PREFIX)
+}
+
+/// 编码 Claude 签名；空值或超限值返回 None，调用方必须 fail closed。
+pub(crate) fn encode_claude_reasoning_signature_carrier(signature: &str) -> Option<String> {
+    claude_reasoning_carrier_payload_is_valid(signature)
+        .then(|| encode_claude_reasoning_carrier_raw("signature", signature))
+}
+
+/// 编码 redacted_thinking 数据；空值或超限值返回 None。
+pub(crate) fn encode_claude_redacted_thinking_carrier(data: &str) -> Option<String> {
+    claude_reasoning_carrier_payload_is_valid(data)
+        .then(|| encode_claude_reasoning_carrier_raw("redacted", data))
+}
+
+/// 解码并校验 Aether Claude carrier；只接受本版本、已知类型、非嵌套、限长且合法 Base64 的值。
+pub(crate) fn decode_claude_reasoning_carrier(value: &str) -> Option<ClaudeReasoningCarrier> {
+    let payload = value.strip_prefix(CLAUDE_REASONING_CARRIER_PREFIX)?;
+    let (kind, encoded) = payload.split_once(':')?;
+    // 未知 kind 在解码前拒绝，避免为不可用载荷分配解码缓冲。
+    if !matches!(kind, "signature" | "redacted") {
+        return None;
+    }
+    if encoded.len() > MAX_CLAUDE_REASONING_CARRIER_ENCODED_LEN {
+        return None;
+    }
+    let decoded = STANDARD_NO_PAD.decode(encoded).ok()?;
+    if decoded.is_empty() || decoded.len() > MAX_CLAUDE_REASONING_CARRIER_LEN {
+        return None;
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    if decoded.starts_with(CLAUDE_REASONING_CARRIER_PREFIX) {
+        return None;
+    }
+    match kind {
+        "signature" => Some(ClaudeReasoningCarrier::Signature(decoded)),
+        "redacted" => Some(ClaudeReasoningCarrier::Redacted(decoded)),
+        _ => None,
+    }
+}
+
+/// 前缀命中却无法解码的值属于损坏的内部 carrier，必须 fail closed 而不是当成上游密文。
+pub(crate) fn claude_reasoning_carrier_is_malformed(value: &str) -> bool {
+    value.starts_with(CLAUDE_REASONING_CARRIER_PREFIX)
+        && decode_claude_reasoning_carrier(value).is_none()
+}
+
 /// Controls which provider-owned reasoning items may be replayed on a Responses request.
 ///
 /// OpenAI reasoning references are identified by their `rs...` item IDs. DeepSeek's Responses
@@ -308,7 +383,10 @@ fn openai_responses_reasoning_item_is_replayable(
     if object
         .get("encrypted_content")
         .and_then(Value::as_str)
-        .is_some_and(|value| decode_gemini_tool_signature_carrier(value).is_some())
+        .is_some_and(|value| {
+            decode_gemini_tool_signature_carrier(value).is_some()
+                || decode_claude_reasoning_carrier(value).is_some()
+        })
     {
         return false;
     }

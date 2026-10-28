@@ -1,5 +1,6 @@
 pub mod chat_spec;
 pub mod cli_spec;
+mod partial_args;
 pub mod request;
 pub mod response;
 pub mod spec;

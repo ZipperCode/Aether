@@ -6,13 +6,18 @@ use sha2::{Digest, Sha256};
 use crate::formats::openai::chat::response::openai_chat_reasoning_texts;
 use crate::formats::openai::namespace::NamespaceToolAliases;
 use crate::formats::openai::responses::{
-    decode_gemini_tool_signature_carrier, encode_gemini_tool_signature_carrier_with_direction,
+    claude_reasoning_carrier_is_malformed, decode_claude_reasoning_carrier,
+    decode_gemini_tool_signature_carrier, encode_claude_reasoning_signature_carrier,
+    encode_claude_redacted_thinking_carrier, encode_gemini_tool_signature_carrier_with_direction,
     openai_responses_message_item_id, openai_responses_reasoning_text_parts,
     openai_responses_synthetic_reasoning_item_id,
     response::{
         ensure_modern_openai_responses_response_fields, openai_responses_current_timestamp,
     },
-    GeminiToolSignatureCarrierDirection,
+    ClaudeReasoningCarrier, GeminiToolSignatureCarrierDirection,
+};
+use crate::formats::openai::tool_lowering::{
+    custom_tool_input_from_arguments, tool_search_call_arguments, ResponsesToolRestore,
 };
 use crate::formats::shared::citations::canonical_citations_to_openai_annotations;
 use crate::formats::shared::response::build_generated_tool_call_id;
@@ -59,6 +64,10 @@ fn validate_agent_bridge_stream_function_call(
     Ok(())
 }
 
+fn format_is_claude_messages(value: &str) -> bool {
+    crate::formats::id::api_format_alias_matches(value, "claude:messages")
+}
+
 fn normalize_openai_service_tier(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -85,6 +94,8 @@ pub struct OpenAIChatProviderState {
     pending_finish_reason: Option<String>,
     last_reasoning_index: Option<usize>,
     tool_calls: BTreeMap<usize, OpenAIChatProviderToolState>,
+    /// 失败前已观察到的 usage（来自已解析 chunk），避免矩阵再次解码 SSE。
+    known_usage: Option<CanonicalUsage>,
 }
 
 #[derive(Default)]
@@ -116,8 +127,14 @@ pub struct OpenAIResponsesProviderState {
     tool_calls: BTreeMap<usize, OpenAIResponsesProviderToolState>,
     tool_results: BTreeMap<usize, OpenAIResponsesProviderToolResultState>,
     tool_index_by_key: BTreeMap<String, usize>,
+    /// 失败前已观察到的 usage（来自已解析 response 对象）。
+    known_usage: Option<CanonicalUsage>,
     image_item_keys: BTreeSet<String>,
     opaque_completed_item_keys: BTreeSet<OpenAIResponsesOutputItemKey>,
+    /// 已发射过的完整 reasoning item；output_item.done 与 completed 快照只发射一次。
+    completed_reasoning_item_keys: BTreeSet<OpenAIResponsesOutputItemKey>,
+    /// reasoning item 级文本增量，用于快照补齐时避免重复或截断。
+    reasoning_text_by_item: BTreeMap<String, String>,
     seen_tool_signature_carriers: BTreeSet<String>,
     pending_tool_signatures: VecDeque<String>,
     last_tool_index: Option<usize>,
@@ -142,6 +159,11 @@ impl OpenAIChatProviderState {
 
     pub(crate) fn actual_service_tier(&self) -> Option<&str> {
         self.actual_service_tier.as_deref()
+    }
+
+    /// 已解析 chunk 中观察到的 usage；失败终态由矩阵读取，无需再次解码。
+    pub(crate) fn known_usage(&self) -> Option<CanonicalUsage> {
+        self.known_usage.clone()
     }
 
     fn finish_usage(value: Option<&Value>) -> Option<CanonicalUsage> {
@@ -217,6 +239,9 @@ impl OpenAIChatProviderState {
             normalize_openai_service_tier(chunk_object.get("service_tier").and_then(Value::as_str))
         {
             self.actual_service_tier = Some(service_tier);
+        }
+        if let Some(usage) = Self::finish_usage(chunk_object.get("usage")) {
+            self.known_usage = Some(usage);
         }
 
         let mut out = Vec::new();
@@ -531,6 +556,11 @@ impl OpenAIResponsesProviderState {
         self.actual_service_tier.as_deref()
     }
 
+    /// 已解析 response 对象中观察到的 usage。
+    pub(crate) fn known_usage(&self) -> Option<CanonicalUsage> {
+        self.known_usage.clone()
+    }
+
     fn identity(&self, report_context: &Value) -> (String, String) {
         resolve_identity(
             self.response_id.as_deref(),
@@ -682,38 +712,6 @@ impl OpenAIResponsesProviderState {
             id,
             model,
             event: CanonicalStreamEvent::TextDelta(missing),
-        });
-    }
-
-    fn emit_missing_reasoning(
-        &mut self,
-        report_context: &Value,
-        out: &mut Vec<CanonicalStreamFrame>,
-        reasoning: &str,
-    ) {
-        if self.terminal_only {
-            if !reasoning.is_empty() {
-                self.ensure_started(report_context, out);
-            }
-            return;
-        }
-        let missing = if reasoning.starts_with(&self.reasoning) {
-            reasoning[self.reasoning.len()..].to_string()
-        } else if self.reasoning == reasoning {
-            String::new()
-        } else {
-            reasoning.to_string()
-        };
-        if missing.is_empty() {
-            return;
-        }
-        self.ensure_started(report_context, out);
-        self.reasoning.push_str(&missing);
-        let (id, model) = self.identity(report_context);
-        out.push(CanonicalStreamFrame {
-            id,
-            model,
-            event: CanonicalStreamEvent::ReasoningDelta(missing),
         });
     }
 
@@ -1444,20 +1442,124 @@ impl OpenAIResponsesProviderState {
         report_context: &Value,
         out: &mut Vec<CanonicalStreamFrame>,
         item: &Map<String, Value>,
-    ) {
+    ) -> Result<(), AiSurfaceFinalizeError> {
         if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-            return;
+            return Ok(());
         }
         let completed_reasoning = reasoning_item_text(item);
+        let raw_carrier = item.get("encrypted_content").and_then(Value::as_str);
+        // 命中 Aether 前缀但结构非法属于损坏的内部 carrier；不得降级成无签名 thinking。
+        if raw_carrier.is_some_and(claude_reasoning_carrier_is_malformed) {
+            return Err(AiSurfaceFinalizeError::new(
+                "Malformed Aether Claude reasoning carrier in Responses stream",
+            ));
+        }
+        let claude_carrier = raw_carrier.and_then(decode_claude_reasoning_carrier);
+        if matches!(
+            claude_carrier.as_ref(),
+            Some(ClaudeReasoningCarrier::Redacted(_))
+        ) && !completed_reasoning.trim().is_empty()
+        {
+            return Err(AiSurfaceFinalizeError::new(
+                "Claude redacted thinking carrier must not carry visible text",
+            ));
+        }
         if self.terminal_only {
-            if !completed_reasoning.is_empty() {
+            if !completed_reasoning.is_empty() || claude_carrier.is_some() {
+                self.ensure_started(report_context, out);
+            }
+            return Ok(());
+        }
+        // output_item.done 与 response.completed 会重复携带同一 item，按身份去重。
+        if !self
+            .completed_reasoning_item_keys
+            .insert(self.retained_output_item_key(item))
+        {
+            return Ok(());
+        }
+        let item_id = item.get("id").and_then(Value::as_str);
+        if let Some(ClaudeReasoningCarrier::Redacted(data)) = claude_carrier.as_ref() {
+            self.ensure_started(report_context, out);
+            let (id, model) = self.identity(report_context);
+            out.push(CanonicalStreamFrame {
+                id,
+                model,
+                event: CanonicalStreamEvent::ReasoningRedacted(data.clone()),
+            });
+            return Ok(());
+        }
+        if !completed_reasoning.is_empty() {
+            self.emit_missing_reasoning_for_item(
+                report_context,
+                out,
+                item_id,
+                &completed_reasoning,
+            );
+        }
+        if let Some(ClaudeReasoningCarrier::Signature(signature)) = claude_carrier {
+            self.ensure_started(report_context, out);
+            let (id, model) = self.identity(report_context);
+            out.push(CanonicalStreamFrame {
+                id,
+                model,
+                event: CanonicalStreamEvent::ReasoningSignature(signature),
+            });
+            let (id, model) = self.identity(report_context);
+            out.push(CanonicalStreamFrame {
+                id,
+                model,
+                // Claude 每个 reasoning item 是一个独立 thinking 块。
+                event: CanonicalStreamEvent::ReasoningSummaryDone,
+            });
+        }
+        Ok(())
+    }
+
+    /// 按 item 身份补齐 reasoning 增量；已有 delta 前缀不重复发射，也不清空全局累积。
+    fn emit_missing_reasoning_for_item(
+        &mut self,
+        report_context: &Value,
+        out: &mut Vec<CanonicalStreamFrame>,
+        item_id: Option<&str>,
+        reasoning: &str,
+    ) {
+        if self.terminal_only {
+            if !reasoning.is_empty() {
                 self.ensure_started(report_context, out);
             }
             return;
         }
-        if !completed_reasoning.is_empty() {
-            self.emit_missing_reasoning(report_context, out, &completed_reasoning);
+        let missing = match item_id {
+            Some(item_id) => match self.reasoning_text_by_item.get(item_id) {
+                Some(emitted) if reasoning.starts_with(emitted.as_str()) => {
+                    reasoning[emitted.len()..].to_string()
+                }
+                Some(emitted) if emitted == reasoning => String::new(),
+                Some(_) => reasoning.to_string(),
+                // 未见的 item 身份必须发射自身完整文本；不得借用全局前缀吞掉块。
+                None => reasoning.to_string(),
+            },
+            None if reasoning.starts_with(&self.reasoning) => {
+                reasoning[self.reasoning.len()..].to_string()
+            }
+            None if self.reasoning == reasoning => String::new(),
+            None => reasoning.to_string(),
+        };
+        if let Some(item_id) = item_id {
+            self.reasoning_text_by_item
+                .insert(item_id.to_string(), reasoning.to_string());
         }
+        if missing.is_empty() {
+            return;
+        }
+        self.ensure_started(report_context, out);
+        self.reasoning.push_str(&missing);
+        let (id, model) = self.identity(report_context);
+        out.push(CanonicalStreamFrame {
+            id,
+            model,
+            event: CanonicalStreamEvent::ReasoningDelta(missing),
+        });
     }
 
     fn emit_image_generation_item(
@@ -1570,7 +1672,7 @@ impl OpenAIResponsesProviderState {
         item: &Map<String, Value>,
         output_index: Option<usize>,
         final_item: bool,
-    ) -> bool {
+    ) -> Result<bool, AiSurfaceFinalizeError> {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
         if item_type == "reasoning" {
             // Aether carries Gemini function-call signatures through Responses as
@@ -1588,34 +1690,34 @@ impl OpenAIResponsesProviderState {
                     } else {
                         self.agent_bridge_function_index(item, output_index);
                     }
-                    return true;
+                    return Ok(true);
                 }
                 self.emit_tool_call_item(report_context, out, item, output_index);
-                true
+                Ok(true)
             }
             "function_call_output" => {
                 self.emit_tool_result_item(report_context, out, item, output_index);
-                true
+                Ok(true)
             }
             "custom_tool_call" => {
                 self.emit_custom_tool_call_item(report_context, out, item, output_index);
-                true
+                Ok(true)
             }
             "tool_search_call" => {
                 self.emit_tool_search_call_item(report_context, out, item, output_index);
-                true
+                Ok(true)
             }
             "local_shell_call" | "shell_call" => {
                 self.emit_shell_tool_call_item(report_context, out, item, output_index);
-                true
+                Ok(true)
             }
             "apply_patch_call" => {
                 self.emit_apply_patch_tool_call_item(report_context, out, item, output_index);
-                true
+                Ok(true)
             }
             "computer_call" => {
                 self.emit_computer_tool_call_item(report_context, out, item, output_index);
-                true
+                Ok(true)
             }
             "custom_tool_call_output"
             | "tool_search_output"
@@ -1624,25 +1726,25 @@ impl OpenAIResponsesProviderState {
             | "apply_patch_call_output"
             | "computer_call_output" => {
                 self.emit_generic_tool_result_item(report_context, out, item, output_index);
-                true
+                Ok(true)
             }
             "message" => {
                 self.emit_message_item(report_context, out, item, output_index);
-                true
+                Ok(true)
             }
             "reasoning" if final_item => {
-                self.emit_reasoning_item(report_context, out, item);
-                true
+                self.emit_reasoning_item(report_context, out, item)?;
+                Ok(true)
             }
             "reasoning" => {
                 self.ensure_started(report_context, out);
-                true
+                Ok(true)
             }
             "compaction" | "context_compaction" | "response.compaction"
                 if agent_bridge_stream_enabled(report_context) =>
             {
                 self.ensure_started(report_context, out);
-                true
+                Ok(true)
             }
             "image_generation_call" => {
                 self.emit_image_generation_item(
@@ -1652,15 +1754,15 @@ impl OpenAIResponsesProviderState {
                     output_index,
                     final_item,
                 );
-                true
+                Ok(true)
             }
             "web_search_call" | "file_search_call" | "code_interpreter_call" | "mcp_call" => {
                 if !final_item {
                     self.ensure_started(report_context, out);
                 }
-                true
+                Ok(true)
             }
-            _ => false,
+            _ => Ok(false),
         }
     }
 
@@ -1672,9 +1774,9 @@ impl OpenAIResponsesProviderState {
         item: &Map<String, Value>,
         output_index: Option<usize>,
         final_item: bool,
-    ) {
-        if self.emit_output_item(report_context, out, item, output_index, final_item) {
-            return;
+    ) -> Result<(), AiSurfaceFinalizeError> {
+        if self.emit_output_item(report_context, out, item, output_index, final_item)? {
+            return Ok(());
         }
 
         if item
@@ -1683,7 +1785,7 @@ impl OpenAIResponsesProviderState {
             .is_none_or(str::is_empty)
         {
             out.push(self.unknown_frame(report_context, raw_event.clone()));
-            return;
+            return Ok(());
         }
 
         if final_item {
@@ -1692,7 +1794,7 @@ impl OpenAIResponsesProviderState {
         }
         self.ensure_started(report_context, out);
         if self.terminal_only {
-            return;
+            return Ok(());
         }
         let (id, model) = self.identity(report_context);
         out.push(CanonicalStreamFrame {
@@ -1704,6 +1806,7 @@ impl OpenAIResponsesProviderState {
                 raw_event: raw_event.clone(),
             },
         });
+        Ok(())
     }
 
     fn emit_response_output_items(
@@ -1711,7 +1814,7 @@ impl OpenAIResponsesProviderState {
         report_context: &Value,
         out: &mut Vec<CanonicalStreamFrame>,
         response: &Map<String, Value>,
-    ) {
+    ) -> Result<(), AiSurfaceFinalizeError> {
         for (output_index, raw_item) in response
             .get("output")
             .and_then(Value::as_array)
@@ -1722,7 +1825,7 @@ impl OpenAIResponsesProviderState {
             let Some(item) = raw_item.as_object() else {
                 continue;
             };
-            if !self.emit_output_item(report_context, out, item, Some(output_index), true)
+            if !self.emit_output_item(report_context, out, item, Some(output_index), true)?
                 && !self
                     .opaque_completed_item_keys
                     .contains(&self.retained_output_item_key(item))
@@ -1730,6 +1833,7 @@ impl OpenAIResponsesProviderState {
                 out.push(self.unknown_frame(report_context, Value::Object(item.clone())));
             }
         }
+        Ok(())
     }
 
     fn emit_agent_bridge_reasoning_fallbacks(
@@ -1785,6 +1889,9 @@ impl OpenAIResponsesProviderState {
     ) -> Result<Vec<CanonicalStreamFrame>, AiSurfaceFinalizeError> {
         let mut out = Vec::new();
         if let Some(response) = value.get("response").and_then(Value::as_object) {
+            if let Some(usage) = canonical_usage_from_openai_usage(response.get("usage")) {
+                self.known_usage = Some(usage);
+            }
             self.response_id = response
                 .get("id")
                 .and_then(Value::as_str)
@@ -1936,6 +2043,12 @@ impl OpenAIResponsesProviderState {
                         return Ok(out);
                     }
                     self.reasoning.push_str(piece);
+                    if let Some(item_id) = value.get("item_id").and_then(Value::as_str) {
+                        self.reasoning_text_by_item
+                            .entry(item_id.to_string())
+                            .or_default()
+                            .push_str(piece);
+                    }
                     self.reasoning_parts
                         .entry(summary_index)
                         .or_default()
@@ -2000,7 +2113,7 @@ impl OpenAIResponsesProviderState {
                     item,
                     output_index,
                     false,
-                );
+                )?;
             }
             "response.custom_tool_call_input.delta" => {
                 let delta = value
@@ -2270,7 +2383,7 @@ impl OpenAIResponsesProviderState {
                     item,
                     output_index,
                     true,
-                );
+                )?;
             }
             "response.aether_reasoning_fallback" if agent_bridge_stream_enabled(report_context) => {
                 let Some(signature) = value.get("signature").and_then(Value::as_str) else {
@@ -2304,7 +2417,7 @@ impl OpenAIResponsesProviderState {
                 }
                 self.ensure_started(report_context, &mut out);
                 let (id, model) = self.identity(report_context);
-                self.emit_response_output_items(report_context, &mut out, response);
+                self.emit_response_output_items(report_context, &mut out, response)?;
                 self.emit_agent_bridge_reasoning_fallbacks(report_context, &mut out, value);
 
                 self.flush_unstarted_tool_calls(&id, &model, &mut out);
@@ -2356,7 +2469,7 @@ impl OpenAIResponsesProviderState {
                 }
                 self.ensure_started(report_context, &mut out);
                 let (id, model) = self.identity(report_context);
-                self.emit_response_output_items(report_context, &mut out, response);
+                self.emit_response_output_items(report_context, &mut out, response)?;
                 self.emit_agent_bridge_reasoning_fallbacks(report_context, &mut out, value);
 
                 let finish_reason = if self.tool_calls.is_empty() {
@@ -2510,6 +2623,8 @@ struct OpenAIResponsesClientToolState {
     thought_signature_output_index: Option<usize>,
     output_index: Option<usize>,
     web_search: bool,
+    /// Responses 客户端原始工具身份（namespace/custom/tool_search）。
+    restore: Option<ResponsesToolRestore>,
 }
 
 #[derive(Clone, Default)]
@@ -2519,6 +2634,11 @@ struct OpenAIResponsesClientToolResultState {
     content: String,
     output_index: Option<usize>,
     item_started: bool,
+}
+
+fn parse_tool_arguments_value(arguments: &str) -> Value {
+    serde_json::from_str::<Value>(arguments)
+        .unwrap_or_else(|_| Value::String(arguments.to_string()))
 }
 
 fn web_search_query_from_arguments(arguments: &str) -> String {
@@ -2542,6 +2662,8 @@ pub struct OpenAIResponsesClientEmitter {
     created_at: Option<i64>,
     message_item_id: Option<String>,
     reasoning_item_id: Option<String>,
+    /// 规范流来源是否为 Claude；只有 Claude 签名才编码为 Aether carrier。
+    claude_reasoning_source: bool,
     started: bool,
     finished: bool,
     sequence_number: u64,
@@ -2549,6 +2671,12 @@ pub struct OpenAIResponsesClientEmitter {
     reasoning_item_started: bool,
     reasoning_part_started: bool,
     reasoning_output_index: Option<usize>,
+    /// 已关闭的 reasoning 输出项，按 output_index 排序后进入终态快照。
+    reasoning_items: BTreeMap<usize, Value>,
+    /// 已关闭的 assistant message 输出项；被工具/reasoning 打断的文本独立成项。
+    message_items: BTreeMap<usize, Value>,
+    /// 当前 thinking 块的签名增量；同一块的多次 delta 原样拼接。
+    reasoning_signature: String,
     text_item_started: bool,
     text_part_started: bool,
     message_output_index: Option<usize>,
@@ -2566,6 +2694,8 @@ pub struct OpenAIResponsesClientEmitter {
     opaque_output_indexes: BTreeMap<String, usize>,
     completed_history_response: Option<Value>,
     namespace_tool_aliases: NamespaceToolAliases,
+    /// 失败前已观察到的 usage（来自流式 usage 事件）；失败终态必须保留。
+    known_usage: Option<CanonicalUsage>,
 }
 
 impl OpenAIChatClientEmitter {
@@ -2704,6 +2834,7 @@ impl OpenAIChatClientEmitter {
                 Ok(out)
             }
             CanonicalStreamEvent::ReasoningSignature(_) => Ok(Vec::new()),
+            CanonicalStreamEvent::ReasoningRedacted(_) => Ok(Vec::new()),
             CanonicalStreamEvent::ContentPart(part) => {
                 let placeholder = openai_stream_placeholder_for_content_part(&part);
                 let mut out = self.ensure_started()?;
@@ -2888,7 +3019,18 @@ impl OpenAIChatClientEmitter {
 
 impl OpenAIResponsesClientEmitter {
     pub(crate) fn with_report_context(report_context: &Value) -> Self {
+        // 仅 Claude 来源的 ReasoningSignature 属于 Anthropic 签名；Gemini 的
+        // thoughtSignature 必须继续按原有语义丢弃，不能借道 Claude carrier。
+        let provider_format = report_context
+            .get("provider_stream_event_api_format")
+            .or_else(|| report_context.get("provider_stream_api_format"))
+            .or_else(|| report_context.get("provider_api_format"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
         Self {
+            claude_reasoning_source: format_is_claude_messages(&provider_format),
             namespace_tool_aliases: NamespaceToolAliases::from_report_context(report_context),
             ..Self::default()
         }
@@ -2907,6 +3049,76 @@ impl OpenAIResponsesClientEmitter {
         }
     }
 
+    /// 记录失败前已观察到的 usage；后续更完整的值覆盖旧值。
+    pub(crate) fn set_known_usage(&mut self, usage: Option<&CanonicalUsage>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        if self.known_usage.as_ref() == Some(usage) {
+            return;
+        }
+        self.known_usage = Some(usage.clone());
+    }
+
+    fn failure_usage(&self, body: &Value) -> CanonicalUsage {
+        body.get("response")
+            .and_then(|response| response.get("usage"))
+            .or_else(|| body.get("usage"))
+            .and_then(|usage| canonical_usage_from_openai_usage(Some(usage)))
+            .or_else(|| self.known_usage.clone())
+            .unwrap_or_default()
+    }
+
+    /// 失败载荷自带身份时补全尚未确立的字段，不覆盖已累积的稳定身份。
+    fn absorb_failure_identity(&mut self, hints: &Map<String, Value>) {
+        if self.response_id.is_none() {
+            if let Some(id) = hints
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                self.response_id = Some(id.to_string());
+            }
+        }
+        if self.model.is_none() {
+            if let Some(model) = hints
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                self.model = Some(model.to_string());
+            }
+        }
+        if self.created_at.is_none() {
+            if let Some(created_at) = hints.get("created_at").and_then(Value::as_i64) {
+                self.created_at = Some(created_at);
+            }
+        }
+        if self.actual_service_tier.is_none() {
+            self.set_actual_service_tier(hints.get("service_tier").and_then(Value::as_str));
+        }
+    }
+
+    fn failed_response_from_payload(
+        &self,
+        error_body: &Value,
+        payload: Option<&Map<String, Value>>,
+    ) -> Result<Value, AiSurfaceFinalizeError> {
+        let error = error_body
+            .get("error")
+            .cloned()
+            .unwrap_or_else(|| json!({ "message": "Upstream stream ended with an error" }));
+        let mut response = self.failed_response(self.failure_usage(error_body), error)?;
+        if let Some(output) = payload
+            .and_then(|payload| payload.get("output"))
+            .filter(|output| output.as_array().is_some_and(|output| !output.is_empty()))
+        {
+            // 上游已提供权威的失败输出时原样保留（含其 item 状态）。
+            response["output"] = output.clone();
+        }
+        Ok(response)
+    }
+
     fn response_id(&self) -> &str {
         self.response_id.as_deref().unwrap_or("resp-local-stream")
     }
@@ -2920,9 +3132,12 @@ impl OpenAIResponsesClientEmitter {
     }
 
     fn message_item_id(&self) -> String {
-        self.message_item_id
-            .clone()
-            .unwrap_or_else(|| openai_responses_message_item_id(self.response_id(), 0))
+        self.message_item_id.clone().unwrap_or_else(|| {
+            openai_responses_message_item_id(
+                self.response_id(),
+                self.message_output_index.unwrap_or(0),
+            )
+        })
     }
 
     fn reasoning_item_id(&self) -> String {
@@ -2941,7 +3156,11 @@ impl OpenAIResponsesClientEmitter {
 
     fn ensure_message_item_id(&mut self) -> String {
         if self.message_item_id.is_none() {
-            self.message_item_id = Some(openai_responses_message_item_id(self.response_id(), 0));
+            let output_index = self.message_output_index.unwrap_or(0);
+            self.message_item_id = Some(openai_responses_message_item_id(
+                self.response_id(),
+                output_index,
+            ));
         }
         self.message_item_id()
     }
@@ -3056,28 +3275,162 @@ impl OpenAIResponsesClientEmitter {
     }
 
     fn reasoning_texts(&self) -> Vec<String> {
-        if self.reasoning_summary_parts.is_empty() {
-            if self.reasoning.trim().is_empty() {
-                Vec::new()
-            } else {
-                vec![self.reasoning.clone()]
-            }
-        } else {
-            self.reasoning_summary_parts.clone()
+        let mut parts = self.reasoning_summary_parts.clone();
+        if self.reasoning_part_started && !self.reasoning_part.is_empty() {
+            parts.push(self.reasoning_part.clone());
         }
+        if parts.is_empty() && !self.reasoning.trim().is_empty() {
+            parts.push(self.reasoning.clone());
+        }
+        parts
     }
 
-    fn reasoning_item_value(&self) -> Value {
+    /// 编码当前 thinking 块的 Aether carrier；仅 Claude 来源且确有签名时存在。
+    /// 超限签名必须 fail closed，不能静默丢弃后继续输出成功终态。
+    fn reasoning_carrier(&self) -> Result<Option<String>, AiSurfaceFinalizeError> {
+        if !self.claude_reasoning_source || self.reasoning_signature.trim().is_empty() {
+            return Ok(None);
+        }
+        encode_claude_reasoning_signature_carrier(self.reasoning_signature.as_str())
+            .map(Some)
+            .ok_or_else(|| {
+                AiSurfaceFinalizeError::new(
+                    "Claude thinking signature exceeds the Aether carrier bound",
+                )
+            })
+    }
+
+    fn reasoning_item_value_with_status(
+        &self,
+        status: &str,
+    ) -> Result<Value, AiSurfaceFinalizeError> {
         let content = openai_responses_reasoning_text_parts(self.reasoning_texts());
-        json!({
+        let mut item = json!({
             "type": "reasoning",
             "id": self.reasoning_item_id(),
-            "status": "completed",
+            "status": status,
             // Raw thinking goes on `content` only. Mirroring it onto `summary`
             // makes Codex (which renders both channels) print it twice.
             "summary": [],
             "content": content,
-        })
+        });
+        if let Some(carrier) = self.reasoning_carrier()? {
+            item["encrypted_content"] = Value::String(carrier);
+        }
+        Ok(item)
+    }
+
+    fn reasoning_item_value(&self) -> Result<Value, AiSurfaceFinalizeError> {
+        self.reasoning_item_value_with_status("completed")
+    }
+
+    /// 终态快照中的 reasoning 项：已关闭块加上尚未关闭的当前块。
+    fn reasoning_output_items(
+        &self,
+        open_status: &str,
+    ) -> Result<Vec<(usize, Value)>, AiSurfaceFinalizeError> {
+        let mut items = self
+            .reasoning_items
+            .iter()
+            .map(|(output_index, item)| (*output_index, item.clone()))
+            .collect::<Vec<_>>();
+        if self.reasoning_item_started {
+            items.push((
+                self.reasoning_output_index.unwrap_or(0),
+                self.reasoning_item_value_with_status(open_status)?,
+            ));
+        }
+        Ok(items)
+    }
+
+    /// 关闭当前 reasoning 项并记录其 output_index，使多个 thinking 块在终态中保持原顺序。
+    fn close_reasoning_item(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        if !self.reasoning_item_started {
+            return Ok(Vec::new());
+        }
+        let output_index = self.reasoning_output_index.unwrap_or(0);
+        let item_id = self.reasoning_item_id();
+        let mut out = Vec::new();
+        if self.reasoning_part_started {
+            let part_index = self.current_reasoning_summary_index();
+            let part_text = self.reasoning_part.clone();
+            out.extend(self.encode_reasoning_text_done_events(
+                &item_id,
+                output_index,
+                part_index,
+                part_text.as_str(),
+            )?);
+            self.reasoning_summary_parts.push(part_text);
+            self.reasoning_part.clear();
+            self.reasoning_part_started = false;
+        }
+        let item = self.reasoning_item_value()?;
+        out.extend(self.encode_response_event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "response_id": self.response_id(),
+                "output_index": output_index,
+                "item": item,
+            }),
+        )?);
+        self.reasoning_items.insert(output_index, item);
+        self.reset_reasoning_block();
+        Ok(out)
+    }
+
+    fn reset_reasoning_block(&mut self) {
+        self.reasoning_item_started = false;
+        self.reasoning_part_started = false;
+        self.reasoning_output_index = None;
+        self.reasoning_item_id = None;
+        self.reasoning.clear();
+        self.reasoning_part.clear();
+        self.reasoning_summary_parts.clear();
+        self.reasoning_signature.clear();
+    }
+
+    /// 立即产出一个完整的 redacted_thinking reasoning 项（无文本、只有 Aether carrier）。
+    fn emit_redacted_reasoning_item(
+        &mut self,
+        data: &str,
+    ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        let Some(carrier) = encode_claude_redacted_thinking_carrier(data) else {
+            return Err(AiSurfaceFinalizeError::new(
+                "Claude redacted thinking block exceeds the Aether carrier bound",
+            ));
+        };
+        let mut out = self.close_reasoning_item()?;
+        out.extend(self.close_text_item()?);
+        out.extend(self.ensure_started()?);
+        let output_index = self.allocate_output_index();
+        let item = json!({
+            "type": "reasoning",
+            "id": openai_responses_synthetic_reasoning_item_id(self.response_id(), output_index),
+            "status": "completed",
+            "summary": [],
+            "encrypted_content": carrier,
+        });
+        out.extend(self.encode_response_event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "response_id": self.response_id(),
+                "output_index": output_index,
+                "item": item,
+            }),
+        )?);
+        out.extend(self.encode_response_event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "response_id": self.response_id(),
+                "output_index": output_index,
+                "item": item,
+            }),
+        )?);
+        self.reasoning_items.insert(output_index, item);
+        Ok(out)
     }
 
     fn encode_reasoning_text_delta(
@@ -3118,6 +3471,93 @@ impl OpenAIResponsesClientEmitter {
                 "text": part_text,
             }),
         )
+    }
+
+    fn message_item_value_with_status(&self, status: &str) -> Value {
+        json!({
+            "type": "message",
+            "id": self.message_item_id(),
+            "role": "assistant",
+            "status": status,
+            "content": [{
+                "type": "output_text",
+                "text": self.text.as_str(),
+                "annotations": self.annotations.as_slice(),
+            }],
+        })
+    }
+
+    /// 终态快照中的 message 项：已关闭段加上仍在累积的当前段。
+    fn message_output_items(&self, open_status: &str) -> Vec<(usize, Value)> {
+        let mut items = self
+            .message_items
+            .iter()
+            .map(|(output_index, item)| (*output_index, item.clone()))
+            .collect::<Vec<_>>();
+        if self.text_item_started {
+            items.push((
+                self.message_output_index.unwrap_or(0),
+                self.message_item_value_with_status(open_status),
+            ));
+        }
+        items
+    }
+
+    /// 关闭当前文本段；工具/reasoning 打断后再次输出文本会分配新的 message item，
+    /// 从而保持 carrier 块与文本段的原始交错顺序。
+    fn close_text_item(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        if !self.text_item_started {
+            return Ok(Vec::new());
+        }
+        let item_id = self.message_item_id();
+        let output_index = self.message_output_index.unwrap_or(0);
+        let mut out = Vec::new();
+        if self.text_part_started {
+            out.extend(self.encode_response_event(
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "response_id": self.response_id(),
+                    "output_index": output_index,
+                    "item_id": item_id.clone(),
+                    "content_index": 0,
+                    "text": self.text.as_str(),
+                }),
+            )?);
+            out.extend(self.encode_response_event(
+                "response.content_part.done",
+                json!({
+                    "type": "response.content_part.done",
+                    "response_id": self.response_id(),
+                    "output_index": output_index,
+                    "item_id": item_id.clone(),
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": self.text.as_str(),
+                        "annotations": self.annotations.as_slice(),
+                    }
+                }),
+            )?);
+        }
+        let item = self.message_item_value_with_status("completed");
+        out.extend(self.encode_response_event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "response_id": self.response_id(),
+                "output_index": output_index,
+                "item": item,
+            }),
+        )?);
+        self.message_items.insert(output_index, item);
+        self.text_item_started = false;
+        self.text_part_started = false;
+        self.message_output_index = None;
+        self.message_item_id = None;
+        self.text.clear();
+        self.annotations.clear();
+        Ok(out)
     }
 
     fn ensure_message_output_index(&mut self) -> usize {
@@ -3161,7 +3601,8 @@ impl OpenAIResponsesClientEmitter {
     }
 
     fn ensure_reasoning_item_started(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
-        let mut out = self.ensure_started()?;
+        let mut out = self.close_text_item()?;
+        out.extend(self.ensure_started()?);
         let output_index = self.ensure_reasoning_output_index();
         let item_id = self.ensure_reasoning_item_id();
         if !self.reasoning_item_started {
@@ -3180,9 +3621,6 @@ impl OpenAIResponsesClientEmitter {
                 }),
             )?);
             self.reasoning_item_started = true;
-        }
-        if !self.reasoning_part_started {
-            self.reasoning_part_started = true;
         }
         Ok(out)
     }
@@ -3231,92 +3669,11 @@ impl OpenAIResponsesClientEmitter {
     }
 
     fn finish_text_item(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
-        if !self.text_item_started {
-            return Ok(Vec::new());
-        }
-        let item_id = self.message_item_id();
-        let output_index = self.message_output_index.unwrap_or(0);
-        let mut out = Vec::new();
-        if self.text_part_started {
-            out.extend(self.encode_response_event(
-                "response.output_text.done",
-                json!({
-                    "type": "response.output_text.done",
-                    "response_id": self.response_id(),
-                    "output_index": output_index,
-                    "item_id": item_id.clone(),
-                    "content_index": 0,
-                    "text": self.text.as_str(),
-                }),
-            )?);
-            out.extend(self.encode_response_event(
-                "response.content_part.done",
-                json!({
-                    "type": "response.content_part.done",
-                    "response_id": self.response_id(),
-                    "output_index": output_index,
-                    "item_id": item_id.clone(),
-                    "content_index": 0,
-                    "part": {
-                        "type": "output_text",
-                        "text": self.text.as_str(),
-                        "annotations": self.annotations.as_slice(),
-                    }
-                }),
-            )?);
-        }
-        out.extend(self.encode_response_event(
-            "response.output_item.done",
-            json!({
-                "type": "response.output_item.done",
-                "response_id": self.response_id(),
-                "output_index": output_index,
-                "item": {
-                    "type": "message",
-                    "id": item_id,
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": self.text.as_str(),
-                        "annotations": self.annotations.as_slice(),
-                    }],
-                }
-            }),
-        )?);
-        Ok(out)
+        self.close_text_item()
     }
 
     fn finish_reasoning_item(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
-        if !self.reasoning_item_started {
-            return Ok(Vec::new());
-        }
-        let output_index = self.reasoning_output_index.unwrap_or(0);
-        let item_id = self.reasoning_item_id();
-        let mut out = Vec::new();
-        if self.reasoning_part_started {
-            let summary_index = self.current_reasoning_summary_index();
-            let part_text = self.reasoning_part.clone();
-            out.extend(self.encode_reasoning_text_done_events(
-                &item_id,
-                output_index,
-                summary_index,
-                part_text.as_str(),
-            )?);
-            self.reasoning_summary_parts.push(part_text);
-            self.reasoning_part.clear();
-            self.reasoning_part_started = false;
-        }
-        out.extend(self.encode_response_event(
-            "response.output_item.done",
-            json!({
-                "type": "response.output_item.done",
-                "response_id": self.response_id(),
-                "output_index": output_index,
-                "item": self.reasoning_item_value(),
-            }),
-        )?);
-        Ok(out)
+        self.close_reasoning_item()
     }
 
     fn finish_tool_items(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
@@ -3336,6 +3693,71 @@ impl OpenAIResponsesClientEmitter {
             } else {
                 state.name.clone()
             };
+            if let Some(restore) = state.restore.as_ref() {
+                if let Some((namespace, custom_name)) = restore.custom_text_identity() {
+                    let input = custom_tool_input_from_arguments(&parse_tool_arguments_value(
+                        state.arguments.as_str(),
+                    ))
+                    .unwrap_or_else(|| state.arguments.clone());
+                    out.extend(self.encode_response_event(
+                        "response.custom_tool_call_input.done",
+                        json!({
+                            "type": "response.custom_tool_call_input.done",
+                            "response_id": self.response_id(),
+                            "output_index": output_index,
+                            "item_id": item_id.clone(),
+                            "call_id": call_id.clone(),
+                            "name": custom_name,
+                            "input": input,
+                        }),
+                    )?);
+                    let mut item = json!({
+                        "type": "custom_tool_call",
+                        "id": item_id,
+                        "call_id": call_id,
+                        "name": custom_name,
+                        "input": input,
+                        "status": "completed",
+                    });
+                    if let (Some(namespace), Some(item)) = (namespace, item.as_object_mut()) {
+                        item.insert(
+                            "namespace".to_string(),
+                            Value::String(namespace.to_string()),
+                        );
+                    }
+                    out.extend(self.encode_response_event(
+                        "response.output_item.done",
+                        json!({
+                            "type": "response.output_item.done",
+                            "response_id": self.response_id(),
+                            "output_index": output_index,
+                            "item": item,
+                        }),
+                    )?);
+                    continue;
+                }
+                if restore.is_client_tool_search() {
+                    out.extend(self.encode_response_event(
+                        "response.output_item.done",
+                        json!({
+                            "type": "response.output_item.done",
+                            "response_id": self.response_id(),
+                            "output_index": output_index,
+                            "item": {
+                                "type": "tool_search_call",
+                                "id": item_id,
+                                "call_id": call_id,
+                                "execution": "client",
+                                "arguments": tool_search_call_arguments(
+                                    &parse_tool_arguments_value(state.arguments.as_str()),
+                                ),
+                                "status": "completed",
+                            }
+                        }),
+                    )?);
+                    continue;
+                }
+            }
             if state.web_search {
                 out.extend(self.encode_response_event(
                     "response.output_item.done",
@@ -3476,30 +3898,17 @@ impl OpenAIResponsesClientEmitter {
         usage: CanonicalUsage,
         status: &str,
         incomplete_reason: Option<&str>,
-    ) -> Value {
+        error: Option<Value>,
+    ) -> Result<Value, AiSurfaceFinalizeError> {
         let mut ordered_output = Vec::new();
-        if !self.reasoning_texts().is_empty() {
-            ordered_output.push((
-                self.reasoning_output_index.unwrap_or(0),
-                self.reasoning_item_value(),
-            ));
-        }
-        if self.text_item_started || !self.text.is_empty() {
-            ordered_output.push((
-                self.message_output_index.unwrap_or(0),
-                json!({
-                    "type": "message",
-                    "id": self.message_item_id(),
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{
-                        "type": "output_text",
-                        "text": self.text.as_str(),
-                        "annotations": self.annotations.as_slice(),
-                    }],
-                }),
-            ));
-        }
+        // 失败终态只标记未完成的 reasoning/工具项，绝不伪造成功完成。
+        let item_status = if status == "failed" {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        ordered_output.extend(self.reasoning_output_items(item_status)?);
+        ordered_output.extend(self.message_output_items(item_status));
         for (index, state) in &self.tool_calls {
             if let (Some(output_index), Some(carrier)) = (
                 state.thought_signature_output_index,
@@ -3526,6 +3935,46 @@ impl OpenAIResponsesClientEmitter {
                     state.call_id.clone()
                 };
                 let item_id = self.tool_call_item_id(*index);
+                if let Some(restore) = state.restore.as_ref() {
+                    if let Some((namespace, custom_name)) = restore.custom_text_identity() {
+                        let input = custom_tool_input_from_arguments(&parse_tool_arguments_value(
+                            state.arguments.as_str(),
+                        ))
+                        .unwrap_or_else(|| state.arguments.clone());
+                        let mut item = json!({
+                            "type": "custom_tool_call",
+                            "id": item_id,
+                            "call_id": call_id,
+                            "name": custom_name,
+                            "input": input,
+                            "status": item_status,
+                        });
+                        if let (Some(namespace), Some(item)) = (namespace, item.as_object_mut()) {
+                            item.insert(
+                                "namespace".to_string(),
+                                Value::String(namespace.to_string()),
+                            );
+                        }
+                        ordered_output.push((output_index, item));
+                        continue;
+                    }
+                    if restore.is_client_tool_search() {
+                        ordered_output.push((
+                            output_index,
+                            json!({
+                                "type": "tool_search_call",
+                                "id": item_id,
+                                "call_id": call_id,
+                                "execution": "client",
+                                "arguments": tool_search_call_arguments(
+                                    &parse_tool_arguments_value(state.arguments.as_str()),
+                                ),
+                                "status": item_status,
+                            }),
+                        ));
+                        continue;
+                    }
+                }
                 if state.web_search {
                     ordered_output.push((
                         output_index,
@@ -3551,7 +4000,7 @@ impl OpenAIResponsesClientEmitter {
                         state.name.clone()
                     },
                     "arguments": state.arguments.clone(),
-                    "status": "completed",
+                    "status": item_status,
                 });
                 if let (Some(namespace), Some(item)) =
                     (state.namespace.clone(), item.as_object_mut())
@@ -3609,6 +4058,9 @@ impl OpenAIResponsesClientEmitter {
         if let Some(reason) = incomplete_reason {
             response["incomplete_details"] = json!({ "reason": reason });
         }
+        if let Some(error) = error {
+            response["error"] = error;
+        }
         if let Some(response_object) = response.as_object_mut() {
             if let Some(created_at) = self.created_at {
                 response_object.insert("created_at".to_string(), Value::from(created_at));
@@ -3621,15 +4073,27 @@ impl OpenAIResponsesClientEmitter {
                 );
             }
         }
-        response
+        Ok(response)
     }
 
-    fn completed_response(&self, usage: CanonicalUsage) -> Value {
-        self.terminal_response(usage, "completed", None)
+    fn completed_response(&self, usage: CanonicalUsage) -> Result<Value, AiSurfaceFinalizeError> {
+        self.terminal_response(usage, "completed", None, None)
     }
 
-    fn incomplete_response(&self, usage: CanonicalUsage, reason: &str) -> Value {
-        self.terminal_response(usage, "incomplete", Some(reason))
+    fn incomplete_response(
+        &self,
+        usage: CanonicalUsage,
+        reason: &str,
+    ) -> Result<Value, AiSurfaceFinalizeError> {
+        self.terminal_response(usage, "incomplete", Some(reason), None)
+    }
+
+    fn failed_response(
+        &self,
+        usage: CanonicalUsage,
+        error: Value,
+    ) -> Result<Value, AiSurfaceFinalizeError> {
+        self.terminal_response(usage, "failed", None, Some(error))
     }
 
     pub(crate) fn finish_with_authoritative_response_event(
@@ -3673,10 +4137,15 @@ impl OpenAIResponsesClientEmitter {
         }
 
         let mut out = self.ensure_started()?;
-        out.extend(self.finish_reasoning_item()?);
-        out.extend(self.finish_text_item()?);
-        out.extend(self.finish_tool_items()?);
-        out.extend(self.finish_tool_result_items()?);
+        if event_type == "response.failed" {
+            // 失败终态不得补发 output_item.done/参数校验，也不能伪装成功工具完成；
+            // 已累积的部分内容只通过权威 response.output 呈现。
+        } else {
+            out.extend(self.finish_reasoning_item()?);
+            out.extend(self.finish_text_item()?);
+            out.extend(self.finish_tool_items()?);
+            out.extend(self.finish_tool_result_items()?);
+        }
         if event_type == "response.completed" {
             self.completed_history_response = Some(response.clone());
         }
@@ -3697,7 +4166,8 @@ impl OpenAIResponsesClientEmitter {
         match frame.event {
             CanonicalStreamEvent::Start => self.ensure_started(),
             CanonicalStreamEvent::TextDelta(text) => {
-                let mut out = self.ensure_text_item_started()?;
+                let mut out = self.close_reasoning_item()?;
+                out.extend(self.ensure_text_item_started()?);
                 self.text.push_str(&text);
                 out.extend(self.encode_response_event(
                     "response.output_text.delta",
@@ -3714,6 +4184,7 @@ impl OpenAIResponsesClientEmitter {
             }
             CanonicalStreamEvent::ReasoningDelta(text) => {
                 let mut out = self.ensure_reasoning_item_started()?;
+                self.reasoning_part_started = true;
                 self.reasoning.push_str(&text);
                 self.reasoning_part.push_str(&text);
                 out.extend(self.encode_reasoning_text_delta(&text)?);
@@ -3749,30 +4220,32 @@ impl OpenAIResponsesClientEmitter {
                 Ok(out)
             }
             CanonicalStreamEvent::ReasoningSummaryDone => {
-                // Close the current reasoning part and reset state so the next
-                // ReasoningDelta starts a fresh part within the same item.
-                if !self.reasoning_item_started || !self.reasoning_part_started {
+                // 每个 thinking 块拥有独立 output_index，关闭后下一块重新分配。
+                self.close_reasoning_item()
+            }
+            CanonicalStreamEvent::ReasoningSignature(signature) => {
+                if !self.claude_reasoning_source {
+                    // Gemini thoughtSignature 等非 Claude 签名没有 Responses 对等字段。
                     return Ok(Vec::new());
                 }
-                let output_index = self.reasoning_output_index.unwrap_or(0);
-                let item_id = self.reasoning_item_id();
-                let summary_index = self.current_reasoning_summary_index();
-                let part_text = self.reasoning_part.clone();
-                let out = self.encode_reasoning_text_done_events(
-                    &item_id,
-                    output_index,
-                    summary_index,
-                    part_text.as_str(),
-                )?;
-                self.reasoning_summary_parts.push(part_text);
-                self.reasoning_part.clear();
-                self.reasoning_part_started = false;
+                let out = self.ensure_reasoning_item_started()?;
+                let mut combined = self.reasoning_signature.clone();
+                combined.push_str(&signature);
+                if encode_claude_reasoning_signature_carrier(combined.as_str()).is_none() {
+                    return Err(AiSurfaceFinalizeError::new(
+                        "Claude thinking signature exceeds the Aether carrier bound",
+                    ));
+                }
+                self.reasoning_signature = combined;
                 Ok(out)
             }
-            CanonicalStreamEvent::ReasoningSignature(_) => Ok(Vec::new()),
+            CanonicalStreamEvent::ReasoningRedacted(data) => {
+                self.emit_redacted_reasoning_item(data.as_str())
+            }
             CanonicalStreamEvent::ContentPart(part) => {
                 let placeholder = openai_stream_placeholder_for_content_part(&part);
-                let mut out = self.ensure_text_item_started()?;
+                let mut out = self.close_reasoning_item()?;
+                out.extend(self.ensure_text_item_started()?);
                 self.text.push_str(&placeholder);
                 out.extend(self.encode_response_event(
                     "response.output_text.delta",
@@ -3788,7 +4261,10 @@ impl OpenAIResponsesClientEmitter {
                 Ok(out)
             }
             CanonicalStreamEvent::ImageGenerationCall { index, item } => {
-                self.emit_image_generation_call_item(index, item)
+                let mut out = self.close_reasoning_item()?;
+                out.extend(self.close_text_item()?);
+                out.extend(self.emit_image_generation_call_item(index, item)?);
+                Ok(out)
             }
             CanonicalStreamEvent::OpenAiResponsesOutputItem {
                 output_index,
@@ -3826,7 +4302,9 @@ impl OpenAIResponsesClientEmitter {
                     self.opaque_output_indexes.insert(item_key, output_index);
                     output_index
                 };
-                let mut out = self.ensure_started()?;
+                let mut out = self.close_reasoning_item()?;
+                out.extend(self.close_text_item()?);
+                out.extend(self.ensure_started()?);
                 if event_type == "response.output_item.done" {
                     self.opaque_output_items
                         .insert(materialized_output_index, item);
@@ -3839,27 +4317,32 @@ impl OpenAIResponsesClientEmitter {
                 call_id,
                 name,
             } => {
-                let mut out = self.ensure_started()?;
+                let mut out = self.close_reasoning_item()?;
+                out.extend(self.close_text_item()?);
+                out.extend(self.ensure_started()?);
                 let output_index = self.ensure_tool_output_index(index);
                 let response_id = self.response_id().to_string();
                 let item_id = self.tool_call_item_id(index);
-                let namespaced_tool = self.namespace_tool_aliases.responses_name(&name);
-                let emitted_name = namespaced_tool
-                    .map(|(_, child_name)| child_name.to_string())
-                    .unwrap_or_else(|| name.clone());
-                let emitted_namespace = namespaced_tool.map(|(namespace, _)| namespace.to_string());
-                let web_search = self
-                    .namespace_tool_aliases
-                    .emits_hosted_web_search_call(&name);
+                let restore = self.namespace_tool_aliases.restore_tool_call(&name);
+                let emitted_name = restore.responses_name(&name).to_string();
+                let emitted_namespace = restore.namespace().map(ToOwned::to_owned);
+                let custom_text = restore.custom_text_identity().is_some();
+                let client_search = restore.is_client_tool_search();
+                let web_search = !custom_text
+                    && !client_search
+                    && self
+                        .namespace_tool_aliases
+                        .emits_hosted_web_search_call(&name);
                 let state = self.tool_calls.entry(index).or_default();
                 state.call_id = call_id.clone();
                 state.name = emitted_name;
                 state.namespace = emitted_namespace;
                 state.web_search = web_search;
+                state.restore = Some(restore);
                 let emitted_call_id = state.call_id.clone();
                 let emitted_name = state.name.clone();
                 let emitted_namespace = state.namespace.clone();
-                let mut item = if state.web_search {
+                let mut item = if web_search {
                     json!({
                         "type": "web_search_call",
                         "id": item_id,
@@ -3868,6 +4351,24 @@ impl OpenAIResponsesClientEmitter {
                             "type": "search",
                             "query": "",
                         },
+                    })
+                } else if custom_text {
+                    json!({
+                        "type": "custom_tool_call",
+                        "id": item_id,
+                        "call_id": emitted_call_id,
+                        "name": emitted_name,
+                        "input": "",
+                        "status": "in_progress",
+                    })
+                } else if client_search {
+                    json!({
+                        "type": "tool_search_call",
+                        "id": item_id,
+                        "call_id": emitted_call_id,
+                        "execution": "client",
+                        "arguments": {},
+                        "status": "in_progress",
                     })
                 } else {
                     json!({
@@ -3962,7 +4463,10 @@ impl OpenAIResponsesClientEmitter {
                 let response_id = self.response_id().to_string();
                 let state = self.tool_calls.entry(index).or_default();
                 state.arguments.push_str(&arguments);
-                if state.web_search {
+                let suppress_delta = state.restore.as_ref().is_some_and(|restore| {
+                    restore.custom_text_identity().is_some() || restore.is_client_tool_search()
+                });
+                if state.web_search || suppress_delta {
                     return Ok(out);
                 }
                 let call_id = if state.call_id.is_empty() {
@@ -3990,7 +4494,9 @@ impl OpenAIResponsesClientEmitter {
                 name,
                 content,
             } => {
-                let mut out = self.ensure_started()?;
+                let mut out = self.close_reasoning_item()?;
+                out.extend(self.close_text_item()?);
+                out.extend(self.ensure_started()?);
                 let output_index = self.ensure_tool_result_output_index(index);
                 let response_id = self.response_id().to_string();
                 let state = self.tool_results.entry(index).or_default();
@@ -4062,25 +4568,32 @@ impl OpenAIResponsesClientEmitter {
             CanonicalStreamEvent::UnknownEvent(payload)
                 if openai_stream_terminal_error_body(&payload).is_some() =>
             {
+                if self.finished {
+                    return Ok(Vec::new());
+                }
                 self.finished = true;
-                let raw_event = payload.get("type").and_then(Value::as_str);
-                let event = raw_event
-                    .filter(|event| {
-                        matches!(*event, "response.failed" | "response.incomplete" | "error")
-                    })
-                    .unwrap_or("response.failed")
-                    .to_string();
-                let mut payload = if raw_event == Some(event.as_str()) {
-                    payload
-                } else {
-                    openai_stream_terminal_error_body(&payload).unwrap_or(payload)
+                self.ensure_created_at();
+                let hints = payload.get("response").and_then(Value::as_object).cloned();
+                if let Some(hints) = hints.as_ref() {
+                    self.absorb_failure_identity(hints);
+                }
+                let Some(mut error_body) = openai_stream_terminal_error_body(&payload) else {
+                    return Ok(Vec::new());
                 };
-                if payload.get("type").is_none() {
-                    if let Some(object) = payload.as_object_mut() {
-                        object.insert("type".to_string(), Value::String(event.clone()));
+                if let Some(response) = payload.get("response") {
+                    // failure_usage 从 response.usage 读取已知用量；原始终止事件必须保真。
+                    if let Some(body) = error_body.as_object_mut() {
+                        body.insert("response".to_string(), response.clone());
                     }
                 }
-                self.encode_response_event(event.as_str(), payload)
+                let response = self.failed_response_from_payload(&error_body, hints.as_ref())?;
+                self.encode_response_event(
+                    "response.failed",
+                    json!({
+                        "type": "response.failed",
+                        "response": response,
+                    }),
+                )
             }
             CanonicalStreamEvent::UnknownEvent(_) => Ok(Vec::new()),
             CanonicalStreamEvent::Finish {
@@ -4099,13 +4612,13 @@ impl OpenAIResponsesClientEmitter {
                 let (event_type, response) = match finish_reason.as_deref() {
                     Some("length") => (
                         "response.incomplete",
-                        self.incomplete_response(usage, "max_output_tokens"),
+                        self.incomplete_response(usage, "max_output_tokens")?,
                     ),
                     Some("content_filter") => (
                         "response.incomplete",
-                        self.incomplete_response(usage, "content_filter"),
+                        self.incomplete_response(usage, "content_filter")?,
                     ),
-                    _ => ("response.completed", self.completed_response(usage)),
+                    _ => ("response.completed", self.completed_response(usage)?),
                 };
                 if event_type == "response.completed" {
                     self.completed_history_response = Some(response.clone());
@@ -4124,15 +4637,27 @@ impl OpenAIResponsesClientEmitter {
     }
 
     pub fn emit_error(&mut self, error_body: Value) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
-        let Some(error) = error_body.get("error").cloned() else {
+        if self.finished {
             return Ok(Vec::new());
-        };
+        }
+        if error_body.get("error").is_none() {
+            return Ok(Vec::new());
+        }
         self.finished = true;
+        self.ensure_created_at();
+        let hints = error_body
+            .get("response")
+            .and_then(Value::as_object)
+            .cloned();
+        if let Some(hints) = hints.as_ref() {
+            self.absorb_failure_identity(hints);
+        }
+        let response = self.failed_response_from_payload(&error_body, hints.as_ref())?;
         self.encode_response_event(
             "response.failed",
             json!({
                 "type": "response.failed",
-                "error": error,
+                "response": response,
             }),
         )
     }
@@ -4328,6 +4853,7 @@ fn openai_responses_incomplete_finish_reason(payload: &Value) -> String {
 mod tests {
     use super::*;
     use crate::formats::claude::messages::stream::ClaudeClientEmitter;
+    use crate::formats::claude::messages::stream::ClaudeProviderState;
     use crate::formats::gemini::generate_content::stream::GeminiClientEmitter;
     use crate::formats::openai::responses::encode_gemini_tool_signature_carrier;
 
@@ -4634,6 +5160,28 @@ mod tests {
             }
         }
         sequence_numbers
+    }
+
+    fn sse_json_events(sse: &str) -> Vec<Value> {
+        sse.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .collect()
+    }
+
+    fn terminal_response_event(events: &[Value]) -> Value {
+        events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("response.completed" | "response.incomplete" | "response.failed")
+                )
+            })
+            .unwrap_or_else(|| panic!("terminal response event missing: {events:?}"))
+            .get("response")
+            .cloned()
+            .expect("terminal event should carry a response object")
     }
 
     fn response_reasoning_text_done_parts(sse: &str) -> Vec<(u64, String)> {
@@ -7308,10 +7856,20 @@ mod tests {
         );
 
         let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        // 每个 thinking 块现在拥有独立 output_index/item，块内 content_index 从 0 重新开始。
         assert_eq!(
             response_reasoning_text_done_parts(&sse),
-            vec![(0, "alpha".to_string()), (1, "beta".to_string())]
+            vec![(0, "alpha".to_string()), (0, "beta".to_string())]
         );
+        let response = terminal_response_event(&sse_json_events(&sse));
+        let output = response["output"].as_array().expect("output array");
+        let reasoning_items = output
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning_items.len(), 2, "{response}");
+        assert_eq!(reasoning_items[0]["content"][0]["text"], "alpha");
+        assert_eq!(reasoning_items[1]["content"][0]["text"], "beta");
     }
 
     /// Regression: raw thinking must reach the client exactly once.
@@ -7419,6 +7977,643 @@ mod tests {
         assert!(sse.contains("\"message\":\"boom\""));
         assert!(!sse.contains("event: response.completed\n"));
         assert_eq!(response_sequence_numbers(&sse), (1..=6).collect::<Vec<_>>());
+    }
+
+    /// R1：可见内容与部分工具参数之后失败时，终态必须携带完整累积 Response 和已知 usage，
+    /// 且不得补发成功工具完成或 response.completed。
+    #[test]
+    fn openai_responses_client_emitter_failed_terminal_accumulates_output_tools_and_usage() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let frame = |event: CanonicalStreamEvent| CanonicalStreamFrame {
+            id: "chatcmpl_partial_123".to_string(),
+            model: "gpt-5.4".to_string(),
+            event,
+        };
+        let mut bytes = emitter
+            .emit(frame(CanonicalStreamEvent::Start))
+            .expect("start should encode");
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::TextDelta("hello".to_string())))
+                .expect("text should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_partial".to_string(),
+                    name: "lookup".to_string(),
+                }))
+                .expect("tool start should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments: "{\"query\":".to_string(),
+                }))
+                .expect("partial arguments should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit_error(json!({
+                    "error": {
+                        "message": "upstream stopped",
+                        "type": "server_error",
+                        "code": "stream_terminal_error",
+                    },
+                    "response": {
+                        "usage": {
+                            "input_tokens": 11,
+                            "output_tokens": 4,
+                            "total_tokens": 15,
+                        }
+                    }
+                }))
+                .expect("failed terminal should encode"),
+        );
+        // 失败后再次 Finish 必须保持惰性，绝不能再发一个终态。
+        assert!(emitter
+            .emit(frame(CanonicalStreamEvent::Finish {
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+            }))
+            .expect("post-failure finish should be inert")
+            .is_empty());
+        bytes.extend(
+            emitter
+                .finish()
+                .expect("finish after failure should be inert"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let events = sse_json_events(&sse);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.failed")
+                .count(),
+            1,
+            "{sse}"
+        );
+        assert!(!sse.contains("event: response.completed\n"), "{sse}");
+        // 文本段在工具开始前已合法关闭：允许其既有 output_item.done；
+        // 失败后不得再出现任何“成功工具完成”事件。
+        assert!(
+            !events.iter().any(|event| {
+                event["type"] == "response.output_item.done"
+                    && event["item"]["type"] == "function_call"
+            }),
+            "{sse}"
+        );
+        assert!(
+            !sse.contains("response.function_call_arguments.done"),
+            "{sse}"
+        );
+        assert_eq!(response_sequence_numbers(&sse), {
+            let length = response_sequence_numbers(&sse).len() as u64;
+            (1..=length).collect::<Vec<_>>()
+        });
+
+        let response = terminal_response_event(&events);
+        assert_eq!(response["id"], "resp_partial_123");
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["model"], "gpt-5.4");
+        assert_eq!(response["status"], "failed");
+        assert!(response["created_at"].is_number(), "{response}");
+        assert_eq!(response["error"]["code"], "stream_terminal_error");
+        assert_eq!(response["usage"]["input_tokens"], 11);
+        assert_eq!(response["usage"]["output_tokens"], 4);
+        assert_eq!(response["usage"]["total_tokens"], 15);
+        let output = response["output"].as_array().expect("output array");
+        let message = output
+            .iter()
+            .find(|item| item["type"] == "message")
+            .expect("accumulated message item");
+        // 文本段在失败前已被工具调用合法关闭，必须保留其 completed 状态。
+        assert_eq!(message["status"], "completed");
+        assert_eq!(message["content"][0]["text"], "hello");
+        let call = output
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("accumulated partial function call");
+        assert_eq!(call["call_id"], "call_partial");
+        assert_eq!(call["arguments"], "{\"query\":");
+        assert_eq!(call["status"], "incomplete");
+    }
+
+    /// R1：上游 response.failed 事件同样必须补全累积输出与 usage，且只保留一个终态。
+    #[test]
+    fn openai_responses_client_emitter_terminal_failed_event_keeps_accumulated_output() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let frame = |event: CanonicalStreamEvent| CanonicalStreamFrame {
+            id: "resp_terminal_123".to_string(),
+            model: "gpt-5.4".to_string(),
+            event,
+        };
+        let mut bytes = emitter
+            .emit(frame(CanonicalStreamEvent::TextDelta(
+                "visible".to_string(),
+            )))
+            .expect("text should encode");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_terminal_123".to_string(),
+                    model: "gpt-5.4".to_string(),
+                    event: CanonicalStreamEvent::UnknownEvent(json!({
+                        "type": "response.failed",
+                        "response": {
+                            "id": "resp_terminal_123",
+                            "model": "gpt-5.4",
+                            "status": "failed",
+                            "error": {
+                                "message": "policy failure",
+                                "type": "invalid_request_error",
+                                "code": "cyber_policy"
+                            },
+                            "usage": {
+                                "input_tokens": 21,
+                                "output_tokens": 5,
+                                "total_tokens": 26
+                            }
+                        }
+                    })),
+                })
+                .expect("terminal failed event should encode"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let events = sse_json_events(&sse);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.failed")
+                .count(),
+            1,
+            "{sse}"
+        );
+        let response = terminal_response_event(&events);
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["error"]["code"], "cyber_policy");
+        assert_eq!(response["usage"]["total_tokens"], 26);
+        assert_eq!(response["output"][0]["content"][0]["text"], "visible");
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert!(!sse.contains("event: response.completed\n"), "{sse}");
+    }
+
+    /// R1：sync 桥接的权威 failed 终态不得补发 output_item.done/成功工具完成。
+    #[test]
+    fn openai_responses_client_emitter_authoritative_failure_skips_success_item_events() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_auth_123".to_string(),
+                model: "gpt-5.4".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_auth".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("tool start should encode");
+        let authoritative = json!({
+            "id": "resp_auth_123",
+            "object": "response",
+            "model": "gpt-5.4",
+            "status": "failed",
+            "error": {"message": "failed", "type": "server_error"},
+            "output": [{
+                "type": "function_call",
+                "id": "fc_auth_123_0",
+                "call_id": "call_auth",
+                "name": "lookup",
+                "arguments": "{\"partial\":",
+                "status": "incomplete"
+            }]
+        });
+        let bytes = emitter
+            .finish_with_authoritative_response_event(authoritative.clone(), "response.failed")
+            .expect("authoritative failure should encode");
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert!(sse.contains("event: response.failed\n"), "{sse}");
+        assert!(!sse.contains("event: response.output_item.done\n"), "{sse}");
+        assert!(
+            !sse.contains("response.function_call_arguments.done"),
+            "{sse}"
+        );
+        assert_eq!(
+            terminal_response_event(&sse_json_events(&sse)),
+            authoritative
+        );
+    }
+
+    /// R2：Claude 流式签名/redacted 块经 Responses 终态保留，并按顺序回放回 Claude 请求。
+    #[test]
+    fn claude_stream_reasoning_carriers_roundtrip_through_responses() {
+        let report_context = json!({
+            "provider_api_format": "claude:messages",
+            "client_api_format": "openai:responses",
+        });
+        let mut state = ClaudeProviderState::default();
+        let mut emitter = OpenAIResponsesClientEmitter::with_report_context(&report_context);
+        let mut bytes = Vec::new();
+        let events = [
+            json!({"type": "message_start", "message": {
+                "id": "msg_carrier_1", "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 9, "output_tokens": 0}
+            }}),
+            json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "first"}}),
+            json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig_one"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "redacted_thinking", "data": "redacted_data"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2,
+                "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 2,
+                "delta": {"type": "thinking_delta", "thinking": "second"}}),
+            json!({"type": "content_block_delta", "index": 2,
+                "delta": {"type": "signature_delta", "signature": "sig_two"}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "content_block_start", "index": 3,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "lookup",
+                    "input": {"query": "aether"}}}),
+            json!({"type": "content_block_stop", "index": 3}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+                "usage": {"input_tokens": 9, "output_tokens": 12}}),
+            json!({"type": "message_stop"}),
+        ];
+        for event in events {
+            for frame in state.push_line(&report_context, data_line(event)).unwrap() {
+                bytes.extend(emitter.emit(frame).expect("frame should encode"));
+            }
+        }
+        bytes.extend(emitter.finish().expect("finish should encode"));
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let terminal = terminal_response_event(&sse_json_events(&sse));
+        assert_eq!(terminal["status"], "completed");
+        let output = terminal["output"].as_array().expect("output array");
+        let types = output
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec!["reasoning", "reasoning", "reasoning", "function_call"],
+            "{terminal}"
+        );
+        let decoded = output
+            .iter()
+            .map(|item| {
+                item.get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .and_then(crate::formats::openai::responses::decode_claude_reasoning_carrier)
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            decoded[0].as_ref(),
+            Some(crate::formats::openai::responses::ClaudeReasoningCarrier::Signature(signature))
+                if signature == "sig_one"
+        ));
+        assert!(matches!(
+            decoded[1].as_ref(),
+            Some(crate::formats::openai::responses::ClaudeReasoningCarrier::Redacted(data))
+                if data == "redacted_data"
+        ));
+        assert!(matches!(
+            decoded[2].as_ref(),
+            Some(crate::formats::openai::responses::ClaudeReasoningCarrier::Signature(signature))
+                if signature == "sig_two"
+        ));
+
+        // 用终态 output 作为下一轮 Responses 输入，回放到 Claude 请求。
+        let mut input = output.clone();
+        input.push(json!({
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": "ok",
+        }));
+        input.push(json!({
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "continue"}]
+        }));
+        let replay = json!({
+            "model": "claude-sonnet-4-5",
+            "max_output_tokens": 256,
+            "reasoning": {"effort": "high"},
+            "input": input,
+        });
+        let converted = crate::formats::registry::convert_request_pure(
+            "openai:responses",
+            "claude:messages",
+            &replay,
+        )
+        .expect("carrier replay should convert to Claude")
+        .value;
+        let contents = converted["messages"]
+            .as_array()
+            .expect("Claude messages array")
+            .iter()
+            .map(|message| {
+                (
+                    message["role"].as_str().unwrap_or_default(),
+                    message["content"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contents[0].0, "user", "{converted}");
+        assert_eq!(contents[1].0, "assistant", "{converted}");
+        assert_eq!(
+            contents[1].1,
+            json!([
+                {"type": "thinking", "thinking": "first", "signature": "sig_one"},
+                {"type": "redacted_thinking", "data": "redacted_data"},
+                {"type": "thinking", "thinking": "second", "signature": "sig_two"},
+                {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"query": "aether"}}
+            ])
+        );
+        let tool_result = contents.iter().find(|(role, content)| {
+            *role == "user" && content.to_string().contains("\"tool_result\"")
+        });
+        assert!(tool_result.is_some(), "{converted}");
+    }
+
+    /// R2：Claude 同步响应（签名 + redacted + 签名）经 Responses 输出后回放回 Claude 请求。
+    #[test]
+    fn claude_sync_reasoning_carriers_roundtrip_through_responses() {
+        let claude_response = json!({
+            "id": "msg_sync_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [
+                {"type": "thinking", "thinking": "sync one", "signature": "sig_sync_1"},
+                {"type": "redacted_thinking", "data": "redacted_sync"},
+                {"type": "thinking", "thinking": "sync two", "signature": "sig_sync_2"},
+                {"type": "tool_use", "id": "toolu_sync", "name": "lookup", "input": {"q": "x"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 5, "output_tokens": 7}
+        });
+        let responses = crate::formats::registry::convert_response_pure(
+            "claude:messages",
+            "openai:responses",
+            &claude_response,
+        )
+        .expect("Claude response with redacted thinking should convert to Responses")
+        .value;
+        let output = responses["output"].as_array().expect("Responses output");
+        let types = output
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec!["reasoning", "reasoning", "reasoning", "function_call"],
+            "{responses}"
+        );
+
+        let mut input = output.clone();
+        input.push(json!({
+            "type": "function_call_output",
+            "call_id": "toolu_sync",
+            "output": "ok",
+        }));
+        let replay = json!({
+            "model": "claude-sonnet-4-5",
+            "max_output_tokens": 256,
+            "reasoning": {"effort": "high"},
+            "input": input,
+        });
+        let converted = crate::formats::registry::convert_request_pure(
+            "openai:responses",
+            "claude:messages",
+            &replay,
+        )
+        .expect("sync carrier replay should convert to Claude")
+        .value;
+        let assistant = converted["messages"]
+            .as_array()
+            .expect("Claude messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant message");
+        assert_eq!(
+            assistant["content"],
+            json!([
+                {"type": "thinking", "thinking": "sync one", "signature": "sig_sync_1"},
+                {"type": "redacted_thinking", "data": "redacted_sync"},
+                {"type": "thinking", "thinking": "sync two", "signature": "sig_sync_2"},
+                {"type": "tool_use", "id": "toolu_sync", "name": "lookup", "input": {"q": "x"}}
+            ])
+        );
+    }
+
+    /// R2：真实 provider 密文不得被误当作 Aether Claude carrier，损坏 carrier 必须 fail closed。
+    #[test]
+    fn responses_reasoning_carrier_replay_ignores_foreign_ciphertext_and_rejects_malformed() {
+        let foreign = json!({
+            "model": "claude-sonnet-4-5",
+            "max_output_tokens": 64,
+            "input": [{
+                "type": "reasoning",
+                "id": "rs_provider",
+                "encrypted_content": "real-openai-opaque-ciphertext",
+                "content": [{"type": "reasoning_text", "text": "opaque"}]
+            }]
+        });
+        let converted = crate::formats::registry::convert_request_pure(
+            "openai:responses",
+            "claude:messages",
+            &foreign,
+        )
+        .expect("foreign ciphertext remains opaque provider data");
+        assert!(!converted
+            .value
+            .to_string()
+            .contains("real-openai-opaque-ciphertext"));
+        let malformed = json!({
+            "model": "claude-sonnet-4-5",
+            "max_output_tokens": 64,
+            "input": [{
+                "type": "reasoning",
+                "encrypted_content": "aether-claude-reasoning-carrier-v1:signature:not-base64!"
+            }]
+        });
+        assert!(
+            crate::formats::registry::convert_request_pure(
+                "openai:responses",
+                "claude:messages",
+                &malformed,
+            )
+            .is_err(),
+            "malformed internal carrier must fail closed"
+        );
+    }
+
+    /// R4：Claude→Responses 流式工具调用恢复 custom/tool_search 形状。
+    #[test]
+    fn responses_stream_restores_lowered_custom_and_tool_search_items() {
+        let report_context = json!({
+            "provider_api_format": "claude:messages",
+            "original_request_body": {
+                "tools": [
+                    {"type": "tool_search", "execution": "client"},
+                    {"type": "custom", "name": "shell", "description": "Run a command"}
+                ]
+            }
+        });
+        let mut emitter = OpenAIResponsesClientEmitter::with_report_context(&report_context);
+        let frame = |event: CanonicalStreamEvent| CanonicalStreamFrame {
+            id: "msg_stream_tools".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            event,
+        };
+        let mut bytes = emitter
+            .emit(frame(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "toolu_shell".to_string(),
+                name: "shell".to_string(),
+            }))
+            .expect("custom tool start");
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments: "{\"input\":\"ls\"}".to_string(),
+                }))
+                .expect("custom arguments"),
+        );
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::ToolCallStart {
+                    index: 1,
+                    call_id: "toolu_search".to_string(),
+                    name: "tool_search".to_string(),
+                }))
+                .expect("search tool start"),
+        );
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 1,
+                    arguments: "{\"query\":\"next\"}".to_string(),
+                }))
+                .expect("search arguments"),
+        );
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::Finish {
+                    finish_reason: Some("tool_use".to_string()),
+                    usage: None,
+                }))
+                .expect("finish"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert!(
+            sse.contains("response.custom_tool_call_input.done"),
+            "{sse}"
+        );
+        assert!(
+            !sse.contains("response.function_call_arguments.delta"),
+            "{sse}"
+        );
+        let response = terminal_response_event(&sse_json_events(&sse));
+        let output = response["output"].as_array().expect("output array");
+        let custom = output
+            .iter()
+            .find(|item| item["type"] == "custom_tool_call")
+            .expect("custom tool call item");
+        assert_eq!(custom["name"], "shell");
+        assert_eq!(custom["input"], "ls");
+        let search = output
+            .iter()
+            .find(|item| item["type"] == "tool_search_call")
+            .expect("tool search call item");
+        assert_eq!(search["execution"], "client");
+        assert_eq!(search["arguments"], json!({"query": "next"}));
+    }
+
+    /// R2：thinking 块与文本/工具交错时，终态 output 顺序必须保持原始顺序。
+    #[test]
+    fn responses_stream_keeps_reasoning_and_text_segments_ordered() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let frame = |event: CanonicalStreamEvent| CanonicalStreamFrame {
+            id: "resp_order_123".to_string(),
+            model: "gpt-5.4".to_string(),
+            event,
+        };
+        let mut bytes = emitter
+            .emit(frame(CanonicalStreamEvent::ReasoningDelta(
+                "think-one".to_string(),
+            )))
+            .expect("first reasoning");
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::TextDelta(
+                    "answer-one".to_string(),
+                )))
+                .expect("first text"),
+        );
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_order".to_string(),
+                    name: "lookup".to_string(),
+                }))
+                .expect("tool"),
+        );
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::TextDelta(
+                    "answer-two".to_string(),
+                )))
+                .expect("second text"),
+        );
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::ReasoningDelta(
+                    "think-two".to_string(),
+                )))
+                .expect("second reasoning"),
+        );
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::Finish {
+                    finish_reason: Some("stop".to_string()),
+                    usage: None,
+                }))
+                .expect("finish"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let response = terminal_response_event(&sse_json_events(&sse));
+        let output = response["output"].as_array().expect("output array");
+        let types = output
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                "reasoning",
+                "message",
+                "function_call",
+                "message",
+                "reasoning"
+            ],
+            "{response}"
+        );
+        assert_eq!(output[1]["content"][0]["text"], "answer-one");
+        assert_eq!(output[3]["content"][0]["text"], "answer-two");
     }
 
     #[test]
@@ -7676,5 +8871,230 @@ mod tests {
             frame.event,
             CanonicalStreamEvent::ReasoningDelta(ref text) if text == "item fallback reasoning"
         )));
+    }
+
+    /// output_item.done 与 completed 快照携带同一 reasoning item 时只发射一次。
+    #[test]
+    fn openai_responses_provider_state_dedupes_completed_reasoning_carriers() {
+        let signed_carrier =
+            encode_claude_reasoning_signature_carrier("sig_once").expect("carrier");
+        let redacted_carrier =
+            encode_claude_redacted_thinking_carrier("opaque_once").expect("carrier");
+        let signed = json!({
+            "type": "reasoning",
+            "id": "rs_signed_once",
+            "status": "completed",
+            "encrypted_content": signed_carrier,
+            "content": [{"type": "reasoning_text", "text": "plan"}],
+            "summary": []
+        });
+        let redacted = json!({
+            "type": "reasoning",
+            "id": "rs_redacted_once",
+            "status": "completed",
+            "encrypted_content": redacted_carrier,
+            "summary": []
+        });
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let mut frames = Vec::new();
+        for item in [&signed, &redacted] {
+            frames.extend(
+                state
+                    .push_line(
+                        &report_context,
+                        data_line(json!({
+                            "type": "response.output_item.done",
+                            "response_id": "resp_once",
+                            "output_index": 0,
+                            "item": item,
+                        })),
+                    )
+                    .expect("reasoning item should parse"),
+            );
+        }
+        frames.extend(
+            state
+                .push_line(
+                    &report_context,
+                    data_line(json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_once",
+                            "model": "gpt-5.4",
+                            "status": "completed",
+                            "output": [signed, redacted],
+                        }
+                    })),
+                )
+                .expect("completed snapshot should parse"),
+        );
+
+        let mut delta_plan = 0;
+        let mut signatures = 0;
+        let mut redacted_blocks = 0;
+        let mut summary_done = 0;
+        for frame in &frames {
+            match &frame.event {
+                CanonicalStreamEvent::ReasoningDelta(text) if text == "plan" => delta_plan += 1,
+                CanonicalStreamEvent::ReasoningSignature(signature) if signature == "sig_once" => {
+                    signatures += 1;
+                }
+                CanonicalStreamEvent::ReasoningRedacted(data) if data == "opaque_once" => {
+                    redacted_blocks += 1;
+                }
+                CanonicalStreamEvent::ReasoningSummaryDone => summary_done += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(delta_plan, 1);
+        assert_eq!(signatures, 1);
+        assert_eq!(redacted_blocks, 1);
+        assert_eq!(summary_done, 1);
+    }
+
+    /// 不同 item 身份即使共享文本前缀也必须各自发射完整自有文本,不能借用全局前缀。
+    #[test]
+    fn openai_responses_provider_state_keeps_distinct_reasoning_item_texts() {
+        let item = |id: &str, text: &str, signature: &str| {
+            json!({
+                "type": "reasoning",
+                "id": id,
+                "status": "completed",
+                "encrypted_content": encode_claude_reasoning_signature_carrier(signature)
+                    .expect("carrier"),
+                "content": [{"type": "reasoning_text", "text": text}],
+                "summary": []
+            })
+        };
+        let first = item("rs_plan_one", "plan", "sig_plan_one");
+        let second = item("rs_plan_two", "plan next", "sig_plan_two");
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let mut frames = Vec::new();
+        for item in [&first, &second] {
+            frames.extend(
+                state
+                    .push_line(
+                        &report_context,
+                        data_line(json!({
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": item,
+                        })),
+                    )
+                    .expect("reasoning item should parse"),
+            );
+        }
+        frames.extend(
+            state
+                .push_line(
+                    &report_context,
+                    data_line(json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_plan",
+                            "model": "gpt-5.4",
+                            "status": "completed",
+                            "output": [first, second],
+                        }
+                    })),
+                )
+                .expect("completed snapshot should parse"),
+        );
+
+        let deltas = frames
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                CanonicalStreamEvent::ReasoningDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, vec!["plan", "plan next"], "{deltas:?}");
+    }
+
+    /// 相同文本的不同 item 身份仍是两个独立 thinking 块。
+    #[test]
+    fn openai_responses_provider_state_emits_identical_text_for_distinct_items() {
+        let item = |id: &str, signature: &str| {
+            json!({
+                "type": "reasoning",
+                "id": id,
+                "status": "completed",
+                "encrypted_content": encode_claude_reasoning_signature_carrier(signature)
+                    .expect("carrier"),
+                "content": [{"type": "reasoning_text", "text": "same"}],
+                "summary": []
+            })
+        };
+        let first = item("rs_same_one", "sig_same_one");
+        let second = item("rs_same_two", "sig_same_two");
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let mut frames = Vec::new();
+        for item in [&first, &second] {
+            frames.extend(
+                state
+                    .push_line(
+                        &report_context,
+                        data_line(json!({
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": item,
+                        })),
+                    )
+                    .expect("reasoning item should parse"),
+            );
+        }
+
+        let deltas = frames
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                CanonicalStreamEvent::ReasoningDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, vec!["same", "same"], "{deltas:?}");
+    }
+
+    /// 损坏的内部 carrier 或带文本的 redacted carrier 必须终止失败,不能作为无签名 thinking。
+    #[test]
+    fn openai_responses_provider_state_rejects_malformed_claude_carriers() {
+        let report_context = json!({});
+        let mut state = OpenAIResponsesProviderState::default();
+        assert!(state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_malformed",
+                        "encrypted_content": "aether-claude-reasoning-carrier-v1:signature:not-base64!",
+                        "content": [{"type": "reasoning_text", "text": "plan"}]
+                    }
+                })),
+            )
+            .is_err());
+
+        let redacted_carrier =
+            encode_claude_redacted_thinking_carrier("opaque_text").expect("carrier");
+        let mut state = OpenAIResponsesProviderState::default();
+        assert!(state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_redacted_text",
+                        "encrypted_content": redacted_carrier,
+                        "content": [{"type": "reasoning_text", "text": "must not leak"}]
+                    }
+                })),
+            )
+            .is_err());
     }
 }

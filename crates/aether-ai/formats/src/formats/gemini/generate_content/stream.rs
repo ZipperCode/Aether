@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
+use super::partial_args::VertexPartialArgsAssembler;
 use crate::formats::gemini::generate_content::response::{
     gemini_candidate_grounding, gemini_grounding_citations,
 };
@@ -10,6 +11,20 @@ use crate::formats::shared::sse::encode_json_sse;
 use crate::formats::shared::stream_core::common::*;
 use crate::formats::shared::{AiSurfaceFinalizeError, GeminiStreamWireMode};
 use crate::protocol::canonical::audit_gemini_cross_format_response_part;
+
+/// Vertex 分片参数调用（`functionCall.partialArgs`）的组装与输出状态。
+#[derive(Default)]
+struct GeminiPartialCallState {
+    assembler: VertexPartialArgsAssembler,
+    /// Start 事件发出前缓冲的参数增量。
+    pending_deltas: String,
+    /// 已输出的 thoughtSignature；签名仍须先于 Start，因此可能延后补发。
+    signature_emitted: String,
+    /// 调用级 willContinue 已结束；之后不再接受同一调用的分片。
+    finalized: bool,
+    /// 该分片调用所属候选；用于调用结束后的活动关联恢复。
+    candidate_key: Option<u64>,
+}
 
 #[derive(Default)]
 /// 累积单个 Gemini provider 工具调用的流式身份、参数与签名状态。
@@ -20,6 +35,8 @@ struct GeminiProviderToolState {
     /// 最近一次已发出的函数调用 thoughtSignature；用于去重并保证先于调用开始事件。
     thought_signature: String,
     started_emitted: bool,
+    /// 分片参数调用的组装状态；完整 `args` 调用保持为 None。
+    partial: Option<GeminiPartialCallState>,
 }
 
 #[derive(Default)]
@@ -42,6 +59,14 @@ pub struct GeminiProviderState {
     content_parts: BTreeMap<usize, CanonicalContentPart>,
     tool_calls: BTreeMap<usize, GeminiProviderToolState>,
     tool_results: BTreeMap<usize, GeminiProviderToolResultState>,
+    /// 下一个工具调用索引；只增不减，保证分片续写与完整调用的索引稳定。
+    next_tool_call_index: usize,
+    /// 显式 id -> 分片调用索引，仅用于把后续分片关联到同一调用。
+    partial_call_ids: BTreeMap<String, usize>,
+    /// 候选索引 -> 该候选当前仍在延续的无 id 分片调用。
+    active_partial_calls: BTreeMap<u64, usize>,
+    /// 已观测到的规范 usage；Gemini usageMetadata 为累计值，只覆盖非零字段。
+    known_usage: Option<CanonicalUsage>,
     /// Last `groundingMetadata` seen. Gemini resends it cumulatively, so the
     /// newest copy is the complete one; citations are emitted once at finish,
     /// when the answer text they index into is whole.
@@ -63,6 +88,11 @@ impl GeminiProviderState {
             report_context,
             "resp-local-stream",
         )
+    }
+
+    /// 已观测到的规范 usage（最近一次含 usage 的 Gemini 事件，非零字段合并）。
+    pub(crate) fn known_usage(&self) -> Option<CanonicalUsage> {
+        self.known_usage.clone()
     }
 
     fn ensure_started(&mut self, report_context: &Value, out: &mut Vec<CanonicalStreamFrame>) {
@@ -158,8 +188,17 @@ impl GeminiProviderState {
         if let Some(version) = event_object.get("modelVersion").and_then(Value::as_str) {
             self.model = Some(version.to_string());
         }
+        // usageMetadata 在事件解析前记录（含 terminal observation 模式），
+        // 供 stream_core 直接读取，避免对同一数据行二次 JSON 解码。
+        if let Some(usage) = canonical_usage_from_gemini_usage(event_object.get("usageMetadata"))
+            .or_else(|| canonical_usage_from_gemini_usage(raw_event_object.get("usageMetadata")))
+        {
+            merge_known_usage(&mut self.known_usage, usage);
+        }
 
         let mut out = Vec::new();
+        // 同一事件可能包含多个候选：先处理完所有候选的关闭标记，再统一做终态校验。
+        let mut pending_finish_reasons: Vec<String> = Vec::new();
         let cross_format = report_context
             .get("client_api_format")
             .and_then(Value::as_str)
@@ -213,11 +252,16 @@ impl GeminiProviderState {
             return Ok(out);
         };
 
-        for candidate in candidates {
+        for (candidate_position, candidate) in candidates.iter().enumerate() {
             let Some(candidate_object) = candidate.as_object() else {
                 out.push(self.unknown_frame(report_context, candidate.clone()));
                 return Ok(out);
             };
+            // 分片工具调用按候选关联；缺 index 的候选退回出现顺序。
+            let candidate_key = candidate_object
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(candidate_position as u64);
             if cross_format
                 && candidate_object.keys().any(|field| {
                     !matches!(
@@ -297,7 +341,9 @@ impl GeminiProviderState {
                     out.push(self.unknown_frame(report_context, part.clone()));
                     return Ok(out);
                 };
-                if cross_format && audit_gemini_cross_format_response_part(part_object).is_err() {
+                if cross_format
+                    && audit_gemini_cross_format_response_part(part_object, true).is_err()
+                {
                     // 已知错误终态比同帧不可回放的空签名 part 更权威；否则仍按未知字段 fail closed。
                     if terminal_error.is_none() {
                         out.push(self.unknown_frame(report_context, part.clone()));
@@ -458,12 +504,41 @@ impl GeminiProviderState {
                     self.observed_tool_calls = true;
                     continue;
                 }
-                // Gemini streams are incremental and every functionCall part is a
-                // complete call, so parallel calls arriving in separate chunks all
+                // Vertex 分片参数（functionCall.partialArgs）由 jsonPath 组装器负责；
+                // 完整 args 调用继续走下面的既有路径。
+                match self.try_handle_partial_function_call(
+                    candidate_key,
+                    function_call,
+                    reasoning_signature.as_deref(),
+                    &id,
+                    &model,
+                    &mut out,
+                ) {
+                    Ok(true) => {
+                        // 观测器对任何 functionCall part 都记为“见过工具调用”，
+                        // 正常路径同样记录，保证 finish reason 与观测结果一致。
+                        self.observed_tool_calls = true;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        // 分片参数非法：输出可路由的失败终态，而不是直接抛出截断流。
+                        out.push(self.partial_args_failure_frame(
+                            report_context,
+                            &error.0,
+                            event_object.get("usageMetadata"),
+                        ));
+                        self.finished = true;
+                        return Ok(out);
+                    }
+                }
+                // Gemini streams are incremental and every complete-args functionCall
+                // part is a full call, so parallel calls arriving in separate chunks all
                 // sit at parts[0]. Key calls by arrival order, not part position.
                 // Ids cannot disambiguate: they are optional, and the Antigravity
                 // envelope synthesizes per-chunk ids that repeat across chunks.
-                let index = self.tool_calls.len();
+                let index = self.next_tool_call_index;
+                self.next_tool_call_index += 1;
                 let tool_state = self.tool_calls.entry(index).or_default();
                 tool_state.call_id = function_call
                     .get("id")
@@ -533,9 +608,31 @@ impl GeminiProviderState {
                 .or_else(|| candidate_object.get("finish_reason"))
                 .and_then(Value::as_str)
             {
+                // 同事件的其他候选可能还携带本事件的关闭标记：延后到全部候选处理完再终态，
+                // 避免把仍将在同一事件内结束的分片调用误判为截断。
+                pending_finish_reasons.push(finish_reason.to_string());
+            }
+        }
+
+        if !pending_finish_reasons.is_empty() {
+            // 权威终态错误已置 finished 时不再追加二次失败；否则此时所有候选的关闭标记
+            // 都已消费，可以安全地全局校验是否仍有未结束的分片调用。
+            if !self.finished {
+                if let Err(error) = self.ensure_partial_calls_closed() {
+                    out.push(self.partial_args_failure_frame(
+                        report_context,
+                        &error.0,
+                        event_object.get("usageMetadata"),
+                    ));
+                    self.finished = true;
+                    return Ok(out);
+                }
+            }
+            for finish_reason in pending_finish_reasons {
+                let (id, model) = self.identity(report_context);
                 let has_tool_calls = self.observed_tool_calls || !self.tool_calls.is_empty();
                 let mut finish_reason =
-                    normalize_openai_finish_reason(map_gemini_stream_finish_reason(finish_reason));
+                    normalize_openai_finish_reason(map_gemini_stream_finish_reason(&finish_reason));
                 if has_tool_calls && finish_reason.as_deref().is_none_or(|value| value == "stop") {
                     finish_reason = Some("tool_calls".to_string());
                 }
@@ -555,12 +652,404 @@ impl GeminiProviderState {
         Ok(out)
     }
 
+    /// 处理 Vertex 分片参数 functionCall；返回 true 表示已由本路径消费。
+    ///
+    /// 关联规则：显式 id 只匹配同 id 的分片调用；无 id 分片只续写该候选当前仍在
+    /// 延续的调用。已结束调用不再接受分片，避免把新的并行调用并进旧调用。
+    fn try_handle_partial_function_call(
+        &mut self,
+        candidate_key: u64,
+        function_call: &Map<String, Value>,
+        reasoning_signature: Option<&str>,
+        frame_id: &str,
+        frame_model: &str,
+        out: &mut Vec<CanonicalStreamFrame>,
+    ) -> Result<bool, AiSurfaceFinalizeError> {
+        let partial_args = function_call
+            .get("partialArgs")
+            .or_else(|| function_call.get("partial_args"));
+        let call_will_continue = match function_call
+            .get("willContinue")
+            .or_else(|| function_call.get("will_continue"))
+        {
+            Some(value) => Some(value.as_bool().ok_or_else(|| {
+                AiSurfaceFinalizeError::new("Gemini functionCall.willContinue 必须是布尔值")
+            })?),
+            None => None,
+        };
+        if function_call.contains_key("args") {
+            if partial_args.is_some() {
+                return Err(AiSurfaceFinalizeError::new(
+                    "Gemini functionCall 不能同时携带 args 与 partialArgs",
+                ));
+            }
+            return Ok(false);
+        }
+        let explicit_id = function_call
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let name = function_call
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        // 只有 id/name、没有参数与 willContinue 的 functionCall：可能是一次分片调用的
+        // 终结标记（仅 id），也可能是既有语义下的无参完整调用（带 name）。
+        let bare =
+            partial_args.is_none() && call_will_continue.is_none() && !function_call.is_empty();
+
+        let mut target = match explicit_id {
+            Some(id) => self.partial_call_ids.get(id).copied(),
+            None => self.active_partial_calls.get(&candidate_key).copied(),
+        };
+        if target
+            .and_then(|index| self.tool_calls.get(&index))
+            .and_then(|state| state.partial.as_ref())
+            .is_none_or(|partial| partial.finalized)
+        {
+            // 目标已结束或不是分片调用：显式 id 可能被上游逐块复用，按新调用处理。
+            target = None;
+        }
+
+        if bare {
+            if target.is_none() {
+                // 没有活动分片调用：带 name 的沿用既有（无参）完整调用语义输出 `{}`，
+                // 无 name 的游离标记忽略，绝不产出空成功调用。
+                return Ok(name.is_none());
+            }
+            // 命中活动分片调用时，即使重复带 name 也只是该调用的终结标记。
+        } else if target.is_none() && partial_args.is_none() && call_will_continue != Some(true) {
+            // 没有活动分片调用时的终结标记：带 name 的是合法无参完整调用，交由既有路径
+            // 输出 `{}`；无 name 的游离标记不伪造成成功调用。
+            return Ok(name.is_none());
+        }
+        let index = match target {
+            Some(index) => index,
+            None => self.start_partial_call(candidate_key, explicit_id, name),
+        };
+
+        let (name_conflict, id_changed, started_emitted) = {
+            let state = self
+                .tool_calls
+                .get_mut(&index)
+                .ok_or_else(|| AiSurfaceFinalizeError::new("Gemini 分片函数调用状态丢失"))?;
+            let mut name_conflict = false;
+            let mut id_changed = false;
+            if let Some(name) = name {
+                if state.name.is_empty() {
+                    state.name = name.to_string();
+                } else if state.name != name {
+                    name_conflict = true;
+                }
+            }
+            if state.call_id.is_empty() && explicit_id.is_some() {
+                state.call_id = explicit_id.unwrap_or_default().to_string();
+                id_changed = true;
+            }
+            if let Some(signature) = reasoning_signature {
+                state.thought_signature = signature.to_string();
+            }
+            (name_conflict, id_changed, state.started_emitted)
+        };
+        if name_conflict {
+            return Err(AiSurfaceFinalizeError::new(
+                "Gemini 分片函数调用在流中改名为不一致的函数",
+            ));
+        }
+        if id_changed {
+            if let Some(id) = explicit_id {
+                self.partial_call_ids.insert(id.to_string(), index);
+            }
+        }
+        if started_emitted {
+            // Start 已输出时签名可以立即追加；否则由 flush 保证签名先于 Start。
+            self.emit_partial_signature(index, frame_id, frame_model, out);
+        }
+
+        if let Some(entries_value) = partial_args {
+            let entries = entries_value.as_array().ok_or_else(|| {
+                AiSurfaceFinalizeError::new("Gemini functionCall.partialArgs 必须是数组")
+            })?;
+            let delta = {
+                let partial = self
+                    .tool_calls
+                    .get_mut(&index)
+                    .and_then(|state| state.partial.as_mut())
+                    .ok_or_else(|| AiSurfaceFinalizeError::new("Gemini 分片函数调用状态丢失"))?;
+                partial
+                    .assembler
+                    .push_entries(entries)
+                    .map_err(AiSurfaceFinalizeError::new)?
+            };
+            if !delta.is_empty() {
+                let partial = self
+                    .tool_calls
+                    .get_mut(&index)
+                    .and_then(|state| state.partial.as_mut())
+                    .ok_or_else(|| AiSurfaceFinalizeError::new("Gemini 分片函数调用状态丢失"))?;
+                partial.pending_deltas.push_str(&delta);
+            }
+        }
+
+        let open_string = self
+            .tool_calls
+            .get(&index)
+            .and_then(|state| state.partial.as_ref())
+            .is_some_and(|partial| partial.assembler.has_open_strings());
+        // 调用级 willContinue 缺失时按单块完整调用处理；空 functionCall 与 willContinue:false
+        // 是显式终结标记，仍在延续的字符串会因此在终态校验中失败。
+        let should_finalize = match call_will_continue {
+            Some(true) => false,
+            Some(false) => true,
+            None => function_call.is_empty() || bare || !open_string,
+        };
+
+        self.flush_partial_call_frames(index, should_finalize, frame_id, frame_model, out);
+        if should_finalize {
+            self.finalize_partial_call(index, frame_id, frame_model, out)?;
+        }
+        Ok(true)
+    }
+
+    fn start_partial_call(
+        &mut self,
+        candidate_key: u64,
+        explicit_id: Option<&str>,
+        name: Option<&str>,
+    ) -> usize {
+        let index = self.next_tool_call_index;
+        self.next_tool_call_index += 1;
+        let state = self.tool_calls.entry(index).or_default();
+        state.call_id = explicit_id.unwrap_or_default().to_string();
+        state.name = name.unwrap_or_default().to_string();
+        state.partial = Some(GeminiPartialCallState {
+            candidate_key: Some(candidate_key),
+            ..GeminiPartialCallState::default()
+        });
+        if let Some(id) = explicit_id {
+            self.partial_call_ids.insert(id.to_string(), index);
+        }
+        self.active_partial_calls.insert(candidate_key, index);
+        index
+    }
+
+    /// 补发尚未输出的函数调用签名；同一签名只输出一次。
+    fn emit_partial_signature(
+        &mut self,
+        index: usize,
+        frame_id: &str,
+        frame_model: &str,
+        out: &mut Vec<CanonicalStreamFrame>,
+    ) {
+        let Some(state) = self.tool_calls.get_mut(&index) else {
+            return;
+        };
+        if state.thought_signature.is_empty() {
+            return;
+        }
+        let Some(partial) = state.partial.as_mut() else {
+            return;
+        };
+        if partial.signature_emitted == state.thought_signature {
+            return;
+        }
+        let signature = state.thought_signature.clone();
+        partial.signature_emitted = signature.clone();
+        out.push(CanonicalStreamFrame {
+            id: frame_id.to_string(),
+            model: frame_model.to_string(),
+            event: CanonicalStreamEvent::ToolCallSignature { index, signature },
+        });
+    }
+
+    /// Start 在函数名已知前不发射；参数增量在其后统一补发，保证事件顺序稳定。
+    fn flush_partial_call_frames(
+        &mut self,
+        index: usize,
+        force_start: bool,
+        frame_id: &str,
+        frame_model: &str,
+        out: &mut Vec<CanonicalStreamFrame>,
+    ) {
+        let (has_pending, will_start) = match self.tool_calls.get(&index) {
+            Some(state) => (
+                state
+                    .partial
+                    .as_ref()
+                    .is_some_and(|partial| !partial.pending_deltas.is_empty()),
+                !state.started_emitted && (force_start || !state.name.trim().is_empty()),
+            ),
+            None => return,
+        };
+        if !has_pending {
+            return;
+        }
+        if will_start
+            || self
+                .tool_calls
+                .get(&index)
+                .is_some_and(|state| state.started_emitted)
+        {
+            // 签名必须早于调用开始事件，即使 Start 因缺名被延后。
+            self.emit_partial_signature(index, frame_id, frame_model, out);
+        }
+        let Some(state) = self.tool_calls.get_mut(&index) else {
+            return;
+        };
+        if !state.started_emitted && will_start {
+            out.push(CanonicalStreamFrame {
+                id: frame_id.to_string(),
+                model: frame_model.to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index,
+                    call_id: if state.call_id.is_empty() {
+                        build_generated_tool_call_id(index)
+                    } else {
+                        state.call_id.clone()
+                    },
+                    name: state.name.clone(),
+                },
+            });
+            state.started_emitted = true;
+        }
+        if state.started_emitted {
+            let Some(partial) = state.partial.as_mut() else {
+                return;
+            };
+            let arguments = std::mem::take(&mut partial.pending_deltas);
+            out.push(CanonicalStreamFrame {
+                id: frame_id.to_string(),
+                model: frame_model.to_string(),
+                event: CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments },
+            });
+        }
+    }
+
+    /// 终结分片调用：补齐闭合结构并输出终态参数增量。
+    /// 显式终结的零参数调用是合法无参调用，输出 `{}`；调用未终结（截断）由
+    /// `ensure_partial_calls_closed` 拒绝，绝不补成成功调用。
+    fn finalize_partial_call(
+        &mut self,
+        index: usize,
+        frame_id: &str,
+        frame_model: &str,
+        out: &mut Vec<CanonicalStreamFrame>,
+    ) -> Result<(), AiSurfaceFinalizeError> {
+        let candidate_key = {
+            let partial = self
+                .tool_calls
+                .get_mut(&index)
+                .and_then(|state| state.partial.as_mut())
+                .ok_or_else(|| AiSurfaceFinalizeError::new("Gemini 分片函数调用状态丢失"))?;
+            if partial.finalized {
+                return Ok(());
+            }
+            // 显式终结的零参数调用是合法无参调用：空组装结果序列化为 `{}` 正常发射。
+            let suffix = partial
+                .assembler
+                .finish()
+                .map_err(AiSurfaceFinalizeError::new)?;
+            partial.finalized = true;
+            partial.pending_deltas.push_str(&suffix);
+            partial.candidate_key
+        };
+        if let Some(candidate_key) = candidate_key {
+            self.restore_active_partial_call(candidate_key);
+        }
+        self.flush_partial_call_frames(index, true, frame_id, frame_model, out);
+        self.partial_call_ids.retain(|_, value| *value != index);
+        Ok(())
+    }
+
+    /// 把分片参数错误编码为 stream_core 可路由的失败终态。
+    ///
+    /// 直接返回错误会让上游流被截断而没有终态事件；这里生成 Responses 形状的
+    /// `response.failed` 载荷，由共享 rewriter 转成各客户端格式的失败终态。
+    fn partial_args_failure_frame(
+        &self,
+        report_context: &Value,
+        message: &str,
+        usage_metadata: Option<&Value>,
+    ) -> CanonicalStreamFrame {
+        let (id, model) = self.identity(report_context);
+        let mut response = json!({
+            "id": id.clone(),
+            "object": "response",
+            "model": model.clone(),
+            "status": "failed",
+            "error": {
+                "type": "upstream_gemini_partial_args_error",
+                "code": "INVALID_PARTIAL_ARGS",
+                "message": message,
+                "upstream_status": 200,
+            }
+        });
+        if let Some(usage) = canonical_usage_from_gemini_usage(usage_metadata)
+            .map(|usage| openai_responses_usage_from_usage(&usage))
+        {
+            response["usage"] = usage;
+        }
+        CanonicalStreamFrame {
+            id,
+            model,
+            event: CanonicalStreamEvent::UnknownEvent(json!({
+                "type": "response.failed",
+                "response": response,
+            })),
+        }
+    }
+
+    /// 调用结束后恢复候选的活动分片关联：仅当该候选仍恰好有一个未结束调用时关联，
+    /// 多个仍开放则无法无歧义关联无 id 分片，保持不猜测。
+    fn restore_active_partial_call(&mut self, candidate_key: u64) {
+        self.active_partial_calls.remove(&candidate_key);
+        let open_calls = self
+            .tool_calls
+            .iter()
+            .filter(|(_, state)| {
+                state.partial.as_ref().is_some_and(|partial| {
+                    !partial.finalized && partial.candidate_key == Some(candidate_key)
+                })
+            })
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        if let [only] = open_calls.as_slice() {
+            self.active_partial_calls.insert(candidate_key, *only);
+        }
+    }
+
+    /// 终态前仍有未结束的分片调用：判定为截断输入并终止。
+    fn ensure_partial_calls_closed(&self) -> Result<(), AiSurfaceFinalizeError> {
+        if self.tool_calls.values().any(|state| {
+            state
+                .partial
+                .as_ref()
+                .is_some_and(|partial| !partial.finalized)
+        }) {
+            return Err(AiSurfaceFinalizeError::new(
+                "Gemini 流式函数调用分片参数在终态前仍未结束",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn finish(
         &mut self,
         report_context: &Value,
     ) -> Result<Vec<CanonicalStreamFrame>, AiSurfaceFinalizeError> {
         if !self.started || self.finished {
             return Ok(Vec::new());
+        }
+        if let Err(error) = self.ensure_partial_calls_closed() {
+            // EOF 时仍存在未结束的分片调用：输出失败终态，绝不补成正常 Finish。
+            self.finished = true;
+            return Ok(vec![self.partial_args_failure_frame(
+                report_context,
+                &error.0,
+                None,
+            )]);
         }
         self.finished = true;
         let (id, model) = self.identity(report_context);
@@ -1024,6 +1513,10 @@ impl GeminiClientEmitter {
                 Ok(out)
             }
             CanonicalStreamEvent::ReasoningSummaryDone => Ok(Vec::new()),
+            // Gemini 没有 redacted thinking 载体：必须失败，不得静默丢弃或伪造 thoughtSignature。
+            CanonicalStreamEvent::ReasoningRedacted(_) => Err(AiSurfaceFinalizeError::new(
+                "Claude redacted thinking cannot be represented in Gemini GenerateContent",
+            )),
         }
     }
 
@@ -1296,6 +1789,42 @@ fn guess_media_type_from_reference(reference: &str, default_mime: &str) -> Strin
     }
 }
 
+/// 合并分片到达的 Gemini usage：usageMetadata 是累计值，非零字段覆盖旧值，
+/// 零值不覆盖已有值；与 stream_core 的 known usage 合并语义保持一致。
+fn merge_known_usage(target: &mut Option<CanonicalUsage>, incoming: CanonicalUsage) {
+    let Some(current) = target.as_mut() else {
+        *target = Some(incoming);
+        return;
+    };
+    if incoming.input_tokens > 0 {
+        current.input_tokens = incoming.input_tokens;
+        current.input_tokens_include_cache = incoming.input_tokens_include_cache;
+    }
+    if incoming.output_tokens > 0 {
+        current.output_tokens = incoming.output_tokens;
+    }
+    if incoming.cache_read_tokens > 0 {
+        current.cache_read_tokens = incoming.cache_read_tokens;
+    }
+    if incoming.cache_creation_tokens > 0 {
+        current.cache_creation_tokens = incoming.cache_creation_tokens;
+    }
+    if incoming.cache_creation_ephemeral_5m_tokens > 0 {
+        current.cache_creation_ephemeral_5m_tokens = incoming.cache_creation_ephemeral_5m_tokens;
+    }
+    if incoming.cache_creation_ephemeral_1h_tokens > 0 {
+        current.cache_creation_ephemeral_1h_tokens = incoming.cache_creation_ephemeral_1h_tokens;
+    }
+    if incoming.reasoning_tokens > 0 {
+        current.reasoning_tokens = incoming.reasoning_tokens;
+    }
+    if incoming.total_tokens > 0 {
+        current.total_tokens = incoming.total_tokens;
+    } else if current.total_tokens == 0 {
+        current.total_tokens = current.input_tokens.saturating_add(current.output_tokens);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1529,6 +2058,66 @@ mod tests {
                 assert_observer_has_no_content_buffers(&observer);
             }
         }
+    }
+
+    #[test]
+    fn gemini_provider_state_tracks_known_usage_from_parsed_events() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        state
+            .push_line(
+                &context,
+                data_line(json!({
+                    "responseId": "resp_usage",
+                    "modelVersion": "gemini-2.5-pro",
+                    "candidates": [{"index": 0, "content": {"parts": [{"text": "hi"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 10,
+                        "candidatesTokenCount": 4,
+                        "totalTokenCount": 14
+                    }
+                })),
+            )
+            .expect("usage chunk parses");
+        let usage = state.known_usage().expect("usage recorded");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.total_tokens, 14);
+
+        // 累计值分片：零值不覆盖已有字段，非零字段覆盖。
+        state
+            .push_line(
+                &context,
+                data_line(json!({
+                    "candidates": [{"index": 0, "content": {"parts": []}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 0,
+                        "candidatesTokenCount": 7,
+                        "totalTokenCount": 17
+                    }
+                })),
+            )
+            .expect("cumulative usage chunk parses");
+        let usage = state.known_usage().expect("usage still recorded");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.total_tokens, 17);
+
+        // terminal observation 模式同样记录 usage（不保留内容缓冲）。
+        let mut observer = GeminiProviderState::terminal_observation();
+        observer
+            .push_line(
+                &context,
+                data_line(json!({
+                    "candidates": [],
+                    "usageMetadata": {"promptTokenCount": 3, "totalTokenCount": 3}
+                })),
+            )
+            .expect("observer usage chunk parses");
+        assert_eq!(
+            observer.known_usage().expect("observer usage").input_tokens,
+            3
+        );
     }
 
     #[test]
@@ -1945,6 +2534,19 @@ mod tests {
         assert_eq!(arguments[&1], "{\"city\":\"Tokyo\"}");
         assert_eq!(arguments[&2], "{\"city\":\"Paris\"}");
         assert_eq!(arguments[&3], "{\"city\":\"Tokyo\"}");
+    }
+
+    #[test]
+    fn gemini_client_emitter_rejects_redacted_reasoning() {
+        let mut emitter = GeminiClientEmitter::default();
+        let error = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_redacted".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                event: CanonicalStreamEvent::ReasoningRedacted("opaque".to_string()),
+            })
+            .expect_err("Gemini has no redacted thinking carrier");
+        assert!(error.0.contains("redacted thinking"));
     }
 
     #[test]
@@ -2636,5 +3238,698 @@ mod tests {
             .transform_line(&context, data_line(events[4].clone()))
             .expect_err("nameless tool call must fail closed at the Gemini surface");
         assert!(error.0.contains("仍未获得函数名"));
+    }
+
+    fn gemini_partial_args_chunk(calls: Vec<Value>, finish_reason: Option<&str>) -> Vec<u8> {
+        let parts = calls
+            .into_iter()
+            .map(|call| json!({"functionCall": call}))
+            .collect::<Vec<_>>();
+        let mut record = json!({
+            "responseId": "resp_partial_args",
+            "modelVersion": "gemini-2.5-pro",
+            "candidates": [{
+                "index": 0,
+                "content": {"role": "model", "parts": parts}
+            }]
+        });
+        if let Some(finish_reason) = finish_reason {
+            record["candidates"][0]["finishReason"] = json!(finish_reason);
+        }
+        data_line(record)
+    }
+
+    fn tool_call_starts(frames: &[CanonicalStreamFrame]) -> Vec<(usize, String, String)> {
+        frames
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                CanonicalStreamEvent::ToolCallStart {
+                    index,
+                    call_id,
+                    name,
+                } => Some((*index, call_id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn arguments_by_index(frames: &[CanonicalStreamFrame]) -> BTreeMap<usize, String> {
+        let mut arguments = BTreeMap::<usize, String>::new();
+        for frame in frames {
+            if let CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index,
+                arguments: delta,
+            } = &frame.event
+            {
+                arguments.entry(*index).or_default().push_str(delta);
+            }
+        }
+        arguments
+    }
+
+    /// 提取分片参数失败终态载荷（Responses 形状，由 stream_core 路由到各客户端）。
+    fn terminal_failure_payload(frames: &[CanonicalStreamFrame]) -> Value {
+        frames
+            .iter()
+            .find_map(|frame| match &frame.event {
+                CanonicalStreamEvent::UnknownEvent(payload)
+                    if payload["type"] == "response.failed" =>
+                {
+                    Some(payload.clone())
+                }
+                _ => None,
+            })
+            .expect("partial args failure frame")
+    }
+
+    fn failure_message(payload: &Value) -> String {
+        payload["response"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn has_finish(frames: &[CanonicalStreamFrame]) -> bool {
+        frames
+            .iter()
+            .any(|frame| matches!(frame.event, CanonicalStreamEvent::Finish { .. }))
+    }
+
+    #[test]
+    fn gemini_provider_state_assembles_partial_args_across_chunks() {
+        let mut state = GeminiProviderState::default();
+        // 跨格式客户端下 partialArgs 也必须通过响应 part 审计。
+        let context = json!({"client_api_format": "openai:chat"});
+        let mut frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "id": "call_1",
+                        "name": "search",
+                        "partialArgs": [{
+                            "jsonPath": "$.query",
+                            "stringValue": "line1",
+                            "willContinue": true
+                        }],
+                        "willContinue": true
+                    })],
+                    None,
+                ),
+            )
+            .expect("first partial chunk parses");
+        frames.extend(
+            state
+                .push_line(
+                    &context,
+                    gemini_partial_args_chunk(
+                        vec![json!({
+                            "partialArgs": [
+                                {"jsonPath": "$.query"},
+                                {"jsonPath": "$.limit", "numberValue": 5}
+                            ],
+                            "willContinue": true
+                        })],
+                        None,
+                    ),
+                )
+                .expect("id-less continuation attaches to the active call"),
+        );
+        frames.extend(
+            state
+                .push_line(
+                    &context,
+                    gemini_partial_args_chunk(vec![json!({})], Some("STOP")),
+                )
+                .expect("empty marker ends the call and stream"),
+        );
+
+        assert_eq!(
+            tool_call_starts(&frames),
+            vec![(0, "call_1".to_string(), "search".to_string())]
+        );
+        assert_eq!(
+            arguments_by_index(&frames)[&0],
+            "{\"query\":\"line1\",\"limit\":5}"
+        );
+        let finish_reason = frames.iter().find_map(|frame| match &frame.event {
+            CanonicalStreamEvent::Finish { finish_reason, .. } => Some(finish_reason.clone()),
+            _ => None,
+        });
+        assert_eq!(finish_reason, Some(Some("tool_calls".to_string())));
+    }
+
+    #[test]
+    fn gemini_provider_state_correlates_parallel_partial_calls_by_id() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        let mut frames = Vec::new();
+        for call in [
+            json!({
+                "id": "call_a",
+                "name": "get_weather",
+                "partialArgs": [{"jsonPath": "$.city", "stringValue": "Paris"}],
+                "willContinue": true
+            }),
+            json!({
+                "id": "call_b",
+                "name": "get_weather",
+                "partialArgs": [{"jsonPath": "$.city", "stringValue": "Tokyo"}],
+                "willContinue": true
+            }),
+            json!({
+                "id": "call_a",
+                "partialArgs": [{"jsonPath": "$.unit", "stringValue": "c"}],
+                "willContinue": false
+            }),
+            json!({"id": "call_b", "willContinue": false}),
+        ] {
+            frames.extend(
+                state
+                    .push_line(&context, gemini_partial_args_chunk(vec![call], None))
+                    .expect("parallel partial chunk parses"),
+            );
+        }
+
+        let starts = tool_call_starts(&frames);
+        assert_eq!(
+            starts
+                .iter()
+                .map(|(index, _, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(starts[0].1, "call_a");
+        assert_eq!(starts[1].1, "call_b");
+        let arguments = arguments_by_index(&frames);
+        assert_eq!(arguments[&0], "{\"city\":\"Paris\",\"unit\":\"c\"}");
+        assert_eq!(arguments[&1], "{\"city\":\"Tokyo\"}");
+    }
+
+    #[test]
+    fn gemini_provider_state_fails_closed_on_unterminated_partial_args() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "name": "search",
+                        "partialArgs": [{"jsonPath": "$.q", "stringValue": "x"}],
+                        "willContinue": true
+                    })],
+                    None,
+                ),
+            )
+            .expect("open call parses");
+        let frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(Vec::new(), Some("STOP")),
+            )
+            .expect("normal finish with an open call yields a failure frame");
+        let payload = terminal_failure_payload(&frames);
+        assert!(failure_message(&payload).contains("仍未结束"));
+        assert_eq!(payload["response"]["status"], "failed");
+        assert_eq!(payload["response"]["error"]["code"], "INVALID_PARTIAL_ARGS");
+        assert!(!has_finish(&frames));
+
+        let mut state = GeminiProviderState::default();
+        state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "id": "call_open",
+                        "name": "search",
+                        "partialArgs": [{
+                            "jsonPath": "$.q",
+                            "stringValue": "x",
+                            "willContinue": true
+                        }],
+                        "willContinue": true
+                    })],
+                    None,
+                ),
+            )
+            .expect("open string parses");
+        let frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({"id": "call_open", "willContinue": false})],
+                    None,
+                ),
+            )
+            .expect("closing a call with an incomplete string yields a failure frame");
+        assert!(failure_message(&terminal_failure_payload(&frames)).contains("未闭合字符串"));
+        assert!(!has_finish(&frames));
+    }
+
+    #[test]
+    fn gemini_provider_state_fails_eof_for_open_partial_call() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "name": "search",
+                        "partialArgs": [{"jsonPath": "$.q", "stringValue": "x"}],
+                        "willContinue": true
+                    })],
+                    None,
+                ),
+            )
+            .expect("open call parses");
+        let frames = state
+            .finish(&context)
+            .expect("truncated stream yields a failure frame at EOF");
+        assert!(failure_message(&terminal_failure_payload(&frames)).contains("仍未结束"));
+        assert!(!has_finish(&frames));
+    }
+
+    #[test]
+    fn gemini_provider_state_emits_empty_arguments_for_explicitly_completed_calls() {
+        let context = json!({});
+        // name + willContinue:false 是上游合法的无参调用，必须输出 `{}`。
+        let mut state = GeminiProviderState::default();
+        let frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "id": "call_ping",
+                        "name": "ping",
+                        "willContinue": false
+                    })],
+                    None,
+                ),
+            )
+            .expect("valid no-argument call parses");
+        assert_eq!(
+            tool_call_starts(&frames),
+            vec![(0, "call_ping".to_string(), "ping".to_string())]
+        );
+        assert_eq!(arguments_by_index(&frames)[&0], "{}");
+
+        // 分片路径显式终结的零参数调用同样输出 `{}`。
+        let mut state = GeminiProviderState::default();
+        let mut frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "id": "call_ping2",
+                        "name": "ping",
+                        "partialArgs": [],
+                        "willContinue": true
+                    })],
+                    None,
+                ),
+            )
+            .expect("name-first partial call parses");
+        frames.extend(
+            state
+                .push_line(
+                    &context,
+                    gemini_partial_args_chunk(
+                        vec![json!({"id": "call_ping2", "willContinue": false})],
+                        None,
+                    ),
+                )
+                .expect("explicit finalization emits the empty arguments"),
+        );
+        assert_eq!(
+            tool_call_starts(&frames),
+            vec![(0, "call_ping2".to_string(), "ping".to_string())]
+        );
+        assert_eq!(arguments_by_index(&frames)[&0], "{}");
+
+        // 未终结的零参数调用是截断输入：失败终态，绝不输出空成功调用。
+        let mut state = GeminiProviderState::default();
+        state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({"name": "ping", "willContinue": true})],
+                    None,
+                ),
+            )
+            .expect("open zero-argument call parses");
+        let frames = state.finish(&context).expect("EOF yields a failure frame");
+        assert!(failure_message(&terminal_failure_payload(&frames)).contains("仍未结束"));
+        assert!(!has_finish(&frames));
+        assert!(tool_call_starts(&frames).is_empty());
+        assert!(arguments_by_index(&frames).is_empty());
+    }
+
+    #[test]
+    fn gemini_client_emitter_reassembles_partial_args_from_deltas() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        let mut frames = Vec::new();
+        for (call, finish) in [
+            (
+                json!({
+                    "id": "call_1",
+                    "name": "search",
+                    "partialArgs": [{
+                        "jsonPath": "$.query",
+                        "stringValue": "line1\n",
+                        "willContinue": true
+                    }],
+                    "willContinue": true
+                }),
+                None,
+            ),
+            (
+                json!({
+                    "partialArgs": [
+                        {"jsonPath": "$.query", "stringValue": "line2", "willContinue": false},
+                        {"jsonPath": "$.nested.list[0]", "numberValue": 1}
+                    ],
+                    "willContinue": true
+                }),
+                None,
+            ),
+            (
+                json!({
+                    "partialArgs": [{"jsonPath": "$.nested.list[1]", "numberValue": 2}],
+                    "willContinue": false
+                }),
+                None,
+            ),
+        ] {
+            frames.extend(
+                state
+                    .push_line(&context, gemini_partial_args_chunk(vec![call], finish))
+                    .expect("partial chunk parses"),
+            );
+        }
+
+        let mut emitter = GeminiClientEmitter::default();
+        let mut output = Vec::new();
+        for frame in frames {
+            output.extend(emitter.emit(frame).expect("emitter consumes deltas"));
+        }
+        output.extend(emitter.finish().expect("emitter finishes"));
+
+        let text = String::from_utf8(output).expect("utf8 sse");
+        let mut function_calls = Vec::new();
+        for line in text.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            for part in value["candidates"][0]["content"]["parts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if let Some(call) = part.get("functionCall") {
+                    function_calls.push(call.clone());
+                }
+            }
+        }
+        assert_eq!(function_calls.len(), 1, "partial call emits exactly once");
+        assert_eq!(function_calls[0]["id"], "call_1");
+        assert_eq!(function_calls[0]["name"], "search");
+        assert_eq!(
+            function_calls[0]["args"],
+            json!({"query": "line1\nline2", "nested": {"list": [1, 2]}})
+        );
+    }
+
+    #[test]
+    fn gemini_partial_args_failure_becomes_response_failed_through_matrix() {
+        use crate::formats::shared::stream_core::StreamingStandardFormatMatrix;
+
+        let context = json!({
+            "provider_api_format": "gemini:generate_content",
+            "client_api_format": "openai:responses",
+            "mapped_model": "test-model",
+        });
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let bytes = matrix
+            .transform_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "name": "search",
+                        "partialArgs": [{"jsonPath": "query", "stringValue": "x"}]
+                    })],
+                    None,
+                ),
+            )
+            .expect("malformed partial args yields a terminal failure event");
+        let text = String::from_utf8(bytes).expect("utf8 sse");
+        // 非法分片参数必须经真实 rewriter 变成失败终态，而不是抛错导致流被截断。
+        assert!(text.contains("response.failed"));
+        assert!(text.contains("\"status\":\"failed\""));
+        assert!(text.contains("jsonPath"));
+        assert!(!text.contains("response.completed"));
+        assert!(!text.contains("response.incomplete"));
+    }
+
+    #[test]
+    fn gemini_provider_state_bare_named_marker_finalizes_active_call() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        let mut frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "id": "call_a",
+                        "name": "search",
+                        "partialArgs": [{"jsonPath": "$.q", "stringValue": "x"}],
+                        "willContinue": true
+                    })],
+                    None,
+                ),
+            )
+            .expect("open call parses");
+        frames.extend(
+            state
+                .push_line(
+                    &context,
+                    gemini_partial_args_chunk(
+                        vec![json!({"id": "call_a", "name": "search"})],
+                        None,
+                    ),
+                )
+                .expect("bare named marker finalizes the active call"),
+        );
+
+        assert_eq!(
+            tool_call_starts(&frames),
+            vec![(0, "call_a".to_string(), "search".to_string())],
+            "重复 name 的裸节点不得新建空调用"
+        );
+        assert_eq!(arguments_by_index(&frames)[&0], "{\"q\":\"x\"}");
+        let frames = state
+            .finish(&context)
+            .expect("closed call finishes cleanly");
+        assert!(has_finish(&frames));
+    }
+
+    #[test]
+    fn gemini_provider_state_restores_remaining_open_call_after_parallel_finish() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        let mut frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "id": "call_a",
+                        "name": "search",
+                        "partialArgs": [{"jsonPath": "$.q", "stringValue": "x"}],
+                        "willContinue": true
+                    })],
+                    None,
+                ),
+            )
+            .expect("open call A parses");
+        frames.extend(
+            state
+                .push_line(
+                    &context,
+                    gemini_partial_args_chunk(
+                        vec![json!({
+                            "id": "call_b",
+                            "name": "ping",
+                            "partialArgs": [],
+                            "willContinue": false
+                        })],
+                        None,
+                    ),
+                )
+                .expect("parallel call B starts and finishes"),
+        );
+        frames.extend(
+            state
+                .push_line(
+                    &context,
+                    gemini_partial_args_chunk(
+                        vec![json!({
+                            "partialArgs": [{"jsonPath": "$.limit", "numberValue": 1}],
+                            "willContinue": false
+                        })],
+                        None,
+                    ),
+                )
+                .expect("id-less fragment attaches to the still-open call A"),
+        );
+
+        let starts = tool_call_starts(&frames);
+        assert_eq!(
+            starts.len(),
+            2,
+            "无 id 分片必须续写 A，而不是新建第三个调用"
+        );
+        assert_eq!(starts[0].1, "call_a");
+        assert_eq!(starts[1].1, "call_b");
+        let arguments = arguments_by_index(&frames);
+        assert_eq!(arguments[&0], "{\"q\":\"x\",\"limit\":1}");
+        assert_eq!(arguments[&1], "{}");
+        let frames = state.finish(&context).expect("all calls closed");
+        assert!(has_finish(&frames));
+    }
+
+    #[test]
+    fn gemini_provider_state_defers_terminal_validation_across_candidates() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        let mut frames = state
+            .push_line(
+                &context,
+                data_line(json!({
+                    "responseId": "resp_multi",
+                    "modelVersion": "gemini-2.5-pro",
+                    "candidates": [
+                        {"index": 0, "content": {"role": "model", "parts": [{"functionCall": {
+                            "id": "call_a",
+                            "name": "search",
+                            "partialArgs": [{"jsonPath": "$.q", "stringValue": "a"}],
+                            "willContinue": true
+                        }}]}},
+                        {"index": 1, "content": {"role": "model", "parts": [{"functionCall": {
+                            "id": "call_b",
+                            "name": "ping",
+                            "partialArgs": [{"jsonPath": "$.q", "stringValue": "b"}],
+                            "willContinue": true
+                        }}]}}
+                    ]
+                })),
+            )
+            .expect("two candidates open distinct calls");
+        frames.extend(
+            state
+                .push_line(
+                    &context,
+                    data_line(json!({
+                        "candidates": [
+                            {
+                                "index": 0,
+                                "finishReason": "STOP",
+                                "content": {"role": "model", "parts": [
+                                    {"functionCall": {"id": "call_a", "willContinue": false}}
+                                ]}
+                            },
+                            {
+                                "index": 1,
+                                "finishReason": "STOP",
+                                "content": {"role": "model", "parts": [
+                                    {"functionCall": {"id": "call_b", "willContinue": false}}
+                                ]}
+                            }
+                        ]
+                    })),
+                )
+                .expect("simultaneous candidate closure is valid"),
+        );
+
+        assert!(
+            frames
+                .iter()
+                .all(|frame| !matches!(&frame.event, CanonicalStreamEvent::UnknownEvent(_))),
+            "同一事件内的合法同时关闭不得产生失败终态"
+        );
+        let starts = tool_call_starts(&frames);
+        assert_eq!(
+            starts
+                .iter()
+                .map(|(_, call_id, _)| call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_a", "call_b"]
+        );
+        let finishes = frames
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                CanonicalStreamEvent::Finish { finish_reason, .. } => Some(finish_reason.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finishes.len(), 2);
+        assert!(finishes
+            .iter()
+            .all(|reason| reason.as_deref() == Some("tool_calls")));
+        let arguments = arguments_by_index(&frames);
+        assert_eq!(arguments[&0], "{\"q\":\"a\"}");
+        assert_eq!(arguments[&1], "{\"q\":\"b\"}");
+    }
+
+    #[test]
+    fn gemini_provider_state_rejects_malformed_partial_args() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        let frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "name": "search",
+                        "partialArgs": [{"jsonPath": "query", "stringValue": "x"}]
+                    })],
+                    None,
+                ),
+            )
+            .expect("malformed jsonPath yields a failure frame");
+        assert!(failure_message(&terminal_failure_payload(&frames)).contains("jsonPath"));
+        assert!(!has_finish(&frames));
+
+        let mut state = GeminiProviderState::default();
+        let frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "name": "search",
+                        "args": {},
+                        "partialArgs": []
+                    })],
+                    None,
+                ),
+            )
+            .expect("args and partialArgs together yield a failure frame");
+        assert!(failure_message(&terminal_failure_payload(&frames)).contains("partialArgs"));
+
+        let mut state = GeminiProviderState::default();
+        let frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({"name": "search", "willContinue": "yes"})],
+                    None,
+                ),
+            )
+            .expect("non-boolean willContinue yields a failure frame");
+        assert!(failure_message(&terminal_failure_payload(&frames)).contains("willContinue"));
     }
 }

@@ -435,36 +435,86 @@ pub fn build_cross_format_openai_responses_request_body_with_model_directives_an
     enable_model_directives: bool,
     history_scope: Option<&str>,
 ) -> Option<Value> {
-    let chat_like_request =
-        chat_compatible_body_for_standard_source(body_json, client_api_format, history_scope)?;
+    let source_is_openai_responses = matches!(
+        aether_ai_formats::normalize_api_format_alias(client_api_format).as_str(),
+        "openai:responses" | "openai:responses:compact"
+    );
     let conversion_kind = request_conversion_kind(client_api_format, provider_api_format)?;
-    let provider_request_body = match conversion_kind {
-        RequestConversionKind::ToOpenAIChat => {
-            build_local_openai_chat_request_body_with_model_directives(
-                chat_like_request.as_ref(),
-                mapped_model,
-                upstream_is_stream,
-                enable_model_directives,
-            )?
+    // 同格式 Responses/compact 与 Chat 目标保持既有路由;仅跨格式 Claude/Gemini
+    // 需要绕过会丢失类型化工具元数据的 Chat 中转。
+    let direct_responses_conversion = source_is_openai_responses
+        && matches!(
+            conversion_kind,
+            RequestConversionKind::ToClaudeStandard | RequestConversionKind::ToGeminiStandard
+        );
+    let provider_request_body = if direct_responses_conversion {
+        // Responses 源必须直接走规范转换:经 Chat 中转会把 custom/tool_search/deferred
+        // 等类型化工具元数据降级丢失,再转 Claude/Gemini 无法恢复。
+        let has_previous_response = body_json
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let expanded = if has_previous_response {
+            Some(
+                crate::formats::openai::responses::history::expand_previous_response_for_chat(
+                    body_json,
+                    history_scope,
+                )
+                .ok()?,
+            )
+        } else {
+            None
+        };
+        let body_for_conversion = expanded.as_ref().unwrap_or(body_json);
+        let mut format_context = FormatContext::default()
+            .with_mapped_model(mapped_model)
+            .with_upstream_stream(upstream_is_stream);
+        if let Some(history_scope) = history_scope {
+            format_context = format_context.with_history_scope(history_scope);
         }
-        RequestConversionKind::ToOpenAiResponses => {
-            convert_openai_chat_request_to_openai_responses_request(
-                chat_like_request.as_ref(),
-                mapped_model,
-                upstream_is_stream,
-                false,
-            )?
+        aether_ai_formats::convert_request(
+            client_api_format,
+            provider_api_format,
+            body_for_conversion,
+            &format_context,
+        )
+        .ok()?
+    } else {
+        let chat_like_request =
+            chat_compatible_body_for_standard_source(body_json, client_api_format, history_scope)?;
+        match conversion_kind {
+            RequestConversionKind::ToOpenAIChat => {
+                build_local_openai_chat_request_body_with_model_directives(
+                    chat_like_request.as_ref(),
+                    mapped_model,
+                    upstream_is_stream,
+                    enable_model_directives,
+                )?
+            }
+            RequestConversionKind::ToOpenAiResponses => {
+                convert_openai_chat_request_to_openai_responses_request(
+                    chat_like_request.as_ref(),
+                    mapped_model,
+                    upstream_is_stream,
+                    false,
+                )?
+            }
+            RequestConversionKind::ToClaudeStandard => {
+                convert_openai_chat_request_to_claude_request(
+                    chat_like_request.as_ref(),
+                    mapped_model,
+                    upstream_is_stream,
+                )?
+            }
+            RequestConversionKind::ToGeminiStandard => {
+                convert_openai_chat_request_to_gemini_request(
+                    chat_like_request.as_ref(),
+                    mapped_model,
+                    upstream_is_stream,
+                )?
+            }
         }
-        RequestConversionKind::ToClaudeStandard => convert_openai_chat_request_to_claude_request(
-            chat_like_request.as_ref(),
-            mapped_model,
-            upstream_is_stream,
-        )?,
-        RequestConversionKind::ToGeminiStandard => convert_openai_chat_request_to_gemini_request(
-            chat_like_request.as_ref(),
-            mapped_model,
-            upstream_is_stream,
-        )?,
     };
     let mut provider_request_body = with_model_directive_overrides(
         provider_request_body,
@@ -684,6 +734,203 @@ mod tests {
         assert_eq!(provider_request_body["model"], "gpt-5-upstream");
         assert_eq!(provider_request_body["messages"][0]["role"], "user");
         assert_eq!(provider_request_body["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn runtime_builder_keeps_custom_text_tool_when_targeting_claude() {
+        // 运行时 Responses→Claude 必须直连规范转换:经 Chat 中转会返回 None。
+        let body_json = json!({
+            "model": "smoke-model",
+            "input": "Run text",
+            "tools": [{
+                "type": "custom",
+                "name": "terminal",
+                "format": {"type": "text"}
+            }]
+        });
+
+        let provider_request_body = build_cross_format_openai_responses_request_body(
+            &body_json,
+            "upstream-model",
+            "openai:responses",
+            "claude:messages",
+            true,
+        )
+        .expect("Responses custom tool must convert directly to Claude");
+
+        assert_eq!(provider_request_body["model"], "upstream-model");
+        assert_eq!(provider_request_body["stream"], true);
+        let tools = provider_request_body["tools"]
+            .as_array()
+            .expect("Claude tools array");
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "terminal")
+            .expect("custom tool survives as a Claude function");
+        assert!(tool.get("input_schema").is_some(), "{tool}");
+    }
+
+    #[test]
+    fn runtime_builder_keeps_discovered_tool_history_when_targeting_claude() {
+        let body_json = json!({
+            "model": "smoke-model",
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "call_id": "ts_1",
+                    "execution": "client",
+                    "arguments": {"query": "lookup"}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "ts_1",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "description": "Look up records",
+                        "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+                    }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_lookup",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"x\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_lookup",
+                    "output": "ok"
+                },
+                {"type": "message", "role": "user", "content": "go"}
+            ],
+            "tools": [{"type": "tool_search", "execution": "client"}]
+        });
+
+        let provider_request_body = build_cross_format_openai_responses_request_body(
+            &body_json,
+            "upstream-model",
+            "openai:responses",
+            "claude:messages",
+            true,
+        )
+        .expect("discovered tool history must convert directly to Claude");
+
+        let tools = provider_request_body["tools"]
+            .as_array()
+            .expect("Claude tools array");
+        assert!(
+            tools.iter().any(|tool| tool["name"] == "lookup"),
+            "{provider_request_body}"
+        );
+        assert!(
+            provider_request_body.to_string().contains("lookup"),
+            "{provider_request_body}"
+        );
+    }
+
+    #[test]
+    fn runtime_builder_expands_scoped_history_for_direct_claude_conversion() {
+        use crate::api::{
+            build_cross_format_openai_responses_request_body_with_provider_context as responses,
+            record_converted_response_history,
+        };
+        let response_id = "resp_direct_claude_history";
+        let scope = "direct-claude-history-scope";
+        record_converted_response_history(
+            &json!({
+                "needs_conversion": true,
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:chat",
+                "api_key_id": scope,
+                "original_request_body": {"model": "client", "input": "first"}
+            }),
+            &json!({
+                "id": response_id,
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "remembered"}]
+                }]
+            }),
+        )
+        .expect("seed scoped history");
+
+        let input = json!({
+            "model": "client",
+            "previous_response_id": response_id,
+            "input": "second"
+        });
+        let built = responses(
+            &input,
+            "claude-upstream",
+            "openai:responses",
+            "anthropic",
+            "claude:messages",
+            true,
+            false,
+            Some(scope),
+        )
+        .expect("expand scoped history through direct conversion");
+
+        let rendered = built.to_string();
+        let first = rendered.find("first").expect("hydrated first turn");
+        let remembered = rendered.find("remembered").expect("hydrated response");
+        let second = rendered.find("second").expect("current turn");
+        assert!(first < remembered && remembered < second, "{built}");
+        assert!(responses(
+            &input,
+            "claude-upstream",
+            "openai:responses",
+            "anthropic",
+            "claude:messages",
+            true,
+            false,
+            Some("different-scope"),
+        )
+        .is_none());
+    }
+
+    /// Responses include/reasoning.summary/additional_tools 在直连 Claude 时按既有审计规则降级。
+    #[test]
+    fn runtime_builder_applies_responses_cross_format_normalization_directly() {
+        let body_json = json!({
+            "model": "smoke-model",
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {}}
+                    }]
+                },
+                {"type": "message", "role": "user", "content": "hi"}
+            ]
+        });
+
+        let built = build_cross_format_openai_responses_request_body(
+            &body_json,
+            "upstream-model",
+            "openai:responses",
+            "claude:messages",
+            true,
+        )
+        .expect("audited Responses normalization must survive direct conversion");
+
+        assert_eq!(built["model"], "upstream-model");
+        assert!(
+            built["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "lookup")),
+            "{built}"
+        );
+        assert!(built.get("include").is_none(), "{built}");
     }
 
     #[test]

@@ -6,7 +6,9 @@ use serde_json::{json, Map, Value};
 
 use crate::formats::openai::responses::openai_responses_message_item_id;
 use crate::formats::openai::responses::{
-    decode_gemini_tool_signature_carrier, GeminiToolSignatureCarrierDirection,
+    claude_reasoning_carrier_is_malformed, decode_claude_reasoning_carrier,
+    decode_gemini_tool_signature_carrier, ClaudeReasoningCarrier,
+    GeminiToolSignatureCarrierDirection,
 };
 use crate::formats::openai::shared::map_thinking_budget_to_openai_reasoning_effort;
 use crate::formats::shared::model_directives::ReasoningEffort;
@@ -1437,22 +1439,38 @@ pub(crate) fn canonical_to_openai_responses_response_with_profile(
     canonical: &CanonicalResponse,
     report_context: &Value,
     compact: bool,
-) -> Value {
-    crate::formats::openai::responses::response::to_raw(canonical, report_context, compact)
+) -> Option<Value> {
+    crate::formats::openai::responses::response::try_to_raw(canonical, report_context, compact)
+}
+
+/// 供审计过的转换路径使用：carrier 编码失败时返回 None，由调用方 fail closed。
+pub(crate) fn try_canonical_to_openai_responses_response(
+    canonical: &CanonicalResponse,
+    report_context: &Value,
+) -> Option<Value> {
+    canonical_to_openai_responses_response_with_profile(canonical, report_context, false)
+}
+
+/// 供审计过的 compact 转换路径使用。
+pub(crate) fn try_canonical_to_openai_responses_compact_response(
+    canonical: &CanonicalResponse,
+    report_context: &Value,
+) -> Option<Value> {
+    canonical_to_openai_responses_response_with_profile(canonical, report_context, true)
 }
 
 pub fn canonical_to_openai_responses_response(
     canonical: &CanonicalResponse,
     report_context: &Value,
 ) -> Value {
-    canonical_to_openai_responses_response_with_profile(canonical, report_context, false)
+    crate::formats::openai::responses::response::to_raw(canonical, report_context, false)
 }
 
 pub fn canonical_to_openai_responses_compact_response(
     canonical: &CanonicalResponse,
     report_context: &Value,
 ) -> Value {
-    canonical_to_openai_responses_response_with_profile(canonical, report_context, true)
+    crate::formats::openai::responses::response::to_raw(canonical, report_context, true)
 }
 
 pub fn canonical_to_claude_response(canonical: &CanonicalResponse) -> Value {
@@ -1696,6 +1714,7 @@ pub(crate) fn gemini_contents_to_canonical_messages(
 /// 返回的字段后缀由调用方拼入原始路径，使同步与流式转换执行同一 fail-closed 边界。
 pub(crate) fn audit_gemini_cross_format_response_part(
     part: &Map<String, Value>,
+    allow_partial_args: bool,
 ) -> Result<(), String> {
     let variants: [(&str, &str); 7] = [
         ("inlineData", "inline_data"),
@@ -1772,6 +1791,17 @@ pub(crate) fn audit_gemini_cross_format_response_part(
     let allowed: &[&str] = match primary_camel {
         "inlineData" => &["mimeType", "mime_type", "data"],
         "fileData" => &["mimeType", "mime_type", "fileUri", "file_uri"],
+        // partialArgs/willContinue 是 Gemini 流式增量函数调用的独占 wire 状态：
+        // 仅流式审计允许，同步响应无法无损承载，必须继续 fail-closed。
+        "functionCall" if allow_partial_args => &[
+            "id",
+            "name",
+            "args",
+            "partialArgs",
+            "partial_args",
+            "willContinue",
+            "will_continue",
+        ],
         "functionCall" => &["id", "name", "args"],
         "functionResponse" => &["id", "name", "response"],
         "executableCode" => &["language", "code"],
@@ -1790,6 +1820,26 @@ pub(crate) fn audit_gemini_cross_format_response_part(
         .find(|field| !allowed.contains(&field.as_str()))
     {
         return Err(format!("{primary_camel}.{field}"));
+    }
+    if primary_camel == "functionCall" && allow_partial_args {
+        if let Some(partial_args) = object
+            .get("partialArgs")
+            .or_else(|| object.get("partial_args"))
+        {
+            let shape_is_valid = partial_args
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(Value::is_object));
+            if !shape_is_valid {
+                return Err("functionCall.partialArgs".to_string());
+            }
+        }
+        if object
+            .get("willContinue")
+            .or_else(|| object.get("will_continue"))
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err("functionCall.willContinue".to_string());
+        }
     }
     Ok(())
 }
@@ -2984,7 +3034,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
         Value::Array(items) => {
             let mut messages = Vec::new();
             let mut next_generated_tool_call_index = 0usize;
-            let mut pending_reasoning: Option<CanonicalContentBlock> = None;
+            let mut pending_reasoning: Vec<CanonicalContentBlock> = Vec::new();
             for item in items {
                 if let Some(text) = item.as_str() {
                     if !text.trim().is_empty() {
@@ -2997,7 +3047,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             extensions: BTreeMap::new(),
                         });
                     }
-                    pending_reasoning = None;
+                    pending_reasoning.clear();
                     continue;
                 }
                 let Some(item_object) = item.as_object() else {
@@ -3005,7 +3055,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                         item,
                         String::new(),
                     ));
-                    pending_reasoning = None;
+                    pending_reasoning.clear();
                     continue;
                 };
                 let item_type = item_object
@@ -3016,7 +3066,11 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                     .to_ascii_lowercase();
                 match item_type.as_str() {
                     "reasoning" => {
-                        let reasoning = openai_responses_reasoning_block_from_item(item_object);
+                        let reasoning =
+                            match openai_responses_reasoning_block_from_item(item_object) {
+                                Ok(reasoning) => reasoning,
+                                Err(()) => return None,
+                            };
                         let previous_signature = reasoning.as_ref().and_then(|block| match block {
                             CanonicalContentBlock::Thinking {
                                 text,
@@ -3036,11 +3090,13 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                                 &mut messages,
                                 signature,
                             ) {
-                                pending_reasoning = None;
+                                pending_reasoning.clear();
                                 continue;
                             }
                         }
-                        pending_reasoning = reasoning;
+                        if let Some(reasoning) = reasoning {
+                            pending_reasoning.push(reasoning);
+                        }
                     }
                     "message" => {
                         let role = openai_role_to_canonical(
@@ -3061,11 +3117,12 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             extensions,
                         };
                         if is_assistant {
-                            if let Some(reasoning) = pending_reasoning.take() {
-                                prepend_openai_responses_reasoning_block(&mut message, reasoning);
-                            }
+                            prepend_openai_responses_reasoning_blocks(
+                                &mut message,
+                                std::mem::take(&mut pending_reasoning),
+                            );
                         } else {
-                            pending_reasoning = None;
+                            pending_reasoning.clear();
                         }
                         messages.push(message);
                     }
@@ -3144,11 +3201,12 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                         let tool_use = CanonicalContentBlock::ToolUse {
                             id,
                             name,
-                            input: parse_jsonish_value(
-                                item_object
-                                    .get("input")
-                                    .or_else(|| item_object.get("arguments")),
-                            ),
+                            // custom tool input 是完整自由文本，不得 JSON 解析后丢失外层 `input` 文本。
+                            input: item_object
+                                .get("input")
+                                .or_else(|| item_object.get("arguments"))
+                                .cloned()
+                                .unwrap_or_else(|| json!({})),
                             extensions,
                         };
                         append_openai_responses_tool_use(
@@ -3254,7 +3312,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             }],
                             extensions: BTreeMap::new(),
                         });
-                        pending_reasoning = None;
+                        pending_reasoning.clear();
                     }
                     "custom_tool_call_output"
                     | "tool_search_output"
@@ -3271,11 +3329,11 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             )],
                             extensions: BTreeMap::new(),
                         });
-                        pending_reasoning = None;
+                        pending_reasoning.clear();
                     }
                     _ => {
                         messages.push(openai_responses_opaque_input_item_message(item, item_type));
-                        pending_reasoning = None;
+                        pending_reasoning.clear();
                     }
                 }
             }
@@ -3304,25 +3362,26 @@ fn openai_responses_opaque_input_item_message(item: &Value, raw_type: String) ->
 fn append_openai_responses_tool_use(
     messages: &mut Vec<CanonicalMessage>,
     mut tool_use: CanonicalContentBlock,
-    pending_reasoning: &mut Option<CanonicalContentBlock>,
+    pending_reasoning: &mut Vec<CanonicalContentBlock>,
 ) {
-    let mut reasoning = pending_reasoning.take();
-    if let Some(CanonicalContentBlock::Thinking {
-        text,
-        encrypted_content: Some(carrier),
-        ..
-    }) = reasoning.as_ref()
-    {
-        if text.trim().is_empty() {
-            if let Some((signature, GeminiToolSignatureCarrierDirection::Next)) =
-                decode_gemini_tool_signature_carrier(carrier)
-            {
-                if let CanonicalContentBlock::ToolUse { extensions, .. } = &mut tool_use {
-                    canonical_extension_object_mut(extensions, "gemini")
-                        .insert("thoughtSignature".to_string(), Value::String(signature));
-                    reasoning = None;
-                }
-            }
+    let mut reasoning = std::mem::take(pending_reasoning);
+    let next_signature = reasoning.last().and_then(|block| match block {
+        CanonicalContentBlock::Thinking {
+            text,
+            encrypted_content: Some(carrier),
+            ..
+        } if text.trim().is_empty() => {
+            decode_gemini_tool_signature_carrier(carrier).and_then(|(signature, direction)| {
+                (direction == GeminiToolSignatureCarrierDirection::Next).then_some(signature)
+            })
+        }
+        _ => None,
+    });
+    if let Some(signature) = next_signature {
+        if let CanonicalContentBlock::ToolUse { extensions, .. } = &mut tool_use {
+            canonical_extension_object_mut(extensions, "gemini")
+                .insert("thoughtSignature".to_string(), Value::String(signature));
+            reasoning.pop();
         }
     }
     if let Some(last_message) = messages.last_mut() {
@@ -3330,18 +3389,15 @@ fn append_openai_responses_tool_use(
             && (!is_openai_responses_input_message(&last_message.extensions)
                 || canonical_assistant_message_has_visible_content(last_message))
         {
-            if let Some(reasoning) = reasoning {
-                prepend_openai_responses_reasoning_block(last_message, reasoning);
-            }
+            // pending reasoning 紧跟在这条既有 assistant 内容之后、工具调用之前；
+            // 直接追加以保持原顺序，不因已有 thinking 而丢弃，也不前插重排。
+            last_message.content.extend(reasoning);
             last_message.content.push(tool_use);
             return;
         }
     }
 
-    let mut content = Vec::new();
-    if let Some(reasoning) = reasoning {
-        content.push(reasoning);
-    }
+    let mut content = reasoning;
     content.push(tool_use);
     messages.push(CanonicalMessage {
         role: CanonicalRole::Assistant,
@@ -3383,31 +3439,40 @@ fn canonical_assistant_message_has_visible_content(message: &CanonicalMessage) -
     })
 }
 
-fn prepend_openai_responses_reasoning_block(
+fn prepend_openai_responses_reasoning_blocks(
     message: &mut CanonicalMessage,
-    reasoning: CanonicalContentBlock,
+    reasoning: Vec<CanonicalContentBlock>,
 ) {
-    if message
-        .content
-        .iter()
-        .any(|block| matches!(block, CanonicalContentBlock::Thinking { .. }))
+    if reasoning.is_empty()
+        || message
+            .content
+            .iter()
+            .any(|block| matches!(block, CanonicalContentBlock::Thinking { .. }))
     {
         return;
     }
-    message.content.insert(0, reasoning);
+    // 保持 Responses 中多个 reasoning item 的原始顺序。
+    message.content.splice(0..0, reasoning);
 }
 
 fn openai_responses_reasoning_block_from_item(
     item_object: &Map<String, Value>,
-) -> Option<CanonicalContentBlock> {
+) -> Result<Option<CanonicalContentBlock>, ()> {
     let text = openai_responses_reasoning_text(item_object);
     let encrypted_content = item_object
         .get("encrypted_content")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    if let Some(carrier) = responses_reasoning_item_claude_carrier(item_object)? {
+        if matches!(carrier, ClaudeReasoningCarrier::Redacted(_)) && !text.trim().is_empty() {
+            // redacted_thinking 无文本；带文本的 carrier 结构不一致，必须 fail closed。
+            return Err(());
+        }
+        return Ok(Some(claude_thinking_block_from_carrier(carrier, text)));
+    }
     if text.is_empty() && encrypted_content.is_none() {
-        return None;
+        return Ok(None);
     }
     let mut extensions = BTreeMap::new();
     extensions.extend(openai_responses_extensions(
@@ -3428,12 +3493,51 @@ fn openai_responses_reasoning_block_from_item(
     canonical_extension_object_mut(&mut extensions, "openai")
         .insert("omit_reasoning_parts".to_string(), Value::Bool(true));
     let extensions = openai_thinking_extensions(extensions);
-    Some(CanonicalContentBlock::Thinking {
+    Ok(Some(CanonicalContentBlock::Thinking {
         text,
         signature: None,
         encrypted_content,
         extensions,
-    })
+    }))
+}
+
+/// 区分「没有内部 carrier」与「内部 carrier 损坏」；损坏必须让调用方 fail closed。
+fn responses_reasoning_item_claude_carrier(
+    item_object: &Map<String, Value>,
+) -> Result<Option<ClaudeReasoningCarrier>, ()> {
+    let Some(raw) = item_object
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if claude_reasoning_carrier_is_malformed(raw) {
+        return Err(());
+    }
+    Ok(decode_claude_reasoning_carrier(raw))
+}
+
+/// 把已解码的 Claude carrier 还原为带 Claude 来源标记的规范 Thinking 块。
+fn claude_thinking_block_from_carrier(
+    carrier: ClaudeReasoningCarrier,
+    text: String,
+) -> CanonicalContentBlock {
+    let extensions = claude_thinking_extensions(BTreeMap::new());
+    match carrier {
+        ClaudeReasoningCarrier::Signature(signature) => CanonicalContentBlock::Thinking {
+            text,
+            signature: Some(signature),
+            encrypted_content: None,
+            extensions,
+        },
+        ClaudeReasoningCarrier::Redacted(data) => CanonicalContentBlock::Thinking {
+            text: String::new(),
+            signature: None,
+            encrypted_content: Some(data),
+            extensions,
+        },
+    }
 }
 
 fn openai_responses_reasoning_text(item_object: &Map<String, Value>) -> String {
@@ -3539,14 +3643,61 @@ pub(crate) fn openai_responses_output_to_canonical(
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                     .map(ToOwned::to_owned);
-                let mut texts = openai_responses_reasoning_text_parts(item_object.get("content"));
+                let mut texts = openai_responses_reasoning_text_parts(item_object.get("content"))
+                    .into_iter()
+                    .filter(|text| !text.trim().is_empty())
+                    .collect::<Vec<_>>();
                 if texts.is_empty() {
-                    texts = openai_responses_reasoning_text_parts(item_object.get("summary"));
+                    texts = openai_responses_reasoning_text_parts(item_object.get("summary"))
+                        .into_iter()
+                        .filter(|text| !text.trim().is_empty())
+                        .collect();
+                }
+                let carrier = match responses_reasoning_item_claude_carrier(item_object) {
+                    Ok(carrier) => carrier,
+                    Err(()) => return None,
+                };
+                if let Some(carrier) = carrier {
+                    match carrier {
+                        ClaudeReasoningCarrier::Redacted(data) => {
+                            // redacted_thinking 不携带可见文本；结构冲突时 fail closed。
+                            if !texts.is_empty() {
+                                return None;
+                            }
+                            blocks.push(claude_thinking_block_from_carrier(
+                                ClaudeReasoningCarrier::Redacted(data),
+                                String::new(),
+                            ));
+                        }
+                        ClaudeReasoningCarrier::Signature(signature) => {
+                            if texts.is_empty() {
+                                blocks.push(claude_thinking_block_from_carrier(
+                                    ClaudeReasoningCarrier::Signature(signature),
+                                    String::new(),
+                                ));
+                            } else {
+                                let last_index = texts.len() - 1;
+                                for (index, text) in texts.into_iter().enumerate() {
+                                    if index == last_index {
+                                        blocks.push(claude_thinking_block_from_carrier(
+                                            ClaudeReasoningCarrier::Signature(signature.clone()),
+                                            text,
+                                        ));
+                                    } else {
+                                        blocks.push(CanonicalContentBlock::Thinking {
+                                            text,
+                                            signature: None,
+                                            encrypted_content: None,
+                                            extensions: claude_thinking_extensions(BTreeMap::new()),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
                 }
                 for text in texts {
-                    if text.trim().is_empty() {
-                        continue;
-                    }
                     let mut extensions = openai_responses_extensions(
                         item_object,
                         &[
@@ -3658,11 +3809,12 @@ pub(crate) fn openai_responses_output_to_canonical(
                 blocks.push(CanonicalContentBlock::ToolUse {
                     id,
                     name: name.to_string(),
-                    input: parse_jsonish_value(
-                        item_object
-                            .get("input")
-                            .or_else(|| item_object.get("arguments")),
-                    ),
+                    // 同请求侧：保留原始 custom 输入文本，避免 JSON 形态文本被二次包装。
+                    input: item_object
+                        .get("input")
+                        .or_else(|| item_object.get("arguments"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
                     extensions,
                 });
             }
@@ -4562,11 +4714,29 @@ fn openai_thinking_extensions(mut extensions: BTreeMap<String, Value>) -> BTreeM
     extensions
 }
 
-fn mark_openai_custom_tool_call(extensions: &mut BTreeMap<String, Value>) {
+pub(crate) fn mark_openai_custom_tool_call(extensions: &mut BTreeMap<String, Value>) {
     canonical_extension_object_mut(extensions, AETHER_EXTENSION_NAMESPACE).insert(
         "source".to_string(),
         Value::String(OPENAI_CUSTOM_TOOL_CALL_SOURCE_MARKER.to_string()),
     );
+}
+
+/// 清除 custom_tool_call 来源标记，使被降级为 function 的 custom 调用按函数参数输出。
+pub(crate) fn clear_openai_custom_tool_call_marker(extensions: &mut BTreeMap<String, Value>) {
+    let Some(aether) = extensions
+        .get_mut(AETHER_EXTENSION_NAMESPACE)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if aether.get("source").and_then(Value::as_str) != Some(OPENAI_CUSTOM_TOOL_CALL_SOURCE_MARKER) {
+        return;
+    }
+    aether.remove("source");
+    let empty = aether.is_empty();
+    if empty {
+        extensions.remove(AETHER_EXTENSION_NAMESPACE);
+    }
 }
 
 fn remember_openai_responses_tool_call_item_id(
@@ -6680,7 +6850,11 @@ pub(crate) fn canonical_block_to_claude(
                     "text": text,
                 })));
             }
-            if text.trim().is_empty() {
+            if text.trim().is_empty()
+                && signature
+                    .as_ref()
+                    .is_none_or(|signature| signature.is_empty())
+            {
                 return Some(None);
             }
             let mut out = Map::new();
@@ -7017,46 +7191,28 @@ pub(crate) fn extract_canonical_claude_content_blocks(content: Option<&Value>) -
     }
 }
 
-pub(crate) fn canonical_tools_to_claude(canonical: &CanonicalRequest) -> Vec<Value> {
-    let mut tools = canonical
-        .tools
-        .iter()
-        .map(|tool| {
-            let mut out = Map::new();
-            out.insert("name".to_string(), Value::String(tool.name.clone()));
-            if let Some(description) = &tool.description {
-                out.insert(
-                    "description".to_string(),
-                    Value::String(description.clone()),
-                );
-            }
-            out.insert(
-                "input_schema".to_string(),
-                tool.extensions
-                    .get("claude")
-                    .and_then(Value::as_object)
-                    .and_then(|value| value.get("raw_input_schema"))
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        claude_input_schema_from_tool_parameters(tool.parameters.as_ref())
-                    }),
-            );
-            let mut extra = namespace_extension_object(&tool.extensions, "claude", &out);
-            extra.remove("raw_input_schema");
-            out.extend(extra);
-            Value::Object(out)
-        })
-        .collect::<Vec<_>>();
-    if let Some(builtin_tools) = canonical
-        .extensions
-        .get("claude")
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("builtin_tools"))
-        .and_then(Value::as_array)
-    {
-        tools.extend(builtin_tools.iter().cloned());
+pub(crate) fn canonical_tool_to_claude(tool: &CanonicalToolDefinition) -> Value {
+    let mut out = Map::new();
+    out.insert("name".to_string(), Value::String(tool.name.clone()));
+    if let Some(description) = &tool.description {
+        out.insert(
+            "description".to_string(),
+            Value::String(description.clone()),
+        );
     }
-    tools
+    out.insert(
+        "input_schema".to_string(),
+        tool.extensions
+            .get("claude")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("raw_input_schema"))
+            .cloned()
+            .unwrap_or_else(|| claude_input_schema_from_tool_parameters(tool.parameters.as_ref())),
+    );
+    let mut extra = namespace_extension_object(&tool.extensions, "claude", &out);
+    extra.remove("raw_input_schema");
+    out.extend(extra);
+    Value::Object(out)
 }
 
 fn claude_input_schema_from_tool_parameters(parameters: Option<&Value>) -> Value {

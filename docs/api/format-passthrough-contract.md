@@ -1,6 +1,6 @@
 # Format Passthrough Contract
 
-Last audited: 2026-09-23
+Last audited: 2026-10-28
 
 This document defines the boundary between runtime passthrough, canonical roundtrip tests, and cross-format conversion.
 
@@ -68,6 +68,33 @@ Required behavior:
 跨格式回写 Gemini 时，canonical parser 保留实际函数名，不补造 `unknown`。函数名或参数分片尚未到齐可缓冲；终态仍缺失/空白函数名，或非空参数不是完整 JSON 对象时，返回 `AiSurfaceFinalizeError`。错误信息仅包含索引和原因，不包含原始工具参数。
 
 明确结束的合法无参数调用可输出 `args: {}`；截断参数不能伪造成 `{}`。发生转换错误后不得继续补发调用或正常 `STOP`。原生同格式流仍执行原有透传合同。
+
+### Responses cross-format compatibility
+
+- Synthesized stream failures contain a complete `response.failed.response`
+  snapshot with identity, timestamps, known usage and accumulated output. Partial
+  tool arguments stay incomplete; no successful tool closure or later completion
+  is fabricated. Previously closed text segments retain their completed status.
+- Claude thinking signatures and redacted blocks round-trip through versioned
+  Aether-owned reasoning carriers. Sync and SSE replay preserve separate blocks
+  and their order. Only validated internal carriers are removed on OpenAI egress;
+  real provider ciphertext remains opaque. Malformed carriers and unsupported
+  cross-provider redacted reasoning fail closed.
+- Vertex streaming `partialArgs` supports typed JSON-path updates and continued
+  strings. Argument deltas form one exact JSON object; unsafe out-of-order updates
+  buffer until safe. Explicit parameterless completion yields `{}`, while
+  malformed paths, conflicts and truncated calls fail the stream.
+- Responses client-executed tool search lowers to Chat/Claude functions and
+  restores search-call identity on return. Discovered definitions are loaded from
+  `tool_search_output.tools` even when no top-level tools are repeated. Deferred
+  definitions remain hidden until discovered. Namespace aliases and tool choice
+  use the same request-local inventory; custom text tools preserve raw input when
+  lowered to functions. Hosted search and unsupported custom grammars remain
+  rejected rather than silently weakened.
+- The runtime Responses-to-Claude builder converts directly through the
+  canonical target path, retaining scoped history and tool metadata; it does not
+  stage custom tools through a lossy Chat intermediate. These mappings do not
+  change native same-format passthrough.
 
 ## Pure Conversion Interface
 

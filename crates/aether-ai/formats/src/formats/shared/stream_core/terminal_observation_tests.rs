@@ -4,10 +4,10 @@ use super::{ProviderStreamParser, StreamingStandardTerminalObserver, TerminalStr
 
 fn full_observer(context: &Value) -> StreamingStandardTerminalObserver {
     StreamingStandardTerminalObserver {
-        provider: Some(TerminalStreamParser::Standard(
+        provider: Some(TerminalStreamParser::Standard(Box::new(
             ProviderStreamParser::for_api_format(context["provider_api_format"].as_str().unwrap())
                 .unwrap(),
-        )),
+        ))),
         ..Default::default()
     }
 }

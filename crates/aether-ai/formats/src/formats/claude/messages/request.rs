@@ -3,21 +3,30 @@ use serde_json::{json, Map, Value};
 use crate::{
     formats::{
         context::FormatContext,
-        openai::shared::{
-            map_openai_reasoning_effort_to_claude_output,
-            map_openai_reasoning_effort_to_thinking_budget,
+        openai::{
+            namespace::{LoweredToolChoiceName, NamespaceToolAliases},
+            shared::{
+                map_openai_reasoning_effort_to_claude_output,
+                map_openai_reasoning_effort_to_thinking_budget,
+            },
+            tool_lowering::{
+                custom_tool_function_arguments, tool_search_provider_arguments, ToolLoweringError,
+                ToolLoweringTarget,
+            },
         },
         shared::model_directives::claude_model_uses_adaptive_effort,
     },
     protocol::canonical::{
         canonical_extension_object_mut, canonical_instructions_to_claude_system,
         canonical_messages_to_claude, canonical_openai_reasoning_effort,
-        canonical_tool_choice_to_claude, canonical_tools_to_claude, claude_extensions,
+        canonical_tool_choice_to_claude, canonical_tool_to_claude, claude_extensions,
         claude_generation_config, claude_messages_to_canonical, claude_parallel_tool_calls,
         claude_response_format_to_canonical, claude_system_to_canonical_instructions,
         claude_thinking_to_canonical, claude_tool_choice_to_canonical, claude_tools_to_canonical,
-        compact_canonical_claude_messages, insert_f64, mark_claude_messages_request_source,
-        namespace_extension_object, CanonicalRequest,
+        clear_openai_custom_tool_call_marker, compact_canonical_claude_messages, insert_f64,
+        mark_claude_messages_request_source, namespace_extension_object,
+        openai_responses_extension, CanonicalContentBlock, CanonicalMessage, CanonicalRequest,
+        CanonicalToolChoice,
     },
 };
 
@@ -107,12 +116,34 @@ pub fn to_raw(
     mapped_model: &str,
     upstream_is_stream: bool,
 ) -> Option<Value> {
+    let lowering =
+        if crate::formats::openai::chat::request::canonical_request_has_responses_tool_surface(
+            canonical,
+        ) {
+            NamespaceToolAliases::from_canonical_request(
+                canonical,
+                ToolLoweringTarget::ClaudeMessages,
+            )
+            .ok()?
+        } else {
+            NamespaceToolAliases::from_canonical_tools(&canonical.tools)
+        };
+    if let Some(CanonicalToolChoice::Tool { name }) = canonical.tool_choice.as_ref() {
+        // deferred 但尚未被搜索发现的工具不能出现在 tool_choice 中。
+        if lowering.name_is_declared_but_unoffered(name) {
+            return None;
+        }
+    }
+    let mut rewritten = canonical.clone();
+    for message in &mut rewritten.messages {
+        rewrite_tool_uses_for_claude(message, &lowering).ok()?;
+    }
     let mut output = Map::new();
     output.insert("model".to_string(), Value::String(mapped_model.to_string()));
     output.insert(
         "messages".to_string(),
         Value::Array(compact_canonical_claude_messages(
-            canonical_messages_to_claude(canonical)?,
+            canonical_messages_to_claude(&rewritten)?,
         )),
     );
     output.insert(
@@ -142,14 +173,31 @@ pub fn to_raw(
             Value::Array(stop_sequences.iter().cloned().map(Value::String).collect()),
         );
     }
-    let tools = canonical_tools_to_claude(canonical);
+    let mut tools = Vec::new();
+    for (tool_index, tool) in canonical.tools.iter().enumerate() {
+        if let Some(lowered) =
+            lowering.lowered_tools_for_source(ToolLoweringTarget::ClaudeMessages, tool_index)
+        {
+            tools.extend(lowered);
+        } else {
+            tools.push(canonical_tool_to_claude(tool));
+        }
+    }
+    tools.extend(lowering.discovered_tools(ToolLoweringTarget::ClaudeMessages));
+    if let Some(builtin_tools) = canonical
+        .extensions
+        .get("claude")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("builtin_tools"))
+        .and_then(Value::as_array)
+    {
+        tools.extend(builtin_tools.iter().cloned());
+    }
     if !tools.is_empty() {
         output.insert("tools".to_string(), Value::Array(tools));
     }
-    if let Some(tool_choice) = canonical_tool_choice_to_claude(
-        canonical.tool_choice.as_ref(),
-        canonical.parallel_tool_calls,
-    ) {
+    let tool_choice = claude_tool_choice_with_lowering(canonical, &lowering).ok()?;
+    if let Some(tool_choice) = tool_choice {
         output.insert("tool_choice".to_string(), tool_choice);
     }
     if let Some(metadata) = canonical.metadata.clone() {
@@ -233,4 +281,105 @@ pub fn to_raw(
         }
     }
     Some(Value::Object(output))
+}
+
+/// 读取 Responses 工具调用上的 namespace；`functions` 默认空间由 lowering 归一。
+fn claude_tool_namespace(
+    extensions: &std::collections::BTreeMap<String, Value>,
+) -> Result<Option<String>, ToolLoweringError> {
+    let Some(responses) = openai_responses_extension(extensions).and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(namespace) = responses.get("namespace") else {
+        return Ok(None);
+    };
+    namespace
+        .as_str()
+        .map(str::trim)
+        .filter(|namespace| !namespace.is_empty())
+        .map(|namespace| Ok(Some(namespace.to_string())))
+        .unwrap_or_else(|| {
+            Err(ToolLoweringError::new(
+                "messages[].content[].openai_responses.namespace",
+                "Responses tool call namespace is invalid",
+            ))
+        })
+}
+
+fn claude_tool_item_type(extensions: &std::collections::BTreeMap<String, Value>) -> Option<&str> {
+    openai_responses_extension(extensions)
+        .and_then(|value| value.get("item_type"))
+        .and_then(Value::as_str)
+}
+
+/// 把 Responses 历史工具调用/结果改写为 Claude 可执行形态。
+fn rewrite_tool_uses_for_claude(
+    message: &mut CanonicalMessage,
+    aliases: &NamespaceToolAliases,
+) -> Result<(), ToolLoweringError> {
+    for block in &mut message.content {
+        match block {
+            CanonicalContentBlock::ToolUse {
+                name,
+                input,
+                extensions,
+                ..
+            } => {
+                let namespace =
+                    claude_tool_namespace(extensions)?.filter(|namespace| namespace != "functions");
+                let provider_name = aliases.tool_use_provider_name(namespace.as_deref(), name)?;
+                let custom_lowered =
+                    aliases.custom_tool_is_function_lowered(namespace.as_deref(), name);
+                let is_tool_search = claude_tool_item_type(extensions) == Some("tool_search_call");
+                *name = provider_name;
+                if custom_lowered {
+                    *input = custom_tool_function_arguments(input);
+                    clear_openai_custom_tool_call_marker(extensions);
+                } else if is_tool_search {
+                    *input = tool_search_provider_arguments(input);
+                }
+            }
+            CanonicalContentBlock::ToolResult {
+                output,
+                content_text,
+                extensions,
+                ..
+            } if claude_tool_item_type(extensions) == Some("tool_search_output") => {
+                if let Some(tools) = output.as_ref() {
+                    if let Some(text) = aliases.tool_search_output_text(tools) {
+                        *output = Some(Value::String(text.clone()));
+                        *content_text = Some(text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Claude tool_choice 使用 provider 别名；namespace 子工具在请求中可能只给出 child 名。
+fn claude_tool_choice_with_lowering(
+    canonical: &CanonicalRequest,
+    aliases: &NamespaceToolAliases,
+) -> Result<Option<Value>, ()> {
+    let Some(mut choice) = canonical_tool_choice_to_claude(
+        canonical.tool_choice.as_ref(),
+        canonical.parallel_tool_calls,
+    ) else {
+        return Ok(None);
+    };
+    if let Some(CanonicalToolChoice::Tool { name }) = canonical.tool_choice.as_ref() {
+        match aliases.resolve_tool_choice_name(name) {
+            LoweredToolChoiceName::Unchanged => {}
+            LoweredToolChoiceName::Alias(alias) => {
+                if let Some(object) = choice.as_object_mut() {
+                    object.insert("name".to_string(), Value::String(alias));
+                }
+            }
+            // 多个 namespace/顶层同名函数时不能任选一个,必须 fail closed。
+            LoweredToolChoiceName::Ambiguous => return Err(()),
+        }
+    }
+    Ok(Some(choice))
 }

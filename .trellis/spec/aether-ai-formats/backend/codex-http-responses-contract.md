@@ -110,11 +110,73 @@ tool call, emit one complete `response.failed` event with the accumulated
 Response and usage in the same stream; never splice in another candidate.
 
 Before replaying a Responses conversation to an OpenAI provider, remove only a
-valid Aether Gemini tool-signature carrier. Preserve real provider
-`encrypted_content`, opaque ciphertext, and valid `rs_` reasoning references;
-their prefixes are provider-owned data, not cleanup markers.
+decoded, validated Aether Gemini tool-signature or Claude reasoning carrier.
+Preserve real provider `encrypted_content`, opaque ciphertext, and valid `rs_`
+reasoning references; their prefixes are provider-owned data, not cleanup markers.
 
 Aether stores normal usage/audit records only. It does not store Response bodies or create `response_id` affinity for this Codex HTTP surface.
+
+### Cross-format Responses compatibility
+
+`OpenAIResponsesClientEmitter::emit_error` creates one failed Response snapshot,
+not a bare error with a `response.failed` label. Keep `id`, `object`, `model`,
+`created_at`, accumulated `output`, known `usage`, `status=failed` and nested
+`error`. Already completed items remain completed; open tool arguments remain
+partial/incomplete. An error must not close an unfinished tool as successful or
+emit a later `response.completed`. Provider parse errors after visible output
+use this same terminal boundary.
+
+Claude signed thinking uses
+`aether-claude-reasoning-carrier-v1:signature:<base64>` in a reasoning item's
+`encrypted_content`; redacted thinking uses the `redacted` kind. The signature
+and redacted data are opaque, not newly encrypted by Aether. Preserve each
+thinking block, its text, its signature and its position through synchronous and
+streaming Responses output and subsequent Claude history, including thinking
+interleaved with assistant text and tool calls. Accept signatures from both
+block-start metadata and signature deltas. Reconcile completed item snapshots by
+their own item IDs, never another item's text prefix; a done item repeated in the
+terminal snapshot emits once. Reject malformed owned carriers and redacted
+carriers carrying visible text. Gemini must not receive Claude signatures as
+`thoughtSignature`, nor silently drop redacted blocks.
+
+Audited response conversion enforces the carrier payload bound before emission;
+encoding failure is a conversion error, not missing reasoning. Public raw
+canonical-to-JSON projection keeps its infallible `Value` API and preserves the
+input without truncation; it is not the checked runtime conversion entry point.
+
+Vertex `functionCall.partialArgs` is a streaming-only mapping. Assemble typed
+leaves by `jsonPath`, respecting both leaf and call `willContinue`. A continued
+string stays open until its final fragment or explicit leaf marker. Emitted
+argument deltas must concatenate to exactly the assembled JSON object; buffer
+non-depth-first updates when no safe append-only prefix exists. Correlate
+parallel calls by explicit IDs. Id-less continuation may use only the sole
+remaining active candidate call after another parallel call finishes; never
+guess an ambiguous owner. Validate terminal closure after all candidates in the
+event are consumed. Explicitly finished parameterless calls emit `{}`; malformed
+or unfinished calls emit failure, never an empty success. Synchronous partialArgs
+remains unsupported.
+
+Responses client-executed `tool_search` lowers to a provider function for Chat
+or Claude and restores to `tool_search_call`. Build the inventory from both
+declared tools and `tool_search_output.tools`, including history-only requests
+without top-level `tools`. Hide `defer_loading` definitions until discovered;
+discovered definitions are callable even if their loaded form retains that
+flag. Namespace aliases, tool choice, invocation and result replay share one
+request-local identity map; an ambiguous named tool choice fails conversion.
+Custom text tools lowered to functions restore the original raw `input` string,
+including JSON-looking text. Provider tool-search argument objects are not
+Responses envelopes: a schema property named `arguments` remains intact.
+Discovered client functions named `web_search` win over hosted-name heuristics.
+Hosted search, unsupported custom grammars and unrecognized material fields
+remain fail-closed. Native same-format requests do not enter this lowering.
+
+Cross-format normalization retains leading `additional_tools` declarations and
+audits downgrade values instead of dropping their keys unconditionally. An
+empty `include` or entries limited to `reasoning.encrypted_content` and
+`file_search_call.results` retain the existing conversion behavior; unknown or
+mixed values fail closed. Claude/Gemini may omit Responses `reasoning.summary`
+only for `auto`, `concise`, `detailed`, or `null`, while preserving effort.
+Native same-format metadata bypasses these conversion rules.
 
 ## 4. Validation & Error Matrix
 
@@ -138,6 +200,11 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 | Gemini tool terminal error after visible output | Emit one complete in-band `response.failed` with usage; do not retry another candidate. |
 | Responses replay contains an Aether Gemini carrier | Remove only the decoded, validated carrier. |
 | Responses replay contains provider ciphertext or an `rs_` reference | Preserve it byte-for-byte as provider-owned data. |
+| Aether-synthesized stream failure after text or partial tool arguments | Emit one complete failed Response with known output/usage; no successful tool closure or later completion. |
+| Claude signed/redacted thinking passes through Responses history | Restore the original blocks and signatures in order; reject malformed owned carriers. |
+| Vertex partialArgs continuation or parallel call | Preserve call identity and concatenate deltas into exact JSON; unfinished or conflicting input fails. |
+| Explicitly finished Vertex parameterless function | Emit the named call with `{}` arguments. |
+| Client tool-search output contains discovered deferred definitions | Materialize them once, even without top-level tools, and restore Responses identity on return. |
 | `store=false` | Forward unchanged; create no Aether Response persistence. |
 
 ## 5. Good / Base / Bad Cases
@@ -147,6 +214,14 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 - Good: 5,000-byte fragments cross the prefetch budget at 20,000 bytes; restoration retains all 20,000 consumed bytes before reading the next fragment.
 - Base: Codex sends a compact payload to a native provider; Aether returns the provider `output` array without local state.
 - Base: the selected provider model or stream policy changes the candidate JSON; the planner serializes the final JSON instead of reusing the source bytes.
+- Good: Claude emits signed thinking, redacted thinking and a tool call; the next
+  Responses turn replays all three blocks and its real tool result back to Claude.
+- Good: tool search discovers a deferred namespace child; a tools-less follow-up
+  makes that child callable and restores the namespace on its returned call.
+- Bad: a partial argument string is closed on every fragment, or only the leaf
+  value is returned without the object/key prefix; concatenated deltas are invalid.
+- Bad: a stream error discards accumulated output or labels unfinished tool
+  arguments as completed.
 - Bad: a cross-format provider cannot represent a new input/tool item, and Aether silently removes it to keep the request running.
 - Bad: exact source bytes are selected before model/body/redaction rules finish, undoing the final candidate request.
 - Bad: rebuilding a stream parser from a 16,384-byte diagnostic prefix after consuming 20,000 bytes; the missing 3,616 bytes can corrupt JSON or silently shorten a still-valid string.
@@ -173,6 +248,17 @@ Keep focused regressions on the shared paths:
   in-band failure shape, usage retention, and no post-visibility failover.
 - Replay regressions must distinguish a valid Aether carrier from real provider
   ciphertext and `rs_` reasoning references.
+- `openai_responses_client_emitter_failed_terminal_accumulates_output_tools_and_usage`:
+  partial arguments and known usage survive one failed terminal; no successful tool closure.
+- `claude_sync_reasoning_carriers_roundtrip_through_responses` and
+  `claude_stream_reasoning_carriers_roundtrip_through_responses`: replay signed and
+  redacted blocks, ordering and tool results through the real conversion paths.
+- `claude_provider_state_preserves_signature_from_block_start`: initial metadata
+  signatures survive without requiring a later delta.
+- Vertex assembler/provider regressions: escaped strings, nested and out-of-order
+  paths, interleaved leaves, parallel IDs, valid empty calls and terminal truncation.
+- Tool discovery regressions: history-only inventory, deferred loading, namespace
+  collision stability, custom text input and sync/stream identity restoration.
 
 Run the API coverage generator in check mode and `cargo fmt --all --check`. Broaden crate tests only when a focused regression exposes a shared-contract risk.
 

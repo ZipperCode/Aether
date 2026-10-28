@@ -46,6 +46,8 @@ pub enum CanonicalStreamEvent {
     ReasoningDelta(String),
     ReasoningSummaryDone,
     ReasoningSignature(String),
+    /// Claude `redacted_thinking` 块的不透明数据；只有 Claude 协议拥有该块类型。
+    ReasoningRedacted(String),
     ContentPart(CanonicalContentPart),
     ImageGenerationCall {
         index: usize,

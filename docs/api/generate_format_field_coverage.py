@@ -482,6 +482,48 @@ def default_status(field: SourceField, profile: list[CoverageStatus]) -> Coverag
 
 
 def audited_status_override(field: SourceField) -> CoverageStatus | None:
+    if field.provider == "OpenAI" and field.schema in {
+        "NamespaceToolParam",
+        "CustomToolParam",
+        "ToolSearchToolParam",
+        "ToolSearchCall",
+        "ToolSearchCallItemParam",
+        "ToolSearchOutput",
+        "ToolSearchOutputItemParam",
+    }:
+        return CoverageStatus(
+            surface="openai:responses standard",
+            same_format_runtime="native",
+            canonical_roundtrip="extension-preserved",
+            cross_format="mapped/lossy-blocked",
+            notes="Responses client tool search, discovered/deferred functions, namespaces and custom text tools use request-local reversible Chat/Claude lowering; hosted search, unsupported grammars and unrepresentable fields fail closed; native Chat custom tools retain their format",
+        )
+    if (
+        field.provider == "OpenAI"
+        and field.schema == "FunctionTool"
+        and field.field == "defer_loading"
+    ):
+        return CoverageStatus(
+            surface="openai:responses standard",
+            same_format_runtime="native",
+            canonical_roundtrip="extension-preserved",
+            cross_format="mapped/lossy-blocked",
+            notes="Chat/Claude lowering hides deferred functions until tool_search_output discovers them; discovered definitions become callable even when the loaded form retains defer_loading",
+        )
+    if field.provider == "Claude" and (
+        field.schema in {"RedactedThinkingBlock", "RedactedThinkingBlockParam"}
+        or (
+            field.schema in {"ThinkingBlock", "ThinkingBlockParam"}
+            and field.field == "signature"
+        )
+    ):
+        return CoverageStatus(
+            surface="claude:messages standard",
+            same_format_runtime="native",
+            canonical_roundtrip="extension-preserved",
+            cross_format="mapped/lossy-blocked",
+            notes="Claude signed/redacted reasoning round-trips through versioned Aether Responses carriers in sync and streaming output; unsupported targets remain fail closed and real vendor ciphertext stays opaque",
+        )
     if (
         field.provider == "OpenAI"
         and field.schema == "CreateChatCompletionRequest"

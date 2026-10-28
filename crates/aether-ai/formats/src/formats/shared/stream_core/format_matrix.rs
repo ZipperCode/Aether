@@ -17,6 +17,7 @@ use crate::formats::shared::error_body::{
 };
 use crate::formats::shared::sse::encode_json_sse;
 use crate::formats::shared::stream_core::common::{
+    canonical_usage_from_claude_usage, canonical_usage_from_gemini_usage,
     canonical_usage_from_openai_usage, decode_json_data_line, openai_stream_terminal_error_body,
     openai_stream_terminal_error_message, unsupported_stream_event_message, CanonicalStreamEvent,
     CanonicalStreamFrame, CanonicalUsage,
@@ -32,6 +33,8 @@ pub struct StreamingStandardFormatMatrix {
     provider: Option<ProviderStreamParser>,
     client: Option<ClientStreamEmitter>,
     propagated_actual_service_tier: Option<String>,
+    /// 失败前观察到的 usage；终止错误必须把已知用量带进失败响应。
+    known_usage: Option<CanonicalUsage>,
     pending_sse_event: Option<String>,
     terminated: bool,
     history_recorded: bool,
@@ -49,23 +52,43 @@ impl StreamingStandardFormatMatrix {
         }
         self.ensure_initialized(report_context);
         let line = self.apply_sse_event_type(line);
-        if let Some(error_body) = build_client_error_body_for_line(report_context, &line) {
+        if let Some((error_body, usage)) = build_client_error_body_for_line(report_context, &line) {
+            if let Some(usage) = usage {
+                merge_known_usage(&mut self.known_usage, usage);
+            }
             self.terminated = true;
             return self.emit_error(error_body);
         }
-        let (provider, client, propagated_actual_service_tier) = (
-            &mut self.provider,
-            &mut self.client,
-            &mut self.propagated_actual_service_tier,
-        );
-        let Some(provider) = provider.as_mut() else {
-            return Ok(Vec::new());
+        let pushed = {
+            let Some(provider) = self.provider.as_mut() else {
+                return Ok(Vec::new());
+            };
+            match provider.push_line(report_context, line) {
+                Ok(frames) => Ok((
+                    frames,
+                    provider.actual_service_tier().map(ToOwned::to_owned),
+                )),
+                Err(error) => {
+                    // 部分参数组装器等 provider 解析错误在可见输出后必须转成完整失败终态，
+                    // 不能以裸 EOF 结束已提交的流。
+                    Err(error)
+                }
+            }
         };
-        let frames = provider.push_line(report_context, line)?;
-        if provider.actual_service_tier() != propagated_actual_service_tier.as_deref() {
-            *propagated_actual_service_tier = provider.actual_service_tier().map(ToOwned::to_owned);
-            if let Some(client) = client.as_mut() {
-                client.set_actual_service_tier(propagated_actual_service_tier.as_deref());
+        let (frames, actual_service_tier) = match pushed {
+            Ok(pushed) => pushed,
+            Err(error) => {
+                self.capture_provider_known_usage();
+                self.terminated = true;
+                return self.emit_provider_parse_error(report_context, error);
+            }
+        };
+        self.capture_provider_known_usage();
+        if actual_service_tier != self.propagated_actual_service_tier {
+            self.propagated_actual_service_tier = actual_service_tier;
+            if let Some(client) = self.client.as_mut() {
+                let tier = self.propagated_actual_service_tier.clone();
+                client.set_actual_service_tier(tier.as_deref());
             }
         }
         self.emit_frames(report_context, frames)
@@ -80,19 +103,35 @@ impl StreamingStandardFormatMatrix {
             return Ok(Vec::new());
         }
         self.ensure_initialized(report_context);
-        let (provider, client, propagated_actual_service_tier) = (
-            &mut self.provider,
-            &mut self.client,
-            &mut self.propagated_actual_service_tier,
-        );
-        let Some(provider) = provider.as_mut() else {
-            return Ok(Vec::new());
+        let finished = {
+            let Some(provider) = self.provider.as_mut() else {
+                return Ok(Vec::new());
+            };
+            match provider.finish(report_context) {
+                Ok(frames) => Ok((
+                    frames,
+                    provider.actual_service_tier().map(ToOwned::to_owned),
+                )),
+                Err(error) => {
+                    // EOF 时仍处于未完成 partial 调用/未闭合字符串：统一收束为失败终态。
+                    Err(error)
+                }
+            }
         };
-        let frames = provider.finish(report_context)?;
-        if provider.actual_service_tier() != propagated_actual_service_tier.as_deref() {
-            *propagated_actual_service_tier = provider.actual_service_tier().map(ToOwned::to_owned);
-            if let Some(client) = client.as_mut() {
-                client.set_actual_service_tier(propagated_actual_service_tier.as_deref());
+        let (frames, actual_service_tier) = match finished {
+            Ok(finished) => finished,
+            Err(error) => {
+                self.capture_provider_known_usage();
+                self.terminated = true;
+                return self.emit_provider_parse_error(report_context, error);
+            }
+        };
+        self.capture_provider_known_usage();
+        if actual_service_tier != self.propagated_actual_service_tier {
+            self.propagated_actual_service_tier = actual_service_tier;
+            if let Some(client) = self.client.as_mut() {
+                let tier = self.propagated_actual_service_tier.clone();
+                client.set_actual_service_tier(tier.as_deref());
             }
         }
         let mut out = self.emit_frames(report_context, frames)?;
@@ -122,6 +161,10 @@ impl StreamingStandardFormatMatrix {
         report_context: &Value,
         frames: Vec<CanonicalStreamFrame>,
     ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        let known_usage = self.known_usage.clone();
+        if let Some(client) = self.client.as_mut() {
+            client.set_known_usage(known_usage.as_ref());
+        }
         let Some(client) = self.client.as_mut() else {
             return Ok(Vec::new());
         };
@@ -182,10 +225,90 @@ impl StreamingStandardFormatMatrix {
     }
 
     fn emit_error(&mut self, error_body: Value) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        let known_usage = self.known_usage.clone();
+        if let Some(client) = self.client.as_mut() {
+            client.set_known_usage(known_usage.as_ref());
+        }
         let Some(client) = self.client.as_mut() else {
             return Ok(Vec::new());
         };
         client.emit_error(error_body)
+    }
+
+    /// Provider 增量解析失败（partial 参数/未闭合字符串/EOF 未完成）在已提交流中
+    /// 必须作为结构化失败终态下发；客户端格式本身无法表达错误时继续向上返回。
+    fn emit_provider_parse_error(
+        &mut self,
+        report_context: &Value,
+        error: AiSurfaceFinalizeError,
+    ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        let client_api_format = client_api_format_for_context(report_context);
+        let Some(error_body) = build_core_error_body_for_client_format(
+            &client_api_format,
+            &format!("Provider stream ended with an invalid incremental tool payload: {error}"),
+            Some("stream_parse_error"),
+            LocalCoreSyncErrorKind::ServerError,
+        ) else {
+            return Err(error);
+        };
+        let known_usage = self.known_usage.clone();
+        if let Some(client) = self.client.as_mut() {
+            client.set_known_usage(known_usage.as_ref());
+        }
+        let Some(client) = self.client.as_mut() else {
+            return Err(error);
+        };
+        client.emit_error(error_body)
+    }
+
+    /// 从已由 provider 解析并累计的 usage 取一次，供失败终态使用；不重新解码 SSE。
+    fn capture_provider_known_usage(&mut self) {
+        let Some(usage) = self
+            .provider
+            .as_ref()
+            .and_then(ProviderStreamParser::known_usage)
+        else {
+            return;
+        };
+        merge_known_usage(&mut self.known_usage, usage);
+    }
+}
+
+/// 合并分片到达的 usage（Claude 的 input/output 分属不同事件）；已有非零值不被零值覆盖。
+fn merge_known_usage(target: &mut Option<CanonicalUsage>, incoming: CanonicalUsage) {
+    if target.is_none() {
+        *target = Some(incoming);
+        return;
+    }
+    let current = target
+        .as_mut()
+        .expect("known usage was just initialized when absent");
+    if incoming.input_tokens > 0 {
+        current.input_tokens = incoming.input_tokens;
+        current.input_tokens_include_cache = incoming.input_tokens_include_cache;
+    }
+    if incoming.output_tokens > 0 {
+        current.output_tokens = incoming.output_tokens;
+    }
+    if incoming.cache_read_tokens > 0 {
+        current.cache_read_tokens = incoming.cache_read_tokens;
+    }
+    if incoming.cache_creation_tokens > 0 {
+        current.cache_creation_tokens = incoming.cache_creation_tokens;
+    }
+    if incoming.cache_creation_ephemeral_5m_tokens > 0 {
+        current.cache_creation_ephemeral_5m_tokens = incoming.cache_creation_ephemeral_5m_tokens;
+    }
+    if incoming.cache_creation_ephemeral_1h_tokens > 0 {
+        current.cache_creation_ephemeral_1h_tokens = incoming.cache_creation_ephemeral_1h_tokens;
+    }
+    if incoming.reasoning_tokens > 0 {
+        current.reasoning_tokens = incoming.reasoning_tokens;
+    }
+    if incoming.total_tokens > 0 {
+        current.total_tokens = incoming.total_tokens;
+    } else if current.total_tokens == 0 {
+        current.total_tokens = current.input_tokens.saturating_add(current.output_tokens);
     }
 }
 
@@ -415,8 +538,10 @@ impl StreamingStandardTerminalObserver {
 }
 
 enum TerminalStreamParser {
-    Standard(ProviderStreamParser),
-    OpenAIImage(OpenAiImageStreamTerminalState),
+    // 终端观测器每个流只创建一次;两个变体各自装箱,避免任一内联状态
+    // (Responses/Gemini 含多个映射与 usage,Image 亦较大)撑大枚举。
+    Standard(Box<ProviderStreamParser>),
+    OpenAIImage(Box<OpenAiImageStreamTerminalState>),
 }
 
 impl TerminalStreamParser {
@@ -425,7 +550,7 @@ impl TerminalStreamParser {
             .trim()
             .eq_ignore_ascii_case("openai:image")
         {
-            return Some(Self::OpenAIImage(OpenAiImageStreamTerminalState::default()));
+            return Some(Self::OpenAIImage(Box::default()));
         }
         let provider = match ProviderStreamParser::for_api_format(provider_api_format)? {
             ProviderStreamParser::OpenAIChat(_) => {
@@ -439,7 +564,7 @@ impl TerminalStreamParser {
             }
             provider @ ProviderStreamParser::Claude(_) => provider,
         };
-        Some(Self::Standard(provider))
+        Some(Self::Standard(Box::new(provider)))
     }
 }
 
@@ -525,6 +650,16 @@ impl ProviderStreamParser {
             ProviderStreamParser::OpenAIChat(state) => state.actual_service_tier(),
             ProviderStreamParser::OpenAIResponses(state) => state.actual_service_tier(),
             ProviderStreamParser::Claude(_) | ProviderStreamParser::Gemini(_) => None,
+        }
+    }
+
+    /// provider 解析状态已观察到的 usage；矩阵据此填充失败终态，避免再次解码。
+    fn known_usage(&self) -> Option<CanonicalUsage> {
+        match self {
+            ProviderStreamParser::OpenAIChat(state) => state.known_usage(),
+            ProviderStreamParser::OpenAIResponses(state) => state.known_usage(),
+            ProviderStreamParser::Claude(state) => state.known_usage(),
+            ProviderStreamParser::Gemini(state) => state.known_usage(),
         }
     }
 }
@@ -623,6 +758,13 @@ impl ClientStreamEmitter {
             ClientStreamEmitter::OpenAIChat(state) => state.set_actual_service_tier(value),
             ClientStreamEmitter::OpenAIResponses(state) => state.set_actual_service_tier(value),
             ClientStreamEmitter::Claude(_) | ClientStreamEmitter::Gemini(_) => {}
+        }
+    }
+
+    /// 只有 Responses 失败终态需要累积 usage；其他客户端格式无此语义。
+    fn set_known_usage(&mut self, usage: Option<&CanonicalUsage>) {
+        if let ClientStreamEmitter::OpenAIResponses(state) = self {
+            state.set_known_usage(usage);
         }
     }
 
@@ -741,7 +883,10 @@ fn canonical_stream_finish_reason_is_supported(finish_reason: &str) -> bool {
     )
 }
 
-fn build_client_error_body_for_line(report_context: &Value, line: &[u8]) -> Option<Value> {
+fn build_client_error_body_for_line(
+    report_context: &Value,
+    line: &[u8],
+) -> Option<(Value, Option<CanonicalUsage>)> {
     let value = decode_json_data_line(line)?;
     let provider_api_format = provider_api_format_for_context(report_context);
     let client_api_format = report_context
@@ -751,7 +896,39 @@ fn build_client_error_body_for_line(report_context: &Value, line: &[u8]) -> Opti
         .trim()
         .to_ascii_lowercase();
     let (message, code, kind) = parse_provider_error(&provider_api_format, &value)?;
-    build_core_error_body_for_client_format(&client_api_format, &message, code.as_deref(), kind)
+    let body = build_core_error_body_for_client_format(
+        &client_api_format,
+        &message,
+        code.as_deref(),
+        kind,
+    )?;
+    // 复用本条错误行已经解析出的 Value，不额外解码。
+    let usage = provider_usage_from_value(&provider_api_format, &value);
+    Some((body, usage))
+}
+
+/// 从已解析的 provider 载荷提取 usage；仅错误行路径使用。
+fn provider_usage_from_value(provider_api_format: &str, value: &Value) -> Option<CanonicalUsage> {
+    let format = FormatId::parse(provider_api_format)?;
+    let usage = match format {
+        FormatId::GeminiGenerateContent => value
+            .get("usageMetadata")
+            .or_else(|| value.get("response")?.get("usageMetadata")),
+        FormatId::ClaudeMessages => value
+            .get("message")
+            .and_then(|message| message.get("usage"))
+            .or_else(|| value.get("usage")),
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact => value
+            .get("response")
+            .and_then(|response| response.get("usage"))
+            .or_else(|| value.get("usage")),
+        _ => value.get("usage"),
+    };
+    match format {
+        FormatId::GeminiGenerateContent => canonical_usage_from_gemini_usage(usage),
+        FormatId::ClaudeMessages => canonical_usage_from_claude_usage(usage),
+        _ => canonical_usage_from_openai_usage(usage),
+    }
 }
 
 fn parse_provider_error(
@@ -3408,7 +3585,7 @@ mod tests {
     fn agent_bridge_stream_rejects_empty_or_invalid_function_arguments() {
         let report_context = agent_bridge_report_context();
         let mut matrix = StreamingStandardFormatMatrix::default();
-        let error = matrix
+        let output = matrix
             .transform_line(
                 &report_context,
                 data_line(json!({
@@ -3417,8 +3594,20 @@ mod tests {
                     "item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":""}
                 })),
             )
-            .expect_err("empty function arguments must fail closed");
-        assert!(error.to_string().contains("empty arguments"));
+            .expect("parse failure must terminate in-band, not as EOF");
+        let sse = String::from_utf8(output).unwrap();
+        // 行为约束:必须出现错误终态,且不得伪造成功工具完成。
+        assert!(sse.contains("event: error\n"), "{sse}");
+        assert!(!sse.contains("event: response.completed\n"), "{sse}");
+        assert!(
+            !sse.contains("response.function_call_arguments.done"),
+            "{sse}"
+        );
+        // 后续帧必须保持惰性,不能再次输出终态。
+        assert!(matrix
+            .finish(&report_context)
+            .expect("finished matrix should stay inert")
+            .is_empty());
     }
 }
 

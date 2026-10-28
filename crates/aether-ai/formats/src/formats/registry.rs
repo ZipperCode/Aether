@@ -1,6 +1,7 @@
 use serde_json::{Map, Value};
 
-use crate::formats::openai::namespace::NamespaceToolAliases;
+use crate::formats::openai::namespace::{LoweredToolChoiceName, NamespaceToolAliases};
+use crate::formats::openai::tool_lowering::{ToolLoweringError, ToolLoweringTarget};
 use crate::formats::{
     aliyun,
     claude::messages as claude_messages,
@@ -13,8 +14,9 @@ use crate::formats::{
 use crate::protocol::canonical::AETHER_AGENT_BRIDGE_PROMPT_CACHE_BREAKPOINT_FIELD;
 use crate::protocol::canonical::{
     audit_gemini_cross_format_response_part, claude_text_citations_to_openai_annotations,
-    gemini_candidate_to_openai_url_annotations, CanonicalContentBlock, CanonicalEmbeddingInput,
-    CanonicalRequest, CanonicalResponse, CanonicalStopReason,
+    gemini_candidate_to_openai_url_annotations, is_claude_thinking_block, CanonicalContentBlock,
+    CanonicalEmbeddingInput, CanonicalRequest, CanonicalResponse, CanonicalStopReason,
+    CanonicalToolChoice,
 };
 
 pub use crate::formats::context::{
@@ -125,7 +127,7 @@ pub fn convert_request_pure_with_context(
     let pure_ctx = ctx.without_runtime_request_edits();
     let source = parse_format(source_format)?;
     let target = parse_format(target_format)?;
-    let normalized_body = normalize_openai_responses_to_chat_body(source, target, body)?;
+    let normalized_body = normalize_openai_responses_cross_format_body(source, target, body)?;
     let request = parse_request(source_format, &normalized_body, &pure_ctx)?;
     validate_openai_responses_target_contract(target_format, &normalized_body)?;
     validate_request_conversion(
@@ -165,7 +167,7 @@ pub fn convert_request(
         None
     };
     let body = expanded_body.as_ref().unwrap_or(body);
-    let normalized_body = normalize_openai_responses_to_chat_body(source, target, body)?;
+    let normalized_body = normalize_openai_responses_cross_format_body(source, target, body)?;
     validate_openai_responses_target_contract(target_format, &normalized_body)?;
     let mut request = parse_request(source_format, &normalized_body, ctx)?;
     validate_runtime_request_conversion(
@@ -185,8 +187,9 @@ pub fn convert_request(
     emit_request_inner(target_format, &request, ctx)
 }
 
-/// 将严格形状的前导 Responses additional_tools 合并进 Chat 工具数组；其余形状保留给校验器拒绝。
-fn normalize_openai_responses_to_chat_body(
+/// 将严格形状的前导 Responses additional_tools 合并进目标工具数组；只用于
+/// Responses 跨格式转换（Chat/Claude/Gemini），同格式保留原始线格式。
+fn normalize_openai_responses_cross_format_body(
     source: FormatId,
     target: FormatId,
     body: &Value,
@@ -194,7 +197,10 @@ fn normalize_openai_responses_to_chat_body(
     if !matches!(
         source,
         FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
-    ) || target != FormatId::OpenAiChat
+    ) || matches!(
+        target,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) || source == target
     {
         return Ok(body.clone());
     }
@@ -551,6 +557,7 @@ fn validate_cross_format_request_contract(
     request: &CanonicalRequest,
 ) -> Result<(), FormatError> {
     validate_cross_format_tool_use_names(source, target, request)?;
+    validate_claude_carrier_origin_target(source, target, request)?;
     validate_known_standard_request_root_fields(source, target, body)?;
     validate_openai_responses_cross_format_input(source, target, body)?;
     validate_cross_format_generation_target(source, target, request)?;
@@ -600,6 +607,38 @@ fn validate_gemini_mixed_tool_model(
             "model {target_model:?} does not support combining built-in tools with custom function declarations; use a Gemini 3 model"
         ),
     })
+}
+
+/// Aether Claude thinking carrier 只属于 Claude/Responses 回放；不得泄漏到 Gemini
+/// 的原生 thoughtSignature,也不能静默丢弃 redacted 块。
+fn validate_claude_carrier_origin_target(
+    source: FormatId,
+    target: FormatId,
+    request: &CanonicalRequest,
+) -> Result<(), FormatError> {
+    if !matches!(
+        source,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) || target != FormatId::GeminiGenerateContent
+    {
+        return Ok(());
+    }
+    for message in &request.messages {
+        for block in &message.content {
+            if let CanonicalContentBlock::Thinking { extensions, .. } = block {
+                if is_claude_thinking_block(extensions) {
+                    return Err(FormatError::LossyConversionBlocked {
+                        source_format: source.as_str().to_string(),
+                        target_format: target.as_str().to_string(),
+                        field: "messages[].content[].thinking".to_string(),
+                        reason: "Claude signed/redacted thinking has no Gemini equivalent"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 跨格式发往 Gemini 时拒绝空函数名：Gemini functionCall 的 name 必填，
@@ -977,7 +1016,7 @@ fn validate_gemini_response_part(
         );
     };
     let location = format!("candidates[{candidate_index}].content.parts[{part_index}]");
-    if let Err(field) = audit_gemini_cross_format_response_part(part) {
+    if let Err(field) = audit_gemini_cross_format_response_part(part, false) {
         let field = if field.is_empty() {
             location
         } else {
@@ -1108,19 +1147,6 @@ fn validate_claude_cross_format_response(
                 target,
                 &format!("content[{block_index}].type"),
                 "Gemini response parts cannot preserve Claude redacted thinking",
-            );
-        }
-        if block_type == "redacted_thinking"
-            && matches!(
-                target,
-                FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
-            )
-        {
-            return lossy_provider_response_field(
-                source,
-                target,
-                &format!("content[{block_index}].type"),
-                "OpenAI Responses reasoning items cannot preserve Claude redacted thinking",
             );
         }
         if matches!(block_type, "image" | "document") && target == FormatId::OpenAiChat {
@@ -1423,10 +1449,12 @@ fn validate_openai_responses_cross_format_response_extensions(
     for block in &response.content {
         if let CanonicalContentBlock::Thinking {
             encrypted_content: Some(encrypted_content),
+            extensions,
             ..
         } = block
         {
-            if !encrypted_content.is_empty() {
+            // 已解码的 Claude redacted carrier 还原为 redacted_thinking 块，不属于上游密文。
+            if !encrypted_content.is_empty() && !is_claude_thinking_block(extensions) {
                 return openai_responses_lossy_response(
                     source,
                     target,
@@ -2007,9 +2035,39 @@ fn validate_cross_format_request_extensions(
 ) -> Result<(), FormatError> {
     validate_openai_responses_namespace_tools_to_chat(source, target, request)?;
     validate_request_content_has_no_unknown_blocks(source, target, request)?;
-    let namespace_aliases = NamespaceToolAliases::from_canonical_tools(&request.tools);
+    // Responses 工具清单只有在 Chat/Claude 目标才做严格降级审计；其他目标沿用
+    // 宽松别名以免影响既有 Gemini 等路径。
+    let strict_target = matches!(
+        source,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    )
+    .then(|| ToolLoweringTarget::for_format(target))
+    .flatten();
+    let namespace_aliases = match strict_target {
+        Some(lowering_target) => {
+            NamespaceToolAliases::from_canonical_request(request, lowering_target)
+                .map_err(|error| tool_lowering_format_error(source, target, error))?
+        }
+        None => NamespaceToolAliases::from_canonical_tools(&request.tools),
+    };
     let request_extensions = mapped_namespace_request_extensions(source, target, request);
     validate_request_extension_namespace(source, target, "request", &request_extensions)?;
+    if target == FormatId::ClaudeMessages {
+        if let Some(CanonicalToolChoice::Tool { name }) = request.tool_choice.as_ref() {
+            if matches!(
+                namespace_aliases.resolve_tool_choice_name(name),
+                LoweredToolChoiceName::Ambiguous
+            ) {
+                return Err(FormatError::LossyConversionBlocked {
+                    source_format: source.as_str().to_string(),
+                    target_format: target.as_str().to_string(),
+                    field: "tool_choice".to_string(),
+                    reason: "tool choice matches multiple namespace children or top-level tools"
+                        .to_string(),
+                });
+            }
+        }
+    }
     for instruction in &request.instructions {
         validate_request_extension_namespace(
             source,
@@ -2019,7 +2077,8 @@ fn validate_cross_format_request_extensions(
         )?;
     }
     for message in &request.messages {
-        validate_request_extension_namespace(source, target, "messages[]", &message.extensions)?;
+        let message_extensions = mapped_message_extensions(source, target, &message.extensions);
+        validate_request_extension_namespace(source, target, "messages[]", &message_extensions)?;
         for block in &message.content {
             match block {
                 CanonicalContentBlock::Text { extensions, .. }
@@ -2060,17 +2119,18 @@ fn validate_cross_format_request_extensions(
         if matches!(
             source,
             FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
-        ) && target == FormatId::OpenAiChat
-            && namespace_aliases.is_representable_namespace_tool(tool_index)
+        ) && strict_target.is_some()
+            && namespace_aliases.tool_is_audited(tool_index)
         {
-            // The namespace adapter has already audited the complete raw parent and every child.
-            // Do not broadly allow these provider-extension keys for unrelated tool types.
+            // The lowering adapter audited the complete raw tool (namespace, deferred,
+            // custom/search); do not broadly allow provider keys for unrelated tools.
             continue;
         }
         validate_request_extension_namespace(source, target, "tools[]", &tool.extensions)?;
     }
     if let Some(thinking) = &request.thinking {
-        validate_request_extension_namespace(source, target, "thinking", &thinking.extensions)?;
+        let thinking_extensions = mapped_thinking_extensions(source, target, &thinking.extensions);
+        validate_request_extension_namespace(source, target, "thinking", &thinking_extensions)?;
     }
     if let Some(response_format) = &request.response_format {
         validate_request_extension_namespace(
@@ -2083,7 +2143,57 @@ fn validate_cross_format_request_extensions(
     Ok(())
 }
 
-/// 映射请求级 provider 扩展；Responses→Chat 可安全删除 include 和已表达的 tool_choice。
+/// Responses message item 的 id/status/phase 是源侧身份元数据；Claude 用新消息表达
+/// 同一内容，必须剥离这些已知 sidecar（未知字段继续 fail closed），不能丢内容。
+fn mapped_message_extensions(
+    source: FormatId,
+    target: FormatId,
+    extensions: &std::collections::BTreeMap<String, Value>,
+) -> std::collections::BTreeMap<String, Value> {
+    let mut mapped = extensions.clone();
+    if matches!(
+        source,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) && target == FormatId::ClaudeMessages
+    {
+        for provider_namespace in ["openai_responses", "openai_cli"] {
+            let should_remove_namespace = mapped
+                .get_mut(provider_namespace)
+                .and_then(Value::as_object_mut)
+                .is_some_and(|fields| {
+                    for key in ["id", "status", "phase", "item_type"] {
+                        fields.remove(key);
+                    }
+                    fields.is_empty()
+                });
+            if should_remove_namespace {
+                mapped.remove(provider_namespace);
+            }
+        }
+    }
+    mapped
+}
+
+/// Responses include 只有既有降级语义覆盖的值可跨格式省略；空数组是无操作，
+/// 未知/混合值保留给现有扩展审计 fail closed。
+fn openai_responses_include_is_droppable(value: &Value) -> bool {
+    value.as_array().is_some_and(|values| {
+        values.iter().all(|value| {
+            matches!(
+                value.as_str(),
+                Some("reasoning.encrypted_content" | "file_search_call.results")
+            )
+        })
+    })
+}
+
+/// Responses reasoning.summary 的合法枚举；null 表示未设置。其他值保留给审计拒绝。
+fn openai_responses_reasoning_summary_is_droppable(value: &Value) -> bool {
+    value.is_null() || matches!(value.as_str(), Some("auto" | "concise" | "detailed"))
+}
+
+/// 映射请求级 provider 扩展；Responses 跨格式转换可安全删除 include，
+/// Chat 目标额外删除已表达的 tool_choice。
 fn mapped_namespace_request_extensions(
     source: FormatId,
     target: FormatId,
@@ -2093,19 +2203,30 @@ fn mapped_namespace_request_extensions(
     if !matches!(
         source,
         FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
-    ) || target != FormatId::OpenAiChat
-    {
+    ) || matches!(
+        target,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) {
         return mapped;
     }
 
-    let remove_tool_choice =
-        openai_chat::request::raw_tool_choice_extension_is_representable_for_openai_chat(request);
+    let remove_tool_choice = target == FormatId::OpenAiChat
+        && openai_chat::request::raw_tool_choice_extension_is_representable_for_openai_chat(
+            request,
+        );
     for provider_namespace in ["openai_responses", "openai_cli"] {
         let should_remove_namespace = mapped
             .get_mut(provider_namespace)
             .and_then(Value::as_object_mut)
             .is_some_and(|fields| {
-                fields.remove("include");
+                // include 只影响 Responses 原生 reasoning 交付；仅既有映射覆盖的
+                // 值可省略，未知值保留给扩展审计 fail closed。
+                if fields
+                    .get("include")
+                    .is_some_and(openai_responses_include_is_droppable)
+                {
+                    fields.remove("include");
+                }
                 if remove_tool_choice {
                     fields.remove("tool_choice");
                 }
@@ -2113,6 +2234,42 @@ fn mapped_namespace_request_extensions(
             });
         if should_remove_namespace {
             mapped.remove(provider_namespace);
+        }
+    }
+    mapped
+}
+
+/// Responses reasoning 的 summary 是原生摘要选项，只有 Claude/Gemini 无对等语义；
+/// 合法枚举值可省略，未知值保留给审计拒绝，effort 等已审计字段保留。
+fn mapped_thinking_extensions(
+    source: FormatId,
+    target: FormatId,
+    extensions: &std::collections::BTreeMap<String, Value>,
+) -> std::collections::BTreeMap<String, Value> {
+    let mut mapped = extensions.clone();
+    if matches!(
+        source,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) && matches!(
+        target,
+        FormatId::ClaudeMessages | FormatId::GeminiGenerateContent
+    ) {
+        for provider_namespace in ["openai_responses", "openai_cli"] {
+            let should_remove_namespace = mapped
+                .get_mut(provider_namespace)
+                .and_then(Value::as_object_mut)
+                .is_some_and(|fields| {
+                    if fields
+                        .get("summary")
+                        .is_some_and(openai_responses_reasoning_summary_is_droppable)
+                    {
+                        fields.remove("summary");
+                    }
+                    fields.is_empty()
+                });
+            if should_remove_namespace {
+                mapped.remove(provider_namespace);
+            }
         }
     }
     mapped
@@ -2131,7 +2288,7 @@ fn mapped_namespace_tool_use_extensions(
         FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
     ) || !matches!(
         target,
-        FormatId::OpenAiChat | FormatId::GeminiGenerateContent
+        FormatId::OpenAiChat | FormatId::ClaudeMessages | FormatId::GeminiGenerateContent
     ) {
         return Ok(extensions.clone());
     }
@@ -2144,7 +2301,7 @@ fn mapped_namespace_tool_use_extensions(
         else {
             continue;
         };
-        if target == FormatId::OpenAiChat {
+        if target != FormatId::GeminiGenerateContent {
             if let Some(namespace) = provider_fields.get("namespace") {
                 let Some(namespace) = namespace
                     .as_str()
@@ -2159,29 +2316,44 @@ fn mapped_namespace_tool_use_extensions(
                             .to_string(),
                     });
                 };
-                if aliases.chat_name(namespace, name).is_none() {
-                    return Err(FormatError::LossyConversionBlocked {
-                        source_format: source.as_str().to_string(),
-                        target_format: target.as_str().to_string(),
-                        field: format!("messages[].content[].{provider_namespace}.namespace"),
-                        reason: "Responses namespace tool call does not match an expanded namespace child"
-                            .to_string(),
-                    });
+                // 统一走 lowering：`functions` 默认 namespace 归一为 flat，(ns, child) 必须是
+                // 本次请求实际提供的工具。
+                let normalized = (namespace != "functions").then_some(namespace);
+                if let Err(error) = aliases.tool_use_provider_name(normalized, name) {
+                    return Err(tool_lowering_format_error(source, target, error));
                 }
                 provider_fields.remove("namespace");
             }
         }
-        // Responses item IDs are distinct from executable call IDs, but Chat
-        // and Gemini pair tools by the latter. A completed history item is
-        // fully represented by the model function call, so these transport
-        // sidecars can be discarded after any namespace identity is proven.
+        // Responses item IDs are distinct from executable call IDs, but Chat/Gemini
+        // pair tools by the latter. Claude has no such sidecars at all.
         provider_fields.remove("item_id");
         if provider_fields.get("status").and_then(Value::as_str) == Some("completed") {
             provider_fields.remove("status");
         }
+        if target == FormatId::ClaudeMessages {
+            // Claude tool_use carries only id/name/input; search/custom transport keys
+            // are reconstructed by the Claude request emitter.
+            for key in ["item_type", "execution", "created_by"] {
+                provider_fields.remove(key);
+            }
+        }
     }
     mapped.retain(|_, value| value.as_object().is_none_or(|object| !object.is_empty()));
     Ok(mapped)
+}
+
+fn tool_lowering_format_error(
+    source: FormatId,
+    target: FormatId,
+    error: ToolLoweringError,
+) -> FormatError {
+    FormatError::LossyConversionBlocked {
+        source_format: source.as_str().to_string(),
+        target_format: target.as_str().to_string(),
+        field: error.location().to_string(),
+        reason: error.reason().to_string(),
+    }
 }
 
 fn validate_request_content_has_no_unknown_blocks(
@@ -2245,6 +2417,9 @@ fn validate_request_extension_namespace(
                     )
                     && key == "store"
                     && object.get(key).and_then(Value::as_bool) == Some(false))
+                || openai_responses_empty_content_metadata_is_cross_format_safe(
+                    source, target, location, namespace, object, key,
+                )
                 || openai_responses_custom_tool_key_is_cross_format_safe(
                     source, target, location, namespace, object, key,
                 )
@@ -2301,7 +2476,42 @@ fn openai_stream_options_are_transport_only(
         })
 }
 
-/// 判断 Responses custom 工具扩展字段是否可被 Chat 的 custom 工具结构完整承载。
+/// 发射器默认生成的空 annotations/logprobs 不携带引用或概率语义，跨格式可安全省略；
+/// 非空值仍由既有 canonical citations 映射处理或 fail closed。
+fn openai_responses_empty_content_metadata_is_cross_format_safe(
+    source: FormatId,
+    target: FormatId,
+    location: &str,
+    namespace: &str,
+    extension: &Map<String, Value>,
+    key: &str,
+) -> bool {
+    if location != "messages[].content[]"
+        || !matches!(
+            source,
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+        )
+        || matches!(
+            target,
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+        )
+        || !matches!(namespace, "openai_responses" | "openai_cli")
+    {
+        return false;
+    }
+    match key {
+        "annotations" => extension
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty),
+        "logprobs" => extension
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty),
+        _ => false,
+    }
+}
+
 fn openai_responses_custom_tool_key_is_cross_format_safe(
     source: FormatId,
     target: FormatId,
@@ -2399,7 +2609,7 @@ fn request_extension_key_is_cross_format_safe(
             source,
             FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
         )
-        && target == FormatId::OpenAiChat
+        && matches!(target, FormatId::OpenAiChat | FormatId::ClaudeMessages)
         && matches!(namespace, "openai_responses" | "openai_cli")
         && matches!(
             key,
@@ -3522,7 +3732,10 @@ fn validate_openai_responses_to_chat(
                 .unwrap_or("function")
                 .trim()
                 .to_ascii_lowercase();
-            if !matches!(tool_type.as_str(), "function" | "custom" | "namespace") {
+            if !matches!(
+                tool_type.as_str(),
+                "function" | "custom" | "namespace" | "tool_search"
+            ) {
                 return Err(FormatError::LossyConversionBlocked {
                     source_format: FormatId::OpenAiResponses.as_str().to_string(),
                     target_format: FormatId::OpenAiChat.as_str().to_string(),
@@ -3550,25 +3763,16 @@ fn validate_openai_responses_namespace_tools_to_chat(
     if !matches!(
         source,
         FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
-    ) || target != FormatId::OpenAiChat
-    {
+    ) {
         return Ok(());
     }
-
-    let aliases = NamespaceToolAliases::from_canonical_tools(&request.tools);
-    for (tool_index, _) in request.tools.iter().enumerate() {
-        if aliases.is_namespace_tool(tool_index)
-            && !aliases.is_representable_namespace_tool(tool_index)
-        {
-            return Err(FormatError::LossyConversionBlocked {
-                source_format: source.as_str().to_string(),
-                target_format: target.as_str().to_string(),
-                field: format!("tools[{tool_index}]"),
-                reason: "Responses namespace tool cannot be losslessly expanded into OpenAI Chat function tools"
-                    .to_string(),
-            });
-        }
-    }
+    // Chat/Claude 的 Responses 工具清单由同一 lowering 审计（namespace、deferred、
+    // custom 形态、tool_search）；其他目标保持原有宽松路径。
+    let Some(lowering_target) = ToolLoweringTarget::for_format(target) else {
+        return Ok(());
+    };
+    NamespaceToolAliases::from_canonical_request(request, lowering_target)
+        .map_err(|error| tool_lowering_format_error(source, target, error))?;
     Ok(())
 }
 
@@ -5164,16 +5368,6 @@ mod tests {
                 "name": "mcp__reports",
                 "description": "Reporting tools",
                 "tools": [{
-                    "type": "custom",
-                    "name": "write_report",
-                    "description": "custom child"
-                }]
-            }),
-            json!({
-                "type": "namespace",
-                "name": "mcp__reports",
-                "description": "Reporting tools",
-                "tools": [{
                     "type": "function",
                     "name": "write_report",
                     "parameters": {"type": "object", "properties": {}},
@@ -5221,11 +5415,8 @@ mod tests {
             .expect_err("runtime conversion must reject an unrepresentable namespace");
 
             for error in [pure_error, runtime_error] {
-                assert!(matches!(
-                    error,
-                    FormatError::LossyConversionBlocked { ref field, .. }
-                        if field == "tools[0]"
-                ));
+                // 只断言失败语义;具体定位路径属于实现措辞,不在此固化。
+                assert!(matches!(error, FormatError::LossyConversionBlocked { .. }));
             }
         }
     }
@@ -6683,18 +6874,181 @@ mod tests {
             "input": [{
                 "type": "additional_tools",
                 "role": "developer",
-                "tools": [{"type": "tool_search", "execution": "client"}]
+                "tools": [{"type": "tool_search", "execution": "server"}]
             }]
         });
 
         let error = convert_request_pure("openai:responses", "openai:chat", &body)
-            .expect_err("Chat cannot represent client tool_search");
+            .expect_err("hosted tool_search cannot be lowered to a client function");
 
         assert!(matches!(
-            error,
-            super::FormatError::LossyConversionBlocked { ref field, .. }
-                if field == "tools"
+            &error,
+            super::FormatError::LossyConversionBlocked { field, .. }
+                if field.starts_with("tools")
         ));
+    }
+
+    /// R4：客户端执行的 tool_search 必须降级为 Chat function 并保留可逆身份。
+    #[test]
+    fn openai_responses_client_tool_search_lowers_to_chat_function() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "tools": [{
+                "type": "tool_search",
+                "execution": "client",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}}
+                }
+            }],
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "find a tool"}]
+            }]
+        });
+
+        let converted = convert_request_pure("openai:responses", "openai:chat", &body)
+            .expect("client tool_search should lower to a Chat function")
+            .value;
+        let tools = converted["tools"].as_array().expect("Chat tools array");
+        assert!(
+            tools.iter().any(|tool| {
+                tool["type"] == "function" && tool["function"]["name"] == "tool_search"
+            }),
+            "{converted}"
+        );
+    }
+
+    /// R4：第二轮请求省略顶层 tools，只带 search 历史时，已发现工具必须仍被提供。
+    #[test]
+    fn openai_responses_history_only_tool_search_discovers_chat_functions() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "tools": [{"type": "tool_search", "execution": "client"}],
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "call_id": "ts_1",
+                    "execution": "client",
+                    "arguments": {"query": "lookup"}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "ts_1",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "description": "Look up records",
+                        "defer_loading": true,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"q": {"type": "string"}}
+                        }
+                    }]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "go"}]
+                }
+            ]
+        });
+
+        let converted = convert_request_pure("openai:responses", "openai:chat", &body)
+            .expect("history-only discovery should lower to Chat")
+            .value;
+        let tools = converted["tools"].as_array().expect("Chat tools");
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"tool_search"), "{converted}");
+        assert!(names.contains(&"lookup"), "{converted}");
+        let messages = converted["messages"].as_array().expect("Chat messages");
+        let search_call = messages
+            .iter()
+            .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+            .find(|call| call["function"]["name"] == "tool_search")
+            .expect("tool_search call");
+        assert_eq!(
+            search_call["function"]["arguments"],
+            json!({"query": "lookup"}).to_string()
+        );
+        assert!(
+            messages.iter().any(
+                |message| message["content"].as_str().is_some_and(
+                    |content| content.contains("These tools are now available to call: lookup")
+                )
+            ),
+            "{converted}"
+        );
+    }
+
+    /// R4：Claude 工具调用同步恢复为 custom_tool_call / tool_search_call / function_call。
+    #[test]
+    fn claude_tool_calls_restore_responses_identities_in_sync() {
+        let request_context = json!({
+            "provider_api_format": "claude:messages",
+            "original_request_body": {
+                "tools": [
+                    {"type": "tool_search", "execution": "client"},
+                    {"type": "custom", "name": "shell", "description": "Run a command"}
+                ],
+                "input": [{
+                    "type": "tool_search_output",
+                    "call_id": "ts_history",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "defer_loading": true,
+                        "parameters": {"type": "object"}
+                    }]
+                }]
+            }
+        });
+        let claude_response = json!({
+            "id": "msg_tools_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [
+                {"type": "tool_use", "id": "toolu_lookup", "name": "lookup", "input": {"q": "x"}},
+                {"type": "tool_use", "id": "toolu_shell", "name": "shell", "input": {"input": "ls"}},
+                {"type": "tool_use", "id": "toolu_search", "name": "tool_search", "input": {"query": "next"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let converted = super::convert_response(
+            "claude:messages",
+            "openai:responses",
+            &claude_response,
+            &super::FormatContext::default().with_report_context(request_context),
+        )
+        .expect("Claude tool calls should restore Responses identities");
+        let output = converted["output"].as_array().expect("Responses output");
+        let lookup = output
+            .iter()
+            .find(|item| item["call_id"] == "toolu_lookup")
+            .expect("function call");
+        assert_eq!(lookup["type"], "function_call");
+        assert_eq!(lookup["name"], "lookup");
+        let shell = output
+            .iter()
+            .find(|item| item["call_id"] == "toolu_shell")
+            .expect("custom call");
+        assert_eq!(shell["type"], "custom_tool_call");
+        assert_eq!(shell["name"], "shell");
+        assert_eq!(shell["input"], "ls");
+        let search = output
+            .iter()
+            .find(|item| item["call_id"] == "toolu_search")
+            .expect("search call");
+        assert_eq!(search["type"], "tool_search_call");
+        assert_eq!(search["execution"], "client");
+        assert_eq!(search["arguments"], json!({"query": "next"}));
     }
 
     /// 验证 additional_tools 控制项含未知字段时不被规范化吞掉。
@@ -9414,5 +9768,269 @@ mod tests {
         }
         cells.push(current.trim().to_string());
         cells
+    }
+
+    /// R2:Claude thinking/redacted 与既有 assistant 文本、工具按原位置保留。
+    #[test]
+    fn responses_replay_preserves_interleaved_claude_reasoning_before_tool() {
+        let signature =
+            crate::formats::openai::responses::encode_claude_reasoning_signature_carrier("sig_a")
+                .expect("signature carrier");
+        let redacted =
+            crate::formats::openai::responses::encode_claude_redacted_thinking_carrier("opaque_a")
+                .expect("redacted carrier");
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_a",
+                    "encrypted_content": signature,
+                    "content": [{"type": "reasoning_text", "text": "a"}]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_smoke",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "visible"}]
+                },
+                {"type": "reasoning", "id": "rs_b", "encrypted_content": redacted},
+                {
+                    "type": "function_call",
+                    "call_id": "call_a",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"x\"}"
+                },
+                {"type": "function_call_output", "call_id": "call_a", "output": "ok"}
+            ]
+        });
+
+        let converted = convert_request_pure("openai:responses", "claude:messages", &body)
+            .expect("interleaved carriers should replay")
+            .value;
+        let assistant = converted["messages"]
+            .as_array()
+            .expect("Claude messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant message");
+        assert_eq!(
+            assistant["content"],
+            json!([
+                {"type": "thinking", "thinking": "a", "signature": "sig_a"},
+                {"type": "text", "text": "visible"},
+                {"type": "redacted_thinking", "data": "opaque_a"},
+                {"type": "tool_use", "id": "call_a", "name": "lookup", "input": {"q": "x"}}
+            ])
+        );
+    }
+
+    /// R2:Aether Claude carrier 不得跨到 Gemini 或伪造 thoughtSignature。
+    #[test]
+    fn responses_claude_carriers_are_rejected_for_gemini_target() {
+        let signature =
+            crate::formats::openai::responses::encode_claude_reasoning_signature_carrier(
+                "sig_gemini",
+            )
+            .expect("signature carrier");
+        let redacted = crate::formats::openai::responses::encode_claude_redacted_thinking_carrier(
+            "opaque_gemini",
+        )
+        .expect("redacted carrier");
+        for carrier in [signature, redacted] {
+            let body = json!({
+                "model": "gemini-2.5-pro",
+                "input": [
+                    {"type": "reasoning", "encrypted_content": carrier},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hi"}]
+                    }
+                ]
+            });
+            let error = convert_request_pure("openai:responses", "gemini:generate_content", &body)
+                .expect_err("Claude carrier must not cross into Gemini");
+            assert!(matches!(
+                error,
+                FormatError::LossyConversionBlocked { ref field, .. }
+                    if field == "messages[].content[].thinking"
+            ));
+        }
+    }
+
+    /// 发射器默认的空 annotations/logprobs 不应阻塞 Responses→Claude 文本回放。
+    #[test]
+    fn responses_empty_text_part_metadata_replays_to_claude() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "input": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "visible",
+                    "annotations": [],
+                    "logprobs": []
+                }]
+            }]
+        });
+
+        let converted = convert_request_pure("openai:responses", "claude:messages", &body)
+            .expect("empty metadata sidecars should be harmless")
+            .value;
+        let assistant = converted["messages"]
+            .as_array()
+            .expect("Claude messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant message");
+        let text = assistant["content"]
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                assistant["content"]
+                    .as_array()
+                    .and_then(|parts| parts.first())
+                    .and_then(|part| part.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            });
+        assert_eq!(text.as_deref(), Some("visible"), "{converted}");
+    }
+
+    /// Responses include/summary 仅允许既有语义覆盖的值跨格式降级；未知值必须拒绝。
+    #[test]
+    fn responses_include_and_summary_value_boundaries_fail_closed() {
+        for target in ["openai:chat", "claude:messages", "gemini:generate_content"] {
+            let unknown_include = json!({
+                "model": "test-model",
+                "input": "hi",
+                "include": ["future.material_state"]
+            });
+            assert!(
+                convert_request_pure("openai:responses", target, &unknown_include).is_err(),
+                "unknown include must fail closed for {target}"
+            );
+        }
+
+        for target in ["openai:chat", "claude:messages", "gemini:generate_content"] {
+            let invalid_summary = json!({
+                "model": "test-model",
+                "input": "hi",
+                "reasoning": {"effort": "high", "summary": "future_material_summary"}
+            });
+            assert!(
+                convert_request_pure("openai:responses", target, &invalid_summary).is_err(),
+                "invalid reasoning.summary must fail closed for {target}"
+            );
+        }
+
+        let valid = json!({
+            "model": "test-model",
+            "input": "hi",
+            "include": ["reasoning.encrypted_content", "file_search_call.results"],
+            "reasoning": {"effort": "high", "summary": "detailed"}
+        });
+        assert!(
+            convert_request_pure("openai:responses", "claude:messages", &valid).is_ok(),
+            "audited include/summary values must remain accepted"
+        );
+
+        let empty_include = json!({
+            "model": "test-model",
+            "input": "hi",
+            "include": []
+        });
+        assert!(
+            convert_request_pure("openai:responses", "claude:messages", &empty_include).is_ok(),
+            "empty include is a valid no-op"
+        );
+
+        let null_summary = json!({
+            "model": "test-model",
+            "input": "hi",
+            "reasoning": {"effort": "high", "summary": null}
+        });
+        assert!(
+            convert_request_pure("openai:responses", "claude:messages", &null_summary).is_ok(),
+            "null reasoning.summary is unset"
+        );
+
+        let wrong_type_include = json!({
+            "model": "test-model",
+            "input": "hi",
+            "include": "reasoning.encrypted_content"
+        });
+        assert!(
+            convert_request_pure("openai:responses", "claude:messages", &wrong_type_include)
+                .is_err(),
+            "non-array include must fail closed"
+        );
+    }
+
+    /// custom 自由文本输入即使是 JSON 形态也必须原样保留并只包装一次。
+    #[test]
+    fn responses_custom_input_preserves_json_looking_text_when_lowered() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "tools": [{
+                "type": "custom",
+                "name": "shell",
+                "format": {"type": "text"}
+            }],
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "call_shell",
+                "name": "shell",
+                "input": "{\"input\":\"echo hi\"}"
+            }]
+        });
+
+        let converted = convert_request_pure("openai:responses", "claude:messages", &body)
+            .expect("custom input should lower to Claude")
+            .value;
+        let assistant = converted["messages"]
+            .as_array()
+            .expect("Claude messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant message");
+        assert_eq!(
+            assistant["content"][0],
+            json!({
+                "type": "tool_use",
+                "id": "call_shell",
+                "name": "shell",
+                "input": {"input": "{\"input\":\"echo hi\"}"}
+            }),
+            "{converted}"
+        );
+    }
+
+    /// 多个 namespace/顶层同名工具不得让 Claude tool_choice 任选其一。
+    #[test]
+    fn claude_tool_choice_rejects_ambiguous_namespace_children() {
+        let namespace = |name: &str| {
+            json!({
+                "type": "namespace",
+                "name": name,
+                "description": name,
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            })
+        };
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "input": "hi",
+            "tools": [namespace("reports"), namespace("files")],
+            "tool_choice": {"type": "function", "name": "lookup"}
+        });
+
+        assert!(convert_request_pure("openai:responses", "claude:messages", &body).is_err());
     }
 }

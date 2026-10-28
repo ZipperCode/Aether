@@ -9,4 +9,5 @@ pub mod rerank;
 pub mod responses;
 pub mod search;
 pub mod shared;
+pub(crate) mod tool_lowering;
 pub mod video;

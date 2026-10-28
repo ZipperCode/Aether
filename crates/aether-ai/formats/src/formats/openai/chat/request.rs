@@ -1,19 +1,27 @@
 use serde_json::{json, Map, Value};
 
 use crate::{
-    formats::{context::FormatContext, openai::namespace::NamespaceToolAliases},
+    formats::{
+        context::FormatContext,
+        openai::{
+            namespace::NamespaceToolAliases,
+            tool_lowering::{
+                custom_tool_function_arguments, ToolLoweringError, ToolLoweringTarget,
+            },
+        },
+    },
     protocol::canonical::{
         canonical_extension_object_mut, canonical_message_to_openai_chat_messages,
         canonical_response_format_to_openai, canonical_tool_choice_to_openai,
-        canonical_tool_is_openai_custom, canonical_tool_to_openai, is_claude_tool_result,
-        namespace_extension_object, openai_content_text, openai_extensions,
-        openai_generation_config, openai_message_content_blocks,
-        openai_response_format_to_canonical, openai_responses_extension, openai_role_to_canonical,
-        openai_tool_choice_raw_to_chat, openai_tool_choice_to_canonical, openai_tools_to_canonical,
-        write_openai_generation_config, CanonicalContentBlock, CanonicalInstruction,
-        CanonicalMessage, CanonicalRequest, CanonicalRole, CanonicalThinkingConfig,
-        CanonicalToolChoice, CanonicalToolDefinition, OPENAI_RESPONSES_EXTENSION_NAMESPACE,
-        OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
+        canonical_tool_is_openai_custom, canonical_tool_to_openai,
+        clear_openai_custom_tool_call_marker, is_claude_tool_result, namespace_extension_object,
+        openai_content_text, openai_extensions, openai_generation_config,
+        openai_message_content_blocks, openai_response_format_to_canonical,
+        openai_responses_extension, openai_role_to_canonical, openai_tool_choice_raw_to_chat,
+        openai_tool_choice_to_canonical, openai_tools_to_canonical, write_openai_generation_config,
+        CanonicalContentBlock, CanonicalInstruction, CanonicalMessage, CanonicalRequest,
+        CanonicalRole, CanonicalThinkingConfig, CanonicalToolChoice, CanonicalToolDefinition,
+        OPENAI_RESPONSES_EXTENSION_NAMESPACE, OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
     },
 };
 
@@ -27,8 +35,37 @@ pub fn to(request: &CanonicalRequest, ctx: &FormatContext) -> Option<Value> {
     Some(body)
 }
 
+pub(crate) fn canonical_request_has_responses_tool_surface(canonical: &CanonicalRequest) -> bool {
+    let has_namespace = |extensions: &std::collections::BTreeMap<String, Value>| {
+        extensions.contains_key(OPENAI_RESPONSES_EXTENSION_NAMESPACE)
+            || extensions.contains_key(OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE)
+    };
+    has_namespace(&canonical.extensions)
+        || canonical
+            .tools
+            .iter()
+            .any(|tool| has_namespace(&tool.extensions))
+        || canonical.messages.iter().any(|message| {
+            message.content.iter().any(|block| match block {
+                CanonicalContentBlock::Text { extensions, .. }
+                | CanonicalContentBlock::Thinking { extensions, .. }
+                | CanonicalContentBlock::Image { extensions, .. }
+                | CanonicalContentBlock::File { extensions, .. }
+                | CanonicalContentBlock::Audio { extensions, .. }
+                | CanonicalContentBlock::ToolUse { extensions, .. }
+                | CanonicalContentBlock::ToolResult { extensions, .. }
+                | CanonicalContentBlock::Unknown { extensions, .. } => has_namespace(extensions),
+            })
+        })
+}
+
 pub(crate) fn to_raw(canonical: &CanonicalRequest) -> Option<Value> {
-    let namespace_tool_aliases = NamespaceToolAliases::from_canonical_tools(&canonical.tools);
+    let namespace_tool_aliases = if canonical_request_has_responses_tool_surface(canonical) {
+        NamespaceToolAliases::from_canonical_request(canonical, ToolLoweringTarget::OpenAiChat)
+            .ok()?
+    } else {
+        NamespaceToolAliases::from_canonical_tools(&canonical.tools)
+    };
     if canonical_request_has_unrepresentable_claude_tool_result_for_openai_chat(canonical)
         || canonical_request_has_unrepresentable_namespace_tools_for_openai_chat(
             canonical,
@@ -37,10 +74,13 @@ pub(crate) fn to_raw(canonical: &CanonicalRequest) -> Option<Value> {
     {
         return None;
     }
-    Some(to_raw_with_namespace_aliases(
-        canonical,
-        &namespace_tool_aliases,
-    ))
+    if let Some(CanonicalToolChoice::Tool { name }) = canonical.tool_choice.as_ref() {
+        // 已声明但尚未被 discovery 提供的 deferred 工具无法安全表达为 tool_choice。
+        if namespace_tool_aliases.name_is_declared_but_unoffered(name) {
+            return None;
+        }
+    }
+    to_raw_with_namespace_aliases(canonical, &namespace_tool_aliases)
 }
 
 pub fn from_raw(body_json: &Value) -> Option<CanonicalRequest> {
@@ -151,7 +191,7 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalRequest> {
 fn to_raw_with_namespace_aliases(
     canonical: &CanonicalRequest,
     namespace_tool_aliases: &NamespaceToolAliases,
-) -> Value {
+) -> Option<Value> {
     let mut output = serde_json::Map::new();
     if !canonical.model.trim().is_empty() {
         output.insert("model".to_string(), Value::String(canonical.model.clone()));
@@ -172,25 +212,24 @@ fn to_raw_with_namespace_aliases(
     }
     for message in &canonical.messages {
         let mut message = message.clone();
-        rewrite_namespaced_tool_uses_for_openai_chat(&mut message, namespace_tool_aliases);
+        rewrite_tool_uses_for_openai_chat(&mut message, namespace_tool_aliases).ok()?;
         messages.extend(canonical_message_to_openai_chat_messages(&message));
     }
     output.insert("messages".to_string(), Value::Array(messages));
 
     write_openai_generation_config(&mut output, &canonical.generation);
-    if !canonical.tools.is_empty() {
-        let mut tools = Vec::new();
-        for (tool_index, tool) in canonical.tools.iter().enumerate() {
-            if namespace_tool_aliases.is_representable_namespace_tool(tool_index) {
-                tools.extend(
-                    namespace_tool_aliases
-                        .tools_for_source(tool_index)
-                        .map(|tool| tool.to_openai_chat_tool()),
-                );
-            } else {
-                tools.push(canonical_tool_to_openai(tool));
-            }
+    let mut tools = Vec::new();
+    for (tool_index, tool) in canonical.tools.iter().enumerate() {
+        if let Some(lowered) = namespace_tool_aliases
+            .lowered_tools_for_source(ToolLoweringTarget::OpenAiChat, tool_index)
+        {
+            tools.extend(lowered);
+        } else {
+            tools.push(canonical_tool_to_openai(tool));
         }
+    }
+    tools.extend(namespace_tool_aliases.discovered_tools(ToolLoweringTarget::OpenAiChat));
+    if !tools.is_empty() {
         output.insert("tools".to_string(), Value::Array(tools));
     }
     if let Some(tool_choice) =
@@ -244,7 +283,7 @@ fn to_raw_with_namespace_aliases(
         OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
         &output,
     ));
-    Value::Object(output)
+    Some(Value::Object(output))
 }
 
 fn canonical_tool_choice_to_openai_for_request(
@@ -256,6 +295,13 @@ fn canonical_tool_choice_to_openai_for_request(
         .as_ref()
         .map(|tool_choice| {
             if let CanonicalToolChoice::Tool { name } = tool_choice {
+                if namespace_tool_aliases.custom_tool_is_function_lowered(None, name) {
+                    // custom 已被降级为 function 契约，tool_choice 必须跟随实际提供的类型。
+                    return json!({
+                        "type": "function",
+                        "function": { "name": name },
+                    });
+                }
                 if let NamespaceNameResolution::Alias(alias) =
                     resolve_namespace_child_name(name, &canonical.tools, namespace_tool_aliases)
                 {
@@ -290,7 +336,11 @@ fn raw_tool_choice_to_openai_chat_for_request(
 pub(crate) fn raw_tool_choice_extension_is_representable_for_openai_chat(
     canonical: &CanonicalRequest,
 ) -> bool {
-    let aliases = NamespaceToolAliases::from_canonical_tools(&canonical.tools);
+    let Ok(aliases) =
+        NamespaceToolAliases::from_canonical_request(canonical, ToolLoweringTarget::OpenAiChat)
+    else {
+        return false;
+    };
     raw_tool_choice_extension(canonical).is_some_and(|raw| {
         raw_tool_choice_to_openai_chat_for_request(raw, &canonical.tools, &aliases).is_some()
     })
@@ -316,13 +366,13 @@ fn canonical_tool_choice_to_openai_for_tools(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NamespaceNameResolution<'a> {
+pub(crate) enum NamespaceNameResolution<'a> {
     Unchanged,
     Alias(&'a str),
     Ambiguous,
 }
 
-fn resolve_namespace_child_name<'a>(
+pub(crate) fn resolve_namespace_child_name<'a>(
     name: &'a str,
     tools: &[CanonicalToolDefinition],
     aliases: &'a NamespaceToolAliases,
@@ -478,24 +528,65 @@ fn rewrite_named_function_choice(
     }
 }
 
-fn rewrite_namespaced_tool_uses_for_openai_chat(
+/// 把规范工具调用/结果改写为本次请求的 provider 形态：
+/// - namespace 子工具/普通函数改名为 collision-safe provider 名称；
+/// - 被降级为 function 的 custom 文本工具改写参数并去掉 custom 标记；
+/// - tool_search_output 结果携带模型可见的发现工具文本。
+fn rewrite_tool_uses_for_openai_chat(
     message: &mut CanonicalMessage,
     aliases: &NamespaceToolAliases,
-) {
+) -> Result<(), ToolLoweringError> {
     for block in &mut message.content {
-        let CanonicalContentBlock::ToolUse {
-            name, extensions, ..
-        } = block
-        else {
-            continue;
-        };
-        let NamespaceField::Name(namespace) = namespace_field(extensions) else {
-            continue;
-        };
-        if let Some(alias) = aliases.chat_name(namespace, name) {
-            *name = alias.to_string();
+        match block {
+            CanonicalContentBlock::ToolUse {
+                name,
+                input,
+                extensions,
+                ..
+            } => {
+                let namespace = match namespace_field(extensions) {
+                    NamespaceField::Name(namespace) => Some(namespace.to_string()),
+                    NamespaceField::Absent => None,
+                    NamespaceField::Invalid => {
+                        return Err(ToolLoweringError::new(
+                            "messages[].content[].openai_responses.namespace",
+                            "Responses tool call namespace is invalid",
+                        ))
+                    }
+                }
+                .filter(|namespace| namespace != "functions");
+                let provider_name = aliases.tool_use_provider_name(namespace.as_deref(), name)?;
+                let custom_lowered =
+                    aliases.custom_tool_is_function_lowered(namespace.as_deref(), name);
+                *name = provider_name;
+                if custom_lowered {
+                    *input = custom_tool_function_arguments(input);
+                    clear_openai_custom_tool_call_marker(extensions);
+                }
+            }
+            CanonicalContentBlock::ToolResult {
+                output,
+                content_text,
+                extensions,
+                ..
+            } => {
+                let is_search_output = openai_responses_extension(extensions)
+                    .and_then(|value| value.get("item_type"))
+                    .and_then(Value::as_str)
+                    == Some("tool_search_output");
+                if is_search_output {
+                    if let Some(tools) = output.as_ref() {
+                        if let Some(text) = aliases.tool_search_output_text(tools) {
+                            *output = Some(Value::String(text.clone()));
+                            *content_text = Some(text);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -553,7 +644,10 @@ fn canonical_request_has_unrepresentable_namespace_tools_for_openai_chat(
                 NamespaceField::Absent => false,
                 NamespaceField::Invalid => true,
                 NamespaceField::Name(namespace) => {
-                    aliases.chat_name(namespace, name).is_none()
+                    // 与改写路径一致:默认 `functions` namespace 归一为 flat 工具,
+                    // 通过 provider 名称解析判定是否可表达。
+                    let normalized = (namespace != "functions").then_some(namespace);
+                    aliases.tool_use_provider_name(normalized, name).is_err()
                         || !namespace_tool_use_sidecars_are_chat_representable(
                             extensions, namespace,
                         )
@@ -832,6 +926,42 @@ mod tests {
         assert_eq!(
             historical_call["tool_calls"][0]["function"]["name"],
             "write_report"
+        );
+    }
+
+    #[test]
+    fn responses_default_functions_namespace_history_maps_to_flat_tool_call() {
+        let body = json!({
+            "model": "gpt-source",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_lookup",
+                    "namespace": "functions",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"x\"}"
+                },
+                {"type": "function_call_output", "call_id": "call_lookup", "output": "ok"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+            }]
+        });
+        let canonical = responses::request::from_raw(&body).expect("Responses request");
+        let chat = to(&canonical, &FormatContext::default()).expect("Chat request");
+        let historical_call = chat["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.get("tool_calls").is_some())
+            })
+            .expect("historical tool call");
+        assert_eq!(
+            historical_call["tool_calls"][0]["function"]["name"],
+            "lookup"
         );
     }
 

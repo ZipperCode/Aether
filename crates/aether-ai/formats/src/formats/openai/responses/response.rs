@@ -6,21 +6,29 @@ use std::{
 use serde_json::{json, Map, Value};
 
 use super::{
-    apply_openai_responses_reasoning_text, encode_gemini_tool_signature_carrier,
+    apply_openai_responses_reasoning_text, claude_reasoning_carrier_payload_is_valid,
+    encode_claude_reasoning_carrier_raw, encode_gemini_tool_signature_carrier,
     encode_tool_result_error, history::record_converted_response_history,
     openai_responses_synthetic_reasoning_item_id,
 };
 
 use crate::{
-    formats::{context::FormatContext, openai::namespace::NamespaceToolAliases},
+    formats::{
+        context::FormatContext,
+        openai::{
+            namespace::NamespaceToolAliases,
+            tool_lowering::{custom_tool_input_from_arguments, tool_search_call_arguments},
+        },
+    },
     protocol::canonical::{
         canonical_content_block_to_openai_responses_part, canonical_extension_object_mut,
         canonical_tool_use_to_openai_responses_item, canonical_usage_to_openai_responses_usage,
-        flush_openai_responses_message_item, is_openai_responses_raw_block,
-        is_openai_thinking_block, namespace_extension_object, openai_responses_extensions,
-        openai_responses_output_to_canonical, openai_responses_result_item_extension_object,
-        openai_responses_usage_to_canonical, openai_service_tier_extension, CanonicalContentBlock,
-        CanonicalResponse, CanonicalResponseOutput, CanonicalRole, CanonicalStopReason,
+        flush_openai_responses_message_item, is_claude_thinking_block,
+        is_openai_responses_raw_block, is_openai_thinking_block, namespace_extension_object,
+        openai_responses_extensions, openai_responses_output_to_canonical,
+        openai_responses_result_item_extension_object, openai_responses_usage_to_canonical,
+        openai_service_tier_extension, CanonicalContentBlock, CanonicalResponse,
+        CanonicalResponseOutput, CanonicalRole, CanonicalStopReason,
         OPENAI_RESPONSES_EXTENSION_NAMESPACE, OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
     },
 };
@@ -33,13 +41,13 @@ pub fn from(body: &Value, _ctx: &FormatContext) -> Option<CanonicalResponse> {
 
 pub fn to(response: &CanonicalResponse, ctx: &FormatContext) -> Option<Value> {
     let report_context = ctx.report_context_value();
-    let response = to_raw(response, &report_context, false);
+    let response = try_to_raw(response, &report_context, false)?;
     record_converted_response_history(&report_context, &response);
     Some(response)
 }
 
 pub fn to_compact(response: &CanonicalResponse, ctx: &FormatContext) -> Option<Value> {
-    Some(to_raw(response, &ctx.report_context_value(), true))
+    try_to_raw(response, &ctx.report_context_value(), true)
 }
 
 pub fn from_raw(body_json: &Value) -> Option<CanonicalResponse> {
@@ -123,7 +131,50 @@ fn canonical_incomplete_reason(canonical: &CanonicalResponse) -> Option<&'static
 }
 
 /// 将规范响应投影为 Responses JSON；Gemini 工具签名以定向合成 reasoning item 邻接输出。
+/// 原始投影不做 carrier 长度裁剪：调用方显式要求 raw 时任何 UTF-8 载荷都完整编码。
 pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bool) -> Value {
+    render_to_raw(canonical, report_context, compact)
+}
+
+/// 供转换路径使用；carrier 超出审计边界时返回 None，由调用方 fail closed。
+pub(crate) fn try_to_raw(
+    canonical: &CanonicalResponse,
+    report_context: &Value,
+    compact: bool,
+) -> Option<Value> {
+    validate_claude_reasoning_carrier_bounds(canonical)?;
+    Some(render_to_raw(canonical, report_context, compact))
+}
+
+/// 审计边界：Claude thinking 的签名/redacted 载荷必须非空、限长且非嵌套。
+fn validate_claude_reasoning_carrier_bounds(canonical: &CanonicalResponse) -> Option<()> {
+    for block in &canonical.content {
+        let CanonicalContentBlock::Thinking {
+            signature,
+            encrypted_content,
+            extensions,
+            ..
+        } = block
+        else {
+            continue;
+        };
+        if !is_claude_thinking_block(extensions) {
+            continue;
+        }
+        for payload in [encrypted_content, signature]
+            .into_iter()
+            .flatten()
+            .filter(|payload| !payload.is_empty())
+        {
+            if !claude_reasoning_carrier_payload_is_valid(payload) {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+fn render_to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bool) -> Value {
     let namespace_tool_aliases = NamespaceToolAliases::from_report_context(report_context);
     let mut response = Map::new();
     let response_id = canonical.id.replace("chatcmpl", "resp");
@@ -205,14 +256,29 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bo
             }
             CanonicalContentBlock::Thinking {
                 text,
+                signature,
                 encrypted_content,
                 extensions,
-                ..
             } => {
-                let encrypted_content = encrypted_content
-                    .as_ref()
-                    .filter(|value| !value.is_empty())
-                    .filter(|_| is_openai_thinking_block(extensions));
+                // Claude 签名/redacted 数据无法成为 Responses 原生 reasoning 状态，
+                // 只以 Aether 自有 carrier 保存，回放时严格解码还原。
+                let encrypted_content = if is_claude_thinking_block(extensions) {
+                    if let Some(data) = encrypted_content.as_ref().filter(|value| !value.is_empty())
+                    {
+                        Some(encode_claude_reasoning_carrier_raw("redacted", data))
+                    } else {
+                        signature
+                            .as_ref()
+                            .filter(|value| !value.is_empty())
+                            .map(|signature| {
+                                encode_claude_reasoning_carrier_raw("signature", signature)
+                            })
+                    }
+                } else if is_openai_thinking_block(extensions) {
+                    encrypted_content.clone().filter(|value| !value.is_empty())
+                } else {
+                    None
+                };
                 if text.trim().is_empty() && encrypted_content.is_none() {
                     continue;
                 }
@@ -239,6 +305,8 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bo
                     );
                 }
                 apply_openai_responses_reasoning_text(&mut item, text);
+                item.entry("summary".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
                 output.push(Value::Object(item));
             }
             CanonicalContentBlock::ToolUse {
@@ -275,7 +343,7 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bo
                         "summary": [],
                     }));
                 }
-                let namespaced_tool = namespace_tool_aliases.responses_name(name);
+                let restore = namespace_tool_aliases.restore_tool_call(name);
                 if namespace_tool_aliases.emits_hosted_web_search_call(name) {
                     output.push(json!({
                         "type": "web_search_call",
@@ -286,17 +354,54 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bo
                             "query": web_search_query_from_value(input),
                         },
                     }));
+                } else if let Some((namespace, custom_name)) = restore.custom_text_identity() {
+                    // client 自定义文本工具被降级为 function 调用：恢复 custom_tool_call。
+                    let custom_input = custom_tool_input_from_arguments(input)
+                        .unwrap_or_else(|| input.to_string());
+                    let mut item = json!({
+                        "type": "custom_tool_call",
+                        "id": id,
+                        "call_id": id,
+                        "name": custom_name,
+                        "input": custom_input,
+                        "status": "completed",
+                    });
+                    if let (Some(namespace), Some(item)) = (namespace, item.as_object_mut()) {
+                        item.insert(
+                            "namespace".to_string(),
+                            Value::String(namespace.to_string()),
+                        );
+                    }
+                    output.push(item);
+                } else if restore.is_client_tool_search() {
+                    let mut item = json!({
+                        "type": "tool_search_call",
+                        "id": id,
+                        "call_id": id,
+                        "execution": "client",
+                        "arguments": tool_search_call_arguments(input),
+                        "status": "completed",
+                    });
+                    if let Some(item_id) = extensions
+                        .get(OPENAI_RESPONSES_EXTENSION_NAMESPACE)
+                        .and_then(|value| value.get("item_id"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        if let Some(item) = item.as_object_mut() {
+                            item.insert("id".to_string(), Value::String(item_id.to_string()));
+                        }
+                    }
+                    output.push(item);
                 } else {
-                    let response_name = namespaced_tool
-                        .map(|(_, child_name)| child_name)
-                        .unwrap_or(name.as_str());
+                    let response_name = restore.responses_name(name);
                     let mut item = canonical_tool_use_to_openai_responses_item(
                         id,
                         response_name,
                         input,
                         extensions,
                     );
-                    if let Some((namespace, _)) = namespaced_tool {
+                    if let Some(namespace) = restore.namespace() {
                         if let Some(item) = item.as_object_mut() {
                             item.insert(
                                 "namespace".to_string(),
@@ -349,6 +454,12 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bo
                 let extension_fields =
                     openai_responses_result_item_extension_object(extensions, &item);
                 item.extend(extension_fields);
+                if item.get("type").and_then(Value::as_str) == Some("tool_search_output")
+                    && !item.contains_key("execution")
+                {
+                    // Aether 只支持客户端执行的 tool_search。
+                    item.insert("execution".to_string(), Value::String("client".to_string()));
+                }
                 output.push(Value::Object(item));
             }
             CanonicalContentBlock::Unknown {
@@ -970,31 +1081,6 @@ mod tests {
     }
 
     #[test]
-    fn responses_response_builder_does_not_emit_claude_redacted_as_openai_encrypted_content() {
-        let mut extensions = BTreeMap::new();
-        extensions.insert("aether".to_string(), json!({"source": "claude_thinking"}));
-        let response = CanonicalResponse {
-            id: "msg_claude".to_string(),
-            model: "claude-sonnet".to_string(),
-            content: vec![CanonicalContentBlock::Thinking {
-                text: String::new(),
-                signature: None,
-                encrypted_content: Some("{\"type\":\"redacted_thinking\",\"v\":5}".to_string()),
-                extensions,
-            }],
-            outputs: Vec::new(),
-            stop_reason: Some(CanonicalStopReason::EndTurn),
-            usage: None,
-            extensions: BTreeMap::new(),
-        };
-
-        let body = to_raw(&response, &json!({}), false);
-
-        assert!(body["output"].as_array().expect("output").is_empty());
-        assert!(!body.to_string().contains("encrypted_content"));
-    }
-
-    #[test]
     fn responses_response_parser_reads_web_search_call_as_tool_use() {
         let body = json!({
             "id": "resp_test",
@@ -1123,6 +1209,39 @@ mod tests {
         assert_eq!(
             body["incomplete_details"],
             json!({"reason": "max_output_tokens"})
+        );
+    }
+
+    /// carrier 超限必须让同步转换失败,不能成功返回缺少 thinking 的响应。
+    #[test]
+    fn responses_builder_fails_closed_when_claude_carrier_exceeds_bound() {
+        let oversized =
+            "x".repeat(crate::formats::openai::responses::MAX_CLAUDE_REASONING_CARRIER_LEN + 1);
+        let mut extensions = BTreeMap::new();
+        extensions.insert("aether".to_string(), json!({"source": "claude_thinking"}));
+        let response = CanonicalResponse {
+            id: "resp_oversized".to_string(),
+            model: "claude-sonnet".to_string(),
+            content: vec![CanonicalContentBlock::Thinking {
+                text: String::new(),
+                signature: None,
+                encrypted_content: Some(oversized),
+                extensions,
+            }],
+            outputs: Vec::new(),
+            stop_reason: Some(CanonicalStopReason::EndTurn),
+            usage: None,
+            extensions: BTreeMap::new(),
+        };
+
+        assert!(super::try_to_raw(&response, &json!({}), false).is_none());
+        // 公共 raw 投影不过滤长度:显式调用必须保留原始 carrier 内容。
+        let raw = super::to_raw(&response, &json!({}), false);
+        assert!(
+            raw["output"][0]["encrypted_content"].as_str().is_some_and(
+                |carrier| carrier.contains("aether-claude-reasoning-carrier-v1:redacted:")
+            ),
+            "{raw}"
         );
     }
 }

@@ -224,16 +224,11 @@ impl ClaudeProviderState {
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if block_type == "thinking" {
-                    self.in_thinking_block = true;
-                    let Some(piece) = block
-                        .get("thinking")
-                        .and_then(Value::as_str)
-                        .or_else(|| block.get("text").and_then(Value::as_str))
-                    else {
+                if block_type == "redacted_thinking" {
+                    let Some(data) = block.get("data").and_then(Value::as_str) else {
                         return Ok(out);
                     };
-                    if piece.is_empty() {
+                    if data.is_empty() {
                         return Ok(out);
                     }
                     self.ensure_started(report_context, &mut out);
@@ -241,8 +236,42 @@ impl ClaudeProviderState {
                     out.push(CanonicalStreamFrame {
                         id,
                         model,
-                        event: CanonicalStreamEvent::ReasoningDelta(piece.to_string()),
+                        event: CanonicalStreamEvent::ReasoningRedacted(data.to_string()),
                     });
+                    return Ok(out);
+                }
+                if block_type == "thinking" {
+                    self.in_thinking_block = true;
+                    let piece = block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .or_else(|| block.get("text").and_then(Value::as_str))
+                        .unwrap_or_default();
+                    let signature = block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .filter(|signature| !signature.is_empty());
+                    if piece.is_empty() && signature.is_none() {
+                        return Ok(out);
+                    }
+                    self.ensure_started(report_context, &mut out);
+                    let (id, model) = self.identity(report_context);
+                    if !piece.is_empty() {
+                        out.push(CanonicalStreamFrame {
+                            id: id.clone(),
+                            model: model.clone(),
+                            event: CanonicalStreamEvent::ReasoningDelta(piece.to_string()),
+                        });
+                    }
+                    // 部分 provider 在 content_block_start 就带 signature；必须在本块关闭前
+                    // 输出，否则终态 carrier 丢失签名。
+                    if let Some(signature) = signature {
+                        out.push(CanonicalStreamFrame {
+                            id,
+                            model,
+                            event: CanonicalStreamEvent::ReasoningSignature(signature.to_string()),
+                        });
+                    }
                     return Ok(out);
                 }
                 if block_type == "text" {
@@ -381,6 +410,11 @@ impl ClaudeProviderState {
         }])
     }
 
+    /// 当前已合并的 usage；失败终态由矩阵读取。
+    pub(crate) fn known_usage(&self) -> Option<CanonicalUsage> {
+        self.usage.clone()
+    }
+
     fn merge_usage(&mut self, usage: Option<CanonicalUsage>) {
         let Some(usage) = usage else {
             return;
@@ -391,7 +425,7 @@ impl ClaudeProviderState {
 
     fn finish_usage(&mut self, usage: Option<CanonicalUsage>) -> Option<CanonicalUsage> {
         self.merge_usage(usage);
-        self.usage.take()
+        self.usage.clone()
     }
 }
 
@@ -726,6 +760,31 @@ impl ClaudeClientEmitter {
                             "type": "signature_delta",
                             "signature": signature,
                         }
+                    }),
+                )?);
+                Ok(out)
+            }
+            CanonicalStreamEvent::ReasoningRedacted(data) => {
+                let mut out = self.ensure_started()?;
+                out.extend(self.close_open_block()?);
+                let block_index = self.next_block_index;
+                self.next_block_index += 1;
+                out.extend(encode_json_sse(
+                    Some("content_block_start"),
+                    &json!({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "redacted_thinking",
+                            "data": data,
+                        }
+                    }),
+                )?);
+                out.extend(encode_json_sse(
+                    Some("content_block_stop"),
+                    &json!({
+                        "type": "content_block_stop",
+                        "index": block_index,
                     }),
                 )?);
                 Ok(out)
@@ -1447,6 +1506,55 @@ mod tests {
             frame.event,
             CanonicalStreamEvent::ReasoningSignature(ref signature) if signature == "sig_123"
         )));
+    }
+
+    #[test]
+    fn claude_provider_state_preserves_signature_from_block_start() {
+        let mut state = ClaudeProviderState::default();
+        let report_context = json!({});
+        let frames = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "content_block_start",
+                    "index": 2,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": "plan 二",
+                        "signature": "signed-two"
+                    }
+                })),
+            )
+            .expect("block start with signature should parse");
+        let events = frames.iter().map(|frame| &frame.event).collect::<Vec<_>>();
+        // 只校验投影语义:start 携带的文本先于签名,且签名不丢失;不固化 Start 等附带事件。
+        let delta = events
+            .iter()
+            .position(|event| {
+                matches!(event, CanonicalStreamEvent::ReasoningDelta(text) if text.as_str() == "plan 二")
+            })
+            .expect("start thinking text projected as reasoning delta");
+        let signature = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    CanonicalStreamEvent::ReasoningSignature(signature)
+                        if signature == "signed-two"
+                )
+            })
+            .expect("start signature projected as reasoning signature");
+        assert!(delta < signature, "signature must follow the block text");
+        // 块关闭不得丢弃 start 携带的签名。
+        let stop = state
+            .push_line(
+                &report_context,
+                data_line(json!({"type": "content_block_stop", "index": 2})),
+            )
+            .expect("block stop should parse");
+        assert!(!stop
+            .iter()
+            .any(|frame| matches!(frame.event, CanonicalStreamEvent::ReasoningSignature(_))));
     }
 
     #[test]

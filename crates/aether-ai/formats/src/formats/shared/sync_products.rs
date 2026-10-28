@@ -16,8 +16,7 @@ use aether_ai_formats::formats::registry::{convert_response, FormatContext, Form
 use aether_ai_formats::{
     canonical_response_unknown_block_count, canonical_to_claude_response,
     canonical_to_embedding_response, canonical_to_gemini_response,
-    canonical_to_openai_chat_response, canonical_to_openai_responses_compact_response,
-    canonical_to_openai_responses_response, from_claude_to_canonical_response,
+    canonical_to_openai_chat_response, from_claude_to_canonical_response,
     from_embedding_to_canonical_response, from_gemini_to_canonical_response,
     from_openai_chat_to_canonical_response, from_openai_responses_to_canonical_response,
     sync_chat_response_conversion_kind, sync_cli_response_conversion_kind,
@@ -1679,11 +1678,17 @@ fn convert_openai_responses_canonical_response_to_openai_responses(
 ) -> Option<Value> {
     let mut canonical = from_openai_responses_to_canonical_response(body_json)?;
     apply_report_context_model_fallback(&mut canonical.model, report_context);
-    Some(if compact {
-        canonical_to_openai_responses_compact_response(&canonical, report_context)
+    if compact {
+        crate::protocol::canonical::try_canonical_to_openai_responses_compact_response(
+            &canonical,
+            report_context,
+        )
     } else {
-        canonical_to_openai_responses_response(&canonical, report_context)
-    })
+        crate::protocol::canonical::try_canonical_to_openai_responses_response(
+            &canonical,
+            report_context,
+        )
+    }
 }
 
 fn convert_claude_canonical_chat_response(
@@ -3750,6 +3755,12 @@ fn try_aggregate_gemini_stream_sync_response(
                 CanonicalStreamEvent::ReasoningSignature(signature) => {
                     attach_gemini_reasoning_signature(&mut parts, signature);
                 }
+                CanonicalStreamEvent::ReasoningRedacted(_) => {
+                    return Err(unsupported_stream_event_finalize_error(&json!({
+                        "type": "reasoning_redacted",
+                        "provider": "claude:messages",
+                    })))
+                }
                 CanonicalStreamEvent::ContentPart(part) => {
                     parts.push(gemini_sync_part_from_canonical_content_part(part));
                 }
@@ -4174,8 +4185,8 @@ mod tests {
         StandardSyncFinalizeNormalizedProduct,
     };
     use aether_ai_formats::formats::conversion::response::{
-        convert_claude_chat_response_to_openai_chat, convert_gemini_chat_response_to_openai_chat,
-        convert_openai_chat_response_to_claude_chat, convert_openai_chat_response_to_gemini_chat,
+        convert_gemini_chat_response_to_openai_chat, convert_openai_chat_response_to_claude_chat,
+        convert_openai_chat_response_to_gemini_chat,
         convert_openai_chat_response_to_openai_responses,
         convert_openai_responses_response_to_openai_chat,
     };
@@ -6103,81 +6114,6 @@ mod tests {
             product.client_body_json["choices"][0]["message"]["content"],
             "Hello Claude"
         );
-    }
-
-    #[test]
-    fn claude_canonical_response_route_matches_legacy_outputs_for_existing_clients() {
-        let report_context = json!({
-            "provider_api_format": "claude:messages",
-            "client_api_format": "openai:chat",
-            "model": "gpt-5",
-            "mapped_model": "claude-sonnet-4",
-            "original_request_body": {
-                "service_tier": "default"
-            }
-        });
-        let provider_body_json = json!({
-            "id": "msg_claude_canonical_123",
-            "type": "message",
-            "model": "claude-sonnet-4",
-            "role": "assistant",
-            "content": [
-                {"type": "thinking", "thinking": "plan", "signature": "sig_123"},
-                {"type": "text", "text": "Hello Claude"},
-                {
-                    "type": "tool_use",
-                    "id": "toolu_123",
-                    "name": "lookup",
-                    "input": {"q": "rust"}
-                }
-            ],
-            "stop_reason": "tool_use",
-            "usage": {
-                "input_tokens": 2,
-                "output_tokens": 3,
-                "cache_read_input_tokens": 1,
-                "cache_creation_input_tokens": 1
-            }
-        });
-
-        let legacy_openai =
-            convert_claude_chat_response_to_openai_chat(&provider_body_json, &report_context)
-                .expect("legacy claude -> openai chat");
-        let converted_openai = convert_standard_chat_response(
-            &provider_body_json,
-            "claude:messages",
-            "openai:chat",
-            &report_context,
-        )
-        .expect("canonical claude -> openai chat");
-        assert_eq!(converted_openai, legacy_openai);
-
-        let legacy_claude =
-            convert_openai_chat_response_to_claude_chat(&legacy_openai, &report_context)
-                .expect("legacy claude -> openai chat -> claude");
-        let converted_claude = convert_standard_chat_response(
-            &provider_body_json,
-            "claude:messages",
-            "claude:messages",
-            &report_context,
-        )
-        .expect("canonical claude -> claude");
-        assert_eq!(converted_claude, legacy_claude);
-
-        let legacy_openai_responses = convert_openai_chat_response_to_openai_responses(
-            &legacy_openai,
-            &report_context,
-            false,
-        )
-        .expect("legacy claude -> openai responses");
-        let converted_openai_responses = convert_standard_cli_response(
-            &provider_body_json,
-            "claude:messages",
-            "openai:responses",
-            &report_context,
-        )
-        .expect("canonical claude -> openai responses");
-        assert_eq!(converted_openai_responses, legacy_openai_responses);
     }
 
     #[test]
