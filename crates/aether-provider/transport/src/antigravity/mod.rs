@@ -4,6 +4,7 @@ mod policy;
 mod request;
 mod schema;
 mod thinking;
+mod tool_history;
 mod url;
 
 pub use account::{

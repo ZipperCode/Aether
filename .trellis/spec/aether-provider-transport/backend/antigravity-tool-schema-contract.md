@@ -89,3 +89,48 @@ Standard-matrix regressions cover scope/toggle, nested tool-result markers, busi
 Wrong: add a post-conversion body rule to remove source markers; strict conversion has already rejected the request.
 
 Correct: prepare a candidate-local source body before validation, preserve the original source for audit/rules/fallback, and retain strict checks elsewhere.
+
+## Claude native tool history identifiers
+
+### 1. Scope / Trigger
+
+Gemini-native clients may omit function IDs. Antigravity's Claude bridge requires `tool_use.id`: request c09a882d contained 178 ID-less call/result pairs and received the same required-ID rejection in 47 recorded HTTP 400 responses. Same-format Gemini traffic must be adapted at the private provider boundary, not sent through universal format conversion.
+
+### 2. Signatures
+
+`build_antigravity_safe_v1internal_request(...)` invokes private `tool_history::normalize_antigravity_claude_tool_history(&mut Map<String, Value>, &str)` in both ordinary and already-enveloped branches. No exported API, configuration, dependency or persistence change is introduced.
+
+### 3. Contracts
+
+- Apply only to `claude-*` models inside the Antigravity envelope builder. Public Gemini and other Antigravity models retain their histories.
+- Read only protocol-level `contents[*].parts[*]`: model function calls and user/tool/function results, including snake-case spellings. Never traverse arguments, result data, signatures or arbitrary extensions.
+- Preserve nonempty explicit ID bytes. Promote `call_id` or `callId` only when canonical `id` is missing, null or blank; leave malformed non-string IDs and explicit conflicts for upstream validation.
+- Reserve explicit call/result IDs across all turns before generating collision-free `call_auto_N` identifiers. Resolve exact explicit causal pairs first, then process remaining results chronologically. For a current unassigned result-only ID, prefer a preceding same-name missing-ID call; otherwise use pending name/occurrence FIFO. Never globally reserve a missing-ID call for a later result before earlier ID-less results consume their calls. Do not fabricate associations for orphan results or overwrite conflicting IDs.
+- Borrow matching metadata; write only new canonical IDs. Already-complete histories use an allocation-free scan. Keep original client/audit input, message order, tool payloads and signatures unchanged. Rebuilding or re-normalizing the same history must be deterministic and idempotent.
+
+### 4. Validation & Error Matrix
+
+| History | Result |
+| --- | --- |
+| Call and matching result lack IDs | Generate one unique ID and write both sides |
+| Only one side has an explicit ID | Reuse that ID on the missing side |
+| Parallel same-name calls with reordered explicit results | Explicit identities win before name/FIFO matching |
+| Generated ID resembles an explicit ID in a later turn | Skip the reserved identifier |
+| Orphan result or conflicting explicit identities | Preserve the inconsistency; do not invent a different association |
+| Non-Claude target or public Gemini provider | No private ID repair |
+
+### 5. Good / Base / Bad Cases
+
+- Good: `functionCall: {"name":"lookup","args":{}}` and its ID-less `functionResponse` gain the same `call_auto_N` without changing payloads.
+- Base: a complete explicit-ID history stays byte-semantically unchanged.
+- Bad: assigning unrelated random IDs to calls and results, matching only by tool name, overwriting explicit identities, or round-tripping native history through canonical conversion.
+
+### 6. Tests Required
+
+Inline `antigravity::tool_history` regressions cover both envelope branches, cross-turn and parallel pairing, mixed one-sided/explicit IDs in either response order, aliases and blank values, future-ID collisions, orphan/conflict handling, determinism, idempotence, signature/business-data preservation and non-Claude isolation. A local executable using the original c09a882d body failed before repair and verified 178 unique matching pairs afterward; this is local transport proof, not deployed upstream-serving verification.
+
+### 7. Wrong vs Correct
+
+Wrong: treat `has_format_conversion=false` as proof no provider-specific compatibility work is needed, or fix a missing invocation ID by rotating accounts.
+
+Correct: repair missing identity pairs at the explicit Antigravity Claude transport owner, preserve the original request, and validate actual emitted history independently of routing status.

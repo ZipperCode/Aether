@@ -3,6 +3,7 @@ use serde_json::{Map, Value};
 use super::auth::{antigravity_client_identity, AntigravityRequestAuth};
 use super::schema::{normalize_claude_unions, normalize_tool_parameters, SchemaBudget};
 use super::thinking::normalize_antigravity_gemini_thinking_level;
+use super::tool_history::normalize_antigravity_claude_tool_history;
 
 /// 只识别真实 HTTP 400 的 Gemini 签名拒绝；调用方还必须确认 Antigravity 适配身份。
 pub fn is_antigravity_corrupted_thought_signature(status_code: u16, body: &Value) -> bool {
@@ -249,6 +250,7 @@ pub fn build_antigravity_safe_v1internal_request(
         inner_request.remove("safetySettings");
         inner_request.remove("safety_settings");
         normalize_antigravity_claude_thought_history(&mut inner_request, model);
+        normalize_antigravity_claude_tool_history(&mut inner_request, model);
         normalize_antigravity_builtin_tool_names(&mut inner_request);
         if normalize_antigravity_function_declaration_parameters(&mut inner_request, model).is_err()
         {
@@ -288,6 +290,7 @@ pub fn build_antigravity_safe_v1internal_request(
     inner_request.remove("safetySettings");
     inner_request.remove("safety_settings");
     normalize_antigravity_claude_thought_history(&mut inner_request, model);
+    normalize_antigravity_claude_tool_history(&mut inner_request, model);
     normalize_antigravity_builtin_tool_names(&mut inner_request);
     if normalize_antigravity_function_declaration_parameters(&mut inner_request, model).is_err() {
         return AntigravityRequestEnvelopeSupport::Unsupported(
