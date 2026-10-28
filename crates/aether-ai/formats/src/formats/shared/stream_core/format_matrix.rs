@@ -135,8 +135,19 @@ impl StreamingStandardFormatMatrix {
             }
         }
         let mut out = self.emit_frames(report_context, frames)?;
-        if let Some(client) = self.client.as_mut() {
-            out.extend(client.finish()?);
+        if self.terminated {
+            return Ok(out);
+        }
+        if let Some(result) = self.client.as_mut().map(ClientStreamEmitter::finish) {
+            match result {
+                Ok(bytes) => out.extend(bytes),
+                Err(error) => {
+                    self.capture_provider_known_usage();
+                    self.terminated = true;
+                    out.extend(self.emit_provider_parse_error(report_context, error)?);
+                    return Ok(out);
+                }
+            }
         }
         self.record_response_history(report_context);
         Ok(out)
@@ -198,7 +209,16 @@ impl StreamingStandardFormatMatrix {
                     break;
                 }
             }
-            out.extend(client.emit(frame)?);
+            match client.emit(frame) {
+                Ok(bytes) => out.extend(bytes),
+                Err(error) => {
+                    // 目标发射器的签名/参数校验也属于转换失败，不能截断已输出的流。
+                    self.capture_provider_known_usage();
+                    self.terminated = true;
+                    out.extend(self.emit_provider_parse_error(report_context, error)?);
+                    return Ok(out);
+                }
+            }
         }
         self.record_response_history(report_context);
         Ok(out)
@@ -235,8 +255,8 @@ impl StreamingStandardFormatMatrix {
         client.emit_error(error_body)
     }
 
-    /// Provider 增量解析失败（partial 参数/未闭合字符串/EOF 未完成）在已提交流中
-    /// 必须作为结构化失败终态下发；客户端格式本身无法表达错误时继续向上返回。
+    /// Provider 解析或客户端发射失败都收束到同一个终态；保留已经输出的内容与用量。
+    /// 客户端格式本身无法表达错误时继续向上返回。
     fn emit_provider_parse_error(
         &mut self,
         report_context: &Value,
@@ -245,7 +265,7 @@ impl StreamingStandardFormatMatrix {
         let client_api_format = client_api_format_for_context(report_context);
         let Some(error_body) = build_core_error_body_for_client_format(
             &client_api_format,
-            &format!("Provider stream ended with an invalid incremental tool payload: {error}"),
+            &format!("Provider stream conversion failed: {error}"),
             Some("stream_parse_error"),
             LocalCoreSyncErrorKind::ServerError,
         ) else {
@@ -1400,6 +1420,63 @@ mod tests {
             .finish(&context)
             .expect("failed matrix should stay terminated")
             .is_empty());
+    }
+
+    #[test]
+    fn client_carrier_rejection_after_visible_output_becomes_failed_response() {
+        let context = report_context("claude:messages", "openai:responses");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        matrix
+            .transform_line(&context, data_line(json!({
+                "type": "message_start",
+                "message": {"id":"msg_carrier_failure","model":"claude-review","usage":{"input_tokens":7,"output_tokens":0}}
+            })))
+            .expect("start");
+        let visible = matrix
+            .transform_line(
+                &context,
+                data_line(json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "visible"}
+                })),
+            )
+            .expect("visible reasoning should stream");
+        assert!(json_data_events(&visible).iter().any(|event| {
+            event["type"] == "response.reasoning_text.delta" && event["delta"] == "visible"
+        }));
+        let failed = matrix
+            .transform_line(
+                &context,
+                data_line(json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "signature_delta", "signature": "aether-claude-reasoning-carrier-v1:signature:eA"}
+                })),
+            )
+            .expect("carrier rejection should be encoded as failed response");
+        let events = json_data_events(&failed);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.failed")
+                .count(),
+            1
+        );
+        let response = &events
+            .iter()
+            .find(|event| event["type"] == "response.failed")
+            .expect("failure")["response"];
+        assert_eq!(response["id"], "msg_carrier_failure");
+        assert_eq!(response["model"], "claude-review");
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["usage"]["input_tokens"], 7);
+        assert_eq!(response["output"][0]["content"][0]["text"], "visible");
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert!(!events
+            .iter()
+            .any(|event| event["type"] == "response.completed"));
+        assert!(matrix.finish(&context).expect("terminated").is_empty());
     }
 
     #[test]

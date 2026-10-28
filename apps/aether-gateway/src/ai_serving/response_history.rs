@@ -16,9 +16,16 @@ pub(crate) async fn hydrate_openai_response_history(
     provider_api_format: &str,
     history_scope: &str,
 ) -> Result<(), GatewayError> {
-    if normalize_api_format_alias(client_api_format) != "openai:responses"
-        || normalize_api_format_alias(provider_api_format) != "openai:chat"
-    {
+    // Responses clients continue against Chat, Claude and Gemini providers by
+    // expanding `previous_response_id` at request time; all of them must see
+    // the shared history before that expansion runs.
+    if !matches!(
+        normalize_api_format_alias(client_api_format).as_str(),
+        "openai:responses" | "openai:responses:compact"
+    ) || !matches!(
+        normalize_api_format_alias(provider_api_format).as_str(),
+        "openai:chat" | "claude:messages" | "gemini:generate_content"
+    ) {
         return Ok(());
     }
     let Some(previous_response_id) = request

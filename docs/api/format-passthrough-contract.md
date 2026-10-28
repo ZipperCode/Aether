@@ -73,28 +73,37 @@ Required behavior:
 
 - Synthesized stream failures contain a complete `response.failed.response`
   snapshot with identity, timestamps, known usage and accumulated output. Partial
-  tool arguments stay incomplete; no successful tool closure or later completion
-  is fabricated. Previously closed text segments retain their completed status.
+  tool arguments and unfinished hosted searches stay incomplete; no successful
+  closure or later completion is fabricated. Checked emitter failures use the
+  same terminal path. Previously closed text segments remain completed.
 - Claude thinking signatures and redacted blocks round-trip through versioned
-  Aether-owned reasoning carriers. Sync and SSE replay preserve separate blocks
-  and their order. Only validated internal carriers are removed on OpenAI egress;
-  real provider ciphertext remains opaque. Malformed carriers and unsupported
-  cross-provider redacted reasoning fail closed.
+  Aether-owned reasoning carriers. Sync and SSE replay preserve separate item
+  IDs, text/signature pairs and order, including reasoning-only turns. Only
+  validated internal carriers are removed on OpenAI egress; real provider
+  ciphertext remains opaque. Malformed carriers and Claude-owned carriers sent
+  to Gemini fail closed.
 - Vertex streaming `partialArgs` supports typed JSON-path updates and continued
   strings. Argument deltas form one exact JSON object; unsafe out-of-order updates
-  buffer until safe. Explicit parameterless completion yields `{}`, while
-  malformed paths, conflicts and truncated calls fail the stream.
+  buffer until safe. Quoted JSON-path keys support RFC 9535 escapes. Idless
+  fragments and close markers require a unique active owner; each candidate
+  closes only its own calls. Explicit parameterless completion yields `{}`,
+  while malformed paths, conflicts and truncated calls fail the stream.
 - Responses client-executed tool search lowers to Chat/Claude functions and
   restores search-call identity on return. Discovered definitions are loaded from
   `tool_search_output.tools` even when no top-level tools are repeated. Deferred
   definitions remain hidden until discovered. Namespace aliases and tool choice
-  use the same request-local inventory; custom text tools preserve raw input when
-  lowered to functions. Hosted search and unsupported custom grammars remain
-  rejected rather than silently weakened.
-- The runtime Responses-to-Claude builder converts directly through the
-  canonical target path, retaining scoped history and tool metadata; it does not
-  stage custom tools through a lossy Chat intermediate. These mappings do not
-  change native same-format passthrough.
+  use the same request-local inventory, including discovered flat tools and
+  custom `allowed_tools`. Pin this inventory after scoped history expansion for
+  sync/SSE identity restoration; missing history fails closed instead of losing
+  namespace identity. Custom text tools preserve raw input when lowered to
+  functions. Hosted search and unsupported custom grammars remain rejected.
+- Replayed Responses message identity/status metadata uses the explicit
+  cross-format downgrade for Chat, Claude and Gemini. Unknown message fields
+  remain fail-closed; native Responses retains its message metadata.
+- Runtime Responses-to-Claude/Gemini builders preserve top-level instructions
+  and input system/developer messages. Claude conversion uses the canonical
+  target path with scoped history and tool metadata, not a lossy Chat
+  intermediate. These mappings do not change native same-format passthrough.
 
 ## Pure Conversion Interface
 

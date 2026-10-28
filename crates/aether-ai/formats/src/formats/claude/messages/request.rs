@@ -150,14 +150,8 @@ pub fn to_raw(
         "max_tokens".to_string(),
         Value::from(canonical.generation.max_tokens.unwrap_or(8192)),
     );
-    if let Some(system) = canonical_instructions_to_claude_system(&canonical.instructions) {
+    if let Some(system) = canonical_instructions_to_claude_system(canonical) {
         output.insert("system".to_string(), system);
-    } else if let Some(system) = canonical
-        .system
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        output.insert("system".to_string(), Value::String(system.clone()));
     }
     if upstream_is_stream {
         output.insert("stream".to_string(), Value::Bool(true));

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
@@ -22,7 +22,7 @@ struct GeminiPartialCallState {
     signature_emitted: String,
     /// 调用级 willContinue 已结束；之后不再接受同一调用的分片。
     finalized: bool,
-    /// 该分片调用所属候选；用于调用结束后的活动关联恢复。
+    /// 该分片调用所属候选；无 id 分片只能关联到该候选唯一未结束的调用。
     candidate_key: Option<u64>,
 }
 
@@ -63,8 +63,10 @@ pub struct GeminiProviderState {
     next_tool_call_index: usize,
     /// 显式 id -> 分片调用索引，仅用于把后续分片关联到同一调用。
     partial_call_ids: BTreeMap<String, usize>,
-    /// 候选索引 -> 该候选当前仍在延续的无 id 分片调用。
-    active_partial_calls: BTreeMap<u64, usize>,
+    /// 已在流中出现过的候选：响应级 Finish 必须等待这些候选全部终结。
+    observed_candidates: BTreeSet<u64>,
+    /// 已报告 finishReason 的候选 -> 原始终止原因；两者共同决定唯一响应级 Finish。
+    finished_candidate_reasons: BTreeMap<u64, String>,
     /// 已观测到的规范 usage；Gemini usageMetadata 为累计值，只覆盖非零字段。
     known_usage: Option<CanonicalUsage>,
     /// Last `groundingMetadata` seen. Gemini resends it cumulatively, so the
@@ -197,8 +199,8 @@ impl GeminiProviderState {
         }
 
         let mut out = Vec::new();
-        // 同一事件可能包含多个候选：先处理完所有候选的关闭标记，再统一做终态校验。
-        let mut pending_finish_reasons: Vec<String> = Vec::new();
+        // 同一事件可能包含多个候选：先处理完所有候选的关闭标记，再按候选做终态校验。
+        let mut pending_finish_reasons: Vec<(u64, String)> = Vec::new();
         let cross_format = report_context
             .get("client_api_format")
             .and_then(Value::as_str)
@@ -262,6 +264,8 @@ impl GeminiProviderState {
                 .get("index")
                 .and_then(Value::as_u64)
                 .unwrap_or(candidate_position as u64);
+            // 响应级 Finish 只能在所有已出现的候选都终结后输出；此处记录可见候选集合。
+            self.observed_candidates.insert(candidate_key);
             if cross_format
                 && candidate_object.keys().any(|field| {
                     !matches!(
@@ -609,16 +613,22 @@ impl GeminiProviderState {
                 .and_then(Value::as_str)
             {
                 // 同事件的其他候选可能还携带本事件的关闭标记：延后到全部候选处理完再终态，
-                // 避免把仍将在同一事件内结束的分片调用误判为截断。
-                pending_finish_reasons.push(finish_reason.to_string());
+                // 避免把仍将在同一事件内结束的分片调用误判为截断；校验按候选隔离，
+                // 因此先结束的候选不会让仍在延续的其他候选失败。
+                pending_finish_reasons.push((candidate_key, finish_reason.to_string()));
             }
         }
 
         if !pending_finish_reasons.is_empty() {
             // 权威终态错误已置 finished 时不再追加二次失败；否则此时所有候选的关闭标记
-            // 都已消费，可以安全地全局校验是否仍有未结束的分片调用。
+            // 都已消费，只校验本次到达终态的候选是否仍留有未结束的分片调用。
             if !self.finished {
-                if let Err(error) = self.ensure_partial_calls_closed() {
+                let finished_candidates = pending_finish_reasons
+                    .iter()
+                    .map(|(candidate_key, _)| *candidate_key)
+                    .collect::<BTreeSet<_>>();
+                if let Err(error) = self.ensure_candidate_partial_calls_closed(&finished_candidates)
+                {
                     out.push(self.partial_args_failure_frame(
                         report_context,
                         &error.0,
@@ -627,25 +637,39 @@ impl GeminiProviderState {
                     self.finished = true;
                     return Ok(out);
                 }
-            }
-            for finish_reason in pending_finish_reasons {
-                let (id, model) = self.identity(report_context);
-                let has_tool_calls = self.observed_tool_calls || !self.tool_calls.is_empty();
-                let mut finish_reason =
-                    normalize_openai_finish_reason(map_gemini_stream_finish_reason(&finish_reason));
-                if has_tool_calls && finish_reason.as_deref().is_none_or(|value| value == "stop") {
-                    finish_reason = Some("tool_calls".to_string());
+                for (candidate_key, finish_reason) in &pending_finish_reasons {
+                    self.finished_candidate_reasons
+                        .entry(*candidate_key)
+                        .or_insert_with(|| finish_reason.clone());
                 }
-                self.push_citations_frame(&id, &model, &mut out);
-                out.push(CanonicalStreamFrame {
-                    id,
-                    model,
-                    event: CanonicalStreamEvent::Finish {
-                        finish_reason,
-                        usage: canonical_usage_from_gemini_usage(event_object.get("usageMetadata")),
-                    },
-                });
-                self.finished = true;
+                // 规范 Finish 是响应级唯一终态：只在一个事件里所有已出现候选都终结后输出，
+                // 否则先终结的候选会让下游客户端提前完成并丢弃其他候选的后续增量。
+                if self
+                    .observed_candidates
+                    .iter()
+                    .all(|candidate| self.finished_candidate_reasons.contains_key(candidate))
+                {
+                    let (id, model) = self.identity(report_context);
+                    let has_tool_calls = self.observed_tool_calls || !self.tool_calls.is_empty();
+                    let mut finish_reason = self.response_finish_reason();
+                    if has_tool_calls
+                        && finish_reason.as_deref().is_none_or(|value| value == "stop")
+                    {
+                        finish_reason = Some("tool_calls".to_string());
+                    }
+                    self.push_citations_frame(&id, &model, &mut out);
+                    out.push(CanonicalStreamFrame {
+                        id,
+                        model,
+                        event: CanonicalStreamEvent::Finish {
+                            finish_reason,
+                            usage: canonical_usage_from_gemini_usage(
+                                event_object.get("usageMetadata"),
+                            ),
+                        },
+                    });
+                    self.finished = true;
+                }
             }
         }
 
@@ -655,7 +679,8 @@ impl GeminiProviderState {
     /// 处理 Vertex 分片参数 functionCall；返回 true 表示已由本路径消费。
     ///
     /// 关联规则：显式 id 只匹配同 id 的分片调用；无 id 分片只续写该候选当前仍在
-    /// 延续的调用。已结束调用不再接受分片，避免把新的并行调用并进旧调用。
+    /// 延续的唯一调用，该候选存在多个未结束调用时任何无 id 续写/关闭标记都立即失败，
+    /// 绝不猜测。已结束调用不再接受分片，避免把新的并行调用并进旧调用。
     fn try_handle_partial_function_call(
         &mut self,
         candidate_key: u64,
@@ -702,7 +727,10 @@ impl GeminiProviderState {
 
         let mut target = match explicit_id {
             Some(id) => self.partial_call_ids.get(id).copied(),
-            None => self.active_partial_calls.get(&candidate_key).copied(),
+            // 无 id 分片只能关联该候选唯一仍在延续的调用。多于一个未结束调用时，
+            // 参数续写、显式关闭标记与裸终结标记都无法无歧义关联，必须立即失败；
+            // 只有该候选没有活动调用时，带名的无参调用才按全新调用放行。
+            None => self.sole_active_partial_call(candidate_key)?,
         };
         if target
             .and_then(|index| self.tool_calls.get(&index))
@@ -831,7 +859,6 @@ impl GeminiProviderState {
         if let Some(id) = explicit_id {
             self.partial_call_ids.insert(id.to_string(), index);
         }
-        self.active_partial_calls.insert(candidate_key, index);
         index
     }
 
@@ -937,7 +964,7 @@ impl GeminiProviderState {
         frame_model: &str,
         out: &mut Vec<CanonicalStreamFrame>,
     ) -> Result<(), AiSurfaceFinalizeError> {
-        let candidate_key = {
+        {
             let partial = self
                 .tool_calls
                 .get_mut(&index)
@@ -953,10 +980,6 @@ impl GeminiProviderState {
                 .map_err(AiSurfaceFinalizeError::new)?;
             partial.finalized = true;
             partial.pending_deltas.push_str(&suffix);
-            partial.candidate_key
-        };
-        if let Some(candidate_key) = candidate_key {
-            self.restore_active_partial_call(candidate_key);
         }
         self.flush_partial_call_frames(index, true, frame_id, frame_model, out);
         self.partial_call_ids.retain(|_, value| *value != index);
@@ -1001,11 +1024,14 @@ impl GeminiProviderState {
         }
     }
 
-    /// 调用结束后恢复候选的活动分片关联：仅当该候选仍恰好有一个未结束调用时关联，
-    /// 多个仍开放则无法无歧义关联无 id 分片，保持不猜测。
-    fn restore_active_partial_call(&mut self, candidate_key: u64) {
-        self.active_partial_calls.remove(&candidate_key);
-        let open_calls = self
+    /// 该候选唯一仍在延续的分片调用。
+    ///
+    /// 无 id 分片只能关联到唯一所有者；多于一个未结束调用时返回歧义错误，绝不猜测最新调用。
+    fn sole_active_partial_call(
+        &self,
+        candidate_key: u64,
+    ) -> Result<Option<usize>, AiSurfaceFinalizeError> {
+        let mut open_calls = self
             .tool_calls
             .iter()
             .filter(|(_, state)| {
@@ -1013,14 +1039,57 @@ impl GeminiProviderState {
                     !partial.finalized && partial.candidate_key == Some(candidate_key)
                 })
             })
-            .map(|(index, _)| *index)
-            .collect::<Vec<_>>();
-        if let [only] = open_calls.as_slice() {
-            self.active_partial_calls.insert(candidate_key, *only);
+            .map(|(index, _)| *index);
+        match (open_calls.next(), open_calls.next()) {
+            (Some(only), None) => Ok(Some(only)),
+            (None, _) => Ok(None),
+            (Some(_), Some(_)) => Err(AiSurfaceFinalizeError::new(
+                "Gemini 分片函数调用存在多个未结束调用，无 id 分片无法无歧义关联",
+            )),
         }
     }
 
-    /// 终态前仍有未结束的分片调用：判定为截断输入并终止。
+    /// 所有可见候选都终结后唯一的响应级终止原因。
+    ///
+    /// 多候选终结原因不一致时优先非 `stop`（截断/内容过滤不得被另一候选的 STOP 掩盖）；
+    /// 单一候选的映射结果与逐候选处理完全一致。
+    fn response_finish_reason(&self) -> Option<String> {
+        let mapped = self
+            .finished_candidate_reasons
+            .values()
+            .map(|reason| normalize_openai_finish_reason(map_gemini_stream_finish_reason(reason)))
+            .collect::<Vec<_>>();
+        mapped
+            .iter()
+            .flatten()
+            .find(|reason| reason.as_str() != "stop")
+            .or_else(|| mapped.iter().flatten().next())
+            .cloned()
+    }
+
+    /// 候选终态前仍有未结束的分片调用：判定为截断输入并终止。
+    ///
+    /// 只校验本次到达终态的候选：并行的其他候选可以在后续事件里继续并各自终结。
+    fn ensure_candidate_partial_calls_closed(
+        &self,
+        finished_candidates: &BTreeSet<u64>,
+    ) -> Result<(), AiSurfaceFinalizeError> {
+        if self.tool_calls.values().any(|state| {
+            state.partial.as_ref().is_some_and(|partial| {
+                !partial.finalized
+                    && partial
+                        .candidate_key
+                        .is_some_and(|key| finished_candidates.contains(&key))
+            })
+        }) {
+            return Err(AiSurfaceFinalizeError::new(
+                "Gemini 流式函数调用分片参数在候选终态前仍未结束",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 整体终态（EOF）前仍有未结束的分片调用：判定为截断输入并终止。
     fn ensure_partial_calls_closed(&self) -> Result<(), AiSurfaceFinalizeError> {
         if self.tool_calls.values().any(|state| {
             state
@@ -3150,11 +3219,44 @@ mod tests {
         let interim = String::from_utf8(bytes).expect("utf8");
         assert!(!interim.contains("functionCall"));
         assert!(!interim.contains("unknown"));
-        // 终态确认缺名：源 parser 保留空名补发，Gemini emitter fail-closed。
-        let error = matrix
+        assert!(!interim.contains("\"finishReason\":\"STOP\""));
+        // 终态确认缺名：目标发射器返回错误，矩阵必须在新契约下把它收束为目标格式
+        // 内的错误终态，而不是丢到 EOF、丢掉错误或输出成功的函数调用。
+        let failure = matrix
             .finish(&context)
-            .expect_err("nameless tool call must fail closed at the Gemini surface");
-        assert!(error.0.contains("仍未获得函数名"));
+            .expect("nameless tool call becomes an in-band Gemini error terminal");
+        let events = sse_json_events(&failure);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.get("error").is_some())
+                .count(),
+            1,
+            "目标错误终态必须恰好出现一次"
+        );
+        let error = target_error_event(&events);
+        assert_eq!(error["code"], 500);
+        assert_eq!(error["status"], "INTERNAL");
+        let failure_text = String::from_utf8_lossy(&failure);
+        assert!(!failure_text.contains("functionCall"));
+        assert!(!failure_text.contains("\"finishReason\":\"STOP\""));
+        // 失败终态之后矩阵已终止：后续行与 EOF 都不再产生任何字节。
+        assert!(matrix
+            .transform_line(
+                &context,
+                data_line(json!({
+                    "id": "chatcmpl_1",
+                    "object": "chat.completion.chunk",
+                    "model": "test-model",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                })),
+            )
+            .expect("terminated matrix ignores later lines")
+            .is_empty());
+        assert!(matrix
+            .finish(&context)
+            .expect("terminated matrix finishes quietly")
+            .is_empty());
     }
 
     #[test]
@@ -3233,11 +3335,36 @@ mod tests {
         let interim = String::from_utf8(bytes).expect("utf8");
         assert!(!interim.contains("functionCall"));
         assert!(!interim.contains("unknown"));
-        // claude message_delta 立即产生终态帧，Gemini emitter 在该行就 fail-closed。
-        let error = matrix
+        assert!(!interim.contains("\"finishReason\":\"STOP\""));
+        // claude message_delta 立即产生终态帧；Gemini emitter 拒绝缺名工具调用后，
+        // 矩阵必须把该错误收束为目标格式内的错误终态。
+        let failure = matrix
             .transform_line(&context, data_line(events[4].clone()))
-            .expect_err("nameless tool call must fail closed at the Gemini surface");
-        assert!(error.0.contains("仍未获得函数名"));
+            .expect("nameless tool call becomes an in-band Gemini error terminal");
+        let output = sse_json_events(&failure);
+        assert_eq!(
+            output
+                .iter()
+                .filter(|event| event.get("error").is_some())
+                .count(),
+            1,
+            "目标错误终态必须恰好出现一次"
+        );
+        let error = target_error_event(&output);
+        assert_eq!(error["code"], 500);
+        assert_eq!(error["status"], "INTERNAL");
+        let failure_text = String::from_utf8_lossy(&failure);
+        assert!(!failure_text.contains("functionCall"));
+        assert!(!failure_text.contains("\"finishReason\":\"STOP\""));
+        // 失败终态之后矩阵已终止：后续事件与 EOF 都不再产生任何字节。
+        assert!(matrix
+            .transform_line(&context, data_line(json!({"type": "message_stop"})))
+            .expect("terminated matrix ignores later events")
+            .is_empty());
+        assert!(matrix
+            .finish(&context)
+            .expect("terminated matrix finishes quietly")
+            .is_empty());
     }
 
     fn gemini_partial_args_chunk(calls: Vec<Value>, finish_reason: Option<&str>) -> Vec<u8> {
@@ -3313,6 +3440,23 @@ mod tests {
         frames
             .iter()
             .any(|frame| matches!(frame.event, CanonicalStreamEvent::Finish { .. }))
+    }
+
+    /// 提取 SSE 中的 JSON data 事件：目标格式终态按结构断言，不绑定原始字节或文案。
+    fn sse_json_events(bytes: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .collect()
+    }
+
+    /// 目标格式的结构化错误体（Gemini error frame 的唯一顶层 `error`）。
+    fn target_error_event(events: &[Value]) -> &Value {
+        events
+            .iter()
+            .find_map(|event| event.get("error"))
+            .expect("target format error frame")
     }
 
     #[test]
@@ -3876,10 +4020,9 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(finishes.len(), 2);
-        assert!(finishes
-            .iter()
-            .all(|reason| reason.as_deref() == Some("tool_calls")));
+        // 两个候选在同一事件内同时终结：只允许唯一的响应级 Finish。
+        assert_eq!(finishes.len(), 1);
+        assert_eq!(finishes[0].as_deref(), Some("tool_calls"));
         let arguments = arguments_by_index(&frames);
         assert_eq!(arguments[&0], "{\"q\":\"a\"}");
         assert_eq!(arguments[&1], "{\"q\":\"b\"}");
@@ -3931,5 +4074,477 @@ mod tests {
             )
             .expect("non-boolean willContinue yields a failure frame");
         assert!(failure_message(&terminal_failure_payload(&frames)).contains("willContinue"));
+    }
+
+    #[test]
+    fn gemini_provider_state_rejects_ambiguous_idless_partial_args_continuation() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        let opened = gemini_partial_args_chunk(
+            vec![
+                json!({
+                    "id": "call_a",
+                    "name": "search",
+                    "partialArgs": [{"jsonPath": "$.q", "stringValue": "a"}],
+                    "willContinue": true
+                }),
+                json!({
+                    "id": "call_b",
+                    "name": "ping",
+                    "partialArgs": [{"jsonPath": "$.q", "stringValue": "b"}],
+                    "willContinue": true
+                }),
+            ],
+            None,
+        );
+        let frames = state
+            .push_line(&context, opened.clone())
+            .expect("two parallel partial calls open on the same candidate");
+        // Start + Start/参数增量各一次：两个调用都只输出未闭合前缀。
+        assert_eq!(frames.len(), 5);
+        assert_eq!(
+            tool_call_starts(&frames),
+            vec![
+                (0, "call_a".to_string(), "search".to_string()),
+                (1, "call_b".to_string(), "ping".to_string()),
+            ]
+        );
+        assert_eq!(arguments_by_index(&frames)[&0], "{\"q\":\"a\"");
+        assert_eq!(arguments_by_index(&frames)[&1], "{\"q\":\"b\"");
+
+        // 两个调用都未结束时，无 id 分片无法无歧义关联：必须立即失败而不是选择最新调用。
+        let frames = state
+            .push_line(
+                &context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "partialArgs": [{"jsonPath": "$.q", "stringValue": "c"}],
+                        "willContinue": false
+                    })],
+                    None,
+                ),
+            )
+            .expect("ambiguous id-less continuation yields a terminal failure");
+        assert_eq!(frames.len(), 1, "歧义续写只能输出一个失败终态");
+        let payload = terminal_failure_payload(&frames);
+        assert_eq!(payload["type"], "response.failed");
+        assert_eq!(payload["response"]["status"], "failed");
+        assert_eq!(payload["response"]["error"]["code"], "INVALID_PARTIAL_ARGS");
+        assert!(failure_message(&payload).contains("无法无歧义关联"));
+        assert!(!has_finish(&frames), "歧义续写不得产生成功终态");
+        assert!(arguments_by_index(&frames).is_empty());
+        assert!(state
+            .finish(&context)
+            .expect("finished state yields no frames")
+            .is_empty());
+
+        // 同一歧义必须经真实矩阵变成客户端 response.failed，而不是被截断或静默成功。
+        use crate::formats::shared::stream_core::StreamingStandardFormatMatrix;
+        let matrix_context = json!({
+            "provider_api_format": "gemini:generate_content",
+            "client_api_format": "openai:responses",
+            "mapped_model": "test-model",
+        });
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        matrix
+            .transform_line(&matrix_context, opened)
+            .expect("parallel partial calls pass through the matrix");
+        let bytes = matrix
+            .transform_line(
+                &matrix_context,
+                gemini_partial_args_chunk(
+                    vec![json!({
+                        "partialArgs": [{"jsonPath": "$.q", "stringValue": "c"}],
+                        "willContinue": false
+                    })],
+                    None,
+                ),
+            )
+            .expect("ambiguity becomes a routable failure frame");
+        let text = String::from_utf8(bytes).expect("utf8 sse");
+        assert!(text.contains("response.failed"));
+        assert!(!text.contains("response.completed"));
+        assert!(!text.contains("response.incomplete"));
+    }
+
+    #[test]
+    fn gemini_matrix_fails_ambiguous_idless_close_markers() {
+        use crate::formats::shared::stream_core::StreamingStandardFormatMatrix;
+
+        let context = json!({
+            "provider_api_format": "gemini:generate_content",
+            "client_api_format": "openai:responses",
+            "mapped_model": "test-model",
+        });
+        let opened = data_line(json!({
+            "responseId": "resp_ambiguous_markers",
+            "modelVersion": "gemini-2.5-pro",
+            "candidates": [{
+                "index": 0,
+                "content": {"role": "model", "parts": [
+                    {"functionCall": {
+                        "id": "call_a",
+                        "name": "search",
+                        "partialArgs": [{"jsonPath": "$.q", "stringValue": "a"}],
+                        "willContinue": true
+                    }},
+                    {"functionCall": {
+                        "id": "call_b",
+                        "name": "ping",
+                        "partialArgs": [{"jsonPath": "$.q", "stringValue": "b"}],
+                        "willContinue": true
+                    }}
+                ]}
+            }]
+        }));
+        let explicit_closes = data_line(json!({
+            "candidates": [{
+                "index": 0,
+                "finishReason": "STOP",
+                "content": {"role": "model", "parts": [
+                    {"functionCall": {
+                        "id": "call_a",
+                        "partialArgs": [{"jsonPath": "$.q"}],
+                        "willContinue": false
+                    }},
+                    {"functionCall": {
+                        "id": "call_b",
+                        "partialArgs": [{"jsonPath": "$.q"}],
+                        "willContinue": false
+                    }}
+                ]}
+            }]
+        }));
+
+        for marker in [
+            // 无 id 的显式关闭标记和空裸标记都无法在多个活动调用间无歧义关联。
+            json!({"willContinue": false}),
+            json!({}),
+        ] {
+            let mut matrix = StreamingStandardFormatMatrix::default();
+            matrix
+                .transform_line(&context, opened.clone())
+                .expect("two parallel calls open on one candidate");
+            let failure = matrix
+                .transform_line(
+                    &context,
+                    data_line(json!({
+                        "candidates": [{
+                            "index": 0,
+                            "content": {
+                                "role": "model",
+                                "parts": [{"functionCall": marker.clone()}]
+                            }
+                        }]
+                    })),
+                )
+                .expect("ambiguous close marker becomes an in-band terminal failure");
+            let events = sse_json_events(&failure);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "response.failed")
+                    .count(),
+                1,
+                "歧义关闭标记必须恰好产生一个失败终态"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["type"] == "response.completed"),
+                "歧义关闭标记不得产生成功终态"
+            );
+            // 失败后矩阵已终止：后续显式关闭不产生任何字节，也不会补成成功终态。
+            assert!(matrix
+                .transform_line(&context, explicit_closes.clone())
+                .expect("terminated matrix ignores later closes")
+                .is_empty());
+            assert!(matrix
+                .finish(&context)
+                .expect("terminated matrix finishes quietly")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn gemini_provider_state_validates_finish_only_for_the_finishing_candidate() {
+        let mut state = GeminiProviderState::default();
+        let context = json!({});
+        let mut frames = state
+            .push_line(
+                &context,
+                data_line(json!({
+                    "responseId": "resp_candidate_finish",
+                    "modelVersion": "gemini-2.5-pro",
+                    "candidates": [
+                        {"index": 0, "content": {"role": "model", "parts": [{"functionCall": {
+                            "id": "call_a",
+                            "name": "search",
+                            "partialArgs": [{"jsonPath": "$.q", "stringValue": "a"}],
+                            "willContinue": true
+                        }}]}},
+                        {"index": 1, "content": {"role": "model", "parts": [{"functionCall": {
+                            "id": "call_b",
+                            "name": "ping",
+                            "partialArgs": [{"jsonPath": "$.q", "stringValue": "b"}],
+                            "willContinue": true
+                        }}]}}
+                    ]
+                })),
+            )
+            .expect("two candidates open distinct calls");
+        assert_eq!(frames.len(), 5);
+
+        let candidate_zero_finish = state
+            .push_line(
+                &context,
+                data_line(json!({
+                    "candidates": [{
+                        "index": 0,
+                        "finishReason": "STOP",
+                        "content": {"role": "model", "parts": [{"functionCall": {
+                            "id": "call_a",
+                            "partialArgs": [{"jsonPath": "$.q"}],
+                            "willContinue": false
+                        }}]}
+                    }]
+                })),
+            )
+            .expect("candidate 0 finishes while candidate 1 stays open");
+        // 候选 0 已终结但候选 1 仍可见：只能输出参数增量，不得输出响应级 Finish。
+        assert_eq!(candidate_zero_finish.len(), 1);
+        assert_eq!(
+            arguments_by_index(&candidate_zero_finish),
+            BTreeMap::from([(0usize, "}".to_string())])
+        );
+        assert!(
+            !candidate_zero_finish
+                .iter()
+                .any(|frame| matches!(&frame.event, CanonicalStreamEvent::Finish { .. })),
+            "仍有候选在延续时不得输出响应级 Finish"
+        );
+        assert!(
+            !candidate_zero_finish
+                .iter()
+                .any(|frame| matches!(&frame.event, CanonicalStreamEvent::UnknownEvent(_))),
+            "候选 1 仍在延续不得让候选 0 的终结失败"
+        );
+
+        let candidate_one_finish = state
+            .push_line(
+                &context,
+                data_line(json!({
+                    "candidates": [{
+                        "index": 1,
+                        "finishReason": "STOP",
+                        "content": {"role": "model", "parts": [{"functionCall": {
+                            "id": "call_b",
+                            "partialArgs": [{"jsonPath": "$.q"}],
+                            "willContinue": false
+                        }}]}
+                    }]
+                })),
+            )
+            .expect("candidate 1 finishes afterwards");
+        // 最后一个候选终结时才输出参数增量与唯一的响应级 Finish。
+        assert_eq!(candidate_one_finish.len(), 2);
+        assert_eq!(
+            arguments_by_index(&candidate_one_finish),
+            BTreeMap::from([(1usize, "}".to_string())])
+        );
+        assert!(matches!(
+            &candidate_one_finish[1].event,
+            CanonicalStreamEvent::Finish { finish_reason: Some(reason), .. }
+                if reason.as_str() == "tool_calls"
+        ));
+
+        frames.extend(candidate_zero_finish);
+        frames.extend(candidate_one_finish);
+        assert!(frames
+            .iter()
+            .all(|frame| !matches!(&frame.event, CanonicalStreamEvent::UnknownEvent(_))));
+        let arguments = arguments_by_index(&frames);
+        assert_eq!(arguments[&0], "{\"q\":\"a\"}");
+        assert_eq!(arguments[&1], "{\"q\":\"b\"}");
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| matches!(&frame.event, CanonicalStreamEvent::Finish { .. }))
+                .count(),
+            1,
+            "多候选分阶段终结只允许一个响应级 Finish"
+        );
+        assert!(state
+            .finish(&context)
+            .expect("all candidate calls are closed")
+            .is_empty());
+    }
+
+    #[test]
+    fn gemini_matrix_defers_completion_until_all_candidates_finish() {
+        use crate::formats::shared::stream_core::StreamingStandardFormatMatrix;
+
+        fn sse_data_events(bytes: Vec<u8>) -> Vec<Value> {
+            String::from_utf8(bytes)
+                .expect("utf8 sse")
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+                .collect()
+        }
+
+        fn terminal_types(events: &[Value]) -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|event| event["type"].as_str())
+                .filter(|event_type| {
+                    matches!(
+                        *event_type,
+                        "response.completed" | "response.incomplete" | "response.failed"
+                    )
+                })
+                .map(ToOwned::to_owned)
+                .collect()
+        }
+
+        let context = json!({
+            "provider_api_format": "gemini:generate_content",
+            "client_api_format": "openai:responses",
+            "mapped_model": "test-model",
+        });
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let opened = data_line(json!({
+            "responseId": "resp_matrix_candidates",
+            "modelVersion": "gemini-2.5-pro",
+            "candidates": [
+                {"index": 0, "content": {"role": "model", "parts": [{"functionCall": {
+                    "id": "call_a",
+                    "name": "search",
+                    "partialArgs": [{"jsonPath": "$.q", "stringValue": "a"}],
+                    "willContinue": true
+                }}]}},
+                {"index": 1, "content": {"role": "model", "parts": [{"functionCall": {
+                    "id": "call_b",
+                    "name": "ping",
+                    "partialArgs": [{"jsonPath": "$.q", "stringValue": "b"}],
+                    "willContinue": true
+                }}]}}
+            ]
+        }));
+        let first = sse_data_events(
+            matrix
+                .transform_line(&context, opened)
+                .expect("first record opens both candidate calls"),
+        );
+        assert!(terminal_types(&first).is_empty());
+
+        // 候选 0 先终结：只允许参数增量，客户端不得提前 complete。
+        let second = sse_data_events(
+            matrix
+                .transform_line(
+                    &context,
+                    data_line(json!({
+                        "candidates": [{
+                            "index": 0,
+                            "finishReason": "STOP",
+                            "content": {"role": "model", "parts": [{"functionCall": {
+                                "id": "call_a",
+                                "partialArgs": [{"jsonPath": "$.q"}],
+                                "willContinue": false
+                            }}]}
+                        }]
+                    })),
+                )
+                .expect("candidate 0 closes while candidate 1 is still active"),
+        );
+        let second_deltas = second
+            .iter()
+            .filter(|event| event["type"] == "response.function_call_arguments.delta")
+            .collect::<Vec<_>>();
+        assert_eq!(second_deltas.len(), 1);
+        assert_eq!(second_deltas[0]["call_id"], "call_a");
+        assert_eq!(second_deltas[0]["delta"], "}");
+        assert!(
+            terminal_types(&second).is_empty(),
+            "仍有候选未终结时不得输出客户端终态"
+        );
+
+        // 候选 1 随后终结：唯一的响应级 Finish 带上两个调用的完整参数。
+        let third = sse_data_events(
+            matrix
+                .transform_line(
+                    &context,
+                    data_line(json!({
+                        "candidates": [{
+                            "index": 1,
+                            "finishReason": "STOP",
+                            "content": {"role": "model", "parts": [{"functionCall": {
+                                "id": "call_b",
+                                "partialArgs": [{"jsonPath": "$.q"}],
+                                "willContinue": false
+                            }}]}
+                        }]
+                    })),
+                )
+                .expect("candidate 1 finishes last"),
+        );
+        let mut done_arguments = BTreeMap::new();
+        for event in &third {
+            if event["type"] == "response.output_item.done"
+                && event["item"]["type"] == "function_call"
+            {
+                done_arguments.insert(
+                    event["item"]["call_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    event["item"]["arguments"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(
+            done_arguments,
+            BTreeMap::from([
+                ("call_a".to_string(), "{\"q\":\"a\"}".to_string()),
+                ("call_b".to_string(), "{\"q\":\"b\"}".to_string()),
+            ]),
+            "最后一个候选终结时必须回放两个调用的完整参数"
+        );
+        assert_eq!(
+            terminal_types(&third),
+            vec!["response.completed".to_string()],
+            "全部候选终结后只允许一个客户端终态"
+        );
+        let completed = third
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("single response.completed");
+        let mut completed_arguments = BTreeMap::new();
+        for item in completed["response"]["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if item["type"] == "function_call" {
+                completed_arguments.insert(
+                    item["call_id"].as_str().unwrap_or_default().to_string(),
+                    item["arguments"].as_str().unwrap_or_default().to_string(),
+                );
+            }
+        }
+        assert_eq!(
+            completed_arguments, done_arguments,
+            "completed 终态快照必须包含两个调用的完整参数"
+        );
+        assert!(
+            matrix
+                .finish(&context)
+                .expect("eof after all candidates closed")
+                .is_empty(),
+            "结束后 EOF 不得再补发第二个终态"
+        );
     }
 }

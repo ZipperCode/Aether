@@ -18,6 +18,35 @@ const OPENAI_CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 const HASHED_ALIAS_PREFIX: &str = "aether_ns_";
 const HASH_HEX_LEN: usize = 32;
 
+/// Report-context field carrying the pinned Responses tool identity projection.
+///
+/// The field is written once before provider conversion and is authoritative
+/// for response rehydration: a present-but-empty projection means the request
+/// offered no Responses tool identity, never "fall back to the client body".
+pub const OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY: &str = "responses_tool_identity";
+
+/// Why a provider response cannot be mapped back to the original Responses
+/// tool identities.
+///
+/// Restoration must fail closed here: an empty/unexpanded inventory would emit
+/// provider aliases as if they were Responses names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolIdentityRestoreError {
+    /// The request continued a previous response whose history is not loaded in
+    /// this process and no pinned identity context was carried.
+    HistoryUnavailable,
+}
+
+impl std::fmt::Display for ToolIdentityRestoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HistoryUnavailable => {
+                formatter.write_str("previous response tool history is unavailable")
+            }
+        }
+    }
+}
+
 /// Provider-neutral identity of a Responses tool after lowering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum LoweredToolKind {
@@ -198,13 +227,76 @@ impl NamespaceToolAliases {
     /// `tool_search_output` history. The provider format in the report context
     /// selects the custom text tool representation. Requires the request to
     /// carry its complete input, which the Responses client does.
+    ///
+    /// Infallible compatibility wrapper. Audited response/stream entrypoints
+    /// must use [`Self::try_from_report_context`] instead: this wrapper cannot
+    /// report a continuation whose previous-response identity is unavailable
+    /// and falls back to the empty inventory.
     pub(crate) fn from_report_context(report_context: &Value) -> Self {
+        Self::try_from_report_context(report_context).unwrap_or_default()
+    }
+
+    /// Rebuild the request-local inventory from a report context, failing
+    /// closed when the identity depends on previous-response history that is
+    /// not available in this process.
+    ///
+    /// Resolution order:
+    /// 1. [`OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY`], the pinned projection
+    ///    written before provider conversion. It is authoritative, including
+    ///    when it is empty.
+    /// 2. The captured client body. A continuation (`previous_response_id`)
+    ///    resolves the scoped cached history and rebuilds the inventory from
+    ///    the expanded body; missing history is a typed error, never an empty
+    ///    inventory that would leak provider aliases to the client.
+    pub(crate) fn try_from_report_context(
+        report_context: &Value,
+    ) -> Result<Self, ToolIdentityRestoreError> {
+        let target = ToolLoweringTarget::from_report_context(report_context);
+        if let Some(identity_context) = report_context
+            .get(OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY)
+            .filter(|value| value.is_object())
+        {
+            return Ok(Self::from_effective_request_body(identity_context, target));
+        }
         let Some(request) = report_context.get("original_request_body") else {
-            return Self::default();
+            return Ok(Self::default());
         };
+        // Native same-format Responses traffic and targets without namespace
+        // lowering never rewrite tool names, so their identity does not depend
+        // on expanding previous-response history here.
+        if target.is_none() || previous_response_id(request).is_none() {
+            return Ok(Self::from_effective_request_body(request, target));
+        }
+        let history_scope = report_context
+            .get("api_key_id")
+            .and_then(Value::as_str)
+            .or_else(|| report_context.get("history_scope").and_then(Value::as_str));
+        let expanded =
+            crate::formats::openai::responses::history::expand_previous_response_for_chat(
+                request,
+                history_scope,
+            )
+            .map_err(|_| ToolIdentityRestoreError::HistoryUnavailable)?;
+        Ok(Self::from_effective_request_body(&expanded, target))
+    }
+
+    /// Rebuild the request-local inventory from the *effective* Responses
+    /// request body a conversion actually consumed, for response
+    /// rehydration.
+    ///
+    /// Callers that expand `previous_response_id` history or fold
+    /// `additional_tools` items into `tools` before converting must feed the
+    /// expanded body here: the raw client body still carries the unexpanded
+    /// `previous_response_id`, so client `tool_search_output` items recorded in
+    /// the previous response would be invisible and discovered tools would
+    /// restore as untouched provider names. `target` selects the custom text
+    /// tool representation, exactly as request lowering did.
+    pub(crate) fn from_effective_request_body(
+        request: &Value,
+        target: Option<ToolLoweringTarget>,
+    ) -> Self {
         let tools_value = raw_declared_tools(request);
         let client_function_tool_names = client_function_tool_names(&tools_value);
-        let target = ToolLoweringTarget::from_report_context(report_context);
         let discovered = raw_discovered_tool_specs(request);
         let tools = openai_responses_tools_to_canonical(Some(&tools_value)).unwrap_or_default();
         let mut result = assemble(&tools, &discovered, target).0;
@@ -435,10 +527,6 @@ impl NamespaceToolAliases {
             .filter(move |tool| tool.source_tool_index == Some(source_tool_index))
     }
 
-    pub(crate) fn is_namespace_tool(&self, source_tool_index: usize) -> bool {
-        self.namespace_tool_indices.contains(&source_tool_index)
-    }
-
     pub(crate) fn has_invalid_namespace_tools(&self) -> bool {
         !self.invalid_namespace_tool_indices.is_empty()
     }
@@ -582,6 +670,55 @@ fn responses_tool_result_item_type(extensions: &BTreeMap<String, Value>) -> Opti
     openai_responses_extension(extensions)?
         .get("item_type")
         .and_then(Value::as_str)
+}
+
+/// Narrow tool identity projection of an effective Responses request body.
+///
+/// Only the declared tool inventory (`tools`, with leading `additional_tools`
+/// items folded in) and the tool definitions carried by client
+/// `tool_search_output` items are kept. Search call ids, execution/status
+/// fields, result text and conversation content never enter the projection, so
+/// the report-context snapshot cannot reattach raw conversation.
+pub fn openai_responses_tool_identity_context(effective_request_body: &Value) -> Value {
+    let mut projection = Map::new();
+    let tools = raw_declared_tools(effective_request_body);
+    if tools.is_array() {
+        projection.insert("tools".to_string(), tools);
+    }
+    let discovered = effective_request_body
+        .get("input")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("tool_search_output")
+                })
+                .filter_map(|item| {
+                    let tools = tool_search_output_tools(
+                        item.get("tools"),
+                        item.get("content").and_then(Value::as_str),
+                    )?;
+                    Some(json!({
+                        "type": "tool_search_output",
+                        "tools": tools,
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !discovered.is_empty() {
+        projection.insert("input".to_string(), Value::Array(discovered));
+    }
+    Value::Object(projection)
+}
+
+fn previous_response_id(request: &Value) -> Option<&str> {
+    request
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// Parse the declared tool inventory plus discovered specs and allocate
@@ -746,6 +883,14 @@ fn assemble(
             .or_default() += 1;
         if candidate.identity.namespace.is_none() {
             reserved_names.insert(candidate.identity.name.clone());
+            // Discovered tools are offered exactly like declared ones, so a
+            // named tool choice must see the same ordinary-name collision
+            // surface. A discovered flat `lookup` beside a discovered
+            // `crm.lookup` child is ambiguous, never the child alias.
+            *result
+                .ordinary_tool_name_counts
+                .entry(candidate.identity.name.clone())
+                .or_default() += 1;
         }
     }
     reject_flat_provider_name_collisions(&offered, &mut error);
@@ -1980,9 +2125,11 @@ mod tests {
     }
 
     fn request_with(tools: Value, discovered: Option<Value>) -> CanonicalRequest {
-        let mut request = CanonicalRequest::default();
-        request.tools = openai_responses_tools_to_canonical(Some(&tools))
-            .expect("Responses tools should parse");
+        let mut request = CanonicalRequest {
+            tools: openai_responses_tools_to_canonical(Some(&tools))
+                .expect("Responses tools should parse"),
+            ..Default::default()
+        };
         if let Some(discovered) = discovered {
             request.messages.push(discovered_message(discovered));
         }
@@ -2341,7 +2488,6 @@ mod tests {
         ] {
             let aliases = aliases(json!([raw]));
             assert!(aliases.has_invalid_namespace_tools());
-            assert!(aliases.is_namespace_tool(0));
             // An invalid namespace is never audited: the registry keeps its
             // generic extension validation for it.
             assert!(!aliases.tool_is_audited(0));
@@ -2898,6 +3044,41 @@ mod tests {
         // Responses tool-choice name.
         assert_eq!(
             lowered.resolve_tool_choice_name("shared"),
+            LoweredToolChoiceName::Ambiguous
+        );
+    }
+
+    #[test]
+    fn discovered_flat_names_share_the_named_choice_collision_surface() {
+        let lowered = lowering(
+            json!([{"type": "tool_search", "execution": "client"}]),
+            Some(json!([
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                {
+                    "type": "namespace",
+                    "name": "crm",
+                    "description": "CRM tools",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type": "object"}
+                    }]
+                }
+            ])),
+            ToolLoweringTarget::OpenAiChat,
+        );
+
+        // The discovered flat tool owns the bare name, so the discovered
+        // namespace child is aliased away from it.
+        assert_eq!(lowered.chat_name("crm", "lookup"), Some("crm__lookup"));
+        let discovered = lowered.discovered_tools(ToolLoweringTarget::OpenAiChat);
+        assert_eq!(discovered[0]["function"]["name"], "lookup");
+        assert_eq!(discovered[1]["function"]["name"], "crm__lookup");
+        // A choice for `lookup` matches both the discovered flat tool and the
+        // discovered namespace child: it must fail closed instead of resolving
+        // to the child alias.
+        assert_eq!(
+            lowered.resolve_tool_choice_name("lookup"),
             LoweredToolChoiceName::Ambiguous
         );
     }

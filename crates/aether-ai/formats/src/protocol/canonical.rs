@@ -3037,6 +3037,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
             let mut pending_reasoning: Vec<CanonicalContentBlock> = Vec::new();
             for item in items {
                 if let Some(text) = item.as_str() {
+                    flush_openai_responses_pending_reasoning(&mut messages, &mut pending_reasoning);
                     if !text.trim().is_empty() {
                         messages.push(CanonicalMessage {
                             role: CanonicalRole::User,
@@ -3047,15 +3048,14 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             extensions: BTreeMap::new(),
                         });
                     }
-                    pending_reasoning.clear();
                     continue;
                 }
                 let Some(item_object) = item.as_object() else {
+                    flush_openai_responses_pending_reasoning(&mut messages, &mut pending_reasoning);
                     messages.push(openai_responses_opaque_input_item_message(
                         item,
                         String::new(),
                     ));
-                    pending_reasoning.clear();
                     continue;
                 };
                 let item_type = item_object
@@ -3122,7 +3122,10 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                                 std::mem::take(&mut pending_reasoning),
                             );
                         } else {
-                            pending_reasoning.clear();
+                            flush_openai_responses_pending_reasoning(
+                                &mut messages,
+                                &mut pending_reasoning,
+                            );
                         }
                         messages.push(message);
                     }
@@ -3297,6 +3300,10 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             AETHER_EXTENSION_NAMESPACE.to_string(),
                             json!({ "source": OPENAI_RESPONSES_TOOL_RESULT_SOURCE_MARKER }),
                         );
+                        flush_openai_responses_pending_reasoning(
+                            &mut messages,
+                            &mut pending_reasoning,
+                        );
                         messages.push(CanonicalMessage {
                             role: CanonicalRole::Tool,
                             content: vec![CanonicalContentBlock::ToolResult {
@@ -3312,7 +3319,6 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             }],
                             extensions: BTreeMap::new(),
                         });
-                        pending_reasoning.clear();
                     }
                     "custom_tool_call_output"
                     | "tool_search_output"
@@ -3320,6 +3326,10 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                     | "shell_call_output"
                     | "apply_patch_call_output"
                     | "computer_call_output" => {
+                        flush_openai_responses_pending_reasoning(
+                            &mut messages,
+                            &mut pending_reasoning,
+                        );
                         messages.push(CanonicalMessage {
                             role: CanonicalRole::Tool,
                             content: vec![openai_responses_hosted_tool_result_to_block(
@@ -3329,14 +3339,17 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             )],
                             extensions: BTreeMap::new(),
                         });
-                        pending_reasoning.clear();
                     }
                     _ => {
+                        flush_openai_responses_pending_reasoning(
+                            &mut messages,
+                            &mut pending_reasoning,
+                        );
                         messages.push(openai_responses_opaque_input_item_message(item, item_type));
-                        pending_reasoning.clear();
                     }
                 }
             }
+            flush_openai_responses_pending_reasoning(&mut messages, &mut pending_reasoning);
             Some(messages)
         }
         Value::Object(_) => {
@@ -3437,6 +3450,26 @@ fn canonical_assistant_message_has_visible_content(message: &CanonicalMessage) -
         | CanonicalContentBlock::ToolUse { .. }
         | CanonicalContentBlock::ToolResult { .. } => true,
     })
+}
+
+/// 在非 assistant 输入项（user/tool/字符串/不透明项/EOF）之前，把尚未被
+/// assistant 消息或工具调用消费的 reasoning 块按原位置落成 assistant 消息。
+///
+/// 不能直接 `clear`：reasoning-only 输出在下一轮回放时会把 Claude 签名/redacted
+/// 块整块丢掉；这里只搬运真实块，不伪造任何可见文本。
+fn flush_openai_responses_pending_reasoning(
+    messages: &mut Vec<CanonicalMessage>,
+    pending_reasoning: &mut Vec<CanonicalContentBlock>,
+) {
+    if pending_reasoning.is_empty() {
+        return;
+    }
+    let reasoning = std::mem::take(pending_reasoning);
+    messages.push(CanonicalMessage {
+        role: CanonicalRole::Assistant,
+        content: reasoning,
+        extensions: BTreeMap::new(),
+    });
 }
 
 fn prepend_openai_responses_reasoning_blocks(
@@ -6728,23 +6761,61 @@ fn raw_allowed_tool_to_responses(value: &Value) -> Value {
     }
 }
 
-pub(crate) fn canonical_instructions_to_claude_system(
-    instructions: &[CanonicalInstruction],
-) -> Option<Value> {
-    let instructions = instructions
+/// Responses 把 system/developer 指令保留在 input；目标原生系统字段须同时收集
+/// 顶层指令与这些消息，顺序不变，且不改写同格式回放时的原始位置。
+pub(crate) fn canonical_system_instruction_parts(
+    canonical: &CanonicalRequest,
+) -> impl Iterator<Item = (&str, Option<&BTreeMap<String, Value>>)> {
+    let instructions = canonical
+        .instructions
         .iter()
-        .filter(|instruction| !instruction.text.trim().is_empty())
-        .collect::<Vec<_>>();
+        .filter(|instruction| !instruction.text.trim().is_empty());
+    let fallback = canonical.system.as_deref().filter(|text| {
+        !text.trim().is_empty()
+            && !canonical
+                .instructions
+                .iter()
+                .any(|instruction| !instruction.text.trim().is_empty())
+    });
+    instructions
+        .map(|instruction| (instruction.text.as_str(), Some(&instruction.extensions)))
+        .chain(fallback.map(|text| (text, None)))
+        .chain(
+            canonical
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message.role,
+                        CanonicalRole::System | CanonicalRole::Developer
+                    )
+                })
+                .flat_map(|message| &message.content)
+                .filter_map(|block| match block {
+                    CanonicalContentBlock::Text { text, extensions } if !text.trim().is_empty() => {
+                        Some((text.as_str(), Some(extensions)))
+                    }
+                    _ => None,
+                }),
+        )
+}
+
+pub(crate) fn canonical_instructions_to_claude_system(
+    canonical: &CanonicalRequest,
+) -> Option<Value> {
+    let instructions = canonical_system_instruction_parts(canonical).collect::<Vec<_>>();
     if instructions.is_empty() {
         return None;
     }
     let mut blocks = Vec::new();
     let mut has_structured_extensions = false;
-    for instruction in &instructions {
+    for (text, extensions) in &instructions {
         let mut block = Map::new();
+        block.insert("text".to_string(), Value::String((*text).to_string()));
         block.insert("type".to_string(), Value::String("text".to_string()));
-        block.insert("text".to_string(), Value::String(instruction.text.clone()));
-        let extra = namespace_extension_object(&instruction.extensions, "claude", &block);
+        let extra = extensions
+            .map(|extensions| namespace_extension_object(extensions, "claude", &block))
+            .unwrap_or_default();
         if !extra.is_empty() {
             has_structured_extensions = true;
             block.extend(extra);
@@ -6757,7 +6828,7 @@ pub(crate) fn canonical_instructions_to_claude_system(
         Some(Value::String(
             instructions
                 .iter()
-                .map(|instruction| instruction.text.as_str())
+                .map(|(text, _)| *text)
                 .collect::<Vec<_>>()
                 .join("\n\n"),
         ))
@@ -9449,6 +9520,70 @@ mod tests {
         assert_eq!(rebuilt["input"][0]["encrypted_content"], "enc_reasoning");
         assert_eq!(rebuilt["input"][1]["type"], "message");
         assert_eq!(rebuilt["input"][1]["content"][0]["text"], "done");
+    }
+
+    /// Responses reasoning-only 输出（两个签名块）在下一轮 user 输入前回放到
+    /// Claude 时，必须落成 assistant thinking 块，而不是被 user 项清空丢弃。
+    #[test]
+    fn openai_responses_reasoning_only_output_replays_before_next_user_turn() {
+        let claude_response = json!({
+            "id": "msg_reasoning_only",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [
+                {"type": "thinking", "thinking": "one", "signature": "sig_one"},
+                {"type": "thinking", "thinking": "two", "signature": "sig_two"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 3, "output_tokens": 4}
+        });
+        let canonical_response =
+            from_claude_to_canonical_response(&claude_response).expect("canonical response");
+        let responses = canonical_to_openai_responses_response(&canonical_response, &json!({}));
+        assert_eq!(responses["output"][0]["type"], "reasoning");
+        assert_eq!(responses["output"][1]["type"], "reasoning");
+
+        let mut input = responses["output"]
+            .as_array()
+            .cloned()
+            .expect("responses output");
+        input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "next"}]
+        }));
+        let replay = json!({
+            "model": "claude-sonnet-4-5",
+            "max_output_tokens": 64,
+            "reasoning": {"effort": "high"},
+            "input": input
+        });
+        let canonical_request =
+            from_openai_responses_to_canonical_request(&replay).expect("canonical request");
+        let rebuilt = canonical_to_claude_request(&canonical_request, "claude-sonnet-4-5", false)
+            .expect("claude request");
+
+        let messages = rebuilt["messages"].as_array().expect("claude messages");
+        // Claude 请求要求 user 开头；首个 assistant 历史前会补一个空 user 项。
+        assert_eq!(
+            messages.last().map(|message| message["role"].clone()),
+            Some(json!("user")),
+            "{rebuilt}"
+        );
+        assert_eq!(messages.last().unwrap()["content"], json!("next"));
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant message with reasoning");
+        assert_eq!(
+            assistant["content"],
+            json!([
+                {"type": "thinking", "thinking": "one", "signature": "sig_one"},
+                {"type": "thinking", "thinking": "two", "signature": "sig_two"}
+            ]),
+            "{rebuilt}"
+        );
     }
 
     #[test]

@@ -59,6 +59,9 @@ pub use crate::formats::openai::image::stream::{
     maybe_build_openai_image_sync_finalize_product, OpenAiImageStreamState,
     OpenAiImageSyncFinalizeProduct,
 };
+pub use crate::formats::openai::namespace::{
+    openai_responses_tool_identity_context, OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY,
+};
 pub use crate::formats::openai::prompt_cache::resolve_openai_prompt_cache_ttl_minutes;
 pub use crate::formats::openai::shared::{
     copy_request_number_field, copy_request_number_field_as,
@@ -207,8 +210,9 @@ pub use crate::formats::{
                 CODEX_OPENAI_IMAGE_DEFAULT_VARIATION_PROMPT, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
             },
             history::{
-                hydrate_response_history, record_converted_response_history,
-                response_history_is_loaded, response_history_storage_key, ResponseHistoryRecord,
+                expand_openai_responses_request_body, hydrate_response_history,
+                record_converted_response_history, response_history_is_loaded,
+                response_history_storage_key, ResponseHistoryRecord,
             },
             spec::{
                 resolve_stream_spec as resolve_openai_responses_stream_spec,

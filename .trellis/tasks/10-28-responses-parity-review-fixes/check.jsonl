@@ -1,0 +1,2 @@
+{"file":".trellis/tasks/10-28-responses-parity-review-fixes/prd.md","reason":"Verify every reviewed defect through consumer-visible regressions"}
+{"file":".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md","reason":"Check original protocol invariants remain intact"}

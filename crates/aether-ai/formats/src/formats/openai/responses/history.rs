@@ -320,6 +320,23 @@ pub(crate) fn expand_previous_response_for_chat(
     Ok(expanded)
 }
 
+/// Expand a client Responses request for a cross-format conversion exactly
+/// once.
+///
+/// Callers must hydrate the scoped previous response first (the gateway does
+/// that before provider conversion). The returned body has
+/// `previous_response_id` removed and the client transcript merged into
+/// `input`; feed it to both the conversion and
+/// [`crate::formats::openai::namespace::openai_responses_tool_identity_context`].
+/// An unknown, expired or wrongly scoped `previous_response_id` is a typed
+/// error: identity restoration must never guess.
+pub fn expand_openai_responses_request_body(
+    request: &Value,
+    history_scope: Option<&str>,
+) -> Result<Value, String> {
+    expand_previous_response_for_chat(request, history_scope)
+}
+
 pub fn record_converted_response_history(
     report_context: &Value,
     response: &Value,
@@ -340,21 +357,26 @@ pub fn record_converted_response_history(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|scope| !scope.is_empty());
+    let previous_response_id = request
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let mut transcript = if request.get("messages").and_then(Value::as_array).is_some() {
         Vec::new()
+    } else if let Some(previous_response_id) = previous_response_id {
+        // The continued transcript is the authoritative source. Never fabricate
+        // a partial (tool-only) transcript when it was evicted or expired before
+        // this response landed: recording that would present an incomplete
+        // conversation as complete. Without a record the next continuation fails
+        // closed instead; tools for *this* response still restore from the
+        // pinned identity context.
+        response_history_store()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(previous_response_id, history_scope, Instant::now())?
     } else {
-        request
-            .get("previous_response_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .and_then(|previous_response_id| {
-                response_history_store()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(previous_response_id, history_scope, Instant::now())
-            })
-            .unwrap_or_default()
+        Vec::new()
     };
     transcript.extend(request_input_items(request));
     if let Some(output) = response.get("output").and_then(Value::as_array) {
@@ -391,14 +413,26 @@ pub fn record_converted_response_history(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use serde_json::json;
 
-    use crate::formats::{context::FormatContext, registry::convert_request};
+    use crate::formats::openai::namespace::{
+        openai_responses_tool_identity_context, NamespaceToolAliases, ToolIdentityRestoreError,
+        OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY,
+    };
+    use crate::formats::openai::tool_lowering::ResponsesToolRestore;
+    use crate::formats::shared::sync_products::convert_standard_chat_response;
+    use crate::formats::shared::sync_to_stream::maybe_bridge_standard_sync_json_to_stream;
+    use crate::formats::{
+        context::{FormatContext, FormatError},
+        registry::{convert_request, convert_response},
+    };
 
     use super::{
-        expand_previous_response_for_chat, hydrate_response_history,
-        record_converted_response_history, response_history_key, response_history_storage_key,
-        response_history_store,
+        expand_openai_responses_request_body, expand_previous_response_for_chat,
+        hydrate_response_history, record_converted_response_history, response_history_is_loaded,
+        response_history_key, response_history_storage_key, response_history_store,
     };
 
     fn conversion_report_context(original_request_body: serde_json::Value) -> serde_json::Value {
@@ -810,5 +844,644 @@ mod tests {
         assert_eq!(messages[3]["tool_calls"][1]["id"], "call_audit_2b");
         assert_eq!(messages[4]["tool_call_id"], "call_deep_scan_2a");
         assert_eq!(messages[5]["tool_call_id"], "call_audit_2b");
+        // Every assistant call pairs with exactly one tool result, by id.
+        let paired = messages[3..]
+            .iter()
+            .filter_map(|message| message["tool_call_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paired, vec!["call_deep_scan_2a", "call_audit_2b"]);
+    }
+
+    fn tool_search_tools() -> serde_json::Value {
+        json!([{
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Find tools",
+            "parameters": {"type": "object", "properties": {"goal": {"type": "string"}}}
+        }])
+    }
+
+    fn discovered_namespace_output(call_id: &str) -> serde_json::Value {
+        json!({
+            "type": "tool_search_output",
+            "call_id": call_id,
+            "execution": "client",
+            "tools": [{
+                "type": "namespace",
+                "name": "crm",
+                "description": "CRM tools",
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"}
+                }]
+            }]
+        })
+    }
+
+    fn identity_report_context(
+        original_request_body: serde_json::Value,
+        provider_api_format: &str,
+        scope: &str,
+    ) -> serde_json::Value {
+        json!({
+            "needs_conversion": true,
+            "client_api_format": "openai:responses",
+            "provider_api_format": provider_api_format,
+            "api_key_id": scope,
+            "original_request_body": original_request_body,
+        })
+    }
+
+    fn chat_lookup_response() -> serde_json::Value {
+        json!({
+            "id": "chatcmpl-identity",
+            "object": "chat.completion",
+            "model": "gpt-source",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_lookup",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"q\":\"42\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+        })
+    }
+
+    fn claude_lookup_response() -> serde_json::Value {
+        json!({
+            "id": "msg_identity",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_lookup",
+                "name": "lookup",
+                "input": {"q": "42"}
+            }],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 5, "output_tokens": 3}
+        })
+    }
+
+    fn restored_lookup_item(body: &serde_json::Value) -> serde_json::Value {
+        body["output"]
+            .as_array()
+            .expect("responses output")
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .cloned()
+            .expect("restored function call item")
+    }
+
+    /// Records turn one (with a discovered namespace child in its input) and
+    /// returns the continuation body a client would send next.
+    fn record_turn_one(scope: &str, response_id: &str) -> serde_json::Value {
+        record_converted_response_history(
+            &identity_report_context(
+                json!({
+                    "model": "gpt-source",
+                    "tools": tool_search_tools(),
+                    "input": [
+                        {"role": "user", "content": "find crm tools"},
+                        discovered_namespace_output("call_search_t1"),
+                    ]
+                }),
+                "openai:chat",
+                scope,
+            ),
+            &json!({
+                "id": response_id,
+                "status": "completed",
+                "output": [{
+                    "type": "tool_search_call",
+                    "call_id": "call_search_t1",
+                    "execution": "client",
+                    "arguments": {"goal": "crm"}
+                }]
+            }),
+        )
+        .expect("turn one history should record");
+        json!({
+            "model": "gpt-source",
+            "previous_response_id": response_id,
+            "tools": tool_search_tools(),
+            "input": [{"role": "user", "content": "look up the customer"}]
+        })
+    }
+
+    #[test]
+    fn library_roundtrip_restores_namespace_identity_from_scoped_history() {
+        let scope = "history-identity-roundtrip";
+        let continuation = record_turn_one(scope, "resp_identity_roundtrip_t1");
+        let request_ctx = FormatContext::default().with_history_scope(scope);
+
+        let chat_body = convert_request(
+            "openai:responses",
+            "openai:chat",
+            &continuation,
+            &request_ctx,
+        )
+        .expect("continuation should convert with scoped history");
+        assert!(
+            chat_body["tools"]
+                .as_array()
+                .expect("chat tools")
+                .iter()
+                .any(|tool| tool["function"]["name"] == "lookup"),
+            "{chat_body}"
+        );
+
+        let response_ctx = FormatContext::default().with_report_context(identity_report_context(
+            continuation.clone(),
+            "openai:chat",
+            scope,
+        ));
+        let responses_body = convert_response(
+            "openai:chat",
+            "openai:responses",
+            &chat_lookup_response(),
+            &response_ctx,
+        )
+        .expect("response conversion should restore the scoped identity");
+        let item = restored_lookup_item(&responses_body);
+        assert_eq!(item["namespace"], "crm");
+        assert_eq!(item["name"], "lookup");
+
+        let expanded = expand_openai_responses_request_body(&continuation, Some(scope))
+            .expect("library callers expand the continuation once with the scope");
+        let claude_body = convert_request(
+            "openai:responses",
+            "claude:messages",
+            &expanded,
+            &FormatContext::default(),
+        )
+        .expect("expanded continuation should convert for Claude");
+        assert!(
+            claude_body["tools"]
+                .as_array()
+                .expect("claude tools")
+                .iter()
+                .any(|tool| tool["name"] == "lookup"),
+            "{claude_body}"
+        );
+        let claude_ctx = FormatContext::default().with_report_context(identity_report_context(
+            continuation,
+            "claude:messages",
+            scope,
+        ));
+        let responses_body = convert_response(
+            "claude:messages",
+            "openai:responses",
+            &claude_lookup_response(),
+            &claude_ctx,
+        )
+        .expect("claude response should restore the scoped identity");
+        let item = restored_lookup_item(&responses_body);
+        assert_eq!(item["namespace"], "crm");
+        assert_eq!(item["name"], "lookup");
+    }
+
+    #[test]
+    fn real_chat_response_replays_into_a_chat_request() {
+        let scope = "history-identity-real-replay";
+        let first_request = json!({
+            "model": "gpt-source",
+            "tools": tool_search_tools(),
+            "input": [
+                {"role": "user", "content": "find crm tools"},
+                discovered_namespace_output("call_search_t1")
+            ]
+        });
+        let report_context = identity_report_context(first_request, "openai:chat", scope);
+
+        // Real provider conversion: a Chat sync completion becomes a Responses
+        // body whose synthesized assistant message item carries item id/status
+        // metadata. History replay must downgrade exactly that metadata.
+        let responses_body = convert_response(
+            "openai:chat",
+            "openai:responses",
+            &json!({
+                "id": "chatcmpl-identity-replay",
+                "object": "chat.completion",
+                "model": "gpt-source",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "crm tools discovered"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+            }),
+            &FormatContext::default().with_report_context(report_context.clone()),
+        )
+        .expect("Chat sync body converts to Responses");
+        let message_item = responses_body["output"]
+            .as_array()
+            .expect("responses output")
+            .iter()
+            .find(|item| item["type"] == "message")
+            .expect("assistant message item")
+            .clone();
+        assert!(message_item.get("id").is_some(), "{message_item}");
+        assert_eq!(message_item["status"], "completed");
+        let response_id = responses_body["id"]
+            .as_str()
+            .expect("responses id")
+            .to_string();
+        assert!(
+            record_converted_response_history(&report_context, &responses_body)
+                .expect("completed conversion records history")
+                .payload
+                .contains("crm tools discovered")
+        );
+
+        let continuation = json!({
+            "model": "gpt-source",
+            "previous_response_id": response_id,
+            "tools": tool_search_tools(),
+            "input": [{"role": "user", "content": "now use it"}]
+        });
+        let chat_body = convert_request(
+            "openai:responses",
+            "openai:chat",
+            &continuation,
+            &FormatContext::default().with_history_scope(scope),
+        )
+        .expect("recorded Responses history must replay into Chat");
+        let messages = chat_body["messages"].as_array().expect("chat messages");
+        assert!(
+            messages.iter().any(|message| {
+                message["role"] == "assistant" && message["content"] == "crm tools discovered"
+            }),
+            "{chat_body}"
+        );
+        assert!(
+            chat_body["tools"]
+                .as_array()
+                .expect("chat tools")
+                .iter()
+                .any(|tool| tool["function"]["name"] == "lookup"),
+            "{chat_body}"
+        );
+
+        // Only established message metadata is downgraded; unknown source
+        // fields still fail closed rather than being stripped.
+        let smuggled = json!({
+            "model": "gpt-source",
+            "input": [{
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_smuggled",
+                "status": "completed",
+                "future_semantic": {"k": 1},
+                "content": [{"type": "output_text", "text": "hi", "annotations": []}]
+            }]
+        });
+        assert!(convert_request(
+            "openai:responses",
+            "openai:chat",
+            &smuggled,
+            &FormatContext::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pinned_tool_identity_survives_history_expiration() {
+        let scope = "history-identity-expired";
+        let previous_response_id = "resp_identity_expired_t1";
+        response_history_store()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                previous_response_id.to_string(),
+                Some(scope),
+                vec![json!({"role": "user", "content": "earlier"})],
+                Instant::now() - Duration::from_secs(10),
+                Duration::from_secs(1),
+            );
+        assert!(!response_history_is_loaded(
+            previous_response_id,
+            Some(scope)
+        ));
+
+        let continuation = json!({
+            "model": "gpt-source",
+            "previous_response_id": previous_response_id,
+            "tools": tool_search_tools(),
+            "input": [{"role": "user", "content": "look up the customer"}]
+        });
+        let effective_body = json!({
+            "model": "gpt-source",
+            "tools": tool_search_tools(),
+            "input": [
+                discovered_namespace_output("call_search_t1"),
+                {"role": "user", "content": "look up the customer"}
+            ]
+        });
+        let mut report_context =
+            identity_report_context(continuation.clone(), "openai:chat", scope);
+        report_context[OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY] =
+            openai_responses_tool_identity_context(&effective_body);
+
+        // The pinned projection keeps tool identities only, never the search
+        // call envelope or conversation content.
+        let pinned = &report_context[OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY];
+        assert!(pinned["input"][0].get("call_id").is_none());
+        assert!(pinned["input"][0].get("execution").is_none());
+        assert!(pinned["input"][0].get("content").is_none());
+        assert_eq!(pinned["input"][0]["tools"][0]["name"], "crm");
+
+        let aliases = NamespaceToolAliases::try_from_report_context(&report_context)
+            .expect("pinned identity must not depend on cached history");
+        assert_eq!(
+            aliases.restore_tool_call("lookup"),
+            ResponsesToolRestore::NamespaceChild {
+                namespace: "crm".to_string(),
+                name: "lookup".to_string(),
+            }
+        );
+
+        let pinned_response = convert_response(
+            "openai:chat",
+            "openai:responses",
+            &chat_lookup_response(),
+            &FormatContext::default().with_report_context(report_context),
+        )
+        .expect("pinned identity restores the namespace");
+        assert_eq!(restored_lookup_item(&pinned_response)["namespace"], "crm");
+
+        // Without the pinned sidecar the expired history must fail closed.
+        let legacy_context = identity_report_context(continuation, "openai:chat", scope);
+        assert_eq!(
+            NamespaceToolAliases::try_from_report_context(&legacy_context),
+            Err(ToolIdentityRestoreError::HistoryUnavailable)
+        );
+        let error = convert_response(
+            "openai:chat",
+            "openai:responses",
+            &chat_lookup_response(),
+            &FormatContext::default().with_report_context(legacy_context.clone()),
+        )
+        .expect_err("unavailable identity must fail closed");
+        match error {
+            FormatError::LossyConversionBlocked { field, .. } => {
+                assert_eq!(field, "previous_response_id");
+            }
+            other => panic!("expected LossyConversionBlocked, got {other:?}"),
+        }
+        // The sync product bridge must not fall back to a pairwise converter.
+        assert!(convert_standard_chat_response(
+            &chat_lookup_response(),
+            "openai:chat",
+            "openai:responses",
+            &legacy_context,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn wrong_scope_or_unknown_previous_response_rejects_identity() {
+        let owner_scope = "history-identity-owner";
+        let other_scope = "history-identity-other";
+        let continuation = record_turn_one(owner_scope, "resp_identity_scoped_t1");
+
+        let record = record_converted_response_history(
+            &identity_report_context(
+                json!({"model": "gpt-source", "input": [{"role": "user", "content": "inspect"}]}),
+                "openai:chat",
+                owner_scope,
+            ),
+            &json!({
+                "id": "resp_identity_scoped_other",
+                "status": "completed",
+                "output": []
+            }),
+        )
+        .expect("completed conversion records history");
+        assert!(hydrate_response_history(
+            "resp_identity_scoped_other",
+            Some(other_scope),
+            &record.payload
+        )
+        .is_err());
+
+        let wrong_scope = identity_report_context(continuation.clone(), "openai:chat", other_scope);
+        assert_eq!(
+            NamespaceToolAliases::try_from_report_context(&wrong_scope),
+            Err(ToolIdentityRestoreError::HistoryUnavailable)
+        );
+        assert!(convert_response(
+            "openai:chat",
+            "openai:responses",
+            &chat_lookup_response(),
+            &FormatContext::default().with_report_context(wrong_scope),
+        )
+        .is_err());
+
+        let unknown = identity_report_context(
+            json!({
+                "model": "gpt-source",
+                "previous_response_id": "resp_identity_missing",
+                "input": []
+            }),
+            "openai:chat",
+            owner_scope,
+        );
+        assert_eq!(
+            NamespaceToolAliases::try_from_report_context(&unknown),
+            Err(ToolIdentityRestoreError::HistoryUnavailable)
+        );
+        // A recorded history for the same id but a different scope cannot be
+        // re-read by the owner of another scope.
+        assert!(expand_previous_response_for_chat(&continuation, Some(other_scope)).is_err());
+    }
+
+    #[test]
+    fn continuation_record_preserves_the_full_transcript() {
+        let scope = "history-identity-two-turn";
+        let turn_two_body = record_turn_one(scope, "resp_identity_two_turn_t1");
+        let expanded_turn_two = expand_previous_response_for_chat(&turn_two_body, Some(scope))
+            .expect("turn two expands while the entry exists");
+        let mut turn_two_context = identity_report_context(turn_two_body, "openai:chat", scope);
+        turn_two_context[OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY] =
+            openai_responses_tool_identity_context(&expanded_turn_two);
+
+        record_converted_response_history(
+            &turn_two_context,
+            &json!({
+                "id": "resp_identity_two_turn_t2",
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "id": "fc_two_turn",
+                    "call_id": "call_two_turn",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"42\"}"
+                }]
+            }),
+        )
+        .expect("a continuation records the full transcript");
+
+        let transcript = response_history_store()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get("resp_identity_two_turn_t2", Some(scope), Instant::now())
+            .expect("turn two transcript");
+        // The full stored transcript survives: turn one's turns, the discovery
+        // item, turn two's input and the response output.
+        assert!(transcript
+            .iter()
+            .any(|item| item["type"] == "tool_search_output" && item["tools"][0]["name"] == "crm"));
+        assert!(transcript
+            .iter()
+            .any(|item| item["content"] == "find crm tools"));
+        assert!(transcript
+            .iter()
+            .any(|item| item["content"] == "look up the customer"));
+        assert!(transcript
+            .iter()
+            .any(|item| item["type"] == "function_call" && item["name"] == "lookup"));
+
+        let turn_three = identity_report_context(
+            json!({
+                "model": "gpt-source",
+                "previous_response_id": "resp_identity_two_turn_t2",
+                "input": [{"role": "user", "content": "again"}]
+            }),
+            "openai:chat",
+            scope,
+        );
+        let aliases = NamespaceToolAliases::try_from_report_context(&turn_three)
+            .expect("second continuation keeps the discovered identity");
+        assert_eq!(
+            aliases.restore_tool_call("lookup"),
+            ResponsesToolRestore::NamespaceChild {
+                namespace: "crm".to_string(),
+                name: "lookup".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn continuation_record_refuses_incomplete_transcript_after_eviction() {
+        let scope = "history-identity-evicted";
+        let turn_two_body = record_turn_one(scope, "resp_identity_evicted_t1");
+        let expanded_turn_two = expand_previous_response_for_chat(&turn_two_body, Some(scope))
+            .expect("turn two expands while the entry exists");
+        let mut turn_two_context = identity_report_context(turn_two_body, "openai:chat", scope);
+        turn_two_context[OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY] =
+            openai_responses_tool_identity_context(&expanded_turn_two);
+
+        // The continued transcript is evicted between request and response.
+        response_history_store()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&response_history_key(
+                "resp_identity_evicted_t1",
+                Some(scope),
+            ));
+        assert!(!response_history_is_loaded(
+            "resp_identity_evicted_t1",
+            Some(scope)
+        ));
+
+        // Recording a tool-only + new-turn transcript would present an
+        // incomplete conversation as complete: refuse it instead.
+        assert!(record_converted_response_history(
+            &turn_two_context,
+            &json!({
+                "id": "resp_identity_evicted_t2",
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "id": "fc_evicted",
+                    "call_id": "call_evicted",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"42\"}"
+                }]
+            }),
+        )
+        .is_none());
+        assert!(!response_history_is_loaded(
+            "resp_identity_evicted_t2",
+            Some(scope)
+        ));
+
+        // The pinned identity still restores the current response...
+        let aliases = NamespaceToolAliases::try_from_report_context(&turn_two_context)
+            .expect("pinned identity restores the current response");
+        assert_eq!(
+            aliases.restore_tool_call("lookup"),
+            ResponsesToolRestore::NamespaceChild {
+                namespace: "crm".to_string(),
+                name: "lookup".to_string(),
+            }
+        );
+        // ...while the next continuation fails closed instead of silently
+        // losing the earlier conversation and discovery.
+        let turn_three = identity_report_context(
+            json!({
+                "model": "gpt-source",
+                "previous_response_id": "resp_identity_evicted_t2",
+                "input": [{"role": "user", "content": "again"}]
+            }),
+            "openai:chat",
+            scope,
+        );
+        assert_eq!(
+            NamespaceToolAliases::try_from_report_context(&turn_three),
+            Err(ToolIdentityRestoreError::HistoryUnavailable)
+        );
+    }
+
+    #[test]
+    fn sync_to_stream_bridge_uses_pinned_identity_when_history_is_gone() {
+        let report_context = json!({
+            "provider_api_format": "openai:chat",
+            "client_api_format": "openai:responses",
+            "needs_conversion": true,
+            "api_key_id": "history-identity-bridge",
+            "original_request_body": {
+                "model": "gpt-source",
+                "previous_response_id": "resp_identity_bridge_missing",
+                "input": [{"role": "user", "content": "look up"}]
+            },
+            "responses_tool_identity": {
+                "tools": [{"type": "tool_search", "execution": "client"}],
+                "input": [{
+                    "type": "tool_search_output",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "crm",
+                        "description": "CRM tools",
+                        "tools": [{
+                            "type": "function",
+                            "name": "lookup",
+                            "parameters": {"type": "object"}
+                        }]
+                    }]
+                }]
+            }
+        });
+        let outcome = maybe_bridge_standard_sync_json_to_stream(
+            &chat_lookup_response(),
+            "openai:chat",
+            "openai:responses",
+            Some(&report_context),
+        )
+        .expect("bridge should accept the pinned identity")
+        .expect("bridge should produce SSE");
+        let sse = String::from_utf8(outcome.sse_body).expect("sse should be utf8");
+        assert!(sse.contains("\"namespace\":\"crm\""), "{sse}");
+        assert!(sse.contains("\"name\":\"lookup\""), "{sse}");
     }
 }

@@ -737,6 +737,63 @@ mod tests {
     }
 
     #[test]
+    fn responses_direct_targets_preserve_input_system_and_developer_instructions() {
+        let body = json!({
+            "model": "client",
+            "instructions": "root rules",
+            "input": [
+                {"role": "system", "content": "system rules"},
+                {"role": "developer", "content": [
+                    {"type": "input_text", "text": "developer first"},
+                    {"type": "input_text", "text": "developer second"}
+                ]},
+                {"role": "user", "content": "question"}
+            ]
+        });
+        let expected = "root rules\n\nsystem rules\n\ndeveloper first\n\ndeveloper second";
+        for (target, model) in [
+            ("claude:messages", "claude-sonnet-4-5"),
+            ("gemini:generate_content", "gemini-2.5-pro"),
+        ] {
+            let converted = build_cross_format_openai_responses_request_body(
+                &body,
+                model,
+                "openai:responses",
+                target,
+                true,
+            )
+            .expect("direct target preserves every instruction source");
+            let pure = crate::convert_request_pure("openai:responses", target, &body)
+                .expect("pure conversion shares instruction projection")
+                .value;
+            for value in [&converted, &pure] {
+                if target == "claude:messages" {
+                    assert_eq!(value["system"], expected);
+                    assert_eq!(
+                        value["messages"],
+                        json!([{"role":"user","content":"question"}])
+                    );
+                } else {
+                    assert_eq!(
+                        value["systemInstruction"]["parts"],
+                        json!([{"text":expected}])
+                    );
+                    assert_eq!(
+                        value["contents"],
+                        json!([{"role":"user","parts":[{"text":"question"}]}])
+                    );
+                }
+            }
+        }
+        let native = crate::convert_request_pure("openai:responses", "openai:responses", &body)
+            .expect("same-format audit keeps instruction placement")
+            .value;
+        assert_eq!(native["instructions"], "root rules");
+        assert_eq!(native["input"][0]["role"], "system");
+        assert_eq!(native["input"][1]["role"], "developer");
+    }
+
+    #[test]
     fn runtime_builder_keeps_custom_text_tool_when_targeting_claude() {
         // 运行时 Responses→Claude 必须直连规范转换:经 Chat 中转会返回 None。
         let body_json = json!({

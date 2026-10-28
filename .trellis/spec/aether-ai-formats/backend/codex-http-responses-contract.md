@@ -121,10 +121,10 @@ Aether stores normal usage/audit records only. It does not store Response bodies
 `OpenAIResponsesClientEmitter::emit_error` creates one failed Response snapshot,
 not a bare error with a `response.failed` label. Keep `id`, `object`, `model`,
 `created_at`, accumulated `output`, known `usage`, `status=failed` and nested
-`error`. Already completed items remain completed; open tool arguments remain
-partial/incomplete. An error must not close an unfinished tool as successful or
-emit a later `response.completed`. Provider parse errors after visible output
-use this same terminal boundary.
+`error`. Already completed items remain completed; open tool arguments and hosted
+search calls remain incomplete. An error must not close an unfinished tool as
+successful or emit a later `response.completed`. Provider parse errors and checked
+client-emission errors after visible output use this same terminal boundary.
 
 Claude signed thinking uses
 `aether-claude-reasoning-carrier-v1:signature:<base64>` in a reasoning item's
@@ -138,6 +138,10 @@ their own item IDs, never another item's text prefix; a done item repeated in th
 terminal snapshot emits once. Reject malformed owned carriers and redacted
 carriers carrying visible text. Gemini must not receive Claude signatures as
 `thoughtSignature`, nor silently drop redacted blocks.
+Give every reasoning block its own output-item ID. Reasoning-only output must
+replay as an assistant thinking message before the next user turn, without
+inventing answer text. Chat reasoning separators appear only between nonempty
+sections, never after the final section.
 
 Audited response conversion enforces the carrier payload bound before emission;
 encoding failure is a conversion error, not missing reasoning. Public raw
@@ -151,9 +155,11 @@ argument deltas must concatenate to exactly the assembled JSON object; buffer
 non-depth-first updates when no safe append-only prefix exists. Correlate
 parallel calls by explicit IDs. Id-less continuation may use only the sole
 remaining active candidate call after another parallel call finishes; never
-guess an ambiguous owner. Validate terminal closure after all candidates in the
-event are consumed. Explicitly finished parameterless calls emit `{}`; malformed
-or unfinished calls emit failure, never an empty success. Synchronous partialArgs
+guess an ambiguous owner, including empty or argument-free close markers. RFC
+9535 quoted keys decode Unicode escapes and valid surrogate pairs. Validate only
+the finishing candidate's calls; wait for all remaining candidates before stream
+completion. Explicitly finished parameterless calls emit `{}`; malformed or
+unfinished calls emit failure, never an empty success. Synchronous partialArgs
 remains unsupported.
 
 Responses client-executed `tool_search` lowers to a provider function for Chat
@@ -169,6 +175,25 @@ Responses envelopes: a schema property named `arguments` remains intact.
 Discovered client functions named `web_search` win over hosted-name heuristics.
 Hosted search, unsupported custom grammars and unrecognized material fields
 remain fail-closed. Native same-format requests do not enter this lowering.
+
+For a converted continuation, expand `previous_response_id` with the API-key
+scope before conversion. Pin `openai_responses_tool_identity_context` from that
+effective body in the report context; keep only tool definitions, not the full
+conversation. Sync, SSE and sync-to-SSE restoration use that same inventory even
+if the history entry later expires. Missing or wrongly scoped history without
+a pinned inventory fails closed. Never record a tool-only transcript as complete
+when full continuation history is unavailable. Discovered flat tools participate
+in name ambiguity checks, and custom `allowed_tools` choices use the same lowered
+function identity as the offered tools.
+
+Replayed Responses message items carry `id`, `status`, `phase` and `item_type`
+metadata. The explicit message-metadata downgrade applies equally to Chat,
+Claude and Gemini targets; unknown message extensions still fail closed. Keep
+these fields on native Responses traffic. Continuation regressions must record
+real converted responses, not hand-built output that omits generated metadata.
+
+Direct Responses-to-Claude/Gemini conversion combines top-level `instructions`
+with `input` system/developer messages in order instead of discarding the latter.
 
 Cross-format normalization retains leading `additional_tools` declarations and
 audits downgrade values instead of dropping their keys unconditionally. An
@@ -205,6 +230,9 @@ Native same-format metadata bypasses these conversion rules.
 | Vertex partialArgs continuation or parallel call | Preserve call identity and concatenate deltas into exact JSON; unfinished or conflicting input fails. |
 | Explicitly finished Vertex parameterless function | Emit the named call with `{}` arguments. |
 | Client tool-search output contains discovered deferred definitions | Materialize them once, even without top-level tools, and restore Responses identity on return. |
+| Ambiguous idless Vertex argument fragment or close marker | Emit one failure; later explicit closes cannot turn it into success. |
+| A pinned continuation's history expires during execution | Restore this response's tool identity from its snapshot; do not fabricate full history for the next turn. |
+| Missing or wrongly scoped continuation history without a pinned inventory | Fail conversion rather than leaking aliases or inventing tools. |
 | `store=false` | Forward unchanged; create no Aether Response persistence. |
 
 ## 5. Good / Base / Bad Cases
@@ -259,6 +287,17 @@ Keep focused regressions on the shared paths:
   paths, interleaved leaves, parallel IDs, valid empty calls and terminal truncation.
 - Tool discovery regressions: history-only inventory, deferred loading, namespace
   collision stability, custom text input and sync/stream identity restoration.
+- `openai_responses_reasoning_only_output_replays_before_next_user_turn`: preserve
+  both signed thinking blocks before the next user without fabricated text.
+- `gemini_matrix_fails_ambiguous_idless_close_markers`: both empty and explicit
+  idless close markers produce one failure and no later completion.
+- `pinned_tool_identity_survives_history_expiration` and
+  `gateway_restores_discovered_responses_namespace_across_previous_response_id_continuation`:
+  preserve discovered namespace identity through a two-turn scoped continuation;
+  reject another API key before upstream execution.
+- `real_chat_response_replays_into_a_chat_request`: record a real Chat-to-Responses
+  completion, then replay its message identity/status through scoped history;
+  preserve assistant text and discovered tools while rejecting unknown metadata.
 
 Run the API coverage generator in check mode and `cargo fmt --all --check`. Broaden crate tests only when a focused regression exposes a shared-contract risk.
 

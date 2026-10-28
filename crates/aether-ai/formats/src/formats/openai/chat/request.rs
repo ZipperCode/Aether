@@ -4,7 +4,7 @@ use crate::{
     formats::{
         context::FormatContext,
         openai::{
-            namespace::NamespaceToolAliases,
+            namespace::{LoweredToolChoiceName, NamespaceToolAliases},
             tool_lowering::{
                 custom_tool_function_arguments, ToolLoweringError, ToolLoweringTarget,
             },
@@ -302,8 +302,8 @@ fn canonical_tool_choice_to_openai_for_request(
                         "function": { "name": name },
                     });
                 }
-                if let NamespaceNameResolution::Alias(alias) =
-                    resolve_namespace_child_name(name, &canonical.tools, namespace_tool_aliases)
+                if let LoweredToolChoiceName::Alias(alias) =
+                    namespace_tool_aliases.resolve_tool_choice_name(name)
                 {
                     return json!({
                         "type": "function",
@@ -315,22 +315,17 @@ fn canonical_tool_choice_to_openai_for_request(
         })
         .or_else(|| {
             raw_tool_choice_extension(canonical).and_then(|raw| {
-                raw_tool_choice_to_openai_chat_for_request(
-                    raw,
-                    &canonical.tools,
-                    namespace_tool_aliases,
-                )
+                raw_tool_choice_to_openai_chat_for_request(raw, namespace_tool_aliases)
             })
         })
 }
 
 fn raw_tool_choice_to_openai_chat_for_request(
     raw: &Value,
-    tools: &[CanonicalToolDefinition],
     aliases: &NamespaceToolAliases,
 ) -> Option<Value> {
     let mut choice = openai_tool_choice_raw_to_chat(raw);
-    rewrite_namespace_tool_choice_names(&mut choice, tools, aliases).then_some(choice)
+    rewrite_namespace_tool_choice_names(&mut choice, aliases).then_some(choice)
 }
 
 pub(crate) fn raw_tool_choice_extension_is_representable_for_openai_chat(
@@ -341,9 +336,8 @@ pub(crate) fn raw_tool_choice_extension_is_representable_for_openai_chat(
     else {
         return false;
     };
-    raw_tool_choice_extension(canonical).is_some_and(|raw| {
-        raw_tool_choice_to_openai_chat_for_request(raw, &canonical.tools, &aliases).is_some()
-    })
+    raw_tool_choice_extension(canonical)
+        .is_some_and(|raw| raw_tool_choice_to_openai_chat_for_request(raw, &aliases).is_some())
 }
 
 fn canonical_tool_choice_to_openai_for_tools(
@@ -365,47 +359,7 @@ fn canonical_tool_choice_to_openai_for_tools(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NamespaceNameResolution<'a> {
-    Unchanged,
-    Alias(&'a str),
-    Ambiguous,
-}
-
-pub(crate) fn resolve_namespace_child_name<'a>(
-    name: &'a str,
-    tools: &[CanonicalToolDefinition],
-    aliases: &'a NamespaceToolAliases,
-) -> NamespaceNameResolution<'a> {
-    let namespace_children = aliases.namespace_children_named(name).collect::<Vec<_>>();
-    let ordinary_matches = tools
-        .iter()
-        .enumerate()
-        .filter(|(index, tool)| !aliases.is_namespace_tool(*index) && tool.name == name)
-        .count();
-    let namespace_parent_matches = tools
-        .iter()
-        .enumerate()
-        .filter(|(index, tool)| aliases.is_namespace_tool(*index) && tool.name == name)
-        .count();
-
-    match (
-        namespace_children.as_slice(),
-        ordinary_matches,
-        namespace_parent_matches,
-    ) {
-        ([], 0, 0) | ([], 1, _) => NamespaceNameResolution::Unchanged,
-        ([], 0, _) => NamespaceNameResolution::Ambiguous,
-        ([child], 0, _) => NamespaceNameResolution::Alias(child.chat_name.as_str()),
-        _ => NamespaceNameResolution::Ambiguous,
-    }
-}
-
-fn rewrite_namespace_tool_choice_names(
-    choice: &mut Value,
-    tools: &[CanonicalToolDefinition],
-    aliases: &NamespaceToolAliases,
-) -> bool {
+fn rewrite_namespace_tool_choice_names(choice: &mut Value, aliases: &NamespaceToolAliases) -> bool {
     if let Some(choice) = choice.as_str() {
         return matches!(choice, "none" | "auto" | "required");
     }
@@ -426,18 +380,10 @@ fn rewrite_namespace_tool_choice_names(
                 .and_then(Value::as_object_mut)
                 .is_some_and(|function| {
                     object_has_exact_keys(function, &["name"])
-                        && rewrite_named_function_choice(function, tools, aliases)
+                        && rewrite_named_function_choice(function, aliases)
                 })
         }
-        "custom" => {
-            object_has_exact_keys(choice, &["type", "custom"])
-                && choice
-                    .get("custom")
-                    .and_then(Value::as_object)
-                    .is_some_and(|custom| {
-                        object_has_exact_keys(custom, &["name"]) && valid_named_choice(custom)
-                    })
-        }
+        "custom" => rewrite_custom_choice(choice, aliases),
         "allowed_tools" => {
             if !object_has_exact_keys(choice, &["type", "allowed_tools"]) {
                 return false;
@@ -471,25 +417,60 @@ fn rewrite_namespace_tool_choice_names(
                                 .and_then(Value::as_object_mut)
                                 .is_some_and(|function| {
                                     object_has_exact_keys(function, &["name"])
-                                        && rewrite_named_function_choice(function, tools, aliases)
+                                        && rewrite_named_function_choice(function, aliases)
                                 })
                     }
-                    Some("custom") => {
-                        object_has_exact_keys(tool, &["type", "custom"])
-                            && tool
-                                .get("custom")
-                                .and_then(Value::as_object)
-                                .is_some_and(|custom| {
-                                    object_has_exact_keys(custom, &["name"])
-                                        && valid_named_choice(custom)
-                                })
-                    }
+                    Some("custom") => rewrite_custom_choice(tool, aliases),
                     _ => false,
                 }
             })
         }
         _ => false,
     }
+}
+
+/// Rewrite a custom tool choice to the representation the inventory offers.
+///
+/// A custom text tool the lowering serves as a JSON function (a discovered
+/// custom tool, or any custom namespace child) has no `type: custom` entry in
+/// the provider request; keeping the custom choice would name a tool the model
+/// can never call. Declared top-level Chat custom tools stay native custom, so
+/// their choices keep the custom shape.
+fn rewrite_custom_choice(choice: &mut Map<String, Value>, aliases: &NamespaceToolAliases) -> bool {
+    if !object_has_exact_keys(choice, &["type", "custom"]) {
+        return false;
+    }
+    let Some(custom) = choice.get("custom").and_then(Value::as_object) else {
+        return false;
+    };
+    if !object_has_exact_keys(custom, &["name"]) || !valid_named_choice(custom) {
+        return false;
+    }
+    let name = custom
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    match aliases.resolve_tool_choice_name(&name) {
+        LoweredToolChoiceName::Ambiguous => false,
+        LoweredToolChoiceName::Alias(alias) => {
+            rewrite_choice_to_function(choice, &alias);
+            true
+        }
+        LoweredToolChoiceName::Unchanged => {
+            if aliases.custom_tool_is_function_lowered(None, &name) {
+                rewrite_choice_to_function(choice, &name);
+            }
+            true
+        }
+    }
+}
+
+fn rewrite_choice_to_function(choice: &mut Map<String, Value>, name: &str) {
+    choice.clear();
+    choice.insert("type".to_string(), Value::String("function".to_string()));
+    choice.insert("function".to_string(), json!({ "name": name }));
 }
 
 fn object_has_exact_keys(object: &Map<String, Value>, keys: &[&str]) -> bool {
@@ -506,7 +487,6 @@ fn valid_named_choice(choice: &Map<String, Value>) -> bool {
 
 fn rewrite_named_function_choice(
     function: &mut Map<String, Value>,
-    tools: &[CanonicalToolDefinition],
     aliases: &NamespaceToolAliases,
 ) -> bool {
     let Some(name) = function
@@ -518,13 +498,13 @@ fn rewrite_named_function_choice(
     else {
         return false;
     };
-    match resolve_namespace_child_name(&name, tools, aliases) {
-        NamespaceNameResolution::Unchanged => true,
-        NamespaceNameResolution::Alias(alias) => {
-            function.insert("name".to_string(), Value::String(alias.to_string()));
+    match aliases.resolve_tool_choice_name(&name) {
+        LoweredToolChoiceName::Unchanged => true,
+        LoweredToolChoiceName::Alias(alias) => {
+            function.insert("name".to_string(), Value::String(alias));
             true
         }
-        NamespaceNameResolution::Ambiguous => false,
+        LoweredToolChoiceName::Ambiguous => false,
     }
 }
 
@@ -620,14 +600,15 @@ fn canonical_request_has_unrepresentable_namespace_tools_for_openai_chat(
     }
 
     if let Some(CanonicalToolChoice::Tool { name }) = &request.tool_choice {
-        if resolve_namespace_child_name(name, &request.tools, aliases)
-            == NamespaceNameResolution::Ambiguous
-        {
+        if matches!(
+            aliases.resolve_tool_choice_name(name),
+            LoweredToolChoiceName::Ambiguous
+        ) {
             return true;
         }
     } else if let Some(raw) = raw_tool_choice_extension(request) {
         let mut choice = openai_tool_choice_raw_to_chat(raw);
-        if !rewrite_namespace_tool_choice_names(&mut choice, &request.tools, aliases) {
+        if !rewrite_namespace_tool_choice_names(&mut choice, aliases) {
             return true;
         }
     }
@@ -997,6 +978,120 @@ mod tests {
         let canonical = responses::request::from_raw(&body).expect("Responses request");
 
         assert!(to(&canonical, &FormatContext::default()).is_none());
+    }
+
+    #[test]
+    fn responses_discovered_flat_and_namespace_child_with_the_same_name_fails_closed() {
+        let body = json!({
+            "model": "gpt-source",
+            "input": [
+                {"role": "user", "content": "find lookup tools"},
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_search",
+                    "execution": "client",
+                    "arguments": {"goal": "lookup"}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_search",
+                    "execution": "client",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "lookup",
+                            "parameters": {"type": "object"}
+                        },
+                        {
+                            "type": "namespace",
+                            "name": "crm",
+                            "description": "CRM tools",
+                            "tools": [{
+                                "type": "function",
+                                "name": "lookup",
+                                "parameters": {"type": "object"}
+                            }]
+                        }
+                    ]
+                }
+            ],
+            "tools": [{
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Find tools",
+                "parameters": {"type": "object", "properties": {"goal": {"type": "string"}}}
+            }],
+            "tool_choice": {"type": "function", "name": "lookup"}
+        });
+        let canonical = responses::request::from_raw(&body).expect("Responses request");
+
+        // `lookup` names both a discovered flat tool and a discovered namespace
+        // child: picking the child alias would silently force the wrong tool.
+        assert!(to_raw(&canonical).is_none());
+        assert!(to(&canonical, &FormatContext::default()).is_none());
+    }
+
+    #[test]
+    fn responses_discovered_custom_choice_uses_the_offered_function() {
+        let body = json!({
+            "model": "gpt-source",
+            "input": [
+                {"role": "user", "content": "apply the patch"},
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_search",
+                    "execution": "client",
+                    "arguments": {"goal": "patch"}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_search",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Patch files"
+                    }]
+                }
+            ],
+            "tools": [{
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Find tools",
+                "parameters": {"type": "object", "properties": {"goal": {"type": "string"}}}
+            }],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "custom", "name": "apply_patch"}]
+            }
+        });
+        let canonical = responses::request::from_raw(&body).expect("Responses request");
+        let chat = to(&canonical, &FormatContext::default()).expect("Chat request");
+        let offered = chat["tools"].as_array().expect("Chat tools");
+
+        // The discovered custom tool is offered as a JSON function, so the
+        // required custom choice must name that function instead of a custom
+        // tool the request never offers.
+        assert_eq!(
+            chat["tool_choice"]["allowed_tools"]["tools"][0],
+            json!({"type": "function", "function": {"name": "apply_patch"}})
+        );
+        assert_eq!(chat["tool_choice"]["allowed_tools"]["mode"], "required");
+        let definition = offered
+            .iter()
+            .find(|tool| tool["function"]["name"] == "apply_patch")
+            .expect("offered lowered custom function");
+        assert_eq!(definition["type"], "function");
+
+        let mut forced = body;
+        forced["tool_choice"] = json!({"type": "custom", "name": "apply_patch"});
+        let canonical = responses::request::from_raw(&forced).expect("Responses request");
+        let chat = to(&canonical, &FormatContext::default()).expect("Chat request");
+        assert_eq!(
+            chat["tool_choice"],
+            json!({"type": "function", "function": {"name": "apply_patch"}})
+        );
     }
 
     #[test]

@@ -68,6 +68,22 @@ fn format_is_claude_messages(value: &str) -> bool {
     crate::formats::id::api_format_alias_matches(value, "claude:messages")
 }
 
+/// Claude signed/redacted thinking 只对能表达其语义的客户端格式可回放。
+/// Gemini 的 `thoughtSignature` 是 provider 自有签名，不能被 Aether Claude
+/// carrier 复用；未知客户端格式保持既有宽松行为。
+fn claude_thinking_target_supported(report_context: &Value) -> bool {
+    report_context
+        .get("client_api_format")
+        .and_then(Value::as_str)
+        .map(aether_ai_formats::normalize_api_format_alias)
+        .is_none_or(|client_api_format| {
+            matches!(
+                client_api_format.as_str(),
+                "openai:chat" | "openai:responses" | "openai:responses:compact" | "claude:messages"
+            )
+        })
+}
+
 fn normalize_openai_service_tier(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -123,7 +139,9 @@ pub struct OpenAIResponsesProviderState {
     finished: bool,
     text_parts: BTreeMap<String, String>,
     reasoning: String,
-    reasoning_parts: BTreeMap<usize, String>,
+    /// 已发射的 reasoning 文本，按 (item/output 身份, part 索引) 分桶，
+    /// 保证 done 快照按 item 补齐且只发射一次。
+    reasoning_parts: BTreeMap<(String, usize), String>,
     tool_calls: BTreeMap<usize, OpenAIResponsesProviderToolState>,
     tool_results: BTreeMap<usize, OpenAIResponsesProviderToolResultState>,
     tool_index_by_key: BTreeMap<String, usize>,
@@ -715,10 +733,20 @@ impl OpenAIResponsesProviderState {
         });
     }
 
+    /// reasoning 文本的身份键：优先 item_id，其次 output_index。
+    fn reasoning_part_owner_key(item_id: Option<&str>, output_index: Option<usize>) -> String {
+        item_id
+            .map(|item_id| format!("item:{item_id}"))
+            .or_else(|| output_index.map(|index| format!("output:{index}")))
+            .unwrap_or_else(|| "output:0".to_string())
+    }
+
     fn emit_missing_reasoning_part_text(
         &mut self,
         report_context: &Value,
         out: &mut Vec<CanonicalStreamFrame>,
+        item_id: Option<&str>,
+        output_index: Option<usize>,
         summary_index: usize,
         text: &str,
     ) {
@@ -729,15 +757,17 @@ impl OpenAIResponsesProviderState {
             self.ensure_started(report_context, out);
             return;
         }
+        let part_key = (
+            Self::reasoning_part_owner_key(item_id, output_index),
+            summary_index,
+        );
         let missing = {
-            let current = self.reasoning_parts.entry(summary_index).or_default();
+            let current = self.reasoning_parts.entry(part_key).or_default();
             let missing = if text.starts_with(current.as_str()) {
                 text[current.len()..].to_string()
-            } else if current.as_str() == text {
-                String::new()
-            } else if current.is_empty() {
-                text.to_string()
             } else {
+                // 已发射文本不短于当前快照，或同一 part 的最终快照与已发射
+                // 增量冲突时，均不重复发射。
                 String::new()
             };
             if !missing.is_empty() {
@@ -747,6 +777,14 @@ impl OpenAIResponsesProviderState {
         };
         if missing.is_empty() {
             return;
+        }
+        if let Some(item_id) = item_id {
+            // item 级快照（output_item.done / response.completed）之后按同一条目补齐，
+            // done-only 文本不能再被 item 快照重复发射。
+            self.reasoning_text_by_item
+                .entry(item_id.to_string())
+                .or_default()
+                .push_str(&missing);
         }
         self.ensure_started(report_context, out);
         self.reasoning.push_str(&missing);
@@ -906,7 +944,8 @@ impl OpenAIResponsesProviderState {
         let existing_chat_name = existing_chat_name
             .map(str::trim)
             .filter(|name| !name.is_empty());
-        let aliases = NamespaceToolAliases::from_report_context(report_context);
+        let aliases =
+            NamespaceToolAliases::try_from_report_context(report_context).map_err(|_| ())?;
 
         match namespace {
             Some(Value::String(namespace)) if !namespace.trim().is_empty() => {
@@ -1464,6 +1503,13 @@ impl OpenAIResponsesProviderState {
                 "Claude redacted thinking carrier must not carry visible text",
             ));
         }
+        // Gemini 的 thoughtSignature 是 provider 自有签名，不能被 Aether Claude
+        // carrier 借用；在发射任何帧（含 terminal observation）之前 fail closed。
+        if claude_carrier.is_some() && !claude_thinking_target_supported(report_context) {
+            return Err(AiSurfaceFinalizeError::new(
+                "Claude signed/redacted thinking cannot be represented in Gemini GenerateContent",
+            ));
+        }
         if self.terminal_only {
             if !completed_reasoning.is_empty() || claude_carrier.is_some() {
                 self.ensure_started(report_context, out);
@@ -1496,6 +1542,9 @@ impl OpenAIResponsesProviderState {
                 &completed_reasoning,
             );
         }
+        // 完成一个 reasoning item 才关闭 thinking 块：文本与 carrier 已在同一块内，
+        // 不同 item 即使没有签名也不会被合并。
+        let has_completed_block = !completed_reasoning.is_empty() || claude_carrier.is_some();
         if let Some(ClaudeReasoningCarrier::Signature(signature)) = claude_carrier {
             self.ensure_started(report_context, out);
             let (id, model) = self.identity(report_context);
@@ -1504,6 +1553,9 @@ impl OpenAIResponsesProviderState {
                 model,
                 event: CanonicalStreamEvent::ReasoningSignature(signature),
             });
+        }
+        if has_completed_block {
+            self.ensure_started(report_context, out);
             let (id, model) = self.identity(report_context);
             out.push(CanonicalStreamFrame {
                 id,
@@ -1951,9 +2003,16 @@ impl OpenAIResponsesProviderState {
                                 .and_then(Value::as_u64)
                                 .map(|value| value as usize)
                                 .unwrap_or(0);
+                            let item_id = value.get("item_id").and_then(Value::as_str);
+                            let output_index = value
+                                .get("output_index")
+                                .and_then(Value::as_u64)
+                                .map(|value| value as usize);
                             self.emit_missing_reasoning_part_text(
                                 report_context,
                                 &mut out,
+                                item_id,
+                                output_index,
                                 summary_index,
                                 text,
                             );
@@ -2043,14 +2102,22 @@ impl OpenAIResponsesProviderState {
                         return Ok(out);
                     }
                     self.reasoning.push_str(piece);
-                    if let Some(item_id) = value.get("item_id").and_then(Value::as_str) {
+                    let item_id = value.get("item_id").and_then(Value::as_str);
+                    let output_index = value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as usize);
+                    if let Some(item_id) = item_id {
                         self.reasoning_text_by_item
                             .entry(item_id.to_string())
                             .or_default()
                             .push_str(piece);
                     }
                     self.reasoning_parts
-                        .entry(summary_index)
+                        .entry((
+                            Self::reasoning_part_owner_key(item_id, output_index),
+                            summary_index,
+                        ))
                         .or_default()
                         .push_str(piece);
                     let (id, model) = self.identity(report_context);
@@ -2080,9 +2147,16 @@ impl OpenAIResponsesProviderState {
                         .and_then(Value::as_u64)
                         .map(|value| value as usize)
                         .unwrap_or(0);
+                    let item_id = value.get("item_id").and_then(Value::as_str);
+                    let output_index = value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as usize);
                     self.emit_missing_reasoning_part_text(
                         report_context,
                         &mut out,
+                        item_id,
+                        output_index,
                         summary_index,
                         text,
                     );
@@ -2091,12 +2165,8 @@ impl OpenAIResponsesProviderState {
                 if self.terminal_only {
                     return Ok(out);
                 }
-                let (id, model) = self.identity(report_context);
-                out.push(CanonicalStreamFrame {
-                    id,
-                    model,
-                    event: CanonicalStreamEvent::ReasoningSummaryDone,
-                });
+                // part 完成不是 thinking 块边界：同一 reasoning item 可能有多个 part，
+                // 且签名 carrier 稍后才随 output_item.done 到达。块边界在 item 完成时发射。
             }
             "response.output_item.added" => {
                 let Some(item) = value.get("item").and_then(Value::as_object) else {
@@ -2608,6 +2678,11 @@ pub struct OpenAIChatClientEmitter {
     finished: bool,
     next_tool_call_index: usize,
     tool_call_index_by_canonical: BTreeMap<usize, usize>,
+    /// 上一 reasoning 段已结束，分隔符延迟到下一段 reasoning 文本时再补发，
+    /// 避免 reasoning-only 输出留下尾随空行。
+    reasoning_separator_pending: bool,
+    /// 当前 reasoning 段是否已发射过文本；空段不产生分隔符。
+    reasoning_content_emitted: bool,
 }
 
 #[derive(Clone, Default)]
@@ -2694,6 +2769,8 @@ pub struct OpenAIResponsesClientEmitter {
     opaque_output_indexes: BTreeMap<String, usize>,
     completed_history_response: Option<Value>,
     namespace_tool_aliases: NamespaceToolAliases,
+    /// 续接请求的上一响应工具身份是否不可用；为 true 时严格流式路径必须 fail closed。
+    namespace_tool_identity_unavailable: bool,
     /// 失败前已观察到的 usage（来自流式 usage 事件）；失败终态必须保留。
     known_usage: Option<CanonicalUsage>,
 }
@@ -2775,6 +2852,25 @@ impl OpenAIChatClientEmitter {
             }
             CanonicalStreamEvent::ReasoningDelta(text) => {
                 let mut out = self.ensure_started()?;
+                if self.reasoning_separator_pending {
+                    // 只有确实存在下一段 reasoning 文本时才补分隔符，避免尾随 "\n\n"。
+                    self.reasoning_separator_pending = false;
+                    out.extend(self.encode_chunk(json!({
+                        "id": self.response_id
+                            .as_deref()
+                            .unwrap_or("chatcmpl-local-stream"),
+                        "object": "chat.completion.chunk",
+                        "model": self.model.as_deref().unwrap_or("unknown"),
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "reasoning_content": "\n\n",
+                            },
+                            "finish_reason": Value::Null
+                        }]
+                    }))?);
+                }
+                self.reasoning_content_emitted = true;
                 out.extend(self.encode_chunk(json!({
                     "id": self.response_id
                         .as_deref()
@@ -2792,24 +2888,11 @@ impl OpenAIChatClientEmitter {
                 Ok(out)
             }
             CanonicalStreamEvent::ReasoningSummaryDone => {
-                // CPA strategy: emit "\n\n" as paragraph separator between
-                // reasoning sections, matching CPA's Chat downstream behavior.
-                let mut out = self.ensure_started()?;
-                out.extend(self.encode_chunk(json!({
-                    "id": self.response_id
-                        .as_deref()
-                        .unwrap_or("chatcmpl-local-stream"),
-                    "object": "chat.completion.chunk",
-                    "model": self.model.as_deref().unwrap_or("unknown"),
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "reasoning_content": "\n\n",
-                        },
-                        "finish_reason": Value::Null
-                    }]
-                }))?);
-                Ok(out)
+                // CPA strategy: 段落之间用 "\n\n" 分隔，但延迟到下一段 reasoning
+                // 文本到达时才发射；空段和 reasoning-only 结尾都不产生多余分隔符。
+                self.reasoning_separator_pending |= self.reasoning_content_emitted;
+                self.reasoning_content_emitted = false;
+                Ok(Vec::new())
             }
             CanonicalStreamEvent::Citations(citations) => {
                 let annotations = canonical_citations_to_openai_annotations(&citations);
@@ -3029,9 +3112,11 @@ impl OpenAIResponsesClientEmitter {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
+        let namespace_tool_aliases = NamespaceToolAliases::try_from_report_context(report_context);
         Self {
             claude_reasoning_source: format_is_claude_messages(&provider_format),
-            namespace_tool_aliases: NamespaceToolAliases::from_report_context(report_context),
+            namespace_tool_identity_unavailable: namespace_tool_aliases.is_err(),
+            namespace_tool_aliases: namespace_tool_aliases.unwrap_or_default(),
             ..Self::default()
         }
     }
@@ -3141,9 +3226,14 @@ impl OpenAIResponsesClientEmitter {
     }
 
     fn reasoning_item_id(&self) -> String {
-        self.reasoning_item_id
-            .clone()
-            .unwrap_or_else(|| openai_responses_synthetic_reasoning_item_id(self.response_id(), 0))
+        self.reasoning_item_id.clone().unwrap_or_else(|| {
+            // 每个 reasoning 块拥有独立 output_index；ID 必须与之对应，
+            // 否则多个块会共享同一个合成 item ID，回放时被按身份去重。
+            openai_responses_synthetic_reasoning_item_id(
+                self.response_id(),
+                self.reasoning_output_index.unwrap_or(0),
+            )
+        })
     }
 
     fn tool_call_item_id(&self, index: usize) -> String {
@@ -3167,9 +3257,10 @@ impl OpenAIResponsesClientEmitter {
 
     fn ensure_reasoning_item_id(&mut self) -> String {
         if self.reasoning_item_id.is_none() {
+            let output_index = self.reasoning_output_index.unwrap_or(0);
             self.reasoning_item_id = Some(openai_responses_synthetic_reasoning_item_id(
                 self.response_id(),
-                0,
+                output_index,
             ));
         }
         self.reasoning_item_id()
@@ -3981,7 +4072,8 @@ impl OpenAIResponsesClientEmitter {
                         json!({
                             "type": "web_search_call",
                             "id": item_id,
-                            "status": "completed",
+                            // 失败终态不得把未完成的 hosted 搜索伪装成 completed。
+                            "status": item_status,
                             "action": {
                                 "type": "search",
                                 "query": web_search_query_from_arguments(&state.arguments),
@@ -4162,6 +4254,10 @@ impl OpenAIResponsesClientEmitter {
 
     /// 将规范帧写为 Responses SSE；Gemini 工具签名编码为定向合成 reasoning item。
     pub fn emit(&mut self, frame: CanonicalStreamFrame) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        if self.finished {
+            // 成功或失败终态之后的所有增量都必须惰性，保证恰好一个终态。
+            return Ok(Vec::new());
+        }
         self.update_identity(&frame);
         match frame.event {
             CanonicalStreamEvent::Start => self.ensure_started(),
@@ -4320,6 +4416,13 @@ impl OpenAIResponsesClientEmitter {
                 let mut out = self.close_reasoning_item()?;
                 out.extend(self.close_text_item()?);
                 out.extend(self.ensure_started()?);
+                if self.namespace_tool_identity_unavailable {
+                    // 续接响应缺少上一响应的工具身份：继续输出会把 provider 别名
+                    // 当成客户端 Responses 名称，必须严格失败。
+                    return Err(AiSurfaceFinalizeError::new(
+                        "previous response tool identity context is unavailable",
+                    ));
+                }
                 let output_index = self.ensure_tool_output_index(index);
                 let response_id = self.response_id().to_string();
                 let item_id = self.tool_call_item_id(index);
@@ -4929,7 +5032,13 @@ mod tests {
         assert_eq!(observed.tool_index_by_key, full.tool_index_by_key);
         assert!(full.text_parts.values().any(|text| text.len() == 32 * 1024));
         assert_eq!(full.reasoning.len(), 32 * 1024);
-        assert_eq!(full.reasoning_parts[&0].len(), 32 * 1024);
+        assert_eq!(
+            full.reasoning_parts
+                .values()
+                .map(String::len)
+                .sum::<usize>(),
+            32 * 1024
+        );
         assert_eq!(full.tool_calls[&0].arguments.len(), 32 * 1024);
         assert!(!full.tool_results.is_empty());
         assert_eq!(
@@ -7510,6 +7619,57 @@ mod tests {
         assert!(sse.contains("\"reasoning_content\":\"because\""));
     }
 
+    /// reasoning-only 输出不得留下尾随分隔符；多段 reasoning 仍以 "\n\n" 分隔。
+    #[test]
+    fn openai_chat_client_emitter_defers_reasoning_separator_until_next_section() {
+        let reasoning_content = |sse: &str| {
+            sse_json_events(sse)
+                .iter()
+                .filter_map(|event| {
+                    event
+                        .pointer("/choices/0/delta/reasoning_content")
+                        .and_then(Value::as_str)
+                })
+                .collect::<String>()
+        };
+        let encode = |events: Vec<CanonicalStreamEvent>| {
+            let mut emitter = OpenAIChatClientEmitter::default();
+            let mut bytes = Vec::new();
+            for event in events {
+                bytes.extend(
+                    emitter
+                        .emit(CanonicalStreamFrame {
+                            id: "chatcmpl_sep".to_string(),
+                            model: "gpt-5.4".to_string(),
+                            event,
+                        })
+                        .expect("event should encode"),
+                );
+            }
+            String::from_utf8(bytes).expect("sse should be utf8")
+        };
+        let finish = || CanonicalStreamEvent::Finish {
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+        };
+
+        let single = encode(vec![
+            CanonicalStreamEvent::ReasoningDelta("plan".to_string()),
+            CanonicalStreamEvent::ReasoningSummaryDone,
+            finish(),
+        ]);
+        assert_eq!(reasoning_content(&single), "plan", "{single}");
+
+        let multiple = encode(vec![
+            CanonicalStreamEvent::ReasoningDelta("one".to_string()),
+            CanonicalStreamEvent::ReasoningSummaryDone,
+            CanonicalStreamEvent::ReasoningDelta("two".to_string()),
+            CanonicalStreamEvent::ReasoningSummaryDone,
+            finish(),
+        ]);
+        assert_eq!(reasoning_content(&multiple), "one\n\ntwo", "{multiple}");
+    }
+
     #[test]
     fn openai_chat_client_emitter_renders_image_parts_as_placeholder() {
         let mut emitter = OpenAIChatClientEmitter::default();
@@ -8732,13 +8892,64 @@ mod tests {
                 .expect("reasoning done should parse"),
         );
 
-        assert!(frames.iter().any(|frame| matches!(
-            frame.event,
-            CanonicalStreamEvent::ReasoningDelta(ref text) if text == "fallback reasoning"
-        )));
-        assert!(frames
+        // part 完成不等于 thinking 块完成：签名/最终文本仍可能随 item 快照到达。
+        assert!(!frames
             .iter()
             .any(|frame| matches!(frame.event, CanonicalStreamEvent::ReasoningSummaryDone)));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| matches!(
+                    &frame.event,
+                    CanonicalStreamEvent::ReasoningDelta(text) if text == "fallback reasoning"
+                ))
+                .count(),
+            1
+        );
+
+        // done-only 文本在随后的 item 快照中按 item 身份回填，不得重复发射。
+        frames.extend(
+            state
+                .push_line(
+                    &report_context,
+                    data_line(json!({
+                        "type": "response.output_item.done",
+                        "response_id": "resp_done_only",
+                        "output_index": 0,
+                        "item": {
+                            "type": "reasoning",
+                            "id": "resp_done_only_rs_0",
+                            "status": "completed",
+                            "summary": [],
+                            "content": [{
+                                "type": "reasoning_text",
+                                "text": "fallback reasoning",
+                            }],
+                        }
+                    })),
+                )
+                .expect("reasoning item should parse"),
+        );
+
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| matches!(
+                    &frame.event,
+                    CanonicalStreamEvent::ReasoningDelta(text) if text == "fallback reasoning"
+                ))
+                .count(),
+            1,
+            "done-only reasoning text must be emitted exactly once"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| matches!(frame.event, CanonicalStreamEvent::ReasoningSummaryDone))
+                .count(),
+            1,
+            "reasoning item completion closes exactly one thinking block"
+        );
     }
 
     #[test]
@@ -9095,6 +9306,516 @@ mod tests {
                     }
                 })),
             )
+            .is_err());
+    }
+
+    /// 两个连续签名块在块内保持文本/carrier，边界只在 item 完成（签名之后）发射。
+    #[test]
+    fn openai_responses_provider_state_closes_reasoning_items_after_carriers() {
+        let signed = |id: &str, text: &str, signature: &str| {
+            json!({
+                "type": "reasoning",
+                "id": id,
+                "status": "completed",
+                "encrypted_content": encode_claude_reasoning_signature_carrier(signature)
+                    .expect("carrier"),
+                "content": [{"type": "reasoning_text", "text": text}],
+                "summary": []
+            })
+        };
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let mut frames = Vec::new();
+        for (id, text, signature) in [
+            ("rs_first", "first", "sig_first"),
+            ("rs_second", "second", "sig_second"),
+        ] {
+            for event in [
+                json!({
+                    "type": "response.reasoning_text.delta",
+                    "response_id": "resp_signed",
+                    "item_id": id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": text,
+                }),
+                json!({
+                    "type": "response.reasoning_text.done",
+                    "response_id": "resp_signed",
+                    "item_id": id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": text,
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "response_id": "resp_signed",
+                    "output_index": 0,
+                    "item": signed(id, text, signature),
+                }),
+            ] {
+                frames.extend(
+                    state
+                        .push_line(&report_context, data_line(event))
+                        .expect("reasoning event should parse"),
+                );
+            }
+        }
+
+        let sequence = frames
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                CanonicalStreamEvent::ReasoningDelta(text) => Some(format!("delta:{text}")),
+                CanonicalStreamEvent::ReasoningSignature(signature) => {
+                    Some(format!("signature:{signature}"))
+                }
+                CanonicalStreamEvent::ReasoningSummaryDone => Some("done".to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // 文本完成事件（reasoning_text.done）不得先关闭块；签名必须在块边界之前到达。
+        assert_eq!(
+            sequence,
+            vec![
+                "delta:first".to_string(),
+                "signature:sig_first".to_string(),
+                "done".to_string(),
+                "delta:second".to_string(),
+                "signature:sig_second".to_string(),
+                "done".to_string(),
+            ]
+        );
+
+        // Responses 上游的两个签名块转成 Claude 流时，各自是带 text+signature 的独立 thinking 块。
+        let mut claude = ClaudeClientEmitter::default();
+        let mut claude_bytes = Vec::new();
+        for frame in &frames {
+            claude_bytes.extend(
+                claude
+                    .emit((*frame).clone())
+                    .expect("reasoning frame should convert to Claude"),
+            );
+        }
+        claude_bytes.extend(claude.finish().expect("claude finish should encode"));
+        let claude_sse = String::from_utf8(claude_bytes).expect("claude sse should be utf8");
+        let thinking_deltas = sse_json_events(&claude_sse)
+            .iter()
+            .filter(|event| event["type"] == "content_block_delta")
+            .filter_map(|event| {
+                let index = event["index"].as_u64().unwrap_or_default();
+                match event["delta"]["type"].as_str() {
+                    Some("thinking_delta") => Some((
+                        index,
+                        format!(
+                            "thinking:{}",
+                            event["delta"]["thinking"].as_str().unwrap_or_default()
+                        ),
+                    )),
+                    Some("signature_delta") => Some((
+                        index,
+                        format!(
+                            "signature:{}",
+                            event["delta"]["signature"].as_str().unwrap_or_default()
+                        ),
+                    )),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            thinking_deltas,
+            vec![
+                (0, "thinking:first".to_string()),
+                (0, "signature:sig_first".to_string()),
+                (1, "thinking:second".to_string()),
+                (1, "signature:sig_second".to_string()),
+            ],
+            "{claude_sse}"
+        );
+    }
+
+    /// 两个相邻签名块获得不同 item ID，并各自把文本与签名绑定回放到 Claude。
+    #[test]
+    fn claude_stream_two_signed_blocks_keep_text_signature_association() {
+        let report_context = json!({
+            "provider_api_format": "claude:messages",
+            "client_api_format": "openai:responses",
+        });
+        let mut state = ClaudeProviderState::default();
+        let mut emitter = OpenAIResponsesClientEmitter::with_report_context(&report_context);
+        let mut bytes = Vec::new();
+        let events = [
+            json!({"type": "message_start", "message": {
+                "id": "msg_two_signed", "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 3, "output_tokens": 0}
+            }}),
+            json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "first"}}),
+            json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig_first"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "thinking_delta", "thinking": "second"}}),
+            json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "signature_delta", "signature": "sig_second"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 3, "output_tokens": 6}}),
+            json!({"type": "message_stop"}),
+        ];
+        for event in events {
+            for frame in state.push_line(&report_context, data_line(event)).unwrap() {
+                bytes.extend(emitter.emit(frame).expect("frame should encode"));
+            }
+        }
+        bytes.extend(emitter.finish().expect("finish should encode"));
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let terminal = terminal_response_event(&sse_json_events(&sse));
+        let reasoning = terminal["output"]
+            .as_array()
+            .expect("output array")
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning.len(), 2, "{terminal}");
+        let first_id = reasoning[0]["id"].as_str().unwrap_or_default();
+        let second_id = reasoning[1]["id"].as_str().unwrap_or_default();
+        assert_ne!(first_id, second_id, "reasoning items must not share an id");
+
+        let decoded = reasoning
+            .iter()
+            .map(|item| {
+                (
+                    item["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    item.get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .and_then(
+                            crate::formats::openai::responses::decode_claude_reasoning_carrier,
+                        ),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded[0].0, "first");
+        assert_eq!(decoded[1].0, "second");
+        assert!(
+            matches!(&decoded[0].1, Some(ClaudeReasoningCarrier::Signature(signature)) if signature == "sig_first"),
+            "{terminal}"
+        );
+        assert!(
+            matches!(&decoded[1].1, Some(ClaudeReasoningCarrier::Signature(signature)) if signature == "sig_second"),
+            "{terminal}"
+        );
+
+        // 用终态 output 作为下一轮 Responses 输入，回放到 Claude 请求。
+        let mut input = terminal["output"].as_array().expect("output array").clone();
+        input.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}],
+        }));
+        input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "continue"}],
+        }));
+        let replay = json!({
+            "model": "claude-sonnet-4-5",
+            "max_output_tokens": 64,
+            "reasoning": {"effort": "high"},
+            "input": input,
+        });
+        let converted = crate::formats::registry::convert_request_pure(
+            "openai:responses",
+            "claude:messages",
+            &replay,
+        )
+        .expect("signed reasoning replay should convert to Claude")
+        .value;
+        let assistant = converted["messages"]
+            .as_array()
+            .expect("Claude messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant message");
+        assert_eq!(
+            assistant["content"][0],
+            json!({"type": "thinking", "thinking": "first", "signature": "sig_first"}),
+            "{converted}"
+        );
+        assert_eq!(
+            assistant["content"][1],
+            json!({"type": "thinking", "thinking": "second", "signature": "sig_second"}),
+            "{converted}"
+        );
+    }
+
+    /// 失败终态中未完成的 hosted web_search 不得标成 completed。
+    #[test]
+    fn openai_responses_client_emitter_failed_terminal_marks_hosted_search_incomplete() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let frame = |event: CanonicalStreamEvent| CanonicalStreamFrame {
+            id: "resp_search_failed".to_string(),
+            model: "gpt-5.4".to_string(),
+            event,
+        };
+        let mut bytes = emitter
+            .emit(frame(CanonicalStreamEvent::Start))
+            .expect("start should encode");
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_search".to_string(),
+                    name: "web_search".to_string(),
+                }))
+                .expect("search start should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit(frame(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments: "{\"query\":\"aether\"}".to_string(),
+                }))
+                .expect("search arguments should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit_error(json!({
+                    "error": {
+                        "message": "upstream stopped",
+                        "type": "server_error",
+                        "code": "stream_terminal_error",
+                    }
+                }))
+                .expect("failed terminal should encode"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let events = sse_json_events(&sse);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.failed")
+                .count(),
+            1,
+            "{sse}"
+        );
+        assert!(!sse.contains("event: response.completed\n"), "{sse}");
+        let response = terminal_response_event(&events);
+        let search = response["output"]
+            .as_array()
+            .expect("output array")
+            .iter()
+            .find(|item| item["type"] == "web_search_call")
+            .expect("accumulated web search call");
+        assert_ne!(search["status"], "completed", "{response}");
+        assert_eq!(search["status"], "incomplete");
+        assert_eq!(search["action"]["query"], "aether");
+    }
+
+    /// 可见输出后的 carrier 校验失败必须能转成保留累积输出的完整失败终态。
+    #[test]
+    fn openai_responses_client_emitter_carrier_failure_produces_complete_failed_terminal() {
+        let report_context = json!({"provider_api_format": "claude:messages"});
+        let mut emitter = OpenAIResponsesClientEmitter::with_report_context(&report_context);
+        let frame = |event: CanonicalStreamEvent| CanonicalStreamFrame {
+            id: "msg_carrier_failure".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            event,
+        };
+        emitter
+            .emit(frame(CanonicalStreamEvent::ReasoningDelta(
+                "visible thinking".to_string(),
+            )))
+            .expect("reasoning delta should encode");
+        let error = emitter
+            .emit(frame(CanonicalStreamEvent::ReasoningSignature(
+                "aether-claude-reasoning-carrier-v1:signature:nested".to_string(),
+            )))
+            .expect_err("nested carrier signature must fail closed");
+        let message = error.0.as_str();
+        assert!(message.contains("carrier bound"), "{message}");
+
+        let bytes = emitter
+            .emit_error(json!({
+                "error": {
+                    "message": message,
+                    "type": "server_error",
+                    "code": "stream_carrier_error",
+                }
+            }))
+            .expect("failed terminal should encode");
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let events = sse_json_events(&sse);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.failed")
+                .count(),
+            1,
+            "{sse}"
+        );
+        assert!(!sse.contains("event: response.completed\n"), "{sse}");
+        let response = terminal_response_event(&events);
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["error"]["code"], "stream_carrier_error");
+        let reasoning = response["output"]
+            .as_array()
+            .expect("output array")
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .expect("accumulated reasoning item");
+        assert_eq!(reasoning["status"], "incomplete");
+        assert_eq!(reasoning["content"][0]["text"], "visible thinking");
+
+        // 失败之后所有增量与再次失败都保持惰性，恰好一个终态。
+        assert!(emitter
+            .emit(frame(CanonicalStreamEvent::TextDelta("late".to_string())))
+            .expect("post-failure emit should be inert")
+            .is_empty());
+        assert!(emitter
+            .emit_error(json!({"error": {"message": "again"}}))
+            .expect("post-failure error should be inert")
+            .is_empty());
+    }
+
+    /// Aether Claude carrier 不能被当作 Gemini thoughtSignature 回放。
+    #[test]
+    fn openai_responses_provider_state_rejects_claude_carrier_for_gemini_client() {
+        let signed_carrier =
+            encode_claude_reasoning_signature_carrier("sig_gemini_leak").expect("carrier");
+        let redacted_carrier =
+            encode_claude_redacted_thinking_carrier("opaque_gemini").expect("carrier");
+        let item = |carrier: &str| {
+            json!({
+                "type": "response.output_item.done",
+                "response_id": "resp_carrier_target",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_carrier_target",
+                    "encrypted_content": carrier,
+                    "summary": []
+                }
+            })
+        };
+        for carrier in [&signed_carrier, &redacted_carrier] {
+            let report_context = json!({"client_api_format": "gemini:generate_content"});
+            let mut state = OpenAIResponsesProviderState::default();
+            assert!(
+                state
+                    .push_line(&report_context, data_line(item(carrier.as_str())))
+                    .is_err(),
+                "Claude-owned carrier must fail closed for Gemini clients"
+            );
+        }
+        // 终态观察同样必须在记录任何内容之前拒绝 Claude-owned carrier。
+        let report_context = json!({"client_api_format": "gemini:generate_content"});
+        let signed_event = item(signed_carrier.as_str());
+        let mut observation = OpenAIResponsesProviderState::terminal_observation();
+        assert!(
+            observation
+                .push_event(&report_context, &signed_event)
+                .is_err(),
+            "terminal observation must reject Claude-owned carriers for Gemini clients"
+        );
+        for client_api_format in [
+            "claude:messages",
+            "openai:responses",
+            "openai:responses:compact",
+            "openai:chat",
+        ] {
+            let report_context = json!({"client_api_format": client_api_format});
+            let mut state = OpenAIResponsesProviderState::default();
+            let frames = state
+                .push_line(&report_context, data_line(item(signed_carrier.as_str())))
+                .expect("supported client format should accept the carrier");
+            assert!(
+                frames.iter().any(|frame| matches!(
+                    &frame.event,
+                    CanonicalStreamEvent::ReasoningSignature(signature)
+                        if signature == "sig_gemini_leak"
+                )),
+                "{client_api_format}"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_stream_restores_pinned_namespace_identity_for_continuations() {
+        let report_context = json!({
+            "provider_api_format": "openai:chat",
+            "client_api_format": "openai:responses",
+            "api_key_id": "stream-identity-scope",
+            "original_request_body": {
+                "model": "gpt-source",
+                "previous_response_id": "resp_stream_identity_missing",
+                "input": [{"role": "user", "content": "look up"}]
+            },
+            "responses_tool_identity": {
+                "tools": [{"type": "tool_search", "execution": "client"}],
+                "input": [{
+                    "type": "tool_search_output",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "crm",
+                        "description": "CRM tools",
+                        "tools": [{
+                            "type": "function",
+                            "name": "lookup",
+                            "parameters": {"type": "object"}
+                        }]
+                    }]
+                }]
+            }
+        });
+        let mut emitter = OpenAIResponsesClientEmitter::with_report_context(&report_context);
+        let bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_stream_identity".to_string(),
+                model: "gpt-source".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_lookup".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("pinned identity restores the namespace in stream");
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert!(sse.contains("\"namespace\":\"crm\""), "{sse}");
+        assert!(sse.contains("\"name\":\"lookup\""), "{sse}");
+
+        // Without the pinned sidecar and without cached history the stream must
+        // fail closed instead of emitting the provider alias as a Responses name.
+        let report_context = json!({
+            "provider_api_format": "openai:chat",
+            "client_api_format": "openai:responses",
+            "api_key_id": "stream-identity-scope",
+            "original_request_body": {
+                "model": "gpt-source",
+                "previous_response_id": "resp_stream_identity_missing",
+                "input": [{"role": "user", "content": "look up"}]
+            }
+        });
+        let mut emitter = OpenAIResponsesClientEmitter::with_report_context(&report_context);
+        assert!(emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_stream_identity".to_string(),
+                model: "gpt-source".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_lookup".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
             .is_err());
     }
 }

@@ -133,17 +133,27 @@ fn canonical_incomplete_reason(canonical: &CanonicalResponse) -> Option<&'static
 /// 将规范响应投影为 Responses JSON；Gemini 工具签名以定向合成 reasoning item 邻接输出。
 /// 原始投影不做 carrier 长度裁剪：调用方显式要求 raw 时任何 UTF-8 载荷都完整编码。
 pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bool) -> Value {
-    render_to_raw(canonical, report_context, compact)
+    let namespace_tool_aliases = NamespaceToolAliases::from_report_context(report_context);
+    render_to_raw_with_aliases(canonical, report_context, compact, &namespace_tool_aliases)
 }
 
-/// 供转换路径使用；carrier 超出审计边界时返回 None，由调用方 fail closed。
+/// 供转换路径使用；carrier 超出审计边界或工具身份上下文不可用时返回 None，由调用方 fail closed。
 pub(crate) fn try_to_raw(
     canonical: &CanonicalResponse,
     report_context: &Value,
     compact: bool,
 ) -> Option<Value> {
     validate_claude_reasoning_carrier_bounds(canonical)?;
-    Some(render_to_raw(canonical, report_context, compact))
+    // 续接请求的上一响应工具身份必须在转换契约边界可判定：缺失时 fail closed，
+    // 不能借用空清单把 provider 别名当作客户端 Responses 名称输出。
+    let namespace_tool_aliases =
+        NamespaceToolAliases::try_from_report_context(report_context).ok()?;
+    Some(render_to_raw_with_aliases(
+        canonical,
+        report_context,
+        compact,
+        &namespace_tool_aliases,
+    ))
 }
 
 /// 审计边界：Claude thinking 的签名/redacted 载荷必须非空、限长且非嵌套。
@@ -174,8 +184,12 @@ fn validate_claude_reasoning_carrier_bounds(canonical: &CanonicalResponse) -> Op
     Some(())
 }
 
-fn render_to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bool) -> Value {
-    let namespace_tool_aliases = NamespaceToolAliases::from_report_context(report_context);
+fn render_to_raw_with_aliases(
+    canonical: &CanonicalResponse,
+    report_context: &Value,
+    compact: bool,
+    namespace_tool_aliases: &NamespaceToolAliases,
+) -> Value {
     let mut response = Map::new();
     let response_id = canonical.id.replace("chatcmpl", "resp");
     response.insert("id".to_string(), Value::String(response_id.clone()));

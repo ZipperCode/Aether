@@ -485,6 +485,28 @@ pub fn convert_response(
     body: &Value,
     ctx: &FormatContext,
 ) -> Result<Value, FormatError> {
+    let target = parse_format(target_format)?;
+    if matches!(
+        target,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) {
+        // A converted response is rehydrated against the request's pinned tool
+        // identity context. An unavailable previous-response identity must be a
+        // conversion contract failure (correctable at the request boundary), not
+        // an emit failure that sync products may fall back around.
+        NamespaceToolAliases::try_from_report_context(&ctx.report_context_value()).map_err(
+            |_| FormatError::LossyConversionBlocked {
+                source_format: source_format.to_string(),
+                target_format: target.as_str().to_string(),
+                field: "previous_response_id".to_string(),
+                reason: concat!(
+                    "previous response tool history is unavailable ",
+                    "for tool identity restoration"
+                )
+                .to_string(),
+            },
+        )?;
+    }
     let mut response = parse_response(source_format, body, ctx)?;
     validate_response_conversion(source_format, target_format, body, &response)?;
     if response.model.trim().is_empty() || response.model == "unknown" {
@@ -819,11 +841,50 @@ fn validate_response_conversion(
     }
 
     validate_source_response_stop_enums(source, target, body)?;
+    validate_claude_carrier_origin_response_target(source, target, response)?;
     validate_gemini_cross_format_response(source, target, body)?;
     validate_claude_cross_format_response(source, target, body)?;
     validate_response_content_has_no_unknown_blocks(source, target, response)?;
     validate_openai_responses_cross_format_response_extensions(source, target, response)?;
     validate_canonical_response_stop_reasons(source, target, response)
+}
+
+/// Aether Claude signed/redacted thinking 只属于 Claude/Responses/Chat 回放：
+/// Responses 响应里的 carrier 不得被 Gemini 发射成 thoughtSignature/thought 文本，
+/// 也不得因 redacted 无可见文本而被静默丢弃；与请求侧的
+/// `validate_claude_carrier_origin_target` 保持同一 fail-closed 约定。
+/// 非 carrier 的上游密文仍由 `validate_openai_responses_cross_format_response_extensions`
+/// 按既有契约拒绝。
+fn validate_claude_carrier_origin_response_target(
+    source: FormatId,
+    target: FormatId,
+    response: &CanonicalResponse,
+) -> Result<(), FormatError> {
+    if !matches!(
+        source,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) || target != FormatId::GeminiGenerateContent
+    {
+        return Ok(());
+    }
+    for block in response.content.iter().chain(
+        response
+            .outputs
+            .iter()
+            .flat_map(|output| output.content.iter()),
+    ) {
+        if let CanonicalContentBlock::Thinking { extensions, .. } = block {
+            if is_claude_thinking_block(extensions) {
+                return Err(FormatError::LossyConversionBlocked {
+                    source_format: source.as_str().to_string(),
+                    target_format: target.as_str().to_string(),
+                    field: "output[].reasoning".to_string(),
+                    reason: "Claude signed/redacted thinking has no Gemini equivalent".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_gemini_cross_format_response(
@@ -1453,8 +1514,19 @@ fn validate_openai_responses_cross_format_response_extensions(
             ..
         } = block
         {
-            // 已解码的 Claude redacted carrier 还原为 redacted_thinking 块，不属于上游密文。
-            if !encrypted_content.is_empty() && !is_claude_thinking_block(extensions) {
+            // 已解码的 Claude redacted carrier 还原为 redacted_thinking 块，不属于上游密文；
+            // 该例外只对能表达 Claude thinking 的目标成立，Gemini 由
+            // validate_claude_carrier_origin_response_target 明确拒绝。
+            let claude_carrier_target_supported = matches!(
+                target,
+                FormatId::OpenAiChat
+                    | FormatId::OpenAiResponses
+                    | FormatId::OpenAiResponsesCompact
+                    | FormatId::ClaudeMessages
+            );
+            if !encrypted_content.is_empty()
+                && (!is_claude_thinking_block(extensions) || !claude_carrier_target_supported)
+            {
                 return openai_responses_lossy_response(
                     source,
                     target,
@@ -2143,8 +2215,9 @@ fn validate_cross_format_request_extensions(
     Ok(())
 }
 
-/// Responses message item 的 id/status/phase 是源侧身份元数据；Claude 用新消息表达
-/// 同一内容，必须剥离这些已知 sidecar（未知字段继续 fail closed），不能丢内容。
+/// Responses message item 的 id/status/phase 是源侧身份元数据；Chat/Claude/Gemini
+/// 都用新消息表达同一内容，必须剥离这些已知 sidecar（未知字段继续 fail closed），
+/// 不能丢内容。原生同格式转换不经过该跨格式审计。
 fn mapped_message_extensions(
     source: FormatId,
     target: FormatId,
@@ -2154,8 +2227,10 @@ fn mapped_message_extensions(
     if matches!(
         source,
         FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
-    ) && target == FormatId::ClaudeMessages
-    {
+    ) && matches!(
+        target,
+        FormatId::OpenAiChat | FormatId::ClaudeMessages | FormatId::GeminiGenerateContent
+    ) {
         for provider_namespace in ["openai_responses", "openai_cli"] {
             let should_remove_namespace = mapped
                 .get_mut(provider_namespace)
@@ -9858,6 +9933,119 @@ mod tests {
                     if field == "messages[].content[].thinking"
             ));
         }
+    }
+
+    /// R2:Responses 响应中的 Aether Claude signed/redacted carrier 不得被
+    /// Gemini 发射成 thoughtSignature，也不得因 redacted 无文本而静默丢弃。
+    #[test]
+    fn responses_claude_carriers_are_rejected_for_gemini_response_target() {
+        let signature =
+            crate::formats::openai::responses::encode_claude_reasoning_signature_carrier(
+                "sig_gemini_response",
+            )
+            .expect("signature carrier");
+        let redacted = crate::formats::openai::responses::encode_claude_redacted_thinking_carrier(
+            "opaque_gemini_response",
+        )
+        .expect("redacted carrier");
+        for (carrier, reasoning_content) in [
+            (
+                signature,
+                Some(json!([{"type": "reasoning_text", "text": "plan"}])),
+            ),
+            (redacted, None),
+        ] {
+            let mut item = json!({
+                "type": "reasoning",
+                "id": "rs_gemini_carrier",
+                "encrypted_content": carrier,
+            });
+            if let Some(content) = reasoning_content {
+                item["content"] = content;
+            }
+            let body = json!({
+                "id": "resp_gemini_carrier",
+                "object": "response",
+                "model": "gemini-2.5-pro",
+                "status": "completed",
+                "output": [
+                    item,
+                    {
+                        "type": "message",
+                        "id": "msg_visible",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hi"}]
+                    }
+                ]
+            });
+            let error = convert_response_pure("openai:responses", "gemini:generate_content", &body)
+                .expect_err("Claude carrier must not become a Gemini thought part");
+            assert!(matches!(
+                error,
+                FormatError::LossyConversionBlocked { ref field, .. }
+                    if field == "output[].reasoning"
+            ));
+        }
+    }
+
+    /// 非 carrier 的上游密文在 Responses→Gemini 同步响应上仍按既有契约拒绝。
+    #[test]
+    fn responses_foreign_encrypted_reasoning_is_rejected_for_gemini_response_target() {
+        let body = json!({
+            "id": "resp_foreign_ciphertext",
+            "object": "response",
+            "model": "gemini-2.5-pro",
+            "status": "completed",
+            "output": [{
+                "type": "reasoning",
+                "id": "rs_foreign",
+                "encrypted_content": "foreign_opaque_ciphertext",
+                "content": [{"type": "reasoning_text", "text": "plan"}]
+            }]
+        });
+        let error = convert_response_pure("openai:responses", "gemini:generate_content", &body)
+            .expect_err("foreign encrypted reasoning cannot cross into Gemini");
+        assert!(matches!(
+            error,
+            FormatError::LossyConversionBlocked { ref field, .. }
+                if field == "output[].encrypted_content"
+        ));
+    }
+
+    /// Claude 目标仍可无损回放两类 carrier（不被 origin 守卫误伤）。
+    #[test]
+    fn responses_claude_carriers_still_replay_to_claude_response_target() {
+        let signature =
+            crate::formats::openai::responses::encode_claude_reasoning_signature_carrier("sig_ok")
+                .expect("signature carrier");
+        let redacted =
+            crate::formats::openai::responses::encode_claude_redacted_thinking_carrier("opaque_ok")
+                .expect("redacted carrier");
+        let body = json!({
+            "id": "resp_claude_ok",
+            "object": "response",
+            "model": "claude-sonnet-4-5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_ok",
+                    "encrypted_content": signature,
+                    "content": [{"type": "reasoning_text", "text": "plan"}]
+                },
+                {"type": "reasoning", "id": "rs_redacted", "encrypted_content": redacted}
+            ]
+        });
+        let converted = convert_response_pure("openai:responses", "claude:messages", &body)
+            .expect("Claude carrier replay must stay lossless")
+            .value;
+        let content = converted["content"].as_array().expect("Claude content");
+        assert!(content.iter().any(|block| block["type"] == "thinking"
+            && block["thinking"] == "plan"
+            && block["signature"] == "sig_ok"));
+        assert!(content
+            .iter()
+            .any(|block| block["type"] == "redacted_thinking" && block["data"] == "opaque_ok"));
     }
 
     /// 发射器默认的空 annotations/logprobs 不应阻塞 Responses→Claude 文本回放。

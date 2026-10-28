@@ -1,3 +1,8 @@
+use crate::ai_serving::{
+    expand_openai_responses_request_body, hydrate_openai_response_history,
+    is_openai_responses_family_format, openai_responses_tool_identity_context,
+    request_conversion_kind, RequestConversionKind, OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY,
+};
 use serde_json::json;
 use tracing::debug;
 
@@ -73,12 +78,68 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
     let eligible = &attempt.eligible;
     let candidate_index = attempt.candidate_index;
     let candidate_id = attempt.candidate_id.as_str();
+    // Responses 续接请求只解析一次上一响应历史：把展开后的有效请求体同时交给
+    // 转换与工具身份快照，响应阶段不再重读 TTL 历史。审计仍使用原始请求体。
+    let history_scope = input.auth_context.api_key_id.as_str();
+    let client_api_format = spec_metadata.api_format;
+    let provider_api_format = eligible.provider_api_format.as_str();
+    // Grok's local Responses projection never expands `previous_response_id`;
+    // keep that transport's existing body shape untouched.
+    let provider_uses_standard_conversion = !eligible
+        .transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("grok");
+    let needs_history_expansion = provider_uses_standard_conversion
+        && body_json
+            .get("previous_response_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        && is_openai_responses_family_format(client_api_format)
+        && matches!(
+            request_conversion_kind(client_api_format, provider_api_format),
+            Some(
+                RequestConversionKind::ToOpenAIChat
+                    | RequestConversionKind::ToClaudeStandard
+                    | RequestConversionKind::ToGeminiStandard
+            )
+        );
+    let expanded_request_body = if needs_history_expansion {
+        hydrate_openai_response_history(
+            state,
+            body_json,
+            client_api_format,
+            provider_api_format,
+            history_scope,
+        )
+        .await?;
+        match expand_openai_responses_request_body(body_json, Some(history_scope)) {
+            Ok(expanded) => Some(expanded),
+            Err(error) => {
+                // 无法解析的上一响应历史不能猜测别名：该候选不可服务。
+                debug!(
+                    event_name = "local_openai_responses_history_expansion_failed",
+                    log_type = "debug",
+                    trace_id = %trace_id,
+                    candidate_id = %candidate_id,
+                    error = %error,
+                    "gateway skipped candidate with unresolvable previous response history"
+                );
+                return Ok(None);
+            }
+        }
+    } else {
+        None
+    };
+    let request_body_for_resolve = expanded_request_body.as_ref().unwrap_or(body_json);
     let resolved = if websocket_continuation {
         resolve_local_openai_responses_candidate_payload_parts_with_websocket_mode(
             state,
             parts,
             trace_id,
-            body_json,
+            request_body_for_resolve,
             input,
             eligible,
             candidate_index,
@@ -92,7 +153,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
             state,
             parts,
             trace_id,
-            body_json,
+            request_body_for_resolve,
             input,
             eligible,
             candidate_index,
@@ -127,6 +188,15 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         .or_else(|| resolve_transport_profile(&resolved.transport));
     let timeouts = resolve_transport_execution_timeouts(&resolved.transport);
     let mut extra_fields = serde_json::Map::new();
+    if let Some(expanded) = expanded_request_body.as_ref() {
+        // 最小工具身份快照：仅声明工具与 tool_search_output.tools，不含会话文本。
+        // 响应阶段优先消费该快照，本地历史被逐出/过期也不会把 provider 别名
+        // 当作客户端 Responses 名称返回。
+        extra_fields.insert(
+            OPENAI_RESPONSES_TOOL_IDENTITY_CONTEXT_KEY.to_string(),
+            openai_responses_tool_identity_context(expanded),
+        );
+    }
     insert_request_operation(&mut extra_fields, spec_metadata.api_format, body_json);
     if let Some(proxy_value) =
         build_request_trace_proxy_value(Some(&resolved.transport), proxy.as_ref())

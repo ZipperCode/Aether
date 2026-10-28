@@ -520,6 +520,8 @@ fn assign_value(
 }
 
 /// 解析 Vertex 使用的 jsonPath 子集：`$` 前缀、`.key` 与 `[index]`/`['key']`/`["key"]`。
+/// 引号键按 RFC 9535 解码 JSON 转义（含 `\uXXXX` 与代理对）；`\uXXXX` 产出真实字符，
+/// 组装 JSON 时按标准字符串序列化，语义键保持不变。
 fn parse_args_path(raw: &str) -> Result<ArgsPath, String> {
     let trimmed = raw.trim();
     let mut rest = trimmed
@@ -604,11 +606,17 @@ fn parse_quoted_key(trimmed: &str, raw: &str) -> Result<String, String> {
     if trimmed.len() < 2 || !trimmed.ends_with(quote) {
         return Err(format!("Gemini partialArgs.jsonPath 引号未闭合: {raw}"));
     }
+    let body = &trimmed[1..trimmed.len() - 1];
     if quote == '"' {
+        // 双引号体是标准 JSON 字符串：serde 已按 RFC 9535 处理 `\uXXXX`（含代理对）。
         return serde_json::from_str::<String>(trimmed)
             .map_err(|_| format!("Gemini partialArgs.jsonPath 字符串转义非法: {raw}"));
     }
-    let body = &trimmed[1..trimmed.len() - 1];
+    decode_single_quoted_key(body, raw)
+}
+
+/// 解码 RFC 9535 单引号字符串体：JSON 转义（含 `\uXXXX` 与代理对）外加 `\'`。
+fn decode_single_quoted_key(body: &str, raw: &str) -> Result<String, String> {
     let mut key = String::with_capacity(body.len());
     let mut characters = body.chars();
     while let Some(character) = characters.next() {
@@ -619,21 +627,67 @@ fn parse_quoted_key(trimmed: &str, raw: &str) -> Result<String, String> {
         let Some(escaped) = characters.next() else {
             return Err(format!("Gemini partialArgs.jsonPath 转义不完整: {raw}"));
         };
-        key.push(match escaped {
-            '\\' => '\\',
-            '\'' => '\'',
-            '"' => '"',
-            'n' => '\n',
-            'r' => '\r',
-            't' => '\t',
+        match escaped {
+            '\\' => key.push('\\'),
+            '\'' => key.push('\''),
+            '"' => key.push('"'),
+            '/' => key.push('/'),
+            'b' => key.push('\u{8}'),
+            'f' => key.push('\u{c}'),
+            'n' => key.push('\n'),
+            'r' => key.push('\r'),
+            't' => key.push('\t'),
+            'u' => key.push(decode_unicode_escape(&mut characters, raw)?),
             other => {
                 return Err(format!(
                     "Gemini partialArgs.jsonPath 含未知转义 \\{other}: {raw}"
                 ))
             }
-        });
+        }
     }
     Ok(key)
+}
+
+/// 解码一个 `\uXXXX`（调用方已消费 `\u`），并把必须成对出现的高代理合并为标量值。
+fn decode_unicode_escape(characters: &mut std::str::Chars<'_>, raw: &str) -> Result<char, String> {
+    let high = read_unicode_code_unit(characters, raw)?;
+    if (0xDC00..=0xDFFF).contains(&high) {
+        return Err(format!(
+            "Gemini partialArgs.jsonPath 含孤立低代理 \\u{high:04X}: {raw}"
+        ));
+    }
+    if !(0xD800..=0xDBFF).contains(&high) {
+        return char::from_u32(high)
+            .ok_or_else(|| format!("Gemini partialArgs.jsonPath 含非法 \\u 转义: {raw}"));
+    }
+    // 高代理必须紧跟一个 `\u` 低代理转义。
+    if characters.next() != Some('\\') || characters.next() != Some('u') {
+        return Err(format!(
+            "Gemini partialArgs.jsonPath 高代理 \\u{high:04X} 缺少低代理转义: {raw}"
+        ));
+    }
+    let low = read_unicode_code_unit(characters, raw)?;
+    if !(0xDC00..=0xDFFF).contains(&low) {
+        return Err(format!(
+            "Gemini partialArgs.jsonPath 高代理 \\u{high:04X} 后缺少低代理: {raw}"
+        ));
+    }
+    let scalar = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+    char::from_u32(scalar)
+        .ok_or_else(|| format!("Gemini partialArgs.jsonPath 含非法 \\u 转义: {raw}"))
+}
+
+/// 读取四位十六进制码元；不足四位或含非十六进制字符即为非法转义。
+fn read_unicode_code_unit(characters: &mut std::str::Chars<'_>, raw: &str) -> Result<u32, String> {
+    let mut value = 0u32;
+    for _ in 0..4 {
+        let digit = characters
+            .next()
+            .and_then(|character| character.to_digit(16))
+            .ok_or_else(|| format!("Gemini partialArgs.jsonPath 含非法 \\u 转义: {raw}"))?;
+        value = value * 16 + digit;
+    }
+    Ok(value)
 }
 
 fn push_quoted(out: &mut String, value: &str) {
@@ -896,5 +950,61 @@ mod tests {
         // 显式终结的零参数调用是合法调用：空组装结果必须是 `{}`。
         let mut assembler = VertexPartialArgsAssembler::default();
         assert_eq!(assembler.finish().expect("finalize"), "{}");
+    }
+
+    #[test]
+    fn parses_unicode_escape_in_single_quoted_json_path_key() {
+        let mut assembler = VertexPartialArgsAssembler::default();
+        let delta = assembler
+            .push_entries(&[json!({"jsonPath": "$['\\u0061']", "numberValue": 1})])
+            .expect("unicode escape key parses");
+        assert_eq!(delta, "{\"a\":1");
+        assert_eq!(assembler.finish().expect("finalize"), "}");
+        assert_eq!(parsed(&delta, "}"), json!({"a": 1}));
+    }
+
+    #[test]
+    fn parses_json_escapes_and_surrogate_pairs_in_quoted_json_path_keys() {
+        let (delta, suffix) = assemble(&[
+            json!({"jsonPath": "$['\\uD83D\\uDE00']", "numberValue": 1}),
+            json!({"jsonPath": "$['\\b\\f\\/\\n\\r\\t']", "numberValue": 2}),
+            json!({"jsonPath": "$['a\\'b']['inner\\u0020key']", "numberValue": 3}),
+            json!({"jsonPath": "$[\"\\u0064\"]", "numberValue": 4}),
+        ]);
+        assert_eq!(
+            parsed(&delta, &suffix),
+            json!({
+                "\u{1F600}": 1,
+                "\u{8}\u{c}/\n\r\t": 2,
+                "a'b": {"inner key": 3},
+                "d": 4,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_quoted_json_path_key_escapes() {
+        for path in [
+            // \u 必须紧跟四位十六进制码元。
+            "$['\\u12']",
+            "$['\\uZZZZ']",
+            // 未知转义。
+            "$['\\q']",
+            // 孤立代理与错配代理对。
+            "$['\\uD83D']",
+            "$['\\uDE00']",
+            "$['\\uD83D\\u0041']",
+            "$['\\uD83Dx']",
+            // 尾部转义不完整。
+            "$['a\\']",
+        ] {
+            let mut assembler = VertexPartialArgsAssembler::default();
+            assert!(
+                assembler
+                    .push_entries(&[json!({"jsonPath": path, "numberValue": 1})])
+                    .is_err(),
+                "path {path} must be rejected"
+            );
+        }
     }
 }

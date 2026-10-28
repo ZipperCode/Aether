@@ -330,18 +330,10 @@ fn canonical_to_gemini_request_body(
 }
 
 fn canonical_system_instruction(canonical: &CanonicalRequest) -> Option<Value> {
-    let text = canonical
-        .instructions
-        .iter()
-        .map(|instruction| instruction.text.as_str())
-        .filter(|text| !text.trim().is_empty())
+    let text = crate::protocol::canonical::canonical_system_instruction_parts(canonical)
+        .map(|(text, _)| text)
         .collect::<Vec<_>>()
         .join("\n\n");
-    let text = if text.trim().is_empty() {
-        canonical.system.as_deref().unwrap_or_default().to_string()
-    } else {
-        text
-    };
     (!text.trim().is_empty()).then(|| json!({ "parts": [{ "text": text }] }))
 }
 
