@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 17
-- **Last Active**: 2026-10-28
+- **Total Sessions**: 18
+- **Last Active**: 2026-10-29
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~452 | Active |
+| `journal-1.md` | ~474 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 18 | 2026-10-29 | Antigravity Claude 历史工具调用 ID 补齐 | `69f5b9bfa` | `master` |
 | 17 | 2026-10-28 | 修复 Responses 兼容审核回归 | `d8502465e` | `master` |
 | 16 | 2026-10-28 | Responses 跨协议兼容闭环 | `308ed7ba4` | `master` |
 | 15 | 2026-10-28 | Antigravity 按账号动态选择思考档位 | `a9f024872` | `master` |

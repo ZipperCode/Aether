@@ -450,3 +450,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 18: Antigravity Claude 历史工具调用 ID 补齐
+
+**Date**: 2026-10-29
+**Task**: Antigravity Claude 历史工具调用 ID 补齐
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+在 Antigravity 私有 Claude envelope 边界补齐 Gemini 原生工具调用及结果 ID，保留显式 ID、签名和业务载荷。覆盖乱序同名并行、单侧 ID、避碰及幂等边界。provider-transport 606 项回归、Clippy 和原 c09a882d 的178对工具历史本地 smoke 通过；未部署或调用上游，保留其他窗口改动。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `69f5b9bfa` | (see git log) |
+
+### Status
+
+[OK] **Completed**
