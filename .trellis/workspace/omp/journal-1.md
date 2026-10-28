@@ -472,3 +472,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 19: Codex OAuth 账号级模型发现准入
+
+**Date**: 2026-10-29
+**Task**: Codex OAuth 账号级模型发现准入
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+独立保存账号真实远端模型证据并按最终模型准入；覆盖号池、普通候选、管理测试与 WebSocket。Gateway 406 项相关回归、95 项收尾检查、17 项最终专项通过；transport 606、model-fetch 115、Clippy 与格式检查通过。独立 curl 观察高级仅 paid，随后 basic/free 成功；临时 smoke 已移除，未调用生产账号。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `4ba6342df` | (see git log) |
+
+### Status
+
+[OK] **Completed**
