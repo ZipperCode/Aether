@@ -1,17 +1,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aether_provider_transport::antigravity::{
-    antigravity_model_thinking_variant, AntigravityThinkingLevel,
-};
 use serde_json::{Map, Value};
 
 use crate::ai_serving::transport::antigravity::{
-    antigravity_account_observation_due, build_antigravity_safe_v1internal_request,
-    build_antigravity_static_identity_headers, classify_local_antigravity_request_support,
-    AntigravityEnvelopeRequestType, AntigravityRequestAuth,
-    AntigravityRequestAuthUnsupportedReason, AntigravityRequestEnvelopeSupport,
-    AntigravityRequestSideSupport, AntigravityRequestSideUnsupportedReason,
+    antigravity_account_observation_due, antigravity_model_thinking_variant,
+    build_antigravity_safe_v1internal_request, build_antigravity_static_identity_headers,
+    classify_local_antigravity_request_support, AntigravityEnvelopeRequestType,
+    AntigravityRequestAuth, AntigravityRequestAuthUnsupportedReason,
+    AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
+    AntigravityRequestSideUnsupportedReason, AntigravityThinkingLevel,
 };
 use crate::ai_serving::transport::{
     build_standard_provider_request_headers, GatewayProviderTransportSnapshot,
@@ -244,7 +242,7 @@ fn is_antigravity_base_gemini_thinking_target(
         && crate::ai_serving::normalize_api_format_alias(provider_api_format)
             == "gemini:generate_content"
         && is_gemini_family_model(mapped_model)
-        && aether_ai_formats::gemini_model_uses_thinking_level(mapped_model)
+        && crate::ai_serving::gemini_model_uses_thinking_level(mapped_model)
         && antigravity_model_thinking_variant(mapped_model).is_none()
 }
 
@@ -256,7 +254,7 @@ fn ensure_converted_openai_antigravity_thinking_resolved(
         || crate::ai_serving::normalize_api_format_alias(input.provider_api_format)
             != "gemini:generate_content"
         || !is_gemini_family_model(input.requested_model)
-        || !aether_ai_formats::gemini_model_uses_thinking_level(input.mapped_model)
+        || !crate::ai_serving::gemini_model_uses_thinking_level(input.mapped_model)
     {
         return Ok(());
     }

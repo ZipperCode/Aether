@@ -7,7 +7,6 @@ use aether_ai_serving::{
     AiCandidatePreselectionOutcome, AiSkippedCandidatePersistencePort,
 };
 use aether_dispatch_core::{DispatchSequence, DispatchSequenceItem};
-use aether_provider_transport::antigravity::AntigravityThinkingLevel;
 use aether_routing_core::{
     rank_vector_for_candidate, CandidateKind, ResolvedRoutingPolicy, RoutingCandidateFacts,
     RoutingCandidateTrace, RoutingDecisionTrace, RoutingExecutionPolicy,
@@ -40,6 +39,7 @@ use crate::ai_serving::planner::materialization_policy::LocalCandidatePersistenc
 use crate::ai_serving::planner::pool_scheduler::PoolKeyCursor;
 use crate::ai_serving::planner::runtime_miss::record_local_runtime_candidate_skip_reason;
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
+use crate::ai_serving::transport::antigravity::AntigravityThinkingLevel;
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
 use crate::cache::{
     candidate_page_cache_stale_ttl, candidate_page_cache_ttl_from_env,

@@ -2,7 +2,6 @@ use aether_ai_serving::{
     run_ai_candidate_preselection, AiCandidatePreselectionOutcome, AiCandidatePreselectionPort,
 };
 use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
-use aether_provider_transport::antigravity::AntigravityThinkingLevel;
 use aether_routing_core::ResolvedRoutingPolicy;
 use aether_runtime::ConcurrencyPermit;
 use aether_scheduler_core::{
@@ -18,6 +17,7 @@ use std::sync::Arc;
 
 use crate::ai_serving::planner::candidate_affinity_cache::has_explicit_session_affinity;
 use crate::ai_serving::planner::candidate_resolution::SkippedLocalExecutionCandidate;
+use crate::ai_serving::transport::antigravity::AntigravityThinkingLevel;
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
 use crate::cache::{
     candidate_page_cache_stale_ttl, candidate_page_cache_ttl_from_env,

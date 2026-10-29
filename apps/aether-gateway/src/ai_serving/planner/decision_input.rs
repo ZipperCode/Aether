@@ -2,9 +2,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aether_ai_serving::{run_ai_authenticated_decision_input, AiAuthenticatedDecisionInputPort};
-use aether_provider_transport::antigravity::{
-    antigravity_request_thinking_level, AntigravityThinkingLevel,
-};
 use aether_routing_core::{
     rank_vector_for_candidate, CandidateKind, ResolvedRoutingPolicy, RoutingCandidateFacts,
     RoutingCandidateTrace, RoutingDecisionTrace, RoutingPoolExpansionTrace, RoutingRulePhase,
@@ -16,6 +13,9 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
 
 use crate::ai_serving::planner::common::extract_standard_requested_model;
+use crate::ai_serving::transport::antigravity::{
+    antigravity_request_thinking_level, AntigravityThinkingLevel,
+};
 use crate::ai_serving::transport::ProviderOutboundRequestContext;
 use crate::ai_serving::{
     ClientSurface, ExecutionRuntimeAuthContext, GatewayAuthApiKeySnapshot,

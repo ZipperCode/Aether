@@ -156,6 +156,13 @@ Good: free serves only its fetched basic model while paid handles the advanced m
 - Dedicated loopback gateway fixture: free representative, locked/alias, basic/free + sticky, first-fetch rejection/recovery, remove/re-add invalidation, ordinary sync/SSE, real two-turn WebSocket, pinned admin and versioned bootstrap. Pool cursor paging/frozen-window/hot fallback preserves account-level isolation and existing reason priorities.
 - Independent curl streaming smoke observes advanced `free=0, paid=1`, then successful basic free traffic; all credentials synthetic and loopback only. Remove temporary launchers after proof. Production account behavior requires separately authorized real-account validation.
 - Existing OAuth-refresh, expiry, quota and scheduling fixtures must seed the selected upstream model in `codex_model_discovery.model_ids` whenever discovery is not their failure under test. For `keeps_refresh_failed_oauth_candidate_selectable_before_local_auth_resolution`, seed `gpt-4.1-responses` and retain both candidate-order and empty-skip assertions. Include these non-`codex`-named tests in the full Gateway gate; a name-filtered discovery run does not cover them.
+- The WebSocket quota failover fixture seeds both Codex OAuth keys independently
+  with `codex_model_discovery.model_ids: ["gpt-responses-ws-upstream"]`. Preserve
+  quota feedback, distinct-account retry, completion and settlement assertions;
+  absent discovery otherwise rejects both keys before the first upstream send.
+- Keep current Compact identity coverage (`openai:responses:compact` and
+  `/v1/responses/compact`); remove retired-format cases rather than adding guard
+  exceptions or pinning their incidental bypass behavior.
 
 ### 7. Wrong vs Correct
 

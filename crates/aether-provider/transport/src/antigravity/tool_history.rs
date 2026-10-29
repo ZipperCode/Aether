@@ -673,8 +673,10 @@ mod tests {
         let contents = envelope["request"]["contents"].as_array().unwrap();
 
         let mut seen_ids = HashSet::new();
-        for idx in 0..3 {
-            let call_id = non_empty_id(&contents[0]["parts"][idx]["functionCall"]);
+        let lookup_calls = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(lookup_calls.len(), 3);
+        for (idx, call) in lookup_calls.iter().enumerate() {
+            let call_id = non_empty_id(&call["functionCall"]);
             let resp_id = non_empty_id(&contents[1]["parts"][idx]["functionResponse"]);
             assert_eq!(resp_id, call_id, "lookup pair {idx} must share ID");
             assert!(

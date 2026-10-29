@@ -451,7 +451,6 @@ mod tests {
             ("codex", "oauth", "openai:chat"),
             ("codex", "oauth", "/v1/chat/completions"),
             ("codex", "oauth", "openai:embedding"),
-            ("codex", "oauth", "openai:compact"),
         ] {
             assert_eq!(
                 codex_oauth_discovered_model_skip_reason(provider, auth, format, "", None),

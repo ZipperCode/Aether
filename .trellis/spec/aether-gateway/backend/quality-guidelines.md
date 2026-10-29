@@ -179,6 +179,9 @@ python tests/gateway_build_watch_test.py
 `preflight` runs format, gateway Clippy and gateway tests in that order.
 The gateway command is `cargo nextest run -p aether-gateway --lib --bins
 --no-fail-fast --locked`; it still builds distinct lib/bin test artifacts.
+The independent gateway integration targets (`admin_unsigned_identity_headers`,
+`architecture_guard`), all integration scenario bins/tests, and Workspace Rest
+Clippy `--all-targets` are additional CI gates, not part of `preflight`.
 
 ### 3. Contracts
 
@@ -194,6 +197,13 @@ The gateway command is `cargo nextest run -p aether-gateway --lib --bins
 - Data and Workspace Rest nextest jobs also collect all failures after an
   observed fail-fast run left sibling cases unexecuted. Their package/feature,
   PostgreSQL and aggregate gate requirements remain unchanged.
+- Planner format helpers use the existing `ai_serving::pure` root seam; provider
+  transport helpers/types use `ai_serving::transport`. Reuse those owners instead
+  of importing workspace dependencies directly or weakening architecture guards.
+- Before a release tag, require the complete `Rust CI` run and aggregate `check`
+  to succeed for the exact target SHA. `.trellis/**`-only commits do not trigger
+  push CI; `gh workflow run rust-ci.yml --ref master` explicitly runs the full
+  dispatch scope. `release.yml` trusts tag publication and does not enforce CI.
 - Fixtures parsing Cargo text must select `--color never` at their own Cargo
   call. CI's inherited `CARGO_TERM_COLOR=always` must not insert ANSI escapes
   into machine assertions; test the fixture under the real CI environment.

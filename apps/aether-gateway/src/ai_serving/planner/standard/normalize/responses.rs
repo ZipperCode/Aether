@@ -1,7 +1,7 @@
-use aether_provider_transport::antigravity::AntigravityThinkingLevel;
 use serde_json::Value;
 
 use crate::ai_serving::planner::antigravity::apply_antigravity_gemini_thinking_selection;
+use crate::ai_serving::transport::antigravity::AntigravityThinkingLevel;
 use crate::ai_serving::transport::apply_standard_provider_request_body_rules_with_request_headers;
 use crate::ai_serving::{
     apply_openai_responses_compact_special_body_edits,

@@ -1635,8 +1635,9 @@ async fn seed_provider_catalog(
 /// 一把健康、可服务本用例模型的 key。
 ///
 /// codex 类型的候选要求 `auth_type = oauth`（见 candidate_selection 的
-/// provider_type 约束），所以配额重试夹具走 oauth，凭证是一份未过期的
-/// access_token。
+/// provider_type 约束），并且每个 OAuth 账号都必须携带包含目标上游模型的
+/// `codex_model_discovery.model_ids` 发现证据；所以配额重试夹具走 oauth，凭证是
+/// 一份未过期的 access_token，并各自写入独立账号的模型发现目录。
 fn catalog_key(
     key_id: &str,
     secret: &str,
@@ -1658,7 +1659,7 @@ fn catalog_key(
     } else {
         None
     };
-    Ok(StoredProviderCatalogKey::new(
+    let mut key = StoredProviderCatalogKey::new(
         key_id.to_string(),
         PROVIDER_ID.to_string(),
         "Responses WebSocket E2E".to_string(),
@@ -1680,7 +1681,16 @@ fn catalog_key(
     .with_health_fields(
         Some(json!({"openai:responses": {"status": "healthy"}})),
         Some(json!({"openai:responses": {"state": "closed"}})),
-    ))
+    );
+    if oauth {
+        // 额度切换依赖两个账号各自通过模型发现准入，不能借用同供应商其他账号的目录。
+        key.upstream_metadata = Some(json!({
+            "codex_model_discovery": {
+                "model_ids": [UPSTREAM_MODEL]
+            }
+        }));
+    }
+    Ok(key)
 }
 
 /// 先写入全局模型，再原子写入供应商模型及 endpoint 绑定；后两者不可拆分，否则候选查询
