@@ -22,3 +22,7 @@
 
 ## Boundaries
 No real provider traffic replayed, production state/configuration modified, deployment changed, database migrated or history rewritten. Temporary Vite harness and browser tab removed; isolated preview stopped.
+
+## GitHub CI
+- Work commit `492bef38f9b433374fbb3e2cfa65cac622dcea64` pushed to `origin/master`.
+- Rust CI run [40920265937](https://github.com/ZipperCode/Aether/actions/runs/40920265937) completed successfully for that exact commit. All 19 jobs passed, including Frontend, Gateway, workspace/data tests and Clippy, integration scenarios, PostgreSQL smoke, format and shell fixtures.
