@@ -753,6 +753,8 @@ fn omits_codex_prompt_cache_key_for_openai_chat_cross_format_requests() {
         Some("key-123"),
         &http::HeaderMap::new(),
         false,
+        None,
+        None,
     )
     .expect("openai chat to codex request should build");
 

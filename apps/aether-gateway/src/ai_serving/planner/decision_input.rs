@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use aether_ai_serving::{run_ai_authenticated_decision_input, AiAuthenticatedDecisionInputPort};
 use aether_provider_transport::antigravity::{
-    antigravity_model_thinking_variant, antigravity_request_thinking_level,
-    AntigravityThinkingLevel,
+    antigravity_request_thinking_level, AntigravityThinkingLevel,
 };
 use aether_routing_core::{
     rank_vector_for_candidate, CandidateKind, ResolvedRoutingPolicy, RoutingCandidateFacts,
@@ -110,19 +109,6 @@ impl LocalRequestedModelDecisionInput {
             .as_ref()
             .map(|context| &context.effective_headers)
             .unwrap_or(fallback)
-    }
-
-    /// 客户端显式模型后缀优先于正文 effort；无显式后缀时沿用正文档位。
-    ///
-    /// 两者都缺失时返回 None，静态默认映射保持不变。
-    fn decode_antigravity_thinking_level(
-        api_format: &str,
-        body_json: &Value,
-        requested_model: &str,
-    ) -> Option<AntigravityThinkingLevel> {
-        antigravity_model_thinking_variant(requested_model)
-            .map(|(_, level)| level)
-            .or_else(|| antigravity_request_thinking_level(api_format, body_json))
     }
 
     pub(crate) fn set_endpoint_capability_context(
@@ -900,13 +886,12 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
     final_policy.group_name = Some(group_name);
     input.routing_trace_seed = Some(build_routing_trace_seed(&final_policy, client_api_format));
     input.routing_policy = Some(final_policy);
-    // 客户端格式与生效请求体都已由路由规则收敛；后缀/正文 effort 只在这一层解码一次。
-    let thinking_level = LocalRequestedModelDecisionInput::decode_antigravity_thinking_level(
+    // 客户端格式与生效请求体都已由路由规则收敛；后缀/正文/裸名默认档位只在这一层解析一次。
+    input.antigravity_thinking_level = antigravity_request_thinking_level(
         client_api_format,
         &effective_body_json,
         input.requested_model.as_str(),
     );
-    input.antigravity_thinking_level = thinking_level;
     input.routing_context = Some(LocalRoutingRequestContext {
         group_id,
         group_version,
@@ -956,12 +941,11 @@ fn try_attach_static_default_routing_policy_to_input(
         &parts.headers,
         Some(body_json),
     );
-    let thinking_level = LocalRequestedModelDecisionInput::decode_antigravity_thinking_level(
+    input.antigravity_thinking_level = antigravity_request_thinking_level(
         client_api_format,
         body_json,
         input.requested_model.as_str(),
     );
-    input.antigravity_thinking_level = thinking_level;
     input.routing_trace_seed = Some(build_routing_trace_seed(&policy, client_api_format));
     input.routing_policy = Some(policy);
     input.routing_context = None;

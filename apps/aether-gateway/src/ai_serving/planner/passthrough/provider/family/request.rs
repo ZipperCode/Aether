@@ -4,6 +4,9 @@ use std::sync::Arc;
 use aether_contracts::ResolvedTransportProfile;
 use serde_json::Value;
 
+use crate::ai_serving::planner::antigravity::{
+    apply_antigravity_gemini_thinking_selection, has_antigravity_base_gemini_client_suffix,
+};
 use crate::ai_serving::planner::common::{
     enforce_provider_body_stream_policy, request_requires_body_stream_field,
 };
@@ -15,14 +18,16 @@ use crate::ai_serving::transport::antigravity::{
     build_antigravity_static_identity_headers, classify_local_antigravity_request_support,
     AntigravityEnvelopeRequestType, AntigravityRequestAuthUnsupportedReason,
     AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
-    AntigravityRequestSideUnsupportedReason,
+    AntigravityRequestSideUnsupportedReason, AntigravityThinkingLevel,
 };
 use crate::ai_serving::transport::{
+    apply_local_body_rules_with_request_headers, body_rules_have_enabled_rules,
     build_gemini_cli_v1internal_request, build_grok_browser_headers, build_grok_upstream_url,
     build_same_format_provider_headers, resolve_local_gemini_cli_request_auth,
     GeminiCliRequestAuth, GeminiCliRequestAuthSupport, GeminiCliRequestEnvelopeSupport,
     GrokHeaderInput, SameFormatProviderCompatibilityEdit,
-    SameFormatProviderCompatibilityEditAction, SameFormatProviderHeadersInput, GROK_CHAT_PATH,
+    SameFormatProviderCompatibilityEditAction, SameFormatProviderHeadersInput,
+    SameFormatProviderRequestBodyOutput, GROK_CHAT_PATH,
 };
 use crate::ai_serving::{
     CandidateFailureDiagnostic, GatewayProviderTransportSnapshot, CODEX_RESPONSES_LITE_HEADER,
@@ -32,7 +37,9 @@ use crate::{AppState, GatewayError};
 mod policy;
 mod prepare;
 
-use self::prepare::prepare_local_same_format_provider_candidate;
+use self::prepare::{
+    prepare_local_same_format_provider_candidate, PreparedSameFormatProviderCandidate,
+};
 use super::payload::{
     mark_skipped_local_same_format_provider_candidate,
     mark_skipped_local_same_format_provider_candidate_with_extra_data,
@@ -202,23 +209,15 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     let body_json = redaction.body_json.as_ref();
     let mut transport = Arc::clone(&prepared.transport);
 
-    let Some(base_provider_request) =
-        super::super::request::build_same_format_provider_request_body_with_compatibility_report(
-            body_json,
-            prepared.provider_api_format.as_str(),
-            &prepared.mapped_model,
-            spec,
-            prepared.transport.endpoint.body_rules.as_ref(),
-            Some(effective_headers),
-            prepared.upstream_is_stream,
-            prepared.force_body_stream_field,
-            prepared.kiro_auth.as_ref(),
-            prepared.is_claude_code,
-            prepared.is_vertex,
-            false,
-            reasoning_replay_policy,
-        )
-    else {
+    let Some(base_provider_request) = build_same_format_candidate_base_request(
+        body_json,
+        &prepared,
+        spec,
+        effective_headers,
+        input.requested_model.as_str(),
+        input.antigravity_thinking_level,
+        reasoning_replay_policy,
+    ) else {
         mark_skipped_local_same_format_provider_candidate_with_extra_data(
             state,
             input,
@@ -682,6 +681,81 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         compatibility_edits,
         request_redacted: redaction.redacted,
     }))
+}
+
+fn build_same_format_candidate_base_request(
+    body_json: &Value,
+    prepared: &PreparedSameFormatProviderCandidate,
+    spec: LocalSameFormatProviderSpec,
+    effective_headers: &http::HeaderMap,
+    requested_model: &str,
+    antigravity_thinking_level: Option<AntigravityThinkingLevel>,
+    reasoning_replay_policy: crate::ai_serving::OpenAiResponsesReasoningReplayPolicy,
+) -> Option<SameFormatProviderRequestBodyOutput> {
+    let defer_antigravity_suffix_rules = prepared.is_antigravity
+        && spec.operation.is_none()
+        && has_antigravity_base_gemini_client_suffix(
+            prepared.transport.provider.provider_type.as_str(),
+            prepared.provider_api_format.as_str(),
+            &prepared.mapped_model,
+            requested_model,
+        );
+    let body_rules = prepared.transport.endpoint.body_rules.as_ref();
+    let mut output =
+        super::super::request::build_same_format_provider_request_body_with_compatibility_report(
+            body_json,
+            prepared.provider_api_format.as_str(),
+            &prepared.mapped_model,
+            spec,
+            if defer_antigravity_suffix_rules {
+                None
+            } else {
+                body_rules
+            },
+            Some(effective_headers),
+            prepared.upstream_is_stream,
+            prepared.force_body_stream_field,
+            prepared.kiro_auth.as_ref(),
+            prepared.is_claude_code,
+            prepared.is_vertex,
+            false,
+            reasoning_replay_policy,
+        )?;
+    if !defer_antigravity_suffix_rules {
+        return Some(output);
+    }
+
+    apply_antigravity_gemini_thinking_selection(
+        &mut output.body,
+        prepared.transport.provider.provider_type.as_str(),
+        prepared.provider_api_format.as_str(),
+        &prepared.mapped_model,
+        Some(requested_model),
+        antigravity_thinking_level,
+    );
+    let Some(body_rules) = body_rules else {
+        return Some(output);
+    };
+    let before_body_rules =
+        body_rules_have_enabled_rules(Some(body_rules)).then(|| output.body.clone());
+    if !apply_local_body_rules_with_request_headers(
+        &mut output.body,
+        Some(body_rules),
+        Some(body_json),
+        Some(effective_headers),
+    ) {
+        return None;
+    }
+    if before_body_rules.is_some_and(|before| before != output.body) {
+        output
+            .compatibility_edits
+            .push(SameFormatProviderCompatibilityEdit {
+                field: "body_rules".to_string(),
+                action: SameFormatProviderCompatibilityEditAction::OperatorRule,
+                detail: "applied configured provider body rules".to_string(),
+            });
+    }
+    Some(output)
 }
 
 fn same_format_provider_operation_skip_reason(

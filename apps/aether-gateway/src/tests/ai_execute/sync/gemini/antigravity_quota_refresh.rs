@@ -563,6 +563,61 @@ impl AntigravityHttpHarness {
             .expect("gemini streamGenerateContent HTTP request should complete")
     }
 
+    fn generate_body_with_thinking_level(&self, thinking_level: &str) -> serde_json::Value {
+        json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }],
+            "generationConfig": {
+                "temperature": 0.2,
+                "thinkingConfig": { "thinkingLevel": thinking_level }
+            },
+            "session_id": self.client_session_id,
+        })
+    }
+
+    async fn send_generate_with_thinking_level(
+        &self,
+        thinking_level: &str,
+        step: &str,
+    ) -> reqwest::Response {
+        self.send_generate_model_with_thinking_level(&self.global_model_name, thinking_level, step)
+            .await
+    }
+
+    async fn send_generate_model_with_thinking_level(
+        &self,
+        global_model_name: &str,
+        thinking_level: &str,
+        step: &str,
+    ) -> reqwest::Response {
+        let body = self.generate_body_with_thinking_level(thinking_level);
+        self.send_generate_body(global_model_name, &body, step)
+            .await
+    }
+
+    async fn send_stream_generate_with_thinking_level(
+        &self,
+        thinking_level: &str,
+        step: &str,
+    ) -> reqwest::Response {
+        self.send_stream_generate_model_with_thinking_level(
+            &self.global_model_name,
+            thinking_level,
+            step,
+        )
+        .await
+    }
+
+    async fn send_stream_generate_model_with_thinking_level(
+        &self,
+        global_model_name: &str,
+        thinking_level: &str,
+        step: &str,
+    ) -> reqwest::Response {
+        let body = self.generate_body_with_thinking_level(thinking_level);
+        self.send_stream_generate_body(global_model_name, &body, step)
+            .await
+    }
+
     async fn send_refresh_quota(
         &self,
         key_ids_body: Option<serde_json::Value>,
@@ -2378,7 +2433,9 @@ async fn run_antigravity_argon_admission_mode(pool_enabled: bool) {
     // Step 1: higher-priority Pro account exposes only the disabled placeholder; the eligible
     // sibling must serve the exact mapped model natively with zero unsupported generation hits.
     let sticky_before = harness.read_sticky().await;
-    let response = harness.send_generate("step1-pro-placeholder").await;
+    let response = harness
+        .send_generate_with_thinking_level("high", "step1-pro-placeholder")
+        .await;
     let status = response.status();
     let body = if status == StatusCode::OK {
         Some(
@@ -2445,7 +2502,9 @@ async fn run_antigravity_argon_admission_mode(pool_enabled: bool) {
     // Step 1b: the incident surface itself — public native Gemini SSE (`alt=sse`) through the
     // execution runtime stream frame protocol must be served by the same eligible sibling.
     let sticky_before = harness.read_sticky().await;
-    let response = harness.send_stream_generate("step1b-native-stream").await;
+    let response = harness
+        .send_stream_generate_with_thinking_level("high", "step1b-native-stream")
+        .await;
     let status = response.status();
     let content_type = response
         .headers()
@@ -2563,7 +2622,7 @@ async fn run_antigravity_argon_admission_mode(pool_enabled: bool) {
 
     let sticky_before = harness.read_sticky().await;
     let response = harness
-        .send_generate("step2-sticky-sibling-loses-target")
+        .send_generate_with_thinking_level("high", "step2-sticky-sibling-loses-target")
         .await;
     let status = response.status();
     let body = if status == StatusCode::OK {
@@ -2655,7 +2714,9 @@ async fn run_antigravity_argon_admission_mode(pool_enabled: bool) {
     );
 
     let sticky_before = harness.read_sticky().await;
-    let response = harness.send_generate("step3-all-unsupported").await;
+    let response = harness
+        .send_generate_with_thinking_level("high", "step3-all-unsupported")
+        .await;
     let status = response.status();
     let sticky_after = harness.read_sticky().await;
     let c3 = harness.counts();
@@ -3018,7 +3079,11 @@ async fn run_antigravity_runtime_quota_isolation_mode(pool_enabled: bool) {
     // Step 1: both models warm on the preferred account A.
     assert_gemini_model_completion(
         harness
-            .send_generate_model(primary_global_model, "step1-primary-warmup")
+            .send_generate_model_with_thinking_level(
+                primary_global_model,
+                "high",
+                "step1-primary-warmup",
+            )
             .await,
         mode_label,
         "step1-primary-warmup",
@@ -3081,7 +3146,11 @@ async fn run_antigravity_runtime_quota_isolation_mode(pool_enabled: bool) {
 
     assert_gemini_model_completion(
         harness
-            .send_generate_model(primary_global_model, "step2-primary-still-served")
+            .send_generate_model_with_thinking_level(
+                primary_global_model,
+                "high",
+                "step2-primary-still-served",
+            )
             .await,
         mode_label,
         "step2-primary-still-served",
@@ -3158,7 +3227,11 @@ async fn run_antigravity_runtime_quota_isolation_mode(pool_enabled: bool) {
     harness.set_generation_quota_error(true, primary_model, 45);
     assert_gemini_model_completion(
         harness
-            .send_generate_model(primary_global_model, "step4-primary-quota-429")
+            .send_generate_model_with_thinking_level(
+                primary_global_model,
+                "high",
+                "step4-primary-quota-429",
+            )
             .await,
         mode_label,
         "step4-primary-quota-429",
@@ -3188,7 +3261,11 @@ async fn run_antigravity_runtime_quota_isolation_mode(pool_enabled: bool) {
     // Step 5: the next affected-model request must skip account A without sleeping.
     assert_gemini_model_completion(
         harness
-            .send_generate_model(primary_global_model, "step5-primary-skip-exhausted")
+            .send_generate_model_with_thinking_level(
+                primary_global_model,
+                "high",
+                "step5-primary-skip-exhausted",
+            )
             .await,
         mode_label,
         "step5-primary-skip-exhausted",
@@ -3207,7 +3284,11 @@ async fn run_antigravity_runtime_quota_isolation_mode(pool_enabled: bool) {
     baseline = after;
     assert_gemini_stream_model_completion(
         harness
-            .send_stream_generate_model(primary_global_model, "step5-primary-stream-skip")
+            .send_stream_generate_model_with_thinking_level(
+                primary_global_model,
+                "high",
+                "step5-primary-stream-skip",
+            )
             .await,
         mode_label,
         "step5-primary-stream-skip",
@@ -3292,7 +3373,11 @@ async fn run_antigravity_runtime_quota_isolation_mode(pool_enabled: bool) {
     );
     assert_gemini_model_completion(
         harness
-            .send_generate_model(primary_global_model, "step7-primary-after-failed-refresh")
+            .send_generate_model_with_thinking_level(
+                primary_global_model,
+                "high",
+                "step7-primary-after-failed-refresh",
+            )
             .await,
         mode_label,
         "step7-primary-after-failed-refresh",
@@ -3374,7 +3459,11 @@ async fn gateway_antigravity_generic_rate_limit_remains_account_scoped_impl() {
 
     assert_gemini_model_completion(
         harness
-            .send_generate_model(primary_global_model, "step1-primary-warmup")
+            .send_generate_model_with_thinking_level(
+                primary_global_model,
+                "high",
+                "step1-primary-warmup",
+            )
             .await,
         mode_label,
         "step1-primary-warmup",
@@ -3400,7 +3489,11 @@ async fn gateway_antigravity_generic_rate_limit_remains_account_scoped_impl() {
     harness.set_generation_rate_limit_error(true, primary_model, 20);
     assert_gemini_model_completion(
         harness
-            .send_generate_model(primary_global_model, "step2-account-rate-limit")
+            .send_generate_model_with_thinking_level(
+                primary_global_model,
+                "high",
+                "step2-account-rate-limit",
+            )
             .await,
         mode_label,
         "step2-account-rate-limit",

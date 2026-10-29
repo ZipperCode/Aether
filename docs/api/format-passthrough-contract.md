@@ -1,6 +1,6 @@
 # Format Passthrough Contract
 
-Last audited: 2026-10-28
+Last audited: 2026-10-29
 
 This document defines the boundary between runtime passthrough, canonical roundtrip tests, and cross-format conversion.
 
@@ -160,3 +160,12 @@ Responses 的既有格式权限覆盖 Search/Compact，人工停用的绑定保�
 图片与 Search 仍执行认证、Key 模型限制、额度和健康检查。可路由不等于上游必定授权，429 额度耗尽也不等于型号不支持。真实上游权限变化、型号协议或参数变化须依据返回证据适配；不隐式更换协议或伪造成功。
 
 Codex Images 生成和编辑保留通过共享图片校验的 `output_format`（`png`、`jpeg`、`webp`），不因客户端 DTO 缺少该字段而跳过账号。图片同步 JSON 心跳只用于存在可执行候选的请求；全候选跳过时返回正常错误并记录失败 usage，保留已配置的正文采集策略。
+
+## Antigravity Gemini thinking 默认档位
+
+裸 Gemini 名称（如 `gemini-3.8-flash`）未提供思考配置时，默认选择 medium。该选择发生在普通调度、号池及亲和账号的模型权限和额度检查之前，不沿用静态映射中的默认 high。Chat `reasoning_effort: null`、Responses `reasoning: null` 和 `reasoning.effort: null` 与省略配置等价。
+
+- 客户端显式模型后缀优先于正文；正文使用对应协议的 `thinkingLevel`、数值 `thinkingBudget`、`reasoning_effort` 或 `reasoning.effort`。`xhigh`、`max` 等兼容值继续规范化。
+- 只选择当前服务账号实际发现的模型。medium 缺失、禁用或额度耗尽时换到可服务的账号；全部不满足时返回 503，不改用 high/low，也不补造模型名称。
+- Gemini 3 上游使用 `thinkingLevel: "medium"`；`thinkingBudget` 仍为数值，不发送 `thinkingBudget: "medium"`。仅有基础模型的目录保留该模型身份，Gemini 2.5 的数值预算请求保持原有协议。
+- 原生 Gemini 继续绕过格式转换，保留无关字段。转换后的请求、最终上游模型和客户端完成结果保持同一档位。

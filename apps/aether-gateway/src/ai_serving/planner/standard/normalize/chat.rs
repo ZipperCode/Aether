@@ -1,5 +1,7 @@
+use aether_provider_transport::antigravity::AntigravityThinkingLevel;
 use serde_json::Value;
 
+use crate::ai_serving::planner::antigravity::apply_antigravity_gemini_thinking_selection;
 use crate::ai_serving::transport::apply_standard_provider_request_body_rules_with_request_headers;
 use crate::ai_serving::{
     apply_codex_openai_responses_chat_body_edits,
@@ -69,8 +71,10 @@ pub(crate) fn build_cross_format_openai_chat_request_body(
     user_api_key_id: Option<&str>,
     request_headers: &http::HeaderMap,
     enable_model_directives: bool,
+    requested_model: Option<&str>,
+    antigravity_thinking_level: Option<AntigravityThinkingLevel>,
 ) -> Option<Value> {
-    let provider_request_body = surface_build_cross_format_openai_chat_request_body(
+    let mut provider_request_body = surface_build_cross_format_openai_chat_request_body(
         body_json,
         mapped_model,
         provider_type,
@@ -79,6 +83,14 @@ pub(crate) fn build_cross_format_openai_chat_request_body(
         enable_model_directives,
         user_api_key_id,
     )?;
+    apply_antigravity_gemini_thinking_selection(
+        &mut provider_request_body,
+        provider_type,
+        provider_api_format,
+        mapped_model,
+        requested_model,
+        antigravity_thinking_level,
+    );
     let mut provider_request_body =
         apply_standard_provider_request_body_rules_with_request_headers(
             provider_request_body,
@@ -153,6 +165,8 @@ mod antigravity_schema_tests {
                     None,
                     &http::HeaderMap::new(),
                     false,
+                    None,
+                    None,
                 )
                 .unwrap();
                 let parameters = &output["tools"][0]["functionDeclarations"][0]["parameters"];

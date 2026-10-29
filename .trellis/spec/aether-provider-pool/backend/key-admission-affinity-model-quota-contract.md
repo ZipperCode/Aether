@@ -40,6 +40,7 @@ pub enum AntigravityThinkingLevel { Minimal, Low, Medium, High }
 pub fn antigravity_request_thinking_level(
     api_format: &str,
     body: &serde_json::Value,
+    requested_model: &str,
 ) -> Option<AntigravityThinkingLevel>;
 pub fn antigravity_model_thinking_variant(
     model: &str,
@@ -162,12 +163,41 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   mutations. `xhigh/max/extra` normalize to high; `none/minimal/extra-low` prefer
   a discovered minimal variant, using low only when no minimal variant exists.
   Never bypass a disabled minimal variant or approximate missing medium/high.
+- Native Gemini without a recognized `thinkingLevel` also decodes integer
+  `thinkingBudget` through the shared budget ladder: `0..=1664` -> low,
+  `1665..=3072` -> medium, `>=3073` -> high; dynamic `-1` -> medium.
+  Accept snake_case aliases and existing private envelopes. Explicit level and
+  client model suffix retain precedence; other negative budgets select no tier.
 - Only `gemini-` terminal effort suffixes form variant families; preserve exact
   family/version identity. Explicit client suffix takes precedence over body
-  effort; a mapped default suffix is not a client choice. Return the actual
-  discovered ID, never synthesize catalog entries. No effort keeps static
-  mapping; absent discovery and base models without variants retain prior
-  behavior. Claude and unrelated providers remain unchanged.
+  effort; a mapped default suffix is not a client choice. Bare Gemini names
+  without format-native thinking settings default to medium before preselection,
+  strong-Key permission and quota admission, regardless of the mapped default.
+  Explicit malformed settings are not replaced by this default. Return only
+  discovered IDs; a missing/disabled medium never falls back to high/low.
+- OpenAI null reasoning fields are unconfigured: Chat `reasoning_effort: null`,
+  Responses `reasoning: null` and `reasoning.effort: null` use the same bare
+  Gemini medium default; explicit non-null malformed values do not.
+- Absent discovery and base-only catalogs retain the actual selected model
+  identity. Base-only Gemini 3 private envelopes use canonical medium when
+  settings are absent; legacy Gemini 2.5 budget-only wire requests remain
+  unchanged. Claude and unrelated providers retain their existing behavior.
+- Native base-only Gemini 3 also projects explicit client suffixes before
+  endpoint body rules and directive patches. Defer those rules only for this
+  narrow suffix case and execute them once; never enter canonical conversion or
+  enable global model directives to recover an Antigravity suffix.
+- Converted OpenAI requests retain the frozen Antigravity selection across
+  conversion. Recover omitted compatible tiers and client suffix overrides on
+  base-only Gemini 3 before endpoint body rules/directive patches; never restore
+  them afterward. At the private-envelope boundary an unresolved explicit
+  source setting with no effective target tier is `EnvelopeUnsupported`, not
+  implicit medium. Presence of malformed target fields is not absence; do not
+  repair those containers or alter the pure-conversion/OpenAI pass-through
+  contract to enforce this provider-specific default.
+- Converted response finalizers retain the client's recognized directive suffix
+  as the display model. For a base-only catalog, assert that client alias
+  separately from the exact bare upstream identity and its selected thinking
+  level; do not change the established response-model restoration contract.
 - Static mapping cannot pre-reject a low-only Key against a default-high alias.
   Defer row `key_allowed_models` only for effort-sensitive Antigravity Gemini
   rows whose possible mapping targets are all Gemini. Then the unavoidable
@@ -315,6 +345,10 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
 | Sticky account loses target after successful discovery refresh | Re-evaluate strong Key evidence, skip old binding and serve/rebind an eligible sibling. |
 | All accounts exclude target in discovery | HTTP 503 and zero upstream generation requests. |
 | Alias defaults to high, client requests low | Select that Key's discovered low before quota filtering; high exhaustion must not block low. |
+| Gemini has only legacy numeric budget | Resolve its normalized tier before account admission; do not retain default-high solely because `thinkingLevel` is absent. |
+| Bare Gemini name, no native thinking setting, default mapping bare/high | Resolve current account's discovered medium before admission; preserve explicit suffix/level/budget overrides. |
+| OpenAI reasoning field absent or null on bare Gemini | Resolve discovered medium, including warm ordinary/Pool requests and converted completion. |
+| Medium missing/disabled/exhausted on preferred account | Skip that account, serve eligible sibling medium; all ineligible returns 503 with no unsupported generation. |
 | Requested tier missing/disabled on an account | `key_model_disabled`; continue another account, never silently choose another tier. |
 | A allows only high, B only low; alias defaults high and effort is low | Reject A, defer static permission on B, authorize B's resolved low and serve/rebind B. |
 | Client exact low model conflicts with body high | Keep discovered low identity and canonical low thinking level. |
@@ -348,10 +382,12 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   Gemini even when its automatic model-fetch toggle is disabled.
 - Bad: treating unknown quota as proof of model entitlement, or allowing a null
   allowlist to erase an account's fetched model restriction.
-- Good: a stable `gemini-3.8-flash` alias maps to high by default; low effort
-  selects the serving account's discovered low while xhigh/max select high.
-- Bad: rewrite only the envelope after default-high quota admission, or clear
-  a row allowlist without enforcing the actual strong-Key target afterward.
+- Good: a stable `gemini-3.8-flash` alias maps to high but no-effort requests
+  select discovered medium; explicit low selects low and xhigh/max select high.
+- Good: native Gemini `thinkingBudget=1280/2048/16384/-1` selects the same
+  account-local low/medium/high/medium models as explicit thinking levels.
+- Bad: rewrite only the envelope after default-high quota admission, or clear a row
+  allowlist without enforcing the actual strong-Key target afterward.
 
 ## 6. Tests Required
 
@@ -409,13 +445,26 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   Assert zero unsupported generations, exact mapped model, native SSE `STOP`,
   refreshed discovery rebinding, and all-unsupported HTTP 503 with no generation.
 - `gateway_antigravity_dynamic_effort_*` exercises ordinary/Pool HTTP for native
-  Gemini sync/SSE and converted Chat/Responses: alternating tiers with warm
-  caches, explicit suffix priority, canonical xhigh/max, missing tiers, scoped
-  high quota feedback, default-high exhaustion/missing discovery with low still
-  available, and high-only/low-only Key allowlists. Assert completion text,
-  exact envelope model/level, preserved native custom fields and no unsupported
-  upstream calls. Runtime unit coverage retains an eligible sibling when the
-  preferred Key is absent from the strong snapshot.
+  Gemini sync/SSE and converted Chat/Responses: no-effort/null medium with
+  bare/high mappings, warm alternating tiers, explicit suffix priority,
+  canonical xhigh/max, missing/disabled/exhausted medium, scoped high quota
+  feedback and high-only/low-only Key allowlists. Assert completion text,
+  exact envelope model/level, preserved native custom fields and zero unsupported
+  upstream calls; all-medium-ineligible requests return 503 without generation.
+  Runtime unit coverage retains an eligible sibling when the preferred Key is
+  absent from the strong snapshot.
+- `gateway_antigravity_dynamic_effort_legacy_budget_alias_variants` asserts
+  ordinary/Pool HTTP completion model and outbound level for numeric budgets
+  and `-1`; the transport regression covers snake_case and level precedence.
+- `gateway_antigravity_dynamic_effort_converted_base_only_invalid_effort_rejected`
+  asserts zero upstream generation for unresolved `ultra`, accepted `extra-low`
+  on the discovered bare identity, and client low suffix over conflicting valid
+  or invalid body effort. Check both completion semantics and the exact outbound
+  thinking level in ordinary and Pool modes.
+- `gateway_antigravity_dynamic_effort_native_base_only_explicit_suffix_priority`
+  disables conversion and exercises ordinary/Pool native sync/SSE. Assert bare
+  default medium, explicit client low over body high, exact bare upstream model,
+  restored client display alias, native STOP/text and preserved unknown fields.
 
 - Runtime-state: keyed resources isolate capacity and permits release correctly.
 - Gateway: sync, stream, Responses WS, and Live admission/release; saturation

@@ -59,29 +59,53 @@ const THINKING_SUFFIXES: [(&str, AntigravityThinkingLevel); 9] = [
     ("-extra", AntigravityThinkingLevel::High),
 ];
 
-/// Read the client's requested thinking level from the request body. Only the
-/// field native to `api_format` is consulted so routing rules remain
-/// authoritative; Gemini also accepts an already-enveloped private request.
+/// Read the client's requested thinking level from the requested model suffix
+/// or format-native request body.
+///
+/// Precedence is:
+/// 1. Explicit client model suffix (`-low`, `-medium`, `-high`, `-xhigh`, ...).
+/// 2. Format-native body field (`thinkingLevel` > `thinkingBudget` for Gemini,
+///    `reasoning_effort` for OpenAI Chat, `reasoning.effort` for Responses).
+/// 3. `Medium` default for a bare `gemini-` model when the native thinking
+///    field is absent.
+///
+/// An explicit malformed setting returns `None` rather than silently falling
+/// back to `Medium`; in Gemini bodies an unrecognized `thinkingLevel` still
+/// falls through to a valid numeric `thinkingBudget` when present.
 pub fn antigravity_request_thinking_level(
     api_format: &str,
     body: &Value,
+    requested_model: &str,
 ) -> Option<AntigravityThinkingLevel> {
+    if let Some((_, level)) = antigravity_model_thinking_variant(requested_model) {
+        return Some(level);
+    }
+    let default_level = default_bare_gemini_thinking_level(requested_model);
     match aether_ai_formats::normalize_api_format_alias(api_format).as_str() {
-        "gemini:generate_content" => gemini_request_payload(body)
-            .get("generationConfig")?
-            .get("thinkingConfig")?
-            .get("thinkingLevel")?
-            .as_str()
-            .and_then(AntigravityThinkingLevel::parse),
-        "openai:chat" => body
-            .get("reasoning_effort")?
-            .as_str()
-            .and_then(AntigravityThinkingLevel::parse),
-        "openai:responses" | "openai:responses:compact" => body
-            .get("reasoning")?
-            .get("effort")?
-            .as_str()
-            .and_then(AntigravityThinkingLevel::parse),
+        "gemini:generate_content" => {
+            let payload = gemini_request_payload(body).as_object()?;
+            gemini_payload_thinking_level(payload, default_level)
+        }
+        "openai:chat" => {
+            let body = body.as_object()?;
+            // OpenAI treats `reasoning_effort: null` as omitted (`formats/openai/reasoning.rs`).
+            match body.get("reasoning_effort") {
+                None | Some(Value::Null) => default_level,
+                Some(effort) => effort.as_str().and_then(AntigravityThinkingLevel::parse),
+            }
+        }
+        "openai:responses" | "openai:responses:compact" => {
+            let body = body.as_object()?;
+            // OpenAI treats `reasoning: null` and `reasoning.effort: null` as omitted.
+            let reasoning = match body.get("reasoning") {
+                None | Some(Value::Null) => return default_level,
+                Some(reasoning) => reasoning.as_object()?,
+            };
+            match reasoning.get("effort") {
+                None | Some(Value::Null) => default_level,
+                Some(effort) => effort.as_str().and_then(AntigravityThinkingLevel::parse),
+            }
+        }
         _ => None,
     }
 }
@@ -108,9 +132,11 @@ pub fn antigravity_model_thinking_variant(model: &str) -> Option<(&str, Antigrav
 }
 
 /// Finalize the Gemini `thinkingLevel` at the private-envelope boundary. An
-/// explicit suffix always wins over a conflicting body level; a base-only model
-/// only canonicalizes a recognized level that is already present. Claude and
-/// unrelated model families are intentionally untouched.
+/// explicit suffix always wins over a conflicting body level. Base-only Gemini
+/// 3 wire models reuse the shared payload reader so absent thinking settings
+/// default to `medium` and numeric budgets derive a level without synthesizing
+/// a budget field; legacy Gemini 2.5 models remain budget-driven and are left
+/// untouched unless a recognized `thinkingLevel` is already present.
 pub(super) fn normalize_antigravity_gemini_thinking_level(
     request: &mut Map<String, Value>,
     model: &str,
@@ -122,13 +148,33 @@ pub(super) fn normalize_antigravity_gemini_thinking_level(
 
     let level = match antigravity_model_thinking_variant(model) {
         Some((_, level)) => level,
+        // Gate newly injected defaults and budget-derived levels on Gemini 3
+        // `thinkingLevel` capability so Gemini 2.5 budget-only wire payloads
+        // never acquire an unsupported `thinkingLevel` field.
+        None if aether_ai_formats::gemini_model_uses_thinking_level(model) => {
+            let Some(level) =
+                gemini_payload_thinking_level(request, default_bare_gemini_thinking_level(model))
+            else {
+                return;
+            };
+            level
+        }
         None => {
             let existing = request
                 .get("generationConfig")
+                .or_else(|| request.get("generation_config"))
                 .and_then(Value::as_object)
-                .and_then(|config| config.get("thinkingConfig"))
+                .and_then(|config| {
+                    config
+                        .get("thinkingConfig")
+                        .or_else(|| config.get("thinking_config"))
+                })
                 .and_then(Value::as_object)
-                .and_then(|config| config.get("thinkingLevel"))
+                .and_then(|config| {
+                    config
+                        .get("thinkingLevel")
+                        .or_else(|| config.get("thinking_level"))
+                })
                 .and_then(Value::as_str);
             match existing.and_then(AntigravityThinkingLevel::parse) {
                 Some(level) => level,
@@ -136,25 +182,112 @@ pub(super) fn normalize_antigravity_gemini_thinking_level(
             }
         }
     };
-
+    // Mutate existing camelCase or snake_case containers in place with the same
+    // camel-first priority as the reader so same-format/pre-enveloped snake_case
+    // payloads never acquire duplicate sibling config objects.
+    let generation_key =
+        if !request.contains_key("generationConfig") && request.contains_key("generation_config") {
+            "generation_config"
+        } else {
+            "generationConfig"
+        };
     let Some(generation_config) = request
-        .entry("generationConfig".to_string())
+        .entry(generation_key.to_string())
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
     else {
         return;
+    };
+    let thinking_key = if generation_config.contains_key("thinkingConfig") {
+        "thinkingConfig"
+    } else if generation_config.contains_key("thinking_config")
+        || generation_key == "generation_config"
+    {
+        "thinking_config"
+    } else {
+        "thinkingConfig"
     };
     let Some(thinking_config) = generation_config
-        .entry("thinkingConfig".to_string())
+        .entry(thinking_key.to_string())
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
     else {
         return;
     };
+    let level_key = if thinking_config.contains_key("thinkingLevel") {
+        "thinkingLevel"
+    } else if thinking_config.contains_key("thinking_level") || thinking_key == "thinking_config" {
+        "thinking_level"
+    } else {
+        "thinkingLevel"
+    };
     thinking_config.insert(
-        "thinkingLevel".to_string(),
+        level_key.to_string(),
         Value::String(level.as_str().to_string()),
     );
+}
+
+fn gemini_payload_thinking_level(
+    payload: &Map<String, Value>,
+    default_level: Option<AntigravityThinkingLevel>,
+) -> Option<AntigravityThinkingLevel> {
+    let Some(generation_config) = payload
+        .get("generationConfig")
+        .or_else(|| payload.get("generation_config"))
+    else {
+        return default_level;
+    };
+    let generation_config = generation_config.as_object()?;
+    let Some(thinking_config) = generation_config
+        .get("thinkingConfig")
+        .or_else(|| generation_config.get("thinking_config"))
+    else {
+        return default_level;
+    };
+    let thinking_config = thinking_config.as_object()?;
+    let raw_level = thinking_config
+        .get("thinkingLevel")
+        .or_else(|| thinking_config.get("thinking_level"));
+    if let Some(level) = raw_level
+        .and_then(Value::as_str)
+        .and_then(AntigravityThinkingLevel::parse)
+    {
+        return Some(level);
+    }
+    let raw_budget = thinking_config
+        .get("thinkingBudget")
+        .or_else(|| thinking_config.get("thinking_budget"));
+    if let Some(level) = raw_budget.and_then(parse_gemini_thinking_budget) {
+        return Some(level);
+    }
+    // Absent level/budget (including `thinkingConfig` with only `includeThoughts`)
+    // inherits `default_level`, whereas an explicit malformed level or budget
+    // must fail closed to `None` instead of silently selecting `Medium`.
+    if raw_level.is_some() || raw_budget.is_some() {
+        return None;
+    }
+    default_level
+}
+
+fn parse_gemini_thinking_budget(raw: &Value) -> Option<AntigravityThinkingLevel> {
+    let budget = raw.as_i64()?;
+    if budget == -1 {
+        return Some(AntigravityThinkingLevel::Medium);
+    }
+    let budget = u64::try_from(budget).ok()?;
+    let effort =
+        aether_ai_formats::formats::openai::shared::map_thinking_budget_to_openai_reasoning_effort(
+            budget,
+        );
+    AntigravityThinkingLevel::parse(effort)
+}
+
+fn default_bare_gemini_thinking_level(model: &str) -> Option<AntigravityThinkingLevel> {
+    let model = model.trim();
+    (has_gemini_model_prefix(model)
+        && model.len() > GEMINI_MODEL_PREFIX.len()
+        && !model.ends_with('-'))
+    .then_some(AntigravityThinkingLevel::Medium)
 }
 
 fn gemini_request_payload(body: &Value) -> &Value {
@@ -326,32 +459,55 @@ mod tests {
     }
 
     #[test]
-    fn request_reader_uses_only_the_native_field_for_each_format() {
+    fn request_reader_enforces_suffix_native_field_and_bare_gemini_medium_precedence() {
+        // Explicit client suffix outranks conflicting or malformed body fields.
+        assert_eq!(
+            antigravity_request_thinking_level(
+                "gemini:generate_content",
+                &json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"low","thinkingBudget":0}}}),
+                "gemini-3.8-flash-high",
+            ),
+            Some(AntigravityThinkingLevel::High)
+        );
+        assert_eq!(
+            antigravity_request_thinking_level(
+                "openai:chat",
+                &json!({"reasoning_effort":"ultra"}),
+                "gemini-3.8-flash-low",
+            ),
+            Some(AntigravityThinkingLevel::Low)
+        );
+        assert_eq!(
+            antigravity_request_thinking_level(
+                "openai:responses",
+                &json!({"reasoning":{"effort":"high"}}),
+                "gemini-3.8-flash-extra-low",
+            ),
+            Some(AntigravityThinkingLevel::Minimal)
+        );
+
+        // Explicit native fields override the bare-Gemini medium default.
         assert_eq!(
             antigravity_request_thinking_level(
                 "gemini:generate_content",
                 &json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}}),
+                "gemini-3.8-flash",
             ),
             Some(AntigravityThinkingLevel::High)
         );
         assert_eq!(
             antigravity_request_thinking_level(
                 "gemini:generate_content",
-                &json!({"request":{"contents":[],"generationConfig":{"thinkingConfig":{"thinkingLevel":"medium"}}}}),
+                &json!({"request":{"contents":[],"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}),
+                "gemini-3.8-flash",
             ),
-            Some(AntigravityThinkingLevel::Medium)
-        );
-        assert_eq!(
-            antigravity_request_thinking_level(
-                "gemini:generate_content",
-                &json!({"reasoning_effort":"high","reasoning":{"effort":"low"}}),
-            ),
-            None
+            Some(AntigravityThinkingLevel::Low)
         );
         assert_eq!(
             antigravity_request_thinking_level(
                 "openai:chat",
                 &json!({"reasoning_effort":"max","generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}),
+                "gemini-3.8-flash",
             ),
             Some(AntigravityThinkingLevel::High)
         );
@@ -359,6 +515,7 @@ mod tests {
             antigravity_request_thinking_level(
                 "openai:responses",
                 &json!({"reasoning":{"effort":"minimal"},"reasoning_effort":"high"}),
+                "gemini-3.8-flash",
             ),
             Some(AntigravityThinkingLevel::Minimal)
         );
@@ -366,20 +523,200 @@ mod tests {
             antigravity_request_thinking_level(
                 "openai:responses:compact",
                 &json!({"reasoning":{"effort":" extra "}}),
+                "gpt-5.2",
+            ),
+            Some(AntigravityThinkingLevel::High)
+        );
+
+        // Bare Gemini defaults to medium when the format-native thinking field is absent,
+        // including `thinkingConfig` with only `includeThoughts`, pre-enveloped requests,
+        // and bodies carrying only foreign-format fields.
+        for body in [
+            json!({"contents":[{"role":"user","parts":[{"text":"hello"}]}]}),
+            json!({"generationConfig":{"maxOutputTokens":256}}),
+            json!({"generationConfig":{"thinkingConfig":{"includeThoughts":true}}}),
+            json!({"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}),
+            json!({"reasoning_effort":"high","reasoning":{"effort":"low"}}),
+        ] {
+            assert_eq!(
+                antigravity_request_thinking_level(
+                    "gemini:generate_content",
+                    &body,
+                    " Gemini-3.8-Flash ",
+                ),
+                Some(AntigravityThinkingLevel::Medium),
+                "gemini body={body}"
+            );
+            assert_eq!(
+                antigravity_request_thinking_level(
+                    "gemini:generate_content",
+                    &body,
+                    "claude-opus-4-6",
+                ),
+                None,
+                "non-gemini body={body}"
+            );
+        }
+
+        for body in [
+            json!({"messages":[{"role":"user","content":"hello"}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}),
+            json!({"messages":[{"role":"user","content":"hello"}],"reasoning_effort":null}),
+        ] {
+            assert_eq!(
+                antigravity_request_thinking_level("openai:chat", &body, "gemini-3.8-flash"),
+                Some(AntigravityThinkingLevel::Medium),
+                "chat body={body}"
+            );
+            assert_eq!(
+                antigravity_request_thinking_level("openai:chat", &body, "gpt-5.2"),
+                None,
+                "chat non-gemini body={body}"
+            );
+        }
+        for format in ["openai:responses", "openai:responses:compact"] {
+            for body in [
+                json!({"input":"hello"}),
+                json!({"input":"hello","reasoning":null}),
+                json!({"input":"hello","reasoning":{"summary":"auto"}}),
+                json!({"input":"hello","reasoning":{"effort":null,"summary":"auto"}}),
+            ] {
+                assert_eq!(
+                    antigravity_request_thinking_level(format, &body, "gemini-3.8-flash"),
+                    Some(AntigravityThinkingLevel::Medium),
+                    "{format} body={body}"
+                );
+                assert_eq!(
+                    antigravity_request_thinking_level(format, &body, "gpt-5.2"),
+                    None,
+                    "{format} non-gemini body={body}"
+                );
+            }
+        }
+
+        // Unrelated formats and explicit malformed settings never acquire the medium default.
+        assert_eq!(
+            antigravity_request_thinking_level(
+                "claude:messages",
+                &json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}),
+                "gemini-3.8-flash",
+            ),
+            None
+        );
+        for body in [
+            json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"ultra"}}}),
+            json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":-2}}}),
+            json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":"medium"}}}),
+            json!({"generationConfig":"invalid"}),
+            json!({"generationConfig":{"thinkingConfig":"invalid"}}),
+        ] {
+            assert_eq!(
+                antigravity_request_thinking_level(
+                    "gemini:generate_content",
+                    &body,
+                    "gemini-3.8-flash",
+                ),
+                None,
+                "malformed gemini body={body}"
+            );
+        }
+        for body in [
+            json!({"reasoning_effort":"ultra"}),
+            json!({"reasoning_effort":123}),
+        ] {
+            assert_eq!(
+                antigravity_request_thinking_level("openai:chat", &body, "gemini-3.8-flash"),
+                None,
+                "malformed chat body={body}"
+            );
+        }
+        for body in [
+            json!({"reasoning":{"effort":"ultra"}}),
+            json!({"reasoning":{"effort":123}}),
+            json!({"reasoning":"invalid"}),
+        ] {
+            assert_eq!(
+                antigravity_request_thinking_level("openai:responses", &body, "gemini-3.8-flash"),
+                None,
+                "malformed responses body={body}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_request_reader_maps_legacy_thinking_budgets_to_levels() {
+        for (budget, expected) in [
+            (0, AntigravityThinkingLevel::Low),
+            (1280, AntigravityThinkingLevel::Low),
+            (2048, AntigravityThinkingLevel::Medium),
+            (16384, AntigravityThinkingLevel::High),
+            (-1, AntigravityThinkingLevel::Medium),
+        ] {
+            assert_eq!(
+                antigravity_request_thinking_level(
+                    "gemini:generate_content",
+                    &json!({
+                        "generationConfig": {
+                            "thinkingConfig": { "thinkingBudget": budget }
+                        }
+                    }),
+                    "gemini-3.8-flash",
+                ),
+                Some(expected),
+                "budget={budget}"
+            );
+        }
+
+        assert_eq!(
+            antigravity_request_thinking_level(
+                "gemini:generate_content",
+                &json!({
+                    "generation_config": {
+                        "thinking_config": { "thinking_budget": 16384 }
+                    }
+                }),
+                "gemini-3.8-flash",
             ),
             Some(AntigravityThinkingLevel::High)
         );
         assert_eq!(
             antigravity_request_thinking_level(
-                "claude:messages",
-                &json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}),
+                "gemini:generate_content",
+                &json!({
+                    "generationConfig": {
+                        "thinkingConfig": {
+                            "thinkingLevel": "low",
+                            "thinkingBudget": 16384
+                        }
+                    }
+                }),
+                "gemini-3.8-flash",
             ),
-            None
+            Some(AntigravityThinkingLevel::Low)
         );
         assert_eq!(
             antigravity_request_thinking_level(
                 "gemini:generate_content",
-                &json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"ultra"}}}),
+                &json!({
+                    "generationConfig": {
+                        "thinkingConfig": {
+                            "thinkingLevel": "ultra",
+                            "thinkingBudget": 16384
+                        }
+                    }
+                }),
+                "gemini-3.8-flash",
+            ),
+            Some(AntigravityThinkingLevel::High)
+        );
+        assert_eq!(
+            antigravity_request_thinking_level(
+                "gemini:generate_content",
+                &json!({
+                    "generationConfig": {
+                        "thinkingConfig": { "thinkingBudget": -2 }
+                    }
+                }),
+                "gemini-3.8-flash",
             ),
             None
         );
@@ -434,7 +771,8 @@ mod tests {
     }
 
     #[test]
-    fn base_only_gemini_canonicalizes_existing_recognized_body_level() {
+    fn base_only_gemini_envelope_normalizes_gemini3_defaults_and_preserves_gemini25_wire_contract()
+    {
         for (raw, expected) in [
             ("xhigh", "high"),
             ("max", "high"),
@@ -460,6 +798,58 @@ mod tests {
             );
         }
 
+        // Base-only Gemini 3 wire models receive `thinkingLevel: "medium"` when
+        // level/budget are absent (missing generationConfig, missing thinkingConfig,
+        // includeThoughts-only, or pre-enveloped private request) without synthesizing
+        // a numeric `thinkingBudget`.
+        for body in [
+            json!({"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}),
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                "generationConfig": {"maxOutputTokens": 128}
+            }),
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                "generationConfig": {"maxOutputTokens": 128, "thinkingConfig": {"includeThoughts": true}}
+            }),
+            json!({
+                "request": {
+                    "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                    "generationConfig": {"maxOutputTokens": 128}
+                }
+            }),
+        ] {
+            let output = envelope(&sample_auth(), "gemini-3.8-flash", &body);
+            let thinking_config = &output["request"]["generationConfig"]["thinkingConfig"];
+            assert_eq!(thinking_config["thinkingLevel"], "medium", "body={body}");
+            assert!(
+                thinking_config.get("thinkingBudget").is_none(),
+                "must not synthesize thinkingBudget: {body}"
+            );
+        }
+
+        // Base-only Gemini 3 models with a legacy numeric budget derive `thinkingLevel`
+        // while preserving the caller's numeric `thinkingBudget`.
+        let budgeted_gemini3 = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingBudget": 16384, "includeThoughts": true}}
+        });
+        let output = envelope(&sample_auth(), "gemini-3.8-flash", &budgeted_gemini3);
+        assert_eq!(
+            output["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+        assert_eq!(
+            output["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            16384
+        );
+        assert_eq!(
+            output["request"]["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+
+        // Explicit malformed settings on base-only Gemini 3 are left untouched rather
+        // than overwritten with `medium`.
         let unrecognized = json!({
             "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
             "generationConfig": {"thinkingConfig": {"thinkingLevel": "ultra"}}
@@ -470,16 +860,116 @@ mod tests {
             "ultra"
         );
 
-        let missing = json!({
+        let invalid_budget = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingBudget": -2}}
+        });
+        let output = envelope(&sample_auth(), "gemini-3.8-flash", &invalid_budget);
+        assert!(output["request"]["generationConfig"]["thinkingConfig"]
+            .get("thinkingLevel")
+            .is_none());
+        assert_eq!(
+            output["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            -2
+        );
+
+        // Legacy Gemini 2.5 budget-only wire models remain untouched both with and
+        // without numeric `thinkingBudget`.
+        let gemini25_budget = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingBudget": 2048, "includeThoughts": true}}
+        });
+        let output = envelope(&sample_auth(), "gemini-2.5-flash", &gemini25_budget);
+        assert!(output["request"]["generationConfig"]["thinkingConfig"]
+            .get("thinkingLevel")
+            .is_none());
+        assert_eq!(
+            output["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            2048
+        );
+
+        let gemini25_missing = json!({
             "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
             "generationConfig": {"maxOutputTokens": 128}
         });
-        let output = envelope(&sample_auth(), "gemini-3.8-flash", &missing);
+        let output = envelope(&sample_auth(), "gemini-2.5-flash", &gemini25_missing);
         assert!(output["request"]["generationConfig"]
             .get("thinkingConfig")
             .is_none());
-    }
+        assert_eq!(
+            output["request"]["generationConfig"]["maxOutputTokens"],
+            128
+        );
 
+        // Snake_case fresh and pre-enveloped wire payloads update their existing
+        // container in place without creating duplicate camelCase sibling objects.
+        let snake_missing = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generation_config": {
+                "max_output_tokens": 128,
+                "thinking_config": {"include_thoughts": true}
+            }
+        });
+        for input in [&snake_missing, &json!({"request": snake_missing.clone()})] {
+            let output = envelope(&sample_auth(), "gemini-3.8-flash", input);
+            let req = &output["request"];
+            assert!(req.get("generationConfig").is_none(), "input={input}");
+            let gen_cfg = &req["generation_config"];
+            assert!(gen_cfg.get("thinkingConfig").is_none(), "input={input}");
+            assert_eq!(gen_cfg["max_output_tokens"], 128);
+            let think_cfg = &gen_cfg["thinking_config"];
+            assert_eq!(think_cfg["thinking_level"], "medium", "input={input}");
+            assert_eq!(think_cfg["include_thoughts"], true, "input={input}");
+            assert!(think_cfg.get("thinkingLevel").is_none(), "input={input}");
+            assert!(think_cfg.get("thinking_budget").is_none(), "input={input}");
+        }
+
+        for (raw, expected) in [("LOW", "low"), ("xhigh", "high")] {
+            let snake_explicit = json!({
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                "generation_config": {
+                    "thinking_config": {
+                        "thinking_level": raw,
+                        "thinking_budget": 4096,
+                        "include_thoughts": true
+                    }
+                }
+            });
+            for input in [&snake_explicit, &json!({"request": snake_explicit.clone()})] {
+                let output = envelope(&sample_auth(), "gemini-3.8-flash", input);
+                let req = &output["request"];
+                assert!(req.get("generationConfig").is_none(), "raw={raw}");
+                let think_cfg = &req["generation_config"]["thinking_config"];
+                assert_eq!(think_cfg["thinking_level"], expected, "raw={raw}");
+                assert_eq!(think_cfg["thinking_budget"], 4096, "raw={raw}");
+                assert_eq!(think_cfg["include_thoughts"], true, "raw={raw}");
+                assert!(think_cfg.get("thinkingLevel").is_none(), "raw={raw}");
+            }
+        }
+
+        let snake_budget_only = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generation_config": {
+                "thinking_config": {
+                    "thinking_budget": 16384,
+                    "include_thoughts": true
+                }
+            }
+        });
+        for input in [
+            &snake_budget_only,
+            &json!({"request": snake_budget_only.clone()}),
+        ] {
+            let output = envelope(&sample_auth(), "gemini-3.8-flash", input);
+            let req = &output["request"];
+            assert!(req.get("generationConfig").is_none());
+            let think_cfg = &req["generation_config"]["thinking_config"];
+            assert_eq!(think_cfg["thinking_level"], "high");
+            assert_eq!(think_cfg["thinking_budget"], 16384);
+            assert_eq!(think_cfg["include_thoughts"], true);
+            assert!(think_cfg.get("thinkingLevel").is_none());
+        }
+    }
     #[test]
     fn explicit_suffix_adds_level_without_dropping_budgets_or_claude_data() {
         let body = json!({

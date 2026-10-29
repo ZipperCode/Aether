@@ -1,5 +1,7 @@
+use aether_provider_transport::antigravity::AntigravityThinkingLevel;
 use serde_json::Value;
 
+use crate::ai_serving::planner::antigravity::apply_antigravity_gemini_thinking_selection;
 use crate::ai_serving::transport::apply_standard_provider_request_body_rules_with_request_headers;
 use crate::ai_serving::{
     apply_openai_responses_compact_special_body_edits,
@@ -206,6 +208,8 @@ pub(crate) fn build_cross_format_openai_responses_request_body(
         user_api_key_id,
         None,
         enable_model_directives,
+        None,
+        None,
     )
 }
 
@@ -222,8 +226,10 @@ pub(crate) fn build_cross_format_openai_responses_request_body_with_codex_model_
     history_scope: Option<&str>,
     model_capabilities: Option<&crate::ai_serving::CodexResponsesModelCapabilities>,
     enable_model_directives: bool,
+    requested_model: Option<&str>,
+    antigravity_thinking_level: Option<AntigravityThinkingLevel>,
 ) -> Option<Value> {
-    let provider_request_body = surface_build_cross_format_openai_responses_request_body(
+    let mut provider_request_body = surface_build_cross_format_openai_responses_request_body(
         body_json,
         mapped_model,
         client_api_format,
@@ -233,6 +239,14 @@ pub(crate) fn build_cross_format_openai_responses_request_body_with_codex_model_
         enable_model_directives,
         history_scope,
     )?;
+    apply_antigravity_gemini_thinking_selection(
+        &mut provider_request_body,
+        provider_type,
+        provider_api_format,
+        mapped_model,
+        requested_model,
+        antigravity_thinking_level,
+    );
     let mut provider_request_body =
         apply_standard_provider_request_body_rules_with_request_headers(
             provider_request_body,
@@ -336,6 +350,8 @@ mod antigravity_schema_tests {
                     Some("antigravity-schema-test"),
                     None,
                     false,
+                    None,
+                    None,
                 )
                 .unwrap();
             let parameters = &output["tools"][0]["functionDeclarations"][0]["parameters"];

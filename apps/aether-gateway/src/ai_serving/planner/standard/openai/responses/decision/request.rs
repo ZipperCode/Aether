@@ -508,6 +508,8 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts_with_
             Some(input.auth_context.api_key_id.as_str()),
             codex_model_capabilities.as_ref(),
             false,
+            Some(input.requested_model.as_str()),
+            input.antigravity_thinking_level,
         )
     } else if websocket_continuation {
         build_local_openai_responses_request_body_with_codex_model_capabilities_for_websocket_continuation(
@@ -955,6 +957,9 @@ async fn build_antigravity_openai_responses_payload_parts(
             parts,
             transport,
             trace_id,
+            client_api_format,
+            requested_model: &input.requested_model,
+            antigravity_thinking_level: input.antigravity_thinking_level,
             mapped_model: &mapped_model,
             provider_api_format,
             auth_header: &auth_header,

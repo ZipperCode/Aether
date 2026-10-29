@@ -810,6 +810,8 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         Some(input.auth_context.api_key_id.as_str()),
         effective_headers,
         false,
+        Some(input.requested_model.as_str()),
+        input.antigravity_thinking_level,
     ) else {
         mark_skipped_local_openai_chat_candidate_with_extra_data(
             state,
@@ -1053,6 +1055,9 @@ async fn build_antigravity_openai_chat_cross_format_payload_parts(
             parts,
             transport,
             trace_id,
+            client_api_format: "openai:chat",
+            requested_model: &input.requested_model,
+            antigravity_thinking_level: input.antigravity_thinking_level,
             mapped_model: &mapped_model,
             provider_api_format,
             auth_header: &auth_header,
@@ -2431,6 +2436,8 @@ mod tests {
             None,
             &http::HeaderMap::new(),
             false,
+            None,
+            None,
         )
         .expect("Responses-shaped chat request should build");
 

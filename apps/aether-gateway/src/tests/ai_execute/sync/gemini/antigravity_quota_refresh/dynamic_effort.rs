@@ -345,17 +345,49 @@ async fn run_converted_chat_step(
     harness: &AntigravityHttpHarness,
     mode_label: &str,
     step: &str,
-    reasoning_effort: &str,
+    reasoning_effort: Option<Value>,
     expected_model: &str,
     expected_level: &str,
     expected_account_a: bool,
 ) {
-    let body = json!({
-        "model": EFFORT_FAMILY_ALIAS,
-        "messages": [{ "role": "user", "content": "ping" }],
-        "temperature": 0.2,
-        "reasoning_effort": reasoning_effort,
-    });
+    run_converted_chat_model_step(
+        harness,
+        mode_label,
+        step,
+        EFFORT_FAMILY_ALIAS,
+        reasoning_effort,
+        expected_model,
+        expected_model,
+        expected_level,
+        expected_account_a,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_converted_chat_model_step(
+    harness: &AntigravityHttpHarness,
+    mode_label: &str,
+    step: &str,
+    request_model: &str,
+    reasoning_effort: Option<Value>,
+    expected_client_model: &str,
+    expected_upstream_model: &str,
+    expected_level: &str,
+    expected_account_a: bool,
+) {
+    let mut body = serde_json::Map::from_iter([
+        ("model".to_string(), json!(request_model)),
+        (
+            "messages".to_string(),
+            json!([{ "role": "user", "content": "ping" }]),
+        ),
+        ("temperature".to_string(), json!(0.2)),
+    ]);
+    if let Some(reasoning_effort) = reasoning_effort {
+        body.insert("reasoning_effort".to_string(), reasoning_effort);
+    }
+    let body = Value::Object(body);
     let plans_before = harness.captured_generation_plans().len();
     let counts_before = harness.generation_counts();
     let response = harness.send_chat_completion_body(&body, step).await;
@@ -378,20 +410,24 @@ async fn run_converted_chat_step(
     );
     assert_eq!(
         payload.get("model").and_then(Value::as_str),
-        Some(expected_model),
-        "{mode_label}/{step}: chat completion must report the resolved upstream model"
+        Some(expected_client_model),
+        "{mode_label}/{step}: chat completion must report the expected client model"
     );
     assert_step_plan(
         harness,
         plans_before,
         mode_label,
         step,
-        expected_model,
+        expected_upstream_model,
         expected_level,
     );
     assert_eq!(
         generation_deltas(&counts_before, &harness.generation_counts()),
-        vec![expected_generation(expected_account_a, expected_model, 1)],
+        vec![expected_generation(
+            expected_account_a,
+            expected_upstream_model,
+            1
+        )],
         "{mode_label}/{step}: converted chat request must use the expected account+variant"
     );
 }
@@ -400,17 +436,46 @@ async fn run_converted_responses_step(
     harness: &AntigravityHttpHarness,
     mode_label: &str,
     step: &str,
-    reasoning_effort: &str,
+    reasoning: Option<Value>,
     expected_model: &str,
     expected_level: &str,
     expected_account_a: bool,
 ) {
-    let body = json!({
-        "model": EFFORT_FAMILY_ALIAS,
-        "input": "ping",
-        "temperature": 0.2,
-        "reasoning": { "effort": reasoning_effort },
-    });
+    run_converted_responses_model_step(
+        harness,
+        mode_label,
+        step,
+        EFFORT_FAMILY_ALIAS,
+        reasoning,
+        expected_model,
+        expected_model,
+        expected_level,
+        expected_account_a,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_converted_responses_model_step(
+    harness: &AntigravityHttpHarness,
+    mode_label: &str,
+    step: &str,
+    request_model: &str,
+    reasoning: Option<Value>,
+    expected_client_model: &str,
+    expected_upstream_model: &str,
+    expected_level: &str,
+    expected_account_a: bool,
+) {
+    let mut body = serde_json::Map::from_iter([
+        ("model".to_string(), json!(request_model)),
+        ("input".to_string(), json!("ping")),
+        ("temperature".to_string(), json!(0.2)),
+    ]);
+    if let Some(reasoning) = reasoning {
+        body.insert("reasoning".to_string(), reasoning);
+    }
+    let body = Value::Object(body);
     let plans_before = harness.captured_generation_plans().len();
     let counts_before = harness.generation_counts();
     let response = harness.send_responses_body(&body, step).await;
@@ -431,20 +496,24 @@ async fn run_converted_responses_step(
     );
     assert_eq!(
         payload.get("model").and_then(Value::as_str),
-        Some(expected_model),
-        "{mode_label}/{step}: responses completion must report the resolved upstream model"
+        Some(expected_client_model),
+        "{mode_label}/{step}: responses completion must report the expected client model"
     );
     assert_step_plan(
         harness,
         plans_before,
         mode_label,
         step,
-        expected_model,
+        expected_upstream_model,
         expected_level,
     );
     assert_eq!(
         generation_deltas(&counts_before, &harness.generation_counts()),
-        vec![expected_generation(expected_account_a, expected_model, 1)],
+        vec![expected_generation(
+            expected_account_a,
+            expected_upstream_model,
+            1
+        )],
         "{mode_label}/{step}: converted responses request must use the expected account+variant"
     );
 }
@@ -456,6 +525,72 @@ fn assert_no_unsupported_upstream_plan(harness: &AntigravityHttpHarness, mode_la
         (0, 0),
         "{mode_label}: no upstream generation may target an account whose discovered catalog lacks the model"
     );
+}
+
+async fn assert_native_effort_unavailable_step(
+    harness: &AntigravityHttpHarness,
+    mode_label: &str,
+    step: &str,
+    request_model: &str,
+    thinking_level: Option<&str>,
+) {
+    let body = native_effort_body(&harness.client_session_id, thinking_level);
+    let plans_before = harness.captured_generation_plans().len();
+    let counts_before = harness.generation_counts();
+    let raw_counts_before = harness.counts();
+    let response = harness.send_generate_body(request_model, &body, step).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{mode_label}/{step}: request must return 503 when no account can serve the resolved variant"
+    );
+    assert_eq!(
+        harness.captured_generation_plans().len(),
+        plans_before,
+        "{mode_label}/{step}: 503 must not emit any upstream generation plan"
+    );
+    assert!(
+        generation_deltas(&counts_before, &harness.generation_counts()).is_empty(),
+        "{mode_label}/{step}: 503 must not increment per-model generation counts"
+    );
+    let raw_counts_after = harness.counts();
+    assert_eq!(
+        (raw_counts_after.gen_a, raw_counts_after.gen_b),
+        (raw_counts_before.gen_a, raw_counts_before.gen_b),
+        "{mode_label}/{step}: 503 must not send any upstream generation request"
+    );
+    assert_no_unsupported_upstream_plan(harness, mode_label);
+}
+
+async fn set_key_model_disabled(
+    harness: &AntigravityHttpHarness,
+    key_id: &str,
+    model: &str,
+    disabled: bool,
+) {
+    use aether_data_contracts::repository::provider_catalog::ProviderCatalogWriteRepository;
+
+    let mut key = harness.read_catalog_key(key_id).await;
+    let entry = key
+        .upstream_metadata
+        .as_mut()
+        .and_then(|meta| meta.pointer_mut(&format!("/antigravity/quota_by_model/{model}")))
+        .and_then(Value::as_object_mut)
+        .expect("seeded quota_by_model entry should exist");
+    if disabled {
+        entry.insert("disabled".to_string(), json!(true));
+    } else {
+        entry.remove("disabled");
+    }
+    assert!(harness
+        .provider_catalog_repository
+        .update_key_upstream_metadata(key_id, key.upstream_metadata.as_ref(), None)
+        .await
+        .expect("catalog key upstream metadata should update"));
+    harness
+        .gateway_state
+        .invalidate_provider_transport_runtime_state_caches();
+    harness.materialize_pool_scores().await;
 }
 
 #[test]
@@ -493,8 +628,8 @@ async fn run_native_alias_variants_mode(pool_enabled: bool) {
         "step1-no-effort-default",
         EFFORT_FAMILY_ALIAS,
         None,
-        EFFORT_HIGH_MODEL,
-        "high",
+        EFFORT_MEDIUM_MODEL,
+        "medium",
         true,
     )
     .await;
@@ -560,8 +695,8 @@ async fn run_native_alias_variants_mode(pool_enabled: bool) {
         "step7-warm-cache-no-effort",
         EFFORT_FAMILY_ALIAS,
         None,
-        EFFORT_HIGH_MODEL,
-        "high",
+        EFFORT_MEDIUM_MODEL,
+        "medium",
         true,
     )
     .await;
@@ -591,9 +726,9 @@ async fn run_native_alias_variants_mode(pool_enabled: bool) {
     run_native_effort_stream_step(
         &harness,
         mode_label,
-        "step10-native-stream-medium",
+        "step10-native-stream-default-medium",
         EFFORT_FAMILY_ALIAS,
-        Some("medium"),
+        None,
         EFFORT_MEDIUM_MODEL,
         "medium",
         true,
@@ -608,6 +743,82 @@ async fn run_native_alias_variants_mode(pool_enabled: bool) {
         );
     }
     assert_no_unsupported_upstream_plan(&harness, mode_label);
+}
+
+#[test]
+fn gateway_antigravity_dynamic_effort_legacy_budget_alias_variants() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_dynamic_effort_legacy_budget_alias_variants",
+        gateway_antigravity_dynamic_effort_legacy_budget_alias_variants_impl,
+    );
+}
+
+async fn gateway_antigravity_dynamic_effort_legacy_budget_alias_variants_impl() {
+    for pool_enabled in [false, true] {
+        let mode_label = if pool_enabled { "pool" } else { "ordinary" };
+        let harness = start_antigravity_http_harness(dynamic_effort_http_config(
+            "legacy-budget",
+            mode_label,
+            pool_enabled,
+            false,
+            all_variant_models(0.9),
+            high_medium_models(0.9),
+        ))
+        .await;
+        harness.materialize_pool_scores().await;
+
+        for (step, budget, expected_model, expected_level) in [
+            ("budget-low", 1280, EFFORT_LOW_MODEL, "low"),
+            ("budget-medium", 2048, EFFORT_MEDIUM_MODEL, "medium"),
+            ("budget-high", 16384, EFFORT_HIGH_MODEL, "high"),
+        ] {
+            let body = json!({
+                "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "thinkingConfig": { "thinkingBudget": budget }
+                },
+                EFFORT_NATIVE_PROBE_FIELD: { "surface": "native-gemini" },
+            });
+            let plans_before = harness.captured_generation_plans().len();
+            let response = harness
+                .send_generate_body(EFFORT_FAMILY_ALIAS, &body, step)
+                .await;
+            assert_gemini_model_completion(response, mode_label, step, expected_model).await;
+            assert_step_plan(
+                &harness,
+                plans_before,
+                mode_label,
+                step,
+                expected_model,
+                expected_level,
+            );
+        }
+
+        let body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }],
+            "generationConfig": {
+                "temperature": 0.2,
+                "thinkingConfig": { "thinkingBudget": -1 }
+            },
+            EFFORT_NATIVE_PROBE_FIELD: { "surface": "native-gemini" },
+        });
+        let plans_before = harness.captured_generation_plans().len();
+        let response = harness
+            .send_generate_body(EFFORT_FAMILY_ALIAS, &body, "budget-dynamic")
+            .await;
+        assert_gemini_model_completion(response, mode_label, "budget-dynamic", EFFORT_MEDIUM_MODEL)
+            .await;
+        assert_step_plan(
+            &harness,
+            plans_before,
+            mode_label,
+            "budget-dynamic",
+            EFFORT_MEDIUM_MODEL,
+            "medium",
+        );
+        assert_no_unsupported_upstream_plan(&harness, mode_label);
+    }
 }
 
 #[test]
@@ -873,8 +1084,28 @@ async fn run_converted_formats_mode(pool_enabled: bool) {
     run_converted_chat_step(
         &harness,
         mode_label,
+        "chat-no-effort-default-medium",
+        None,
+        EFFORT_MEDIUM_MODEL,
+        "medium",
+        true,
+    )
+    .await;
+    run_converted_chat_step(
+        &harness,
+        mode_label,
+        "chat-null-effort-default-medium",
+        Some(Value::Null),
+        EFFORT_MEDIUM_MODEL,
+        "medium",
+        true,
+    )
+    .await;
+    run_converted_chat_step(
+        &harness,
+        mode_label,
         "chat-low",
-        "low",
+        Some(json!("low")),
         EFFORT_LOW_MODEL,
         "low",
         true,
@@ -884,7 +1115,7 @@ async fn run_converted_formats_mode(pool_enabled: bool) {
         &harness,
         mode_label,
         "chat-xhigh-normalizes-high",
-        "xhigh",
+        Some(json!("xhigh")),
         EFFORT_HIGH_MODEL,
         "high",
         true,
@@ -893,8 +1124,38 @@ async fn run_converted_formats_mode(pool_enabled: bool) {
     run_converted_responses_step(
         &harness,
         mode_label,
+        "responses-no-effort-default-medium",
+        None,
+        EFFORT_MEDIUM_MODEL,
+        "medium",
+        true,
+    )
+    .await;
+    run_converted_responses_step(
+        &harness,
+        mode_label,
+        "responses-null-reasoning-default-medium",
+        Some(Value::Null),
+        EFFORT_MEDIUM_MODEL,
+        "medium",
+        true,
+    )
+    .await;
+    run_converted_responses_step(
+        &harness,
+        mode_label,
+        "responses-null-effort-default-medium",
+        Some(json!({ "effort": null })),
+        EFFORT_MEDIUM_MODEL,
+        "medium",
+        true,
+    )
+    .await;
+    run_converted_responses_step(
+        &harness,
+        mode_label,
         "responses-low",
-        "low",
+        Some(json!({ "effort": "low" })),
         EFFORT_LOW_MODEL,
         "low",
         true,
@@ -904,9 +1165,220 @@ async fn run_converted_formats_mode(pool_enabled: bool) {
         &harness,
         mode_label,
         "responses-max-normalizes-high",
-        "max",
+        Some(json!({ "effort": "max" })),
         EFFORT_HIGH_MODEL,
         "high",
+        true,
+    )
+    .await;
+
+    assert_no_unsupported_upstream_plan(&harness, mode_label);
+}
+
+async fn assert_converted_unavailable_response(
+    harness: &AntigravityHttpHarness,
+    mode_label: &str,
+    step: &str,
+    plans_before: usize,
+    counts_before: &BTreeMap<(bool, String), usize>,
+    raw_counts_before: AntigravityHttpCounts,
+    response: reqwest::Response,
+) {
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{mode_label}/{step}: invalid converted effort must fail with 503 rather than defaulting to medium"
+    );
+    assert_eq!(
+        harness.captured_generation_plans().len(),
+        plans_before,
+        "{mode_label}/{step}: 503 must not emit any upstream generation plan"
+    );
+    assert!(
+        generation_deltas(counts_before, &harness.generation_counts()).is_empty(),
+        "{mode_label}/{step}: 503 must not increment per-model generation counts"
+    );
+    let raw_counts_after = harness.counts();
+    assert_eq!(
+        (raw_counts_after.gen_a, raw_counts_after.gen_b),
+        (raw_counts_before.gen_a, raw_counts_before.gen_b),
+        "{mode_label}/{step}: 503 must not send any upstream generation request"
+    );
+    assert_no_unsupported_upstream_plan(harness, mode_label);
+}
+
+#[test]
+fn gateway_antigravity_dynamic_effort_converted_base_only_invalid_effort_rejected() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_dynamic_effort_converted_base_only_invalid_effort_rejected",
+        gateway_antigravity_dynamic_effort_converted_base_only_invalid_effort_rejected_impl,
+    );
+}
+
+async fn gateway_antigravity_dynamic_effort_converted_base_only_invalid_effort_rejected_impl() {
+    run_converted_base_only_invalid_effort_mode(false).await;
+    run_converted_base_only_invalid_effort_mode(true).await;
+}
+
+/// 当 provider 映射与双账号目录都仅有裸基础模型 `gemini-3.8-flash` 且开启格式转换时：
+/// - 非法显式档位（Chat `reasoning_effort: "ultra"`、Responses `reasoning.effort: "ultra"`）
+///   必须在 Antigravity 边界失败返回 503 且 0 次上游生成，绝不能被终态 envelope 改写成 medium；
+/// - 受支持的兼容拼写 `extra-low` 仍命中已发现裸模型并以 `thinkingLevel: "minimal"` 发送；
+/// - 客户端显式后缀 `gemini-3.8-flash-low` 压过非法正文 `ultra`，在已发现裸模型上以
+///   `thinkingLevel: "low"` 完成且不自造 `-low` 模型身份；
+/// - 同配置下的无 effort 请求则在已发现裸基础模型上以 `thinkingLevel: "medium"` 正常完成。
+async fn run_converted_base_only_invalid_effort_mode(pool_enabled: bool) {
+    let mode_label = if pool_enabled { "pool" } else { "ordinary" };
+    let mut config = dynamic_effort_http_config(
+        "converted-base-only",
+        mode_label,
+        pool_enabled,
+        true,
+        effort_models(&[(EFFORT_FAMILY_ALIAS, 0.9)]),
+        effort_models(&[(EFFORT_FAMILY_ALIAS, 0.0)]),
+    );
+    config.provider_model_name = EFFORT_FAMILY_ALIAS.to_string();
+    config.secondary_provider_model_name = Some(EFFORT_FAMILY_ALIAS.to_string());
+    let harness = start_antigravity_http_harness(config).await;
+    harness.materialize_pool_scores().await;
+
+    let plans_before = harness.captured_generation_plans().len();
+    let counts_before = harness.generation_counts();
+    let raw_counts_before = harness.counts();
+    let chat_ultra = harness
+        .send_chat_completion_body(
+            &json!({
+                "model": EFFORT_FAMILY_ALIAS,
+                "messages": [{ "role": "user", "content": "ping" }],
+                "temperature": 0.2,
+                "reasoning_effort": "ultra",
+            }),
+            "chat-base-only-ultra-rejected",
+        )
+        .await;
+    assert_converted_unavailable_response(
+        &harness,
+        mode_label,
+        "chat-base-only-ultra-rejected",
+        plans_before,
+        &counts_before,
+        raw_counts_before,
+        chat_ultra,
+    )
+    .await;
+
+    let plans_before = harness.captured_generation_plans().len();
+    let counts_before = harness.generation_counts();
+    let raw_counts_before = harness.counts();
+    let responses_ultra = harness
+        .send_responses_body(
+            &json!({
+                "model": EFFORT_FAMILY_ALIAS,
+                "input": "ping",
+                "temperature": 0.2,
+                "reasoning": { "effort": "ultra" },
+            }),
+            "responses-base-only-ultra-rejected",
+        )
+        .await;
+    assert_converted_unavailable_response(
+        &harness,
+        mode_label,
+        "responses-base-only-ultra-rejected",
+        plans_before,
+        &counts_before,
+        raw_counts_before,
+        responses_ultra,
+    )
+    .await;
+
+    run_converted_chat_step(
+        &harness,
+        mode_label,
+        "chat-base-only-extra-low-minimal",
+        Some(json!("extra-low")),
+        EFFORT_FAMILY_ALIAS,
+        "minimal",
+        true,
+    )
+    .await;
+    run_converted_responses_step(
+        &harness,
+        mode_label,
+        "responses-base-only-extra-low-minimal",
+        Some(json!({ "effort": "extra-low" })),
+        EFFORT_FAMILY_ALIAS,
+        "minimal",
+        true,
+    )
+    .await;
+
+    run_converted_chat_model_step(
+        &harness,
+        mode_label,
+        "chat-base-only-low-suffix-beats-ultra",
+        EFFORT_LOW_MODEL,
+        Some(json!("ultra")),
+        EFFORT_LOW_MODEL,
+        EFFORT_FAMILY_ALIAS,
+        "low",
+        true,
+    )
+    .await;
+    run_converted_responses_model_step(
+        &harness,
+        mode_label,
+        "responses-base-only-low-suffix-beats-ultra",
+        EFFORT_LOW_MODEL,
+        Some(json!({ "effort": "ultra" })),
+        EFFORT_LOW_MODEL,
+        EFFORT_FAMILY_ALIAS,
+        "low",
+        true,
+    )
+    .await;
+    run_converted_chat_model_step(
+        &harness,
+        mode_label,
+        "chat-base-only-low-suffix-beats-high",
+        EFFORT_LOW_MODEL,
+        Some(json!("high")),
+        EFFORT_LOW_MODEL,
+        EFFORT_FAMILY_ALIAS,
+        "low",
+        true,
+    )
+    .await;
+    run_converted_responses_model_step(
+        &harness,
+        mode_label,
+        "responses-base-only-low-suffix-beats-high",
+        EFFORT_LOW_MODEL,
+        Some(json!({ "effort": "high" })),
+        EFFORT_LOW_MODEL,
+        EFFORT_FAMILY_ALIAS,
+        "low",
+        true,
+    )
+    .await;
+
+    run_converted_chat_step(
+        &harness,
+        mode_label,
+        "chat-base-only-no-effort-medium",
+        None,
+        EFFORT_FAMILY_ALIAS,
+        "medium",
+        true,
+    )
+    .await;
+    run_converted_responses_step(
+        &harness,
+        mode_label,
+        "responses-base-only-no-effort-medium",
+        None,
+        EFFORT_FAMILY_ALIAS,
+        "medium",
         true,
     )
     .await;
@@ -974,6 +1446,15 @@ async fn run_key_allowed_models_mode(pool_enabled: bool) {
         false,
     )
     .await;
+    // 裸名无 effort 默认解析为 medium：A 只允许 high、B 只允许 low，两账号都不得放行。
+    assert_native_effort_unavailable_step(
+        &harness,
+        mode_label,
+        "step3-no-effort-medium-disallowed-on-both-503",
+        EFFORT_FAMILY_ALIAS,
+        None,
+    )
+    .await;
 
     assert_no_unsupported_upstream_plan(&harness, mode_label);
     if pool_enabled {
@@ -983,4 +1464,430 @@ async fn run_key_allowed_models_mode(pool_enabled: bool) {
             "{mode_label}: low 必须绕过 A 并让 sticky 重新绑定到 B"
         );
     }
+
+    // 服务账号仅允许 medium 时（无论静态映射是 bare 还是 default-high），枚举阶段
+    // 必须延迟行级 allowlist，按解析后的 medium 命中 B 的强 allowlist。
+    for (mapping_label, provider_model_name) in [
+        ("bare-map", EFFORT_FAMILY_ALIAS),
+        ("default-high-map", EFFORT_HIGH_MODEL),
+    ] {
+        let case_label = format!("{mode_label}-{mapping_label}");
+        let mut medium_only_config = dynamic_effort_http_config(
+            &format!("key-allowed-medium-only-{mapping_label}"),
+            mode_label,
+            pool_enabled,
+            false,
+            all_variant_models(0.9),
+            all_variant_models(0.9),
+        );
+        medium_only_config.provider_model_name = provider_model_name.to_string();
+        medium_only_config.key_a.allowed_models = Some(vec![EFFORT_HIGH_MODEL.to_string()]);
+        medium_only_config.key_b.allowed_models = Some(vec![EFFORT_MEDIUM_MODEL.to_string()]);
+        let medium_harness = start_antigravity_http_harness(medium_only_config).await;
+        medium_harness.materialize_pool_scores().await;
+
+        run_native_effort_step(
+            &medium_harness,
+            &case_label,
+            "step1-no-effort-served-by-medium-only-b",
+            EFFORT_FAMILY_ALIAS,
+            None,
+            EFFORT_MEDIUM_MODEL,
+            "medium",
+            false,
+        )
+        .await;
+        run_native_effort_step(
+            &medium_harness,
+            &case_label,
+            "step2-explicit-high-served-by-high-only-a",
+            EFFORT_FAMILY_ALIAS,
+            Some("high"),
+            EFFORT_HIGH_MODEL,
+            "high",
+            true,
+        )
+        .await;
+        assert_no_unsupported_upstream_plan(&medium_harness, &case_label);
+    }
+}
+
+#[test]
+fn gateway_antigravity_dynamic_effort_bare_no_effort_medium_admission() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_dynamic_effort_bare_no_effort_medium_admission",
+        gateway_antigravity_dynamic_effort_bare_no_effort_medium_admission_impl,
+    );
+}
+
+async fn gateway_antigravity_dynamic_effort_bare_no_effort_medium_admission_impl() {
+    for pool_enabled in [false, true] {
+        for (mapping_label, provider_model_name) in [
+            ("bare-map", EFFORT_FAMILY_ALIAS),
+            ("default-high-map", EFFORT_HIGH_MODEL),
+        ] {
+            run_bare_no_effort_medium_admission_mode(
+                pool_enabled,
+                mapping_label,
+                provider_model_name,
+            )
+            .await;
+        }
+    }
+}
+
+/// 覆盖 provider 映射为裸模型名与默认 `-high` 两种形态：
+/// - 裸名无 effort 请求选择已发现的 medium，而不是沿用静态映射；
+/// - 首选账号缺少、禁用或耗尽 medium 时切换到有可用 medium 的兄弟账号；
+/// - 所有账号的 medium 都禁用/缺失/耗尽时返回 503 且 0 次上游生成，绝不回退 high/low；
+/// - 显式 high/low/模型后缀在同配置下始终优先。
+async fn run_bare_no_effort_medium_admission_mode(
+    pool_enabled: bool,
+    mapping_label: &str,
+    provider_model_name: &str,
+) {
+    let base_mode = if pool_enabled { "pool" } else { "ordinary" };
+    let mode_label = format!("{base_mode}-{mapping_label}");
+    let mut config = dynamic_effort_http_config(
+        &format!("bare-medium-{mapping_label}"),
+        base_mode,
+        pool_enabled,
+        false,
+        all_variant_models(0.9),
+        all_variant_models(0.9),
+    );
+    config.provider_model_name = provider_model_name.to_string();
+    let harness = start_antigravity_http_harness(config).await;
+    harness.materialize_pool_scores().await;
+
+    // Step 1: 裸名无 effort 在首选账号 A 上命中已发现的 medium。
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step1-bare-no-effort-serves-medium-on-a",
+        EFFORT_FAMILY_ALIAS,
+        None,
+        EFFORT_MEDIUM_MODEL,
+        "medium",
+        true,
+    )
+    .await;
+
+    // Step 2: 显式 high/low 及显式模型后缀优先于默认 medium。
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step2a-explicit-high-wins",
+        EFFORT_FAMILY_ALIAS,
+        Some("high"),
+        EFFORT_HIGH_MODEL,
+        "high",
+        true,
+    )
+    .await;
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step2b-explicit-low-wins",
+        EFFORT_FAMILY_ALIAS,
+        Some("low"),
+        EFFORT_LOW_MODEL,
+        "low",
+        true,
+    )
+    .await;
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step2c-explicit-low-suffix-wins",
+        EFFORT_LOW_MODEL,
+        Some("high"),
+        EFFORT_LOW_MODEL,
+        "low",
+        true,
+    )
+    .await;
+
+    // Step 3: A 的 medium 被标记为 disabled 时，裸名无 effort 切换到 B；
+    // 若 B 的 medium 也 disabled，则返回 503 且 0 次生成（即使 high/low 充足也不借用）。
+    let key_a_id = harness.key_a_id.clone();
+    let key_b_id = harness.key_b_id.clone();
+    set_key_model_disabled(&harness, &key_a_id, EFFORT_MEDIUM_MODEL, true).await;
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step3a-bare-switches-from-disabled-medium-on-a",
+        EFFORT_FAMILY_ALIAS,
+        None,
+        EFFORT_MEDIUM_MODEL,
+        "medium",
+        false,
+    )
+    .await;
+    set_key_model_disabled(&harness, &key_b_id, EFFORT_MEDIUM_MODEL, true).await;
+    assert_native_effort_unavailable_step(
+        &harness,
+        &mode_label,
+        "step3b-all-medium-disabled-503",
+        EFFORT_FAMILY_ALIAS,
+        None,
+    )
+    .await;
+    set_key_model_disabled(&harness, &key_a_id, EFFORT_MEDIUM_MODEL, false).await;
+    set_key_model_disabled(&harness, &key_b_id, EFFORT_MEDIUM_MODEL, false).await;
+
+    // Step 4: A 的发现目录缺少 medium 时，裸名无 effort 切换到 B；显式 low 仍由 A 服务；
+    // 当 A、B 都缺少 medium 时返回 503 且 0 次生成，显式 high 仍正常服务。
+    harness.set_account_models(true, high_low_models(0.9, 0.9));
+    harness.set_account_models(false, high_medium_models(0.9));
+    let refresh = harness.send_refresh_quota(None).await;
+    assert_eq!(refresh["success"], json!(2));
+    assert_eq!(refresh["failed"], json!(0));
+
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step4a-explicit-low-binds-a-without-medium",
+        EFFORT_FAMILY_ALIAS,
+        Some("low"),
+        EFFORT_LOW_MODEL,
+        "low",
+        true,
+    )
+    .await;
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step4b-bare-switches-from-missing-medium-on-a",
+        EFFORT_FAMILY_ALIAS,
+        None,
+        EFFORT_MEDIUM_MODEL,
+        "medium",
+        false,
+    )
+    .await;
+
+    harness.set_account_models(false, effort_models(&[(EFFORT_LOW_MODEL, 0.9)]));
+    let refresh = harness.send_refresh_quota(None).await;
+    assert_eq!(refresh["success"], json!(2));
+    assert_eq!(refresh["failed"], json!(0));
+    assert_native_effort_unavailable_step(
+        &harness,
+        &mode_label,
+        "step4c-all-medium-missing-503",
+        EFFORT_FAMILY_ALIAS,
+        None,
+    )
+    .await;
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step4d-explicit-high-serves-when-all-medium-missing",
+        EFFORT_FAMILY_ALIAS,
+        Some("high"),
+        EFFORT_HIGH_MODEL,
+        "high",
+        true,
+    )
+    .await;
+
+    // Step 5: A 的 medium 额度耗尽（high/low 仍有额度）时，裸名无 effort 切换到 B；
+    // 当 A、B 的 medium 都耗尽时返回 503 且 0 次生成，显式 high/low 仍可在 A 上服务。
+    harness.set_account_models(
+        true,
+        effort_models(&[
+            (EFFORT_HIGH_MODEL, 0.9),
+            (EFFORT_MEDIUM_MODEL, 0.0),
+            (EFFORT_LOW_MODEL, 0.9),
+        ]),
+    );
+    harness.set_account_models(false, high_medium_models(0.9));
+    let refresh = harness.send_refresh_quota(None).await;
+    assert_eq!(refresh["success"], json!(2));
+    assert_eq!(refresh["failed"], json!(0));
+
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step5a-bare-switches-from-exhausted-medium-on-a",
+        EFFORT_FAMILY_ALIAS,
+        None,
+        EFFORT_MEDIUM_MODEL,
+        "medium",
+        false,
+    )
+    .await;
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step5b-explicit-low-serves-on-a-despite-exhausted-medium",
+        EFFORT_FAMILY_ALIAS,
+        Some("low"),
+        EFFORT_LOW_MODEL,
+        "low",
+        true,
+    )
+    .await;
+
+    harness.set_account_models(
+        false,
+        effort_models(&[
+            (EFFORT_HIGH_MODEL, 0.0),
+            (EFFORT_MEDIUM_MODEL, 0.0),
+            (EFFORT_LOW_MODEL, 0.9),
+        ]),
+    );
+    let refresh = harness.send_refresh_quota(None).await;
+    assert_eq!(refresh["success"], json!(2));
+    assert_eq!(refresh["failed"], json!(0));
+    assert_native_effort_unavailable_step(
+        &harness,
+        &mode_label,
+        "step5c-all-medium-exhausted-503",
+        EFFORT_FAMILY_ALIAS,
+        None,
+    )
+    .await;
+    run_native_effort_step(
+        &harness,
+        &mode_label,
+        "step5d-explicit-high-serves-despite-all-medium-exhausted",
+        EFFORT_FAMILY_ALIAS,
+        Some("high"),
+        EFFORT_HIGH_MODEL,
+        "high",
+        true,
+    )
+    .await;
+
+    assert_no_unsupported_upstream_plan(&harness, &mode_label);
+}
+
+#[test]
+fn gateway_antigravity_dynamic_effort_native_base_only_explicit_suffix_priority() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_dynamic_effort_native_base_only_explicit_suffix_priority",
+        gateway_antigravity_dynamic_effort_native_base_only_explicit_suffix_priority_impl,
+    );
+}
+
+async fn gateway_antigravity_dynamic_effort_native_base_only_explicit_suffix_priority_impl() {
+    run_native_base_only_explicit_suffix_priority_mode(false).await;
+    run_native_base_only_explicit_suffix_priority_mode(true).await;
+}
+
+/// 当主映射与显式 `-low` 客户端别名都映射到裸基础模型 `gemini-3.8-flash`，且账号目录
+/// 仅有裸模型（A 正额度、B 零额度使 A 唯一可用，且关闭跨格式转换）时：
+/// - 裸名无 effort 请求在 sync 与原生 SSE 下都以裸模型 + `thinkingLevel: "medium"` 完成；
+/// - 显式客户端 `-low` 后缀在 sync 与原生 SSE 下都压过冲突正文 `thinkingLevel: "high"`，
+///   上游发送裸 `gemini-3.8-flash` + `thinkingLevel: "low"` 并保留未知字段，而客户端
+///   `modelVersion` 维持显式别名 `gemini-3.8-flash-low` 的展示恢复。
+async fn run_native_base_only_explicit_suffix_priority_mode(pool_enabled: bool) {
+    let mode_label = if pool_enabled { "pool" } else { "ordinary" };
+    let mut config = dynamic_effort_http_config(
+        "native-base-only",
+        mode_label,
+        pool_enabled,
+        false,
+        effort_models(&[(EFFORT_FAMILY_ALIAS, 0.9)]),
+        effort_models(&[(EFFORT_FAMILY_ALIAS, 0.0)]),
+    );
+    config.provider_model_name = EFFORT_FAMILY_ALIAS.to_string();
+    config.secondary_provider_model_name = Some(EFFORT_FAMILY_ALIAS.to_string());
+    let harness = start_antigravity_http_harness(config).await;
+    harness.materialize_pool_scores().await;
+
+    run_native_effort_step(
+        &harness,
+        mode_label,
+        "step1-bare-no-effort-default-medium",
+        EFFORT_FAMILY_ALIAS,
+        None,
+        EFFORT_FAMILY_ALIAS,
+        "medium",
+        true,
+    )
+    .await;
+    run_native_effort_stream_step(
+        &harness,
+        mode_label,
+        "step2-bare-stream-no-effort-default-medium",
+        EFFORT_FAMILY_ALIAS,
+        None,
+        EFFORT_FAMILY_ALIAS,
+        "medium",
+        true,
+    )
+    .await;
+
+    let step = "step3-low-suffix-beats-body-high-sync";
+    let body = native_effort_body(&harness.client_session_id, Some("high"));
+    let plans_before = harness.captured_generation_plans().len();
+    let counts_before = harness.generation_counts();
+    let response = harness
+        .send_generate_body(EFFORT_LOW_MODEL, &body, step)
+        .await;
+    let completion =
+        assert_gemini_model_completion(response, mode_label, step, EFFORT_LOW_MODEL).await;
+    assert_eq!(
+        completion
+            .pointer("/candidates/0/content/parts/0/text")
+            .and_then(Value::as_str),
+        Some(EFFORT_COMPLETION_TEXT),
+        "{mode_label}/{step}: client-visible completion text mismatch"
+    );
+    assert_step_plan(
+        &harness,
+        plans_before,
+        mode_label,
+        step,
+        EFFORT_FAMILY_ALIAS,
+        "low",
+    );
+    let plans = harness.captured_generation_plans();
+    assert_native_probe_preserved(&plans[plans_before], mode_label, step);
+    assert_eq!(
+        generation_deltas(&counts_before, &harness.generation_counts()),
+        vec![expected_generation(true, EFFORT_FAMILY_ALIAS, 1)],
+        "{mode_label}/{step}: sole-eligible account A must serve bare upstream model only"
+    );
+
+    let step = "step4-low-suffix-beats-body-high-stream";
+    let plans_before = harness.captured_generation_plans().len();
+    let counts_before = harness.generation_counts();
+    let response = harness
+        .send_stream_generate_body(EFFORT_LOW_MODEL, &body, step)
+        .await;
+    assert_gemini_stream_model_completion(
+        response,
+        mode_label,
+        step,
+        EFFORT_LOW_MODEL,
+        EFFORT_COMPLETION_TEXT,
+    )
+    .await;
+    assert_step_plan(
+        &harness,
+        plans_before,
+        mode_label,
+        step,
+        EFFORT_FAMILY_ALIAS,
+        "low",
+    );
+    let plans = harness.captured_generation_plans();
+    assert_native_probe_preserved(&plans[plans_before], mode_label, step);
+    assert_eq!(
+        generation_deltas(&counts_before, &harness.generation_counts()),
+        vec![expected_generation(true, EFFORT_FAMILY_ALIAS, 1)],
+        "{mode_label}/{step}: native SSE must serve bare upstream model on account A only"
+    );
+
+    if pool_enabled {
+        assert_eq!(
+            harness.read_sticky().await.as_deref(),
+            Some(harness.key_a_id.as_str()),
+            "{mode_label}: the same session should remain sticky to sole-eligible account A"
+        );
+    }
+    assert_no_unsupported_upstream_plan(&harness, mode_label);
 }
