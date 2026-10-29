@@ -2533,3 +2533,233 @@ async fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url_imp
     gateway_handle.abort();
     execution_runtime_handle.abort();
 }
+
+/// 号池所有成员因并发上限跳过时，即使图片规划禁用运行态缺失诊断，也必须从
+/// `pool_group_exhaustion.skip_reason_counts` 推导出纯容量 429；混入非容量成员跳过时回退 503。
+#[test]
+fn gateway_image_sync_pool_capacity_exhaustion_returns_429_and_mixed_pool_returns_503() {
+    run_image_sync_test(
+        "gateway_image_sync_pool_capacity_exhaustion_returns_429_and_mixed_pool_returns_503",
+        || async {
+            assert_image_sync_pool_exhaustion_status(false).await;
+            assert_image_sync_pool_exhaustion_status(true).await;
+        },
+    );
+}
+
+async fn assert_image_sync_pool_exhaustion_status(include_incompatible_sibling: bool) {
+    use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateRoutingFacts;
+    use aether_data_contracts::repository::candidates::{
+        RequestCandidateReadRepository, RequestCandidateStatus, StoredRequestCandidate,
+    };
+
+    use crate::tests::usage::{
+        hash_api_key, sample_local_openai_auth_snapshot, sample_local_openai_candidate_row,
+        sample_local_openai_endpoint, sample_local_openai_key, sample_local_openai_provider,
+    };
+
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_for_handler = Arc::clone(&upstream_hits);
+    let upstream = Router::new().fallback(any(move || {
+        let upstream_hits = Arc::clone(&upstream_hits_for_handler);
+        async move {
+            *upstream_hits.lock().expect("mutex should lock") += 1;
+            StatusCode::IM_A_TEAPOT
+        }
+    }));
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+
+    let client_api_key = "sk-client-image-pool-capacity";
+    let trace_id = if include_incompatible_sibling {
+        "trace-image-pool-capacity-mixed"
+    } else {
+        "trace-image-pool-capacity-only"
+    };
+    let mut auth = sample_local_openai_auth_snapshot("image-pool-client-key", "image-pool-user");
+    auth.api_key_concurrent_limit = None;
+    auth.user_allowed_providers = Some(vec!["openai".to_string()]);
+    auth.api_key_allowed_providers = auth.user_allowed_providers.clone();
+    auth.user_allowed_api_formats = Some(vec!["openai:image".to_string()]);
+    auth.api_key_allowed_api_formats = auth.user_allowed_api_formats.clone();
+    auth.user_allowed_models = Some(vec!["gpt-image-2".to_string()]);
+    auth.api_key_allowed_models = auth.user_allowed_models.clone();
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key(client_api_key)),
+        auth,
+    )]));
+
+    let mut provider = sample_local_openai_provider();
+    provider.config = Some(json!({"pool_advanced": {}}));
+    let provider_id = provider.id.clone();
+    let mut endpoint = sample_local_openai_endpoint();
+    endpoint.api_format = "openai:image".to_string();
+    endpoint.endpoint_kind = Some("image".to_string());
+    endpoint.base_url = format!("{upstream_url}/v1");
+    let endpoint_id = endpoint.id.clone();
+
+    let build_pool_member = |key_id: &str,
+                             internal_priority: i32,
+                             allowed_models: Option<Vec<String>>|
+     -> (StoredProviderCatalogKey, StoredMinimalCandidateSelectionRow) {
+        let mut key = sample_local_openai_key();
+        key.id = key_id.to_string();
+        key.name = key_id.to_string();
+        key.internal_priority = internal_priority;
+        key.concurrent_limit = Some(1);
+        key.api_formats = Some(json!(["openai:image"]));
+        key.global_priority_by_format = Some(json!({"openai:image": 1}));
+        key.allowed_models = allowed_models.as_ref().map(|models| json!(models));
+        key.encrypted_api_key = Some(
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, &format!("sk-{key_id}"))
+                .expect("api key should encrypt"),
+        );
+
+        let mut row = sample_local_openai_candidate_row();
+        row.endpoint_api_format = "openai:image".to_string();
+        row.endpoint_kind = Some("image".to_string());
+        row.key_id = key_id.to_string();
+        row.key_name = key_id.to_string();
+        row.key_internal_priority = internal_priority;
+        row.key_api_formats = Some(vec!["openai:image".to_string()]);
+        row.key_allowed_models = allowed_models;
+        row.key_global_priority_by_format = Some(json!({"openai:image": 1}));
+        row.routing_facts = StoredMinimalCandidateRoutingFacts {
+            provider_pool_enabled: true,
+            ..Default::default()
+        };
+        row.global_model_name = "gpt-image-2".to_string();
+        row.model_provider_model_name = "gpt-image-2".to_string();
+        row.model_provider_model_mappings = None;
+        (key, row)
+    };
+
+    let (key_1, row_1) = build_pool_member("key-image-pool-1", 0, None);
+    let (key_2, row_2) = build_pool_member("key-image-pool-2", 1, None);
+    let mut keys = vec![key_1, key_2];
+    let mut rows = vec![row_1, row_2];
+    if include_incompatible_sibling {
+        let (key_3, row_3) = build_pool_member(
+            "key-image-pool-3",
+            2,
+            Some(vec!["other-image-model".to_string()]),
+        );
+        keys.push(key_3);
+        rows.push(row_3);
+    }
+
+    let now_unix_ms =
+        i64::try_from(crate::clock::current_unix_ms()).expect("timestamp should fit i64");
+    let inflight_candidate = |key_id: &str| {
+        StoredRequestCandidate::new(
+            format!("cand-inflight-{key_id}"),
+            format!("req-inflight-{key_id}"),
+            Some("user-inflight".to_string()),
+            Some("api-key-inflight".to_string()),
+            None,
+            None,
+            0,
+            0,
+            Some(provider_id.clone()),
+            Some(endpoint_id.clone()),
+            Some(key_id.to_string()),
+            RequestCandidateStatus::Pending,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            now_unix_ms,
+            Some(now_unix_ms),
+            None,
+        )
+        .expect("inflight candidate should build")
+    };
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed([
+        inflight_candidate("key-image-pool-1"),
+        inflight_candidate("key-image-pool-2"),
+    ]));
+    let candidate_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows));
+    let provider_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        keys,
+    ));
+    let state = build_state_with_execution_runtime_override("").with_data_state_for_tests(
+        crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
+            auth_repository,
+            candidate_repository,
+            provider_repository,
+            Arc::clone(&request_candidates),
+            DEVELOPMENT_ENCRYPTION_KEY,
+        ),
+    );
+    let (gateway_url, gateway_handle) = start_server(build_router_with_state(state)).await;
+
+    let mut response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/images/generations"))
+        .bearer_auth(client_api_key)
+        .header(TRACE_ID_HEADER, trace_id)
+        .json(&json!({
+            "model": "gpt-image-2",
+            "prompt": "a blue square",
+            "n": 1,
+            "size": "1024x1024"
+        }))
+        .send()
+        .await
+        .expect("image request should complete");
+    let status = response.status();
+    let mut body_bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.expect("error chunk should read") {
+        assert!(body_bytes.len() + chunk.len() <= 64 * 1024);
+        body_bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(body_bytes).expect("error body should be utf-8");
+
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+    let candidates = request_candidates
+        .list_by_request_id(trace_id)
+        .await
+        .expect("candidates should read");
+    assert!(
+        !candidates.is_empty(),
+        "exhausted image pool must persist group summary diagnostics: {candidates:#?}"
+    );
+    let expected_counts = if include_incompatible_sibling {
+        json!({
+            "provider_key_concurrency_limit_reached": 2,
+            "key_model_disabled": 1,
+        })
+    } else {
+        json!({
+            "provider_key_concurrency_limit_reached": 2,
+        })
+    };
+    for summary in &candidates {
+        assert_eq!(summary.status, RequestCandidateStatus::Skipped);
+        assert_eq!(summary.key_id, None);
+        assert_eq!(summary.skip_reason.as_deref(), Some("pool_group_exhausted"));
+        assert_eq!(
+            summary
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("pool_group_exhaustion"))
+                .and_then(|value| value.get("skip_reason_counts")),
+            Some(&expected_counts)
+        );
+    }
+
+    if include_incompatible_sibling {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    } else {
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    }
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}

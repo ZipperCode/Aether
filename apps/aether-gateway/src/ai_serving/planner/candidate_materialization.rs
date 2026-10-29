@@ -3657,7 +3657,7 @@ mod tests {
             .await
             .expect("request candidates should read");
         assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0].key_id.as_deref(), Some("pool-group"));
+        assert_eq!(stored[0].key_id, None);
         assert_eq!(stored[0].status, RequestCandidateStatus::Skipped);
         assert_eq!(
             stored[0].skip_reason.as_deref(),
@@ -4625,7 +4625,7 @@ mod tests {
             Some("pool_group_exhausted")
         );
         assert_eq!(stored[0].candidate_index, 0);
-        assert_eq!(stored[0].key_id.as_deref(), Some("pool-group"));
+        assert_eq!(stored[0].key_id, None);
         assert_eq!(
             stored[0]
                 .extra_data

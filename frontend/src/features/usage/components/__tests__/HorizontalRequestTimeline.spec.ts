@@ -1207,4 +1207,259 @@ describe('HorizontalRequestTimeline', () => {
     expect(detailText).toContain('Streaming Key')
     expect(detailText).toContain('进行中')
   })
+
+  it('renders an incident-shaped historical marked pool summary as pool exhaustion without representative key metadata', async () => {
+    const onSelectAttempt = vi.fn()
+    const historicalSummary = buildCandidate({
+      id: 'cand-pool-historical-summary',
+      request_id: 'c3b46100-14de-497b-ae89-bccf0e99b9a2',
+      candidate_index: 0,
+      retry_index: 0,
+      provider_id: 'provider-antigravity',
+      provider_name: 'Antigravity',
+      endpoint_id: 'endpoint-antigravity',
+      endpoint_name: 'gemini:generate_content',
+      key_id: 'representative-key',
+      key_name: 'Representative key',
+      key_account_label: 'Representative account',
+      key_preview: 'sk-***rep',
+      key_auth_type: 'oauth',
+      key_oauth_plan_type: 'pro',
+      key_api_formats: ['gemini:generate_content'],
+      key_internal_priority: 7,
+      status: 'skipped',
+      skip_reason: 'key_model_disabled',
+      started_at: undefined,
+      finished_at: '2026-10-29T15:07:31.966Z',
+      extra_data: {
+        pool_group_exhaustion: {
+          scanned_keys: 282,
+          budget_scanned_keys: 153,
+          skip_reason_counts: {
+            key_model_disabled: 123,
+            pool_account_blocked: 1,
+            pool_cooldown: 30,
+          },
+        },
+      },
+    })
+    const trace: RequestTrace = {
+      ...buildTrace([historicalSummary]),
+      request_id: 'c3b46100-14de-497b-ae89-bccf0e99b9a2',
+      final_status: 'failed',
+      total_latency_ms: 0,
+    }
+
+    const root = mountTimeline(trace, {
+      requestStatus: 'failed',
+      overrideStatusCode: 503,
+      requestApiFormat: 'gemini:generate_content',
+      onSelectAttempt,
+    })
+    await nextTick()
+
+    expect(root.querySelector('.title-text')?.textContent?.trim()).toBe('Antigravity')
+    expect(root.querySelector('.skip-reason .reason-value')?.textContent?.trim()).toBe('号池已无可用账号')
+    const reasonTags = [...root.querySelectorAll<HTMLElement>('.pool-exhaustion-reasons .pool-reason-tag')]
+      .map(element => element.textContent?.trim())
+    expect(reasonTags).toEqual([
+      '该密钥已停用此模型 × 123',
+      '号池账号冷却中 × 30',
+      '号池账号已被封禁 × 1',
+    ])
+
+    const detailText = root.querySelector('.detail-panel')?.textContent ?? ''
+    expect(detailText).toContain('未向上游发起请求')
+    expect(detailText).not.toContain('Representative account')
+    expect(detailText).not.toContain('Representative key')
+    expect(detailText).not.toContain('representative-key')
+    expect(detailText).not.toContain('sk-***rep')
+    expect(detailText).not.toContain('OAuth')
+    expect(detailText).not.toContain('支持端点')
+    expect(detailText).not.toContain('Key 声明的可用 endpoint 格式')
+    expect(root.querySelector('.key-name')).toBeNull()
+    expect(root.querySelector('.auth-type-tag')).toBeNull()
+
+    const selectedAttempt = onSelectAttempt.mock.calls[onSelectAttempt.mock.calls.length - 1]?.[0] as CandidateRecord
+    expect(selectedAttempt).toMatchObject({
+      id: 'cand-pool-historical-summary',
+      skip_reason: 'pool_group_exhausted',
+      key_id: undefined,
+      key_name: undefined,
+      key_account_label: undefined,
+      key_auth_type: undefined,
+      key_api_formats: undefined,
+      key_internal_priority: undefined,
+    })
+    expect(historicalSummary.key_id).toBe('representative-key')
+    expect(historicalSummary.skip_reason).toBe('key_model_disabled')
+  })
+
+  it('renders current keyless pool summaries and sub-dot tooltips consistently with historical marked summaries', async () => {
+    const poolExhaustionMarker = {
+      scanned_keys: 282,
+      budget_scanned_keys: 153,
+      skip_reason_counts: {
+        key_model_disabled: 123,
+        pool_cooldown: 30,
+        pool_account_blocked: 1,
+      },
+    }
+    const keylessSummary = buildCandidate({
+      id: 'cand-pool-current-summary',
+      candidate_index: 0,
+      provider_id: 'provider-antigravity',
+      provider_name: 'Antigravity',
+      key_id: undefined,
+      key_name: undefined,
+      status: 'skipped',
+      skip_reason: 'pool_group_exhausted',
+      started_at: undefined,
+      finished_at: '2026-10-29T15:07:31.966Z',
+      extra_data: {
+        pool_group_exhaustion: poolExhaustionMarker,
+      },
+    })
+    const trace: RequestTrace = {
+      ...buildTrace([keylessSummary]),
+      final_status: 'failed',
+      total_latency_ms: 0,
+    }
+
+    const root = mountTimeline(trace, {
+      requestStatus: 'failed',
+      overrideStatusCode: 503,
+      requestApiFormat: 'gemini:generate_content',
+    })
+    await nextTick()
+
+    expect(root.querySelector('.skip-reason .reason-value')?.textContent?.trim()).toBe('号池已无可用账号')
+    expect(
+      [...root.querySelectorAll<HTMLElement>('.pool-exhaustion-reasons .pool-reason-tag')]
+        .map(element => element.textContent?.trim()),
+    ).toEqual([
+      '该密钥已停用此模型 × 123',
+      '号池账号冷却中 × 30',
+      '号池账号已被封禁 × 1',
+    ])
+    expect(root.querySelector('.key-name')).toBeNull()
+
+    const subDotRoot = mountTimeline(buildTrace([
+      buildCandidate({
+        id: 'cand-pool-attempt-0',
+        candidate_index: 0,
+        provider_id: 'provider-antigravity',
+        provider_name: 'Antigravity',
+        key_id: 'key-attempt-0',
+        key_name: 'Attempt Key 0',
+        status: 'failed',
+      }),
+      buildCandidate({
+        id: 'cand-pool-historical-subdot',
+        candidate_index: 1,
+        provider_id: 'provider-antigravity',
+        provider_name: 'Antigravity',
+        key_id: 'representative-key',
+        key_name: 'Representative key',
+        key_account_label: 'Representative account',
+        status: 'skipped',
+        skip_reason: 'key_model_disabled',
+        started_at: undefined,
+        extra_data: { pool_group_exhaustion: poolExhaustionMarker },
+      }),
+      buildCandidate({
+        id: 'cand-pool-current-subdot',
+        candidate_index: 2,
+        provider_id: 'provider-antigravity',
+        provider_name: 'Antigravity',
+        key_id: undefined,
+        key_name: undefined,
+        status: 'skipped',
+        skip_reason: 'pool_group_exhausted',
+        started_at: undefined,
+        extra_data: {
+          pool_group_exhaustion: {
+            scanned_keys: 0,
+            budget_scanned_keys: 0,
+          },
+        },
+      }),
+    ]))
+    await nextTick()
+
+    const subDots = [...subDotRoot.querySelectorAll<HTMLButtonElement>('.sub-dot')]
+    expect(subDots.map(dot => dot.getAttribute('title'))).toEqual([
+      '#1 · 号池已无可用账号 · 跳过',
+      '#2 · 号池已无可用账号 · 跳过',
+    ])
+    expect(subDots.map(dot => dot.getAttribute('aria-label'))).toEqual([
+      '#1 · 号池已无可用账号 · 跳过',
+      '#2 · 号池已无可用账号 · 跳过',
+    ])
+
+    subDots[1].click()
+    await nextTick()
+    expect(subDotRoot.querySelector('.skip-reason .reason-value')?.textContent?.trim()).toBe('号池已无可用账号')
+    expect(subDotRoot.querySelector('.pool-exhaustion-reasons')).toBeNull()
+  })
+
+  it('preserves ordinary single-key skip identity and reason when pool_group_exhaustion is absent', async () => {
+    const onSelectAttempt = vi.fn()
+    const ordinaryRoot = mountTimeline(buildTrace([
+      buildCandidate({
+        id: 'cand-ordinary-skip',
+        candidate_index: 0,
+        provider_id: 'provider-antigravity',
+        provider_name: 'Antigravity',
+        key_id: 'representative-key',
+        key_name: 'Representative key',
+        key_account_label: 'Representative account',
+        key_preview: 'sk-***rep',
+        key_auth_type: 'oauth',
+        key_oauth_plan_type: 'pro',
+        key_api_formats: ['gemini:generate_content'],
+        key_internal_priority: 7,
+        status: 'skipped',
+        skip_reason: 'key_model_disabled',
+        started_at: undefined,
+        finished_at: '2026-10-29T15:07:31.966Z',
+      }),
+    ]), {
+      requestStatus: 'failed',
+      overrideStatusCode: 503,
+      requestApiFormat: 'gemini:generate_content',
+      onSelectAttempt,
+    })
+    await nextTick()
+
+    const detailText = ordinaryRoot.querySelector('.detail-panel')?.textContent ?? ''
+    expect(ordinaryRoot.querySelector('.skip-reason .reason-value')?.textContent?.trim()).toBe('该密钥已停用此模型')
+    expect(ordinaryRoot.querySelector('.pool-exhaustion-reasons')).toBeNull()
+    expect(detailText).not.toContain('号池已无可用账号')
+    expect(detailText).toContain('Representative account')
+    expect(detailText).toContain('OAuth pro')
+    expect(detailText).toContain('sk-***rep')
+    expect(detailText).toContain('支持端点')
+    expect(detailText).toContain('Key 声明的可用 endpoint 格式')
+    expect(onSelectAttempt.mock.calls[onSelectAttempt.mock.calls.length - 1]?.[0]).toMatchObject({
+      key_id: 'representative-key',
+      key_internal_priority: 7,
+      skip_reason: 'key_model_disabled',
+    })
+
+    const blankKeyOrdinaryRoot = mountTimeline(buildTrace([
+      buildCandidate({
+        id: 'cand-blank-key-ordinary-skip',
+        key_id: undefined,
+        key_name: undefined,
+        status: 'skipped',
+        skip_reason: 'key_model_disabled',
+        started_at: undefined,
+      }),
+    ]))
+    await nextTick()
+
+    expect(blankKeyOrdinaryRoot.querySelector('.skip-reason .reason-value')?.textContent?.trim()).toBe('该密钥已停用此模型')
+    expect(blankKeyOrdinaryRoot.querySelector('.pool-exhaustion-reasons')).toBeNull()
+  })
 })

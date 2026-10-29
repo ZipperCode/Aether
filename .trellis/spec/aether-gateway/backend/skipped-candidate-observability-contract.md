@@ -58,6 +58,22 @@ polling. These fields describe scheduling decisions; they do not change policy.
 - A PoolGroup count is a logical candidate count, not the number of attempted
   accounts. Keep ordinary pool-row suppression and the yielded-key exhaustion
   guard; record rejection where a concrete plan or quarantined candidate drops.
+- Exhausted pools that yielded no member persist one synthetic skipped candidate:
+  `skip_reason="pool_group_exhausted"`, `key_id=null`, and the existing object
+  `extra_data.pool_group_exhaustion={scanned_keys,budget_scanned_keys,skip_reason_counts}`.
+  Member-reason frequencies describe the group, never its representative Key.
+  Keep every member reason in request-level diagnostics for HTTP classification;
+  do not replace those facts with the synthetic summary reason.
+- When request diagnostics are disabled (for example ImageDecision), the persisted
+  capacity classifier reads the marked group's nonempty `skip_reason_counts`.
+  HTTP 429 requires positive integer counts and every member reason in the
+  existing capacity set. Mixed noncapacity, unknown, empty or malformed group
+  facts retain HTTP 503; `pool_group_exhausted` alone is never a capacity reason.
+- The admin timeline recognizes the explicit group object, including historical
+  rows with a representative Key and plurality reason. Show pool exhaustion and
+  positive integer member counts, without representative account/auth/Key metadata
+  or per-member scheduling details. Do not infer group scope from a missing Key.
+  Existing history is not rewritten; concrete per-Key records stay unchanged.
 - Runtime quarantine drops record `endpoint_capability_quarantined` once at the
   dropping gate. The quarantine cache stores membership, not the original reason;
   do not invent its cause or change quarantine scope/TTL to improve diagnostics.
@@ -80,6 +96,10 @@ polling. These fields describe scheduling decisions; they do not change policy.
 | Pool key lacks a complete auth pair | No upstream send; categorical `transport_auth_unavailable` skipped diagnostic |
 | Candidate dropped by runtime quarantine | Count `endpoint_capability_quarantined` once, not a silent plan miss |
 | Planning skips followed by actual execution exhaustion | Preserve skips and classify execution exhaustion |
+| Mixed unavailable and model-incompatible pool, no yielded Key | Keyless `pool_group_exhausted` row with exact counts; no upstream send; original HTTP classification |
+| Historical group summary still names a representative Key | Timeline shows group diagnosis/counts, no attributed account metadata |
+| Pool yielded a concrete member or ordinary single-Key skip | Keep real identity/reason; no extra synthetic no-attempt summary |
+| Diagnostics-disabled image pool, only concurrency/RPM skips | Persisted member counts preserve HTTP 429 without selecting a representative reason |
 
 ## 5. Good / Base / Bad Cases
 Good: a successful request that skipped an earlier Key shows a skip marker even
@@ -113,8 +133,20 @@ Bad: infer skip existence from nonempty reason text or expose raw reasons to use
   missing pool-key authentication must move from an anonymous plan miss to a
   categorized skipped trace without sending upstream. Verify exact Responses
   endpoint selection with Compact/Search bindings present.
+- `responses_pool_exhausted_supporting_representative_persists_keyless_group_summary`
+  exercises real HTTP with a supporting cooldown member and incompatible siblings:
+  assert 503, zero sends, keyless group scope and exact distinct member counts.
+  Timeline regressions cover historical/current group payloads, emitted selection,
+  tooltips, empty groups and an ordinary per-Key control; inspect desktop/mobile.
+- `gateway_image_sync_pool_capacity_exhaustion_returns_429_and_mixed_pool_returns_503`
+  exercises diagnostics-disabled image HTTP: no upstream sends, keyless group
+  counts, pure capacity 429 and mixed model/capacity 503. Persisted-context tests
+  reject empty, invalid, unknown and nonpositive counts instead of accepting a
+  historical plurality reason as proof of pure capacity.
 
 ## 7. Wrong vs Correct
 Wrong: `has_skipped_candidate = !reasons.is_empty()` or filter the visible page.
 Correct: derive the boolean from candidate status, authorize records first and
 paginate the filtered result; keep detailed diagnostics administrator-only.
+Wrong: assign the most frequent pool member reason to its representative Key.
+Correct: persist a keyless pool summary; render counted reasons as group facts.

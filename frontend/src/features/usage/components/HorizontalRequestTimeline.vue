@@ -195,7 +195,10 @@
 
               <div class="panel-body">
                 <!-- 核心信息网格 -->
-                <div class="info-grid">
+                <div
+                  v-if="hasVisibleInfoGridItems"
+                  class="info-grid"
+                >
                   <div
                     v-if="currentAttemptTimeRange"
                     class="info-item"
@@ -301,7 +304,7 @@
                     </span>
                   </div>
                   <div
-                    v-if="currentAttempt.extra_data?.pool_selection"
+                    v-if="!currentAttemptPoolExhaustion && currentAttempt.extra_data?.pool_selection"
                     class="info-item"
                   >
                     <span class="info-label">号池调度</span>
@@ -331,7 +334,7 @@
                     </span>
                   </div>
                   <div
-                    v-if="currentAttempt.extra_data?.pool_skip"
+                    v-if="!currentAttemptPoolExhaustion && currentAttempt.extra_data?.pool_skip"
                     class="info-item"
                   >
                     <span class="info-label">号池跳过</span>
@@ -467,6 +470,17 @@
                   <span class="reason-label">{{ currentAttemptSkipReasonLabel }}</span>
                   <span class="reason-content">
                     <span class="reason-value">{{ currentAttemptSkipReasonDisplay }}</span>
+                    <span
+                      v-if="currentAttemptPoolExhaustion?.reasonCounts.length"
+                      class="reason-detail pool-exhaustion-reasons"
+                    >
+                      <span
+                        v-for="item in currentAttemptPoolExhaustion.reasonCounts"
+                        :key="item.reason"
+                        class="pool-reason-tag"
+                        :data-pool-skip-reason="item.reason"
+                      >{{ item.label }} × {{ item.count }}</span>
+                    </span>
                     <span
                       v-if="currentAttemptFailureDiagnostic"
                       class="reason-detail"
@@ -857,10 +871,106 @@ const compareBySchedulingOrder = (a: CandidateRecord, b: CandidateRecord): numbe
 }
 
 // 候选时间线（按调度顺序排序；lazy 加载的跳过候选通常没有 started_at）
+const POOL_GROUP_EXHAUSTED_SKIP_REASON = 'pool_group_exhausted'
+
+interface PoolGroupExhaustionReasonCount {
+  reason: string
+  label: string
+  count: number
+}
+
+interface PoolGroupExhaustionSummary {
+  scannedKeys?: number
+  budgetScannedKeys?: number
+  reasonCounts: PoolGroupExhaustionReasonCount[]
+}
+
+function extractPoolGroupExhaustionObject(
+  attempt: CandidateRecord | null | undefined,
+): Record<string, unknown> | null {
+  const extra = extractObject(attempt?.extra_data)
+  return extractObject(extra?.pool_group_exhaustion)
+}
+
+function isPoolGroupExhaustionSummary(
+  attempt: CandidateRecord | null | undefined,
+): boolean {
+  return extractPoolGroupExhaustionObject(attempt) !== null
+}
+
+function resolvePoolGroupExhaustion(
+  attempt: CandidateRecord | null | undefined,
+): PoolGroupExhaustionSummary | null {
+  const raw = extractPoolGroupExhaustionObject(attempt)
+  if (!raw) return null
+
+  const scannedKeysRaw = readNumberField(raw, 'scanned_keys')
+  const budgetScannedKeysRaw = readNumberField(raw, 'budget_scanned_keys')
+  const countsObj = extractObject(raw.skip_reason_counts)
+  const countsByReason = new Map<string, number>()
+
+  if (countsObj) {
+    for (const rawReason of Object.keys(countsObj)) {
+      const reason = rawReason.trim()
+      if (!reason) continue
+      const rawCount = readNumberField(countsObj, rawReason)
+      if (rawCount == null) continue
+      const count = Math.trunc(rawCount)
+      if (count <= 0) continue
+      countsByReason.set(reason, (countsByReason.get(reason) ?? 0) + count)
+    }
+  }
+
+  const reasonCounts: PoolGroupExhaustionReasonCount[] = [...countsByReason.entries()]
+    .map(([reason, count]) => ({
+      reason,
+      label: formatCandidateSkipReason(reason) || reason,
+      count,
+    }))
+    .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason))
+
+  return {
+    scannedKeys: scannedKeysRaw != null && scannedKeysRaw >= 0 ? Math.trunc(scannedKeysRaw) : undefined,
+    budgetScannedKeys: budgetScannedKeysRaw != null && budgetScannedKeysRaw >= 0 ? Math.trunc(budgetScannedKeysRaw) : undefined,
+    reasonCounts,
+  }
+}
+
+function normalizeTimelineCandidate(candidate: CandidateRecord): CandidateRecord {
+  if (!isPoolGroupExhaustionSummary(candidate)) return candidate
+
+  let extraData = candidate.extra_data
+  if (extraData && typeof extraData === 'object' && !Array.isArray(extraData)) {
+    if ('pool_selection' in extraData || 'pool_skip' in extraData) {
+      const sanitizedExtra = { ...extraData }
+      delete sanitizedExtra.pool_selection
+      delete sanitizedExtra.pool_skip
+      extraData = sanitizedExtra
+    }
+  }
+
+  return {
+    ...candidate,
+    key_id: undefined,
+    key_name: undefined,
+    key_account_label: undefined,
+    key_preview: undefined,
+    key_auth_type: undefined,
+    key_api_formats: undefined,
+    key_internal_priority: undefined,
+    key_global_priority_by_format: undefined,
+    key_oauth_plan_type: undefined,
+    key_capabilities: undefined,
+    skip_reason: POOL_GROUP_EXHAUSTED_SKIP_REASON,
+    extra_data: extraData,
+  }
+}
+
 const allTraceCandidates = computed<CandidateRecord[]>(() => {
   if (!trace.value) return []
   return [...trace.value.candidates]
     .filter(c => TIMELINE_STATUS.includes(c.status))
+    .map(normalizeTimelineCandidate)
     .sort(compareBySchedulingOrder)
 })
 
@@ -896,7 +1006,7 @@ const poolAttemptCandidates = computed<CandidateRecord[]>(() => {
     rawTimeline.value,
     auditAttempts,
     props.requestId,
-  )
+  ).map(normalizeTimelineCandidate)
 })
 
 const poolAttemptsByGroup = computed<Map<string, CandidateRecord[]>>(() => {
@@ -945,7 +1055,7 @@ const getProviderDisplayName = (
   if (!attempt) return '未知'
   const providerName = String(attempt.provider_name || '').trim()
   if (providerName) return providerName
-  if (allowAuthTypeFallback) {
+  if (allowAuthTypeFallback && !isPoolGroupExhaustionSummary(attempt)) {
     const authType = String(attempt.key_auth_type || '').trim().toLowerCase()
     if (authType && AUTH_TYPE_PROVIDER_LABEL_MAP[authType]) {
       return AUTH_TYPE_PROVIDER_LABEL_MAP[authType]
@@ -1166,19 +1276,19 @@ const normalizeFormatSignature = (value: string): string => {
   return value.trim().toLowerCase()
 }
 
-const extractObject = (value: unknown): Record<string, unknown> | null => {
+function extractObject(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return null
   }
   return value as Record<string, unknown>
 }
 
-const readStringField = (obj: Record<string, unknown>, key: string): string | undefined => {
+function readStringField(obj: Record<string, unknown>, key: string): string | undefined {
   const value = obj[key]
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
-const readNumberField = (obj: Record<string, unknown>, key: string): number | undefined => {
+function readNumberField(obj: Record<string, unknown>, key: string): number | undefined {
   const value = obj[key]
   if (typeof value === 'number' && Number.isFinite(value)) return value
   if (typeof value === 'string' && value.trim()) {
@@ -1439,15 +1549,19 @@ const currentAttemptRequestPathDisplay = computed(() => {
   return ''
 })
 
+const currentAttemptPoolExhaustion = computed<PoolGroupExhaustionSummary | null>(() => {
+  return resolvePoolGroupExhaustion(currentAttempt.value)
+})
+
 const currentAttemptKeyDisplay = computed(() => {
   const attempt = currentAttempt.value
-  if (!attempt) return ''
+  if (!attempt || currentAttemptPoolExhaustion.value) return ''
   return attempt.key_account_label || attempt.key_name || attempt.key_id || ''
 })
 
 const currentAttemptKeyFormatsDisplay = computed(() => {
   const attempt = currentAttempt.value
-  if (!attempt) return ''
+  if (!attempt || currentAttemptPoolExhaustion.value) return ''
 
   const formats = extractStringList(attempt.key_api_formats)
   if (!formats.length) return ''
@@ -1456,10 +1570,30 @@ const currentAttemptKeyFormatsDisplay = computed(() => {
     .map(format => formatApiFormat(format))
     .join(' / ')
 })
+
+const hasVisibleInfoGridItems = computed(() => {
+  const attempt = currentAttempt.value
+  if (!attempt) return false
+  return Boolean(
+    currentAttemptTimeRange.value
+    || attempt.extra_data?.first_byte_time_ms != null
+    || currentAttemptFormatDisplay.value
+    || currentAttemptRequestPathDisplay.value
+    || currentAttemptKeyDisplay.value
+    || currentAttemptKeyFormatsDisplay.value
+    || attempt.extra_data?.proxy
+    || (!currentAttemptPoolExhaustion.value && attempt.extra_data?.pool_selection)
+    || (!currentAttemptPoolExhaustion.value && attempt.extra_data?.pool_skip),
+  )
+})
+
 const currentAttemptSkipReasonDisplay = computed(() => {
   const attempt = currentAttempt.value
-  if (!attempt?.skip_reason) return ''
-
+  if (!attempt) return ''
+  if (currentAttemptPoolExhaustion.value) {
+    return formatCandidateSkipReason(POOL_GROUP_EXHAUSTED_SKIP_REASON)
+  }
+  if (!attempt.skip_reason) return ''
   // transport_unsupported 这类"泛化原因"优先展示后端采集到的具体细节，便于排查。
   if (attempt.skip_reason === 'transport_unsupported') {
     const transportDiagnostics = resolveTransportDiagnostics(attempt)
@@ -2197,9 +2331,12 @@ const formatCandidateAttemptIndex = (attempt: CandidateRecord): string => {
 }
 
 const formatAttemptDotTitle = (attempt: CandidateRecord): string => {
+  const identityLabel = isPoolGroupExhaustionSummary(attempt)
+    ? formatCandidateSkipReason(POOL_GROUP_EXHAUSTED_SKIP_REASON)
+    : (attempt.key_name || attempt.key_account_label || attempt.key_preview || '未知 Key')
   const parts = [
     formatCandidateAttemptIndex(attempt),
-    attempt.key_name || attempt.key_account_label || attempt.key_preview || '未知 Key',
+    identityLabel,
     getStatusLabel(getDisplayStatus(attempt)),
   ]
   return parts.filter(Boolean).join(' · ')
@@ -3375,6 +3512,10 @@ function getDisplayStatus(attempt: CandidateRecord | null | undefined): string {
   font-size: 0.85rem;
 }
 
+.skip-reason:first-child {
+  margin-top: 0;
+}
+
 .reason-label {
   color: hsl(var(--muted-foreground));
   flex-shrink: 0;
@@ -3404,6 +3545,26 @@ function getDisplayStatus(attempt: CandidateRecord | null | undefined): string {
   background: hsl(var(--background) / 0.8);
   color: hsl(var(--foreground));
   font-size: 0.8rem;
+}
+
+.pool-exhaustion-reasons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+}
+
+.pool-exhaustion-reasons .pool-reason-tag {
+  background: hsl(var(--background) / 0.8);
+  color: hsl(var(--foreground));
+  max-width: 100%;
+  white-space: normal;
+}
+
+@media (max-width: 640px) {
+  .skip-reason {
+    flex-direction: column;
+    gap: 0.375rem;
+  }
 }
 
 /* 错误信息 */

@@ -717,7 +717,7 @@ impl<'a> PoolKeyCursor<'a> {
             .collect::<serde_json::Map<String, serde_json::Value>>();
         Some(SkippedLocalExecutionCandidate {
             candidate: self.group.candidate.clone(),
-            skip_reason: self.runtime_miss_pool_exhaustion_skip_reason(),
+            skip_reason: "pool_group_exhausted",
             transport: Some(self.group.transport.clone()),
             ranking: self.group.ranking.clone(),
             extra_data: Some(serde_json::json!({
@@ -775,18 +775,6 @@ impl<'a> PoolKeyCursor<'a> {
         for reason in self.skip_reason_counts.keys() {
             record_local_runtime_candidate_skip_reason(self.state.app(), trace_id, reason);
         }
-    }
-
-    fn runtime_miss_pool_exhaustion_skip_reason(&self) -> &'static str {
-        let mut selected_reason = "pool_group_exhausted";
-        let mut selected_count = 0;
-        for (reason, count) in &self.skip_reason_counts {
-            if *count > selected_count {
-                selected_reason = *reason;
-                selected_count = *count;
-            }
-        }
-        selected_reason
     }
 
     async fn next_page_candidates(&mut self) -> Option<Vec<EligibleLocalExecutionCandidate>> {
@@ -4412,6 +4400,72 @@ mod tests {
             diagnostic.skip_reasons.get("transport_snapshot_missing"),
             Some(&1)
         );
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_exhausted_summary_uses_group_reason_and_suppresses_after_yield() {
+        let app = AppState::new().expect("state should build");
+        let trace_id = "trace-pool-exhausted-group-reason";
+        app.set_local_execution_runtime_miss_diagnostic(
+            trace_id,
+            LocalExecutionRuntimeMissDiagnostic {
+                reason: "candidate_evaluation_incomplete".to_string(),
+                requested_model: Some("gpt-5".to_string()),
+                candidate_count: Some(1),
+                ..LocalExecutionRuntimeMissDiagnostic::default()
+            },
+        );
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            Some(json!({ "pool_advanced": {} })),
+        );
+        let mut cursor =
+            PoolKeyCursor::new(PlannerAppState::new(&app), group.clone(), None, None, None)
+                .with_runtime_miss_diagnostic(trace_id, true);
+        cursor.record_skip_reason("pool_cooldown");
+        cursor.record_skip_reason("key_model_disabled");
+        cursor.record_skip_reason("key_model_disabled");
+
+        let summary = cursor
+            .exhausted_group_skipped_candidate()
+            .expect("no-attempt group should emit summary");
+        assert_eq!(summary.skip_reason, "pool_group_exhausted");
+        assert_eq!(
+            summary
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("pool_group_exhaustion"))
+                .and_then(|value| value.get("skip_reason_counts")),
+            Some(&json!({
+                "key_model_disabled": 2,
+                "pool_cooldown": 1,
+            }))
+        );
+
+        cursor.log_exhausted();
+        apply_local_runtime_candidate_terminal_reason(&app, trace_id, "no_local_sync_plans");
+        let diagnostic = app
+            .take_local_execution_runtime_miss_diagnostic(trace_id)
+            .expect("runtime miss diagnostic should exist");
+        assert_eq!(diagnostic.reason, "all_candidates_skipped");
+        assert_eq!(diagnostic.skip_reasons.get("pool_cooldown"), Some(&1));
+        assert_eq!(diagnostic.skip_reasons.get("key_model_disabled"), Some(&1));
+
+        let mut yielded_cursor =
+            PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        yielded_cursor.queued_candidates = VecDeque::from([sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-a",
+            10,
+            Some(json!({ "pool_advanced": {} })),
+        )]);
+        yielded_cursor.record_skip_reason("key_model_disabled");
+        assert!(yielded_cursor.next_key().await.is_some());
+        assert!(yielded_cursor.exhausted_group_skipped_candidate().is_none());
     }
 
     #[tokio::test]

@@ -62,6 +62,7 @@ async fn responses_pool_key_concurrency_skip_stays_distinct_from_execution_exhau
 
 const FIRST_KEY_SECRET: &str = "pool-first-upstream-secret-1008";
 const SECOND_KEY_SECRET: &str = "pool-second-upstream-secret-1008";
+const THIRD_KEY_SECRET: &str = "pool-third-upstream-secret-1008";
 const POOL_CONCURRENCY_SKIP_REASON: &str = "provider_key_concurrency_limit_reached";
 const ACCOUNT_MODEL_A: &str = "claude-opus-4-6-thinking";
 const ACCOUNT_MODEL_B: &str = "claude-opus-5-5";
@@ -86,7 +87,10 @@ const ACCOUNT_MAPPED_SUFFIX_MODEL: &str = "gpt-5-high";
 ///   与请求不兼容，不得在枚举阶段否决整个组；代表自身零上游发送，兄弟账号以
 ///   自己清单映射出的 `gpt-5-high` 成功交付；
 /// - all_incompatible：两个账号的显式清单都与本次请求无交集，必须零上游发送并以
-///   503 结束，成员留下 key_model_disabled 的具体诊断。
+///   503 结束，成员留下 key_model_disabled 的具体诊断；
+/// - exhausted_supporting_representative：代表账号显式支持请求模型但处于冷却耗尽，
+///   同时存在更多模型不兼容兄弟账号；必须零上游发送、返回 503，只落库一条无 Key 身份的
+///   pool_group_exhausted 组摘要并保留精确成员计数，不得把代表账号误标为 key_model_disabled。
 async fn run_pool_responses_scenario(mode: &'static str) {
     let all_bad = mode == "all_bad";
     let concurrency = mode == "concurrency";
@@ -96,12 +100,14 @@ async fn run_pool_responses_scenario(mode: &'static str) {
     let account_model_b = mode == "account_model_b";
     let incompatible_representative = mode == "incompatible_representative";
     let all_incompatible = mode == "all_incompatible";
+    let exhausted_supporting_representative = mode == "exhausted_supporting_representative";
     let account_model_mode = mixed_model
         || empty_model_list
         || account_model_a
         || account_model_b
         || incompatible_representative
-        || all_incompatible;
+        || all_incompatible
+        || exhausted_supporting_representative;
     let account_model_is_bidirectional = account_model_a || account_model_b;
     let requested_account_model = account_model_a
         .then_some(ACCOUNT_MODEL_A)
@@ -281,6 +287,12 @@ async fn run_pool_responses_scenario(mode: &'static str) {
     let model_id = format!("model-pool-responses-{mode}");
     let first_key_id = format!("key-pool-first-{mode}");
     let second_key_id = format!("key-pool-second-{mode}");
+    let third_key_id = format!("key-pool-third-{mode}");
+    let pool_config_json = if exhausted_supporting_representative {
+        json!({"pool_advanced": {"rate_limit_cooldown_seconds": 300}})
+    } else {
+        json!({"pool_advanced": {}})
+    };
 
     let providers = vec![StoredProviderCatalogProvider::new(
         provider_id.clone(),
@@ -299,7 +311,7 @@ async fn run_pool_responses_scenario(mode: &'static str) {
         Some(20.0),
         None,
         // pool_advanced 使候选解析把该 Provider 识别为号池组。
-        Some(json!({"pool_advanced": {}})),
+        Some(pool_config_json.clone()),
     )];
     let endpoints = vec![StoredProviderCatalogEndpoint::new(
         endpoint_id.clone(),
@@ -318,6 +330,8 @@ async fn run_pool_responses_scenario(mode: &'static str) {
         Some(vec![ACCOUNT_MODEL_A.to_string()])
     } else if account_model_b {
         Some(vec![ACCOUNT_MODEL_A.to_string()])
+    } else if exhausted_supporting_representative {
+        Some(vec!["gpt-5".to_string()])
     } else if incompatible_representative || all_incompatible {
         Some(vec!["gpt-6".to_string()])
     } else {
@@ -336,7 +350,7 @@ async fn run_pool_responses_scenario(mode: &'static str) {
             "gpt-5-medium".to_string(),
             "gpt-5-tiered".to_string(),
         ])
-    } else if all_incompatible {
+    } else if all_incompatible || exhausted_supporting_representative {
         Some(vec!["gpt-7".to_string()])
     } else {
         None
@@ -398,7 +412,34 @@ async fn run_pool_responses_scenario(mode: &'static str) {
         first_key.concurrent_limit = Some(1);
         second_key.concurrent_limit = Some(1);
     }
-    let keys = vec![first_key, second_key];
+    let mut keys = vec![first_key, second_key];
+    if exhausted_supporting_representative {
+        let mut third_key = StoredProviderCatalogKey::new(
+            third_key_id.clone(),
+            provider_id.clone(),
+            "third".into(),
+            "api_key".into(),
+            None,
+            true,
+        )
+        .unwrap()
+        .with_transport_fields(
+            Some(json!(["openai:responses"])),
+            state
+                .seal_provider_catalog_key_api_key(&provider_id, &third_key_id, THIRD_KEY_SECRET)
+                .unwrap(),
+            None,
+            None,
+            None,
+            Some(json!(["gpt-8"])),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        third_key.internal_priority = 2;
+        keys.push(third_key);
+    }
 
     let pool_row = |key_id: String,
                     key_name: &str,
@@ -459,7 +500,7 @@ async fn run_pool_responses_scenario(mode: &'static str) {
             model_is_available: true,
         }
     };
-    let rows = vec![
+    let mut rows = vec![
         // 首个账号是 Pool 代表（内部优先级更低），组的进入模型目标因此是裸名。
         pool_row(
             first_key_id.clone(),
@@ -474,6 +515,14 @@ async fn run_pool_responses_scenario(mode: &'static str) {
             second_allowed_models.clone(),
         ),
     ];
+    if exhausted_supporting_representative {
+        rows.push(pool_row(
+            third_key_id.clone(),
+            "third",
+            2,
+            Some(vec!["gpt-8".to_string()]),
+        ));
+    }
 
     let auth_snapshot_for = |suffix: &str| {
         StoredAuthApiKeySnapshot::new(
@@ -560,6 +609,23 @@ async fn run_pool_responses_scenario(mode: &'static str) {
             enabled: true,
             ..Default::default()
         });
+    if exhausted_supporting_representative {
+        let pool_config =
+            crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value(
+                Some(&pool_config_json),
+            )
+            .expect("pool_advanced config should parse");
+        crate::handlers::shared::provider_pool::record_admin_provider_pool_error(
+            state.runtime_state.as_ref(),
+            &provider_id,
+            &first_key_id,
+            &pool_config,
+            429,
+            None,
+            None,
+        )
+        .await;
+    }
     let (gateway_url, gateway_server) = start_server(build_router_with_state(state)).await;
 
     let client = reqwest::Client::builder()
@@ -631,6 +697,25 @@ async fn run_pool_responses_scenario(mode: &'static str) {
             }),
             "no pool key may be executed while both concurrency slots are held: {third_candidates:#?}"
         );
+        assert!(
+            !third_candidates.is_empty(),
+            "exhausted pool must persist group summary diagnostics: {third_candidates:#?}"
+        );
+        for summary in &third_candidates {
+            assert_eq!(summary.status, RequestCandidateStatus::Skipped);
+            assert_eq!(summary.key_id, None);
+            assert_eq!(summary.skip_reason.as_deref(), Some("pool_group_exhausted"));
+            assert_eq!(
+                summary
+                    .extra_data
+                    .as_ref()
+                    .and_then(|value| value.get("pool_group_exhaustion"))
+                    .and_then(|value| value.get("skip_reason_counts")),
+                Some(&json!({
+                    POOL_CONCURRENCY_SKIP_REASON: 2,
+                }))
+            );
+        }
         let diagnostics = format!("{third_candidates:?}");
         assert!(
             diagnostics.contains(POOL_CONCURRENCY_SKIP_REASON),
@@ -772,6 +857,17 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                     RequestCandidateStatus::Success
                 );
                 assert_eq!(second_key_attempts[0].status_code, Some(200));
+                assert!(
+                    !stored.iter().any(|candidate| {
+                        candidate.skip_reason.as_deref() == Some("pool_group_exhausted")
+                            || candidate
+                                .extra_data
+                                .as_ref()
+                                .and_then(|value| value.get("pool_group_exhaustion"))
+                                .is_some()
+                    }),
+                    "a pool that yields a real key must not persist a synthetic exhaustion summary: {stored:#?}"
+                );
             } else if all_incompatible {
                 assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
                 // 无可用成员：任何账号都不得发出上游请求，也不允许落成真实执行耗尽。
@@ -802,6 +898,80 @@ async fn run_pool_responses_scenario(mode: &'static str) {
                 assert!(
                     diagnostics.contains("pool_group_exhaustion"),
                     "pool group exhaustion must keep its aggregated diagnostic payload: {diagnostics}"
+                );
+                assert!(
+                    !stored.is_empty(),
+                    "exhausted pool must persist group summary diagnostics: {stored:#?}"
+                );
+                for summary in &stored {
+                    assert_eq!(summary.status, RequestCandidateStatus::Skipped);
+                    assert_eq!(summary.key_id, None);
+                    assert_eq!(summary.skip_reason.as_deref(), Some("pool_group_exhausted"));
+                    assert_eq!(
+                        summary
+                            .extra_data
+                            .as_ref()
+                            .and_then(|value| value.get("pool_group_exhaustion"))
+                            .and_then(|value| value.get("skip_reason_counts")),
+                        Some(&json!({
+                            "key_model_disabled": 2,
+                        }))
+                    );
+                }
+            } else if exhausted_supporting_representative {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+                assert_eq!(
+                    total_hits.load(Ordering::SeqCst),
+                    0,
+                    "no upstream send is allowed when representative is in cooldown and siblings are model-incompatible: first_models={first_models:?}, second_models={second_models:?}"
+                );
+                assert!(
+                    first_models.is_empty() && second_models.is_empty(),
+                    "no model may reach the upstream: first_models={first_models:?}, second_models={second_models:?}"
+                );
+                assert_ne!(
+                    miss_reason.as_deref(),
+                    Some("execution_runtime_candidates_exhausted"),
+                    "status={status}, body={body}, candidates={stored:#?}"
+                );
+                assert!(
+                    attempted.is_empty(),
+                    "no account may be attempted: {stored:#?}"
+                );
+                assert_eq!(
+                    stored.len(),
+                    1,
+                    "exhausted pool must persist exactly one group summary row: {stored:#?}"
+                );
+                let summary = &stored[0];
+                assert_eq!(summary.status, RequestCandidateStatus::Skipped);
+                assert_eq!(summary.provider_id.as_deref(), Some(provider_id.as_str()));
+                assert_eq!(summary.endpoint_id.as_deref(), Some(endpoint_id.as_str()));
+                let exhaustion = summary
+                    .extra_data
+                    .as_ref()
+                    .and_then(|value| value.get("pool_group_exhaustion"))
+                    .expect("pool_group_exhaustion scope marker must be persisted");
+                assert_eq!(exhaustion.get("scanned_keys"), Some(&json!(3)));
+                assert_eq!(exhaustion.get("budget_scanned_keys"), Some(&json!(3)));
+                assert_eq!(
+                    exhaustion.get("skip_reason_counts"),
+                    Some(&json!({
+                        "pool_cooldown": 1,
+                        "key_model_disabled": 2,
+                    }))
+                );
+                assert_eq!(
+                    (summary.key_id.as_deref(), summary.skip_reason.as_deref()),
+                    (None, Some("pool_group_exhausted")),
+                    "synthetic pool exhaustion summary must be keyless and use pool_group_exhausted: {summary:#?}"
+                );
+                assert!(
+                    !stored.iter().any(|candidate| {
+                        candidate.key_id.as_deref() == Some(first_key_id.as_str())
+                            || candidate.skip_reason.as_deref() == Some("key_model_disabled")
+                    }),
+                    "supporting representative must never be attributed key_model_disabled: {stored:#?}"
                 );
             } else {
                 assert_eq!(status, StatusCode::OK, "{body}");
@@ -994,4 +1164,12 @@ async fn responses_pool_incompatible_representative_never_sends_and_sibling_serv
 #[tokio::test]
 async fn responses_pool_all_incompatible_account_models_send_nothing() {
     run_pool_responses_scenario("all_incompatible").await;
+}
+
+/// 代表账号显式支持请求模型但因 429 处于冷却耗尽、同时组内存在更多模型不兼容兄弟账号时的回归：
+/// 必须零上游发送并以 503 结束，只落库一条无 Key 身份的 pool_group_exhausted 组摘要，
+/// 保留精确成员跳过计数，不得把多数成员的 key_model_disabled 归因到代表账号。
+#[tokio::test]
+async fn responses_pool_exhausted_supporting_representative_persists_keyless_group_summary() {
+    run_pool_responses_scenario("exhausted_supporting_representative").await;
 }

@@ -829,6 +829,17 @@ pub(crate) async fn persist_available_local_candidate(
     }
 }
 
+fn skipped_candidate_persisted_key_id<'a>(
+    candidate: &'a SchedulerMinimalCandidateSelectionCandidate,
+    extra_data: Option<&Value>,
+) -> Option<&'a str> {
+    let is_pool_group_summary = extra_data
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("pool_group_exhaustion"))
+        .is_some_and(Value::is_object);
+    (!is_pool_group_summary).then_some(candidate.key_id.as_str())
+}
+
 pub(crate) async fn persist_skipped_local_candidate(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     trace_id: &str,
@@ -847,6 +858,7 @@ pub(crate) async fn persist_skipped_local_candidate(
     if !should_persist_request_candidate_status(RequestCandidateStatus::Skipped) {
         return;
     }
+    let persisted_key_id = skipped_candidate_persisted_key_id(candidate, extra_data.as_ref());
     match state
         .upsert_request_candidate(UpsertRequestCandidateRecord {
             id: candidate_id.to_string(),
@@ -859,7 +871,7 @@ pub(crate) async fn persist_skipped_local_candidate(
             retry_index,
             provider_id: Some(candidate.provider_id.clone()),
             endpoint_id: Some(candidate.endpoint_id.clone()),
-            key_id: Some(candidate.key_id.clone()),
+            key_id: persisted_key_id.map(str::to_owned),
             status: RequestCandidateStatus::Skipped,
             skip_reason: Some(skip_reason.to_string()),
             is_cached: Some(false),
@@ -889,7 +901,7 @@ pub(crate) async fn persist_skipped_local_candidate(
                 source = "planner_skipped",
                 provider_id = %candidate.provider_id,
                 endpoint_id = %candidate.endpoint_id,
-                key_id = %candidate.key_id,
+                key_id = stored.key_id.as_deref(),
                 has_required_capabilities = required_capabilities.is_some(),
                 "gateway persisted skipped local request candidate"
             );
@@ -907,7 +919,7 @@ pub(crate) async fn persist_skipped_local_candidate(
                 source = "planner_skipped",
                 provider_id = %candidate.provider_id,
                 endpoint_id = %candidate.endpoint_id,
-                key_id = %candidate.key_id,
+                key_id = persisted_key_id,
                 "gateway skipped request candidate persistence because writer is unavailable"
             );
         }
@@ -1001,8 +1013,9 @@ mod tests {
 
     use super::{
         ensure_execution_request_candidate_slot, persist_available_local_candidate,
-        record_report_request_candidate_status, resolve_request_candidate_required_capabilities,
-        select_requested_model_capabilities, snapshot_local_request_candidate_status,
+        persist_skipped_local_candidate, record_report_request_candidate_status,
+        resolve_request_candidate_required_capabilities, select_requested_model_capabilities,
+        snapshot_local_request_candidate_status,
         try_enqueue_local_request_candidate_status_snapshot, RequestCandidateRuntimeWriter,
         SchedulerRequestCandidateStatusUpdate,
     };
@@ -1501,5 +1514,98 @@ mod tests {
             stored[0].required_capabilities,
             sample_minimal_candidate().key_capabilities
         );
+    }
+
+    #[tokio::test]
+    async fn persists_keyless_pool_group_exhaustion_summary_without_clearing_single_key_skips() {
+        let repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = build_test_state(Arc::clone(&repository));
+        let candidate = sample_minimal_candidate();
+
+        persist_skipped_local_candidate(
+            &state,
+            "req-pool-summary-scope-123",
+            "user-1",
+            "api-key-1",
+            &candidate,
+            0,
+            0,
+            "cand-pool-summary-0",
+            None,
+            "pool_group_exhausted",
+            Some(json!({
+                "pool_group_exhaustion": {
+                    "scanned_keys": 3,
+                    "budget_scanned_keys": 3,
+                    "skip_reason_counts": {
+                        "pool_cooldown": 1,
+                        "key_model_disabled": 2
+                    }
+                }
+            })),
+            100_000,
+            "pool summary persist should succeed",
+        )
+        .await;
+        persist_skipped_local_candidate(
+            &state,
+            "req-pool-summary-scope-123",
+            "user-1",
+            "api-key-1",
+            &candidate,
+            1,
+            0,
+            "cand-single-skip-1",
+            None,
+            "key_model_disabled",
+            None,
+            100_001,
+            "single key skip persist should succeed",
+        )
+        .await;
+        persist_skipped_local_candidate(
+            &state,
+            "req-pool-summary-scope-123",
+            "user-1",
+            "api-key-1",
+            &candidate,
+            2,
+            0,
+            "cand-single-skip-2",
+            None,
+            "pool_cooldown",
+            Some(json!({"pool_group_exhaustion": "invalid-scalar"})),
+            100_002,
+            "non-object marker skip persist should succeed",
+        )
+        .await;
+
+        let stored = repository
+            .list_by_request_id("req-pool-summary-scope-123")
+            .await
+            .expect("request candidates should read");
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0].key_id, None);
+        assert_eq!(stored[0].provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(stored[0].endpoint_id.as_deref(), Some("endpoint-1"));
+        assert_eq!(
+            stored[0].skip_reason.as_deref(),
+            Some("pool_group_exhausted")
+        );
+        assert_eq!(
+            stored[0]
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("pool_group_exhaustion"))
+                .and_then(|value| value.get("skip_reason_counts")),
+            Some(&json!({
+                "pool_cooldown": 1,
+                "key_model_disabled": 2
+            }))
+        );
+        assert_eq!(stored[1].key_id.as_deref(), Some("provider-key-1"));
+        assert_eq!(stored[1].skip_reason.as_deref(), Some("key_model_disabled"));
+        assert_eq!(stored[2].key_id.as_deref(), Some("provider-key-1"));
+        assert_eq!(stored[2].skip_reason.as_deref(), Some("pool_cooldown"));
     }
 }

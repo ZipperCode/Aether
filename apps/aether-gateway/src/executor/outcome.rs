@@ -138,20 +138,14 @@ impl LocalExecutionRuntimeMissContext {
         })
     }
 
-    /// 判断所有持久候选是否都以允许集合中的原因跳过；空候选或空集合均返回 `false`。
+    /// 判断所有持久候选是否都以允许集合中的原因跳过；显式组摘要按成员计数严格判定，空候选或空集合均返回 `false`。
     pub(crate) fn all_candidates_skipped_for_reasons(&self, reasons: &[&str]) -> bool {
         if reasons.is_empty() || self.candidate_contexts.is_empty() {
             return false;
         }
 
         self.candidate_contexts.iter().all(|candidate| {
-            candidate.candidate.status == RequestCandidateStatus::Skipped
-                && candidate
-                    .candidate
-                    .skip_reason
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|value| reasons.contains(&value))
+            runtime_miss_candidate_skipped_for_reasons(&candidate.candidate, reasons)
         })
     }
 
@@ -192,6 +186,42 @@ impl LocalExecutionRuntimeMissContext {
 
         Some("上游请求体转换失败（原因代码: provider_request_body_build_failed）".to_string())
     }
+}
+
+fn runtime_miss_candidate_skipped_for_reasons(
+    candidate: &StoredRequestCandidate,
+    reasons: &[&str],
+) -> bool {
+    if candidate.status != RequestCandidateStatus::Skipped {
+        return false;
+    }
+    if let Some(exhaustion) = candidate
+        .extra_data
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("pool_group_exhaustion"))
+    {
+        let Some(counts) = exhaustion
+            .as_object()
+            .and_then(|object| object.get("skip_reason_counts"))
+            .and_then(Value::as_object)
+            .filter(|counts| !counts.is_empty())
+        else {
+            return false;
+        };
+        return counts.iter().all(|(reason, count)| {
+            let reason = reason.trim();
+            !reason.is_empty()
+                && count.as_u64().is_some_and(|value| value > 0)
+                && reasons.contains(&reason)
+        });
+    }
+
+    candidate
+        .skip_reason
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty() && reasons.contains(&value))
 }
 
 /// 从实际失败计划和持久候选构造耗尽快照，保留回退响应来源并规范错误分类。
@@ -1765,5 +1795,203 @@ mod tests {
         assert!(!detail.contains("字段路径"));
         assert!(!detail.contains("OpenAI Responses"));
         assert!(detail.contains("provider_request_body_build_failed"));
+    }
+
+    #[test]
+    fn all_candidates_skipped_for_reasons_derives_marked_pool_group_from_member_counts() {
+        const CAPACITY_REASONS: &[&str] = &[
+            "provider_key_concurrency_limit_reached",
+            "key_rpm_exhausted",
+        ];
+
+        fn build_candidate(
+            status: RequestCandidateStatus,
+            skip_reason: Option<&str>,
+            extra_data: Option<Value>,
+        ) -> StoredRequestCandidate {
+            StoredRequestCandidate::new(
+                "cand-1".to_string(),
+                "req-1".to_string(),
+                Some("user-1".to_string()),
+                Some("api-key-1".to_string()),
+                None,
+                None,
+                0,
+                0,
+                Some("provider-1".to_string()),
+                Some("endpoint-1".to_string()),
+                None,
+                status,
+                skip_reason.map(str::to_string),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                extra_data,
+                None,
+                100,
+                None,
+                None,
+            )
+            .expect("candidate should build")
+        }
+        fn context_for(
+            candidates: Vec<StoredRequestCandidate>,
+        ) -> LocalExecutionRuntimeMissContext {
+            LocalExecutionRuntimeMissContext {
+                candidate_contexts: candidates
+                    .into_iter()
+                    .map(|candidate| RuntimeMissCandidateContext {
+                        candidate,
+                        provider_name: None,
+                        key_name: None,
+                        client_api_format: None,
+                        provider_api_format: None,
+                        global_model_name: None,
+                        selected_provider_model_name: None,
+                        endpoint_url: None,
+                    })
+                    .collect(),
+                ..LocalExecutionRuntimeMissContext::default()
+            }
+        }
+
+        assert!(!context_for(Vec::new()).all_candidates_skipped_for_reasons(CAPACITY_REASONS));
+
+        let mut pure_capacity_group = build_candidate(
+            RequestCandidateStatus::Skipped,
+            Some("pool_group_exhausted"),
+            Some(json!({
+                "pool_group_exhaustion": {
+                    "scanned_keys": 2,
+                    "budget_scanned_keys": 2,
+                    "skip_reason_counts": {
+                        "provider_key_concurrency_limit_reached": 1,
+                        "key_rpm_exhausted": 1
+                    }
+                }
+            })),
+        );
+        pure_capacity_group.sanitize_for_persistence();
+        assert!(
+            !context_for(vec![pure_capacity_group.clone()]).all_candidates_skipped_for_reasons(&[])
+        );
+        assert!(context_for(vec![pure_capacity_group.clone()])
+            .all_candidates_skipped_for_reasons(CAPACITY_REASONS));
+
+        let mut historical_mixed_with_capacity_top = build_candidate(
+            RequestCandidateStatus::Skipped,
+            Some("provider_key_concurrency_limit_reached"),
+            Some(json!({
+                "pool_group_exhaustion": {
+                    "scanned_keys": 3,
+                    "budget_scanned_keys": 3,
+                    "skip_reason_counts": {
+                        "provider_key_concurrency_limit_reached": 2,
+                        "key_model_disabled": 1
+                    }
+                }
+            })),
+        );
+        historical_mixed_with_capacity_top.sanitize_for_persistence();
+        assert!(!context_for(vec![historical_mixed_with_capacity_top])
+            .all_candidates_skipped_for_reasons(CAPACITY_REASONS));
+
+        let mut sanitized_unknown_member = build_candidate(
+            RequestCandidateStatus::Skipped,
+            Some("pool_group_exhausted"),
+            Some(json!({
+                "pool_group_exhaustion": {
+                    "scanned_keys": 2,
+                    "budget_scanned_keys": 2,
+                    "skip_reason_counts": {
+                        "provider_key_concurrency_limit_reached": 1,
+                        "unknown_future_reason": 1
+                    }
+                }
+            })),
+        );
+        sanitized_unknown_member.sanitize_for_persistence();
+        assert!(!context_for(vec![sanitized_unknown_member])
+            .all_candidates_skipped_for_reasons(CAPACITY_REASONS));
+
+        for (label, invalid_extra) in [
+            (
+                "zero-scanned-without-counts",
+                json!({"pool_group_exhaustion": {"scanned_keys": 0, "budget_scanned_keys": 0}}),
+            ),
+            (
+                "empty-counts",
+                json!({"pool_group_exhaustion": {"skip_reason_counts": {}}}),
+            ),
+            (
+                "zero-count",
+                json!({
+                    "pool_group_exhaustion": {
+                        "skip_reason_counts": {"provider_key_concurrency_limit_reached": 0}
+                    }
+                }),
+            ),
+            (
+                "string-count",
+                json!({
+                    "pool_group_exhaustion": {
+                        "skip_reason_counts": {"provider_key_concurrency_limit_reached": "2"}
+                    }
+                }),
+            ),
+            (
+                "array-counts",
+                json!({"pool_group_exhaustion": {"skip_reason_counts": []}}),
+            ),
+            ("null-marker", json!({"pool_group_exhaustion": null})),
+            ("scalar-marker", json!({"pool_group_exhaustion": "scalar"})),
+            ("array-marker", json!({"pool_group_exhaustion": []})),
+        ] {
+            for reason in [
+                "pool_group_exhausted",
+                "provider_key_concurrency_limit_reached",
+            ] {
+                let mut raw = build_candidate(RequestCandidateStatus::Skipped, Some(reason), None);
+                raw.extra_data = Some(invalid_extra.clone());
+                assert!(
+                    !context_for(vec![raw]).all_candidates_skipped_for_reasons(CAPACITY_REASONS),
+                    "raw {label} ({reason}) must fail closed"
+                );
+            }
+            let sanitized = build_candidate(
+                RequestCandidateStatus::Skipped,
+                Some("pool_group_exhausted"),
+                Some(invalid_extra),
+            );
+            assert!(
+                !context_for(vec![sanitized]).all_candidates_skipped_for_reasons(CAPACITY_REASONS),
+                "sanitized {label} must fail closed"
+            );
+        }
+
+        let single_capacity = build_candidate(
+            RequestCandidateStatus::Skipped,
+            Some("provider_key_concurrency_limit_reached"),
+            Some(json!({"routing_trace": {"selected_order": 0}})),
+        );
+        let single_non_capacity = build_candidate(
+            RequestCandidateStatus::Skipped,
+            Some("key_model_disabled"),
+            None,
+        );
+        let attempted_failed = build_candidate(RequestCandidateStatus::Failed, None, None);
+        assert!(
+            context_for(vec![pure_capacity_group.clone(), single_capacity])
+                .all_candidates_skipped_for_reasons(CAPACITY_REASONS)
+        );
+        assert!(
+            !context_for(vec![pure_capacity_group.clone(), single_non_capacity])
+                .all_candidates_skipped_for_reasons(CAPACITY_REASONS)
+        );
+        assert!(!context_for(vec![pure_capacity_group, attempted_failed])
+            .all_candidates_skipped_for_reasons(CAPACITY_REASONS));
     }
 }
