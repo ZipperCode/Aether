@@ -494,3 +494,26 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 20: Antigravity 默认 medium 与 Codex 测试修复
+
+**Date**: 2026-10-29
+**Task**: Antigravity 默认 medium 与 Codex 测试修复
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+裸 Gemini 默认 medium 在账号模型权限与额度筛选前生效，保留原生及转换请求的显式参数优先级；补齐 Codex OAuth 调度测试的账号模型发现证据，未改生产准入。preflight 全部通过：5766 项网关测试、3 项跳过，Clippy 和格式检查通过；另有 82 项传输测试、5 项解析测试与 16 个独立 localhost HTTP 场景通过。已归档当前任务；按用户授权推送 origin/master，不部署生产。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `691f1989b` | (see git log) |
+| `44c7846a3` | (see git log) |
+
+### Status
+
+[OK] **Completed**
