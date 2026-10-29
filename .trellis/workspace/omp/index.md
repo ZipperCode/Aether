@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 20
+- **Total Sessions**: 21
 - **Last Active**: 2026-10-29
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~519 | Active |
+| `journal-1.md` | ~541 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 21 | 2026-10-29 | 修复 CI 阻塞并发布 v0.7.51 | `a5d9fb546` | `master` |
 | 20 | 2026-10-29 | Antigravity 默认 medium 与 Codex 测试修复 | `691f1989b`, `44c7846a3` | `master` |
 | 19 | 2026-10-29 | Codex OAuth 账号级模型发现准入 | `4ba6342df` | `master` |
 | 18 | 2026-10-29 | Antigravity Claude 历史工具调用 ID 补齐 | `69f5b9bfa` | `master` |

@@ -517,3 +517,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 21: 修复 CI 阻塞并发布 v0.7.51
+
+**Date**: 2026-10-29
+**Task**: 修复 CI 阻塞并发布 v0.7.51
+**Package**: aether-gateway
+**Branch**: `master`
+
+### Summary
+
+修复 planner 架构依赖边界、传输测试 Clippy 和 Codex WebSocket 双账号发现前提，移除退役 Compact 测试。Gateway5766、架构210、集成31、transport606及独立三轮 WS 额度切换实跑通过。Rust CI40805947219全19作业成功后创建并推送注释tag v0.7.51，严格指向a5d9fb546；Release40807046371全8作业成功，六项资产和多架构GHCR镜像已发布。未部署生产。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a5d9fb546` | (see git log) |
+
+### Status
+
+[OK] **Completed**
