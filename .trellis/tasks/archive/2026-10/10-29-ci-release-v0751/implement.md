@@ -22,4 +22,7 @@
 - All integration scenario bins/tests: 31 passed, including all 13 Responses WebSocket and both tunnel E2E cases.
 - Provider transport nextest: 606 passed. Final Workspace Rest Clippy `--all-targets` and full Rust formatting passed after all source adjustments and smoke cleanup.
 - Independent loopback runtime: a standalone gateway plus disposable PostgreSQL/mock WS upstream was driven by an external stdlib RFC 6455 client. Three client turns completed; account one had one send/one 429, account two had three sends/three completions; continuation reused its socket and a fresh client socket excluded account one. Four settled audit rows recorded one 429 and three billed 200s. Service exited 0 and all throwaway sources/config/results were removed.
-- Exact remote CI and tag publication remain gated until after the repair commit is pushed.
+- Repair commit `a5d9fb546a93c90cd1d1115b14595cf0874d530d` was pushed to `origin/master`. Rust CI run `40805947219` completed successfully: all 19 jobs, including frontend, real Postgres smoke, architecture/integration and aggregate `check`, succeeded.
+- Only after that success, annotated `v0.7.51` was created and pushed. Remote tag object `46f6805cdee52ece64b3d72d6d27bb4fbcab42d2` resolves to the exact green SHA above.
+- Automatic tag-push `Release Aether` run `40807046371` succeeded on that same SHA: all eight jobs passed, including Linux amd64/arm64 builds, multi-arch GHCR publication/provenance and GitHub Release assets.
+- Stable non-draft `v0.7.51` was published at `2026-10-29T02:52:56Z` with both Linux tarballs, VSCodex VSIX, Sigstore provenance, installer and SHA256SUMS (six assets). Release: https://github.com/ZipperCode/Aether/releases/tag/v0.7.51 . No production deployment occurred.
