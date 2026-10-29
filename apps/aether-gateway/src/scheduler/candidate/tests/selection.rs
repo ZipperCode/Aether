@@ -2118,6 +2118,10 @@ async fn keeps_refresh_failed_oauth_candidate_selectable_before_local_auth_resol
                     "[REFRESH_FAILED] Token 续期失败 (401): refresh_token 已被使用并轮换，请重新登录授权"
                         .to_string(),
                 );
+                // 本用例验证刷新失败但 token 尚未过期；先满足独立的账号模型发现准入。
+                key.upstream_metadata = Some(json!({
+                    "codex_model_discovery": {"model_ids": ["gpt-4.1-responses"]}
+                }));
                 key
             },
             sample_key("key-openai", "provider-openai", Some(10)),

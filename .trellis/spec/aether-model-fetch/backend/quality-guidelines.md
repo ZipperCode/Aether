@@ -155,6 +155,7 @@ Good: free serves only its fetched basic model while paid handles the advanced m
 - Raw hidden/compatible/multi-endpoint/empty provenance; background locked/image/preset separation, LKG and successful replacement; real independently authenticated two-account model fetch.
 - Dedicated loopback gateway fixture: free representative, locked/alias, basic/free + sticky, first-fetch rejection/recovery, remove/re-add invalidation, ordinary sync/SSE, real two-turn WebSocket, pinned admin and versioned bootstrap. Pool cursor paging/frozen-window/hot fallback preserves account-level isolation and existing reason priorities.
 - Independent curl streaming smoke observes advanced `free=0, paid=1`, then successful basic free traffic; all credentials synthetic and loopback only. Remove temporary launchers after proof. Production account behavior requires separately authorized real-account validation.
+- Existing OAuth-refresh, expiry, quota and scheduling fixtures must seed the selected upstream model in `codex_model_discovery.model_ids` whenever discovery is not their failure under test. For `keeps_refresh_failed_oauth_candidate_selectable_before_local_auth_resolution`, seed `gpt-4.1-responses` and retain both candidate-order and empty-skip assertions. Include these non-`codex`-named tests in the full Gateway gate; a name-filtered discovery run does not cover them.
 
 ### 7. Wrong vs Correct
 
