@@ -539,3 +539,33 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 22: 修复号池耗尽诊断归属并通过 CI
+
+**Date**: 2026-10-30
+**Task**: 修复号池耗尽诊断归属并通过 CI
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+号池汇总改为无密钥身份，展示真实成员原因计数；保留图片容量回退429。独立审核已修复并复审；Gateway5771与Frontend2234测试通过，CI40920265937全绿。
+
+### Main Changes
+
+- 修正 PoolGroup 摘要身份及历史时间线显示，不改线上状态
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `492bef38f` | (see git log) |
+
+### Testing
+
+- [OK] Gateway preflight5771passed/3skipped; frontend2234passed/typecheck/build; desktop/mobile6scenarios; GitHub19jobs success
+
+### Status
+
+[OK] **Completed**
