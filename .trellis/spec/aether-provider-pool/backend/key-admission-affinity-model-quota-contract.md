@@ -216,39 +216,38 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   applicable window prevents a known exhausted sibling window from proving
   exhaustion; all-unknown windows alone remain unresolved. Missing, empty and
   malformed model quota is unknown, not a default exhausted state.
-- Antigravity model `quotaInfo` is normalized by
+- Antigravity model `quotaInfo` and grouped buckets are normalized by
   `aether_provider_transport::antigravity::antigravity_quota_info_remaining_fraction(&serde_json::Map<String, Value>) -> Option<f64>`.
-  Both admin quota refresh and model discovery use this function. Explicit
-  `remainingFraction` numbers or trimmed numeric strings must be finite and are
-  clamped to `[0, 1]`; explicit invalid/null values remain unknown, even with a
-  valid reset. Only an absent fraction plus a trimmed RFC3339 string `resetTime`
+  Admin quota refresh, grouped quota parsing and model discovery use this function.
+  `remainingFraction` (or `remaining_fraction`) numbers/trimmed numeric strings
+  must be finite and are clamped to `[0, 1]`; explicit invalid/null values remain
+  unknown, even with a valid reset. CamelCase presence wins over snake_case,
+  including invalid values. Only an absent fraction plus an RFC3339 string
+  `resetTime` (or `reset_time`)
   with nonnegative Unix seconds means observed zero remaining (upstream omits
   zero scalar values). Empty/missing quotaInfo and malformed/non-string resets
   remain unknown. Do not compare current time in this parser: preserve zero and
   reset, and let the existing selection deadline release elapsed observations.
-  No group matching, plan inference, cross-bucket fallback or account-wide ban
-  is introduced. Historical reset-only records converge after a successful
-  normal quota refresh/model discovery, not by replacing the binary alone.
-- Antigravity `quota_group` windows do not infer model relationships. An
-  administrator can explicitly bind each account's exact discovered upstream
-  model to one saved quota group with a binding-only
-  `PUT /api/admin/endpoints/keys/{id}` body:
-  `{"antigravity_quota_bindings":{"exact-model":"opaque-group-key"}}`.
-  Empty object clears bindings; mixed configuration writes, unknown/disabled
-  account models, unknown groups, and duplicate normalized model identities are
-  rejected. Store the mapping in its own `upstream_metadata.antigravity_quota_bindings`
-  namespace using CAS, so normal quota/model refresh cannot overwrite it.
-  System configuration export/import preserves the optional per-Key
-  `antigravity_quota_bindings` map, including an explicit empty map. Import
-  validates its structure before any Key write; refreshed runtime quota remains
-  independent and is not replaced by restoring administrator bindings.
+  The parser does not choose groups or infer plans. Historical reset-only records
+  converge after successful normal quota refresh/model discovery.
+- Antigravity group admission is automatic and account-local. The resolver in
+  `quota/antigravity.rs::model_quota_exhausted(&StoredProviderCatalogKey, &str) -> bool`
+  adapts [OmniRoute #18026](https://github.com/cheaper-inference/OmniRoute/pull/18026),
+  revision `848f2573cf3d32a91f93bacf5b4ab3148dffa1c6`; preserve its MIT notice.
+  Identify Argon before Gemini using group names/IDs and bucket names/IDs.
+  Dedicated Argon groups take precedence; only their absence selects Gemini
+  shared groups. Claude/GPT groups are independent. Unknown families/groups keep
+  exact-model behavior. Quota-family classification does not add models or alter
+  the account-scoped upstream model selected from client thinking parameters.
+  No plan-based availability, static model catalog, provider template, manual
+  binding API/editor, or binding config backup field exists. Legacy stored
+  binding maps are inert and require no destructive storage migration.
 - `antigravity_quota_group_key(&Map<String, Value>) -> Option<String>` uses
   `id:<group_id>` when available, otherwise `buckets:<JSON sorted unique bucket IDs>`.
-  Group ordering/display names do not change identity. No model/tier/prefix
-  inference or cross-pool fallback: Pro/Ultra and Argon associations are account
-  configuration, not static routing policy. A missing binding/group preserves
-  existing exact-model admission rather than guessing a replacement pool.
-- Within an explicitly bound group, enabled buckets are cumulative constraints:
+  Group ordering/display names do not change display identity. Association is
+  reevaluated from the account's current groups, not persisted administrator
+  mappings. An exhausted independent Argon group never falls through to Gemini.
+- Within an automatically selected group, enabled buckets are cumulative constraints:
   any known exhausted bucket whose reset has not elapsed blocks that model.
   An unknown sibling never hides a known exhausted window. `disabled:true`
   buckets are ignored and project `is_included:false`; UI shows not applicable,
@@ -394,10 +393,13 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
 | Matching persisted refresh succeeds or the scoped deadline elapses | Release only the exact Key/model guard; preserve independent manual bans/cooldowns. Positive refresh preserves affinity. |
 | All eligible accounts have the requested exact-model fact active | Return HTTP 503 with zero generation attempts for that model; background quota probes remain eligible. |
 | `fetchAvailableModels` fails but `loadCodeAssist` succeeds | Preserve old quota and never restore an exhausted model from the account observation. |
-| Explicitly bound group has weekly zero / short positive, or the reverse | Block only models bound to that account/group; positive sibling does not mask the exhausted limit. |
-| Short reset elapsed but weekly exhaustion reset is future | Keep the bound model excluded. |
+| Selected automatic group has weekly zero / short positive, or the reverse | Block only that account's matching model family; positive sibling does not mask exhaustion. |
+| Short reset elapsed but weekly exhaustion reset is future | Keep the affected model excluded. |
 | Disabled zero bucket with all enabled buckets available | Ignore disabled bucket; show not applicable, no progress percentage/bar. |
-| No explicit binding or the saved group identity disappears | Retain exact-model behavior; require explicit reassociation rather than model-prefix guessing. |
+| Dedicated Argon group is present and exhausted; generic Gemini is positive | Skip Argon, retain Flash; never borrow generic quota. |
+| Dedicated Argon group is absent; Gemini shared group is positive/exhausted | Argon follows the shared group's enabled windows. |
+| Group or model family is unrecognized | Preserve exact-model behavior, without inventing quota or model availability. |
+| Group fraction omitted with valid reset / explicit null with valid reset | Observe zero / retain unknown, respectively. |
 | Antigravity quota HTTP 401 | Persist hard-invalid Token rejection; display abnormal account and skip ordinary/Pool/sticky serving. |
 | Failed quota refresh after an authentication failure | Preserve the original reason/timestamp; do not restore serving. |
 | Successful quota refresh after Token rejection | Clear recoverable credential failure and immediately restore eligible serving. |
@@ -568,19 +570,22 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   after successful quota refresh. Admin classifier tests distinguish explicit
   account restrictions from parameter/model/project errors without retaining
   upstream secrets.
-- Provider Pool `antigravity_joint_quota_tests` asserts cumulative window
-  blocking, unknown siblings, invalid reset retention, disabled exclusion,
-  elapsed resets, stable group identity, no-binding fallback and exact-model
-  exhaustion precedence.
+- Provider Pool `antigravity_joint_quota_tests` asserts automatic family
+  isolation, dedicated/shared Argon precedence, cumulative windows, unknown
+  siblings, invalid reset retention, disabled exclusion, elapsed resets,
+  stable group identity and exact-model exhaustion precedence.
 - Gateway `gateway_antigravity_joint_group_quota_restores_serving` uses real
-  loopback admin PUT/refresh and native Gemini sync/SSE ordinary/Pool/sticky
-  requests. Assert validation errors, exact account/model execution deltas,
-  both exhausted-window directions, partial resets, unrelated models, all-blocked
-  503, disabled windows, elapsed deadlines and clear-binding recovery. Cover
-  group-ID and sorted opaque bucket-set identities through safe API projection.
-- Browser smoke must operate the real OAuth account editor to select an exact
-  model/group, save only the binding field, clear it, and render disabled quota
-  as not applicable without a progress bar. No new hardcoded model lists.
+  loopback admin refresh and native Gemini sync/SSE ordinary/Pool/sticky
+  requests without binding writes. Assert exact execution deltas, both
+  exhausted-window directions, partial reset, reset-only and disabled buckets,
+  unrelated-model availability, all-blocked 503 and elapsed recovery.
+- `gateway_antigravity_automatic_argon_groups_isolate_and_restore_serving`
+  covers discovered display-only models, independent Argon versus shared-only
+  accounts, no borrowing when independent Argon is exhausted, Flash isolation,
+  positive refresh, group disappearance, reset-only and elapsed deadlines.
+- Browser smoke verifies ordinary account save and unsaved-close protection
+  with no binding controls, automatic policy explanation and disabled quota
+  shown as not applicable without a progress bar. Keep desktop/mobile layouts.
 - OAuth/transport/admin: preserve Antigravity refresh credentials, Google userinfo
   email, current `quota_by_model` projection, legacy `models` input and RFC3339
   reset parsing. Quota refresh never changes the model catalog or resurrects
@@ -658,7 +663,9 @@ Correct: retain failures, normalize explicit Token rejection to `oauth_token_inv
 and reuse existing hard-invalid guards. Account verification is a separate
 `[ACCOUNT_BLOCK]` and cannot be healed by a successful quota probe.
 
-For cumulative group windows, wrong: reuse independent model-window `all`
-exhaustion or match Argon to Gemini by prefix. Correct: explicitly bind the
-account's exact model to an upstream group and reject when any enabled
-nonelapsed group limit is known exhausted; preserve independent model guards.
+For cumulative groups, wrong: require users to map every account, borrow Gemini
+after independent Argon exhaustion, or collapse two reset deadlines into one.
+Correct: select the account's family windows using the referenced automatic
+policy; reject any known exhausted enabled/nonelapsed window and retain exact
+model guards. Missing independent Argon permits shared Gemini; exhausted Argon
+does not. Quota scope must not synthesize account model availability.

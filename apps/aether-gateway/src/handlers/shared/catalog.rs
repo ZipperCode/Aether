@@ -9,8 +9,7 @@ use crate::AppState;
 use aether_admin::provider::quota as admin_provider_quota_pure;
 use aether_admin::provider::redaction::{
     admin_provider_oauth_invalid_reason_safe_text, admin_provider_status_snapshot_safe_json,
-    admin_provider_upstream_metadata_safe_json, admin_safe_antigravity_quota_bindings,
-    admin_secret_safe_json, admin_secret_safe_proxy,
+    admin_provider_upstream_metadata_safe_json, admin_secret_safe_json, admin_secret_safe_proxy,
 };
 use aether_admin::provider::status as admin_provider_status_pure;
 #[cfg(test)]
@@ -27,7 +26,6 @@ use aether_provider_pool::{
 use aether_scheduler_core::provider_key_circuit_payload_is_active_open_at;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const OAUTH_ACCOUNT_BLOCK_PREFIX: &str = "[ACCOUNT_BLOCK] ";
@@ -520,13 +518,6 @@ fn provider_quota_model_bucket(metadata: &Map<String, Value>) -> Option<&Map<Str
 }
 
 /// 读取 Antigravity 权威模型映射（依次检查 `quota_by_model`、`models`、`model_quotas` 首个对象，空对象同样权威）。
-pub(crate) fn antigravity_authoritative_model_map<'a>(
-    upstream_metadata: Option<&'a Value>,
-) -> Option<&'a Map<String, Value>> {
-    let metadata = provider_quota_metadata_bucket(upstream_metadata, "antigravity")?;
-    antigravity_authoritative_model_map_from_bucket(metadata)
-}
-
 fn antigravity_authoritative_model_map_from_bucket(
     metadata: &Map<String, Value>,
 ) -> Option<&Map<String, Value>> {
@@ -535,88 +526,12 @@ fn antigravity_authoritative_model_map_from_bucket(
         .find_map(|field| metadata.get(field).and_then(Value::as_object))
 }
 
-pub(crate) fn antigravity_model_entry_is_disabled(entry: &Value) -> bool {
+fn antigravity_model_entry_is_disabled(entry: &Value) -> bool {
     entry
         .as_object()
         .and_then(|object| object.get("disabled"))
         .and_then(admin_provider_quota_pure::coerce_json_bool)
         == Some(true)
-}
-
-/// 投影 Key 顶层的安全 `antigravity_quota_bindings` 字段；Antigravity 始终返回对象。
-pub(crate) fn antigravity_quota_bindings_payload(
-    key: &StoredProviderCatalogKey,
-    provider_type: &str,
-) -> Value {
-    if !provider_type.trim().eq_ignore_ascii_case("antigravity") {
-        return Value::Null;
-    }
-    admin_safe_antigravity_quota_bindings(
-        key.upstream_metadata
-            .as_ref()
-            .and_then(Value::as_object)
-            .and_then(|metadata| metadata.get("antigravity_quota_bindings")),
-    )
-}
-
-/// 投影 Key 顶层的安全 `antigravity_quota_models` 候选模型列表（排除 `disabled: true` 与内部重置额度键）。
-pub(crate) fn antigravity_quota_models_payload(
-    key: &StoredProviderCatalogKey,
-    provider_type: &str,
-) -> Value {
-    if !provider_type.trim().eq_ignore_ascii_case("antigravity") {
-        return Value::Null;
-    }
-    let mut seen = BTreeSet::new();
-    let mut models = Vec::new();
-    if let Some(model_map) = antigravity_authoritative_model_map(key.upstream_metadata.as_ref()) {
-        for (model_id, entry) in model_map {
-            let trimmed = model_id.trim();
-            if trimmed.is_empty()
-                || trimmed.starts_with("RateLimitResetCredit_")
-                || antigravity_model_entry_is_disabled(entry)
-            {
-                continue;
-            }
-            if seen.insert(trimmed.to_ascii_lowercase()) {
-                models.push(trimmed.to_string());
-            }
-        }
-    } else if let Some(windows) = key
-        .status_snapshot
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|snapshot| snapshot.get("quota"))
-        .and_then(Value::as_object)
-        .and_then(|quota| quota.get("windows"))
-        .and_then(Value::as_array)
-    {
-        for window in windows.iter().filter_map(Value::as_object) {
-            if !quota_window_is_included(window) {
-                continue;
-            }
-            let is_model_scope = window
-                .get("scope")
-                .and_then(Value::as_str)
-                .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("model"));
-            if !is_model_scope {
-                continue;
-            }
-            let Some(model_id) = window
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty() && !value.starts_with("RateLimitResetCredit_"))
-            else {
-                continue;
-            };
-            if seen.insert(model_id.to_ascii_lowercase()) {
-                models.push(model_id.to_string());
-            }
-        }
-    }
-    models.sort();
-    Value::Array(models.into_iter().map(Value::String).collect())
 }
 
 fn quota_window_reset_seconds(
@@ -3778,14 +3693,6 @@ pub(crate) fn build_admin_provider_key_response(
         admin_provider_upstream_metadata_safe_json(key.upstream_metadata.as_ref()),
     );
     payload.insert(
-        "antigravity_quota_bindings".to_string(),
-        antigravity_quota_bindings_payload(key, provider_type),
-    );
-    payload.insert(
-        "antigravity_quota_models".to_string(),
-        antigravity_quota_models_payload(key, provider_type),
-    );
-    payload.insert(
         "proxy".to_string(),
         admin_secret_safe_proxy(key.proxy.as_ref()),
     );
@@ -6213,9 +6120,6 @@ mod tests {
                         }
                     ]
                 }]
-            },
-            "antigravity_quota_bindings": {
-                "gemini-4-argon-high": "buckets:[\"gemini-5h\",\"gemini-weekly\"]"
             }
         }));
 
@@ -6236,17 +6140,6 @@ mod tests {
         // 即使过去时间已越过 reset_at，已禁用窗口也不得在读取归一化时被改写为剩余 100%。
         assert_eq!(disabled_short["remaining_ratio"], json!(0.0));
         assert_eq!(snapshot["quota"]["exhausted"], json!(false));
-
-        assert_eq!(
-            antigravity_quota_bindings_payload(&key, "antigravity"),
-            json!({
-                "gemini-4-argon-high": "buckets:[\"gemini-5h\",\"gemini-weekly\"]"
-            })
-        );
-        assert_eq!(
-            antigravity_quota_models_payload(&key, "antigravity"),
-            json!(["gemini-3.8-flash-medium", "gemini-4-argon-high"])
-        );
     }
 
     #[test]

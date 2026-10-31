@@ -1,10 +1,13 @@
 use serde_json::{json, Value};
 
-/// 解释模型额度的显式比例及上游耗尽时省略零值的 Timestamp 形态。
+/// 解释模型/分组额度的显式比例及上游耗尽时省略零值的 Timestamp 形态。
 pub fn antigravity_quota_info_remaining_fraction(
     quota_info: &serde_json::Map<String, Value>,
 ) -> Option<f64> {
-    if let Some(value) = quota_info.get("remainingFraction") {
+    if let Some(value) = quota_info
+        .get("remainingFraction")
+        .or_else(|| quota_info.get("remaining_fraction"))
+    {
         // 显式无效值不等于省略，不能借 resetTime 将其误判为耗尽。
         return value
             .as_f64()
@@ -13,7 +16,11 @@ pub fn antigravity_quota_info_remaining_fraction(
             .map(|fraction| fraction.clamp(0.0, 1.0));
     }
     // 上游零值省略时只保留 resetTime；到期恢复由调度判断，不在解析时丢弃观察。
-    let reset = quota_info.get("resetTime")?.as_str()?.trim();
+    let reset = quota_info
+        .get("resetTime")
+        .or_else(|| quota_info.get("reset_time"))?
+        .as_str()?
+        .trim();
     chrono::DateTime::parse_from_rfc3339(reset)
         .ok()
         .filter(|deadline| deadline.timestamp() >= 0)
@@ -274,6 +281,32 @@ mod tests {
             assert_eq!(
                 antigravity_quota_info_remaining_fraction(info.as_object().unwrap()),
                 Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_quota_info_normalized_aliases_preserve_explicit_precedence() {
+        for (info, expected) in [
+            (json!({"remaining_fraction": "0.6"}), Some(0.6)),
+            (json!({"reset_time": "2099-01-01T00:00:00Z"}), Some(0.0)),
+            (
+                json!({"remaining_fraction": null, "reset_time": "2099-01-01T00:00:00Z"}),
+                None,
+            ),
+            (
+                json!({"remainingFraction": null, "remaining_fraction": 0.7, "resetTime": "2099-01-01T00:00:00Z"}),
+                None,
+            ),
+            (
+                json!({"resetTime": null, "reset_time": "2099-01-01T00:00:00Z"}),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                antigravity_quota_info_remaining_fraction(info.as_object().unwrap()),
+                expected,
+                "{info}"
             );
         }
     }

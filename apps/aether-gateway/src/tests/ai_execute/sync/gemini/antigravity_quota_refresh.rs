@@ -4185,21 +4185,16 @@ async fn gateway_antigravity_joint_group_quota_restores_serving_impl() {
         let harness = start_antigravity_http_harness(config).await;
         let future = format_rfc3339_secs(current_unix_secs() + 3600);
         let past = format_rfc3339_secs(current_unix_secs() - 60);
-        let group_key = if pool {
-            "id:opaque-pool"
-        } else {
-            "buckets:[\"opaque-short\",\"opaque-week\"]"
-        };
         let summary = |short: f64,
                        week: f64,
                        short_reset: &str,
                        week_reset: &str,
                        disabled: bool| {
             let mut result = json!({"groups":[{
-                "displayName":"Shared arbitrary pool",
+                "displayName":"Gemini Models",
                 "buckets":[
-                    {"bucketId":"opaque-short", "window":"5h", "remainingFraction":short,"resetTime":short_reset,"disabled":disabled},
-                    {"bucketId":"opaque-week", "window":"weekly", "remainingFraction":week,"resetTime":week_reset}
+                    {"bucketId":"gemini-5h", "window":"5h", "remainingFraction":short,"resetTime":short_reset,"disabled":disabled},
+                    {"bucketId":"gemini-weekly", "window":"weekly", "remainingFraction":week,"resetTime":week_reset}
                 ]
             }]});
             if pool {
@@ -4216,49 +4211,6 @@ async fn gateway_antigravity_joint_group_quota_restores_serving_impl() {
                 .insert(account, summary(1.0, 1.0, &future, &future, false));
         }
         assert_eq!(harness.send_refresh_quota(None).await["success"], 2);
-        for invalid in [
-            json!({"antigravity_quota_bindings":{"undiscovered":"id:opaque-pool"}}),
-            json!({"antigravity_quota_bindings":{ANTIGRAVITY_RUNTIME_PRIMARY_MODEL:"id:unknown"}}),
-            json!({"antigravity_quota_bindings":{},"name":"mixed-write"}),
-        ] {
-            let response = harness
-                .send_admin_put(
-                    &format!("/api/admin/endpoints/keys/{}", harness.key_a_id),
-                    &invalid,
-                )
-                .await;
-            assert_eq!(
-                response.status(),
-                StatusCode::BAD_REQUEST,
-                "invalid binding must not mutate configuration"
-            );
-        }
-        for key_id in [&harness.key_a_id, &harness.key_b_id] {
-            let response = harness
-                .send_admin_put(
-                    &format!("/api/admin/endpoints/keys/{key_id}"),
-                    &json!({
-                        "antigravity_quota_bindings": {ANTIGRAVITY_RUNTIME_PRIMARY_MODEL:group_key}
-                    }),
-                )
-                .await;
-            let status = response.status();
-            let text = response.text().await.unwrap();
-            assert_eq!(status, StatusCode::OK, "binding save: {text}");
-            let returned: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(
-                returned["antigravity_quota_bindings"][ANTIGRAVITY_RUNTIME_PRIMARY_MODEL],
-                group_key
-            );
-            assert!(
-                returned["status_snapshot"]["quota"]["windows"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|window| window["quota_group"] == group_key),
-                "opaque identity survives safe API projection"
-            );
-        }
         let body = json!({"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"temperature":0.2,"thinkingConfig":{"thinkingLevel":"HIGH"}},"session_id":harness.client_session_id});
         assert_reset_only_serving_step(
             &harness,
@@ -4303,17 +4255,50 @@ async fn gateway_antigravity_joint_group_quota_restores_serving_impl() {
                 future.as_str(),
                 false,
             ),
-        ] {
-            harness.mock_state.lock().unwrap().quota_summaries.insert(
+            (
+                "weekly-reset-only",
+                1.0,
+                0.0,
+                future.as_str(),
+                future.as_str(),
+                false,
+            ),
+            (
+                "disabled-short-weekly-exhausted",
+                1.0,
+                0.0,
+                future.as_str(),
+                future.as_str(),
                 true,
-                summary(short, week, short_reset, week_reset, disabled),
-            );
+            ),
+        ] {
+            let mut response = summary(short, week, short_reset, week_reset, disabled);
+            if step == "weekly-reset-only" {
+                response["groups"][0]["buckets"][1]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("remainingFraction");
+            }
+            harness
+                .mock_state
+                .lock()
+                .unwrap()
+                .quota_summaries
+                .insert(true, response);
             assert_eq!(
                 harness
                     .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
                     .await["success"],
                 1
             );
+            if step == "weekly-reset-only" {
+                let key = harness.read_catalog_key(&harness.key_a_id).await;
+                assert_eq!(
+                    key.upstream_metadata.unwrap()["antigravity"]["quota_groups"][0]["buckets"][1]
+                        ["remaining_fraction"],
+                    0.0
+                );
+            }
             for stream in [false, true] {
                 b_count += 1;
                 assert_reset_only_serving_step(
@@ -4329,8 +4314,7 @@ async fn gateway_antigravity_joint_group_quota_restores_serving_impl() {
                 .await;
             }
         }
-        // 未绑定模型不继承另一个模型的共享池限制。
-        // B 的旧 sticky 仍在，但它的 secondary 精确模型耗尽，必须切到 A 的未绑定模型。
+        // Claude 不继承 Gemini 共享池限制；B 的旧 sticky 仍须检查当前精确模型额度。
         let mut b_models = antigravity_runtime_quota_models(0.9);
         b_models.insert(
             ANTIGRAVITY_RUNTIME_SECONDARY_MODEL.to_string(),
@@ -4419,43 +4403,269 @@ async fn gateway_antigravity_joint_group_quota_restores_serving_impl() {
             (3, b_count),
         )
         .await;
-        // 管理员清除绑定后回到原有精确模型额度，不篡改上游组观察。
+    }
+}
+
+#[test]
+fn gateway_antigravity_automatic_argon_groups_isolate_and_restore_serving() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_automatic_argon_groups_isolate_and_restore_serving",
+        gateway_antigravity_automatic_argon_groups_isolate_and_restore_serving_impl,
+    );
+}
+
+async fn gateway_antigravity_automatic_argon_groups_isolate_and_restore_serving_impl() {
+    for pool in [false, true] {
+        let mode = if pool {
+            "auto-argon-pool"
+        } else {
+            "auto-argon-ordinary"
+        };
+        let argon = "gemini-4-argon-medium";
+        let flash = "gemini-3.8-flash-medium";
+        let mut config = antigravity_runtime_quota_http_config(mode, pool);
+        config.global_model_name = "gemini-4-argon".into();
+        config.provider_model_name = argon.into();
+        config.secondary_global_model_name = Some("gemini-3.8-flash".into());
+        config.secondary_provider_model_name = Some(flash.into());
+        let models = BTreeMap::from([
+            (
+                argon.to_string(),
+                ModelQuotaFixture::display_only("Gemini 4 Argon"),
+            ),
+            (
+                flash.to_string(),
+                ModelQuotaFixture::display_only("Gemini 3.8 Flash"),
+            ),
+        ]);
+        config.key_a.models = models.clone();
+        config.key_b.models = models;
+        let harness = start_antigravity_http_harness(config).await;
+        let future = format_rfc3339_secs(current_unix_secs() + 3600);
+        let past = format_rfc3339_secs(current_unix_secs() - 60);
+        let summary = |argon_fraction: Option<f64>, gemini_fraction: f64, reset: &str| {
+            let mut groups = vec![json!({
+                "displayName":"Gemini Models", "buckets":[
+                    {"bucketId":"gemini-5h","window":"5h","remainingFraction":1.0,"resetTime":&future},
+                    {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":gemini_fraction,"resetTime":&future}
+                ]
+            })];
+            if let Some(fraction) = argon_fraction {
+                groups.push(json!({"displayName":"Gemini 4 Argon","buckets":[
+                    {"bucketId":"gemini-argon-wtu-weekly","window":"weekly","remainingFraction":fraction,"resetTime":reset}
+                ]}));
+            }
+            json!({"groups":groups})
+        };
+        {
+            let mut upstream = harness.mock_state.lock().unwrap();
+            upstream
+                .quota_summaries
+                .insert(true, summary(Some(1.0), 1.0, &future));
+            upstream
+                .quota_summaries
+                .insert(false, summary(None, 1.0, &future));
+        }
+        assert_eq!(harness.send_refresh_quota(None).await["success"], 2);
+        let body = json!({"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"temperature":0.2,"thinkingConfig":{"thinkingLevel":"MEDIUM"}},"session_id":harness.client_session_id});
+        assert_reset_only_serving_step(
+            &harness,
+            "auto-warmup",
+            "gemini-4-argon",
+            argon,
+            &body,
+            false,
+            StatusCode::OK,
+            (1, 0),
+        )
+        .await;
+        if pool {
+            assert_eq!(
+                harness.read_sticky().await.as_deref(),
+                Some(harness.key_a_id.as_str())
+            );
+        }
         harness
             .mock_state
             .lock()
             .unwrap()
             .quota_summaries
-            .insert(true, summary(1.0, 0.0, &future, &future, false));
+            .insert(true, summary(Some(0.0), 1.0, &future));
         assert_eq!(
             harness
                 .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
                 .await["success"],
             1
         );
-        let response = harness
-            .send_admin_put(
-                &format!("/api/admin/endpoints/keys/{}", harness.key_a_id),
-                &json!({"antigravity_quota_bindings":{}}),
+        for (stream, counts) in [(false, (1, 1)), (true, (1, 2))] {
+            assert_reset_only_serving_step(
+                &harness,
+                "dedicated-empty-shared-account-serves",
+                "gemini-4-argon",
+                argon,
+                &body,
+                stream,
+                StatusCode::OK,
+                counts,
             )
             .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        }
+        // B 共享池耗尽后两账号都不能提供 Argon；A 的 Gemini 仍正数，不能被借给 Argon。
+        harness
+            .mock_state
+            .lock()
+            .unwrap()
+            .quota_summaries
+            .insert(false, summary(None, 0.0, &future));
         assert_eq!(
             harness
-                .read_catalog_key(&harness.key_a_id)
-                .await
-                .upstream_metadata
-                .unwrap()["antigravity_quota_bindings"],
-            json!({})
+                .send_refresh_quota(Some(json!({"key_ids":[&harness.key_b_id]})))
+                .await["success"],
+            1
         );
+        for stream in [false, true] {
+            assert_reset_only_serving_step(
+                &harness,
+                "no-cross-pool-borrowing",
+                "gemini-4-argon",
+                argon,
+                &body,
+                stream,
+                StatusCode::SERVICE_UNAVAILABLE,
+                (1, 2),
+            )
+            .await;
+        }
         assert_reset_only_serving_step(
             &harness,
-            "joint-binding-cleared",
-            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
-            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            "dedicated-does-not-block-flash",
+            "gemini-3.8-flash",
+            flash,
             &body,
             false,
             StatusCode::OK,
-            (4, b_count),
+            (1, 0),
+        )
+        .await;
+        // A 的独立 Argon 恢复，即使通用池耗尽也可服务；更新无需任何映射写入。
+        harness
+            .mock_state
+            .lock()
+            .unwrap()
+            .quota_summaries
+            .insert(true, summary(Some(0.5), 0.0, &future));
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
+                .await["success"],
+            1
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "dedicated-positive-generic-empty",
+            "gemini-4-argon",
+            argon,
+            &body,
+            false,
+            StatusCode::OK,
+            (2, 2),
+        )
+        .await;
+        harness
+            .mock_state
+            .lock()
+            .unwrap()
+            .quota_summaries
+            .insert(true, summary(None, 0.0, &future));
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
+                .await["success"],
+            1
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "dedicated-absent-shared-empty",
+            "gemini-4-argon",
+            argon,
+            &body,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            (2, 2),
+        )
+        .await;
+        harness
+            .mock_state
+            .lock()
+            .unwrap()
+            .quota_summaries
+            .insert(true, summary(None, 0.4, &future));
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
+                .await["success"],
+            1
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "shared-positive-refresh",
+            "gemini-4-argon",
+            argon,
+            &body,
+            true,
+            StatusCode::OK,
+            (3, 2),
+        )
+        .await;
+        let mut reset_only = summary(Some(0.0), 1.0, &future);
+        reset_only["groups"][1]["buckets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("remainingFraction");
+        harness
+            .mock_state
+            .lock()
+            .unwrap()
+            .quota_summaries
+            .insert(true, reset_only);
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
+                .await["success"],
+            1
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "dedicated-reset-only",
+            "gemini-4-argon",
+            argon,
+            &body,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            (3, 2),
+        )
+        .await;
+        harness
+            .mock_state
+            .lock()
+            .unwrap()
+            .quota_summaries
+            .insert(true, summary(Some(0.0), 1.0, &past));
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
+                .await["success"],
+            1
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "dedicated-reset-elapsed",
+            "gemini-4-argon",
+            argon,
+            &body,
+            true,
+            StatusCode::OK,
+            (4, 2),
         )
         .await;
     }

@@ -1101,10 +1101,8 @@
     <OAuthKeyEditDialog
       :open="oauthKeyEditDialogOpen"
       :editing-key="editingKey"
-      :provider-type="selectedProviderData?.provider_type ?? selectedProviderOverview?.provider_type ?? editingKey?.provider_type ?? null"
       @close="closeOAuthEditDialog"
       @saved="handleDialogSaved"
-      @bindings-saved="handleBindingsSaved"
     />
     <KeyAllowedModelsEditDialog
       v-if="selectedProviderId"
@@ -2964,8 +2962,6 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     oauth_invalid_reason: key.oauth_invalid_reason ?? null,
     status_snapshot: key.status_snapshot ?? null,
     upstream_metadata: key.upstream_metadata ?? null,
-    antigravity_quota_bindings: key.antigravity_quota_bindings ?? key.upstream_metadata?.antigravity_quota_bindings ?? null,
-    antigravity_quota_models: key.antigravity_quota_models ?? null,
     proxy: key.proxy ?? null,
   }
 }
@@ -3073,44 +3069,6 @@ async function handleKeyBatchEditSaved(): Promise<void> {
 async function handleDialogSaved() {
   editingKeyDetail.value = null
   await loadKeys({ silent: true })
-}
-
-async function handleBindingsSaved(updatedKey: EndpointAPIKey) {
-  const applyToPoolDetail = (target: PoolKeyDetail) => {
-    if (updatedKey.antigravity_quota_bindings !== undefined) {
-      target.antigravity_quota_bindings = updatedKey.antigravity_quota_bindings
-    }
-    if (updatedKey.antigravity_quota_models !== undefined) {
-      target.antigravity_quota_models = updatedKey.antigravity_quota_models
-    }
-    if (updatedKey.upstream_metadata !== undefined) {
-      target.upstream_metadata = updatedKey.upstream_metadata
-    }
-    if (updatedKey.status_snapshot !== undefined) {
-      target.status_snapshot = updatedKey.status_snapshot
-    }
-  }
-
-  if (editingKeyDetail.value && editingKeyDetail.value.key_id === updatedKey.id) {
-    const patched = { ...editingKeyDetail.value }
-    applyToPoolDetail(patched)
-    editingKeyDetail.value = patched
-  }
-  const row = keyPage.value.keys.find(item => item.key_id === updatedKey.id)
-  if (row) {
-    applyToPoolDetail(row)
-  }
-  await loadKeys({ silent: true })
-  if (oauthKeyEditDialogOpen.value && editingKeyDetail.value?.key_id === updatedKey.id) {
-    const refreshed = keyPage.value.keys.find(item => item.key_id === updatedKey.id)
-    if (refreshed) {
-      const merged = { ...refreshed }
-      if (merged.antigravity_quota_bindings === undefined && updatedKey.antigravity_quota_bindings !== undefined) {
-        merged.antigravity_quota_bindings = updatedKey.antigravity_quota_bindings
-      }
-      editingKeyDetail.value = merged
-    }
-  }
 }
 
 function closeKeyFormDialog() {

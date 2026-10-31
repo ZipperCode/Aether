@@ -1026,10 +1026,8 @@
     v-if="open && oauthKeyEditDialogOpen"
     :open="oauthKeyEditDialogOpen"
     :editing-key="editingKey"
-    :provider-type="provider?.provider_type ?? null"
     @close="oauthKeyEditDialogOpen = false"
     @saved="handleKeyChanged"
-    @bindings-saved="handleKeyChanged"
   />
 
   <!-- 模型权限对话框 -->

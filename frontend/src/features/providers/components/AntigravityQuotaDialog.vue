@@ -98,51 +98,59 @@
       </div>
       <div
         v-if="displayItems.length > 0"
-        class="grid grid-cols-2 gap-3"
+        class="space-y-3"
       >
-        <div
-          v-for="item in displayItems"
-          :key="item.model"
-        >
-          <div class="flex items-center justify-between text-[10px] mb-0.5">
-            <div class="min-w-0 flex-1 mr-2">
-              <div
-                class="text-muted-foreground truncate"
-                :title="item.label"
-              >
-                {{ item.label }}
+        <div class="grid grid-cols-2 gap-3">
+          <div
+            v-for="item in displayItems"
+            :key="item.model"
+          >
+            <div class="flex items-center justify-between text-[10px] mb-0.5">
+              <div class="min-w-0 flex-1 mr-2">
+                <div
+                  class="text-muted-foreground truncate"
+                  :title="item.label"
+                >
+                  {{ item.label }}
+                </div>
               </div>
+              <span
+                :class="item.notApplicable ? 'text-muted-foreground' : getQuotaRemainingClass(item.usedPercent)"
+                data-testid="antigravity-quota-item-meter"
+              >
+                {{ item.notApplicable ? legacyT('不适用') : (item.detail || `${item.remainingPercent.toFixed(1)}%`) }}
+              </span>
             </div>
-            <span
-              :class="item.notApplicable ? 'text-muted-foreground' : getQuotaRemainingClass(item.usedPercent)"
-              data-testid="antigravity-quota-item-meter"
-            >
-              {{ item.notApplicable ? legacyT('不适用') : (item.detail || `${item.remainingPercent.toFixed(1)}%`) }}
-            </span>
-          </div>
-          <div
-            v-if="!item.notApplicable"
-            class="relative w-full h-1.5 bg-border rounded-full overflow-hidden"
-            data-testid="antigravity-quota-item-bar"
-          >
             <div
-              class="absolute left-0 top-0 h-full transition-all duration-300"
-              :class="getQuotaRemainingBarColor(item.usedPercent)"
-              :style="{ width: `${Math.max(item.remainingPercent, 0)}%` }"
-            />
-          </div>
-          <div
-            v-if="!item.notApplicable && item.resetSeconds !== null"
-            class="text-[9px] text-muted-foreground/70 mt-0.5"
-          >
-            <template v-if="item.resetSeconds > 0">
-              {{ formatResetTime(item.resetSeconds) }}后重置
-            </template>
-            <template v-else>
-              已重置
-            </template>
+              v-if="!item.notApplicable"
+              class="relative w-full h-1.5 bg-border rounded-full overflow-hidden"
+              data-testid="antigravity-quota-item-bar"
+            >
+              <div
+                class="absolute left-0 top-0 h-full transition-all duration-300"
+                :class="getQuotaRemainingBarColor(item.usedPercent)"
+                :style="{ width: `${Math.max(item.remainingPercent, 0)}%` }"
+              />
+            </div>
+            <div
+              v-if="!item.notApplicable && item.resetSeconds !== null"
+              class="text-[9px] text-muted-foreground/70 mt-0.5"
+            >
+              <template v-if="item.resetSeconds > 0">
+                {{ formatResetTime(item.resetSeconds) }}后重置
+              </template>
+              <template v-else>
+                已重置
+              </template>
+            </div>
           </div>
         </div>
+        <p
+          class="border-t border-border/50 pt-2.5 text-[11px] leading-relaxed text-muted-foreground"
+          data-testid="antigravity-quota-auto-group-note"
+        >
+          配额组自动匹配：存在独立 Argon 配额组时优先使用，仅在该账号无独立 Argon 组时使用共享 Gemini 配额组。
+        </p>
       </div>
       <div
         v-else

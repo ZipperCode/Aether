@@ -1,0 +1,3 @@
+{"file":".trellis/tasks/10-31-antigravity-auto-quota-groups/prd.md","reason":"Approved zero-configuration quota requirements"}
+{"file":".trellis/tasks/10-31-antigravity-auto-quota-groups/design.md","reason":"Pinned reference policy and ownership boundaries"}
+{"file":".trellis/spec/aether-provider-pool/backend/key-admission-affinity-model-quota-contract.md","reason":"Existing account-scoped admission invariants; manual-binding portion superseded"}

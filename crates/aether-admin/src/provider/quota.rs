@@ -381,11 +381,7 @@ pub fn parse_antigravity_quota_summary_response(
             )
             .unwrap_or_else(|| format!("bucket-{}", bucket_index + 1));
             let window = coerce_json_string(bucket.get("window"));
-            let remaining_fraction = bucket
-                .get("remainingFraction")
-                .or_else(|| bucket.get("remaining_fraction"))
-                .and_then(coerce_json_f64)
-                .map(|value| value.clamp(0.0, 1.0));
+            let remaining_fraction = antigravity_quota_info_remaining_fraction(bucket);
             let reset_time = bucket
                 .get("resetTime")
                 .or_else(|| bucket.get("reset_time"))
@@ -7779,6 +7775,113 @@ mod tests {
         assert_eq!(groups[1]["buckets"][0]["disabled"], json!(true));
         assert_eq!(groups[1]["buckets"][0]["is_included"], json!(false));
         assert_eq!(groups[1]["buckets"][0]["is_exhausted"], json!(false));
+    }
+
+    #[test]
+    fn parses_antigravity_grouped_reset_only_buckets_as_zero_and_keeps_invalid_unknown() {
+        let groups = parse_antigravity_quota_summary_response(&json!({
+            "groups": [
+                {
+                    "group_id": "argon-weekly-group",
+                    "display_name": "Gemini 4 Argon",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-argon-wtu-weekly",
+                            "window": "weekly",
+                            "resetTime": "2026-11-02T04:57:16Z"
+                        },
+                        {
+                            "bucket_id": "snake-past-reset",
+                            "window": "5h",
+                            "reset_time": "2020-01-01T00:00:00Z"
+                        },
+                        {
+                            "bucket_id": "snake-disabled-reset-only",
+                            "window": "5h",
+                            "reset_time": "2026-11-02T04:57:16Z",
+                            "is_disabled": true
+                        }
+                    ]
+                },
+                {
+                    "displayName": "Boundary validation group",
+                    "buckets": [
+                        {
+                            "bucketId": "explicit-null-camel",
+                            "window": "weekly",
+                            "remainingFraction": null,
+                            "remaining_fraction": 0.5,
+                            "resetTime": "2026-11-02T04:57:16Z"
+                        },
+                        {
+                            "bucket_id": "explicit-null-snake",
+                            "window": "weekly",
+                            "remaining_fraction": null,
+                            "reset_time": "2026-11-02T04:57:16Z"
+                        },
+                        {
+                            "bucketId": "explicit-invalid-string",
+                            "window": "weekly",
+                            "remainingFraction": "not-a-number",
+                            "resetTime": "2026-11-02T04:57:16Z"
+                        },
+                        {
+                            "bucketId": "invalid-reset-timestamp",
+                            "window": "weekly",
+                            "resetTime": "not-rfc3339"
+                        },
+                        {
+                            "bucketId": "camel-reset-null-precedence",
+                            "window": "weekly",
+                            "resetTime": null,
+                            "reset_time": "2026-11-02T04:57:16Z"
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("grouped Antigravity reset-only and boundary buckets should parse");
+
+        assert_eq!(groups[0]["group_id"], json!("argon-weekly-group"));
+        assert_eq!(groups[0]["quota_group"], json!("id:argon-weekly-group"));
+        let active_reset_only = &groups[0]["buckets"][0];
+        assert_eq!(active_reset_only["remaining_fraction"], json!(0.0));
+        assert_eq!(active_reset_only["used_percent"], json!(100.0));
+        assert_eq!(active_reset_only["is_exhausted"], json!(true));
+        assert_eq!(active_reset_only["is_included"], json!(true));
+        assert_eq!(
+            active_reset_only["reset_time"],
+            json!("2026-11-02T04:57:16Z")
+        );
+
+        let snake_past_reset = &groups[0]["buckets"][1];
+        assert_eq!(snake_past_reset["remaining_fraction"], json!(0.0));
+        assert_eq!(snake_past_reset["used_percent"], json!(100.0));
+        assert_eq!(snake_past_reset["is_exhausted"], json!(true));
+        assert_eq!(snake_past_reset["is_included"], json!(true));
+
+        let disabled_reset_only = &groups[0]["buckets"][2];
+        assert_eq!(disabled_reset_only["disabled"], json!(true));
+        assert_eq!(disabled_reset_only["is_included"], json!(false));
+        assert_eq!(disabled_reset_only["remaining_fraction"], json!(0.0));
+        assert_eq!(disabled_reset_only["used_percent"], json!(100.0));
+        assert_eq!(disabled_reset_only["is_exhausted"], json!(false));
+
+        for unknown_bucket in groups[1]["buckets"].as_array().expect("boundary buckets") {
+            assert!(
+                unknown_bucket.get("remaining_fraction").is_none(),
+                "unexpected remaining_fraction on {unknown_bucket}"
+            );
+            assert!(
+                unknown_bucket.get("used_percent").is_none(),
+                "unexpected used_percent on {unknown_bucket}"
+            );
+            assert!(
+                unknown_bucket.get("is_exhausted").is_none(),
+                "unexpected is_exhausted on {unknown_bucket}"
+            );
+        }
+        assert!(groups[1]["buckets"][4].get("reset_time").is_none());
     }
 
     #[test]

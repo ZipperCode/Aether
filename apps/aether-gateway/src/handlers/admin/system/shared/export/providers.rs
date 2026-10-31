@@ -10,7 +10,6 @@ use crate::handlers::admin::request::{
     AdminAppState, SystemExportMode, ADMIN_SYSTEM_EXPORT_CREDENTIALS_NOT_EXPORTED,
 };
 use crate::GatewayError;
-use aether_admin::provider::redaction::admin_safe_antigravity_quota_bindings;
 use aether_admin::system::{
     AdminSystemConfigEndpoint, AdminSystemConfigModelEndpointBinding, AdminSystemConfigProvider,
     AdminSystemConfigProviderKey, AdminSystemConfigProviderModel,
@@ -242,34 +241,6 @@ pub(crate) async fn build_admin_system_export_providers_payload(
                                     mode,
                                     key.fingerprint.as_ref(),
                                 ),
-                                antigravity_quota_bindings: provider
-                                    .provider_type
-                                    .trim()
-                                    .eq_ignore_ascii_case("antigravity")
-                                    .then(|| {
-                                        key.upstream_metadata
-                                            .as_ref()
-                                            .and_then(serde_json::Value::as_object)
-                                            .and_then(|meta| meta.get("antigravity_quota_bindings"))
-                                            .map(|raw| {
-                                                admin_safe_antigravity_quota_bindings(Some(raw))
-                                            })
-                                            .and_then(|safe| {
-                                                safe.as_object().map(|map| {
-                                                    map.iter()
-                                                        .filter_map(|(model, group_key)| {
-                                                            group_key.as_str().map(|group_key| {
-                                                                (
-                                                                    model.clone(),
-                                                                    group_key.to_string(),
-                                                                )
-                                                            })
-                                                        })
-                                                        .collect::<BTreeMap<_, _>>()
-                                                })
-                                            })
-                                    })
-                                    .flatten(),
                                 credential_state: (!mode.credentials_are_exported()).then(|| {
                                     ADMIN_SYSTEM_EXPORT_CREDENTIALS_NOT_EXPORTED.to_string()
                                 }),

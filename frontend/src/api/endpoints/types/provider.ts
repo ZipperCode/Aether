@@ -331,8 +331,6 @@ export interface EndpointAPIKey {
   status_snapshot?: ProviderKeyStatusSnapshot | null
   // 上游元数据（由上游响应采集，如 Codex 额度信息 / Antigravity 配额信息）
   upstream_metadata?: UpstreamMetadata | null
-  antigravity_quota_bindings?: AntigravityQuotaBindings | null
-  antigravity_quota_models?: string[] | null
   // Key 级别代理配置（覆盖 Provider 级别代理）
   proxy?: ProxyConfig | null
 }
@@ -386,8 +384,6 @@ export interface AntigravityModelQuota {
 }
 
 export type AntigravityAccountInfoStatus = 'success' | 'error' | 'pending' | 'unknown'
-
-export type AntigravityQuotaBindings = Record<string, string>
 
 export interface AntigravityQuotaBucketMetadata {
   bucket_id?: string | null
@@ -593,7 +589,6 @@ export interface UpstreamMetadata {
   grok?: GrokUpstreamMetadata
   gemini_cli?: GeminiCliUpstreamMetadata
   xai?: XaiUpstreamMetadata
-  antigravity_quota_bindings?: AntigravityQuotaBindings | null
 }
 
 // 按格式的健康度数据
@@ -651,8 +646,6 @@ export interface EndpointAPIKeyUpdate {
   model_exclude_patterns?: string[]  // 模型排除规则（支持 * 和 ? 通配符）
   // Key 级别代理配置（覆盖 Provider 级别代理），null=清除
   proxy?: ProxyConfig | null
-  /** Antigravity 精确模型到配额组绑定；必须独立提交，空对象表示清空。 */
-  antigravity_quota_bindings?: AntigravityQuotaBindings
 }
 
 export interface EndpointHealthDetail {

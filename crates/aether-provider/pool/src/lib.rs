@@ -4192,7 +4192,7 @@ mod antigravity_joint_quota_tests {
     use serde_json::json;
 
     #[test]
-    fn antigravity_bound_group_requires_all_enabled_windows_available() {
+    fn antigravity_automatic_group_requires_all_enabled_windows_available() {
         let future = 4_102_444_800u64;
         let past = 1u64;
         for (short, weekly, short_reset, weekly_reset, short_disabled, blocked) in [
@@ -4203,11 +4203,10 @@ mod antigravity_joint_quota_tests {
             (0.0, 1.0, future, future, true, false),
             (1.0, 1.0, future, future, false, false),
         ] {
-            let group = json!({"display_name":"arbitrary", "buckets":[
+            let group = json!({"display_name":"Gemini Models", "buckets":[
                 {"bucket_id":"opaque-short", "remaining_fraction":short, "reset_time":short_reset, "disabled":short_disabled},
                 {"bucket_id":"opaque-week", "remaining_fraction":weekly, "reset_time":weekly_reset}
             ]});
-            let group_key = antigravity_quota_group_key(group.as_object().unwrap()).unwrap();
             let mut key =
                 aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
                     "key".into(),
@@ -4219,7 +4218,6 @@ mod antigravity_joint_quota_tests {
                 )
                 .unwrap();
             key.upstream_metadata = Some(json!({
-                "antigravity_quota_bindings":{"gemini-exact-medium":group_key},
                 "antigravity":{"quota_by_model":{"gemini-exact-medium":{"remaining_fraction":1.0}, "unrelated":{"remaining_fraction":1.0}},"quota_groups":[group]}
             }));
             assert_eq!(
@@ -4243,12 +4241,7 @@ mod antigravity_joint_quota_tests {
             );
             key.upstream_metadata.as_mut().unwrap()["antigravity"]["quota_by_model"]
                 ["gemini-exact-medium"] = json!({"remaining_fraction":1.0});
-            key.upstream_metadata
-                .as_mut()
-                .unwrap()
-                .as_object_mut()
-                .unwrap()
-                .remove("antigravity_quota_bindings");
+            key.upstream_metadata.as_mut().unwrap()["antigravity"]["quota_groups"] = json!([]);
             assert_eq!(
                 provider_pool_key_model_quota_exhausted(&key, "antigravity", "gemini-exact-medium"),
                 Some(false)
@@ -4275,7 +4268,7 @@ mod antigravity_joint_quota_tests {
     }
 
     #[test]
-    fn antigravity_bound_group_unknown_window_does_not_hide_known_exhaustion() {
+    fn antigravity_automatic_group_unknown_window_does_not_hide_known_exhaustion() {
         let mut key =
             aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
                 "key".into(),
@@ -4287,28 +4280,104 @@ mod antigravity_joint_quota_tests {
             )
             .unwrap();
         key.upstream_metadata = Some(json!({
-            "antigravity_quota_bindings":{"exact-model":"id:pool"},
-            "antigravity":{"quota_by_model":{"exact-model":{"remaining_fraction":1.0}},
-                "quota_groups":[{"group_id":"pool","quota_group":"id:pool","buckets":[
+            "antigravity":{"quota_by_model":{"gemini-exact-medium":{"remaining_fraction":1.0}},
+                "quota_groups":[{"group_id":"pool","display_name":"Gemini Models","quota_group":"id:pool","buckets":[
                     {"bucket_id":"short"},
                     {"bucket_id":"week","remaining_fraction":0.0,"reset_time":"invalid"}
                 ]}]}
         }));
         assert_eq!(
-            provider_pool_key_model_quota_exhausted(&key, "antigravity", "exact-model"),
+            provider_pool_key_model_quota_exhausted(&key, "antigravity", "gemini-exact-medium"),
             Some(true)
         );
         key.upstream_metadata.as_mut().unwrap()["antigravity"]["quota_groups"][0]["buckets"][1] =
             json!({"bucket_id":"week"});
         assert_eq!(
-            provider_pool_key_model_quota_exhausted(&key, "antigravity", "exact-model"),
+            provider_pool_key_model_quota_exhausted(&key, "antigravity", "gemini-exact-medium"),
             Some(false)
         );
-        key.upstream_metadata.as_mut().unwrap()["antigravity_quota_bindings"]["exact-model"] =
-            json!("id:missing-group");
-        assert_eq!(
-            provider_pool_key_model_quota_exhausted(&key, "antigravity", "exact-model"),
-            Some(false)
-        );
+    }
+
+    #[test]
+    fn antigravity_automatic_argon_group_precedence_and_shared_fallback() {
+        let models = json!({
+            "gemini-4-argon-medium":{"remaining_fraction":1.0},
+            "gemini-3.8-flash-high":{"remaining_fraction":1.0},
+            "claude-sonnet-5-5-high":{"remaining_fraction":1.0},
+            "gpt-oss-120b-medium":{"remaining_fraction":1.0},
+            "unknown-model":{"remaining_fraction":1.0}
+        });
+        let group = |name: &str, id: &str, fraction: f64| {
+            json!({
+                "display_name":name,"buckets":[{"bucket_id":id,"remaining_fraction":fraction,"reset_time":4102444800u64}]
+            })
+        };
+        for (groups, expected) in [
+            (
+                json!([
+                    group("Gemini Models", "gemini-weekly", 1.0),
+                    group("Gemini 4 Argon", "gemini-argon-wtu-weekly", 0.0)
+                ]),
+                [true, false, false, false, false],
+            ),
+            (
+                json!([
+                    group("Gemini Models", "gemini-weekly", 0.0),
+                    group("Gemini 4 Argon", "gemini-argon-wtu-weekly", 1.0)
+                ]),
+                [false, true, false, false, false],
+            ),
+            (
+                json!([group("Gemini Models", "gemini-weekly", 0.0)]),
+                [true, true, false, false, false],
+            ),
+            (
+                json!([
+                    group("Gemini Models", "gemini-weekly", 1.0),
+                    group("Claude and GPT models", "3p-weekly", 0.0)
+                ]),
+                [false, false, true, true, false],
+            ),
+            (
+                json!([
+                    group("Opaque", "gemini-argon-wtu-weekly", 0.0),
+                    group("Gemini Models", "gemini-weekly", 1.0)
+                ]),
+                [true, false, false, false, false],
+            ),
+            (
+                json!([group("Unrecognized", "opaque-week", 0.0)]),
+                [false, false, false, false, false],
+            ),
+        ] {
+            let mut key =
+                aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
+                    "key".into(),
+                    "provider".into(),
+                    "account".into(),
+                    "oauth".into(),
+                    None,
+                    true,
+                )
+                .unwrap();
+            key.upstream_metadata =
+                Some(json!({"antigravity":{"quota_by_model":models,"quota_groups":groups}}));
+            for (model, blocked) in [
+                "gemini-4-argon-medium",
+                "gemini-3.8-flash-high",
+                "claude-sonnet-5-5-high",
+                "gpt-oss-120b-medium",
+                "unknown-model",
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                assert_eq!(
+                    provider_pool_key_model_quota_exhausted(&key, "antigravity", model),
+                    Some(blocked),
+                    "model={model}, groups={groups}"
+                );
+            }
+        }
     }
 }

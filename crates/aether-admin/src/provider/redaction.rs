@@ -121,15 +121,6 @@ pub fn admin_provider_upstream_metadata_safe_json(value: Option<&Value>) -> Valu
     if let Some(chatgpt_web) = root.get_mut("chatgpt_web") {
         *chatgpt_web = project_chatgpt_web_metadata(chatgpt_web);
     }
-    if let Some(raw_bindings) = value
-        .and_then(Value::as_object)
-        .and_then(|source| source.get("antigravity_quota_bindings"))
-    {
-        root.insert(
-            "antigravity_quota_bindings".to_string(),
-            admin_safe_antigravity_quota_bindings(Some(raw_bindings)),
-        );
-    }
     redact_upstream_diagnostic_fields(&mut projected);
     projected
 }
@@ -155,27 +146,6 @@ pub fn admin_safe_antigravity_quota_group_key(value: &str) -> Option<&str> {
         return Some(value);
     }
     safe_status_token(value)
-}
-
-/// 投影账号级 Antigravity 模型到配额组的显式绑定，只保留非敏感模型名与合法组键。
-pub fn admin_safe_antigravity_quota_bindings(value: Option<&Value>) -> Value {
-    let Some(bindings) = value.and_then(Value::as_object) else {
-        return json!({});
-    };
-    let mut projected = Map::new();
-    for (model, group_key) in bindings {
-        let Some(model) = safe_display_text(model) else {
-            continue;
-        };
-        let Some(group_key) = group_key
-            .as_str()
-            .and_then(admin_safe_antigravity_quota_group_key)
-        else {
-            continue;
-        };
-        projected.insert(model.to_string(), Value::String(group_key.to_string()));
-    }
-    Value::Object(projected)
 }
 
 pub fn admin_provider_metadata_bucket_safe_json(
@@ -3112,7 +3082,7 @@ mod tests {
     }
 
     #[test]
-    fn status_snapshot_and_metadata_projection_preserve_antigravity_group_keys_and_inclusion() {
+    fn status_snapshot_projection_preserves_antigravity_group_keys_and_inclusion() {
         let snapshot = json!({
             "quota": {
                 "code": "ok",
@@ -3156,21 +3126,5 @@ mod tests {
         assert_eq!(windows[0]["is_exhausted"], json!(false));
         assert!(windows[1].get("quota_group").is_none());
         assert_eq!(windows[1]["is_included"], json!(true));
-
-        let metadata = json!({
-            "antigravity_quota_bindings": {
-                "gemini-4-argon-high": "buckets:[\"opaque-short\",\"opaque-week\"]",
-                "custom-model-key": "id:opaque-pool",
-                "unsafe-model": "https://evil.example?token=secret"
-            }
-        });
-        let projected_metadata = admin_provider_upstream_metadata_safe_json(Some(&metadata));
-        assert_eq!(
-            projected_metadata["antigravity_quota_bindings"],
-            json!({
-                "gemini-4-argon-high": "buckets:[\"opaque-short\",\"opaque-week\"]",
-                "custom-model-key": "id:opaque-pool"
-            })
-        );
     }
 }
