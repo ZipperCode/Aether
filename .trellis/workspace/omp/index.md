@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 22
-- **Last Active**: 2026-10-30
+- **Total Sessions**: 23
+- **Last Active**: 2026-10-31
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~571 | Active |
+| `journal-1.md` | ~593 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 23 | 2026-10-31 | Antigravity reset-only 模型额度耗尽修复 | `03d7cacba` | `master` |
 | 22 | 2026-10-30 | 修复号池耗尽诊断归属并通过 CI | `492bef38f` | `master` |
 | 21 | 2026-10-29 | 修复 CI 阻塞并发布 v0.7.51 | `a5d9fb546` | `master` |
 | 20 | 2026-10-29 | Antigravity 默认 medium 与 Codex 测试修复 | `691f1989b`, `44c7846a3` | `master` |

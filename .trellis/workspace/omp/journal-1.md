@@ -569,3 +569,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 23: Antigravity reset-only 模型额度耗尽修复
+
+**Date**: 2026-10-31
+**Task**: Antigravity reset-only 模型额度耗尽修复
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+统一 admin 与 model-fetch 的 quotaInfo 解析：仅缺失 remainingFraction 且有效 RFC3339 resetTime 时补零，显式无效值保持未知。新增 helper/入口回归及真实 loopback HTTP ordinary、pool/sticky sync/SSE 故障转移与恢复回归；旧解析器失败、修复后通过。6 条计划定向命令及 cargo fmt --all --check 通过。未部署线上、未触发真实账号刷新。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `03d7cacba` | (see git log) |
+
+### Status
+
+[OK] **Completed**
