@@ -326,6 +326,14 @@
                         >
                           {{ keyUiStateMap[key.key_id]?.modelFetchLabel }}
                         </span>
+                        <span
+                          v-if="keyUiStateMap[key.key_id]?.antigravityInactive"
+                          class="text-[10px] text-orange-500 dark:text-orange-400"
+                          :title="legacyT('该账号尚未完成 Gemini Code Assist 激活，无法获取配额和使用模型')"
+                          data-testid="pool-key-antigravity-inactive-desktop"
+                        >
+                          {{ legacyT('账号未激活') }}
+                        </span>
                         <PoolKeyHealthIndicator :score="key.health_score" />
                       </div>
                     </div>
@@ -630,6 +638,14 @@
                   :title="keyUiStateMap[key.key_id]?.modelFetchTitle"
                 >
                   {{ keyUiStateMap[key.key_id]?.modelFetchLabel }}
+                </span>
+                <span
+                  v-if="keyUiStateMap[key.key_id]?.antigravityInactive"
+                  class="text-[10px] text-orange-500 dark:text-orange-400"
+                  :title="legacyT('该账号尚未完成 Gemini Code Assist 激活，无法获取配额和使用模型')"
+                  data-testid="pool-key-antigravity-inactive-mobile"
+                >
+                  {{ legacyT('账号未激活') }}
                 </span>
                 <PoolKeyHealthIndicator :score="key.health_score" />
                 <span
@@ -2218,6 +2234,7 @@ type PoolKeyUiState = {
   canRefreshToken: boolean
   planLabel: string
   planClass: string
+  antigravityInactive: boolean
   accountQuotaText: string | null
   quotaFallbackText: string | null
   quotaTextClass: string
@@ -2303,6 +2320,11 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
         ? resolveAntigravityAccountTierLabel(key.upstream_metadata, legacyT)
         : planType ? formatOAuthPlanType(planType) : '',
       planClass: planType ? getOAuthPlanTypeClass(planType) : '',
+      // 与提供商展开页一致：启用的 OAuth 账号缺少可展示额度时提示尚未激活，不改写调度状态。
+      antigravityInactive: selectedProviderType.value === 'antigravity'
+        && key.is_active
+        && isOAuthManagedCredential(key)
+        && (quotaProgressMap.value[key.key_id]?.length ?? 0) === 0,
       accountQuotaText,
       quotaFallbackText,
       quotaTextClass: accountQuotaText || quotaFallbackText

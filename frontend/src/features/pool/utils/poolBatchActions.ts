@@ -4,6 +4,7 @@ export type PoolBatchActionValue =
   | 'delete'
   | 'refresh_oauth'
   | 'refresh_quota'
+  | 'recover_health'
   | 'clear_proxy'
   | 'set_proxy'
   | 'update_settings'
@@ -21,6 +22,7 @@ export const POOL_BATCH_ACTION_OPTIONS: readonly PoolBatchActionOption[] = [
   { value: 'edit_config', label: '编辑配置', hint: '统一修改支持 API、调度参数与自动获取模型设置。' },
   { value: 'refresh_quota', label: '刷新额度', hint: '调用额度刷新接口，适合核对最新配额状态。' },
   { value: 'refresh_oauth', label: '刷新 OAuth', hint: '仅对 OAuth 账号有效，非 OAuth 账号会自动跳过。' },
+  { value: 'recover_health', label: '重置健康度', hint: '重置所选账号所有格式的健康度、关闭熔断器并启用账号，不发起上游探测。' },
   { value: 'set_proxy', label: '配置代理', hint: '为选中账号绑定独立代理节点。' },
   { value: 'update_settings', label: '更多设置', hint: '选择性修改 RPM、并发、熔断、备注和代理等配置。' },
   { value: 'clear_proxy', label: '清除代理', hint: '移除账号独立代理，回退到提供商默认代理。' },

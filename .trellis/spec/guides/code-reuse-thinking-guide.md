@@ -141,6 +141,7 @@ of that replay model.
 - [ ] Constants defined in one place
 - [ ] Similar patterns follow same structure
 - [ ] Reducer/action transitions live in one reducer or command dispatcher
+- [ ] Account-status UI changes cover both provider details and pool desktop/mobile layouts; batch actions cover credential types, cross-page selection snapshots, and partial failures. See [pool maintenance behavior](../../../README.md#号池账号维护).
 
 ---
 

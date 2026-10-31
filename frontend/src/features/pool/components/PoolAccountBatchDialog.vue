@@ -333,6 +333,7 @@ import {
 } from '@/api/endpoints/pool'
 import { exportKey, refreshProviderQuota } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
+import { recoverKeyHealth } from '@/api/endpoints/health'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import {
   canExportOAuthCredential,
@@ -497,7 +498,7 @@ async function confirmAndExecuteAction(action: PoolBatchActionValue): Promise<vo
   const scopeLabel = selectAllFiltered.value ? '筛选结果' : '已选账号'
   const confirmed = await confirm({
     title: actionLabel,
-    message: `将对${scopeLabel}（${selectedCount.value} 个）执行：${actionLabel}，是否继续？`,
+    message: `将对${scopeLabel}（${selectedCount.value} 个）执行：${actionLabel}，是否继续？${action === 'recover_health' ? `\n${actionOption?.hint}` : ''}`,
     confirmText: actionOption?.destructive ? '确认删除' : '确认执行',
     ...(actionOption?.destructive ? { variant: 'destructive' as const } : {}),
   })
@@ -812,7 +813,7 @@ async function executeAction(actionOverride?: PoolBatchActionValue): Promise<voi
 
         progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
       }
-    } else {
+    } else if (selectedAction.value === 'refresh_oauth' || selectedAction.value === 'recover_health') {
       const CONCURRENCY = props.batchConcurrency || 8
       const tasks: Array<() => Promise<'success' | 'skip'>> = []
       for (const key of selectedKeys) {
@@ -821,7 +822,10 @@ async function executeAction(actionOverride?: PoolBatchActionValue): Promise<voi
           progressDone.value += 1
           continue
         }
-        tasks.push(() => refreshProviderOAuth(key.key_id).then(() => 'success' as const))
+        // 健康恢复适用于所有凭据类型，复用单账号接口，不能套用 OAuth 刷新的跳过条件。
+        tasks.push(() => (selectedAction.value === 'recover_health'
+          ? recoverKeyHealth(key.key_id)
+          : refreshProviderOAuth(key.key_id)).then(() => 'success' as const))
       }
       progressTotal.value = selectedKeys.length
 
