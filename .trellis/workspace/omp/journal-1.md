@@ -635,3 +635,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 26: Antigravity 自动额度组零配置调度
+
+**Date**: 2026-10-31
+**Task**: Antigravity 自动额度组零配置调度
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+按 OmniRoute MIT 规则复刻逐账号自动额度组匹配：独立 Argon 优先，仅缺失时共享 Gemini；五小时/周额度联合阻断，保留精确模型与 reset-only 规则。移除手工绑定 API、备份字段及前端配置。定向 Rust 回归、架构检查、fmt/clippy、前端类型/构建/ESLint 及真实组件浏览器验收通过；本地 HTTP sync/SSE 验证普通/Pool/sticky 故障转移、全耗尽零执行与刷新/到期恢复。未部署或访问真实账号。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8ae7a12e6` | (see git log) |
+
+### Status
+
+[OK] **Completed**
