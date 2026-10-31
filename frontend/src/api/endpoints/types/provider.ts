@@ -247,6 +247,7 @@ export function isAllowedModelsList(value: AllowedModels): value is string[] {
 export interface EndpointAPIKey {
   id: string
   provider_id: string
+  provider_type?: string | null
   api_formats: string[]  // 支持的 endpoint signature 列表（如 "openai:chat"）
   api_key_masked: string
   api_key_plain?: string | null
@@ -330,6 +331,8 @@ export interface EndpointAPIKey {
   status_snapshot?: ProviderKeyStatusSnapshot | null
   // 上游元数据（由上游响应采集，如 Codex 额度信息 / Antigravity 配额信息）
   upstream_metadata?: UpstreamMetadata | null
+  antigravity_quota_bindings?: AntigravityQuotaBindings | null
+  antigravity_quota_models?: string[] | null
   // Key 级别代理配置（覆盖 Provider 级别代理）
   proxy?: ProxyConfig | null
 }
@@ -379,13 +382,42 @@ export interface AntigravityModelQuota {
   model_id?: string | null
   token_type?: string | null
   is_exhausted?: boolean | null
+  disabled?: boolean | null
 }
 
 export type AntigravityAccountInfoStatus = 'success' | 'error' | 'pending' | 'unknown'
 
+export type AntigravityQuotaBindings = Record<string, string>
+
+export interface AntigravityQuotaBucketMetadata {
+  bucket_id?: string | null
+  window?: string | null
+  remaining_fraction?: number | string | null
+  used_percent?: number | string | null
+  reset_time?: string | null
+  reset_at?: number | string | null
+  display_name?: string | null
+  description?: string | null
+  disabled?: boolean | null
+  is_included?: boolean | null
+  is_exhausted?: boolean | null
+}
+
+export interface AntigravityQuotaGroupMetadata {
+  group_id?: string | null
+  quota_group?: string | null
+  display_name?: string | null
+  description?: string | null
+  buckets?: AntigravityQuotaBucketMetadata[] | null
+}
+
 export interface AntigravityUpstreamMetadata {
   updated_at?: number  // Unix 时间戳（秒）
   quota_by_model?: Record<string, AntigravityModelQuota>
+  models?: Record<string, AntigravityModelQuota>
+  model_quotas?: Record<string, AntigravityModelQuota>
+  quota_groups?: AntigravityQuotaGroupMetadata[] | null
+  quota_groups_updated_at?: number | null
   is_forbidden?: boolean  // 账户是否被禁止访问
   forbidden_reason?: string  // 禁止访问原因
   forbidden_at?: number  // 禁止时间（Unix 时间戳，秒）
@@ -561,6 +593,7 @@ export interface UpstreamMetadata {
   grok?: GrokUpstreamMetadata
   gemini_cli?: GeminiCliUpstreamMetadata
   xai?: XaiUpstreamMetadata
+  antigravity_quota_bindings?: AntigravityQuotaBindings | null
 }
 
 // 按格式的健康度数据
@@ -618,6 +651,8 @@ export interface EndpointAPIKeyUpdate {
   model_exclude_patterns?: string[]  // 模型排除规则（支持 * 和 ? 通配符）
   // Key 级别代理配置（覆盖 Provider 级别代理），null=清除
   proxy?: ProxyConfig | null
+  /** Antigravity 精确模型到配额组绑定；必须独立提交，空对象表示清空。 */
+  antigravity_quota_bindings?: AntigravityQuotaBindings
 }
 
 export interface EndpointHealthDetail {

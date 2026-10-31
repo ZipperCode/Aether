@@ -102,6 +102,8 @@ export interface PoolQuotaProgressDisplayItem {
   wrapMeter?: boolean
   /** 为真时只显示紧凑数字，不绘制进度条；最终 Antigravity 摘要不使用该模式。 */
   numericOnly?: boolean
+  /** 窗口被标记为不适用（is_included === false）时隐藏进度条与倒计时。 */
+  notApplicable?: boolean
 }
 
 const props = withDefaults(defineProps<{
@@ -235,44 +237,61 @@ const QuotaProgressRows = defineComponent({
           ? 'flex flex-col gap-1 min-w-0'
           : 'flex flex-col gap-1 min-w-[140px] max-w-[208px]',
     }, [
-      h('div', { class: item.numericOnly ? 'contents' : 'flex items-center justify-between text-[10px] leading-none' }, [
-        h('span', {
-          'data-testid': 'pool-quota-period-label',
-          class: item.numericOnly
-            ? 'min-w-0 truncate text-muted-foreground'
-            : 'text-muted-foreground font-medium shrink-0',
-          title: item.numericOnly ? item.label : undefined,
-        }, item.label),
-        item.resetText && !item.numericOnly
-          ? h('span', {
-            'data-testid': 'pool-quota-reset-text',
-            class: 'text-muted-foreground/80 tabular-nums truncate',
-            title: item.resetText,
-          }, item.resetText)
-          : null,
-      ]),
-      h('div', { class: item.numericOnly ? 'contents' : 'flex items-center gap-1.5' }, [
-        item.numericOnly
-          ? null
-          : h('div', {
-            'data-testid': 'pool-quota-progress-track',
-            class: 'relative flex-1 h-1.5 rounded-full bg-border overflow-hidden',
-          }, [
-            h('div', {
-              class: ['absolute left-0 top-0 h-full rounded-full transition-all duration-300', item.barClass],
-              style: { width: `${item.remainingPercent}%` },
-            }),
-          ]),
-        h('span', {
-          'data-testid': 'pool-quota-meter-text',
-          class: [
-            'text-[10px] font-medium tabular-nums leading-tight',
-            item.wrapMeter ? 'min-w-0 break-all text-right' : 'shrink-0',
-            item.numericOnly ? 'text-right' : '',
-            item.meterClass,
-          ],
-        }, item.meterText),
-      ]),
+      item.notApplicable && !item.numericOnly
+        ? h('div', { class: 'flex items-center justify-between gap-2 text-[10px] leading-none' }, [
+          h('span', {
+            'data-testid': 'pool-quota-period-label',
+            class: 'min-w-0 truncate text-muted-foreground font-medium',
+            title: item.label,
+          }, item.label),
+          h('span', {
+            'data-testid': 'pool-quota-meter-text',
+            class: [
+              'shrink-0 text-[10px] font-medium leading-tight',
+              item.meterClass || 'text-muted-foreground',
+            ],
+          }, item.meterText),
+        ])
+        : h('div', { class: item.numericOnly ? 'contents' : 'flex items-center justify-between text-[10px] leading-none' }, [
+          h('span', {
+            'data-testid': 'pool-quota-period-label',
+            class: item.numericOnly
+              ? 'min-w-0 truncate text-muted-foreground'
+              : 'text-muted-foreground font-medium shrink-0',
+            title: item.numericOnly ? item.label : undefined,
+          }, item.label),
+          item.resetText && !item.numericOnly
+            ? h('span', {
+              'data-testid': 'pool-quota-reset-text',
+              class: 'text-muted-foreground/80 tabular-nums truncate',
+              title: item.resetText,
+            }, item.resetText)
+            : null,
+        ]),
+      item.notApplicable && !item.numericOnly
+        ? null
+        : h('div', { class: item.numericOnly ? 'contents' : 'flex items-center gap-1.5' }, [
+          item.numericOnly
+            ? null
+            : h('div', {
+              'data-testid': 'pool-quota-progress-track',
+              class: 'relative flex-1 h-1.5 rounded-full bg-border overflow-hidden',
+            }, [
+              h('div', {
+                class: ['absolute left-0 top-0 h-full rounded-full transition-all duration-300', item.barClass],
+                style: { width: `${item.remainingPercent}%` },
+              }),
+            ]),
+          h('span', {
+            'data-testid': 'pool-quota-meter-text',
+            class: [
+              'text-[10px] font-medium tabular-nums leading-tight',
+              item.wrapMeter ? 'min-w-0 break-all text-right' : 'shrink-0',
+              item.numericOnly ? 'text-right' : '',
+              item.meterClass,
+            ],
+          }, item.meterText),
+        ]),
     ])))
   },
 })

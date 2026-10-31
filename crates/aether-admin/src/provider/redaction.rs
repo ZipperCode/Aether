@@ -121,8 +121,61 @@ pub fn admin_provider_upstream_metadata_safe_json(value: Option<&Value>) -> Valu
     if let Some(chatgpt_web) = root.get_mut("chatgpt_web") {
         *chatgpt_web = project_chatgpt_web_metadata(chatgpt_web);
     }
+    if let Some(raw_bindings) = value
+        .and_then(Value::as_object)
+        .and_then(|source| source.get("antigravity_quota_bindings"))
+    {
+        root.insert(
+            "antigravity_quota_bindings".to_string(),
+            admin_safe_antigravity_quota_bindings(Some(raw_bindings)),
+        );
+    }
     redact_upstream_diagnostic_fields(&mut projected);
     projected
+}
+
+/// 校验管理端可安全返回的 Antigravity 配额组稳定标识（`id:<ID>` 或 `buckets:[...]`）。
+pub fn admin_safe_antigravity_quota_group_key(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
+        return None;
+    }
+    if let Some(id) = value.strip_prefix("id:") {
+        return safe_status_token(id).map(|_| value);
+    }
+    if let Some(raw_buckets) = value.strip_prefix("buckets:") {
+        let buckets = serde_json::from_str::<Vec<String>>(raw_buckets).ok()?;
+        if buckets.is_empty()
+            || !buckets
+                .iter()
+                .all(|bucket| safe_display_text(bucket).is_some() && !bucket.trim().is_empty())
+        {
+            return None;
+        }
+        return Some(value);
+    }
+    safe_status_token(value)
+}
+
+/// 投影账号级 Antigravity 模型到配额组的显式绑定，只保留非敏感模型名与合法组键。
+pub fn admin_safe_antigravity_quota_bindings(value: Option<&Value>) -> Value {
+    let Some(bindings) = value.and_then(Value::as_object) else {
+        return json!({});
+    };
+    let mut projected = Map::new();
+    for (model, group_key) in bindings {
+        let Some(model) = safe_display_text(model) else {
+            continue;
+        };
+        let Some(group_key) = group_key
+            .as_str()
+            .and_then(admin_safe_antigravity_quota_group_key)
+        else {
+            continue;
+        };
+        projected.insert(model.to_string(), Value::String(group_key.to_string()));
+    }
+    Value::Object(projected)
 }
 
 pub fn admin_provider_metadata_bucket_safe_json(
@@ -1100,9 +1153,10 @@ fn project_quota_window(value: &Value) -> Option<Value> {
     for field in ["label", "model"] {
         copy_safe_display_string_or_null(source, &mut projected, field);
     }
-    for field in ["scope", "unit", "window", "quota_group", "bucket_id"] {
+    for field in ["scope", "unit", "window", "bucket_id"] {
         copy_safe_token_string_or_null(source, &mut projected, field);
     }
+    copy_safe_quota_group_or_null(source, &mut projected, "quota_group");
     for field in ["quota_group_label", "description"] {
         copy_safe_display_string_or_null(source, &mut projected, field);
     }
@@ -1119,7 +1173,9 @@ fn project_quota_window(value: &Value) -> Option<Value> {
     ] {
         copy_json_number_or_null(source, &mut projected, field);
     }
-    copy_json_bool_or_null(source, &mut projected, "is_exhausted");
+    for field in ["is_exhausted", "is_included"] {
+        copy_json_bool_or_null(source, &mut projected, field);
+    }
     if let Some(usage) = source.get("usage") {
         projected.insert("usage".to_string(), project_quota_window_usage(usage));
     }
@@ -1186,6 +1242,24 @@ fn copy_safe_token_string_or_null(
     if value.is_null() {
         target.insert(key.to_string(), Value::Null);
     } else if let Some(value) = value.as_str().and_then(safe_status_token) {
+        target.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn copy_safe_quota_group_or_null(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+    key: &str,
+) {
+    let Some(value) = source.get(key) else {
+        return;
+    };
+    if value.is_null() {
+        target.insert(key.to_string(), Value::Null);
+    } else if let Some(value) = value
+        .as_str()
+        .and_then(admin_safe_antigravity_quota_group_key)
+    {
         target.insert(key.to_string(), Value::String(value.to_string()));
     }
 }
@@ -3034,6 +3108,69 @@ mod tests {
         assert_eq!(
             admin_restore_secret_safe_json(Some(&existing), &projected),
             existing
+        );
+    }
+
+    #[test]
+    fn status_snapshot_and_metadata_projection_preserve_antigravity_group_keys_and_inclusion() {
+        let snapshot = json!({
+            "quota": {
+                "code": "ok",
+                "exhausted": false,
+                "provider_type": "antigravity",
+                "windows": [
+                    {
+                        "code": "group:0:opaque-short",
+                        "label": "Gemini · 5h",
+                        "scope": "quota_group",
+                        "unit": "percent",
+                        "quota_group": "buckets:[\"opaque-short\",\"opaque-week\"]",
+                        "quota_group_label": "Gemini",
+                        "bucket_id": "opaque-short",
+                        "window": "5h",
+                        "used_ratio": 0.0,
+                        "remaining_ratio": 1.0,
+                        "is_exhausted": false,
+                        "is_included": false
+                    },
+                    {
+                        "code": "group:1:evil",
+                        "label": "Unsafe",
+                        "scope": "quota_group",
+                        "quota_group": "https://evil.example/callback?token=secret",
+                        "is_exhausted": false,
+                        "is_included": true
+                    }
+                ]
+            }
+        });
+        let projected_snapshot = admin_provider_status_snapshot_safe_json(Some(&snapshot));
+        let windows = projected_snapshot["quota"]["windows"]
+            .as_array()
+            .expect("projected windows");
+        assert_eq!(
+            windows[0]["quota_group"],
+            json!("buckets:[\"opaque-short\",\"opaque-week\"]")
+        );
+        assert_eq!(windows[0]["is_included"], json!(false));
+        assert_eq!(windows[0]["is_exhausted"], json!(false));
+        assert!(windows[1].get("quota_group").is_none());
+        assert_eq!(windows[1]["is_included"], json!(true));
+
+        let metadata = json!({
+            "antigravity_quota_bindings": {
+                "gemini-4-argon-high": "buckets:[\"opaque-short\",\"opaque-week\"]",
+                "custom-model-key": "id:opaque-pool",
+                "unsafe-model": "https://evil.example?token=secret"
+            }
+        });
+        let projected_metadata = admin_provider_upstream_metadata_safe_json(Some(&metadata));
+        assert_eq!(
+            projected_metadata["antigravity_quota_bindings"],
+            json!({
+                "gemini-4-argon-high": "buckets:[\"opaque-short\",\"opaque-week\"]",
+                "custom-model-key": "id:opaque-pool"
+            })
         );
     }
 }

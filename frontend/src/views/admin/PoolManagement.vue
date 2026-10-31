@@ -1101,8 +1101,10 @@
     <OAuthKeyEditDialog
       :open="oauthKeyEditDialogOpen"
       :editing-key="editingKey"
+      :provider-type="selectedProviderData?.provider_type ?? selectedProviderOverview?.provider_type ?? editingKey?.provider_type ?? null"
       @close="closeOAuthEditDialog"
       @saved="handleDialogSaved"
+      @bindings-saved="handleBindingsSaved"
     />
     <KeyAllowedModelsEditDialog
       v-if="selectedProviderId"
@@ -2183,6 +2185,7 @@ interface QuotaProgressItem {
   remainingPercent: number
   /** 仅用于兼容紧凑数字布局；最终 Antigravity 家族摘要使用普通进度条。 */
   numericOnly?: boolean
+  notApplicable?: boolean
   sortOrder?: number
   detail?: string
   resetAtSeconds?: number | null
@@ -2201,6 +2204,7 @@ interface QuotaProgressDisplayItem {
   meterClass: string
   /** 是否隐藏进度条并采用紧凑数字网格。 */
   numericOnly?: boolean
+  notApplicable?: boolean
 }
 
 type PoolKeyUiState = {
@@ -2243,6 +2247,17 @@ const quotaProgressDisplayMap = computed<Record<string, QuotaProgressDisplayItem
   const map: Record<string, QuotaProgressDisplayItem[]> = {}
   for (const key of keyPage.value.keys) {
     map[key.key_id] = (quotaProgressMap.value[key.key_id] || []).map(item => {
+      if (item.notApplicable) {
+        return {
+          label: getQuotaProgressLabel(item.label),
+          remainingPercent: 0,
+          resetText: '',
+          meterText: item.detail || legacyT('不适用'),
+          barClass: '',
+          meterClass: 'text-muted-foreground',
+          notApplicable: true,
+        }
+      }
       // 倒计时归零表示窗口已越过重置时间点：按“已重置”展示 100%，
       // 不再显示重置前的旧用量文本，与后端读取口径、调度口径保持一致。
       const expired = !item.numericOnly && getQuotaProgressCountdown(item)?.isExpired === true
@@ -2897,10 +2912,12 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
   return {
     id: key.key_id,
     provider_id: selectedProviderId.value || '',
+    provider_type: key.provider_type ?? (selectedProviderType.value || null),
     api_formats: key.api_formats || [],
     api_key_masked: getProviderMaskedSecretLabel(key, selectedProviderType.value),
     auth_type: normalizeAuthTypeForEdit(key),
     auth_type_by_format: key.auth_type_by_format ?? null,
+    allow_auth_channel_mismatch_formats: key.allow_auth_channel_mismatch_formats ?? null,
     credential_kind: key.credential_kind ?? null,
     runtime_auth_kind: key.runtime_auth_kind ?? null,
     oauth_managed: key.oauth_managed ?? undefined,
@@ -2946,6 +2963,9 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     oauth_invalid_at: key.oauth_invalid_at ?? null,
     oauth_invalid_reason: key.oauth_invalid_reason ?? null,
     status_snapshot: key.status_snapshot ?? null,
+    upstream_metadata: key.upstream_metadata ?? null,
+    antigravity_quota_bindings: key.antigravity_quota_bindings ?? key.upstream_metadata?.antigravity_quota_bindings ?? null,
+    antigravity_quota_models: key.antigravity_quota_models ?? null,
     proxy: key.proxy ?? null,
   }
 }
@@ -3053,6 +3073,44 @@ async function handleKeyBatchEditSaved(): Promise<void> {
 async function handleDialogSaved() {
   editingKeyDetail.value = null
   await loadKeys({ silent: true })
+}
+
+async function handleBindingsSaved(updatedKey: EndpointAPIKey) {
+  const applyToPoolDetail = (target: PoolKeyDetail) => {
+    if (updatedKey.antigravity_quota_bindings !== undefined) {
+      target.antigravity_quota_bindings = updatedKey.antigravity_quota_bindings
+    }
+    if (updatedKey.antigravity_quota_models !== undefined) {
+      target.antigravity_quota_models = updatedKey.antigravity_quota_models
+    }
+    if (updatedKey.upstream_metadata !== undefined) {
+      target.upstream_metadata = updatedKey.upstream_metadata
+    }
+    if (updatedKey.status_snapshot !== undefined) {
+      target.status_snapshot = updatedKey.status_snapshot
+    }
+  }
+
+  if (editingKeyDetail.value && editingKeyDetail.value.key_id === updatedKey.id) {
+    const patched = { ...editingKeyDetail.value }
+    applyToPoolDetail(patched)
+    editingKeyDetail.value = patched
+  }
+  const row = keyPage.value.keys.find(item => item.key_id === updatedKey.id)
+  if (row) {
+    applyToPoolDetail(row)
+  }
+  await loadKeys({ silent: true })
+  if (oauthKeyEditDialogOpen.value && editingKeyDetail.value?.key_id === updatedKey.id) {
+    const refreshed = keyPage.value.keys.find(item => item.key_id === updatedKey.id)
+    if (refreshed) {
+      const merged = { ...refreshed }
+      if (merged.antigravity_quota_bindings === undefined && updatedKey.antigravity_quota_bindings !== undefined) {
+        merged.antigravity_quota_bindings = updatedKey.antigravity_quota_bindings
+      }
+      editingKeyDetail.value = merged
+    }
+  }
 }
 
 function closeKeyFormDialog() {
@@ -4084,7 +4142,7 @@ function getQuotaSnapshotWindowsByScope(
 }
 
 function getQuotaWindowUsedPercent(window: QuotaWindowSnapshot | null | undefined): number | null {
-  if (!window) return null
+  if (!window || window.is_included === false || window.unlimited === true) return null
   if (typeof window.used_ratio === 'number') {
     return clampPercent(window.used_ratio * 100)
   }
@@ -4103,7 +4161,7 @@ function getQuotaWindowUsedPercent(window: QuotaWindowSnapshot | null | undefine
 }
 
 function getQuotaWindowRemainingPercent(window: QuotaWindowSnapshot | null | undefined): number | null {
-  if (!window) return null
+  if (!window || window.is_included === false || window.unlimited === true) return null
   if (typeof window.remaining_ratio === 'number') {
     return clampPercent(window.remaining_ratio * 100)
   }
@@ -4389,10 +4447,22 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
     if (windows.length === 0) return []
     return windows
       .map((window, index): QuotaProgressItem | null => {
-        const remainingPercent = getQuotaWindowRemainingPercent(window)
-        if (remainingPercent == null) return null
         const label = resolveAntigravityQuotaGroupLabel(window, t)
         if (!label) return null
+        if (window.is_included === false) {
+          return {
+            label,
+            sortOrder: index,
+            remainingPercent: 0,
+            detail: legacyT('不适用'),
+            notApplicable: true,
+            resetAtSeconds: null,
+            resetSeconds: null,
+            updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+          }
+        }
+        const remainingPercent = getQuotaWindowRemainingPercent(window)
+        if (remainingPercent == null) return null
         return {
           label,
           sortOrder: index,

@@ -229,9 +229,35 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   No group matching, plan inference, cross-bucket fallback or account-wide ban
   is introduced. Historical reset-only records converge after a successful
   normal quota refresh/model discovery, not by replacing the binary alone.
-- Antigravity display-only `quota_group` windows do not infer model relationships
-  or override exact model windows. Structural generic account windows and the
-  adapter's account snapshot fallback remain available.
+- Antigravity `quota_group` windows do not infer model relationships. An
+  administrator can explicitly bind each account's exact discovered upstream
+  model to one saved quota group with a binding-only
+  `PUT /api/admin/endpoints/keys/{id}` body:
+  `{"antigravity_quota_bindings":{"exact-model":"opaque-group-key"}}`.
+  Empty object clears bindings; mixed configuration writes, unknown/disabled
+  account models, unknown groups, and duplicate normalized model identities are
+  rejected. Store the mapping in its own `upstream_metadata.antigravity_quota_bindings`
+  namespace using CAS, so normal quota/model refresh cannot overwrite it.
+  System configuration export/import preserves the optional per-Key
+  `antigravity_quota_bindings` map, including an explicit empty map. Import
+  validates its structure before any Key write; refreshed runtime quota remains
+  independent and is not replaced by restoring administrator bindings.
+- `antigravity_quota_group_key(&Map<String, Value>) -> Option<String>` uses
+  `id:<group_id>` when available, otherwise `buckets:<JSON sorted unique bucket IDs>`.
+  Group ordering/display names do not change identity. No model/tier/prefix
+  inference or cross-pool fallback: Pro/Ultra and Argon associations are account
+  configuration, not static routing policy. A missing binding/group preserves
+  existing exact-model admission rather than guessing a replacement pool.
+- Within an explicitly bound group, enabled buckets are cumulative constraints:
+  any known exhausted bucket whose reset has not elapsed blocks that model.
+  An unknown sibling never hides a known exhausted window. `disabled:true`
+  buckets are ignored and project `is_included:false`; UI shows not applicable,
+  never a consumable percentage. Partial reset cannot release a still-exhausted
+  weekly/short sibling. This group guard is ORed with existing exact-model
+  exhaustion, so a positive shared group never restores an exhausted exact model.
+  Positive refresh or all applicable exhausted deadlines elapsed restores group
+  eligibility; independent authentication/manual guards still apply. Other
+  providers' independent exact-model `all` semantics are unchanged.
 - Antigravity `quota_hard_blocked` derives from the same resettable
   `quota_exhausted` decision. Ordinary and real Pool/sticky Keys reject known
   exhausted models for either `ignore_exhausted_accounts` value, using
@@ -368,6 +394,10 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
 | Matching persisted refresh succeeds or the scoped deadline elapses | Release only the exact Key/model guard; preserve independent manual bans/cooldowns. Positive refresh preserves affinity. |
 | All eligible accounts have the requested exact-model fact active | Return HTTP 503 with zero generation attempts for that model; background quota probes remain eligible. |
 | `fetchAvailableModels` fails but `loadCodeAssist` succeeds | Preserve old quota and never restore an exhausted model from the account observation. |
+| Explicitly bound group has weekly zero / short positive, or the reverse | Block only models bound to that account/group; positive sibling does not mask the exhausted limit. |
+| Short reset elapsed but weekly exhaustion reset is future | Keep the bound model excluded. |
+| Disabled zero bucket with all enabled buckets available | Ignore disabled bucket; show not applicable, no progress percentage/bar. |
+| No explicit binding or the saved group identity disappears | Retain exact-model behavior; require explicit reassociation rather than model-prefix guessing. |
 | Antigravity quota HTTP 401 | Persist hard-invalid Token rejection; display abnormal account and skip ordinary/Pool/sticky serving. |
 | Failed quota refresh after an authentication failure | Preserve the original reason/timestamp; do not restore serving. |
 | Successful quota refresh after Token rejection | Clear recoverable credential failure and immediately restore eligible serving. |
@@ -538,6 +568,19 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   after successful quota refresh. Admin classifier tests distinguish explicit
   account restrictions from parameter/model/project errors without retaining
   upstream secrets.
+- Provider Pool `antigravity_joint_quota_tests` asserts cumulative window
+  blocking, unknown siblings, invalid reset retention, disabled exclusion,
+  elapsed resets, stable group identity, no-binding fallback and exact-model
+  exhaustion precedence.
+- Gateway `gateway_antigravity_joint_group_quota_restores_serving` uses real
+  loopback admin PUT/refresh and native Gemini sync/SSE ordinary/Pool/sticky
+  requests. Assert validation errors, exact account/model execution deltas,
+  both exhausted-window directions, partial resets, unrelated models, all-blocked
+  503, disabled windows, elapsed deadlines and clear-binding recovery. Cover
+  group-ID and sorted opaque bucket-set identities through safe API projection.
+- Browser smoke must operate the real OAuth account editor to select an exact
+  model/group, save only the binding field, clear it, and render disabled quota
+  as not applicable without a progress bar. No new hardcoded model lists.
 - OAuth/transport/admin: preserve Antigravity refresh credentials, Google userinfo
   email, current `quota_by_model` projection, legacy `models` input and RFC3339
   reset parsing. Quota refresh never changes the model catalog or resurrects
@@ -614,3 +657,8 @@ success, or label a rejected Token as merely expired and assume selection stops.
 Correct: retain failures, normalize explicit Token rejection to `oauth_token_invalid`,
 and reuse existing hard-invalid guards. Account verification is a separate
 `[ACCOUNT_BLOCK]` and cannot be healed by a successful quota probe.
+
+For cumulative group windows, wrong: reuse independent model-window `all`
+exhaustion or match Argon to Gemini by prefix. Correct: explicitly bind the
+account's exact model to an upstream group and reject when any enabled
+nonelapsed group limit is known exhausted; preserve independent model guards.

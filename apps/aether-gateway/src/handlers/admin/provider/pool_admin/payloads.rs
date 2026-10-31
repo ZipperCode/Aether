@@ -2,7 +2,10 @@ use crate::handlers::admin::provider::shared::support::{
     AdminProviderPoolConfig, AdminProviderPoolRuntimeState,
 };
 use crate::handlers::admin::request::AdminAppState;
-use crate::handlers::admin::shared::{provider_key_status_snapshot_payload, unix_secs_to_rfc3339};
+use crate::handlers::admin::shared::{
+    antigravity_quota_bindings_payload, antigravity_quota_models_payload,
+    provider_key_status_snapshot_payload, unix_secs_to_rfc3339,
+};
 use crate::provider_key_auth::{
     provider_key_auth_config_is_agent_identity, provider_key_auth_config_uses_header_authorization,
     provider_key_auth_semantics, provider_key_can_export_oauth, provider_key_can_refresh_oauth,
@@ -1475,6 +1478,14 @@ pub(super) fn build_admin_pool_key_payload(
     payload.insert(
         "upstream_metadata".to_string(),
         admin_provider_upstream_metadata_safe_json(key.upstream_metadata.as_ref()),
+    );
+    payload.insert(
+        "antigravity_quota_bindings".to_string(),
+        antigravity_quota_bindings_payload(key, provider_type),
+    );
+    payload.insert(
+        "antigravity_quota_models".to_string(),
+        antigravity_quota_models_payload(key, provider_type),
     );
     payload.insert(
         "proxy".to_string(),

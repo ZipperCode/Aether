@@ -428,16 +428,16 @@
                             :key="item.model"
                             :label="item.label"
                             :title="item.label"
-                            :used-percent="item.usedPercent"
-                            :remaining-percent="item.remainingPercent"
-                            :meter-text="item.detail"
-                            :meter-class="getQuotaRemainingClass(item.usedPercent)"
-                            :bar-class="getQuotaRemainingBarColor(item.usedPercent)"
+                            :used-percent="item.notApplicable ? null : item.usedPercent"
+                            :remaining-percent="item.notApplicable ? null : item.remainingPercent"
+                            :meter-text="item.notApplicable ? legacyT('不适用') : item.detail"
+                            :meter-class="item.notApplicable ? 'text-muted-foreground' : getQuotaRemainingClass(item.usedPercent ?? 0)"
+                            :bar-class="item.notApplicable ? '' : getQuotaRemainingBarColor(item.usedPercent ?? 0)"
                           >
                             <template #footer>
                               <div class="mt-0.5 space-y-0.5">
                                 <div
-                                  v-if="item.resetSeconds !== null"
+                                  v-if="!item.notApplicable && item.resetSeconds !== null"
                                   class="text-[9px] text-muted-foreground/70"
                                 >
                                   <template v-if="item.resetSeconds !== null && item.resetSeconds > 0">
@@ -1026,8 +1026,10 @@
     v-if="open && oauthKeyEditDialogOpen"
     :open="oauthKeyEditDialogOpen"
     :editing-key="editingKey"
+    :provider-type="provider?.provider_type ?? null"
     @close="oauthKeyEditDialogOpen = false"
     @saved="handleKeyChanged"
+    @bindings-saved="handleKeyChanged"
   />
 
   <!-- 模型权限对话框 -->
@@ -2174,7 +2176,8 @@ function getQuotaWindow(
 }
 
 function getQuotaWindowUsedPercent(window: QuotaWindowSnapshot | null | undefined): number | undefined {
-  const used = finiteNumber(window?.used_ratio)
+  if (!window || window.is_included === false || window.unlimited === true) return undefined
+  const used = finiteNumber(window.used_ratio)
   if (used != null) return Math.max(used * 100, 0)
   const remaining = getWindowRemainingPercent(window)
   return remaining == null ? undefined : Math.max(100 - remaining, 0)
@@ -3872,11 +3875,12 @@ function isCodexTeamPlan(key: EndpointAPIKey): boolean {
 interface AntigravityQuotaItem {
   model: string
   label: string
-  usedPercent: number
-  remainingPercent: number
+  usedPercent: number | null
+  remainingPercent: number | null
   resetSeconds: number | null
   /** 家族内剩余百分比的单值或范围文字。 */
   detail?: string
+  notApplicable?: boolean
 }
 
 interface ClaudeCodeQuotaItem {
@@ -4050,9 +4054,22 @@ function getAntigravityQuotaGroupItems(key: EndpointAPIKey): AntigravityQuotaIte
   if (!quota || windows.length === 0) return []
 
   return windows
-    .map((window) => {
+    .map((window): AntigravityQuotaItem | null => {
       const model = String(window.code || window.bucket_id || window.label || '').trim()
       if (!model) return null
+      const label = resolveAntigravityQuotaGroupLabel(window, t)
+      if (!label) return null
+      if (window.is_included === false) {
+        return {
+          model,
+          label,
+          usedPercent: null,
+          remainingPercent: null,
+          resetSeconds: null,
+          detail: legacyT('不适用'),
+          notApplicable: true,
+        } satisfies AntigravityQuotaItem
+      }
 
       const usedPercent = getQuotaWindowUsedPercent(window)
       const remainingPercent = getQuotaWindowRemainingPercent(window)
@@ -4071,7 +4088,7 @@ function getAntigravityQuotaGroupItems(key: EndpointAPIKey): AntigravityQuotaIte
 
       return {
         model,
-        label: resolveAntigravityQuotaGroupLabel(window, t),
+        label,
         usedPercent: normalizedUsedPercent,
         remainingPercent: normalizedRemainingPercent,
         resetSeconds: getQuotaWindowLiveResetSeconds(quota, window),

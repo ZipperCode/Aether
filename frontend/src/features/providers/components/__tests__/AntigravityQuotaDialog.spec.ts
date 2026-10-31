@@ -263,4 +263,46 @@ describe('AntigravityQuotaDialog', () => {
 
     unmount()
   })
+
+  it('renders disabled quota_group buckets with is_included false as 不适用 without a consumable bar or reset countdown', () => {
+    const { root, unmount } = mount({}, {
+      code: 'ok',
+      provider_type: 'antigravity',
+      exhausted: false,
+      windows: [{
+        code: 'group:0:3p-5h',
+        label: 'Claude and GPT models · 5 hour',
+        scope: 'quota_group',
+        quota_group: 'buckets:["3p-5h","3p-weekly"]',
+        quota_group_label: 'Claude and GPT models',
+        bucket_id: '3p-5h',
+        window: '5h',
+        used_ratio: 0,
+        remaining_ratio: 1,
+        is_included: false,
+        reset_at: 1_700_000_000,
+      }, {
+        code: 'group:0:3p-weekly',
+        label: 'Claude and GPT models · Weekly Limit Remaining',
+        scope: 'quota_group',
+        quota_group: 'buckets:["3p-5h","3p-weekly"]',
+        quota_group_label: 'Claude and GPT models',
+        bucket_id: '3p-weekly',
+        window: 'weekly',
+        used_ratio: 1,
+        remaining_ratio: 0,
+        is_included: true,
+        reset_at: Math.floor(Date.now() / 1000) + 7_200,
+      }],
+    })
+
+    const meters = Array.from(root.querySelectorAll('[data-testid="antigravity-quota-item-meter"]'))
+      .map(node => node.textContent?.trim())
+    expect(meters).toEqual(['不适用', '0.0%'])
+    expect(root.querySelectorAll('[data-testid="antigravity-quota-item-bar"]')).toHaveLength(1)
+    expect(root.textContent).not.toContain('100.0%')
+    expect(root.textContent).not.toContain('已重置')
+
+    unmount()
+  })
 })

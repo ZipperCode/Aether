@@ -93,6 +93,7 @@ struct QuotaRuntimeMockState {
     account_b_subscription_tier: String,
     account_a: AccountMockPolicy,
     account_b: AccountMockPolicy,
+    quota_summaries: BTreeMap<bool, serde_json::Value>,
     /// 每个账号+上游模型触发的上游失败；状态码按错误类型区分。
     generation_errors: BTreeMap<(bool, String), AntigravityUpstreamErrorFixture>,
     /// 每个账号+上游模型收到的生成计划次数。
@@ -1203,6 +1204,7 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
             fetch_models_status: 200,
             models: key_b.models.clone(),
         },
+        quota_summaries: BTreeMap::new(),
         generation_errors: BTreeMap::new(),
         generation_counts: BTreeMap::new(),
         generation_plans: Vec::new(),
@@ -1506,6 +1508,7 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
                             .expect("mock state should lock")
                             .reset_rfc3339
                             .clone();
+                        let summary = mock_state_inner.lock().unwrap().quota_summaries.get(&is_account_a).cloned();
                         let result = aether_contracts::ExecutionResult {
                             request_id: plan.request_id,
                             candidate_id: plan.candidate_id,
@@ -1513,7 +1516,7 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
                             headers: BTreeMap::new(),
                             response_observation: None,
                             body: Some(aether_contracts::ResponseBody {
-                                json_body: Some(json!({
+                                json_body: Some(summary.unwrap_or_else(|| json!({
                                     "groups": [{
                                         "displayName": "Claude and GPT models",
                                         "description": "Shared display group",
@@ -1525,7 +1528,7 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
                                             "displayName": "5 hour"
                                         }]
                                     }]
-                                })),
+                                }))),
                                 body_bytes_b64: None,
                             }),
                             telemetry: None,
@@ -4163,5 +4166,297 @@ async fn gateway_antigravity_runtime_account_verification_blocks_serving_impl() 
             )
             .await;
         }
+    }
+}
+
+#[test]
+fn gateway_antigravity_joint_group_quota_restores_serving() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_joint_group_quota_restores_serving",
+        gateway_antigravity_joint_group_quota_restores_serving_impl,
+    );
+}
+
+async fn gateway_antigravity_joint_group_quota_restores_serving_impl() {
+    for pool in [false, true] {
+        let mode = if pool { "joint-pool" } else { "joint-ordinary" };
+        let mut config = antigravity_runtime_quota_http_config(mode, pool);
+        config.key_b.models = antigravity_runtime_quota_models(0.9);
+        let harness = start_antigravity_http_harness(config).await;
+        let future = format_rfc3339_secs(current_unix_secs() + 3600);
+        let past = format_rfc3339_secs(current_unix_secs() - 60);
+        let group_key = if pool {
+            "id:opaque-pool"
+        } else {
+            "buckets:[\"opaque-short\",\"opaque-week\"]"
+        };
+        let summary = |short: f64,
+                       week: f64,
+                       short_reset: &str,
+                       week_reset: &str,
+                       disabled: bool| {
+            let mut result = json!({"groups":[{
+                "displayName":"Shared arbitrary pool",
+                "buckets":[
+                    {"bucketId":"opaque-short", "window":"5h", "remainingFraction":short,"resetTime":short_reset,"disabled":disabled},
+                    {"bucketId":"opaque-week", "window":"weekly", "remainingFraction":week,"resetTime":week_reset}
+                ]
+            }]});
+            if pool {
+                result["groups"][0]["groupId"] = json!("opaque-pool");
+            }
+            result
+        };
+        for account in [true, false] {
+            harness
+                .mock_state
+                .lock()
+                .unwrap()
+                .quota_summaries
+                .insert(account, summary(1.0, 1.0, &future, &future, false));
+        }
+        assert_eq!(harness.send_refresh_quota(None).await["success"], 2);
+        for invalid in [
+            json!({"antigravity_quota_bindings":{"undiscovered":"id:opaque-pool"}}),
+            json!({"antigravity_quota_bindings":{ANTIGRAVITY_RUNTIME_PRIMARY_MODEL:"id:unknown"}}),
+            json!({"antigravity_quota_bindings":{},"name":"mixed-write"}),
+        ] {
+            let response = harness
+                .send_admin_put(
+                    &format!("/api/admin/endpoints/keys/{}", harness.key_a_id),
+                    &invalid,
+                )
+                .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "invalid binding must not mutate configuration"
+            );
+        }
+        for key_id in [&harness.key_a_id, &harness.key_b_id] {
+            let response = harness
+                .send_admin_put(
+                    &format!("/api/admin/endpoints/keys/{key_id}"),
+                    &json!({
+                        "antigravity_quota_bindings": {ANTIGRAVITY_RUNTIME_PRIMARY_MODEL:group_key}
+                    }),
+                )
+                .await;
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert_eq!(status, StatusCode::OK, "binding save: {text}");
+            let returned: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                returned["antigravity_quota_bindings"][ANTIGRAVITY_RUNTIME_PRIMARY_MODEL],
+                group_key
+            );
+            assert!(
+                returned["status_snapshot"]["quota"]["windows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|window| window["quota_group"] == group_key),
+                "opaque identity survives safe API projection"
+            );
+        }
+        let body = json!({"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"temperature":0.2,"thinkingConfig":{"thinkingLevel":"HIGH"}},"session_id":harness.client_session_id});
+        assert_reset_only_serving_step(
+            &harness,
+            "joint-warmup",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::OK,
+            (1, 0),
+        )
+        .await;
+        if pool {
+            assert_eq!(
+                harness.read_sticky().await.as_deref(),
+                Some(harness.key_a_id.as_str())
+            );
+        }
+        let mut b_count = 0;
+        for (step, short, week, short_reset, week_reset, disabled) in [
+            (
+                "weekly-exhausted",
+                1.0,
+                0.0,
+                future.as_str(),
+                future.as_str(),
+                false,
+            ),
+            (
+                "short-exhausted",
+                0.0,
+                1.0,
+                future.as_str(),
+                future.as_str(),
+                false,
+            ),
+            (
+                "short-reset-week-still-exhausted",
+                0.0,
+                0.0,
+                past.as_str(),
+                future.as_str(),
+                false,
+            ),
+        ] {
+            harness.mock_state.lock().unwrap().quota_summaries.insert(
+                true,
+                summary(short, week, short_reset, week_reset, disabled),
+            );
+            assert_eq!(
+                harness
+                    .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
+                    .await["success"],
+                1
+            );
+            for stream in [false, true] {
+                b_count += 1;
+                assert_reset_only_serving_step(
+                    &harness,
+                    step,
+                    ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+                    ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+                    &body,
+                    stream,
+                    StatusCode::OK,
+                    (1, b_count),
+                )
+                .await;
+            }
+        }
+        // 未绑定模型不继承另一个模型的共享池限制。
+        // B 的旧 sticky 仍在，但它的 secondary 精确模型耗尽，必须切到 A 的未绑定模型。
+        let mut b_models = antigravity_runtime_quota_models(0.9);
+        b_models.insert(
+            ANTIGRAVITY_RUNTIME_SECONDARY_MODEL.to_string(),
+            ModelQuotaFixture::with_fraction("Claude", 0.0),
+        );
+        harness.set_account_models(false, b_models);
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids":[&harness.key_b_id]})))
+                .await["success"],
+            1
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "joint-unrelated-model",
+            ANTIGRAVITY_RUNTIME_SECONDARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_SECONDARY_MODEL,
+            &body,
+            false,
+            StatusCode::OK,
+            (1, 0),
+        )
+        .await;
+        harness
+            .mock_state
+            .lock()
+            .unwrap()
+            .quota_summaries
+            .insert(false, summary(1.0, 0.0, &future, &future, false));
+        assert_eq!(harness.send_refresh_quota(None).await["success"], 2);
+        assert_reset_only_serving_step(
+            &harness,
+            "joint-all-exhausted",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            (1, b_count),
+        )
+        .await;
+        // 仍为 0 的短窗口已禁用，不能阻挡有正周额度的 A。
+        harness
+            .mock_state
+            .lock()
+            .unwrap()
+            .quota_summaries
+            .insert(true, summary(0.0, 0.5, &future, &future, true));
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
+                .await["success"],
+            1
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "joint-disabled-window",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::OK,
+            (2, b_count),
+        )
+        .await;
+        harness
+            .mock_state
+            .lock()
+            .unwrap()
+            .quota_summaries
+            .insert(true, summary(0.0, 0.0, &past, &past, false));
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
+                .await["success"],
+            1
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "joint-all-resets-elapsed",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::OK,
+            (3, b_count),
+        )
+        .await;
+        // 管理员清除绑定后回到原有精确模型额度，不篡改上游组观察。
+        harness
+            .mock_state
+            .lock()
+            .unwrap()
+            .quota_summaries
+            .insert(true, summary(1.0, 0.0, &future, &future, false));
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids":[&harness.key_a_id]})))
+                .await["success"],
+            1
+        );
+        let response = harness
+            .send_admin_put(
+                &format!("/api/admin/endpoints/keys/{}", harness.key_a_id),
+                &json!({"antigravity_quota_bindings":{}}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            harness
+                .read_catalog_key(&harness.key_a_id)
+                .await
+                .upstream_metadata
+                .unwrap()["antigravity_quota_bindings"],
+            json!({})
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "joint-binding-cleared",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::OK,
+            (4, b_count),
+        )
+        .await;
     }
 }

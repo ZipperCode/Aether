@@ -442,8 +442,90 @@ pub fn provider_pool_member_quota_snapshot<'a>(
         .then_some(quota_snapshot)
 }
 
+/// 分组身份只来自上游 ID 或完整桶 ID 集，不由展示名、模型前缀或套餐推断。
+pub fn antigravity_quota_group_key(group: &Map<String, Value>) -> Option<String> {
+    if let Some(id) = group
+        .get("group_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return Some(format!("id:{id}"));
+    }
+    let mut ids = group
+        .get("buckets")?
+        .as_array()?
+        .iter()
+        .filter_map(|bucket| bucket.get("bucket_id")?.as_str().map(str::trim))
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    (!ids.is_empty()).then(|| {
+        format!(
+            "buckets:{}",
+            serde_json::to_string(&ids).expect("string IDs serialize")
+        )
+    })
+}
+
+fn antigravity_bound_group_exhausted(key: &StoredProviderCatalogKey, model: &str) -> bool {
+    let Some(metadata) = key.upstream_metadata.as_ref() else {
+        return false;
+    };
+    let Some(bindings) = metadata
+        .get("antigravity_quota_bindings")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(group_key) = bindings.iter().find_map(|(bound_model, group)| {
+        bound_model
+            .trim()
+            .eq_ignore_ascii_case(model.trim())
+            .then(|| group.as_str())
+            .flatten()
+    }) else {
+        return false;
+    };
+    let Some(bucket) = metadata.get("antigravity").and_then(Value::as_object) else {
+        return false;
+    };
+    let observed_at = provider_pool_timestamp_unix_secs(bucket.get("quota_groups_updated_at"))
+        .or_else(|| provider_pool_timestamp_unix_secs(bucket.get("updated_at")));
+    let now = provider_pool_current_unix_secs();
+    bucket
+        .get("quota_groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter(|group| {
+            group
+                .get("quota_group")
+                .and_then(Value::as_str)
+                .map_or_else(
+                    || antigravity_quota_group_key(group).as_deref() == Some(group_key),
+                    |identity| identity == group_key,
+                )
+        })
+        .filter_map(|group| group.get("buckets").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_object)
+        .any(|window| {
+            // 同一池的五小时和周限制是累计约束；禁用窗口不是另一份可消费额度。
+            provider_pool_json_bool(window.get("disabled")) != Some(true)
+                && provider_pool_json_bool(window.get("is_included")) != Some(false)
+                && provider_pool_quota_window_has_observation(window)
+                && provider_pool_quota_window_is_exhausted(window)
+                && !now.is_some_and(|now| {
+                    provider_pool_reset_deadline_elapsed(window, observed_at, now)
+                })
+        })
+}
+
 /// 按上游模型、模型族或分组窗口解析可恢复额度；账号状态与较新的原始元数据共同参与。
-/// 找不到模型桶时返回 None；显式模型窗口均耗尽才阻断，通用窗口仍按任一耗尽判断。
+/// 找不到模型桶时返回 None；显式绑定组先按任一启用窗口耗尽阻断，独立模型窗口保持均耗尽规则。
 ///
 /// Providers are free to expose quota windows in different shapes.  Newer
 /// snapshots should put an explicit `model`/`models` (or `quota_group`) on a
@@ -457,6 +539,11 @@ pub(crate) fn provider_pool_model_quota_exhausted(
     provider_type: &str,
     provider_model_name: &str,
 ) -> Option<bool> {
+    if provider_type.trim().eq_ignore_ascii_case("antigravity")
+        && antigravity_bound_group_exhausted(key, provider_model_name)
+    {
+        return Some(true);
+    }
     // 官方来源已经包含套餐归属，不能再由旧扁平模型/通用窗口覆盖保守的账号判断。
     if let Some(snapshot) = provider_pool_member_quota_snapshot(key, provider_type) {
         if let Some(exhausted) = source_account_exhausted(

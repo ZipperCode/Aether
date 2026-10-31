@@ -397,7 +397,7 @@ function getWindowDisplay(window: QuotaWindowSnapshot, index: number): GenericQu
     : used != null ? `已用 ${used}${limit != null ? ` / ${limit}` : ''} ${unit}`
       : limit != null ? `上限 ${limit} ${unit}` : null
   const isCountUnit = window.unit === 'requests' || window.unit === 'count' || isFreeModelDaily
-  const meterText = window.is_included === false ? '套餐不包含'
+  const meterText = window.is_included === false ? '不适用'
     : window.unlimited === true ? '不限额'
       : isCountUnit && valueDetail && percent != null
         ? `${valueDetail} · 剩余 ${formatPercent(percent)}`
@@ -406,8 +406,9 @@ function getWindowDisplay(window: QuotaWindowSnapshot, index: number): GenericQu
           : valueDetail ?? '额度未知'
   const resetAt = formatQuotaDateTime(window.reset_at) || normalizeText(window.reset_at_text)
   const resetSeconds = finiteNumber(window.reset_seconds)
-  const resetText = resetAt ? `重置 ${resetAt}`
-    : resetSeconds != null ? `${Math.ceil(Math.max(resetSeconds, 0) / 60)} 分钟后重置` : null
+  const resetText = window.is_included === false ? null
+    : resetAt ? `重置 ${resetAt}`
+      : resetSeconds != null ? `${Math.ceil(Math.max(resetSeconds, 0) / 60)} 分钟后重置` : null
   const detail = window.is_included === false || window.unlimited === true ? null
     : isCountUnit
       ? null

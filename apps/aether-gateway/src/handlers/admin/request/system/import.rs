@@ -944,6 +944,42 @@ fn build_import_key_match_name(item: &ImportedProviderKey) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn normalize_imported_antigravity_quota_bindings(
+    provider_type: &str,
+    bindings: Option<&BTreeMap<String, String>>,
+) -> Result<Option<Value>, String> {
+    let Some(bindings) = bindings else {
+        return Ok(None);
+    };
+    if !provider_type.trim().eq_ignore_ascii_case("antigravity") {
+        return Err("仅 Antigravity Provider 支持 antigravity_quota_bindings".to_string());
+    }
+    let mut seen = BTreeSet::new();
+    let mut normalized = Map::new();
+    for (raw_model, raw_group_key) in bindings {
+        let model = raw_model.trim();
+        if model.is_empty()
+            || model.len() > 256
+            || model.chars().any(char::is_control)
+            || model.starts_with("RateLimitResetCredit_")
+        {
+            return Err("导入的 Antigravity 模型绑定名称无效".to_string());
+        }
+        let Some(group_key) =
+            aether_admin::provider::redaction::admin_safe_antigravity_quota_group_key(
+                raw_group_key,
+            )
+        else {
+            return Err(format!("导入的模型 {model} 配额组键无效"));
+        };
+        if !seen.insert(model.to_ascii_lowercase()) {
+            return Err(format!("导入的模型 {model} 存在重复的配额组绑定"));
+        }
+        normalized.insert(model.to_string(), Value::String(group_key.to_string()));
+    }
+    Ok(Some(Value::Object(normalized)))
+}
+
 fn normalize_selected_import_key_format(
     value: &str,
     allowed_formats: &BTreeSet<String>,
@@ -3381,6 +3417,11 @@ impl<'a> AdminAppState<'a> {
                 let credentials_not_exported = invalid!(
                     validate_imported_provider_key_credential_state(&imported_key)
                 );
+                let normalized_antigravity_quota_bindings =
+                    invalid!(normalize_imported_antigravity_quota_bindings(
+                        &provider.provider_type,
+                        imported_key.antigravity_quota_bindings.as_ref(),
+                    ));
                 if imported_provider_credential_identity(
                     &imported_key,
                     &auth_type,
@@ -3484,6 +3525,15 @@ impl<'a> AdminAppState<'a> {
                         imported_key.fingerprint.clone(),
                         "fingerprint",
                     ));
+                    if let Some(bindings) = normalized_antigravity_quota_bindings {
+                        let mut metadata = record
+                            .upstream_metadata
+                            .take()
+                            .and_then(|value| value.as_object().cloned())
+                            .unwrap_or_default();
+                        metadata.insert("antigravity_quota_bindings".to_string(), bindings);
+                        record.upstream_metadata = Some(Value::Object(metadata));
+                    }
                 }
                 if let Some(index) = existing_key_index {
                     existing_keys[index] = record;
@@ -6343,6 +6393,11 @@ impl<'a> AdminAppState<'a> {
                 let credentials_not_exported = invalid!(
                     validate_imported_provider_key_credential_state(&imported_key)
                 );
+                let normalized_antigravity_quota_bindings =
+                    invalid!(normalize_imported_antigravity_quota_bindings(
+                        &provider.provider_type,
+                        imported_key.antigravity_quota_bindings.as_ref(),
+                    ));
                 let normalized_raw_key = normalize_import_key_raw_payload(
                     &raw_key,
                     &auth_type,
@@ -6488,6 +6543,26 @@ impl<'a> AdminAppState<'a> {
                                 };
                                 persisted = reloaded;
                             }
+                            if let Some(bindings) = normalized_antigravity_quota_bindings {
+                                self.app()
+                                    .upsert_provider_catalog_key_upstream_metadata_namespace(
+                                        &persisted.id,
+                                        "antigravity_quota_bindings",
+                                        &bindings,
+                                        updated.updated_at_unix_secs,
+                                    )
+                                    .await?;
+                                if let Some(reloaded) = self
+                                    .read_provider_catalog_keys_by_ids(std::slice::from_ref(
+                                        &persisted.id,
+                                    ))
+                                    .await?
+                                    .into_iter()
+                                    .next()
+                                {
+                                    persisted = reloaded;
+                                }
+                            }
                             if oauth_credentials_supplied {
                                 let Some(reloaded) = self
                                     .reset_provider_catalog_key_recovery_state_fenced(
@@ -6565,6 +6640,15 @@ impl<'a> AdminAppState<'a> {
                     ),
                     "fingerprint",
                 ));
+                if let Some(bindings) = normalized_antigravity_quota_bindings {
+                    let mut metadata = record
+                        .upstream_metadata
+                        .take()
+                        .and_then(|value| value.as_object().cloned())
+                        .unwrap_or_default();
+                    metadata.insert("antigravity_quota_bindings".to_string(), bindings);
+                    record.upstream_metadata = Some(Value::Object(metadata));
+                }
                 let Some(created) = self.create_provider_catalog_key(&record).await? else {
                     return Ok(Err(invalid_request(format!(
                         "创建 Provider '{provider_name}' 的 Key 失败"
@@ -9449,6 +9533,7 @@ mod tests {
             is_active: true,
             proxy: None,
             fingerprint: None,
+            antigravity_quota_bindings: None,
             credential_state: None,
         };
 
@@ -9542,6 +9627,7 @@ mod tests {
             is_active: false,
             proxy: None,
             fingerprint: None,
+            antigravity_quota_bindings: None,
             credential_state: Some("not_exported".to_string()),
         };
 

@@ -62,14 +62,15 @@ pub use providers::{
     ZHIPU_TEAM_QUOTA_URL,
 };
 pub use quota::{
-    provider_pool_codex_metadata_has_account_quota, provider_pool_key_account_quota_exhausted,
-    provider_pool_key_balance_below_minimum, provider_pool_key_minimum_quota_reached,
-    provider_pool_key_model_quota_exhausted, provider_pool_key_model_quota_hard_blocked,
-    provider_pool_key_quota_hard_blocked, provider_pool_key_runtime_quota_blocked,
-    provider_pool_key_scheduling_label, provider_pool_key_supports_discovered_model,
-    provider_pool_member_quota_snapshot, provider_pool_quota_metadata_provider_type,
-    provider_pool_quota_metadata_updated_at, provider_pool_quota_snapshot_updated_at,
-    provider_pool_reset_deadline_elapsed, resolve_provider_pool_key_thinking_model,
+    antigravity_quota_group_key, provider_pool_codex_metadata_has_account_quota,
+    provider_pool_key_account_quota_exhausted, provider_pool_key_balance_below_minimum,
+    provider_pool_key_minimum_quota_reached, provider_pool_key_model_quota_exhausted,
+    provider_pool_key_model_quota_hard_blocked, provider_pool_key_quota_hard_blocked,
+    provider_pool_key_runtime_quota_blocked, provider_pool_key_scheduling_label,
+    provider_pool_key_supports_discovered_model, provider_pool_member_quota_snapshot,
+    provider_pool_quota_metadata_provider_type, provider_pool_quota_metadata_updated_at,
+    provider_pool_quota_snapshot_updated_at, provider_pool_reset_deadline_elapsed,
+    resolve_provider_pool_key_thinking_model,
 };
 pub use quota_refresh::{
     official_balance_backoff_secs, official_balance_backoff_with_jitter_secs,
@@ -4184,3 +4185,130 @@ mod tests {
 }
 mod singleflight;
 pub use singleflight::AsyncSingleflight;
+
+#[cfg(test)]
+mod antigravity_joint_quota_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn antigravity_bound_group_requires_all_enabled_windows_available() {
+        let future = 4_102_444_800u64;
+        let past = 1u64;
+        for (short, weekly, short_reset, weekly_reset, short_disabled, blocked) in [
+            (1.0, 0.0, future, future, false, true),
+            (0.0, 1.0, future, future, false, true),
+            (0.0, 0.0, past, future, false, true),
+            (0.0, 1.0, past, future, false, false),
+            (0.0, 1.0, future, future, true, false),
+            (1.0, 1.0, future, future, false, false),
+        ] {
+            let group = json!({"display_name":"arbitrary", "buckets":[
+                {"bucket_id":"opaque-short", "remaining_fraction":short, "reset_time":short_reset, "disabled":short_disabled},
+                {"bucket_id":"opaque-week", "remaining_fraction":weekly, "reset_time":weekly_reset}
+            ]});
+            let group_key = antigravity_quota_group_key(group.as_object().unwrap()).unwrap();
+            let mut key =
+                aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
+                    "key".into(),
+                    "provider".into(),
+                    "account".into(),
+                    "oauth".into(),
+                    None,
+                    true,
+                )
+                .unwrap();
+            key.upstream_metadata = Some(json!({
+                "antigravity_quota_bindings":{"gemini-exact-medium":group_key},
+                "antigravity":{"quota_by_model":{"gemini-exact-medium":{"remaining_fraction":1.0}, "unrelated":{"remaining_fraction":1.0}},"quota_groups":[group]}
+            }));
+            assert_eq!(
+                provider_pool_key_model_quota_exhausted(
+                    &key,
+                    "antigravity",
+                    " GEMINI-EXACT-MEDIUM "
+                ),
+                Some(blocked)
+            );
+            assert_eq!(
+                provider_pool_key_model_quota_exhausted(&key, "antigravity", "unrelated"),
+                Some(false)
+            );
+            key.upstream_metadata.as_mut().unwrap()["antigravity"]["quota_by_model"]
+                ["gemini-exact-medium"] = json!({"remaining_fraction":0.0,"reset_time":future});
+            assert_eq!(
+                provider_pool_key_model_quota_exhausted(&key, "antigravity", "gemini-exact-medium"),
+                Some(true),
+                "positive group must never override exhausted exact model"
+            );
+            key.upstream_metadata.as_mut().unwrap()["antigravity"]["quota_by_model"]
+                ["gemini-exact-medium"] = json!({"remaining_fraction":1.0});
+            key.upstream_metadata
+                .as_mut()
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("antigravity_quota_bindings");
+            assert_eq!(
+                provider_pool_key_model_quota_exhausted(&key, "antigravity", "gemini-exact-medium"),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_group_identity_ignores_display_and_bucket_order() {
+        let a = json!({"display_name":"one","buckets":[{"bucket_id":"b"},{"bucket_id":"a"}]});
+        let b = json!({"display_name":"two","buckets":[{"bucket_id":"a"},{"bucket_id":"b"}]});
+        assert_eq!(
+            antigravity_quota_group_key(a.as_object().unwrap()),
+            antigravity_quota_group_key(b.as_object().unwrap())
+        );
+        assert_eq!(
+            antigravity_quota_group_key(json!({"display_name":"Gemini"}).as_object().unwrap()),
+            None
+        );
+        assert_eq!(
+            antigravity_quota_group_key(json!({"group_id":"opaque"}).as_object().unwrap()),
+            Some("id:opaque".into())
+        );
+    }
+
+    #[test]
+    fn antigravity_bound_group_unknown_window_does_not_hide_known_exhaustion() {
+        let mut key =
+            aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
+                "key".into(),
+                "provider".into(),
+                "account".into(),
+                "oauth".into(),
+                None,
+                true,
+            )
+            .unwrap();
+        key.upstream_metadata = Some(json!({
+            "antigravity_quota_bindings":{"exact-model":"id:pool"},
+            "antigravity":{"quota_by_model":{"exact-model":{"remaining_fraction":1.0}},
+                "quota_groups":[{"group_id":"pool","quota_group":"id:pool","buckets":[
+                    {"bucket_id":"short"},
+                    {"bucket_id":"week","remaining_fraction":0.0,"reset_time":"invalid"}
+                ]}]}
+        }));
+        assert_eq!(
+            provider_pool_key_model_quota_exhausted(&key, "antigravity", "exact-model"),
+            Some(true)
+        );
+        key.upstream_metadata.as_mut().unwrap()["antigravity"]["quota_groups"][0]["buckets"][1] =
+            json!({"bucket_id":"week"});
+        assert_eq!(
+            provider_pool_key_model_quota_exhausted(&key, "antigravity", "exact-model"),
+            Some(false)
+        );
+        key.upstream_metadata.as_mut().unwrap()["antigravity_quota_bindings"]["exact-model"] =
+            json!("id:missing-group");
+        assert_eq!(
+            provider_pool_key_model_quota_exhausted(&key, "antigravity", "exact-model"),
+            Some(false)
+        );
+    }
+}

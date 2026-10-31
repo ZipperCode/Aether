@@ -35,6 +35,8 @@ pub(crate) use self::auth_api_key_secret::{
     decrypt_or_migrate_auth_api_key_secret, open_auth_api_key_secret, seal_auth_api_key_secret,
 };
 pub(crate) use self::catalog::{
+    antigravity_authoritative_model_map, antigravity_model_entry_is_disabled,
+    antigravity_quota_bindings_payload, antigravity_quota_models_payload,
     build_admin_provider_key_response, decrypt_catalog_secret_or_legacy_plaintext,
     decrypt_catalog_secret_with_fallbacks, default_provider_key_status_snapshot,
     effective_catalog_encryption_key, encrypt_catalog_secret_with_fallbacks,

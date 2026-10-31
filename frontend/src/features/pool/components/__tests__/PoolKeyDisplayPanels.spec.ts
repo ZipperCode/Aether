@@ -576,4 +576,75 @@ describe('pool key display panels', () => {
     root.remove()
   })
 
+  it('renders notApplicable quota rows as 不适用 without a progress bar on desktop and mobile', () => {
+    for (const variant of ['desktop', 'mobile'] as const) {
+      const root = document.createElement('div')
+      document.body.appendChild(root)
+      const app = createApp(PoolKeyQuotaPanel, {
+        variant,
+        items: [
+          {
+            label: 'Claude and GPT models · 5小时',
+            remainingPercent: 0,
+            resetText: '',
+            meterText: '不适用',
+            barClass: '',
+            meterClass: 'text-muted-foreground',
+            notApplicable: true,
+          },
+          {
+            label: 'Claude and GPT models · 周',
+            remainingPercent: 0,
+            resetText: '2h后重置',
+            meterText: '0.0%',
+            barClass: 'bg-red-500',
+            meterClass: 'text-red-600',
+          },
+        ],
+      })
+      app.use(createI18n())
+      app.mount(root)
+
+      const meters = Array.from(root.querySelectorAll('[data-testid="pool-quota-meter-text"]'))
+        .map(node => node.textContent?.trim())
+      expect(meters).toEqual(['不适用', '0.0%'])
+      expect(root.querySelectorAll('[data-testid="pool-quota-progress-track"]')).toHaveLength(1)
+      expect(root.querySelectorAll('[data-testid="pool-quota-reset-text"]')).toHaveLength(1)
+
+      app.unmount()
+      root.remove()
+    }
+  })
+
+  it('renders structured quota windows with is_included false as 不适用 without a progress bar', () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(PoolKeyQuotaPanel, {
+      items: [],
+      providerType: 'zhipu',
+      quota: {
+        code: 'ok',
+        exhausted: false,
+        kind: 'subscription',
+        windows: [{
+          code: 'disabled_window',
+          label: '附加窗口',
+          remaining_ratio: 1,
+          used_ratio: 0,
+          is_included: false,
+          reset_at: 1_700_000_000,
+        }],
+      },
+    })
+    app.use(createI18n())
+    app.mount(root)
+
+    expect(root.querySelector('[data-testid="provider-quota-progress-meter"]')?.textContent?.trim()).toBe('不适用')
+    expect(root.querySelector('[data-testid="provider-quota-progress-bar"]')).toBeNull()
+    expect(root.textContent).not.toContain('100.0%')
+
+    app.unmount()
+    root.remove()
+  })
+
 })

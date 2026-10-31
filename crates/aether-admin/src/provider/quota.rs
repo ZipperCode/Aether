@@ -1,5 +1,6 @@
 use aether_contracts::ExecutionResult;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
+use aether_provider_pool::antigravity_quota_group_key;
 use aether_provider_transport::antigravity::antigravity_quota_info_remaining_fraction;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -305,6 +306,9 @@ pub fn parse_antigravity_usage_response(
         ) {
             payload.insert("display_name".to_string(), json!(display_name));
         }
+        if model_value.get("disabled").and_then(coerce_json_bool) == Some(true) {
+            payload.insert("disabled".to_string(), json!(true));
+        }
 
         let quota_info = model_value
             .get("quotaInfo")
@@ -393,12 +397,18 @@ pub fn parse_antigravity_quota_summary_response(
                     .or_else(|| bucket.get("display_name")),
             );
             let bucket_description = coerce_json_string(bucket.get("description"));
+            let disabled = bucket
+                .get("disabled")
+                .or_else(|| bucket.get("is_disabled"))
+                .and_then(coerce_json_bool);
+            let is_disabled = disabled == Some(true);
 
             if window.is_none()
                 && remaining_fraction.is_none()
                 && reset_time.is_none()
                 && bucket_display_name.is_none()
                 && bucket_description.is_none()
+                && disabled.is_none()
             {
                 continue;
             }
@@ -408,6 +418,10 @@ pub fn parse_antigravity_quota_summary_response(
             if let Some(window) = window {
                 parsed_bucket.insert("window".to_string(), json!(window));
             }
+            if let Some(disabled) = disabled {
+                parsed_bucket.insert("disabled".to_string(), json!(disabled));
+            }
+            parsed_bucket.insert("is_included".to_string(), json!(!is_disabled));
             if let Some(remaining_fraction) = remaining_fraction {
                 parsed_bucket.insert("remaining_fraction".to_string(), json!(remaining_fraction));
                 parsed_bucket.insert(
@@ -416,8 +430,10 @@ pub fn parse_antigravity_quota_summary_response(
                 );
                 parsed_bucket.insert(
                     "is_exhausted".to_string(),
-                    json!(remaining_fraction <= 1e-6),
+                    json!(!is_disabled && remaining_fraction <= 1e-6),
                 );
+            } else if is_disabled {
+                parsed_bucket.insert("is_exhausted".to_string(), json!(false));
             }
             if let Some(reset_time) = reset_time {
                 parsed_bucket.insert("reset_time".to_string(), reset_time);
@@ -446,6 +462,9 @@ pub fn parse_antigravity_quota_summary_response(
             "buckets".to_string(),
             serde_json::Value::Array(parsed_buckets),
         );
+        if let Some(quota_group) = antigravity_quota_group_key(&parsed_group) {
+            parsed_group.insert("quota_group".to_string(), json!(quota_group));
+        }
         parsed_groups.push(serde_json::Value::Object(parsed_group));
     }
 
@@ -7687,13 +7706,79 @@ mod tests {
         }))
         .expect("grouped Antigravity quota should parse");
 
+        assert_eq!(
+            groups[0]["quota_group"],
+            json!("buckets:[\"3p-5h\",\"3p-weekly\"]")
+        );
         assert_eq!(groups[0]["display_name"], json!("Claude and GPT models"));
         assert_eq!(groups[0]["description"], json!("Shared quota"));
         assert_eq!(groups[0]["buckets"][0]["bucket_id"], json!("3p-5h"));
         assert_eq!(groups[0]["buckets"][0]["window"], json!("5h"));
         assert_eq!(groups[0]["buckets"][0]["remaining_fraction"], json!(0.25));
         assert_eq!(groups[0]["buckets"][0]["used_percent"], json!(75.0));
+        assert_eq!(groups[0]["buckets"][0]["is_included"], json!(true));
         assert_eq!(groups[0]["buckets"][1]["bucket_id"], json!("3p-weekly"));
+        assert_eq!(groups[0]["buckets"][1]["is_included"], json!(true));
+    }
+
+    #[test]
+    fn parses_antigravity_grouped_quota_disabled_buckets_without_exhaustion_and_preserves_group_id()
+    {
+        let groups = parse_antigravity_quota_summary_response(&json!({
+            "groups": [
+                {
+                    "groupId": "opaque-pool",
+                    "displayName": "Gemini models",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-5h",
+                            "window": "5h",
+                            "remainingFraction": 0.0,
+                            "resetTime": "2026-05-05T05:00:00Z",
+                            "disabled": true
+                        },
+                        {
+                            "bucketId": "gemini-weekly",
+                            "window": "weekly",
+                            "remainingFraction": 0.0,
+                            "resetTime": "2026-05-11T00:00:00Z"
+                        }
+                    ]
+                },
+                {
+                    "displayName": "Order independent bucket key",
+                    "buckets": [
+                        {
+                            "bucketId": "zeta-bucket",
+                            "disabled": true
+                        },
+                        {
+                            "bucketId": "alpha-bucket",
+                            "window": "weekly",
+                            "remainingFraction": 0.5
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("grouped Antigravity quota with disabled buckets should parse");
+
+        assert_eq!(groups[0]["group_id"], json!("opaque-pool"));
+        assert_eq!(groups[0]["quota_group"], json!("id:opaque-pool"));
+        assert_eq!(groups[0]["buckets"][0]["disabled"], json!(true));
+        assert_eq!(groups[0]["buckets"][0]["is_included"], json!(false));
+        assert_eq!(groups[0]["buckets"][0]["is_exhausted"], json!(false));
+        assert_eq!(groups[0]["buckets"][1]["is_included"], json!(true));
+        assert_eq!(groups[0]["buckets"][1]["is_exhausted"], json!(true));
+
+        assert_eq!(
+            groups[1]["quota_group"],
+            json!("buckets:[\"alpha-bucket\",\"zeta-bucket\"]")
+        );
+        assert_eq!(groups[1]["buckets"][0]["bucket_id"], json!("zeta-bucket"));
+        assert_eq!(groups[1]["buckets"][0]["disabled"], json!(true));
+        assert_eq!(groups[1]["buckets"][0]["is_included"], json!(false));
+        assert_eq!(groups[1]["buckets"][0]["is_exhausted"], json!(false));
     }
 
     #[test]

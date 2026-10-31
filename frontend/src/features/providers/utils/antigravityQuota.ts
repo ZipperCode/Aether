@@ -1,4 +1,8 @@
-import type { QuotaWindowSnapshot, UpstreamMetadata } from '@/api/endpoints/types'
+import type {
+  ProviderKeyStatusSnapshot,
+  QuotaWindowSnapshot,
+  UpstreamMetadata,
+} from '@/api/endpoints/types'
 
 /** 可参与 Antigravity 排序和家族汇总的原始模型额度条目。 */
 export interface AntigravityQuotaSortableItem {
@@ -230,4 +234,266 @@ export function resolveAntigravityAccountTierLabel(
   if (tier === 'pro') return 'Pro'
   if (tier === 'ultra') return 'Ultra'
   return translate ? translate('未知') : 'Unknown'
+}
+
+export interface AntigravityBindingCarrier {
+  provider_type?: string | null
+  antigravity_quota_bindings?: Record<string, string> | null
+  antigravity_quota_models?: string[] | null
+  status_snapshot?: ProviderKeyStatusSnapshot | null
+  upstream_metadata?: UpstreamMetadata | null
+}
+
+export interface AntigravityQuotaModelOption {
+  /** 精确上游模型 ID，提交时保持原值。 */
+  model: string
+  /** 账号元数据中的原始可读名称（与 model 不同时提供辅助识别）。 */
+  displayName: string | null
+}
+
+export interface AntigravityQuotaGroupOption {
+  /** 服务端生成的稳定配额组标识（id:<ID> 或 buckets:[...]），绝不根据展示名合成。 */
+  key: string
+  /** 配额组展示名称。 */
+  label: string
+  /** 组内周期摘要（如“周 · 5小时”）。 */
+  periodsText: string | null
+  /** 可选配额组说明。 */
+  description: string | null
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isStableAntigravityGroupKey(value: string): boolean {
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  return !/^group:\d+$/i.test(trimmed)
+}
+
+/** 判断当前编辑或展示的 Key 是否属于 Antigravity 提供商。 */
+export function isAntigravityProviderKey(
+  input?: AntigravityBindingCarrier | null,
+  fallbackProviderType?: string | null,
+): boolean {
+  const candidates = [
+    fallbackProviderType,
+    input?.provider_type,
+    input?.status_snapshot?.quota?.provider_type,
+  ]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().toLowerCase() === 'antigravity') {
+      return true
+    }
+  }
+  if (input?.antigravity_quota_bindings !== undefined && input.antigravity_quota_bindings !== null) {
+    return true
+  }
+  if (input?.antigravity_quota_models !== undefined && input.antigravity_quota_models !== null) {
+    return true
+  }
+  return isPlainRecord(input?.upstream_metadata?.antigravity)
+}
+
+/** 读取账号当前已保存的模型配额组绑定映射。 */
+export function readAntigravityQuotaBindings(
+  input?: AntigravityBindingCarrier | null,
+): Record<string, string> {
+  const raw = isPlainRecord(input?.antigravity_quota_bindings)
+    ? input?.antigravity_quota_bindings
+    : isPlainRecord(input?.upstream_metadata?.antigravity_quota_bindings)
+      ? input?.upstream_metadata?.antigravity_quota_bindings
+      : null
+  if (!raw) return {}
+
+  const result: Record<string, string> = {}
+  for (const [rawModel, rawGroupKey] of Object.entries(raw)) {
+    const model = rawModel.trim()
+    const groupKey = typeof rawGroupKey === 'string' ? rawGroupKey.trim() : ''
+    if (!model || !groupKey) continue
+    result[model] = groupKey
+  }
+  return result
+}
+
+function findAuthoritativeAntigravityModelMap(
+  metadata?: UpstreamMetadata | null,
+): Record<string, unknown> | null {
+  const antigravity = metadata?.antigravity
+  if (!isPlainRecord(antigravity)) return null
+  for (const field of ['quota_by_model', 'models', 'model_quotas'] as const) {
+    const candidate = antigravity[field]
+    if (isPlainRecord(candidate)) {
+      return candidate
+    }
+  }
+  return null
+}
+
+function collectRawModelDisplayNames(
+  input?: AntigravityBindingCarrier | null,
+): Map<string, string> {
+  const byLowerModel = new Map<string, string>()
+  const authoritativeMap = findAuthoritativeAntigravityModelMap(input?.upstream_metadata)
+  if (authoritativeMap) {
+    for (const [rawModel, rawInfo] of Object.entries(authoritativeMap)) {
+      const model = rawModel.trim()
+      if (!model || !isPlainRecord(rawInfo)) continue
+      const displayName = typeof rawInfo.display_name === 'string'
+        ? rawInfo.display_name.trim()
+        : ''
+      if (displayName && displayName !== model && !isOpaqueAntigravityQuotaIdentifier(displayName)) {
+        byLowerModel.set(model.toLowerCase(), displayName)
+      }
+    }
+  }
+
+  const windows = input?.status_snapshot?.quota?.windows
+  if (Array.isArray(windows)) {
+    for (const window of windows) {
+      if (String(window?.scope || '').trim().toLowerCase() !== 'model') continue
+      const model = String(window?.model || '').trim()
+      const label = String(window?.label || '').trim()
+      if (!model || !label || label === model || isOpaqueAntigravityQuotaIdentifier(label)) continue
+      const lower = model.toLowerCase()
+      if (!byLowerModel.has(lower)) {
+        byLowerModel.set(lower, label)
+      }
+    }
+  }
+
+  return byLowerModel
+}
+
+/**
+ * 提取当前账号可绑定的精确上游模型候选列表，绝不使用内置硬编码模型表。
+ * 优先级：1. antigravity_quota_models 安全字段 -> 2. upstream_metadata 权威模型映射 -> 3. quota.windows 模型窗口。
+ */
+export function resolveAntigravityBindableModels(
+  input?: AntigravityBindingCarrier | null,
+): AntigravityQuotaModelOption[] {
+  if (!input) return []
+
+  const displayNames = collectRawModelDisplayNames(input)
+  const seenLower = new Set<string>()
+  const models: string[] = []
+  const pushUniqueModel = (rawModel: unknown) => {
+    if (typeof rawModel !== 'string') return
+    const model = rawModel.trim()
+    if (!model) return
+    const lower = model.toLowerCase()
+    if (seenLower.has(lower)) return
+    seenLower.add(lower)
+    models.push(model)
+  }
+
+  if (Array.isArray(input.antigravity_quota_models)) {
+    for (const model of input.antigravity_quota_models) {
+      pushUniqueModel(model)
+    }
+  } else {
+    const authoritativeMap = findAuthoritativeAntigravityModelMap(input.upstream_metadata)
+    if (authoritativeMap !== null) {
+      for (const [rawModel, rawInfo] of Object.entries(authoritativeMap)) {
+        if (isPlainRecord(rawInfo) && rawInfo.disabled === true) continue
+        pushUniqueModel(rawModel)
+      }
+    } else {
+      const windows = input.status_snapshot?.quota?.windows
+      if (Array.isArray(windows)) {
+        for (const window of windows) {
+          if (String(window?.scope || '').trim().toLowerCase() !== 'model') continue
+          if (window?.is_included === false) continue
+          pushUniqueModel(window?.model)
+        }
+      }
+    }
+  }
+
+  const options = models.map((model): AntigravityQuotaModelOption => ({
+    model,
+    displayName: displayNames.get(model.toLowerCase()) ?? null,
+  }))
+
+  options.sort((a, b) => (
+    (getAntigravityModelPriority(a.model) - getAntigravityModelPriority(b.model))
+    || a.model.localeCompare(b.model)
+  ))
+  return options
+}
+
+/**
+ * 从账号配额快照中提取已保存的配额组候选（按服务端稳定 quota_group 键去重）。
+ */
+export function resolveAntigravityQuotaGroupOptions(
+  input: AntigravityBindingCarrier | null | undefined,
+  translate: AntigravityQuotaTranslator,
+): AntigravityQuotaGroupOption[] {
+  if (!input) return []
+
+  const byKey = new Map<string, {
+    key: string
+    label: string
+    periods: string[]
+    description: string | null
+  }>()
+
+  const windows = input.status_snapshot?.quota?.windows
+  if (Array.isArray(windows)) {
+    for (const window of windows) {
+      if (String(window?.scope || '').trim().toLowerCase() !== 'quota_group') continue
+      const rawGroupKey = typeof window?.quota_group === 'string' ? window.quota_group.trim() : ''
+      if (!isStableAntigravityGroupKey(rawGroupKey)) continue
+
+      const groupLabel = getAntigravityQuotaGroupName(window) || rawGroupKey
+      const periodLabel = getAntigravityQuotaPeriodLabel(window, translate)
+      const description = typeof window?.description === 'string' && window.description.trim()
+        ? window.description.trim()
+        : null
+
+      const existing = byKey.get(rawGroupKey)
+      if (existing) {
+        if (periodLabel && !existing.periods.includes(periodLabel)) {
+          existing.periods.push(periodLabel)
+        }
+        if (!existing.description && description) {
+          existing.description = description
+        }
+      } else {
+        byKey.set(rawGroupKey, {
+          key: rawGroupKey,
+          label: groupLabel,
+          periods: periodLabel ? [periodLabel] : [],
+          description,
+        })
+      }
+    }
+  }
+
+  const rawGroups = input.upstream_metadata?.antigravity?.quota_groups
+  if (Array.isArray(rawGroups)) {
+    for (const group of rawGroups) {
+      if (!isPlainRecord(group)) continue
+      const rawGroupKey = typeof group.quota_group === 'string' ? group.quota_group.trim() : ''
+      if (!isStableAntigravityGroupKey(rawGroupKey) || byKey.has(rawGroupKey)) continue
+      const rawLabel = typeof group.display_name === 'string' ? group.display_name.trim() : ''
+      const description = typeof group.description === 'string' && group.description.trim()
+        ? group.description.trim()
+        : null
+      byKey.set(rawGroupKey, {
+        key: rawGroupKey,
+        label: rawLabel ? canonicalizeAntigravityQuotaGroupLabel(rawLabel) : rawGroupKey,
+        periods: [],
+        description,
+      })
+    }
+  }
+
+  return Array.from(byKey.values()).map(item => ({
+    key: item.key,
+    label: item.label,
+    periodsText: item.periods.length > 0 ? item.periods.join(' · ') : null,
+    description: item.description,
+  }))
 }

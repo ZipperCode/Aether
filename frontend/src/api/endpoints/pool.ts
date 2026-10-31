@@ -145,6 +145,8 @@ export interface PoolKeyDetail {
   account_status_source?: string | null  // 兼容字段；优先使用 status_snapshot.account
   status_snapshot?: ProviderKeyStatusSnapshot | null
   upstream_metadata?: UpstreamMetadata | null
+  antigravity_quota_bindings?: Record<string, string> | null
+  antigravity_quota_models?: string[] | null
   quota_updated_at?: number | null
   health_score?: number
   circuit_breaker_open?: boolean

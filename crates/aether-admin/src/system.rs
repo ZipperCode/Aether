@@ -20,7 +20,7 @@ use regex::Regex;
 use semver::Version;
 use serde::{de, de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -514,6 +514,8 @@ pub struct AdminSystemConfigProviderKey {
     pub proxy: Option<Value>,
     #[serde(default)]
     pub fingerprint: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_quota_bindings: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_state: Option<String>,
 }

@@ -9,7 +9,8 @@ use crate::AppState;
 use aether_admin::provider::quota as admin_provider_quota_pure;
 use aether_admin::provider::redaction::{
     admin_provider_oauth_invalid_reason_safe_text, admin_provider_status_snapshot_safe_json,
-    admin_provider_upstream_metadata_safe_json, admin_secret_safe_json, admin_secret_safe_proxy,
+    admin_provider_upstream_metadata_safe_json, admin_safe_antigravity_quota_bindings,
+    admin_secret_safe_json, admin_secret_safe_proxy,
 };
 use aether_admin::provider::status as admin_provider_status_pure;
 #[cfg(test)]
@@ -20,12 +21,13 @@ use aether_crypto::{
 };
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_provider_pool::{
-    grok_pool_tier_from_quota_bucket, grok_supported_quota_windows_for_tier,
-    provider_pool_codex_metadata_has_account_quota,
+    antigravity_quota_group_key, grok_pool_tier_from_quota_bucket,
+    grok_supported_quota_windows_for_tier, provider_pool_codex_metadata_has_account_quota,
 };
 use aether_scheduler_core::provider_key_circuit_payload_is_active_open_at;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const OAUTH_ACCOUNT_BLOCK_PREFIX: &str = "[ACCOUNT_BLOCK] ";
@@ -517,6 +519,106 @@ fn provider_quota_model_bucket(metadata: &Map<String, Value>) -> Option<&Map<Str
         .and_then(Value::as_object)
 }
 
+/// 读取 Antigravity 权威模型映射（依次检查 `quota_by_model`、`models`、`model_quotas` 首个对象，空对象同样权威）。
+pub(crate) fn antigravity_authoritative_model_map<'a>(
+    upstream_metadata: Option<&'a Value>,
+) -> Option<&'a Map<String, Value>> {
+    let metadata = provider_quota_metadata_bucket(upstream_metadata, "antigravity")?;
+    antigravity_authoritative_model_map_from_bucket(metadata)
+}
+
+fn antigravity_authoritative_model_map_from_bucket(
+    metadata: &Map<String, Value>,
+) -> Option<&Map<String, Value>> {
+    ["quota_by_model", "models", "model_quotas"]
+        .into_iter()
+        .find_map(|field| metadata.get(field).and_then(Value::as_object))
+}
+
+pub(crate) fn antigravity_model_entry_is_disabled(entry: &Value) -> bool {
+    entry
+        .as_object()
+        .and_then(|object| object.get("disabled"))
+        .and_then(admin_provider_quota_pure::coerce_json_bool)
+        == Some(true)
+}
+
+/// 投影 Key 顶层的安全 `antigravity_quota_bindings` 字段；Antigravity 始终返回对象。
+pub(crate) fn antigravity_quota_bindings_payload(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+) -> Value {
+    if !provider_type.trim().eq_ignore_ascii_case("antigravity") {
+        return Value::Null;
+    }
+    admin_safe_antigravity_quota_bindings(
+        key.upstream_metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("antigravity_quota_bindings")),
+    )
+}
+
+/// 投影 Key 顶层的安全 `antigravity_quota_models` 候选模型列表（排除 `disabled: true` 与内部重置额度键）。
+pub(crate) fn antigravity_quota_models_payload(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+) -> Value {
+    if !provider_type.trim().eq_ignore_ascii_case("antigravity") {
+        return Value::Null;
+    }
+    let mut seen = BTreeSet::new();
+    let mut models = Vec::new();
+    if let Some(model_map) = antigravity_authoritative_model_map(key.upstream_metadata.as_ref()) {
+        for (model_id, entry) in model_map {
+            let trimmed = model_id.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("RateLimitResetCredit_")
+                || antigravity_model_entry_is_disabled(entry)
+            {
+                continue;
+            }
+            if seen.insert(trimmed.to_ascii_lowercase()) {
+                models.push(trimmed.to_string());
+            }
+        }
+    } else if let Some(windows) = key
+        .status_snapshot
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|snapshot| snapshot.get("quota"))
+        .and_then(Value::as_object)
+        .and_then(|quota| quota.get("windows"))
+        .and_then(Value::as_array)
+    {
+        for window in windows.iter().filter_map(Value::as_object) {
+            if !quota_window_is_included(window) {
+                continue;
+            }
+            let is_model_scope = window
+                .get("scope")
+                .and_then(Value::as_str)
+                .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("model"));
+            if !is_model_scope {
+                continue;
+            }
+            let Some(model_id) = window
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.starts_with("RateLimitResetCredit_"))
+            else {
+                continue;
+            };
+            if seen.insert(model_id.to_ascii_lowercase()) {
+                models.push(model_id.to_string());
+            }
+        }
+    }
+    models.sort();
+    Value::Array(models.into_iter().map(Value::String).collect())
+}
+
 fn quota_window_reset_seconds(
     observed_at_unix_secs: Option<u64>,
     reset_at_unix_secs: Option<u64>,
@@ -712,12 +814,12 @@ fn antigravity_grouped_quota_window_snapshots(
 
     for (group_index, group) in groups.iter().filter_map(Value::as_object).enumerate() {
         let group_code = group
-            .get("group_id")
-            .or_else(|| group.get("groupId"))
+            .get("quota_group")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
+            .or_else(|| antigravity_quota_group_key(group))
             .unwrap_or_else(|| format!("group:{group_index}"));
         let group_label = group
             .get("display_name")
@@ -750,12 +852,44 @@ fn antigravity_grouped_quota_window_snapshots(
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| format!("bucket-{}", bucket_index + 1));
-            let Some(mut window) =
-                model_quota_window_snapshot(&bucket_id, bucket, observed_at_unix_secs)
-            else {
-                continue;
-            };
-            let Some(window) = window.as_object_mut() else {
+            let is_disabled = bucket
+                .get("disabled")
+                .or_else(|| bucket.get("is_disabled"))
+                .and_then(admin_provider_quota_pure::coerce_json_bool)
+                == Some(true)
+                || bucket
+                    .get("is_included")
+                    .and_then(admin_provider_quota_pure::coerce_json_bool)
+                    == Some(false);
+            let mut window = model_quota_window_snapshot(&bucket_id, bucket, observed_at_unix_secs)
+                .or_else(|| {
+                    is_disabled.then(|| {
+                        let reset_at = provider_quota_timestamp_unix_secs(
+                            bucket
+                                .get("reset_at")
+                                .or_else(|| bucket.get("next_reset_at"))
+                                .or_else(|| bucket.get("reset_time"))
+                                .or_else(|| bucket.get("next_reset_time")),
+                        );
+                        let reset_seconds =
+                            quota_window_reset_seconds(observed_at_unix_secs, reset_at);
+                        json!({
+                            "code": format!("model:{bucket_id}"),
+                            "label": bucket_id,
+                            "scope": "quota_group",
+                            "unit": "percent",
+                            "used_ratio": Value::Null,
+                            "remaining_ratio": Value::Null,
+                            "used_value": Value::Null,
+                            "remaining_value": Value::Null,
+                            "limit_value": Value::Null,
+                            "reset_at": reset_at,
+                            "reset_seconds": reset_seconds,
+                            "is_exhausted": false,
+                        })
+                    })
+                });
+            let Some(window) = window.as_mut().and_then(Value::as_object_mut) else {
                 continue;
             };
             let period = bucket
@@ -794,6 +928,10 @@ fn antigravity_grouped_quota_window_snapshots(
             window.insert("quota_group".to_string(), json!(group_code));
             window.insert("quota_group_label".to_string(), json!(group_label));
             window.insert("bucket_id".to_string(), json!(bucket_id));
+            window.insert("is_included".to_string(), json!(!is_disabled));
+            if is_disabled {
+                window.insert("is_exhausted".to_string(), json!(false));
+            }
             if let Some(period) = period {
                 window.insert("window".to_string(), json!(period));
             }
@@ -867,10 +1005,18 @@ fn provider_quota_metadata_string_by_paths(
     })
 }
 
+fn quota_window_is_included(window: &Map<String, Value>) -> bool {
+    window
+        .get("is_included")
+        .and_then(admin_provider_quota_pure::coerce_json_bool)
+        != Some(false)
+}
+
 fn quota_windows_usage_ratio(windows: &[Value]) -> Option<f64> {
     windows
         .iter()
         .filter_map(Value::as_object)
+        .filter(|window| quota_window_is_included(window))
         .filter_map(|window| window.get("used_ratio"))
         .filter_map(Value::as_f64)
         .max_by(f64::total_cmp)
@@ -880,6 +1026,7 @@ fn quota_windows_min_reset_seconds(windows: &[Value]) -> Option<u64> {
     windows
         .iter()
         .filter_map(Value::as_object)
+        .filter(|window| quota_window_is_included(window))
         .filter_map(|window| window.get("reset_seconds"))
         .filter_map(admin_provider_quota_pure::coerce_json_u64)
         .min()
@@ -889,6 +1036,7 @@ fn quota_windows_min_reset_at(windows: &[Value]) -> Option<u64> {
     windows
         .iter()
         .filter_map(Value::as_object)
+        .filter(|window| quota_window_is_included(window))
         .filter_map(|window| window.get("reset_at"))
         .filter_map(|value| provider_quota_timestamp_unix_secs(Some(value)))
         .min()
@@ -897,7 +1045,11 @@ fn quota_windows_min_reset_at(windows: &[Value]) -> Option<u64> {
 fn quota_windows_all_exhausted(windows: &[Value]) -> bool {
     let mut total = 0usize;
     let mut exhausted = 0usize;
-    for window in windows.iter().filter_map(Value::as_object) {
+    for window in windows
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|window| quota_window_is_included(window))
+    {
         total += 1;
         let is_exhausted = window
             .get("is_exhausted")
@@ -1936,10 +2088,11 @@ fn build_antigravity_quota_status_snapshot(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let mut windows = provider_quota_model_bucket(metadata)
+    let mut windows = antigravity_authoritative_model_map_from_bucket(metadata)
         .map(|models| {
             models
                 .iter()
+                .filter(|(_, item)| !antigravity_model_entry_is_disabled(item))
                 .filter_map(|(model_name, item)| {
                     antigravity_model_quota_window_snapshot(
                         model_name,
@@ -2665,6 +2818,46 @@ fn codex_upstream_metadata_is_at_least_as_fresh(
     snapshot_updated_at.is_none_or(|updated_at| metadata_updated_at >= updated_at)
 }
 
+/// 当 Antigravity 元数据含有 `quota_groups`，且存量快照的分组窗口仍使用旧版 `group:N`
+/// 占位键或缺少 `is_included` 标记时，在读取侧触发一次无副作用的快照重投影。
+fn antigravity_upstream_metadata_needs_snapshot_sync(
+    quota_snapshot: Option<&Map<String, Value>>,
+    upstream_metadata: Option<&Value>,
+) -> bool {
+    let Some(metadata) = provider_quota_metadata_bucket(upstream_metadata, "antigravity") else {
+        return false;
+    };
+    let has_quota_groups = metadata
+        .get("quota_groups")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| !groups.is_empty());
+    if !has_quota_groups {
+        return false;
+    }
+    let Some(quota_snapshot) = quota_snapshot else {
+        return true;
+    };
+    let Some(windows) = quota_snapshot.get("windows").and_then(Value::as_array) else {
+        return true;
+    };
+    let mut saw_group_window = false;
+    for window in windows.iter().filter_map(Value::as_object) {
+        if window.get("scope").and_then(Value::as_str) != Some("quota_group") {
+            continue;
+        }
+        saw_group_window = true;
+        let valid_group_key = window
+            .get("quota_group")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.starts_with("id:") || key.starts_with("buckets:"));
+        let has_inclusion_flag = window.get("is_included").is_some_and(Value::is_boolean);
+        if !valid_group_key || !has_inclusion_flag {
+            return true;
+        }
+    }
+    !saw_group_window
+}
+
 fn windsurf_quota_snapshot_has_stale_cooldown(quota_snapshot: &Map<String, Value>) -> bool {
     let code = quota_snapshot
         .get("code")
@@ -2747,7 +2940,9 @@ fn normalize_expired_quota_windows(snapshot: &mut serde_json::Map<String, Value>
 
     for window in windows.iter_mut().filter_map(Value::as_object_mut) {
         // 与同类窗口处理保持一致：window_minutes=0 不是真实配额窗口。
-        if window.get("window_minutes").and_then(Value::as_u64) == Some(0) {
+        if window.get("window_minutes").and_then(Value::as_u64) == Some(0)
+            || !quota_window_is_included(window)
+        {
             continue;
         }
         if !aether_provider_pool::provider_pool_reset_deadline_elapsed(
@@ -2913,7 +3108,9 @@ fn backfilled_quota_exhaustion_windows_reset_elapsed(snapshot: &Map<String, Valu
     let mut saw_exhausted_window = false;
     for window in windows.iter().filter_map(Value::as_object) {
         // 与 normalize_expired_quota_windows 一致：window_minutes=0 不是真实配额窗口。
-        if window.get("window_minutes").and_then(Value::as_u64) == Some(0) {
+        if window.get("window_minutes").and_then(Value::as_u64) == Some(0)
+            || !quota_window_is_included(window)
+        {
             continue;
         }
         if quota_window_is_model_scoped(window) || !quota_window_reports_exhaustion(window) {
@@ -2948,6 +3145,11 @@ pub(crate) fn provider_key_status_snapshot_payload(
             quota_snapshot,
             key.upstream_metadata.as_ref(),
         );
+    let refresh_antigravity_snapshot = provider_type.trim().eq_ignore_ascii_case("antigravity")
+        && antigravity_upstream_metadata_needs_snapshot_sync(
+            quota_snapshot,
+            key.upstream_metadata.as_ref(),
+        );
 
     // Whether the payload mirrors the materialized stored snapshot — the same
     // data the scheduling-side exhaustion decision reads. Backfilled payloads
@@ -2956,7 +3158,8 @@ pub(crate) fn provider_key_status_snapshot_payload(
     // clearing below must not overwrite them.
     let uses_materialized_snapshot =
         quota_snapshot_has_materialized_data(quota_snapshot, provider_type)
-            && !refresh_codex_snapshot;
+            && !refresh_codex_snapshot
+            && !refresh_antigravity_snapshot;
     let payload = if uses_materialized_snapshot {
         status_snapshot
             .cloned()
@@ -3573,6 +3776,14 @@ pub(crate) fn build_admin_provider_key_response(
     payload.insert(
         "upstream_metadata".to_string(),
         admin_provider_upstream_metadata_safe_json(key.upstream_metadata.as_ref()),
+    );
+    payload.insert(
+        "antigravity_quota_bindings".to_string(),
+        antigravity_quota_bindings_payload(key, provider_type),
+    );
+    payload.insert(
+        "antigravity_quota_models".to_string(),
+        antigravity_quota_models_payload(key, provider_type),
     );
     payload.insert(
         "proxy".to_string(),
@@ -5943,6 +6154,10 @@ mod tests {
 
         assert_eq!(windows.len(), 3);
         assert_eq!(five_hour["scope"], json!("quota_group"));
+        assert_eq!(
+            five_hour["quota_group"],
+            json!("buckets:[\"3p-5h\",\"3p-weekly\"]")
+        );
         assert_eq!(five_hour["bucket_id"], json!("3p-5h"));
         assert_eq!(five_hour["label"], json!("Claude and GPT models · 5 hour"));
         assert_eq!(
@@ -5951,8 +6166,87 @@ mod tests {
         );
         assert_eq!(five_hour["remaining_ratio"], json!(0.25));
         assert_eq!(five_hour["used_ratio"], json!(0.75));
+        assert_eq!(five_hour["is_included"], json!(true));
         assert!(five_hour.get("model").is_none());
         assert_eq!(weekly["window"], json!("weekly"));
+        assert_eq!(
+            weekly["quota_group"],
+            json!("buckets:[\"3p-5h\",\"3p-weekly\"]")
+        );
+        assert_eq!(weekly["is_included"], json!(true));
+    }
+
+    #[test]
+    fn antigravity_disabled_group_bucket_projects_is_included_false_and_preserves_across_expiry() {
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "antigravity": {
+                "updated_at": 1_777_000_000u64,
+                "quota_by_model": {
+                    "gemini-4-argon-high": {
+                        "display_name": "Gemini 4 Argon (High)",
+                        "remaining_fraction": 0.8
+                    },
+                    "gemini-3.8-flash-medium": {
+                        "display_name": "Gemini 3.8 Flash (Medium)"
+                    },
+                    "gemini-4-argon-disabled": {
+                        "display_name": "Disabled Argon",
+                        "disabled": true
+                    }
+                },
+                "quota_groups": [{
+                    "display_name": "Gemini models",
+                    "buckets": [
+                        {
+                            "bucket_id": "gemini-5h",
+                            "window": "5h",
+                            "remaining_fraction": 0.0,
+                            "reset_time": "2020-01-01T00:00:00Z",
+                            "disabled": true
+                        },
+                        {
+                            "bucket_id": "gemini-weekly",
+                            "window": "weekly",
+                            "remaining_fraction": 0.5,
+                            "reset_time": "2030-01-01T00:00:00Z"
+                        }
+                    ]
+                }]
+            },
+            "antigravity_quota_bindings": {
+                "gemini-4-argon-high": "buckets:[\"gemini-5h\",\"gemini-weekly\"]"
+            }
+        }));
+
+        let snapshot = provider_key_status_snapshot_payload(&key, "antigravity");
+        let windows = snapshot["quota"]["windows"]
+            .as_array()
+            .expect("projected windows should exist");
+        let disabled_short = windows
+            .iter()
+            .find(|window| window["bucket_id"] == "gemini-5h")
+            .expect("disabled 5h bucket window should remain projected");
+        assert_eq!(
+            disabled_short["quota_group"],
+            json!("buckets:[\"gemini-5h\",\"gemini-weekly\"]")
+        );
+        assert_eq!(disabled_short["is_included"], json!(false));
+        assert_eq!(disabled_short["is_exhausted"], json!(false));
+        // 即使过去时间已越过 reset_at，已禁用窗口也不得在读取归一化时被改写为剩余 100%。
+        assert_eq!(disabled_short["remaining_ratio"], json!(0.0));
+        assert_eq!(snapshot["quota"]["exhausted"], json!(false));
+
+        assert_eq!(
+            antigravity_quota_bindings_payload(&key, "antigravity"),
+            json!({
+                "gemini-4-argon-high": "buckets:[\"gemini-5h\",\"gemini-weekly\"]"
+            })
+        );
+        assert_eq!(
+            antigravity_quota_models_payload(&key, "antigravity"),
+            json!(["gemini-3.8-flash-medium", "gemini-4-argon-high"])
+        );
     }
 
     #[test]

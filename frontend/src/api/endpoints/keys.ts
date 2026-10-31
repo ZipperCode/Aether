@@ -248,6 +248,7 @@ export async function updateProviderKey(
     model_include_patterns: string[]  // 模型包含规则
     model_exclude_patterns: string[]  // 模型排除规则
     proxy: import('./types').ProxyConfig | null  // Key 级别代理配置
+    antigravity_quota_bindings: Record<string, string>  // Antigravity 模型配额组绑定（独立保存/清空）
   }>,
   requestOptions?: KeyRequestOptions,
 ): Promise<EndpointAPIKey> {
@@ -257,6 +258,22 @@ export async function updateProviderKey(
     requestOptions,
   )
   return response.data
+}
+
+/**
+ * 独立更新或清空 Antigravity 账号精确模型到配额组的显式绑定。
+ * 服务端要求该字段不能与其他 Key 配置字段混传；传入空对象 `{}` 清空全部绑定。
+ */
+export async function updateAntigravityQuotaBindings(
+  keyId: string,
+  bindings: Record<string, string>,
+  requestOptions?: KeyRequestOptions,
+): Promise<EndpointAPIKey> {
+  return updateProviderKey(
+    keyId,
+    { antigravity_quota_bindings: bindings },
+    requestOptions,
+  )
 }
 
 /**

@@ -113,11 +113,18 @@
                 {{ item.label }}
               </div>
             </div>
-            <span :class="getQuotaRemainingClass(item.usedPercent)">
-              {{ item.detail || `${item.remainingPercent.toFixed(1)}%` }}
+            <span
+              :class="item.notApplicable ? 'text-muted-foreground' : getQuotaRemainingClass(item.usedPercent)"
+              data-testid="antigravity-quota-item-meter"
+            >
+              {{ item.notApplicable ? legacyT('不适用') : (item.detail || `${item.remainingPercent.toFixed(1)}%`) }}
             </span>
           </div>
-          <div class="relative w-full h-1.5 bg-border rounded-full overflow-hidden">
+          <div
+            v-if="!item.notApplicable"
+            class="relative w-full h-1.5 bg-border rounded-full overflow-hidden"
+            data-testid="antigravity-quota-item-bar"
+          >
             <div
               class="absolute left-0 top-0 h-full transition-all duration-300"
               :class="getQuotaRemainingBarColor(item.usedPercent)"
@@ -125,7 +132,7 @@
             />
           </div>
           <div
-            v-if="item.resetSeconds !== null"
+            v-if="!item.notApplicable && item.resetSeconds !== null"
             class="text-[9px] text-muted-foreground/70 mt-0.5"
           >
             <template v-if="item.resetSeconds > 0">
@@ -268,6 +275,8 @@ interface QuotaItem {
   resetSeconds: number | null
   /** 汇总行的百分比单值或范围；原始测试模型条目可为空。 */
   detail?: string
+  /** 上游标记为不适用（is_included === false）时不展示可消耗比例和进度条。 */
+  notApplicable?: boolean
 }
 
 const { error: showError, success: showSuccess } = useToast()
@@ -336,9 +345,10 @@ function buildItemsFromQuotaSnapshot(quota: QuotaStatusSnapshot | null | undefin
   const opaqueDisplayIndex = { value: 1 }
 
   const items = windows
-    .map((window) => {
+    .map((window): QuotaItem | null => {
       const model = String(window.model || window.label || window.code || '').trim()
       if (!model) return null
+      if (window.is_included === false) return null
 
       const usedPercent =
         typeof window.used_ratio === 'number'
@@ -380,10 +390,21 @@ function buildGroupedItemsFromQuotaSnapshot(
     : []
 
   return windows
-    .map((window) => {
+    .map((window): QuotaItem | null => {
       const code = String(window.code || '').trim()
       const label = resolveAntigravityQuotaGroupLabel(window, t)
       if (!code || !label) return null
+      if (window.is_included === false) {
+        return {
+          model: code,
+          label,
+          usedPercent: 0,
+          remainingPercent: 0,
+          resetSeconds: null,
+          detail: legacyT('不适用'),
+          notApplicable: true,
+        } satisfies QuotaItem
+      }
 
       const usedPercent =
         typeof window.used_ratio === 'number'
