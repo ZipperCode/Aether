@@ -7,9 +7,9 @@ use aether_contracts::{
 use aether_crypto::{rsa_pkcs1_sha256_sign, RsaPkcs1Sha256Error};
 use aether_provider_transport::antigravity::{
     antigravity_account_observation_due, antigravity_account_observation_update,
-    antigravity_entitlement_candidates, is_antigravity_entitlement_rejection,
-    parse_antigravity_code_assist_response, resolve_local_antigravity_request_auth,
-    AntigravityRequestAuthSupport,
+    antigravity_entitlement_candidates, antigravity_quota_info_remaining_fraction,
+    is_antigravity_entitlement_rejection, parse_antigravity_code_assist_response,
+    resolve_local_antigravity_request_auth, AntigravityRequestAuthSupport,
 };
 use aether_provider_transport::vertex::{
     looks_like_vertex_ai_host, parse_vertex_service_account_auth_config,
@@ -1741,19 +1741,7 @@ fn build_antigravity_quota_payload(quota_info: Option<&Value>) -> serde_json::Ma
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let remaining_fraction = quota_info
-        .get("remainingFraction")
-        .and_then(|value| {
-            value.as_f64().or_else(|| {
-                value
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .and_then(|value| value.parse::<f64>().ok())
-            })
-        })
-        .filter(|value| value.is_finite())
-        .map(|value| value.clamp(0.0, 1.0));
+    let remaining_fraction = antigravity_quota_info_remaining_fraction(quota_info);
 
     let mut payload = serde_json::Map::new();
     if let Some(remaining_fraction) = remaining_fraction {
@@ -4907,6 +4895,37 @@ mod tests {
         assert_eq!(patch["antigravity"]["subscription_tier"], "ultra");
         assert_eq!(patch["antigravity"]["paid_tier_id"], "g1-ultra-tier");
     }
+    #[test]
+    fn antigravity_models_reset_only_quota_without_exhausting_unknown_models() {
+        let (models, metadata) = parse_antigravity_models_response(&json!({
+            "models": {
+                "gemini-4-argon-medium": {
+                    "displayName": "Gemini 4 Argon Medium",
+                    "quotaInfo": {"resetTime": "2030-01-01T00:00:00Z"}
+                },
+                "gemini-3.8-flash-medium": {"displayName": "Gemini 3.8 Flash Medium"},
+                "empty-quota": {"quotaInfo": {}},
+                "invalid-reset": {"quotaInfo": {"resetTime": "invalid"}}
+            }
+        }))
+        .expect("Antigravity models should parse");
+        assert!(models
+            .iter()
+            .any(|model| model["id"] == "gemini-3.8-flash-medium"));
+        let metadata = metadata.expect("model metadata should exist");
+        let quota = &metadata["antigravity"]["quota_by_model"];
+        assert_eq!(quota["gemini-4-argon-medium"]["remaining_fraction"], 0.0);
+        assert_eq!(quota["gemini-4-argon-medium"]["used_percent"], 100.0);
+        assert_eq!(
+            quota["gemini-4-argon-medium"]["reset_time"],
+            "2030-01-01T00:00:00Z"
+        );
+        for model in ["gemini-3.8-flash-medium", "empty-quota", "invalid-reset"] {
+            assert!(quota[model].get("remaining_fraction").is_none());
+            assert!(quota[model].get("used_percent").is_none());
+        }
+    }
+
     #[test]
     fn antigravity_models_without_explicit_quota_are_not_marked_exhausted() {
         let (models, metadata) = parse_antigravity_models_response(&json!({

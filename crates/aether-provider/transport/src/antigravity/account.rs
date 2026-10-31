@@ -1,5 +1,25 @@
 use serde_json::{json, Value};
 
+/// 解释模型额度的显式比例及上游耗尽时省略零值的 Timestamp 形态。
+pub fn antigravity_quota_info_remaining_fraction(
+    quota_info: &serde_json::Map<String, Value>,
+) -> Option<f64> {
+    if let Some(value) = quota_info.get("remainingFraction") {
+        // 显式无效值不等于省略，不能借 resetTime 将其误判为耗尽。
+        return value
+            .as_f64()
+            .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+            .filter(|fraction| fraction.is_finite())
+            .map(|fraction| fraction.clamp(0.0, 1.0));
+    }
+    // 上游零值省略时只保留 resetTime；到期恢复由调度判断，不在解析时丢弃观察。
+    let reset = quota_info.get("resetTime")?.as_str()?.trim();
+    chrono::DateTime::parse_from_rfc3339(reset)
+        .ok()
+        .filter(|deadline| deadline.timestamp() >= 0)
+        .map(|_| 0.0)
+}
+
 const ACCOUNT_INFO_TTL_SECONDS: u64 = 15 * 60;
 const ACCOUNT_INFO_FAILURE_COOLDOWN_SECONDS: u64 = 60;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -240,6 +260,79 @@ pub fn is_antigravity_entitlement_rejection(status: u16, body: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_quota_info_explicit_fractions_are_finite_and_clamped() {
+        for (value, expected) in [
+            (json!(0.75), 0.75),
+            (json!(" 0.25 "), 0.25),
+            (json!(0), 0.0),
+            (json!(-0.5), 0.0),
+            (json!("1.5"), 1.0),
+        ] {
+            let info = json!({"remainingFraction": value});
+            assert_eq!(
+                antigravity_quota_info_remaining_fraction(info.as_object().unwrap()),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_quota_info_reset_only_requires_valid_nonnegative_timestamp() {
+        for reset in [
+            "2030-01-01T00:00:00Z",
+            " 2000-01-01T00:00:00Z ",
+            "1970-01-01T00:00:00Z",
+        ] {
+            let info = json!({"resetTime": reset});
+            assert_eq!(
+                antigravity_quota_info_remaining_fraction(info.as_object().unwrap()),
+                Some(0.0)
+            );
+        }
+        for info in [
+            json!({}),
+            json!({"displayName": "Gemini"}),
+            json!({"resetTime": ""}),
+            json!({"resetTime": "invalid"}),
+            json!({"resetTime": "2030-02-30T00:00:00Z"}),
+            json!({"resetTime": "1969-12-31T23:59:59Z"}),
+            json!({"resetTime": 1893456000u64}),
+            json!({"resetTime": true}),
+            json!({"resetTime": {}}),
+            json!({"resetTime": null}),
+        ] {
+            assert_eq!(
+                antigravity_quota_info_remaining_fraction(info.as_object().unwrap()),
+                None,
+                "{info}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_quota_info_explicit_invalid_fraction_never_falls_back() {
+        for value in [
+            json!(null),
+            json!(""),
+            json!(" "),
+            json!("invalid"),
+            json!("NaN"),
+            json!("inf"),
+            json!("-inf"),
+            json!(true),
+            json!({}),
+            json!([]),
+        ] {
+            let info = json!({"remainingFraction": value, "resetTime": "2030-01-01T00:00:00Z"});
+            assert_eq!(
+                antigravity_quota_info_remaining_fraction(info.as_object().unwrap()),
+                None,
+                "{info}"
+            );
+        }
+    }
     #[test]
     fn antigravity_tier_normalization_recognizes_aliases_and_rejects_unknown() {
         assert_eq!(

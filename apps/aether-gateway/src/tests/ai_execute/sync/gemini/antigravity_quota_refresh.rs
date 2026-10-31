@@ -29,12 +29,12 @@ use crate::handlers::shared::sync_provider_key_quota_status_snapshot;
 
 /// 一个上游模型在账号目录/额度刷新响应中的最小观测形态。
 ///
-/// `remaining_fraction` 为 `None` 时只表达“账号目录中存在该模型”，不会伪造额度数字；
-/// 事故账号正是以这种占位条目暴露了不包含目标模型的权威目录。
+/// 目录占位不提供额度；reset-only 单独回放上游耗尽时省略零值的形态。
 #[derive(Debug, Clone, PartialEq)]
 struct ModelQuotaFixture {
     display_name: String,
     remaining_fraction: Option<f64>,
+    reset_only: bool,
 }
 
 impl ModelQuotaFixture {
@@ -42,6 +42,7 @@ impl ModelQuotaFixture {
         Self {
             display_name: display_name.to_string(),
             remaining_fraction: Some(remaining_fraction),
+            reset_only: false,
         }
     }
 
@@ -49,6 +50,15 @@ impl ModelQuotaFixture {
         Self {
             display_name: display_name.to_string(),
             remaining_fraction: None,
+            reset_only: false,
+        }
+    }
+
+    fn reset_only(display_name: &str) -> Self {
+        Self {
+            display_name: display_name.to_string(),
+            remaining_fraction: None,
+            reset_only: true,
         }
     }
 }
@@ -231,6 +241,11 @@ fn mock_antigravity_models_body(
                         "remainingFraction": remaining_fraction,
                         "resetTime": reset_rfc3339,
                     }),
+                );
+            } else if fixture.reset_only {
+                entry.insert(
+                    "quotaInfo".to_string(),
+                    json!({ "resetTime": reset_rfc3339 }),
                 );
             }
             (model_id.clone(), serde_json::Value::Object(entry))
@@ -3583,3 +3598,244 @@ async fn gateway_antigravity_generic_rate_limit_remains_account_scoped_impl() {
 
 #[path = "antigravity_quota_refresh/dynamic_effort.rs"]
 mod dynamic_effort;
+
+#[test]
+fn gateway_antigravity_reset_only_quota_refresh_restores_serving() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_reset_only_quota_refresh_restores_serving",
+        gateway_antigravity_reset_only_quota_refresh_restores_serving_impl,
+    );
+}
+
+async fn gateway_antigravity_reset_only_quota_refresh_restores_serving_impl() {
+    for pool_enabled in [false, true] {
+        run_antigravity_reset_only_quota_refresh_mode(pool_enabled).await;
+    }
+}
+
+async fn run_antigravity_reset_only_quota_refresh_mode(pool_enabled: bool) {
+    let mode = if pool_enabled {
+        "reset-only-pool"
+    } else {
+        "reset-only-ordinary"
+    };
+    let argon = "gemini-4-argon-medium";
+    let flash = "gemini-3.8-flash-medium";
+    let models = |argon_quota: ModelQuotaFixture, flash_quota: ModelQuotaFixture| {
+        BTreeMap::from([
+            (argon.to_string(), argon_quota),
+            (flash.to_string(), flash_quota),
+        ])
+    };
+    let positive = || ModelQuotaFixture::with_fraction("Gemini", 1.0);
+    let exhausted = || ModelQuotaFixture::reset_only("Gemini");
+    let mut config = antigravity_runtime_quota_http_config(mode, pool_enabled);
+    config.global_model_name = "gemini-4-argon".to_string();
+    config.provider_model_name = argon.to_string();
+    config.secondary_global_model_name = Some("gemini-3.8-flash".to_string());
+    config.secondary_provider_model_name = Some(flash.to_string());
+    config.key_a.models = models(positive(), positive());
+    config.key_b.models = models(positive(), positive());
+    let harness = start_antigravity_http_harness(config).await;
+    let body = json!({
+        "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+        "generationConfig": {"temperature": 0.2, "thinkingConfig": {"thinkingLevel": "MEDIUM"}},
+        "session_id": harness.client_session_id,
+    });
+
+    assert_reset_only_serving_step(
+        &harness,
+        "warmup",
+        "gemini-4-argon",
+        argon,
+        &body,
+        false,
+        StatusCode::OK,
+        (1, 0),
+    )
+    .await;
+    if pool_enabled {
+        assert_eq!(
+            harness.read_sticky().await.as_deref(),
+            Some(harness.key_a_id.as_str())
+        );
+    }
+
+    harness.set_account_models(true, models(exhausted(), positive()));
+    let refresh = harness
+        .send_refresh_quota(Some(json!({"key_ids": [&harness.key_a_id]})))
+        .await;
+    assert_eq!(refresh["success"], 1);
+    let key_a = harness.read_catalog_key(&harness.key_a_id).await;
+    let quota = &key_a.upstream_metadata.as_ref().unwrap()["antigravity"]["quota_by_model"][argon];
+    assert_eq!(quota["remaining_fraction"], 0.0);
+    assert_eq!(quota["used_percent"], 100.0);
+    assert_eq!(
+        quota["reset_time"],
+        harness.mock_state.lock().unwrap().reset_rfc3339
+    );
+    assert_reset_only_serving_step(
+        &harness,
+        "failover-sync",
+        "gemini-4-argon",
+        argon,
+        &body,
+        false,
+        StatusCode::OK,
+        (1, 1),
+    )
+    .await;
+    assert_reset_only_serving_step(
+        &harness,
+        "failover-stream",
+        "gemini-4-argon",
+        argon,
+        &body,
+        true,
+        StatusCode::OK,
+        (1, 2),
+    )
+    .await;
+    if pool_enabled {
+        assert_eq!(
+            harness.read_sticky().await.as_deref(),
+            Some(harness.key_b_id.as_str())
+        );
+    }
+
+    harness.set_account_models(false, models(positive(), exhausted()));
+    let refresh = harness
+        .send_refresh_quota(Some(json!({"key_ids": [&harness.key_b_id]})))
+        .await;
+    assert_eq!(refresh["success"], 1);
+    // 同一 session 的旧 sticky=B 也必须按 Flash 精确额度重新校验，A 的 Argon 耗尽不能封锁 Flash。
+    assert_reset_only_serving_step(
+        &harness,
+        "sibling-model",
+        "gemini-3.8-flash",
+        flash,
+        &body,
+        false,
+        StatusCode::OK,
+        (1, 0),
+    )
+    .await;
+
+    harness.set_account_models(false, models(exhausted(), exhausted()));
+    assert_eq!(harness.send_refresh_quota(None).await["success"], 2);
+    assert_reset_only_serving_step(
+        &harness,
+        "all-exhausted",
+        "gemini-4-argon",
+        argon,
+        &body,
+        false,
+        StatusCode::SERVICE_UNAVAILABLE,
+        (1, 2),
+    )
+    .await;
+
+    harness.set_account_models(
+        true,
+        models(ModelQuotaFixture::with_fraction("Gemini", 0.5), positive()),
+    );
+    assert_eq!(
+        harness
+            .send_refresh_quota(Some(json!({"key_ids": [&harness.key_a_id]})))
+            .await["success"],
+        1
+    );
+    assert_reset_only_serving_step(
+        &harness,
+        "positive-refresh",
+        "gemini-4-argon",
+        argon,
+        &body,
+        false,
+        StatusCode::OK,
+        (2, 2),
+    )
+    .await;
+
+    // 只刷新 A：B 保留已持久化的未来 reset，避免共享夹具时钟把 B 也释放。
+    harness.mock_state.lock().unwrap().reset_rfc3339 =
+        format_rfc3339_secs(current_unix_secs() - 60);
+    harness.set_account_models(true, models(exhausted(), positive()));
+    assert_eq!(
+        harness
+            .send_refresh_quota(Some(json!({"key_ids": [&harness.key_a_id]})))
+            .await["success"],
+        1
+    );
+    assert_reset_only_serving_step(
+        &harness,
+        "elapsed-reset",
+        "gemini-4-argon",
+        argon,
+        &body,
+        false,
+        StatusCode::OK,
+        (3, 2),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn assert_reset_only_serving_step(
+    harness: &AntigravityHttpHarness,
+    step: &str,
+    global_model: &str,
+    provider_model: &str,
+    body: &serde_json::Value,
+    stream: bool,
+    expected_status: StatusCode,
+    expected_counts: (usize, usize),
+) {
+    let before = harness.generation_counts();
+    let response = if stream {
+        harness
+            .send_stream_generate_body(global_model, body, step)
+            .await
+    } else {
+        harness.send_generate_body(global_model, body, step).await
+    };
+    let status = response.status();
+    let text = response.text().await.expect("Gemini HTTP body should read");
+    let after = harness.generation_counts();
+    let counts = (
+        after
+            .get(&(true, provider_model.to_string()))
+            .copied()
+            .unwrap_or(0),
+        after
+            .get(&(false, provider_model.to_string()))
+            .copied()
+            .unwrap_or(0),
+    );
+    println!("[antigravity-reset-only-http] provider={} step={step} model={provider_model} status={status} counts_before={before:?} counts_after={after:?}", harness.provider_id);
+    assert_eq!(status, expected_status, "{step}: {text}");
+    assert_eq!(
+        counts, expected_counts,
+        "{step}: exact account/model execution counts"
+    );
+    if status == StatusCode::OK {
+        let payload = if stream {
+            gemini_sse_data_frames(&text)
+                .into_iter()
+                .find(|frame| {
+                    frame
+                        .pointer("/candidates/0/finishReason")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("STOP")
+                })
+                .expect("SSE should complete")
+        } else {
+            serde_json::from_str(&text).expect("Gemini response should parse")
+        };
+        assert_eq!(payload["modelVersion"], provider_model);
+        assert_eq!(
+            payload["candidates"][0]["content"]["parts"][0]["text"],
+            ANTIGRAVITY_RUNTIME_COMPLETION_TEXT
+        );
+    }
+}

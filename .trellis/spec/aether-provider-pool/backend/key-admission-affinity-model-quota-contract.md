@@ -216,6 +216,19 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   applicable window prevents a known exhausted sibling window from proving
   exhaustion; all-unknown windows alone remain unresolved. Missing, empty and
   malformed model quota is unknown, not a default exhausted state.
+- Antigravity model `quotaInfo` is normalized by
+  `aether_provider_transport::antigravity::antigravity_quota_info_remaining_fraction(&serde_json::Map<String, Value>) -> Option<f64>`.
+  Both admin quota refresh and model discovery use this function. Explicit
+  `remainingFraction` numbers or trimmed numeric strings must be finite and are
+  clamped to `[0, 1]`; explicit invalid/null values remain unknown, even with a
+  valid reset. Only an absent fraction plus a trimmed RFC3339 string `resetTime`
+  with nonnegative Unix seconds means observed zero remaining (upstream omits
+  zero scalar values). Empty/missing quotaInfo and malformed/non-string resets
+  remain unknown. Do not compare current time in this parser: preserve zero and
+  reset, and let the existing selection deadline release elapsed observations.
+  No group matching, plan inference, cross-bucket fallback or account-wide ban
+  is introduced. Historical reset-only records converge after a successful
+  normal quota refresh/model discovery, not by replacing the binary alone.
 - Antigravity display-only `quota_group` windows do not infer model relationships
   or override exact model windows. Structural generic account windows and the
   adapter's account snapshot fallback remain available.
@@ -324,6 +337,8 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
 | Antigravity target exhausted, sibling version/thinking/tiered model available | Block only the exact target for both ignore-switch values. |
 | Authoritative `quota_by_model = {}` plus legacy exhausted `models` | Do not resurrect the legacy model map. |
 | Exact model has exhausted and unknown independent windows | Preserve fail-open `all` semantics; do not discard the unknown window. |
+| Antigravity absent fraction with valid nonnegative RFC3339 reset | Persist remaining 0 / used 100; block only that exact model until reset. |
+| Antigravity explicit invalid fraction with valid reset | Keep remaining/used unknown; never apply the omitted-zero fallback. |
 | Raw `reset_time` / `next_reset_time` elapsed | Same recovery as the materialized snapshot without waiting for cache TTL. |
 | Successful persisted model refresh, exhausted to available | Recompute candidate and resolved pages on the next selection; preserve affinity. |
 | Antigravity structured `QUOTA_EXHAUSTED`/`QUOTA_EXCEEDED` or quota-reset 429 | Record only the actual Key and selected upstream model in shared RuntimeState; skip that exact pair on the next ordinary/Pool/sticky selection. |
@@ -476,6 +491,20 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   and runtime-quota fallbacks, and strong-read Pool behavior.
 - Provider Pool: model A exhaustion does not block model B for Antigravity and
   Codex model-scoped windows.
+- Transport `antigravity_quota_info_*`: finite numeric/string fractions, zero,
+  clamp bounds, valid future/past/epoch resets, invalid/non-string/pre-epoch
+  resets, and explicit null/empty/invalid/nonfinite fractions with valid reset.
+  Admin `parses_antigravity_reset_only_quota_without_exhausting_unknown_models`
+  and model-fetch `antigravity_models_reset_only_quota_without_exhausting_unknown_models`
+  assert zero/100/reset preservation and keep no-quota/empty/invalid-reset
+  models unknown. Preserve `antigravity_models_without_explicit_quota_are_not_marked_exhausted`.
+- Gateway `gateway_antigravity_reset_only_quota_refresh_restores_serving` binds
+  loopback HTTP and exercises real admin refresh plus native Gemini MEDIUM
+  sync/SSE with format conversion disabled. For ordinary and Pool/sticky paths,
+  assert exact account/model generation counts: preferred A warmup, reset-only
+  A failover to B, available A Flash despite exhausted Argon and B sticky,
+  all-Argon exhaustion 503 with no execution, immediate positive-refresh
+  recovery, and elapsed-reset recovery while B retains a future deadline.
 - OAuth/transport/admin: preserve Antigravity refresh credentials, Google userinfo
   email, current `quota_by_model` projection, legacy `models` input and RFC3339
   reset parsing. Quota refresh never changes the model catalog or resurrects
@@ -530,6 +559,11 @@ map, match `candidate.trim().eq_ignore_ascii_case(requested.trim())`, preserve
 unknown exact windows in the `all` decision, and index the actual key/model pair.
 After a successful persisted model refresh, invalidate candidate pages, not
 affinity or independent manual-recovery scheduling state.
+
+For reset-only parsing, wrong: require `remainingFraction` to observe exhaustion,
+or `unwrap_or(0.0)` for every missing/invalid quota. Correct: normalize only
+absent fraction plus valid RFC3339 reset through the shared transport parser;
+preserve explicit invalid values as unknown and leave reset expiry to selection.
 
 For discovered-model admission, wrong: `allowed_models == null` therefore any
 Provider mapping is valid for that account. Correct: keep existing mapping and

@@ -9,9 +9,9 @@ mod url;
 
 pub use account::{
     antigravity_account_observation_due, antigravity_account_observation_update,
-    antigravity_entitlement_candidates, build_antigravity_fetch_available_models_body,
-    is_antigravity_entitlement_rejection, parse_antigravity_code_assist_response,
-    AntigravityCodeAssistInfo,
+    antigravity_entitlement_candidates, antigravity_quota_info_remaining_fraction,
+    build_antigravity_fetch_available_models_body, is_antigravity_entitlement_rejection,
+    parse_antigravity_code_assist_response, AntigravityCodeAssistInfo,
 };
 pub use auth::{
     antigravity_client_identity, build_antigravity_static_client_headers,

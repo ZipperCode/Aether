@@ -1,5 +1,6 @@
 use aether_contracts::ExecutionResult;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
+use aether_provider_transport::antigravity::antigravity_quota_info_remaining_fraction;
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -259,9 +260,7 @@ pub fn parse_antigravity_usage_response(
         let quota_info = model_value
             .get("quotaInfo")
             .and_then(serde_json::Value::as_object);
-        let remaining_fraction = quota_info
-            .and_then(|object| object.get("remainingFraction"))
-            .and_then(coerce_json_f64);
+        let remaining_fraction = quota_info.and_then(antigravity_quota_info_remaining_fraction);
         if let Some(remaining_fraction) = remaining_fraction {
             let used_percent = ((1.0 - remaining_fraction).max(0.0) * 100.0).min(100.0);
             payload.insert("remaining_fraction".to_string(), json!(remaining_fraction));
@@ -7498,6 +7497,36 @@ mod tests {
         assert_eq!(parsed.get("updated_at"), Some(&json!(1_777_000_000u64)));
         assert!(parsed.get("primary_used_percent").is_none());
         assert!(parsed.get("secondary_used_percent").is_none());
+    }
+
+    #[test]
+    fn parses_antigravity_reset_only_quota_without_exhausting_unknown_models() {
+        let parsed = parse_antigravity_usage_response(
+            &json!({
+                "models": {
+                    "gemini-4-argon-medium": {
+                        "displayName": "Gemini 4 Argon Medium",
+                        "quotaInfo": {"resetTime": "2030-01-01T00:00:00Z"}
+                    },
+                    "gemini-3.8-flash-medium": {"displayName": "Gemini 3.8 Flash Medium"},
+                    "empty-quota": {"quotaInfo": {}},
+                    "invalid-reset": {"quotaInfo": {"resetTime": "invalid"}}
+                }
+            }),
+            1_777_000_000,
+        )
+        .expect("Antigravity quota should parse");
+        let quota = &parsed["quota_by_model"];
+        assert_eq!(quota["gemini-4-argon-medium"]["remaining_fraction"], 0.0);
+        assert_eq!(quota["gemini-4-argon-medium"]["used_percent"], 100.0);
+        assert_eq!(
+            quota["gemini-4-argon-medium"]["reset_time"],
+            "2030-01-01T00:00:00Z"
+        );
+        for model in ["gemini-3.8-flash-medium", "empty-quota", "invalid-reset"] {
+            assert!(quota[model].get("remaining_fraction").is_none());
+            assert!(quota[model].get("used_percent").is_none());
+        }
     }
 
     /// 验证 Antigravity 不透明 reset-credit 项保留显示名与原始 RFC3339 重置时间。
