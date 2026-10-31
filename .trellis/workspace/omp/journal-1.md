@@ -613,3 +613,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 25: Antigravity 五小时周额度联合调度
+
+**Date**: 2026-10-31
+**Task**: Antigravity 五小时周额度联合调度
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+新增逐账号精确模型到真实额度组的显式绑定，独立 namespace CAS 持久化及备份导出导入；启用的五小时和周窗口任一耗尽即排除关联模型，局部重置不提前放行，disabled 展示不适用。未绑定保持原模型逻辑，不按套餐/前缀猜 Argon 归属、不跨池回退。真实 loopback HTTP ordinary/pool/sticky sync/SSE故障转移、503零执行、重置/刷新/清空恢复通过；26项gateway Antigravity、143pool、348admin、209architecture、109frontend、备份HTTP回归及typecheck/build/fmt通过；前端只读ESLint0error3warning。实际浏览器保存/清空独立PUT及禁用无进度条通过，临时harness已清理。未部署线上或修改真实账号。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f28705371` | (see git log) |
+
+### Status
+
+[OK] **Completed**
