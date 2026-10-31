@@ -657,3 +657,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 27: 号池账号未激活提示与批量健康恢复
+
+**Date**: 2026-10-31
+**Task**: 号池账号未激活提示与批量健康恢复
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+号池桌面和移动端补齐 Antigravity 未激活提示；批量重置健康度复用单账号恢复接口，覆盖手动多选和跨页快照全选，确认框说明关闭熔断器与启用账号。类型检查、定向 ESLint、51 项相关测试通过；隔离浏览器验证取消、多凭据类型、刷新健康值、跨页选择及部分失败继续执行，未写入真实账号。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `da50445ac` | (see git log) |
+
+### Status
+
+[OK] **Completed**
