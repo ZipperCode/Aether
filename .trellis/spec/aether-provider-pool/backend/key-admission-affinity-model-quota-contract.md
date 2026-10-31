@@ -249,6 +249,23 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   same real-Key guards. Failed fetch, `no_metadata`, account-only observations,
   CAS conflicts and persistence errors do not claim quota recovery. Manual
   scheduling bans, disablement, OAuth, health and cooldown remain independent.
+- Antigravity refresh failures preserve `oauth_invalid_at` and
+  `oauth_invalid_reason`; missing project, transport errors and `no_metadata`
+  never run success-state clearing. Only a successfully parsed and persisted
+  model quota response clears recoverable credential errors through the existing
+  success policy. Preserve `[ACCOUNT_BLOCK]` even after successful quota probes.
+- Admin refresh and runtime generation share
+  `aether_admin::provider::quota::antigravity_oauth_invalid_reason(u16, Option<&Value>) -> Option<String>`.
+  HTTP 401 and explicit `UNAUTHENTICATED` use `[OAUTH_EXPIRED] oauth_token_invalid`
+  so existing ordinary/Pool hard-invalid guards reject the actual credential;
+  an ambiguous expired-token label alone is recoverable and does not guarantee
+  exclusion. HTTP 400/403 with `VALIDATION_REQUIRED`, `ACCOUNT_DISABLED`,
+  `ACCOUNT_SUSPENDED` ErrorInfo reasons or explicit account verification/disabled/
+  suspended messages use sanitized `[ACCOUNT_BLOCK]` reasons. Generic parameter,
+  model-disabled and project errors do not create runtime account blocks.
+  Keep existing runtime OAuth taxonomy detection and refresh-only generic 403
+  forbidden handling. Credential-fenced persistence and bearer matching remain
+  mandatory; no database migration or production account mutation is implied.
 - Runtime Antigravity quota observations use shared RuntimeState namespace
   `aether:antigravity:model-quota:v1`, indexed by hashed Provider/actual Key,
   credential generation and exact upstream model. The internal record contains
@@ -351,6 +368,11 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
 | Matching persisted refresh succeeds or the scoped deadline elapses | Release only the exact Key/model guard; preserve independent manual bans/cooldowns. Positive refresh preserves affinity. |
 | All eligible accounts have the requested exact-model fact active | Return HTTP 503 with zero generation attempts for that model; background quota probes remain eligible. |
 | `fetchAvailableModels` fails but `loadCodeAssist` succeeds | Preserve old quota and never restore an exhausted model from the account observation. |
+| Antigravity quota HTTP 401 | Persist hard-invalid Token rejection; display abnormal account and skip ordinary/Pool/sticky serving. |
+| Failed quota refresh after an authentication failure | Preserve the original reason/timestamp; do not restore serving. |
+| Successful quota refresh after Token rejection | Clear recoverable credential failure and immediately restore eligible serving. |
+| Runtime 400/403 with structured `VALIDATION_REQUIRED` | Persist account-verification block; subsequent sync/SSE skips that account even after successful quota probes. |
+| Ordinary parameter 400 without account evidence | Do not invent an account or Token block. |
 | Positive refresh with manual ban or disabled Key | Keep the Key ineligible. |
 | All Antigravity target-model accounts exhausted | HTTP 503 and zero generation requests; background probes remain eligible. |
 | Antigravity null allowlist and fetched map excludes target | Skip that actual Key with `key_model_disabled`; zero generation requests. |
@@ -505,6 +527,17 @@ scheduling. Existing accounts acquire the badge on the next quota refresh.
   A failover to B, available A Flash despite exhausted Argon and B sticky,
   all-Argon exhaustion 503 with no execution, immediate positive-refresh
   recovery, and elapsed-reset recovery while B retains a future deadline.
+- Gateway `gateway_antigravity_auth_failure_refresh_blocks_serving`: real HTTP
+  warmup, admin 401 refresh, abnormal status projection, sync/SSE failover with
+  unchanged invalid-account generation counts, failed 400/502 preservation,
+  all-invalid 503, positive-refresh recovery, ordinary 400 non-blocking and
+  refresh 403 exclusion in both ordinary and Pool/sticky modes.
+- Gateway `gateway_antigravity_runtime_account_verification_blocks_serving`:
+  structured verification 400 through sync and SSE, persisted account-verification
+  status, no further execution on the blocked account, and continued exclusion
+  after successful quota refresh. Admin classifier tests distinguish explicit
+  account restrictions from parameter/model/project errors without retaining
+  upstream secrets.
 - OAuth/transport/admin: preserve Antigravity refresh credentials, Google userinfo
   email, current `quota_by_model` projection, legacy `models` input and RFC3339
   reset parsing. Quota refresh never changes the model catalog or resurrects
@@ -575,3 +608,9 @@ For dynamic effort, wrong: admit/quota-filter static high and later rewrite the
 envelope to low. Correct: resolve a discovered model for the actual account,
 authorize that target or client alias, then read exact-model quota and build
 the envelope. Keep family matching out of discovery and quota guards.
+
+For Antigravity authentication, wrong: clear invalid state before checking refresh
+success, or label a rejected Token as merely expired and assume selection stops.
+Correct: retain failures, normalize explicit Token rejection to `oauth_token_invalid`,
+and reuse existing hard-invalid guards. Account verification is a separate
+`[ACCOUNT_BLOCK]` and cannot be healed by a successful quota probe.

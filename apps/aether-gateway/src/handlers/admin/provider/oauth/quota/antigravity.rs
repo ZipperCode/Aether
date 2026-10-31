@@ -10,7 +10,8 @@ use super::shared::{
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::GatewayError;
 use aether_admin::provider::quota::{
-    parse_antigravity_quota_summary_response, parse_antigravity_usage_response,
+    antigravity_oauth_invalid_reason, parse_antigravity_quota_summary_response,
+    parse_antigravity_usage_response,
 };
 use aether_admin::provider::redaction::admin_provider_metadata_bucket_safe_json;
 use aether_contracts::ProxySnapshot;
@@ -287,8 +288,8 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
         let identity = state.resolve_local_antigravity_identity_headers(&transport);
         let Some((project_id, identity_headers)) = identity else {
             failed_count += 1;
-            let (oauth_invalid_at_unix_secs, oauth_invalid_reason) =
-                quota_refresh_success_invalid_state(&key);
+            let oauth_invalid_at_unix_secs = key.oauth_invalid_at_unix_secs;
+            let oauth_invalid_reason = key.oauth_invalid_reason.clone();
 
             // 即使缺少 project_id，也必须持久化成功获取的套餐信息及查询状态；写入失败必须报错。
             if !persist_provider_quota_refresh_state(
@@ -394,8 +395,9 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
         }
         let result = final_result;
 
-        let (mut oauth_invalid_at_unix_secs, mut oauth_invalid_reason) =
-            quota_refresh_success_invalid_state(&key);
+        // 失败或无有效额度不能证明认证恢复；仅成功解析模型额度后清理旧认证错误。
+        let mut oauth_invalid_at_unix_secs = key.oauth_invalid_at_unix_secs;
+        let mut oauth_invalid_reason = key.oauth_invalid_reason.clone();
         let mut status = "error".to_string();
         let mut message = None::<String>;
         let mut quota_metadata = None::<serde_json::Value>;
@@ -433,6 +435,8 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
                     }
                     quota_metadata = Some(json!({ "antigravity": metadata }));
                     status = "success".to_string();
+                    (oauth_invalid_at_unix_secs, oauth_invalid_reason) =
+                        quota_refresh_success_invalid_state(&key);
                 } else {
                     status = "no_metadata".to_string();
                     message = Some("响应中未包含配额信息".to_string());
@@ -446,7 +450,24 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
                 Some(code) => format!("fetchAvailableModels 返回状态码 {code}"),
                 None => "fetchAvailableModels 请求执行失败".to_string(),
             });
-            if status_code == Some(403) {
+            let body = result
+                .as_ref()
+                .and_then(|result| result.body.as_ref())
+                .and_then(|body| body.json_body.as_ref());
+            if let Some(reason) =
+                status_code.and_then(|code| antigravity_oauth_invalid_reason(code, body))
+            {
+                // 已有账号封锁优先于短期 Token 失败，避免自动续期抹掉人工验证要求。
+                if !key
+                    .oauth_invalid_reason
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("[ACCOUNT_BLOCK]"))
+                {
+                    oauth_invalid_at_unix_secs = Some(now_unix_secs);
+                    oauth_invalid_reason = Some(reason);
+                }
+            }
+            if status_code == Some(403) && oauth_invalid_reason.is_none() {
                 let reason = "账户访问被禁止".to_string();
                 oauth_invalid_at_unix_secs = Some(now_unix_secs);
                 oauth_invalid_reason = Some(format!("账户访问被禁止: {reason}"));

@@ -234,6 +234,55 @@ pub fn quota_refresh_success_invalid_state(
     (None, None)
 }
 
+/// 仅明确的认证或账号异常可以封锁账号，普通参数/模型/项目错误不能升级。
+pub fn antigravity_oauth_invalid_reason(
+    status_code: u16,
+    body: Option<&serde_json::Value>,
+) -> Option<String> {
+    if status_code == 401 {
+        return Some(format!(
+            "{OAUTH_EXPIRED_PREFIX}oauth_token_invalid: Antigravity access token was rejected"
+        ));
+    }
+    if !matches!(status_code, 400 | 403) {
+        return None;
+    }
+    let error = body?.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let reasons = error.get("details").and_then(serde_json::Value::as_array);
+    let has_reason = |expected: &str| {
+        reasons.is_some_and(|details| {
+            details.iter().any(|detail| {
+                detail
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|reason| reason.eq_ignore_ascii_case(expected))
+            })
+        })
+    };
+    let reason = if has_reason("VALIDATION_REQUIRED") || message.contains("verify your account") {
+        "Account verification is required (VALIDATION_REQUIRED)"
+    } else if has_reason("ACCOUNT_DISABLED")
+        || message.contains("account has been disabled")
+        || message.contains("account has been deactivated")
+    {
+        "Account is disabled"
+    } else if has_reason("ACCOUNT_SUSPENDED") || message.contains("account has been suspended") {
+        "Account is suspended"
+    } else if error.get("status").and_then(serde_json::Value::as_str) == Some("UNAUTHENTICATED") {
+        return Some(format!(
+            "{OAUTH_EXPIRED_PREFIX}oauth_token_invalid: Antigravity access token was rejected"
+        ));
+    } else {
+        return None;
+    };
+    Some(format!("{OAUTH_ACCOUNT_BLOCK_PREFIX}{reason}"))
+}
+
 pub fn parse_antigravity_usage_response(
     value: &serde_json::Value,
     updated_at_unix_secs: u64,
@@ -4519,6 +4568,53 @@ mod tests {
     use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn antigravity_oauth_invalid_reason_distinguishes_account_and_request_errors() {
+        use super::antigravity_oauth_invalid_reason;
+        assert!(antigravity_oauth_invalid_reason(401, None)
+            .unwrap()
+            .starts_with(OAUTH_EXPIRED_PREFIX));
+        for status in [400, 403] {
+            let verification = json!({"error": {"message": "Check account", "details": [{"reason": "VALIDATION_REQUIRED"}]}});
+            assert!(
+                antigravity_oauth_invalid_reason(status, Some(&verification))
+                    .unwrap()
+                    .starts_with(OAUTH_ACCOUNT_BLOCK_PREFIX)
+            );
+            for message in [
+                "verify your account before continuing",
+                "account has been disabled",
+                "account has been suspended",
+            ] {
+                assert!(antigravity_oauth_invalid_reason(
+                    status,
+                    Some(&json!({"error": {"message": message}}))
+                )
+                .is_some());
+            }
+            for message in [
+                "Invalid argument",
+                "model has been disabled",
+                "permission denied for project",
+            ] {
+                assert_eq!(
+                    antigravity_oauth_invalid_reason(
+                        status,
+                        Some(&json!({"error": {"message": message}}))
+                    ),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            antigravity_oauth_invalid_reason(
+                502,
+                Some(&json!({"error": {"message": "verify your account"}}))
+            ),
+            None
+        );
+    }
 
     fn merge_codex_quota(
         current: Option<&serde_json::Value>,

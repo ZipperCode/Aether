@@ -73,6 +73,7 @@ struct AccountMockPolicy {
 enum AntigravityUpstreamErrorKind {
     ModelQuota,
     AccountRateLimit,
+    AccountVerification,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,7 +93,7 @@ struct QuotaRuntimeMockState {
     account_b_subscription_tier: String,
     account_a: AccountMockPolicy,
     account_b: AccountMockPolicy,
-    /// 每个账号+上游模型触发的真实上游 429；`None` 表示正常成功。
+    /// 每个账号+上游模型触发的上游失败；状态码按错误类型区分。
     generation_errors: BTreeMap<(bool, String), AntigravityUpstreamErrorFixture>,
     /// 每个账号+上游模型收到的生成计划次数。
     generation_counts: BTreeMap<(bool, String), usize>,
@@ -102,6 +103,15 @@ struct QuotaRuntimeMockState {
 }
 
 const ANTIGRAVITY_CAPTURED_PLAN_LIMIT: usize = 256;
+
+fn antigravity_account_verification_body() -> serde_json::Value {
+    json!({"error": {
+        "code": 400,
+        "status": "FAILED_PRECONDITION",
+        "message": "Account validation is required.",
+        "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "VALIDATION_REQUIRED"}]
+    }})
+}
 
 fn antigravity_quota_error_body(model: &str, retry_after_seconds: u64) -> serde_json::Value {
     json!({
@@ -1349,11 +1359,12 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
                                         retry_after_seconds,
                                     )
                                 }
+                                AntigravityUpstreamErrorKind::AccountVerification => antigravity_account_verification_body(),
                             };
                             let result = aether_contracts::ExecutionResult {
                                 request_id: plan.request_id,
                                 candidate_id: plan.candidate_id,
-                                status_code: 429,
+                                status_code: if generation_error.kind == AntigravityUpstreamErrorKind::AccountVerification { 400 } else { 429 },
                                 headers: BTreeMap::from([
                                     (
                                         "content-type".to_string(),
@@ -1635,13 +1646,14 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
                                     retry_after_seconds,
                                 )
                             }
+                            AntigravityUpstreamErrorKind::AccountVerification => antigravity_account_verification_body(),
                         }
                         .to_string();
                         frames.push(json!({
                             "type": "headers",
                             "payload": {
                                 "kind": "headers",
-                                "status_code": 429,
+                                "status_code": if generation_error.kind == AntigravityUpstreamErrorKind::AccountVerification { 400 } else { 429 },
                                 "headers": {
                                     "content-type": "application/json",
                                     "retry-after": retry_after_seconds.to_string()
@@ -3837,5 +3849,319 @@ async fn assert_reset_only_serving_step(
             payload["candidates"][0]["content"]["parts"][0]["text"],
             ANTIGRAVITY_RUNTIME_COMPLETION_TEXT
         );
+    }
+}
+
+#[test]
+fn gateway_antigravity_auth_failure_refresh_blocks_serving() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_auth_failure_refresh_blocks_serving",
+        gateway_antigravity_auth_failure_refresh_blocks_serving_impl,
+    );
+}
+
+async fn gateway_antigravity_auth_failure_refresh_blocks_serving_impl() {
+    for pool_enabled in [false, true] {
+        let mode = if pool_enabled {
+            "auth-pool"
+        } else {
+            "auth-ordinary"
+        };
+        let mut config = antigravity_runtime_quota_http_config(mode, pool_enabled);
+        config.key_b.models = antigravity_runtime_quota_models(0.9);
+        let harness = start_antigravity_http_harness(config).await;
+        let body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+            "generationConfig": {"temperature": 0.2, "thinkingConfig": {"thinkingLevel": "HIGH"}},
+            "session_id": harness.client_session_id,
+        });
+        assert_reset_only_serving_step(
+            &harness,
+            "auth-warmup",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::OK,
+            (1, 0),
+        )
+        .await;
+        if pool_enabled {
+            assert_eq!(
+                harness.read_sticky().await.as_deref(),
+                Some(harness.key_a_id.as_str())
+            );
+        }
+
+        harness.set_account_fetch_models_status(true, 401);
+        let refresh = harness
+            .send_refresh_quota(Some(json!({"key_ids": [&harness.key_a_id]})))
+            .await;
+        assert_eq!(refresh["failed"], 1);
+        let invalid = harness.read_catalog_key(&harness.key_a_id).await;
+        assert!(
+            invalid.oauth_invalid_at_unix_secs.is_some(),
+            "401 must mark the serving credential invalid"
+        );
+        let snapshot =
+            crate::handlers::shared::provider_key_status_snapshot_payload(&invalid, "antigravity");
+        assert_eq!(snapshot["account"]["blocked"], true);
+        assert_eq!(
+            snapshot["oauth"]["invalid_at"],
+            json!(invalid.oauth_invalid_at_unix_secs)
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "auth-failover",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::OK,
+            (1, 1),
+        )
+        .await;
+        assert_reset_only_serving_step(
+            &harness,
+            "auth-stream",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            true,
+            StatusCode::OK,
+            (1, 2),
+        )
+        .await;
+
+        for status in [502, 400] {
+            harness.set_account_fetch_models_status(true, status);
+            assert_eq!(
+                harness
+                    .send_refresh_quota(Some(json!({"key_ids": [&harness.key_a_id]})))
+                    .await["failed"],
+                1
+            );
+            let failed = harness.read_catalog_key(&harness.key_a_id).await;
+            assert_eq!(
+                failed.oauth_invalid_reason, invalid.oauth_invalid_reason,
+                "failed refresh must retain authentication failure"
+            );
+            assert_eq!(
+                failed.oauth_invalid_at_unix_secs,
+                invalid.oauth_invalid_at_unix_secs
+            );
+        }
+        harness.set_account_fetch_models_status(false, 401);
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids": [&harness.key_b_id]})))
+                .await["failed"],
+            1
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "auth-all-invalid",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            (1, 2),
+        )
+        .await;
+
+        harness.set_account_fetch_models_status(true, 200);
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids": [&harness.key_a_id]})))
+                .await["success"],
+            1
+        );
+        let recovered = harness.read_catalog_key(&harness.key_a_id).await;
+        assert!(recovered.oauth_invalid_at_unix_secs.is_none());
+        assert!(recovered.oauth_invalid_reason.is_none());
+        assert_reset_only_serving_step(
+            &harness,
+            "auth-recovered",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::OK,
+            (2, 2),
+        )
+        .await;
+
+        // 普通参数错误既不能制造异常，也不能清除已有异常。
+        harness.set_account_fetch_models_status(true, 400);
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids": [&harness.key_a_id]})))
+                .await["failed"],
+            1
+        );
+        assert!(harness
+            .read_catalog_key(&harness.key_a_id)
+            .await
+            .oauth_invalid_at_unix_secs
+            .is_none());
+        assert_reset_only_serving_step(
+            &harness,
+            "ordinary-400-not-blocked",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::OK,
+            (3, 2),
+        )
+        .await;
+
+        harness.set_account_fetch_models_status(true, 403);
+        assert_eq!(
+            harness
+                .send_refresh_quota(Some(json!({"key_ids": [&harness.key_a_id]})))
+                .await["failed"],
+            1
+        );
+        let forbidden = harness.read_catalog_key(&harness.key_a_id).await;
+        assert_eq!(
+            crate::handlers::shared::provider_key_status_snapshot_payload(
+                &forbidden,
+                "antigravity"
+            )["account"]["blocked"],
+            true
+        );
+        assert_reset_only_serving_step(
+            &harness,
+            "forbidden-all-invalid",
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+            &body,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            (3, 2),
+        )
+        .await;
+    }
+}
+
+#[test]
+fn gateway_antigravity_runtime_account_verification_blocks_serving() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_runtime_account_verification_blocks_serving",
+        gateway_antigravity_runtime_account_verification_blocks_serving_impl,
+    );
+}
+
+async fn gateway_antigravity_runtime_account_verification_blocks_serving_impl() {
+    for pool_enabled in [false, true] {
+        for stream in [false, true] {
+            let mode = format!("verification-{pool_enabled}-{stream}");
+            let mut config = antigravity_runtime_quota_http_config(&mode, pool_enabled);
+            config.key_b.models = antigravity_runtime_quota_models(0.9);
+            let harness = start_antigravity_http_harness(config).await;
+            let body = json!({
+                "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+                "generationConfig": {"temperature": 0.2, "thinkingConfig": {"thinkingLevel": "HIGH"}},
+                "session_id": harness.client_session_id,
+            });
+            assert_reset_only_serving_step(
+                &harness,
+                "verification-warmup",
+                ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+                ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+                &body,
+                stream,
+                StatusCode::OK,
+                (1, 0),
+            )
+            .await;
+            harness.mock_state.lock().unwrap().generation_errors.insert(
+                (true, ANTIGRAVITY_RUNTIME_PRIMARY_MODEL.to_string()),
+                AntigravityUpstreamErrorFixture {
+                    retry_after_seconds: 1,
+                    kind: AntigravityUpstreamErrorKind::AccountVerification,
+                },
+            );
+            // 首次异常允许 A 返回真实错误；后续请求不得再执行 A。
+            let response = if stream {
+                harness
+                    .send_stream_generate_body(
+                        ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+                        &body,
+                        "verification-detected",
+                    )
+                    .await
+            } else {
+                harness
+                    .send_generate_body(
+                        ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+                        &body,
+                        "verification-detected",
+                    )
+                    .await
+            };
+            let _ = response
+                .text()
+                .await
+                .expect("upstream failure should complete");
+            let invalid = harness.read_catalog_key(&harness.key_a_id).await;
+            assert!(invalid
+                .oauth_invalid_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("[ACCOUNT_BLOCK]")));
+            let snapshot = crate::handlers::shared::provider_key_status_snapshot_payload(
+                &invalid,
+                "antigravity",
+            );
+            assert_eq!(snapshot["account"]["code"], "account_verification");
+            assert_eq!(snapshot["account"]["blocked"], true);
+            let before = harness.generation_counts();
+            let a_before = before
+                .get(&(true, ANTIGRAVITY_RUNTIME_PRIMARY_MODEL.to_string()))
+                .copied()
+                .unwrap_or(0);
+            let b_before = before
+                .get(&(false, ANTIGRAVITY_RUNTIME_PRIMARY_MODEL.to_string()))
+                .copied()
+                .unwrap_or(0);
+            assert_reset_only_serving_step(
+                &harness,
+                "verification-skipped",
+                ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+                ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+                &body,
+                stream,
+                StatusCode::OK,
+                (a_before, b_before + 1),
+            )
+            .await;
+            // 成功额度探测不能替代用户完成账号验证。
+            assert_eq!(
+                harness
+                    .send_refresh_quota(Some(json!({"key_ids": [&harness.key_a_id]})))
+                    .await["success"],
+                1
+            );
+            assert_eq!(
+                harness
+                    .read_catalog_key(&harness.key_a_id)
+                    .await
+                    .oauth_invalid_reason,
+                invalid.oauth_invalid_reason
+            );
+            assert_reset_only_serving_step(
+                &harness,
+                "verification-preserved-after-refresh",
+                ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+                ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+                &body,
+                stream,
+                StatusCode::OK,
+                (a_before, b_before + 2),
+            )
+            .await;
+        }
     }
 }

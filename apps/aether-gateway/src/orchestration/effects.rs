@@ -2401,6 +2401,15 @@ fn resolve_local_oauth_invalid_reason(
             status_code,
             upstream_message.as_deref(),
         ),
+        "antigravity" => {
+            let body = response_text.and_then(|text| serde_json::from_str(text).ok());
+            admin_provider_quota_pure::antigravity_oauth_invalid_reason(status_code, body.as_ref())
+                .or_else(|| {
+                    super::oauth_status_may_be_invalid(status_code, response_text).then(|| {
+                        "[OAUTH_EXPIRED] oauth_token_invalid: Antigravity access token was rejected".to_string()
+                    })
+                })
+        }
         _ if super::oauth_status_may_be_invalid(status_code, response_text) => Some(format!(
             "[OAUTH_EXPIRED] {}",
             upstream_message
