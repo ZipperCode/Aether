@@ -591,3 +591,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 24: Antigravity 异常账号调度修复
+
+**Date**: 2026-10-31
+**Task**: Antigravity 异常账号调度修复
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+修复额度刷新 401 未标记、失败清除旧 OAuth 异常，以及 Token 拒绝被解释为可恢复过期导致继续调度。admin 与 runtime 共用账号异常识别，明确 VALIDATION_REQUIRED/账号封禁写 ACCOUNT_BLOCK；普通 400 不封锁。真实 loopback HTTP ordinary/pool sticky sync/SSE 验证异常排除、失败保留、全异常 503、成功刷新恢复及验证封锁保持；旧 HTTP 回归失败，修复后通过。原有两个额度 HTTP 回归、12 项 OAuth invalidation、5 项 admin Antigravity 测试及 fmt 通过。未部署线上或修改真实账号。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `HEAD` | (see git log) |
+
+### Status
+
+[OK] **Completed**
