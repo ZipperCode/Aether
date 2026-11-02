@@ -3,7 +3,7 @@
   "name": "stream-lifecycle-diagnostics",
   "title": "修复长流生命周期与断流诊断",
   "description": "修复活跃长流被清理误判、候选终态不一致，增加无正文诊断；不加总时长上限，不部署生产。",
-  "status": "in_progress",
+  "status": "completed",
   "dev_type": "backend",
   "scope": "stream lifecycle",
   "package": "aether-gateway",
@@ -11,7 +11,7 @@
   "creator": "omp",
   "assignee": "omp",
   "createdAt": "2026-11-02",
-  "completedAt": null,
+  "completedAt": "2026-11-02",
   "branch": null,
   "base_branch": "master",
   "worktree_path": null,
@@ -20,7 +20,13 @@
   "subtasks": [],
   "children": [],
   "parent": null,
-  "relatedFiles": ["apps/aether-gateway/src/request_lifecycle.rs", "apps/aether-gateway/src/execution_runtime/stream/execution.rs", "apps/aether-gateway/src/execution_runtime/stream_pump.rs", "apps/aether-gateway/src/execution_runtime/transport.rs", "crates/aether-data/adapters/postgres/src/usage/mod.rs"],
+  "relatedFiles": [
+    "apps/aether-gateway/src/request_lifecycle.rs",
+    "apps/aether-gateway/src/execution_runtime/stream/execution.rs",
+    "apps/aether-gateway/src/execution_runtime/stream_pump.rs",
+    "apps/aether-gateway/src/execution_runtime/transport.rs",
+    "crates/aether-data/adapters/postgres/src/usage/mod.rs"
+  ],
   "notes": "",
   "meta": {}
 }
