@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/aether-gateway/backend/quality-guidelines.md", "reason": "Focused tests, bounded buffers, architectural ownership"}
+{"file": ".trellis/spec/aether-data-postgres/backend/database-guidelines.md", "reason": "Real PostgreSQL cleanup behavior"}

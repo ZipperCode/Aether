@@ -2745,6 +2745,16 @@ pub trait UsageWriteRepository: Send + Sync {
 
     async fn rebuild_provider_api_key_usage_stats(&self) -> Result<u64, crate::DataLayerError>;
 
+    /// Refresh execution liveness without changing response timing or billing facts.
+    async fn heartbeat_active_request(
+        &self,
+        request_id: &str,
+        now_unix_secs: u64,
+    ) -> Result<(), crate::DataLayerError> {
+        let _ = (request_id, now_unix_secs);
+        Ok(())
+    }
+
     async fn cleanup_stale_pending_requests(
         &self,
         cutoff_unix_secs: u64,

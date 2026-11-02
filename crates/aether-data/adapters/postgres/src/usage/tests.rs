@@ -1,3 +1,5 @@
+mod stream_lifecycle;
+
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 use sqlx::{Execute, Postgres, QueryBuilder, Row};

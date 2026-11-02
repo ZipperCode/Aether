@@ -1216,23 +1216,274 @@ pub(crate) enum DirectUpstreamResponse {
     LocalTunnel(tunnel::DirectRelayResponse),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectUpstreamBodyErrorSource {
+    Reqwest,
+    HyperH2c,
+    BrowserWreq,
+    LocalTunnel,
+}
+
+impl DirectUpstreamBodyErrorSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reqwest => "reqwest",
+            Self::HyperH2c => "hyper_h2c",
+            Self::BrowserWreq => "browser_wreq",
+            Self::LocalTunnel => "local_tunnel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectUpstreamBodyErrorKind {
+    Timeout,
+    ResetOrClosed,
+    Decode,
+    Protocol,
+    Unknown,
+}
+
+impl DirectUpstreamBodyErrorKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "read_timeout",
+            Self::ResetOrClosed => "connection_reset_or_closed",
+            Self::Decode => "body_decode_error",
+            Self::Protocol => "protocol_error",
+            Self::Unknown => "unknown_body_read_error",
+        }
+    }
+
+    pub(crate) const fn execution_error_kind(self) -> aether_contracts::ExecutionErrorKind {
+        match self {
+            Self::Timeout => aether_contracts::ExecutionErrorKind::ReadTimeout,
+            Self::ResetOrClosed | Self::Decode | Self::Protocol | Self::Unknown => {
+                aether_contracts::ExecutionErrorKind::ProtocolError
+            }
+        }
+    }
+
+    pub(crate) const fn stream_failure_error_type(self) -> &'static str {
+        match self {
+            Self::Timeout => "read_timeout",
+            Self::ResetOrClosed | Self::Decode | Self::Protocol | Self::Unknown => {
+                "execution_runtime_stream_read_error"
+            }
+        }
+    }
+
+    pub(crate) const fn stream_failure_status_code(self) -> u16 {
+        match self {
+            Self::Timeout => 504,
+            Self::ResetOrClosed | Self::Decode | Self::Protocol | Self::Unknown => 502,
+        }
+    }
+
+    pub(crate) const fn public_message(self) -> &'static str {
+        match self {
+            Self::Timeout => "Upstream response stream timed out",
+            Self::ResetOrClosed | Self::Decode | Self::Protocol | Self::Unknown => {
+                "Upstream response stream failed"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectUpstreamBodyReadError {
+    pub(crate) source: DirectUpstreamBodyErrorSource,
+    pub(crate) kind: DirectUpstreamBodyErrorKind,
+}
+
+impl DirectUpstreamBodyReadError {
+    pub(crate) const fn new(
+        source: DirectUpstreamBodyErrorSource,
+        kind: DirectUpstreamBodyErrorKind,
+    ) -> Self {
+        Self { source, kind }
+    }
+
+    pub(crate) fn from_reqwest(err: &reqwest::Error) -> Self {
+        Self::new(
+            DirectUpstreamBodyErrorSource::Reqwest,
+            classify_reqwest_body_error(err),
+        )
+    }
+
+    pub(crate) fn from_hyper(err: &hyper::Error) -> Self {
+        Self::new(
+            DirectUpstreamBodyErrorSource::HyperH2c,
+            classify_hyper_body_error(err),
+        )
+    }
+
+    pub(crate) fn from_wreq(err: &wreq::Error) -> Self {
+        Self::new(
+            DirectUpstreamBodyErrorSource::BrowserWreq,
+            classify_wreq_body_error(err),
+        )
+    }
+
+    pub(crate) fn from_local_tunnel(_err: impl AsRef<str>) -> Self {
+        Self::new(
+            DirectUpstreamBodyErrorSource::LocalTunnel,
+            DirectUpstreamBodyErrorKind::Unknown,
+        )
+    }
+
+    pub(crate) const fn public_message(self) -> &'static str {
+        self.kind.public_message()
+    }
+}
+
+impl From<String> for DirectUpstreamBodyReadError {
+    fn from(err: String) -> Self {
+        Self::from_local_tunnel(err)
+    }
+}
+
+impl From<&str> for DirectUpstreamBodyReadError {
+    fn from(err: &str) -> Self {
+        Self::from_local_tunnel(err)
+    }
+}
+
+impl std::fmt::Display for DirectUpstreamBodyReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} ({}:{})",
+            self.public_message(),
+            self.source.as_str(),
+            self.kind.as_str()
+        )
+    }
+}
+
+impl std::error::Error for DirectUpstreamBodyReadError {}
+
+pub(crate) const fn classify_io_body_error_kind(
+    kind: std::io::ErrorKind,
+) -> Option<DirectUpstreamBodyErrorKind> {
+    match kind {
+        std::io::ErrorKind::TimedOut => Some(DirectUpstreamBodyErrorKind::Timeout),
+        std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::NotConnected => Some(DirectUpstreamBodyErrorKind::ResetOrClosed),
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
+            Some(DirectUpstreamBodyErrorKind::Decode)
+        }
+        _ => None,
+    }
+}
+
+fn classify_hyper_error_properties(err: &hyper::Error) -> Option<DirectUpstreamBodyErrorKind> {
+    if err.is_timeout() {
+        return Some(DirectUpstreamBodyErrorKind::Timeout);
+    }
+    if err.is_incomplete_message()
+        || err.is_closed()
+        || err.is_body_write_aborted()
+        || err.is_canceled()
+    {
+        return Some(DirectUpstreamBodyErrorKind::ResetOrClosed);
+    }
+    if err.is_parse() || err.is_parse_status() || err.is_parse_too_large() || err.is_user() {
+        return Some(DirectUpstreamBodyErrorKind::Protocol);
+    }
+    None
+}
+
+fn classify_error_source_chain(
+    mut current: Option<&(dyn std::error::Error + 'static)>,
+) -> Option<DirectUpstreamBodyErrorKind> {
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            if let Some(kind) = classify_io_body_error_kind(io_err.kind()) {
+                return Some(kind);
+            }
+        }
+        if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
+            if let Some(kind) = classify_hyper_error_properties(hyper_err) {
+                return Some(kind);
+            }
+        }
+        current = err.source();
+    }
+    None
+}
+
+pub(crate) fn classify_reqwest_body_error(err: &reqwest::Error) -> DirectUpstreamBodyErrorKind {
+    if err.is_timeout() {
+        return DirectUpstreamBodyErrorKind::Timeout;
+    }
+    if let Some(kind) = classify_error_source_chain(err.source()) {
+        return kind;
+    }
+    if err.is_connect() {
+        return DirectUpstreamBodyErrorKind::ResetOrClosed;
+    }
+    if err.is_decode() {
+        return DirectUpstreamBodyErrorKind::Decode;
+    }
+    if err.is_body() || err.is_request() {
+        return DirectUpstreamBodyErrorKind::Protocol;
+    }
+    DirectUpstreamBodyErrorKind::Unknown
+}
+
+pub(crate) fn classify_hyper_body_error(err: &hyper::Error) -> DirectUpstreamBodyErrorKind {
+    if err.is_timeout() {
+        return DirectUpstreamBodyErrorKind::Timeout;
+    }
+    if let Some(kind) = classify_error_source_chain(err.source()) {
+        return kind;
+    }
+    if let Some(kind) = classify_hyper_error_properties(err) {
+        return kind;
+    }
+    DirectUpstreamBodyErrorKind::Unknown
+}
+
+pub(crate) fn classify_wreq_body_error(err: &wreq::Error) -> DirectUpstreamBodyErrorKind {
+    if err.is_timeout() {
+        return DirectUpstreamBodyErrorKind::Timeout;
+    }
+    if let Some(kind) = classify_error_source_chain(err.source()) {
+        return kind;
+    }
+    if err.is_connect() {
+        return DirectUpstreamBodyErrorKind::ResetOrClosed;
+    }
+    if err.is_decode() {
+        return DirectUpstreamBodyErrorKind::Decode;
+    }
+    if err.is_body() || err.is_request() {
+        return DirectUpstreamBodyErrorKind::Protocol;
+    }
+    DirectUpstreamBodyErrorKind::Unknown
+}
+
 pub(crate) fn direct_upstream_response_byte_stream(
-    prefetched_body: VecDeque<Result<Bytes, String>>,
+    prefetched_body: VecDeque<Result<Bytes, DirectUpstreamBodyReadError>>,
     response: DirectUpstreamResponse,
-) -> futures_util::stream::BoxStream<'static, Result<Bytes, String>> {
+) -> futures_util::stream::BoxStream<'static, Result<Bytes, DirectUpstreamBodyReadError>> {
     let response_stream = match response {
         DirectUpstreamResponse::Reqwest(response) => response
             .bytes_stream()
-            .map(|item| item.map_err(|err| format_upstream_request_error(&err)))
+            .map(|item| item.map_err(|err| DirectUpstreamBodyReadError::from_reqwest(&err)))
             .boxed(),
         DirectUpstreamResponse::HyperH2c(response) => response
             .into_body()
             .into_data_stream()
-            .map(|item| item.map_err(|err| format_hyper_error_chain(&err)))
+            .map(|item| item.map_err(|err| DirectUpstreamBodyReadError::from_hyper(&err)))
             .boxed(),
         DirectUpstreamResponse::BrowserWreq(response) => response
             .bytes_stream()
-            .map(|item| item.map_err(|err| format_wreq_upstream_request_error(&err)))
+            .map(|item| item.map_err(|err| DirectUpstreamBodyReadError::from_wreq(&err)))
             .boxed(),
         DirectUpstreamResponse::LocalTunnel(mut response) => async_stream::stream! {
             loop {
@@ -1240,7 +1491,7 @@ pub(crate) fn direct_upstream_response_byte_stream(
                     Ok(Some(chunk)) => yield Ok(chunk),
                     Ok(None) => break,
                     Err(err) => {
-                        yield Err(err);
+                        yield Err(DirectUpstreamBodyReadError::from_local_tunnel(err));
                         break;
                     }
                 }
@@ -1262,7 +1513,7 @@ pub(crate) struct DirectUpstreamStreamExecution {
     pub(crate) upstream_content_length: Option<u64>,
     pub(crate) provider_api_format: String,
     pub(crate) stream_summary_report_context: Value,
-    pub(crate) prefetched_body: VecDeque<Result<Bytes, String>>,
+    pub(crate) prefetched_body: VecDeque<Result<Bytes, DirectUpstreamBodyReadError>>,
     pub(crate) stream_precommit_committed: bool,
     pub(crate) response: DirectUpstreamResponse,
     pub(crate) started_at: Instant,
@@ -10106,5 +10357,180 @@ mod tests {
             .expect("sync execution should include elapsed time");
         assert!(ttfb_ms > 0);
         assert!(elapsed_ms >= ttfb_ms);
+    }
+
+    #[tokio::test]
+    async fn loopback_body_stream_classifies_timeout_truncated_and_protocol_errors_without_leaking_details(
+    ) {
+        use super::{
+            direct_upstream_response_byte_stream, DirectUpstreamBodyErrorKind,
+            DirectUpstreamBodyErrorSource, DirectUpstreamBodyReadError, DirectUpstreamResponse,
+        };
+        use futures_util::StreamExt;
+        use std::{collections::VecDeque, time::Duration};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. Midstream body read timeout via loopback HTTP
+        let timeout_listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("timeout listener should bind");
+        let timeout_addr = timeout_listener.local_addr().expect("timeout addr");
+        let timeout_server = tokio::spawn(async move {
+            let (mut socket, _) = timeout_listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let payload = b"data: hello\n\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n",
+                payload.len()
+            );
+            socket.write_all(head.as_bytes()).await.expect("write head");
+            socket.write_all(payload).await.expect("write payload");
+            socket.write_all(b"\r\n").await.expect("write chunk crlf");
+            socket.flush().await.expect("flush");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let timeout_client = reqwest::Client::builder()
+            .no_proxy()
+            .read_timeout(Duration::from_millis(40))
+            .build()
+            .expect("reqwest client");
+        let timeout_response = timeout_client
+            .get(format!(
+                "http://{timeout_addr}/stream?api_key=secret-query-token"
+            ))
+            .send()
+            .await
+            .expect("headers should arrive");
+        let mut timeout_stream = direct_upstream_response_byte_stream(
+            VecDeque::new(),
+            DirectUpstreamResponse::Reqwest(timeout_response),
+        );
+        let first = timeout_stream
+            .next()
+            .await
+            .expect("first chunk item")
+            .expect("first chunk ok");
+        assert_eq!(first.as_ref(), b"data: hello\n\n");
+        let timeout_err = timeout_stream
+            .next()
+            .await
+            .expect("timeout error item")
+            .expect_err("second read should time out");
+        timeout_server.abort();
+        assert_eq!(timeout_err.source, DirectUpstreamBodyErrorSource::Reqwest);
+        assert_eq!(timeout_err.kind, DirectUpstreamBodyErrorKind::Timeout);
+        assert_eq!(
+            timeout_err.kind.execution_error_kind(),
+            aether_contracts::ExecutionErrorKind::ReadTimeout
+        );
+        assert!(!timeout_err.to_string().contains("secret-query-token"));
+        assert!(!format!("{timeout_err:?}").contains("secret-query-token"));
+
+        // 2. Truncated / prematurely closed chunked body via loopback HTTP
+        let closed_listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("closed listener should bind");
+        let closed_addr = closed_listener.local_addr().expect("closed addr");
+        let (chunk_read_tx, chunk_read_rx) = tokio::sync::oneshot::channel::<()>();
+        let closed_server = tokio::spawn(async move {
+            let (mut socket, _) = closed_listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let payload = b"data: partial\n\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n",
+                payload.len()
+            );
+            socket.write_all(head.as_bytes()).await.expect("write head");
+            socket.write_all(payload).await.expect("write payload");
+            socket.write_all(b"\r\n").await.expect("write chunk crlf");
+            socket.flush().await.expect("flush");
+            let _ = chunk_read_rx.await;
+            drop(socket);
+        });
+
+        let std_client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("reqwest client");
+        let closed_response = std_client
+            .get(format!(
+                "http://{closed_addr}/stream?token=secret-closed-token"
+            ))
+            .send()
+            .await
+            .expect("headers should arrive");
+        let mut closed_stream = direct_upstream_response_byte_stream(
+            VecDeque::new(),
+            DirectUpstreamResponse::Reqwest(closed_response),
+        );
+        let first_closed = closed_stream
+            .next()
+            .await
+            .expect("first chunk item")
+            .expect("first chunk ok");
+        assert_eq!(first_closed.as_ref(), b"data: partial\n\n");
+        let _ = chunk_read_tx.send(());
+        let closed_err = closed_stream
+            .next()
+            .await
+            .expect("closed error item")
+            .expect_err("truncated chunked stream must fail");
+        let _ = closed_server.await;
+        assert_eq!(closed_err.source, DirectUpstreamBodyErrorSource::Reqwest);
+        assert_eq!(closed_err.kind, DirectUpstreamBodyErrorKind::ResetOrClosed);
+        assert_eq!(
+            closed_err.kind.execution_error_kind(),
+            aether_contracts::ExecutionErrorKind::ProtocolError
+        );
+        assert!(!closed_err.to_string().contains("secret-closed-token"));
+
+        // 3. Invalid chunked framing is surfaced as an InvalidData decoder error.
+        let proto_listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("proto listener should bind");
+        let proto_addr = proto_listener.local_addr().expect("proto addr");
+        let proto_server = tokio::spawn(async move {
+            let (mut socket, _) = proto_listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\nzzzz-invalid-hex\r\n\r\n",
+                )
+                .await
+                .expect("write malformed chunk");
+            socket.flush().await.expect("flush");
+        });
+        let proto_response = std_client
+            .get(format!("http://{proto_addr}/stream"))
+            .send()
+            .await
+            .expect("headers should arrive");
+        let mut proto_stream = direct_upstream_response_byte_stream(
+            VecDeque::new(),
+            DirectUpstreamResponse::Reqwest(proto_response),
+        );
+        let proto_err = proto_stream
+            .next()
+            .await
+            .expect("proto error item")
+            .expect_err("malformed chunked body must fail");
+        let _ = proto_server.await;
+        assert_eq!(proto_err.source, DirectUpstreamBodyErrorSource::Reqwest);
+        assert_eq!(proto_err.kind, DirectUpstreamBodyErrorKind::Decode);
+
+        // 4. Local tunnel untyped arbitrary text remains safe and unknown
+        let tunnel_secret = "Bearer sk-tunnel-secret https://user:pass@internal.example/path";
+        let tunnel_err = DirectUpstreamBodyReadError::from_local_tunnel(tunnel_secret);
+        assert_eq!(
+            tunnel_err.source,
+            DirectUpstreamBodyErrorSource::LocalTunnel
+        );
+        assert_eq!(tunnel_err.kind, DirectUpstreamBodyErrorKind::Unknown);
+        assert!(!tunnel_err.to_string().contains("sk-tunnel-secret"));
+        assert!(!format!("{tunnel_err:?}").contains("sk-tunnel-secret"));
     }
 }

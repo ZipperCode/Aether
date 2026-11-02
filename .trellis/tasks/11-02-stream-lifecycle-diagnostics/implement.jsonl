@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/aether-gateway/backend/sse-keepalive-framing-contract.md", "reason": "Preserve native SSE wire behavior"}
+{"file": ".trellis/spec/aether-data-postgres/backend/database-guidelines.md", "reason": "Use disposable production-prepared PostgreSQL for SQL regressions"}

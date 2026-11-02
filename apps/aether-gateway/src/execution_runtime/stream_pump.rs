@@ -21,14 +21,16 @@ use crate::ai_serving::api::{
     GeminiStreamWireMode, StreamingStandardTerminalObserver,
 };
 use crate::execution_runtime::ndjson::encode_stream_frame_ndjson;
-use crate::execution_runtime::stream::ClientVisibleStreamCompletionTracker;
+use crate::execution_runtime::stream::{
+    log_direct_stream_diagnostics, ClientVisibleStreamCompletionTracker,
+};
 use crate::execution_runtime::stream_read_timeout::{
     await_stream_idle_read, stream_idle_timeout_message,
 };
 use crate::execution_runtime::transport::{
     append_upstream_response_body_chunk, decode_response_body_bytes,
     direct_upstream_response_byte_stream, stream_first_byte_timeout_message,
-    DirectUpstreamResponse,
+    DirectUpstreamBodyReadError, DirectUpstreamResponse,
 };
 use crate::execution_runtime::DirectUpstreamStreamExecution;
 use crate::GatewayError;
@@ -40,22 +42,13 @@ const UPSTREAM_STREAM_READ_ERROR_MESSAGE: &str = "Upstream response stream faile
 /// 上游响应不可信，进入帧构造前无条件剥除同名标记，防止伪造绕过改写。
 pub(crate) const BRIDGED_CLIENT_SSE_MARKER_HEADER: &str = "x-aether-bridged-client-sse";
 
-fn upstream_stream_error_category(response: &DirectUpstreamResponse) -> &'static str {
-    match response {
-        DirectUpstreamResponse::Reqwest(_) => "reqwest_body_read_failed",
-        DirectUpstreamResponse::HyperH2c(_) => "hyper_body_read_failed",
-        DirectUpstreamResponse::BrowserWreq(_) => "browser_body_read_failed",
-        DirectUpstreamResponse::LocalTunnel(_) => "tunnel_body_read_failed",
-    }
-}
-
 pub(crate) fn build_direct_execution_frame_stream(
     execution: DirectUpstreamStreamExecution,
 ) -> impl Stream<Item = Result<Bytes, IoError>> + Send + 'static {
     stream! {
         let DirectUpstreamStreamExecution {
-            request_id: _,
-            candidate_id: _,
+            request_id,
+            candidate_id,
             status_code,
             headers,
             upstream_content_length,
@@ -75,7 +68,6 @@ pub(crate) fn build_direct_execution_frame_stream(
         let mut headers = headers;
         headers.remove(BRIDGED_CLIENT_SSE_MARKER_HEADER);
         let _upstream_target_permit = upstream_target_permit;
-        let upstream_error_category = upstream_stream_error_category(&response);
 
         let mut observer_context = stream_summary_report_context;
         if observer_context
@@ -98,7 +90,7 @@ pub(crate) fn build_direct_execution_frame_stream(
         let mut private_stream_normalizer =
             maybe_build_provider_private_stream_normalizer(Some(&observer_context));
         let mut stream_terminal_observer = StreamingStandardTerminalObserver::default();
-        let mut stream_completion = ClientVisibleStreamCompletionTracker::default();
+        let mut stream_completion = ClientVisibleStreamCompletionTracker::with_started_at(started_at);
         let mut observer_buffered = Vec::new();
 
         if should_buffer_non_stream_response(
@@ -108,6 +100,9 @@ pub(crate) fn build_direct_execution_frame_stream(
         ) {
             let original_headers = headers.clone();
             match buffer_non_sse_upstream_body(
+                request_id.as_str(),
+                candidate_id.as_deref(),
+                status_code,
                 prefetched_body,
                 response,
                 started_at,
@@ -198,6 +193,7 @@ pub(crate) fn build_direct_execution_frame_stream(
                 }
                 Err(BufferedUpstreamBodyError {
                     message,
+                    body_read_error,
                     ttfb_ms,
                     upstream_bytes,
                     first_byte_timeout,
@@ -218,6 +214,8 @@ pub(crate) fn build_direct_execution_frame_stream(
                         encode_first_byte_timeout_frame(timeout)
                     } else if let Some(timeout) = idle_timeout {
                         encode_idle_timeout_frame(timeout)
+                    } else if let Some(body_error) = body_read_error {
+                        encode_error_frame(body_error)
                     } else {
                         encode_error_frame(message)
                     };
@@ -264,11 +262,14 @@ pub(crate) fn build_direct_execution_frame_stream(
         let mut ttfb_ms = None;
         let mut first_chunk_telemetry_emitted = false;
         let mut prefetched_body_failed = false;
+        let mut terminal_error_category: Option<&'static str> = None;
         for item in prefetched_body {
             match item {
                 Ok(chunk) if chunk.is_empty() => continue,
                 Ok(chunk) => {
-                    stream_completion.observe_chunk(&chunk);
+                    let chunk_elapsed_ms =
+                        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    stream_completion.observe_chunk_at(&chunk, chunk_elapsed_ms);
                     if ttfb_ms.is_none() {
                         ttfb_ms = Some(started_at.elapsed().as_millis() as u64);
                     }
@@ -298,16 +299,23 @@ pub(crate) fn build_direct_execution_frame_stream(
                         }
                     }
                 }
-                Err(_message) => {
+                Err(error) => {
+                    stream_completion.record_body_read_error(error);
+                    let snapshot = stream_completion.diagnostic_snapshot();
                     warn!(
                         event_name = "stream_pump_body_read_error",
                         log_type = "ops",
+                        request_id = %request_id,
+                        candidate_id = ?candidate_id.as_deref(),
                         status_code,
                         upstream_bytes,
-                        error_category = "prefetched_body_read_failed",
+                        error_source = error.source.as_str(),
+                        error_category = error.kind.as_str(),
+                        last_content_progress_elapsed_ms = ?snapshot.last_content_progress_elapsed_ms,
+                        observed_terminal = snapshot.observed_terminal,
                         "upstream body stream read error"
                     );
-                    match encode_error_frame(UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string()) {
+                    match encode_error_frame(error) {
                         Ok(frame) => yield Ok(frame),
                         Err(encode_err) => {
                             yield Err(encode_err);
@@ -328,6 +336,7 @@ pub(crate) fn build_direct_execution_frame_stream(
                 ).await {
                     Ok(item) => item,
                     Err(timeout) => {
+                        terminal_error_category = Some("first_byte_timeout");
                         match encode_first_byte_timeout_frame(timeout) {
                             Ok(frame) => yield Ok(frame),
                             Err(err) => yield Err(err),
@@ -355,6 +364,7 @@ pub(crate) fn build_direct_execution_frame_stream(
                             // The terminal summary carries the original provider failure.
                             break;
                         }
+                        terminal_error_category = Some("read_timeout");
                         match encode_idle_timeout_frame(timeout) {
                             Ok(frame) => yield Ok(frame),
                             Err(err) => yield Err(err),
@@ -366,7 +376,9 @@ pub(crate) fn build_direct_execution_frame_stream(
             let Some(item) = item else { break };
             match item {
                 Ok(chunk) => {
-                    stream_completion.observe_chunk(&chunk);
+                    let chunk_elapsed_ms =
+                        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    stream_completion.observe_chunk_at(&chunk, chunk_elapsed_ms);
                     if ttfb_ms.is_none() {
                         ttfb_ms = Some(started_at.elapsed().as_millis() as u64);
                     }
@@ -396,16 +408,23 @@ pub(crate) fn build_direct_execution_frame_stream(
                         }
                     }
                 }
-                Err(_) => {
+                Err(error) => {
+                    stream_completion.record_body_read_error(error);
+                    let snapshot = stream_completion.diagnostic_snapshot();
                     warn!(
                         event_name = "stream_pump_body_read_error",
                         log_type = "ops",
+                        request_id = %request_id,
+                        candidate_id = ?candidate_id.as_deref(),
                         status_code,
                         upstream_bytes,
-                        error_category = upstream_error_category,
+                        error_source = error.source.as_str(),
+                        error_category = error.kind.as_str(),
+                        last_content_progress_elapsed_ms = ?snapshot.last_content_progress_elapsed_ms,
+                        observed_terminal = snapshot.observed_terminal,
                         "upstream body stream read error"
                     );
-                    match encode_error_frame(UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string()) {
+                    match encode_error_frame(error) {
                         Ok(frame) => yield Ok(frame),
                         Err(err) => yield Err(err),
                     }
@@ -421,9 +440,26 @@ pub(crate) fn build_direct_execution_frame_stream(
             &mut observer_buffered,
         );
 
+        let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let diagnostics = stream_completion.diagnostic_snapshot();
+        log_direct_stream_diagnostics(
+            "direct_frame_pump",
+            None,
+            request_id.as_str(),
+            candidate_id.as_deref(),
+            status_code,
+            ttfb_ms,
+            elapsed_ms,
+            upstream_bytes,
+            false,
+            terminal_error_category,
+            summary.as_ref().is_some_and(|item| item.observed_finish),
+            &diagnostics,
+        );
+
         match encode_telemetry_frame(
             ttfb_ms,
-            Some(started_at.elapsed().as_millis() as u64),
+            Some(elapsed_ms),
             upstream_bytes,
         ) {
             Ok(frame) => yield Ok(frame),
@@ -481,14 +517,15 @@ fn encode_data_frame(chunk: &Bytes) -> Result<Bytes, IoError> {
     })
 }
 
-fn encode_error_frame(_message: String) -> Result<Bytes, IoError> {
+fn encode_error_frame(error: impl Into<DirectUpstreamBodyReadError>) -> Result<Bytes, IoError> {
+    let error = error.into();
     encode_stream_frame_ndjson(&StreamFrame {
         frame_type: StreamFrameType::Error,
         payload: StreamFramePayload::Error {
             error: ExecutionError {
-                kind: ExecutionErrorKind::ProtocolError,
+                kind: error.kind.execution_error_kind(),
                 phase: ExecutionPhase::StreamRead,
-                message: UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string(),
+                message: error.public_message().to_string(),
                 upstream_status: None,
                 retryable: true,
                 failover_recommended: true,
@@ -559,6 +596,7 @@ struct BufferedUpstreamBody {
 
 struct BufferedUpstreamBodyError {
     message: String,
+    body_read_error: Option<DirectUpstreamBodyReadError>,
     ttfb_ms: Option<u64>,
     upstream_bytes: u64,
     first_byte_timeout: Option<Duration>,
@@ -575,6 +613,7 @@ fn append_buffered_upstream_body_chunk(
     append_upstream_response_body_chunk(body_bytes, chunk).map_err(|error| {
         BufferedUpstreamBodyError {
             message: error.to_string(),
+            body_read_error: None,
             ttfb_ms,
             upstream_bytes: *upstream_bytes,
             first_byte_timeout: None,
@@ -643,7 +682,10 @@ fn should_buffer_non_stream_response(
 }
 
 async fn buffer_non_sse_upstream_body(
-    prefetched_body: VecDeque<Result<Bytes, String>>,
+    request_id: &str,
+    candidate_id: Option<&str>,
+    status_code: u16,
+    prefetched_body: VecDeque<Result<Bytes, DirectUpstreamBodyReadError>>,
     response: DirectUpstreamResponse,
     started_at: Instant,
     stream_first_byte_timeout: Option<Duration>,
@@ -652,7 +694,6 @@ async fn buffer_non_sse_upstream_body(
     let mut body_bytes = Vec::new();
     let mut upstream_bytes = 0u64;
     let mut ttfb_ms = None;
-    let upstream_error_category = upstream_stream_error_category(&response);
     let mut bytes_stream = direct_upstream_response_byte_stream(prefetched_body, response);
     loop {
         let item = if ttfb_ms.is_none() {
@@ -667,6 +708,7 @@ async fn buffer_non_sse_upstream_body(
                 Err(timeout) => {
                     return Err(BufferedUpstreamBodyError {
                         message: stream_first_byte_timeout_message(timeout),
+                        body_read_error: None,
                         ttfb_ms,
                         upstream_bytes,
                         first_byte_timeout: Some(timeout),
@@ -680,6 +722,7 @@ async fn buffer_non_sse_upstream_body(
                 Err(timeout) => {
                     return Err(BufferedUpstreamBodyError {
                         message: stream_idle_timeout_message(timeout),
+                        body_read_error: None,
                         ttfb_ms,
                         upstream_bytes,
                         first_byte_timeout: None,
@@ -701,16 +744,21 @@ async fn buffer_non_sse_upstream_body(
                     &mut upstream_bytes,
                 )?;
             }
-            Err(_) => {
+            Err(error) => {
                 warn!(
                     event_name = "stream_pump_body_read_error",
                     log_type = "ops",
+                    request_id = %request_id,
+                    candidate_id = ?candidate_id,
+                    status_code,
                     upstream_bytes,
-                    error_category = upstream_error_category,
+                    error_source = error.source.as_str(),
+                    error_category = error.kind.as_str(),
                     "upstream body stream read error"
                 );
                 return Err(BufferedUpstreamBodyError {
-                    message: UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string(),
+                    message: error.public_message().to_string(),
+                    body_read_error: Some(error),
                     ttfb_ms,
                     upstream_bytes,
                     first_byte_timeout: None,
@@ -915,6 +963,9 @@ mod tests {
         UPSTREAM_STREAM_READ_ERROR_MESSAGE,
     };
     use crate::ai_serving::api::StreamingStandardTerminalObserver;
+    use crate::execution_runtime::stream::{
+        log_direct_stream_diagnostics, ClientVisibleStreamCompletionTracker,
+    };
     use crate::execution_runtime::transport::{
         execute_stream_plan_via_local_tunnel, DirectSyncExecutionRuntime, DirectUpstreamResponse,
     };
@@ -2185,5 +2236,318 @@ mod tests {
             &[],
         );
         tunnel_app.hub.handle_proxy_frame(900, &mut end2).await;
+    }
+
+    #[test]
+    fn stream_completion_tracker_tracks_fragments_crlf_keepalives_oversize_and_redacts_unknown_names(
+    ) {
+        use std::sync::Mutex;
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogBuffer {
+            type Writer = LogWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                LogWriter(Arc::clone(&self.0))
+            }
+        }
+
+        let mut tracker = ClientVisibleStreamCompletionTracker::default();
+
+        // 1. Fragmented message_start across CRLF boundaries at t=10..20ms
+        assert!(!tracker.observe_chunk_at(b"event: message_st", 10));
+        assert!(!tracker.observe_chunk_at(b"art\r", 12));
+        assert!(!tracker.observe_chunk_at(b"\ndata: {\"type\":\"message_start\"}\r", 15));
+        assert!(!tracker.observe_chunk_at(b"\n\r", 18));
+        assert!(!tracker.observe_chunk_at(b"\n", 20));
+
+        let snap = tracker.diagnostic_snapshot();
+        assert_eq!(snap.message_start_event_count, 1);
+        assert_eq!(snap.fragmented_event_count, 1);
+        assert_eq!(snap.last_content_progress_elapsed_ms, Some(18));
+        assert!(!snap.incomplete_record_open);
+
+        // 2. Content delta at t=45ms
+        assert!(!tracker.observe_chunk_at(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"secret-body-token\"}}\n\n",
+            45,
+        ));
+        assert_eq!(
+            tracker
+                .diagnostic_snapshot()
+                .last_content_progress_elapsed_ms,
+            Some(45)
+        );
+
+        // 3. Heartbeats (comment keepalive + ping event) at t=120ms and t=240ms must NOT advance content progress
+        assert!(!tracker.observe_chunk_at(b": aether-keepalive\r\n\r\n", 120));
+        assert!(!tracker.observe_chunk_at(b"event: ping\ndata: {\"type\":\"ping\"}\n\n", 240,));
+        let snap = tracker.diagnostic_snapshot();
+        assert_eq!(snap.keepalive_event_count, 2);
+        assert_eq!(snap.last_keepalive_elapsed_ms, Some(240));
+        assert_eq!(snap.last_content_progress_elapsed_ms, Some(45));
+
+        // 4. Unknown event names must be aggregated into unknown_event_count and never logged
+        assert!(!tracker.observe_chunk_at(
+            b"event: vendor.secret_custom_event_alpha\ndata: {\"type\":\"vendor.secret_custom_event_alpha\",\"token\":\"sk-secret-payload\"}\n\n",
+            300,
+        ));
+        let snap = tracker.diagnostic_snapshot();
+        assert_eq!(snap.unknown_event_count, 1);
+        assert_eq!(snap.last_content_progress_elapsed_ms, Some(300));
+
+        // 5. Oversize (>1 MiB) record recovery followed by terminal completion
+        let mut oversized = b"event: content_block_delta\ndata: ".to_vec();
+        oversized.extend(std::iter::repeat_n(b'a', 1024 * 1024 + 64));
+        oversized.extend_from_slice(b"\n\n");
+        assert!(!tracker.observe_chunk_at(&oversized, 410));
+        let snap = tracker.diagnostic_snapshot();
+        assert_eq!(snap.oversized_record_count, 1);
+        assert_eq!(snap.content_delta_event_count, 2);
+        assert_eq!(snap.last_content_progress_elapsed_ms, Some(410));
+        assert!(!snap.incomplete_record_open);
+
+        assert!(tracker.observe_chunk_at(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            500,
+        ));
+        let snap = tracker.diagnostic_snapshot();
+        assert!(snap.observed_terminal);
+        assert!(snap.successful_completion);
+        assert_eq!(snap.terminal_event_count, 1);
+        assert_eq!(snap.total_event_count, 7);
+        assert_eq!(snap.last_content_progress_elapsed_ms, Some(500));
+
+        let log_buf = LogBuffer::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_writer(log_buf.clone())
+                .with_filter(LevelFilter::INFO),
+        );
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatch, || {
+            log_direct_stream_diagnostics(
+                "direct_frame_pump",
+                Some("trace-diag-privacy-1"),
+                "req-full-correlation-id-1234567890",
+                Some("cand-full-correlation-id-9876"),
+                200,
+                Some(10),
+                500,
+                snap.observed_bytes,
+                false,
+                None,
+                true,
+                &snap,
+            );
+        });
+        let logged =
+            String::from_utf8(log_buf.0.lock().expect("log lock").clone()).expect("log utf8");
+        assert!(logged.contains("req-full-correlation-id-1234567890"));
+        assert!(logged.contains("cand-full-correlation-id-9876"));
+        assert!(logged.contains("\"unknown_event_count\":1"));
+        assert!(logged.contains("\"keepalive_event_count\":2"));
+        assert!(logged.contains("\"oversized_record_count\":1"));
+        assert!(!logged.contains("secret_custom_event_alpha"));
+        assert!(!logged.contains("sk-secret-payload"));
+        assert!(!logged.contains("secret-body-token"));
+    }
+
+    #[tokio::test]
+    async fn direct_execution_frame_stream_distinguishes_loopback_read_timeout_and_truncated_body_while_preserving_native_bytes(
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. Loopback HTTP read timeout -> ExecutionErrorKind::ReadTimeout
+        let timeout_listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("timeout listener");
+        let timeout_addr = timeout_listener.local_addr().expect("timeout addr");
+        let native_chunk = b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"exact-wire\"},\"finish_reason\":null}]}\n\n";
+        let timeout_server = tokio::spawn(async move {
+            let (mut socket, _) = timeout_listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n",
+                native_chunk.len()
+            );
+            socket.write_all(head.as_bytes()).await.expect("write head");
+            socket.write_all(native_chunk).await.expect("write chunk");
+            socket.write_all(b"\r\n").await.expect("write crlf");
+            socket.flush().await.expect("flush");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .read_timeout(Duration::from_millis(40))
+            .build()
+            .expect("client");
+        let response = client
+            .post(format!(
+                "http://{timeout_addr}/v1/chat/completions?key=secret-timeout-key"
+            ))
+            .send()
+            .await
+            .expect("response headers");
+        let execution = crate::execution_runtime::DirectUpstreamStreamExecution {
+            request_id: "req-loopback-timeout-full".into(),
+            candidate_id: Some("cand-loopback-timeout-full".into()),
+            status_code: 200,
+            headers: BTreeMap::from([("content-type".into(), "text/event-stream".into())]),
+            upstream_content_length: None,
+            provider_api_format: "openai:chat".into(),
+            stream_summary_report_context: serde_json::json!({
+                "provider_api_format": "openai:chat",
+                "client_api_format": "openai:chat",
+                "upstream_is_stream": true,
+            }),
+            prefetched_body: std::collections::VecDeque::new(),
+            stream_precommit_committed: false,
+            response: DirectUpstreamResponse::Reqwest(response),
+            started_at: std::time::Instant::now(),
+            response_observation: aether_contracts::ExecutionResponseObservation {
+                request_started_at_unix_ms: 1,
+                response_headers_observed_at_unix_ms: 2,
+                request_order_id: "order-timeout-1".into(),
+            },
+            stream_first_byte_timeout: Some(Duration::from_secs(5)),
+            stream_idle_timeout: Some(Duration::from_secs(5)),
+            upstream_target_permit: None,
+        };
+
+        let frames = build_direct_execution_frame_stream(execution)
+            .map(|item| item.expect("frame encode"))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("frame json"))
+            .collect::<Vec<_>>();
+        timeout_server.abort();
+
+        let data_b64 = frames
+            .iter()
+            .find(|f| f.get("type").and_then(Value::as_str) == Some("data"))
+            .and_then(|f| f.pointer("/payload/chunk_b64"))
+            .and_then(Value::as_str)
+            .expect("data frame should exist");
+        let decoded_data = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .expect("decode b64");
+        assert_eq!(decoded_data.as_slice(), native_chunk);
+
+        let err_obj = frames
+            .iter()
+            .find(|f| f.get("type").and_then(Value::as_str) == Some("error"))
+            .and_then(|f| f.pointer("/payload/error"))
+            .expect("error frame should exist");
+        assert_eq!(
+            err_obj.get("kind").and_then(Value::as_str),
+            Some("read_timeout")
+        );
+        assert_eq!(
+            err_obj.get("message").and_then(Value::as_str),
+            Some("Upstream response stream timed out")
+        );
+        assert!(!err_obj.to_string().contains("secret-timeout-key"));
+
+        // 2. Loopback HTTP truncated body -> ExecutionErrorKind::ProtocolError (sanitized)
+        let closed_listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("closed listener");
+        let closed_addr = closed_listener.local_addr().expect("closed addr");
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel::<()>();
+        let closed_server = tokio::spawn(async move {
+            let (mut socket, _) = closed_listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n",
+                native_chunk.len()
+            );
+            socket.write_all(head.as_bytes()).await.expect("write head");
+            socket.write_all(native_chunk).await.expect("write chunk");
+            socket.write_all(b"\r\n").await.expect("write crlf");
+            socket.flush().await.expect("flush");
+            let _ = read_rx.await;
+            drop(socket);
+        });
+
+        let closed_execution = DirectSyncExecutionRuntime::new()
+            .execute_stream(&ExecutionPlan {
+                request_id: "req-loopback-closed-full".into(),
+                candidate_id: Some("cand-loopback-closed-full".into()),
+                provider_name: Some("openai".into()),
+                provider_id: "prov-1".into(),
+                endpoint_id: "ep-1".into(),
+                key_id: "key-1".into(),
+                method: "POST".into(),
+                url: format!("http://{closed_addr}/v1/chat/completions"),
+                headers: BTreeMap::from([("content-type".into(), "application/json".into())]),
+                content_type: Some("application/json".into()),
+                content_encoding: None,
+                body: RequestBody::from_json(serde_json::json!({"stream": true})),
+                stream: true,
+                client_api_format: "openai:chat".into(),
+                provider_api_format: "openai:chat".into(),
+                model_name: Some("gpt-5".into()),
+                proxy: None,
+                transport_profile: None,
+                timeouts: Some(ExecutionTimeouts {
+                    connect_ms: Some(5_000),
+                    first_byte_ms: Some(5_000),
+                    read_ms: Some(5_000),
+                    total_ms: None,
+                    ..ExecutionTimeouts::default()
+                }),
+            })
+            .await
+            .expect("stream execution should open");
+
+        let mut frame_stream = Box::pin(build_direct_execution_frame_stream(closed_execution));
+        let mut closed_frames = Vec::new();
+        let mut release_tx = Some(read_tx);
+        while let Some(item) = frame_stream.next().await {
+            let bytes = item.expect("frame encode");
+            let parsed: Value = serde_json::from_slice(&bytes).expect("frame json");
+            if parsed.get("type").and_then(Value::as_str) == Some("data") {
+                if let Some(tx) = release_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+            closed_frames.push(parsed);
+        }
+        let _ = closed_server.await;
+
+        let closed_err_obj = closed_frames
+            .iter()
+            .find(|f| f.get("type").and_then(Value::as_str) == Some("error"))
+            .and_then(|f| f.pointer("/payload/error"))
+            .expect("error frame should exist on truncated stream");
+        assert_eq!(
+            closed_err_obj.get("kind").and_then(Value::as_str),
+            Some("protocol_error")
+        );
+        assert_eq!(
+            closed_err_obj.get("message").and_then(Value::as_str),
+            Some(UPSTREAM_STREAM_READ_ERROR_MESSAGE)
+        );
     }
 }

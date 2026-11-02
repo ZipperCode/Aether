@@ -258,7 +258,14 @@ DO UPDATE SET
     WHEN EXCLUDED.client_response_body IS NOT NULL OR $60 THEN NULL
     ELSE COALESCE(EXCLUDED.client_response_body_compressed, "usage".client_response_body_compressed)
   END ELSE "usage".client_response_body_compressed END,
-  request_metadata = CASE WHEN "usage".billing_status = 'pending' AND $61 THEN COALESCE(EXCLUDED.request_metadata, "usage".request_metadata) ELSE "usage".request_metadata END,
+  request_metadata = CASE WHEN "usage".billing_status = 'pending' AND $61 THEN
+    CASE WHEN EXCLUDED.status IN ('pending', 'streaming')
+      AND "usage".request_metadata->'runtime_heartbeat_unix_secs' IS NOT NULL THEN
+      (COALESCE(EXCLUDED.request_metadata, "usage".request_metadata)::jsonb
+       || jsonb_build_object('runtime_heartbeat_unix_secs',
+                            "usage".request_metadata->'runtime_heartbeat_unix_secs'))::json
+    ELSE COALESCE(EXCLUDED.request_metadata, "usage".request_metadata) END
+  ELSE "usage".request_metadata END,
   finalized_at = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.finalized_at, "usage".finalized_at) ELSE "usage".finalized_at END,
   updated_at_unix_secs = CASE WHEN "usage".billing_status = 'pending' THEN
     GREATEST(

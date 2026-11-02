@@ -109,11 +109,11 @@ use crate::execution_runtime::submission::{
 };
 use crate::execution_runtime::transport::{
     decode_base64_body_with_limit, direct_upstream_response_byte_stream,
-    execute_stream_plan_via_local_tunnel, format_hyper_error_chain, format_upstream_request_error,
-    format_wreq_upstream_request_error, record_manual_proxy_request_failure,
+    execute_stream_plan_via_local_tunnel, record_manual_proxy_request_failure,
     record_manual_proxy_request_success, record_manual_proxy_stream_error,
     safe_transport_error_message, stream_first_byte_timeout_message, DirectSyncExecutionRuntime,
-    DirectUpstreamResponse, DirectUpstreamStreamExecution, ExecutionRuntimeTransportError,
+    DirectUpstreamBodyReadError, DirectUpstreamResponse, DirectUpstreamStreamExecution,
+    ExecutionRuntimeTransportError,
 };
 use crate::execution_runtime::windsurf::maybe_execute_windsurf_stream;
 use crate::execution_runtime::{
@@ -1719,17 +1719,17 @@ async fn stream_plan_uses_codex_agent_identity(state: &AppState, plan: &Executio
 
 async fn next_direct_upstream_response_chunk(
     response: &mut DirectUpstreamResponse,
-) -> Result<Option<Bytes>, String> {
+) -> Result<Option<Bytes>, DirectUpstreamBodyReadError> {
     match response {
         DirectUpstreamResponse::Reqwest(response) => response
             .chunk()
             .await
-            .map_err(|err| format_upstream_request_error(&err)),
+            .map_err(|err| DirectUpstreamBodyReadError::from_reqwest(&err)),
         DirectUpstreamResponse::HyperH2c(response) => loop {
             let Some(frame) = response.body_mut().frame().await else {
                 return Ok(None);
             };
-            let frame = frame.map_err(|err| format_hyper_error_chain(&err))?;
+            let frame = frame.map_err(|err| DirectUpstreamBodyReadError::from_hyper(&err))?;
             if let Ok(chunk) = frame.into_data() {
                 return Ok(Some(chunk));
             }
@@ -1737,8 +1737,11 @@ async fn next_direct_upstream_response_chunk(
         DirectUpstreamResponse::BrowserWreq(response) => response
             .chunk()
             .await
-            .map_err(|err| format_wreq_upstream_request_error(&err)),
-        DirectUpstreamResponse::LocalTunnel(response) => response.next_chunk().await,
+            .map_err(|err| DirectUpstreamBodyReadError::from_wreq(&err)),
+        DirectUpstreamResponse::LocalTunnel(response) => response
+            .next_chunk()
+            .await
+            .map_err(DirectUpstreamBodyReadError::from_local_tunnel),
     }
 }
 
@@ -1880,7 +1883,7 @@ fn should_use_direct_sse_passthrough(
     )
 }
 
-type DirectUpstreamByteStream = BoxStream<'static, Result<Bytes, String>>;
+type DirectUpstreamByteStream = BoxStream<'static, Result<Bytes, DirectUpstreamBodyReadError>>;
 
 async fn await_direct_passthrough_first_item<T, F>(
     future: F,
@@ -1955,15 +1958,16 @@ async fn forward_direct_passthrough_client_chunk(
         observe_gateway_stage_ms("direct_passthrough_first_client_send_wait", send_wait_ms);
     }
 
-    if observe_stream_completion {
-        *client_visible_stream_completed |=
-            client_stream_completion_tracker.observe_chunk(chunk.as_ref());
-    }
-    *client_stream_bytes = client_stream_bytes.saturating_add(chunk_len);
-    *last_client_chunk_elapsed_ms = stream_started_at
+    let elapsed_ms = stream_started_at
         .elapsed()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
+    if observe_stream_completion {
+        *client_visible_stream_completed |=
+            client_stream_completion_tracker.observe_chunk_at(chunk.as_ref(), elapsed_ms);
+    }
+    *client_stream_bytes = client_stream_bytes.saturating_add(chunk_len);
+    *last_client_chunk_elapsed_ms = elapsed_ms;
     true
 }
 
@@ -2050,7 +2054,7 @@ impl DirectPassthroughFinalizer {
         self.core_mut().terminal_failure = Some(failure);
     }
 
-    fn prepare_upstream_chunk(&mut self, mut chunk: Bytes) -> Option<Bytes> {
+    fn prepare_upstream_chunk(&mut self, mut chunk: Bytes, observed_at: Instant) -> Option<Bytes> {
         let core = self.core_mut();
         if !core.requires_anthropic_message_stop {
             return Some(chunk);
@@ -2058,9 +2062,10 @@ impl DirectPassthroughFinalizer {
         if core.client_visible_stream_completed {
             return None;
         }
+        let elapsed_ms = stream_elapsed_ms_at(core.stream_started_at, observed_at);
         if let Some(terminal_end) = core
             .client_stream_completion_tracker
-            .observe_anthropic_message_stop_terminal_end(chunk.as_ref())
+            .observe_anthropic_message_stop_terminal_end_at(chunk.as_ref(), elapsed_ms)
         {
             chunk.truncate(terminal_end);
             core.client_visible_stream_completed = true;
@@ -2117,11 +2122,12 @@ impl DirectPassthroughFinalizer {
 
     fn observe_upstream_chunk(&mut self, chunk: &Bytes, observed_at: Instant) {
         let core = self.core_mut();
+        let elapsed_ms = stream_elapsed_ms_at(core.stream_started_at, observed_at);
         if core.provider_stream_bytes == 0 {
             observe_gateway_stage_trace_ms(
                 &mut core.stage_trace,
                 "direct_passthrough_upstream_body_first",
-                stream_elapsed_ms_at(core.stream_started_at, observed_at),
+                elapsed_ms,
             );
         }
         let captured_first_stream_event = maybe_capture_first_stream_event_telemetry(
@@ -2131,11 +2137,7 @@ impl DirectPassthroughFinalizer {
             &mut core.usage_stream_telemetry,
         );
         if captured_first_stream_event && core.provider_stream_bytes == 0 {
-            observe_gateway_stage_trace_ms(
-                &mut core.stage_trace,
-                "stream_first_data",
-                stream_elapsed_ms_at(core.stream_started_at, observed_at),
-            );
+            observe_gateway_stage_trace_ms(&mut core.stage_trace, "stream_first_data", elapsed_ms);
         }
 
         core.provider_stream_bytes = core
@@ -2185,19 +2187,20 @@ impl DirectPassthroughFinalizer {
             core.max_stream_body_buffer_bytes,
             &mut core.client_body_truncated,
         );
-        if !core.requires_anthropic_message_stop {
-            core.client_visible_stream_completed |= core
-                .client_stream_completion_tracker
-                .observe_chunk(chunk.as_ref());
-        }
-        core.client_stream_bytes = core
-            .client_stream_bytes
-            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        core.last_client_chunk_elapsed_ms = core
+        let elapsed_ms = core
             .stream_started_at
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
+        if !core.requires_anthropic_message_stop {
+            core.client_visible_stream_completed |= core
+                .client_stream_completion_tracker
+                .observe_chunk_at(chunk.as_ref(), elapsed_ms);
+        }
+        core.client_stream_bytes = core
+            .client_stream_bytes
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        core.last_client_chunk_elapsed_ms = elapsed_ms;
     }
 
     fn observe_first_client_yield(&mut self) {
@@ -2378,7 +2381,7 @@ impl DirectPassthroughFinalizerCore {
             buffered_body,
             provider_body_truncated,
             client_body_truncated,
-            client_stream_completion_tracker: _,
+            client_stream_completion_tracker,
             requires_anthropic_message_stop: _,
             client_visible_stream_completed,
             usage_stream_telemetry,
@@ -2413,14 +2416,34 @@ impl DirectPassthroughFinalizerCore {
             downstream_dropped = false;
         }
 
+        let stream_diagnostics = client_stream_completion_tracker.diagnostic_snapshot();
+        let summary_observed_finish = stream_terminal_summary
+            .as_ref()
+            .is_some_and(|summary| summary.observed_finish);
+
         if let Some(failure) = terminal_failure {
             record_manual_proxy_stream_error(&state, &plan).await;
-            let terminal_telemetry = Some(build_terminal_stream_telemetry(
+            let terminal_telemetry_val = build_terminal_stream_telemetry(
                 stream_started_at,
                 telemetry.as_ref(),
                 usage_stream_telemetry.as_ref(),
                 provider_stream_bytes,
-            ));
+            );
+            log_direct_stream_diagnostics(
+                "direct_passthrough_inline",
+                Some(trace_id.as_str()),
+                plan.request_id.as_str(),
+                candidate_id.as_deref(),
+                status_code,
+                terminal_telemetry_val.ttfb_ms,
+                terminal_telemetry_val.elapsed_ms.unwrap_or(0),
+                provider_stream_bytes,
+                false,
+                Some(failure.error_type.as_str()),
+                summary_observed_finish,
+                &stream_diagnostics,
+            );
+            let terminal_telemetry = Some(terminal_telemetry_val);
             let report_context_for_payload = report_context_with_stage_trace(
                 report_context,
                 stage_trace,
@@ -2450,12 +2473,27 @@ impl DirectPassthroughFinalizerCore {
         }
 
         if downstream_dropped {
-            let terminal_telemetry = Some(build_terminal_stream_telemetry(
+            let terminal_telemetry_val = build_terminal_stream_telemetry(
                 stream_started_at,
                 telemetry.as_ref(),
                 usage_stream_telemetry.as_ref(),
                 provider_stream_bytes,
-            ));
+            );
+            log_direct_stream_diagnostics(
+                "direct_passthrough_inline",
+                Some(trace_id.as_str()),
+                plan.request_id.as_str(),
+                candidate_id.as_deref(),
+                status_code,
+                terminal_telemetry_val.ttfb_ms,
+                terminal_telemetry_val.elapsed_ms.unwrap_or(0),
+                provider_stream_bytes,
+                true,
+                None,
+                summary_observed_finish,
+                &stream_diagnostics,
+            );
+            let terminal_telemetry = Some(terminal_telemetry_val);
             let report_context_for_payload = report_context_with_stage_trace(
                 report_context,
                 stage_trace,
@@ -2544,12 +2582,34 @@ impl DirectPassthroughFinalizerCore {
                 })
             });
         let should_submit_report = report_kind.is_some();
-        let terminal_telemetry = Some(build_terminal_stream_telemetry(
+        let terminal_telemetry_val = build_terminal_stream_telemetry(
             stream_started_at,
             telemetry.as_ref(),
             usage_stream_telemetry.as_ref(),
             provider_stream_bytes,
-        ));
+        );
+        let terminal_diag_error = stream_failed.then_some(if missing_observed_finish {
+            "stream_missing_terminal_event"
+        } else {
+            "stream_terminal_error"
+        });
+        log_direct_stream_diagnostics(
+            "direct_passthrough_inline",
+            Some(trace_id.as_str()),
+            plan.request_id.as_str(),
+            candidate_id.as_deref(),
+            status_code,
+            terminal_telemetry_val.ttfb_ms,
+            terminal_telemetry_val.elapsed_ms.unwrap_or(0),
+            provider_stream_bytes,
+            false,
+            terminal_diag_error,
+            stream_terminal_summary
+                .as_ref()
+                .is_some_and(|summary| summary.observed_finish),
+            &stream_diagnostics,
+        );
+        let terminal_telemetry = Some(terminal_telemetry_val);
         let report_context_for_payload = report_context_with_stage_trace(
             report_context,
             stage_trace,
@@ -2683,7 +2743,7 @@ impl DirectPassthroughFinalizerCore {
 
 fn build_direct_passthrough_inline_body_stream(
     finalizer: DirectPassthroughFinalizer,
-    prefetched_body: VecDeque<Result<Bytes, String>>,
+    prefetched_body: VecDeque<Result<Bytes, DirectUpstreamBodyReadError>>,
     response: DirectUpstreamResponse,
     upstream_started_at: Instant,
     stream_first_byte_timeout: Option<Duration>,
@@ -2716,7 +2776,7 @@ struct DirectPassthroughInlineBodyState {
 impl DirectPassthroughInlineBodyState {
     fn new(
         finalizer: DirectPassthroughFinalizer,
-        prefetched_body: VecDeque<Result<Bytes, String>>,
+        prefetched_body: VecDeque<Result<Bytes, DirectUpstreamBodyReadError>>,
         response: DirectUpstreamResponse,
         upstream_started_at: Instant,
         stream_first_byte_timeout: Option<Duration>,
@@ -2793,7 +2853,7 @@ impl DirectPassthroughInlineBodyState {
             let Some(chunk) = self
                 .finalizer
                 .as_mut()
-                .and_then(|finalizer| finalizer.prepare_upstream_chunk(chunk))
+                .and_then(|finalizer| finalizer.prepare_upstream_chunk(chunk, observed_at))
             else {
                 continue;
             };
@@ -2860,7 +2920,7 @@ impl DirectPassthroughInlineBodyState {
         None
     }
 
-    async fn next_upstream_item(&mut self) -> Option<Result<Bytes, String>> {
+    async fn next_upstream_item(&mut self) -> Option<Result<Bytes, DirectUpstreamBodyReadError>> {
         let needs_first_byte_timeout = self
             .finalizer
             .as_ref()
@@ -2925,7 +2985,7 @@ impl DirectPassthroughInlineBodyState {
         }
     }
 
-    fn log_upstream_read_error_and_fail(&mut self, message: String) {
+    fn log_upstream_read_error_and_fail(&mut self, error: DirectUpstreamBodyReadError) {
         let Some(finalizer) = self.finalizer.as_mut() else {
             return;
         };
@@ -2935,28 +2995,39 @@ impl DirectPassthroughInlineBodyState {
                 event_name = "direct_passthrough_read_error_ignored_after_anthropic_stop",
                 log_type = "debug",
                 trace_id = %core.trace_id,
-                request_id = %core.request_id_for_log,
+                request_id = %core.plan.request_id,
+                request_id_short = %core.request_id_for_log,
                 candidate_id = ?core.candidate_id.as_deref(),
-                error_category = "upstream_body_read_failed",
+                error_source = error.source.as_str(),
+                error_category = error.kind.as_str(),
                 "gateway ignored direct passthrough teardown error after Anthropic message_stop"
             );
             return;
         }
+        finalizer
+            .core_mut()
+            .client_stream_completion_tracker
+            .record_body_read_error(error);
         let core = finalizer.core();
+        let snapshot = core.client_stream_completion_tracker.diagnostic_snapshot();
         warn!(
             event_name = "direct_passthrough_body_read_error",
             log_type = "ops",
             trace_id = %core.trace_id,
-            request_id = %core.request_id_for_log,
+            request_id = %core.plan.request_id,
+            request_id_short = %core.request_id_for_log,
             candidate_id = ?core.candidate_id.as_deref(),
             upstream_bytes = core.provider_stream_bytes,
-            error_category = "upstream_body_read_failed",
+            error_source = error.source.as_str(),
+            error_category = error.kind.as_str(),
+            last_content_progress_elapsed_ms = ?snapshot.last_content_progress_elapsed_ms,
+            observed_terminal = snapshot.observed_terminal,
             "gateway direct passthrough upstream body read failed"
         );
         finalizer.set_terminal_failure(build_stream_transport_failure_report(
-            "execution_runtime_stream_read_error",
-            message,
-            502,
+            error.kind.stream_failure_error_type(),
+            error.public_message(),
+            error.kind.stream_failure_status_code(),
         ));
     }
 
@@ -3236,7 +3307,9 @@ async fn execute_stream_from_direct_passthrough(
             buffered_body: StreamBodyCapture::default(),
             provider_body_truncated: false,
             client_body_truncated: false,
-            client_stream_completion_tracker: ClientVisibleStreamCompletionTracker::default(),
+            client_stream_completion_tracker: ClientVisibleStreamCompletionTracker::with_started_at(
+                stream_started_at,
+            ),
             requires_anthropic_message_stop,
             client_visible_stream_completed: false,
             usage_stream_telemetry: None,
@@ -3321,7 +3394,8 @@ async fn execute_stream_from_direct_passthrough(
         let mut provider_body_truncated = false;
         let mut client_body_truncated = false;
         let mut upstream_control_filter = Some(SseControlBlockFilter::default());
-        let mut client_stream_completion_tracker = ClientVisibleStreamCompletionTracker::default();
+        let mut client_stream_completion_tracker =
+            ClientVisibleStreamCompletionTracker::with_started_at(stream_started_at_for_report);
         let requires_anthropic_message_stop = requires_anthropic_message_stop;
         let mut client_visible_stream_completed = false;
         let mut usage_stream_telemetry: Option<ExecutionTelemetry> = None;
@@ -3398,33 +3472,41 @@ async fn execute_stream_from_direct_passthrough(
             };
             let chunk = match item {
                 Ok(chunk) => chunk,
-                Err(message) => {
+                Err(error) => {
                     if requires_anthropic_message_stop && client_visible_stream_completed {
                         debug!(
                             event_name = "direct_passthrough_read_error_ignored_after_anthropic_stop",
                             log_type = "debug",
                             trace_id = %trace_id_owned,
-                            request_id = %request_id_for_report_log,
+                            request_id = %request_id_for_report,
+                            request_id_short = %request_id_for_report_log,
                             candidate_id = ?candidate_id_for_report.as_deref(),
-                            error_category = "upstream_body_read_failed",
+                            error_source = error.source.as_str(),
+                            error_category = error.kind.as_str(),
                             "gateway ignored direct passthrough teardown error after Anthropic message_stop"
                         );
                         break;
                     }
+                    client_stream_completion_tracker.record_body_read_error(error);
+                    let snapshot = client_stream_completion_tracker.diagnostic_snapshot();
                     warn!(
                         event_name = "direct_passthrough_body_read_error",
                         log_type = "ops",
                         trace_id = %trace_id_owned,
-                        request_id = %request_id_for_report_log,
+                        request_id = %request_id_for_report,
+                        request_id_short = %request_id_for_report_log,
                         candidate_id = ?candidate_id_for_report.as_deref(),
                         upstream_bytes = provider_stream_bytes,
-                        error_category = "upstream_body_read_failed",
+                        error_source = error.source.as_str(),
+                        error_category = error.kind.as_str(),
+                        last_content_progress_elapsed_ms = ?snapshot.last_content_progress_elapsed_ms,
+                        observed_terminal = snapshot.observed_terminal,
                         "gateway direct passthrough upstream body read failed"
                     );
                     terminal_failure = Some(build_stream_transport_failure_report(
-                        "execution_runtime_stream_read_error",
-                        message,
-                        502,
+                        error.kind.stream_failure_error_type(),
+                        error.public_message(),
+                        error.kind.stream_failure_status_code(),
                     ));
                     break;
                 }
@@ -3436,17 +3518,21 @@ async fn execute_stream_from_direct_passthrough(
                 continue;
             }
 
+            let observed_at = Instant::now();
+            let observed_elapsed_ms =
+                stream_elapsed_ms_at(stream_started_at_for_report, observed_at);
             let mut provider_chunk = chunk;
             if requires_anthropic_message_stop {
                 if let Some(terminal_end) = client_stream_completion_tracker
-                    .observe_anthropic_message_stop_terminal_end(provider_chunk.as_ref())
+                    .observe_anthropic_message_stop_terminal_end_at(
+                        provider_chunk.as_ref(),
+                        observed_elapsed_ms,
+                    )
                 {
                     provider_chunk.truncate(terminal_end);
                     client_visible_stream_completed = true;
                 }
             }
-
-            let observed_at = Instant::now();
             if !observed_first_upstream_body {
                 observed_first_upstream_body = true;
                 observe_gateway_stage_trace_ms(
@@ -3650,13 +3736,33 @@ async fn execute_stream_from_direct_passthrough(
             downstream_dropped = false;
         }
 
+        let stream_diagnostics = client_stream_completion_tracker.diagnostic_snapshot();
+        let summary_observed_finish = stream_terminal_summary
+            .as_ref()
+            .is_some_and(|summary| summary.observed_finish);
+
         if downstream_dropped {
-            let terminal_telemetry = Some(build_terminal_stream_telemetry(
+            let terminal_telemetry_val = build_terminal_stream_telemetry(
                 stream_started_at_for_report,
                 telemetry.as_ref(),
                 usage_stream_telemetry.as_ref(),
                 provider_stream_bytes,
-            ));
+            );
+            log_direct_stream_diagnostics(
+                "direct_passthrough_queued",
+                Some(trace_id_owned.as_str()),
+                request_id_for_report.as_str(),
+                candidate_id_for_report.as_deref(),
+                status_code,
+                terminal_telemetry_val.ttfb_ms,
+                terminal_telemetry_val.elapsed_ms.unwrap_or(0),
+                provider_stream_bytes,
+                true,
+                None,
+                summary_observed_finish,
+                &stream_diagnostics,
+            );
+            let terminal_telemetry = Some(terminal_telemetry_val);
             let report_context_for_payload = report_context_with_stage_trace(
                 report_context_owned,
                 stage_trace_for_report,
@@ -3713,12 +3819,27 @@ async fn execute_stream_from_direct_passthrough(
 
         if let Some(failure) = terminal_failure {
             record_manual_proxy_stream_error(&state_for_report, &plan_for_report).await;
-            let terminal_telemetry = Some(build_terminal_stream_telemetry(
+            let terminal_telemetry_val = build_terminal_stream_telemetry(
                 stream_started_at_for_report,
                 telemetry.as_ref(),
                 usage_stream_telemetry.as_ref(),
                 provider_stream_bytes,
-            ));
+            );
+            log_direct_stream_diagnostics(
+                "direct_passthrough_queued",
+                Some(trace_id_owned.as_str()),
+                request_id_for_report.as_str(),
+                candidate_id_for_report.as_deref(),
+                status_code,
+                terminal_telemetry_val.ttfb_ms,
+                terminal_telemetry_val.elapsed_ms.unwrap_or(0),
+                provider_stream_bytes,
+                false,
+                Some(failure.error_type.as_str()),
+                summary_observed_finish,
+                &stream_diagnostics,
+            );
+            let terminal_telemetry = Some(terminal_telemetry_val);
             let report_context_for_payload = report_context_with_stage_trace(
                 report_context_owned,
                 stage_trace_for_report,
@@ -3780,12 +3901,34 @@ async fn execute_stream_from_direct_passthrough(
                 })
             });
         let should_submit_report = report_kind_owned.is_some();
-        let terminal_telemetry = Some(build_terminal_stream_telemetry(
+        let terminal_telemetry_val = build_terminal_stream_telemetry(
             stream_started_at_for_report,
             telemetry.as_ref(),
             usage_stream_telemetry.as_ref(),
             provider_stream_bytes,
-        ));
+        );
+        let terminal_diag_error = stream_failed.then_some(if missing_observed_finish {
+            "stream_missing_terminal_event"
+        } else {
+            "stream_terminal_error"
+        });
+        log_direct_stream_diagnostics(
+            "direct_passthrough_queued",
+            Some(trace_id_owned.as_str()),
+            request_id_for_report.as_str(),
+            candidate_id_for_report.as_deref(),
+            status_code,
+            terminal_telemetry_val.ttfb_ms,
+            terminal_telemetry_val.elapsed_ms.unwrap_or(0),
+            provider_stream_bytes,
+            false,
+            terminal_diag_error,
+            stream_terminal_summary
+                .as_ref()
+                .is_some_and(|summary| summary.observed_finish),
+            &stream_diagnostics,
+        );
+        let terminal_telemetry = Some(terminal_telemetry_val);
         let report_context_for_payload = report_context_with_stage_trace(
             report_context_owned,
             stage_trace_for_report,
@@ -5579,24 +5722,268 @@ enum SseTerminalPolicy {
     AnthropicMessageStop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservedSseEventType {
+    Ping,
+    MessageStart,
+    ContentDelta,
+    MessageStop,
+    ResponseCompleted,
+    ResponseFailed,
+    ResponseIncomplete,
+    Error,
+    GenericMessage,
+    Unknown,
+}
+
+impl ObservedSseEventType {
+    fn from_event_name(name: &str) -> Self {
+        match name.trim() {
+            "ping" | "keepalive" | "response.keepalive" => Self::Ping,
+            "message_start" | "response.created" | "response.in_progress" | "response.queued" => {
+                Self::MessageStart
+            }
+            "message_stop" => Self::MessageStop,
+            "response.completed" => Self::ResponseCompleted,
+            "response.failed" => Self::ResponseFailed,
+            "response.incomplete" => Self::ResponseIncomplete,
+            "error" => Self::Error,
+            "message" => Self::GenericMessage,
+            "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+            | "message_delta"
+            | "response.output_item.added"
+            | "response.output_item.done"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.refusal.delta"
+            | "response.refusal.done"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_text.done"
+            | "image_generation.partial_image"
+            | "image_generation.completed"
+            | "image_edit.partial_image"
+            | "image_edit.completed" => Self::ContentDelta,
+            _ => Self::Unknown,
+        }
+    }
+    const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::MessageStop
+                | Self::ResponseCompleted
+                | Self::ResponseFailed
+                | Self::ResponseIncomplete
+                | Self::Error
+        )
+    }
+
+    const fn is_failure_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::ResponseFailed | Self::ResponseIncomplete | Self::Error
+        )
+    }
+
+    const fn is_success_terminal(self) -> bool {
+        matches!(self, Self::MessageStop | Self::ResponseCompleted)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseDiagnosticEventCategory {
+    Keepalive,
+    MessageStart,
+    ContentDelta,
+    Terminal,
+    Error,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StreamDiagnosticSnapshot {
+    pub(crate) observed_bytes: u64,
+    pub(crate) chunk_count: u64,
+    pub(crate) partial_chunk_count: u64,
+    pub(crate) fragmented_event_count: u64,
+    pub(crate) total_event_count: u64,
+    pub(crate) keepalive_event_count: u64,
+    pub(crate) message_start_event_count: u64,
+    pub(crate) content_delta_event_count: u64,
+    pub(crate) terminal_event_count: u64,
+    pub(crate) error_event_count: u64,
+    pub(crate) unknown_event_count: u64,
+    pub(crate) oversized_record_count: u64,
+    pub(crate) incomplete_record_open: bool,
+    pub(crate) last_content_progress_elapsed_ms: Option<u64>,
+    pub(crate) last_keepalive_elapsed_ms: Option<u64>,
+    pub(crate) observed_terminal: bool,
+    pub(crate) successful_completion: bool,
+    pub(crate) body_read_error: Option<DirectUpstreamBodyReadError>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn log_direct_stream_diagnostics(
+    stream_path: &'static str,
+    trace_id: Option<&str>,
+    request_id: &str,
+    candidate_id: Option<&str>,
+    status_code: u16,
+    ttfb_ms: Option<u64>,
+    elapsed_ms: u64,
+    upstream_bytes: u64,
+    downstream_dropped: bool,
+    terminal_error_category: Option<&str>,
+    summary_observed_finish: bool,
+    diagnostics: &StreamDiagnosticSnapshot,
+) {
+    let error_category = diagnostics
+        .body_read_error
+        .map(|err| err.kind.as_str())
+        .or(terminal_error_category);
+    let error_source = diagnostics.body_read_error.map(|err| err.source.as_str());
+    let observed_terminal = diagnostics.observed_terminal || summary_observed_finish;
+    if error_category.is_some() {
+        warn!(
+            event_name = "direct_stream_terminal_diagnostics",
+            log_type = "ops",
+            stream_path,
+            trace_id = trace_id.unwrap_or("-"),
+            request_id = %request_id,
+            candidate_id = ?candidate_id,
+            status_code,
+            ttfb_ms = ?ttfb_ms,
+            elapsed_ms,
+            upstream_bytes,
+            observed_bytes = diagnostics.observed_bytes,
+            chunk_count = diagnostics.chunk_count,
+            partial_chunk_count = diagnostics.partial_chunk_count,
+            fragmented_event_count = diagnostics.fragmented_event_count,
+            total_event_count = diagnostics.total_event_count,
+            keepalive_event_count = diagnostics.keepalive_event_count,
+            message_start_event_count = diagnostics.message_start_event_count,
+            content_delta_event_count = diagnostics.content_delta_event_count,
+            terminal_event_count = diagnostics.terminal_event_count,
+            error_event_count = diagnostics.error_event_count,
+            unknown_event_count = diagnostics.unknown_event_count,
+            oversized_record_count = diagnostics.oversized_record_count,
+            incomplete_record_open = diagnostics.incomplete_record_open,
+            last_content_progress_elapsed_ms = ?diagnostics.last_content_progress_elapsed_ms,
+            last_keepalive_elapsed_ms = ?diagnostics.last_keepalive_elapsed_ms,
+            observed_terminal,
+            successful_completion = diagnostics.successful_completion,
+            downstream_dropped,
+            error_source = ?error_source,
+            error_category = ?error_category,
+            "gateway direct stream terminated with error"
+        );
+    } else {
+        info!(
+            event_name = "direct_stream_terminal_diagnostics",
+            log_type = "ops",
+            stream_path,
+            trace_id = trace_id.unwrap_or("-"),
+            request_id = %request_id,
+            candidate_id = ?candidate_id,
+            status_code,
+            ttfb_ms = ?ttfb_ms,
+            elapsed_ms,
+            upstream_bytes,
+            observed_bytes = diagnostics.observed_bytes,
+            chunk_count = diagnostics.chunk_count,
+            partial_chunk_count = diagnostics.partial_chunk_count,
+            fragmented_event_count = diagnostics.fragmented_event_count,
+            total_event_count = diagnostics.total_event_count,
+            keepalive_event_count = diagnostics.keepalive_event_count,
+            message_start_event_count = diagnostics.message_start_event_count,
+            content_delta_event_count = diagnostics.content_delta_event_count,
+            terminal_event_count = diagnostics.terminal_event_count,
+            error_event_count = diagnostics.error_event_count,
+            unknown_event_count = diagnostics.unknown_event_count,
+            oversized_record_count = diagnostics.oversized_record_count,
+            incomplete_record_open = diagnostics.incomplete_record_open,
+            last_content_progress_elapsed_ms = ?diagnostics.last_content_progress_elapsed_ms,
+            last_keepalive_elapsed_ms = ?diagnostics.last_keepalive_elapsed_ms,
+            observed_terminal,
+            successful_completion = diagnostics.successful_completion,
+            downstream_dropped,
+            "gateway direct stream terminated"
+        );
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ClientVisibleStreamCompletionTracker {
     line_buffer: Vec<u8>,
-    event_type: Option<String>,
+    event_type: Option<ObservedSseEventType>,
+    oversized_record_event_type: Option<ObservedSseEventType>,
     data_payload: String,
     has_data_payload: bool,
+    record_has_nonempty_line: bool,
+    record_has_comment_line: bool,
+    record_has_data_line: bool,
+    record_touched_in_current_chunk: bool,
+    record_chunk_spans: u32,
     record_bytes: usize,
     dropping_oversized_record: bool,
     discarded_line_nonempty: bool,
     skip_next_lf: bool,
     completed: bool,
     successfully_completed: bool,
+    started_at: Option<Instant>,
+    observed_bytes: u64,
+    chunk_count: u64,
+    partial_chunk_count: u64,
+    fragmented_event_count: u64,
+    total_event_count: u64,
+    keepalive_event_count: u64,
+    message_start_event_count: u64,
+    content_delta_event_count: u64,
+    terminal_event_count: u64,
+    error_event_count: u64,
+    unknown_event_count: u64,
+    oversized_record_count: u64,
+    last_content_progress_elapsed_ms: Option<u64>,
+    last_keepalive_elapsed_ms: Option<u64>,
+    last_body_read_error: Option<DirectUpstreamBodyReadError>,
 }
 
 impl ClientVisibleStreamCompletionTracker {
+    pub(crate) fn with_started_at(started_at: Instant) -> Self {
+        Self {
+            started_at: Some(started_at),
+            ..Self::default()
+        }
+    }
+
+    fn resolve_elapsed_ms(&mut self) -> u64 {
+        let started_at = *self.started_at.get_or_insert_with(Instant::now);
+        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
     pub(crate) fn observe_chunk(&mut self, chunk: &[u8]) -> bool {
-        self.observe_chunk_terminal_end(chunk);
+        let elapsed_ms = self.resolve_elapsed_ms();
+        self.observe_chunk_at(chunk, elapsed_ms)
+    }
+
+    pub(crate) fn observe_chunk_at(&mut self, chunk: &[u8], elapsed_ms: u64) -> bool {
+        self.observe_chunk_terminal_end_with_policy_at(
+            chunk,
+            SseTerminalPolicy::AnyKnown,
+            elapsed_ms,
+        );
         self.completed
+    }
+
+    pub(crate) fn record_body_read_error(&mut self, error: DirectUpstreamBodyReadError) {
+        self.last_body_read_error = Some(error);
     }
 
     pub(crate) fn successful_completion(&self) -> bool {
@@ -5607,8 +5994,42 @@ impl ClientVisibleStreamCompletionTracker {
         self.completed
     }
 
+    pub(crate) fn incomplete_record_open(&self) -> bool {
+        self.record_has_nonempty_line
+            || !self.line_buffer.is_empty()
+            || self.dropping_oversized_record
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> StreamDiagnosticSnapshot {
+        StreamDiagnosticSnapshot {
+            observed_bytes: self.observed_bytes,
+            chunk_count: self.chunk_count,
+            partial_chunk_count: self.partial_chunk_count,
+            fragmented_event_count: self.fragmented_event_count,
+            total_event_count: self.total_event_count,
+            keepalive_event_count: self.keepalive_event_count,
+            message_start_event_count: self.message_start_event_count,
+            content_delta_event_count: self.content_delta_event_count,
+            terminal_event_count: self.terminal_event_count,
+            error_event_count: self.error_event_count,
+            unknown_event_count: self.unknown_event_count,
+            oversized_record_count: self.oversized_record_count,
+            incomplete_record_open: self.incomplete_record_open(),
+            last_content_progress_elapsed_ms: self.last_content_progress_elapsed_ms,
+            last_keepalive_elapsed_ms: self.last_keepalive_elapsed_ms,
+            observed_terminal: self.completed,
+            successful_completion: self.successfully_completed,
+            body_read_error: self.last_body_read_error,
+        }
+    }
+
     fn observe_chunk_terminal_end(&mut self, chunk: &[u8]) -> Option<usize> {
-        self.observe_chunk_terminal_end_with_policy(chunk, SseTerminalPolicy::AnyKnown)
+        let elapsed_ms = self.resolve_elapsed_ms();
+        self.observe_chunk_terminal_end_with_policy_at(
+            chunk,
+            SseTerminalPolicy::AnyKnown,
+            elapsed_ms,
+        )
     }
 
     fn observe_anthropic_message_stop(&mut self, chunk: &[u8]) -> bool {
@@ -5617,26 +6038,69 @@ impl ClientVisibleStreamCompletionTracker {
     }
 
     fn observe_anthropic_message_stop_terminal_end(&mut self, chunk: &[u8]) -> Option<usize> {
-        self.observe_chunk_terminal_end_with_policy(chunk, SseTerminalPolicy::AnthropicMessageStop)
+        let elapsed_ms = self.resolve_elapsed_ms();
+        self.observe_anthropic_message_stop_terminal_end_at(chunk, elapsed_ms)
     }
 
-    fn observe_chunk_terminal_end_with_policy(
+    fn observe_anthropic_message_stop_terminal_end_at(
+        &mut self,
+        chunk: &[u8],
+        elapsed_ms: u64,
+    ) -> Option<usize> {
+        self.observe_chunk_terminal_end_with_policy_at(
+            chunk,
+            SseTerminalPolicy::AnthropicMessageStop,
+            elapsed_ms,
+        )
+    }
+
+    fn observe_chunk_terminal_end_with_policy_at(
         &mut self,
         chunk: &[u8],
         policy: SseTerminalPolicy,
+        elapsed_ms: u64,
     ) -> Option<usize> {
-        if self.completed {
-            return None;
-        }
         if chunk.is_empty() {
             return None;
         }
+        if self.completed {
+            self.chunk_count = self.chunk_count.saturating_add(1);
+            self.observed_bytes = self
+                .observed_bytes
+                .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+            return None;
+        }
 
+        self.chunk_count = self.chunk_count.saturating_add(1);
+        self.record_touched_in_current_chunk = false;
         for (index, byte) in chunk.iter().enumerate() {
+            self.observed_bytes = self.observed_bytes.saturating_add(1);
             self.record_bytes = self.record_bytes.saturating_add(1);
             if self.record_bytes > SSE_TERMINAL_DETECTOR_MAX_RECORD_BYTES
                 && !self.dropping_oversized_record
             {
+                if !self.line_buffer.is_empty() {
+                    if let Ok(partial_line) = std::str::from_utf8(&self.line_buffer) {
+                        let trimmed = partial_line.trim_start();
+                        if trimmed.starts_with("data:") {
+                            self.record_has_data_line = true;
+                        } else if trimmed.starts_with(':') {
+                            self.record_has_comment_line = true;
+                        } else if self.event_type.is_none() && trimmed.starts_with("event:") {
+                            self.event_type = Some(ObservedSseEventType::Unknown);
+                        }
+                    }
+                }
+                self.oversized_record_event_type = self.event_type;
+                self.oversized_record_count = self.oversized_record_count.saturating_add(1);
+                if self.record_has_data_line
+                    && !matches!(
+                        self.oversized_record_event_type,
+                        Some(ObservedSseEventType::Ping)
+                    )
+                {
+                    self.last_content_progress_elapsed_ms = Some(elapsed_ms);
+                }
                 self.dropping_oversized_record = true;
                 self.discarded_line_nonempty = !self.line_buffer.is_empty();
                 self.line_buffer.clear();
@@ -5646,15 +6110,29 @@ impl ClientVisibleStreamCompletionTracker {
             if self.skip_next_lf {
                 self.skip_next_lf = false;
                 if *byte == b'\n' {
+                    if self.record_has_nonempty_line && !self.record_touched_in_current_chunk {
+                        self.record_touched_in_current_chunk = true;
+                        self.record_chunk_spans = self.record_chunk_spans.saturating_add(1);
+                    }
                     continue;
                 }
             }
 
+            if (self.record_has_nonempty_line || !matches!(*byte, b'\r' | b'\n'))
+                && !self.record_touched_in_current_chunk
+            {
+                self.record_touched_in_current_chunk = true;
+                self.record_chunk_spans = self.record_chunk_spans.saturating_add(1);
+            }
+            if !matches!(*byte, b'\r' | b'\n') {
+                self.record_has_nonempty_line = true;
+            }
+
             if self.dropping_oversized_record {
                 match *byte {
-                    b'\n' => self.finish_discarded_line(),
+                    b'\n' => self.finish_discarded_line(elapsed_ms),
                     b'\r' => {
-                        self.finish_discarded_line();
+                        self.finish_discarded_line(elapsed_ms);
                         self.skip_next_lf = true;
                     }
                     _ => self.discarded_line_nonempty = true,
@@ -5663,9 +6141,9 @@ impl ClientVisibleStreamCompletionTracker {
             }
 
             match *byte {
-                b'\n' => self.finish_line(policy),
+                b'\n' => self.finish_line(policy, elapsed_ms),
                 b'\r' => {
-                    self.finish_line(policy);
+                    self.finish_line(policy, elapsed_ms);
                     self.skip_next_lf = true;
                 }
                 _ => self.line_buffer.push(*byte),
@@ -5673,6 +6151,7 @@ impl ClientVisibleStreamCompletionTracker {
 
             if self.completed {
                 let terminal_end = if *byte == b'\r' && chunk.get(index + 1) == Some(&b'\n') {
+                    self.observed_bytes = self.observed_bytes.saturating_add(1);
                     index + 2
                 } else {
                     index + 1
@@ -5681,10 +6160,14 @@ impl ClientVisibleStreamCompletionTracker {
             }
         }
 
+        if self.incomplete_record_open() {
+            self.partial_chunk_count = self.partial_chunk_count.saturating_add(1);
+        }
+
         None
     }
 
-    fn finish_line(&mut self, policy: SseTerminalPolicy) {
+    fn finish_line(&mut self, policy: SseTerminalPolicy, elapsed_ms: u64) {
         let line = std::mem::take(&mut self.line_buffer);
         let Ok(line) = std::str::from_utf8(&line) else {
             self.reset_current_event();
@@ -5693,21 +6176,35 @@ impl ClientVisibleStreamCompletionTracker {
         let line = line.trim();
 
         if line.is_empty() {
-            self.completed = self.current_event_is_terminal(policy);
-            if self.completed {
-                self.successfully_completed = self.current_event_is_successful();
+            if !self.record_has_nonempty_line {
+                self.reset_current_event();
+                self.record_bytes = 0;
+                return;
             }
-            self.reset_current_event();
-            self.record_bytes = 0;
+            let payload_json = (self.has_data_payload && self.data_payload != "[DONE]")
+                .then(|| serde_json::from_str::<Value>(&self.data_payload).ok())
+                .flatten();
+            self.completed = self.current_event_is_terminal(policy, payload_json.as_ref());
+            if self.completed {
+                self.successfully_completed =
+                    self.current_event_is_successful(payload_json.as_ref());
+            }
+            let category = self.classify_current_record(payload_json.as_ref());
+            self.record_completed_category(category, elapsed_ms);
+            self.reset_record_boundary();
             return;
         }
 
+        if line.starts_with(':') {
+            self.record_has_comment_line = true;
+            return;
+        }
         if let Some(event_type) = line.strip_prefix("event:").map(str::trim) {
-            self.event_type = Some(event_type.to_string());
+            self.event_type = Some(ObservedSseEventType::from_event_name(event_type));
             return;
         }
-
         if let Some(data) = line.strip_prefix("data:").map(str::trim) {
+            self.record_has_data_line = true;
             if data.is_empty() {
                 return;
             }
@@ -5719,39 +6216,194 @@ impl ClientVisibleStreamCompletionTracker {
         }
     }
 
-    fn finish_discarded_line(&mut self) {
+    fn finish_discarded_line(&mut self, elapsed_ms: u64) {
         if !self.discarded_line_nonempty {
+            let category = match self.oversized_record_event_type {
+                Some(ObservedSseEventType::Ping) => SseDiagnosticEventCategory::Keepalive,
+                Some(ObservedSseEventType::MessageStart) => {
+                    SseDiagnosticEventCategory::MessageStart
+                }
+                Some(ObservedSseEventType::ContentDelta) => {
+                    SseDiagnosticEventCategory::ContentDelta
+                }
+                Some(
+                    ObservedSseEventType::MessageStop
+                    | ObservedSseEventType::ResponseCompleted
+                    | ObservedSseEventType::ResponseIncomplete,
+                ) => SseDiagnosticEventCategory::Terminal,
+                Some(ObservedSseEventType::ResponseFailed | ObservedSseEventType::Error) => {
+                    SseDiagnosticEventCategory::Error
+                }
+                Some(ObservedSseEventType::GenericMessage | ObservedSseEventType::Unknown)
+                | None => SseDiagnosticEventCategory::Unknown,
+            };
+            self.record_completed_category(category, elapsed_ms);
             self.dropping_oversized_record = false;
-            self.record_bytes = 0;
-            self.reset_current_event();
+            self.oversized_record_event_type = None;
+            self.reset_record_boundary();
         }
         self.discarded_line_nonempty = false;
     }
 
-    fn current_event_is_terminal(&self, policy: SseTerminalPolicy) -> bool {
+    fn record_completed_category(&mut self, category: SseDiagnosticEventCategory, elapsed_ms: u64) {
+        self.total_event_count = self.total_event_count.saturating_add(1);
+        if self.record_chunk_spans > 1 {
+            self.fragmented_event_count = self.fragmented_event_count.saturating_add(1);
+        }
+        match category {
+            SseDiagnosticEventCategory::Keepalive => {
+                self.keepalive_event_count = self.keepalive_event_count.saturating_add(1);
+                self.last_keepalive_elapsed_ms = Some(elapsed_ms);
+            }
+            SseDiagnosticEventCategory::MessageStart => {
+                self.message_start_event_count = self.message_start_event_count.saturating_add(1);
+                self.last_content_progress_elapsed_ms = Some(elapsed_ms);
+            }
+            SseDiagnosticEventCategory::ContentDelta => {
+                self.content_delta_event_count = self.content_delta_event_count.saturating_add(1);
+                self.last_content_progress_elapsed_ms = Some(elapsed_ms);
+            }
+            SseDiagnosticEventCategory::Terminal => {
+                self.terminal_event_count = self.terminal_event_count.saturating_add(1);
+                self.last_content_progress_elapsed_ms = Some(elapsed_ms);
+            }
+            SseDiagnosticEventCategory::Error => {
+                self.error_event_count = self.error_event_count.saturating_add(1);
+                self.last_content_progress_elapsed_ms = Some(elapsed_ms);
+            }
+            SseDiagnosticEventCategory::Unknown => {
+                self.unknown_event_count = self.unknown_event_count.saturating_add(1);
+                if self.record_has_data_line {
+                    self.last_content_progress_elapsed_ms = Some(elapsed_ms);
+                }
+            }
+        }
+    }
+
+    fn classify_current_record(&self, payload_json: Option<&Value>) -> SseDiagnosticEventCategory {
+        if !self.has_data_payload {
+            return match self.event_type {
+                Some(ObservedSseEventType::Ping) => SseDiagnosticEventCategory::Keepalive,
+                Some(ObservedSseEventType::MessageStart) => {
+                    SseDiagnosticEventCategory::MessageStart
+                }
+                Some(ObservedSseEventType::ContentDelta) => {
+                    SseDiagnosticEventCategory::ContentDelta
+                }
+                Some(
+                    ObservedSseEventType::MessageStop
+                    | ObservedSseEventType::ResponseCompleted
+                    | ObservedSseEventType::ResponseIncomplete,
+                ) => SseDiagnosticEventCategory::Terminal,
+                Some(ObservedSseEventType::ResponseFailed | ObservedSseEventType::Error) => {
+                    SseDiagnosticEventCategory::Error
+                }
+                Some(ObservedSseEventType::GenericMessage | ObservedSseEventType::Unknown) => {
+                    SseDiagnosticEventCategory::Unknown
+                }
+                None if self.record_has_comment_line => SseDiagnosticEventCategory::Keepalive,
+                None => SseDiagnosticEventCategory::Unknown,
+            };
+        }
+
+        if self.data_payload == "[DONE]" {
+            return match self.event_type {
+                Some(ObservedSseEventType::ResponseFailed | ObservedSseEventType::Error) => {
+                    SseDiagnosticEventCategory::Error
+                }
+                Some(ObservedSseEventType::Unknown) => SseDiagnosticEventCategory::Unknown,
+                _ => SseDiagnosticEventCategory::Terminal,
+            };
+        }
+
+        let payload_type = payload_json
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            .map(ObservedSseEventType::from_event_name);
+
+        if [self.event_type, payload_type]
+            .into_iter()
+            .flatten()
+            .any(|kind| {
+                matches!(
+                    kind,
+                    ObservedSseEventType::ResponseFailed | ObservedSseEventType::Error
+                )
+            })
+        {
+            return SseDiagnosticEventCategory::Error;
+        }
+        if self.event_type == Some(ObservedSseEventType::Unknown)
+            || payload_type == Some(ObservedSseEventType::Unknown)
+        {
+            return SseDiagnosticEventCategory::Unknown;
+        }
+
+        match payload_type
+            .filter(|kind| *kind != ObservedSseEventType::GenericMessage)
+            .or(self.event_type)
+        {
+            Some(ObservedSseEventType::Ping) => SseDiagnosticEventCategory::Keepalive,
+            Some(ObservedSseEventType::MessageStart) => SseDiagnosticEventCategory::MessageStart,
+            Some(ObservedSseEventType::ContentDelta) => SseDiagnosticEventCategory::ContentDelta,
+            Some(
+                ObservedSseEventType::MessageStop
+                | ObservedSseEventType::ResponseCompleted
+                | ObservedSseEventType::ResponseIncomplete,
+            ) => SseDiagnosticEventCategory::Terminal,
+            Some(ObservedSseEventType::ResponseFailed | ObservedSseEventType::Error) => {
+                SseDiagnosticEventCategory::Error
+            }
+            Some(ObservedSseEventType::GenericMessage) | None => match payload_json {
+                Some(Value::Object(map)) => {
+                    if map.get("error").is_some_and(|value| !value.is_null()) {
+                        SseDiagnosticEventCategory::Error
+                    } else if map.contains_key("choices")
+                        || map.contains_key("candidates")
+                        || map.contains_key("usageMetadata")
+                        || map.contains_key("usage")
+                        || map
+                            .get("object")
+                            .and_then(Value::as_str)
+                            .is_some_and(|obj| {
+                                matches!(obj, "chat.completion.chunk" | "text_completion")
+                            })
+                    {
+                        SseDiagnosticEventCategory::ContentDelta
+                    } else {
+                        SseDiagnosticEventCategory::Unknown
+                    }
+                }
+                _ => SseDiagnosticEventCategory::Unknown,
+            },
+            Some(ObservedSseEventType::Unknown) => SseDiagnosticEventCategory::Unknown,
+        }
+    }
+
+    fn current_event_is_terminal(
+        &self,
+        policy: SseTerminalPolicy,
+        payload_json: Option<&Value>,
+    ) -> bool {
         match policy {
             SseTerminalPolicy::AnyKnown => {
                 self.event_type
-                    .as_deref()
-                    .is_some_and(is_terminal_sse_event_type)
-                    || (self.has_data_payload && sse_data_payload_is_terminal(&self.data_payload))
+                    .is_some_and(ObservedSseEventType::is_terminal)
+                    || (self.has_data_payload
+                        && (self.data_payload == "[DONE]"
+                            || payload_json
+                                .and_then(|value| value.get("type"))
+                                .and_then(Value::as_str)
+                                .is_some_and(is_terminal_sse_event_type)))
             }
             SseTerminalPolicy::AnthropicMessageStop => {
-                let payload_type = self
-                    .has_data_payload
-                    .then(|| serde_json::from_str::<serde_json::Value>(&self.data_payload).ok())
-                    .flatten()
-                    .and_then(|value| {
-                        value
-                            .get("type")
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToOwned::to_owned)
-                    });
-                payload_type.as_deref() == Some("message_stop")
+                let payload_type = payload_json
+                    .and_then(|value| value.get("type"))
+                    .and_then(Value::as_str);
+                payload_type == Some("message_stop")
                     && self
                         .event_type
-                        .as_deref()
-                        .is_none_or(|event_type| event_type == "message_stop")
+                        .is_none_or(|event_type| event_type == ObservedSseEventType::MessageStop)
             }
         }
     }
@@ -5762,24 +6414,29 @@ impl ClientVisibleStreamCompletionTracker {
         self.has_data_payload = false;
     }
 
-    fn current_event_is_successful(&self) -> bool {
-        let payload = self
-            .has_data_payload
-            .then(|| serde_json::from_str::<Value>(&self.data_payload).ok())
-            .flatten();
-        let payload_type = payload
-            .as_ref()
+    fn reset_record_boundary(&mut self) {
+        self.reset_current_event();
+        self.record_bytes = 0;
+        self.record_has_nonempty_line = false;
+        self.record_has_comment_line = false;
+        self.record_has_data_line = false;
+        self.record_chunk_spans = 0;
+        self.record_touched_in_current_chunk = false;
+    }
+
+    fn current_event_is_successful(&self, payload_json: Option<&Value>) -> bool {
+        let payload_type = payload_json
             .and_then(|value| value.get("type"))
-            .and_then(Value::as_str);
-        if [self.event_type.as_deref(), payload_type]
+            .and_then(Value::as_str)
+            .map(ObservedSseEventType::from_event_name);
+        if [self.event_type, payload_type]
             .into_iter()
             .flatten()
-            .any(|kind| matches!(kind, "response.failed" | "response.incomplete" | "error"))
+            .any(ObservedSseEventType::is_failure_terminal)
         {
             return false;
         }
-        if payload
-            .as_ref()
+        if payload_json
             .and_then(|value| value.pointer("/response/status"))
             .and_then(Value::as_str)
             .is_some_and(|status| status != "completed")
@@ -5787,10 +6444,9 @@ impl ClientVisibleStreamCompletionTracker {
             return false;
         }
         self.data_payload == "[DONE]"
-            || matches!(
-                payload_type.or(self.event_type.as_deref()),
-                Some("message_stop" | "response.completed")
-            )
+            || payload_type
+                .or(self.event_type)
+                .is_some_and(ObservedSseEventType::is_success_terminal)
     }
 }
 
@@ -9656,7 +10312,7 @@ pub(crate) mod tests {
         let mut stream = direct_upstream_response_byte_stream(prefetched_body, execution.response);
         let mut body = Vec::new();
         while let Some(item) = stream.next().await {
-            body.extend_from_slice(&item?);
+            body.extend_from_slice(&item.map_err(|err| err.to_string())?);
         }
         Ok(body)
     }
@@ -10868,7 +11524,14 @@ pub(crate) mod tests {
     ) -> DirectPassthroughInlineBodyState {
         DirectPassthroughInlineBodyState {
             finalizer: Some(direct_anthropic_test_finalizer(request_id)),
-            upstream: Some(futures_util::stream::iter(items).boxed()),
+            upstream: Some(
+                futures_util::stream::iter(
+                    items
+                        .into_iter()
+                        .map(|item| item.map_err(super::DirectUpstreamBodyReadError::from)),
+                )
+                .boxed(),
+            ),
             upstream_control_filter: Some(super::SseControlBlockFilter::default()),
             upstream_started_at: Instant::now(),
             stream_first_byte_timeout: None,

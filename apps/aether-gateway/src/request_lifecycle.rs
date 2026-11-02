@@ -27,6 +27,64 @@ pub(crate) fn track_request_activity(permit: aether_runtime::AdmissionPermit) {
     });
 }
 
+/// 心跳跟随实际执行许可的最后一个持有者，客户端断开后的后台收尾也继续受保护。
+pub(crate) fn with_usage_heartbeat(
+    permit: aether_runtime::AdmissionPermit,
+    data: crate::data::GatewayDataState,
+    request_id: String,
+) -> aether_runtime::AdmissionPermit {
+    if !data.has_usage_writer() {
+        return permit;
+    }
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 短请求无需额外数据库写入；持续执行的请求每十五秒续期一次。
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            if data
+                .heartbeat_active_usage_request(&request_id, now)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    event_name = "usage_request_heartbeat_failed",
+                    log_type = "ops",
+                    request_id = %request_id,
+                    "failed to refresh active request liveness"
+                );
+            }
+        }
+    });
+    let heartbeat = aether_runtime::AdmissionPermit::from_parts(
+        None,
+        Some(UsageHeartbeatGuard(task.abort_handle())),
+    )
+    .expect("heartbeat guard creates a permit");
+    aether_runtime::AdmissionPermit::combine([permit, heartbeat])
+        .expect("request activity creates a permit")
+}
+
+struct UsageHeartbeatGuard(tokio::task::AbortHandle);
+
+impl aether_runtime::AdmissionPermitHealth for UsageHeartbeatGuard {
+    fn is_healthy(&self) -> bool {
+        true
+    }
+
+    fn requires_health_poll(&self) -> bool {
+        false
+    }
+}
+
+impl Drop for UsageHeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(crate) fn configure_client_disconnect(policy: RoutingExecutionPolicy) {
     let _ = CANCEL_ON_CLIENT_DISCONNECT.try_with(|cancel| {
         cancel.store(policy.cancel_on_client_disconnect, Ordering::Release);
@@ -510,5 +568,132 @@ mod tests {
         let collected = response.into_body().collect().await.unwrap();
         assert_eq!(collected.trailers().unwrap()["x-finished"], "yes");
         assert_eq!(collected.to_bytes(), "hello");
+    }
+
+    #[tokio::test]
+    async fn usage_heartbeat_guard_follows_body_and_detached_execution_lifetime() {
+        for (cancel_on_disconnect, finish_normally) in
+            [(true, false), (false, false), (false, true)]
+        {
+            let (started_tx, started_rx) = oneshot::channel();
+            let heartbeat = tokio::spawn(async move {
+                started_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            started_rx.await.unwrap();
+            let permit = aether_runtime::AdmissionPermit::from_parts(
+                None,
+                Some(UsageHeartbeatGuard(heartbeat.abort_handle())),
+            )
+            .unwrap();
+            let background = permit.clone();
+            let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(1);
+            let response = run_request(async move {
+                configure_client_disconnect(RoutingExecutionPolicy {
+                    cancel_on_client_disconnect: cancel_on_disconnect,
+                    ..Default::default()
+                });
+                track_request_activity(permit);
+                Ok(Response::new(Body::from_stream(stream::unfold(
+                    receiver,
+                    |mut receiver| async { receiver.recv().await.map(|item| (item, receiver)) },
+                ))))
+            })
+            .await
+            .unwrap();
+            assert!(!heartbeat.is_finished());
+            if finish_normally {
+                drop(sender);
+                response.into_body().collect().await.unwrap();
+            } else {
+                drop(response);
+                if !cancel_on_disconnect {
+                    assert!(!sender.is_closed(), "detached drain retains the request");
+                    assert!(!heartbeat.is_finished());
+                }
+                drop(sender);
+            }
+            assert!(
+                !heartbeat.is_finished(),
+                "background execution still owns the permit"
+            );
+            drop(background);
+            let result = tokio::time::timeout(Duration::from_secs(1), heartbeat)
+                .await
+                .expect("last execution owner must stop heartbeat");
+            assert!(result.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL and production-prepared PostgreSQL"]
+    async fn live_usage_heartbeat_protects_owned_request_and_stops_after_drop() {
+        use aether_data::repository::usage::SqlxUsageReadRepository;
+
+        let url = std::env::var("AETHER_TEST_DATABASE_URL")
+            .expect("AETHER_TEST_DATABASE_URL must name a disposable prepared database");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        let repository = Arc::new(SqlxUsageReadRepository::new(pool.clone()));
+        let data =
+            crate::data::GatewayDataState::with_usage_repository_for_tests(repository.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO usage (id, request_id, provider_name, model, status, created_at) \
+             VALUES ($1, $1, 'heartbeat-test', 'test', 'streaming', NOW() - INTERVAL '1 hour')",
+        )
+        .bind(&request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let activity = Arc::new(crate::request_activity::RequestActivity::default());
+        let permit = with_usage_heartbeat(
+            activity.begin().into_admission_permit(),
+            data,
+            request_id.clone(),
+        );
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        let heartbeat: Option<String> = sqlx::query_scalar(
+            "SELECT request_metadata->>'runtime_heartbeat_unix_secs' FROM usage WHERE request_id=$1",
+        )
+        .bind(&request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let heartbeat: u64 = heartbeat
+            .expect("live guard writes a heartbeat")
+            .parse()
+            .unwrap();
+        repository
+            .cleanup_stale_pending_requests(heartbeat - 600, heartbeat, 10, 10)
+            .await
+            .unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM usage WHERE request_id=$1")
+            .bind(&request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "streaming");
+        drop(permit);
+        tokio::task::yield_now().await;
+        assert_eq!(activity.active(), 0);
+        repository
+            .cleanup_stale_pending_requests(heartbeat + 1, heartbeat + 601, 10, 10)
+            .await
+            .unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM usage WHERE request_id=$1")
+            .bind(&request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+        sqlx::query("DELETE FROM usage WHERE request_id=$1")
+            .bind(&request_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

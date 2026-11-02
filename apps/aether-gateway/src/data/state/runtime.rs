@@ -1589,6 +1589,19 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn heartbeat_active_usage_request(
+        &self,
+        request_id: &str,
+        now_unix_secs: u64,
+    ) -> Result<(), DataLayerError> {
+        if let Some(repository) = &self.usage_writer {
+            repository
+                .heartbeat_active_request(request_id, now_unix_secs)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn cleanup_stale_pending_requests(
         &self,
         cutoff_unix_secs: u64,

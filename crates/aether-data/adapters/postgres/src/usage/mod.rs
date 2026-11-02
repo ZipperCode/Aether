@@ -2204,6 +2204,12 @@ LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = usage.request_id
 WHERE usage.status IN ('pending', 'streaming')
   AND usage.created_at < $1
+  AND CASE
+    WHEN usage.request_metadata->>'runtime_heartbeat_unix_secs' ~ '^[0-9]{1,19}$'
+      THEN (usage.request_metadata->>'runtime_heartbeat_unix_secs')::numeric
+           < EXTRACT(EPOCH FROM $1::timestamptz)
+    ELSE TRUE
+  END
 ORDER BY usage.created_at ASC, usage.request_id ASC
 LIMIT $2
 FOR UPDATE OF usage SKIP LOCKED
@@ -2213,13 +2219,8 @@ const SELECT_COMPLETED_PENDING_REQUEST_IDS_SQL: &str = r#"
 SELECT DISTINCT request_id
 FROM request_candidates
 WHERE request_id = ANY($1)
-  AND (
-    status = 'streaming'
-    OR (
-      status = 'success'
-      AND COALESCE(extra_data->>'stream_completed', 'false') = 'true'
-    )
-  )
+  AND status = 'success'
+  AND COALESCE(extra_data->>'stream_completed', 'false') = 'true'
 "#;
 
 const UPDATE_RECOVERED_STALE_USAGE_SQL: &str = r#"
@@ -2285,14 +2286,6 @@ DO UPDATE SET
         EXCLUDED.finalized_at
     ),
     updated_at = NOW()
-"#;
-
-const UPDATE_RECOVERED_STREAMING_CANDIDATES_SQL: &str = r#"
-UPDATE request_candidates
-SET status = 'success',
-    finished_at = $2
-WHERE request_id = $1
-  AND status = 'streaming'
 "#;
 
 const UPDATE_FAILED_PENDING_CANDIDATES_SQL: &str = r#"
@@ -9099,6 +9092,39 @@ ORDER BY "usage".user_id ASC
                         .fetch_one(&mut **tx)
                         .await
                         .map_postgres_err()?;
+                    if matches!(usage.status.as_str(), "failed" | "cancelled")
+                        && usage.finalized_at_unix_secs.is_some()
+                        && usage.is_stream.unwrap_or_else(|| {
+                            previous_usage
+                                .as_ref()
+                                .is_some_and(|previous| previous.is_stream)
+                        })
+                    {
+                        if let Some(candidate_id) = routing_snapshot.candidate_id.as_deref() {
+                            // 仅纠正旧清理任务伪造的成功；真实完成证据与其它候选保持不可变。
+                            sqlx::query(
+                                "UPDATE request_candidates SET status = $3, status_code = $4, \
+                                 error_type = $5, error_message = NULL, latency_ms = $6, \
+                                 finished_at = TO_TIMESTAMP($7::double precision) \
+                                 WHERE request_id = $1 AND id = $2 AND status = 'success' \
+                                 AND COALESCE(extra_data->>'stream_completed', 'false') <> 'true'",
+                            )
+                            .bind(&usage.request_id)
+                            .bind(candidate_id)
+                            .bind(&usage.status)
+                            .bind(usage.status_code.map(i32::from))
+                            .bind(if usage.status == "cancelled" {
+                                "cancelled"
+                            } else {
+                                "internal"
+                            })
+                            .bind(usage.response_time_ms.map(to_i32).transpose()?)
+                            .bind(usage.finalized_at_unix_secs.map(|value| value as f64))
+                            .execute(&mut **tx)
+                            .await
+                            .map_postgres_err()?;
+                        }
+                    }
                     if capture_update_allowed {
                         sync_usage_body_blob_storage(
                             &mut **tx,
@@ -10625,12 +10651,6 @@ RETURNING
                         .execute(&mut *tx)
                         .await
                         .map_postgres_err()?;
-                    sqlx::query(UPDATE_RECOVERED_STREAMING_CANDIDATES_SQL)
-                        .bind(&row.request_id)
-                        .bind(now)
-                        .execute(&mut *tx)
-                        .await
-                        .map_postgres_err()?;
                     summary.recovered += 1;
                     continue;
                 }
@@ -11139,6 +11159,29 @@ impl UsageWriteRepository for SqlxUsageReadRepository {
 
     async fn rebuild_provider_api_key_usage_stats(&self) -> Result<u64, DataLayerError> {
         Self::rebuild_provider_api_key_usage_stats(self).await
+    }
+
+    async fn heartbeat_active_request(
+        &self,
+        request_id: &str,
+        now_unix_secs: u64,
+    ) -> Result<(), DataLayerError> {
+        // 心跳仅维护执行存活证据，不移动前端耗时快照，也不改变计费或终态。
+        let now = i64::try_from(now_unix_secs).map_err(|_| {
+            DataLayerError::InvalidInput("request heartbeat timestamp is out of range".into())
+        })?;
+        sqlx::query(
+            "UPDATE usage SET request_metadata = \
+             (COALESCE(request_metadata::jsonb, '{}'::jsonb) \
+              || jsonb_build_object('runtime_heartbeat_unix_secs', $2::bigint))::json \
+             WHERE request_id = $1 AND status IN ('pending', 'streaming')",
+        )
+        .bind(request_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_postgres_err()?;
+        Ok(())
     }
 
     async fn cleanup_stale_pending_requests(

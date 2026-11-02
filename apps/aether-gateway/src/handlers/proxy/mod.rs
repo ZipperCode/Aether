@@ -2006,7 +2006,13 @@ async fn proxy_request_inner(
             decision.route_class.as_deref() == Some("ai_public")
                 && decision.execution_runtime_candidate
         })
-        .then(|| state.request_activity.begin().into_admission_permit());
+        .then(|| {
+            crate::request_lifecycle::with_usage_heartbeat(
+                state.request_activity.begin().into_admission_permit(),
+                state.usage_lifecycle_data_state().as_ref().clone(),
+                trace_id.clone(),
+            )
+        });
     if let Some(activity) = activity_permit.as_ref() {
         crate::request_lifecycle::track_request_activity(activity.clone());
     }
