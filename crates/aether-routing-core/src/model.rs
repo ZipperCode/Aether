@@ -35,13 +35,14 @@ pub const DEFAULT_STICKY_KEY_ATTEMPTS: u32 = 2;
 /// transport configuration. A resolved policy is snapshotted for the request
 /// and can therefore be consumed by execution without rereading mutable
 /// system settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RoutingExecutionPolicy {
     #[serde(default, skip_serializing_if = "is_false")]
     pub enable_cf_heartbeat: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub cyber_continue_failover: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
+    // 默认随客户端断开而取消；显式 false 必须写入快照，不能在序列化时丢失。
+    #[serde(default = "default_true")]
     pub cancel_on_client_disconnect: bool,
     #[serde(default)]
     pub max_transfer_count: u64,
@@ -51,12 +52,25 @@ pub struct RoutingExecutionPolicy {
     pub failover_rules: RoutingFailoverRules,
 }
 
+impl Default for RoutingExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            enable_cf_heartbeat: false,
+            cyber_continue_failover: false,
+            cancel_on_client_disconnect: true,
+            max_transfer_count: 0,
+            max_transfer_timeout_seconds: 0,
+            failover_rules: RoutingFailoverRules::default(),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for RoutingExecutionPolicy {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize, Default)]
+        #[derive(Deserialize)]
         struct LegacyCompatibleExecutionPolicy {
             #[serde(default)]
             enable_cf_heartbeat: bool,
@@ -66,7 +80,7 @@ impl<'de> Deserialize<'de> for RoutingExecutionPolicy {
             enable_standard_text_sync_heartbeat: bool,
             #[serde(default)]
             cyber_continue_failover: bool,
-            #[serde(default)]
+            #[serde(default = "default_true")]
             cancel_on_client_disconnect: bool,
             #[serde(default)]
             max_transfer_count: u64,
@@ -239,22 +253,41 @@ mod execution_policy_tests {
     }
 
     #[test]
-    fn cancellation_defaults_off_and_round_trips_with_legacy_heartbeat() {
-        let default: RoutingDefaultPolicy = serde_json::from_str("{}").unwrap();
-        assert!(!default.execution_policy.cancel_on_client_disconnect);
-        let policy: RoutingDefaultPolicy = serde_json::from_value(serde_json::json!({
-            "cancel_on_client_disconnect": true,
-            "enable_standard_text_sync_heartbeat": true
-        }))
-        .unwrap();
-        assert!(policy.execution_policy.cancel_on_client_disconnect);
-        assert!(policy.execution_policy.enable_cf_heartbeat);
-        let encoded = serde_json::to_value(&policy).unwrap();
-        assert_eq!(encoded["cancel_on_client_disconnect"], true);
-        assert_eq!(
-            serde_json::from_value::<RoutingDefaultPolicy>(encoded).unwrap(),
-            policy
-        );
+    fn cancellation_defaults_on_and_preserves_explicit_opt_out() {
+        assert!(super::RoutingExecutionPolicy::default().cancel_on_client_disconnect);
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"default_policy": {}}),
+        ] {
+            let config: RoutingGroupConfig = serde_json::from_value(config).unwrap();
+            assert!(
+                config
+                    .default_policy
+                    .execution_policy
+                    .cancel_on_client_disconnect
+            );
+        }
+        for cancel_on_client_disconnect in [false, true] {
+            let policy: RoutingDefaultPolicy = serde_json::from_value(serde_json::json!({
+                "cancel_on_client_disconnect": cancel_on_client_disconnect,
+                "enable_standard_text_sync_heartbeat": true
+            }))
+            .unwrap();
+            assert_eq!(
+                policy.execution_policy.cancel_on_client_disconnect,
+                cancel_on_client_disconnect
+            );
+            assert!(policy.execution_policy.enable_cf_heartbeat);
+            let encoded = serde_json::to_value(&policy).unwrap();
+            assert_eq!(
+                encoded["cancel_on_client_disconnect"],
+                cancel_on_client_disconnect
+            );
+            assert_eq!(
+                serde_json::from_value::<RoutingDefaultPolicy>(encoded).unwrap(),
+                policy
+            );
+        }
         assert!(
             serde_json::from_value::<RoutingDefaultPolicy>(serde_json::json!({
                 "cancel_on_client_disconnect": "true"

@@ -94,7 +94,7 @@ pub(crate) fn configure_client_disconnect(policy: RoutingExecutionPolicy) {
 pub(crate) fn cancel_on_client_disconnect() -> bool {
     CANCEL_ON_CLIENT_DISCONNECT
         .try_with(|cancel| cancel.load(Ordering::Acquire))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -308,7 +308,10 @@ mod tests {
         let (finished_tx, finished_rx) = oneshot::channel();
         let request = tokio::spawn(run_request(async move {
             let _permit = permit;
-            configure_client_disconnect(RoutingExecutionPolicy::default());
+            configure_client_disconnect(RoutingExecutionPolicy {
+                cancel_on_client_disconnect: false,
+                ..Default::default()
+            });
             started_tx.send(()).unwrap();
             release_rx.await.unwrap();
             assert!(crate::request_diagnostics::current_request_diagnostics().is_some());
@@ -328,16 +331,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabled_cancellation_and_unresolved_requests_drop_immediately() {
+    async fn default_cancellation_and_unresolved_requests_drop_immediately() {
         for resolve_policy in [false, true] {
             let (started_tx, started_rx) = oneshot::channel();
             let (release_tx, release_rx) = oneshot::channel::<()>();
             let request = tokio::spawn(run_request(async move {
                 if resolve_policy {
-                    configure_client_disconnect(RoutingExecutionPolicy {
-                        cancel_on_client_disconnect: true,
-                        ..Default::default()
-                    });
+                    configure_client_disconnect(RoutingExecutionPolicy::default());
                 }
                 started_tx.send(()).unwrap();
                 release_rx.await.unwrap();
@@ -358,7 +358,10 @@ mod tests {
             let (sender, receiver) = mpsc::channel(1);
             let (finished_tx, finished_rx) = oneshot::channel();
             let response = run_request(async move {
-                configure_client_disconnect(RoutingExecutionPolicy::default());
+                configure_client_disconnect(RoutingExecutionPolicy {
+                    cancel_on_client_disconnect: false,
+                    ..Default::default()
+                });
                 let body = Body::from_stream(stream::unfold(
                     (receiver, finished_tx, permit),
                     |(mut receiver, finished_tx, permit)| async move {
@@ -403,13 +406,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabled_cancellation_drops_stream_receiver() {
+    async fn default_cancellation_drops_stream_receiver() {
         let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(1);
         let response = run_request(async move {
-            configure_client_disconnect(RoutingExecutionPolicy {
-                cancel_on_client_disconnect: true,
-                ..Default::default()
-            });
+            configure_client_disconnect(RoutingExecutionPolicy::default());
             Ok(Response::new(Body::from_stream(stream::unfold(
                 receiver,
                 |mut receiver| async { receiver.recv().await.map(|item| (item, receiver)) },
@@ -429,7 +429,10 @@ mod tests {
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel::<()>();
         let request = tokio::spawn(run_request_with_usage(usage.clone(), async move {
-            configure_client_disconnect(RoutingExecutionPolicy::default());
+            configure_client_disconnect(RoutingExecutionPolicy {
+                cancel_on_client_disconnect: false,
+                ..Default::default()
+            });
             track_request_activity(activity_permit);
             started_tx.send(()).unwrap();
             release_rx.await.unwrap();
@@ -467,7 +470,10 @@ mod tests {
         let activity_permit = activity.begin().into_admission_permit();
         let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(1);
         let response = run_request_with_usage(usage.clone(), async move {
-            configure_client_disconnect(RoutingExecutionPolicy::default());
+            configure_client_disconnect(RoutingExecutionPolicy {
+                cancel_on_client_disconnect: false,
+                ..Default::default()
+            });
             track_request_activity(activity_permit);
             let response = Response::new(Body::from_stream(stream::unfold(
                 receiver,

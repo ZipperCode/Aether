@@ -289,7 +289,7 @@
                           <HelpHint
                             portal
                             label="取消请求立即打断"
-                            text="默认关闭：客户端取消或断开后，服务端继续等待请求完成并正常计费。开启后立即打断且不计费，按次计费的请求仍收取单次请求费用。仅作用于当前调度策略。"
+                            text="默认开启：客户端取消或断开后立即打断上游且不计费，按次计费的请求仍收取单次请求费用。关闭后服务端继续等待请求完成并正常计费。仅作用于当前调度策略。"
                           />
                         </div>
                         <Switch
@@ -503,7 +503,7 @@ const keepPriorityOnConversion = computed(() => draft.value?.config_json.default
 const stickyKeyAttempts = computed(() => draft.value?.config_json.default_policy.sticky_key_attempts ?? DEFAULT_STICKY_KEY_ATTEMPTS)
 const cfHeartbeat = computed(() => draft.value?.config_json.default_policy.enable_cf_heartbeat ?? false)
 const cyberContinueFailover = computed(() => draft.value?.config_json.default_policy.cyber_continue_failover ?? false)
-const cancelOnClientDisconnect = computed(() => draft.value?.config_json.default_policy.cancel_on_client_disconnect ?? false)
+const cancelOnClientDisconnect = computed(() => draft.value?.config_json.default_policy.cancel_on_client_disconnect ?? true)
 const billingMultiplierError = computed(() => parseBillingMultiplier(billingMultiplierInput.value) == null ? '分组倍率必须是大于或等于 0 的有效数字' : null)
 const draftDirty = computed(() => draft.value != null && (Boolean(billingMultiplierError.value) || routingFailoverPending.value || savedDraftSnapshot.value !== draftSnapshotValue(draft.value)))
 const canSaveDraft = computed(() => Boolean(draft.value) && !busy.value && draftDirty.value && routingSchedulingValid.value && !billingMultiplierError.value)

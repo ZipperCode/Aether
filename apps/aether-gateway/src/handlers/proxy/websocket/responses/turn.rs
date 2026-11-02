@@ -868,7 +868,8 @@ impl ResponsesProviderAttempt {
         crate::orchestration::routing_execution_policy_from_report_context(
             self.lifecycle.report_context(),
         )
-        .is_some_and(|policy| policy.cancel_on_client_disconnect)
+        .unwrap_or_default()
+        .cancel_on_client_disconnect
     }
 
     /// Releases all per-turn capacity before terminal persistence starts.

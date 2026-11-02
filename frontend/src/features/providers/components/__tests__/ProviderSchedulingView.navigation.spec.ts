@@ -122,6 +122,26 @@ afterEach(() => {
 })
 
 describe('ProviderSchedulingView workspace navigation', () => {
+  it('defaults legacy disconnect cancellation on and preserves an explicit opt-out after saving', async () => {
+    const legacyConfig = createEmptyRoutingGroupConfig()
+    Reflect.deleteProperty(legacyConfig.default_policy, 'cancel_on_client_disconnect')
+    const { root } = await mountWorkspace({}, [group('default', { is_system_default: true, config_json: legacyConfig })])
+    expect(button(root, '取消请求立即打断').getAttribute('aria-checked')).toBe('true')
+    expect(button(root, '保存调度').disabled).toBe(true)
+    button(root, '取消请求立即打断').click()
+    await nextTick()
+    expect(button(root, '取消请求立即打断').getAttribute('aria-checked')).toBe('false')
+    button(root, '保存调度').click()
+    await flush()
+    expect(routingApi.updateRoutingGroup).toHaveBeenLastCalledWith('default', expect.objectContaining({
+      config_json: expect.objectContaining({
+        default_policy: expect.objectContaining({ cancel_on_client_disconnect: false }),
+      }),
+    }))
+    expect(button(root, '取消请求立即打断').getAttribute('aria-checked')).toBe('false')
+    expect(button(root, '保存调度').disabled).toBe(true)
+  })
+
   it('defaults legacy groups to private and saves visibility without losing scheduling or rankings', async () => {
     const legacyConfig = createEmptyRoutingGroupConfig()
     Reflect.deleteProperty(legacyConfig, 'user_visible')

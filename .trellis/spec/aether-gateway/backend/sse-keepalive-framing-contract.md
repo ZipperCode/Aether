@@ -65,7 +65,8 @@ Changes to stale usage cleanup, request lifetime guards, or candidate finalizati
 `UsageWriteRepository::heartbeat_active_request(request_id, now_unix_secs)` updates the database-owned `usage.request_metadata.runtime_heartbeat_unix_secs`. `request_lifecycle::with_usage_heartbeat` binds its task to the existing cloneable admission permit.
 
 ### 3. Contracts
-- Heartbeats follow actual execution, including detached draining; the last owner drop aborts the task. They do not touch usage timing snapshots, billing or terminal status.
+- Client disconnect cancels upstream execution by default for HTTP and Responses WebSocket requests. Missing `cancel_on_client_disconnect` uses `true`; explicit `false` opts into background completion and must survive serialization in routing snapshots.
+- Heartbeats follow actual execution, including detached draining when cancellation is explicitly disabled; the last owner drop aborts the task. They do not touch usage timing snapshots, billing or terminal status.
 - Cleanup uses its existing abandonment grace against a fresh heartbeat; request age alone cannot finalize a live stream. No stream total-duration limit is implied.
 - `streaming` and HTTP 200 are not completion evidence. Only terminal candidate success with `stream_completed=true` can recover success; cleanup never manufactures candidate success.
 - Accepted terminal failed/cancelled stream usage may repair only its exact legacy success candidate without completion evidence. Genuine success, other candidates, and stale lifecycle updates retain existing immutability.

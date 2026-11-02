@@ -2619,30 +2619,39 @@ mod tests {
 
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let response = build_standard_text_sync_heartbeat_shell_response(
-            state,
-            parts,
-            "trace-standard-text-heartbeat-admission".to_string(),
-            test_standard_text_heartbeat_decision(),
-            TEST_STANDARD_TEXT_SYNC_PLAN_KIND.to_string(),
-            move |_state, parts, _trace_id, _decision, _plan_kind, _started_at| async move {
-                assert!(
-                    parts
-                        .extensions
-                        .get::<crate::executor::candidate_loop::BackgroundAdmissionPermit>()
-                        .is_some(),
-                    "background request parts should carry admission"
-                );
-                let _ = started_tx.send(());
-                let _ = release_rx.await;
-                Ok(LocalExecutionRequestOutcome::responded(
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .body(Body::from(r#"{"id":"resp_done","output":[]}"#))
-                        .expect("response should build"),
-                ))
-            },
-        )
+        let response = crate::request_lifecycle::run_request(async move {
+            crate::request_lifecycle::configure_client_disconnect(
+                aether_routing_core::RoutingExecutionPolicy {
+                    cancel_on_client_disconnect: false,
+                    ..Default::default()
+                },
+            );
+            build_standard_text_sync_heartbeat_shell_response(
+                state,
+                parts,
+                "trace-standard-text-heartbeat-admission".to_string(),
+                test_standard_text_heartbeat_decision(),
+                TEST_STANDARD_TEXT_SYNC_PLAN_KIND.to_string(),
+                move |_state, parts, _trace_id, _decision, _plan_kind, _started_at| async move {
+                    assert!(
+                        parts
+                            .extensions
+                            .get::<crate::executor::candidate_loop::BackgroundAdmissionPermit>()
+                            .is_some(),
+                        "background request parts should carry admission"
+                    );
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    Ok(LocalExecutionRequestOutcome::responded(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Body::from(r#"{"id":"resp_done","output":[]}"#))
+                            .expect("response should build"),
+                    ))
+                },
+            )
+        })
+        .await
         .expect("heartbeat shell should build");
 
         started_rx.await.expect("background execution should start");
@@ -2664,15 +2673,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_text_sync_heartbeat_cancels_when_routing_policy_enables_it() {
+    async fn standard_text_sync_heartbeat_cancels_by_default() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (mut release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let response = crate::request_lifecycle::run_request(async move {
             crate::request_lifecycle::configure_client_disconnect(
-                aether_routing_core::RoutingExecutionPolicy {
-                    cancel_on_client_disconnect: true,
-                    ..Default::default()
-                },
+                aether_routing_core::RoutingExecutionPolicy::default(),
             );
             let (parts, _) = http::Request::builder()
                 .method("POST")

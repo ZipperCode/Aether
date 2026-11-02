@@ -94,7 +94,7 @@ export function createEmptyRoutingGroupConfig(): RoutingGroupConfig {
       keep_priority_on_conversion: false,
       enable_cf_heartbeat: false,
       cyber_continue_failover: false,
-      cancel_on_client_disconnect: false,
+      cancel_on_client_disconnect: true,
       sticky_key_attempts: DEFAULT_STICKY_KEY_ATTEMPTS,
     },
     disabled_providers: [],

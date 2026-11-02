@@ -509,14 +509,7 @@ async fn disabling_the_downstream_key_is_enforced_on_the_next_turn_of_the_same_s
 /// `a_closed_client_socket_before_any_terminal_still_voids_the_bill`.
 #[tokio::test]
 async fn client_disconnect_before_any_provider_output_settles_a_void_row() -> Result<(), BoxError> {
-    let harness = Harness::start_configured(
-        UpstreamBehavior::StallAfterCreated,
-        ProviderFixture::SingleOpenAiKey,
-        PiiRedaction::Disabled,
-        true,
-        None,
-    )
-    .await?;
+    let harness = Harness::start(UpstreamBehavior::StallAfterCreated).await?;
     let mut client = harness.connect().await?;
 
     client
@@ -553,8 +546,15 @@ async fn client_disconnect_before_any_provider_output_settles_a_void_row() -> Re
 }
 
 #[tokio::test]
-async fn client_disconnect_defaults_to_completing_and_billing_the_turn() -> Result<(), BoxError> {
-    let harness = Harness::start(UpstreamBehavior::CompleteAfterRelease).await?;
+async fn client_disconnect_opt_out_completes_and_bills_the_turn() -> Result<(), BoxError> {
+    let harness = Harness::start_configured(
+        UpstreamBehavior::CompleteAfterRelease,
+        ProviderFixture::SingleOpenAiKey,
+        PiiRedaction::Disabled,
+        Some(false),
+        None,
+    )
+    .await?;
     let mut client = harness.connect().await?;
     client
         .send(response_create(json!({"input": "finish without client"})))
@@ -582,7 +582,7 @@ async fn client_disconnect_still_settles_the_per_request_fee_when_aborted() -> R
         UpstreamBehavior::StallAfterCreated,
         ProviderFixture::SingleOpenAiKey,
         PiiRedaction::Disabled,
-        true,
+        Some(true),
         Some(0.02),
     )
     .await?;
@@ -928,14 +928,14 @@ impl Harness {
         fixture: ProviderFixture,
         redaction: PiiRedaction,
     ) -> Result<Self, BoxError> {
-        Self::start_configured(behavior, fixture, redaction, false, None).await
+        Self::start_configured(behavior, fixture, redaction, None, None).await
     }
 
     async fn start_configured(
         behavior: UpstreamBehavior,
         fixture: ProviderFixture,
         redaction: PiiRedaction,
-        cancel_on_client_disconnect: bool,
+        cancel_on_client_disconnect: Option<bool>,
         request_price: Option<f64>,
     ) -> Result<Self, BoxError> {
         let upstream = Arc::new(MockUpstreamState::new(behavior));
@@ -974,7 +974,7 @@ impl Harness {
                 ..UsageRuntimeConfig::default()
             })?;
         state.ensure_system_default_routing_group().await?;
-        if cancel_on_client_disconnect {
+        if let Some(cancel_on_client_disconnect) = cancel_on_client_disconnect {
             let backends =
                 DataBackends::from_config(DataLayerConfig::from_database(database.config.clone()))?;
             let mut group = backends
@@ -984,7 +984,8 @@ impl Harness {
                 .find_routing_group(RoutingGroupLookupKey::SystemDefault)
                 .await?
                 .ok_or("default routing group unavailable")?;
-            group.config_json["default_policy"]["cancel_on_client_disconnect"] = json!(true);
+            group.config_json["default_policy"]["cancel_on_client_disconnect"] =
+                json!(cancel_on_client_disconnect);
             backends
                 .write()
                 .routing_groups()

@@ -26,7 +26,7 @@ describe('routingPolicy', () => {
 
     expect(config.default_policy.priority_mode).toBe('provider')
     expect(config.default_policy.scheduling_mode).toBe('cache_affinity')
-    expect(config.default_policy.cancel_on_client_disconnect).toBe(false)
+    expect(config.default_policy.cancel_on_client_disconnect).toBe(true)
     expect(config.billing_multiplier).toBe(1)
     expect(config.user_visible).toBe(false)
   })
@@ -50,17 +50,17 @@ describe('routingPolicy', () => {
     }
   })
 
-  it('preserves cancellation policy across model scheduling edits', () => {
+  it.each([false, true])('preserves cancellation policy %s across model scheduling edits', (cancelOnDisconnect) => {
     const config = createEmptyRoutingGroupConfig()
-    config.default_policy.cancel_on_client_disconnect = true
+    config.default_policy.cancel_on_client_disconnect = cancelOnDisconnect
     const updated = upsertModelSchedulingRule(config, 'gpt-5', {
       priority_mode: 'global_key',
       scheduling_mode: 'fixed_order',
     })
-    expect(normalizeRoutingGroupConfig(updated).default_policy.cancel_on_client_disconnect).toBe(true)
-    expect(getModelScheduling(updated, 'gpt-5').cancel_on_client_disconnect).toBe(true)
-    expect(getModelScheduling(updated, 'other-model').cancel_on_client_disconnect).toBe(true)
-    expect(createEmptyRoutingGroupConfig().default_policy.cancel_on_client_disconnect).toBe(false)
+    expect(normalizeRoutingGroupConfig(updated).default_policy.cancel_on_client_disconnect).toBe(cancelOnDisconnect)
+    expect(getModelScheduling(updated, 'gpt-5').cancel_on_client_disconnect).toBe(cancelOnDisconnect)
+    expect(getModelScheduling(updated, 'other-model').cancel_on_client_disconnect).toBe(cancelOnDisconnect)
+    expect(createEmptyRoutingGroupConfig().default_policy.cancel_on_client_disconnect).toBe(true)
   })
 
   it('drops the legacy group model allowlist while normalizing config', () => {
