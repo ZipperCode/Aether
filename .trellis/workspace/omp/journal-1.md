@@ -701,3 +701,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 29: 默认开启客户端断连取消上游
+
+**Date**: 2026-11-02
+**Task**: 默认开启客户端断连取消上游
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+HTTP、Responses WebSocket 与前端默认开启 cancel_on_client_disconnect；未配置项启用，显式 false 仍保留后台完成且序列化不丢失。62项后端、40项前端及3项真实WebSocket断连测试通过，Clippy/fmt/ESLint/type-check通过。按授权仅将154新调度策略开关写为true并校验配置未变，版本1788939066；无需重启，未部署代码。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `380c3087c` | (see git log) |
+
+### Status
+
+[OK] **Completed**
