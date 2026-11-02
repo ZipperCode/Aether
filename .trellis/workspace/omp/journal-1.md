@@ -679,3 +679,25 @@ Implementation and scoped verification completed; publication explicitly authori
 ### Status
 
 [OK] **Completed**
+
+
+## Session 28: 修复长流生命周期与断流诊断
+
+**Date**: 2026-11-02
+**Task**: 修复长流生命周期与断流诊断
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+修复长流被清理误判成功：执行许可持有期间写轻量心跳，保留原弃置清理阈值且不加总时长上限；终态事务纠正旧假成功候选；保留类型化读取错误并输出无正文的流统计。41项网关定向测试、2项真实PostgreSQL回归、14项候选契约、5项架构检查及网关/数据Clippy、fmt通过。隔离数据库已清理，未部署154。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `15caa3cdd` | (see git log) |
+
+### Status
+
+[OK] **Completed**
