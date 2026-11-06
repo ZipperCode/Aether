@@ -15,6 +15,8 @@ Public Gemini `generateContent` requests routed to Antigravity are adapted to a 
 - Antigravity-aware conversion sets `FormatContext.preserve_gemini_tool_schemas` to defer normalization until private transport; ordinary conversion and context reset do not inherit that flag.
 - Normalize actual Schema positions, not arbitrary tool argument data. Retain supported property names and literal values while dropping unsupported dialect/extension fields. Resolve local references with cycle/depth guards and a shared expansion budget; merge reference siblings without contradictory object-spread overrides.
 - The private subset can relax unsupported constraints. Only Claude targets additionally fold string-literal unions into equivalent enums or retain unsupported mixed-union guidance in descriptions. Do not choose an arbitrary branch; tool execution must still validate its original schema.
+- For `type: [...]`, move type-specific constraints into their matching `anyOf` branches; keep `enum` at the parent because it constrains every type. On single-typed nodes, remove other types' inapplicable keywords (for example `items` on `string`) before Cloud Code validates the private Schema.
+- Antigravity cannot mix client function declarations with built-in tools. At the private envelope boundary, retain client functions and remove incompatible built-ins plus both spellings of `includeServerSideToolInvocations`. Search-only requests retain their existing built-in behavior; ordinary public Gemini remains unchanged.
 - Keep the existing error-triggered Gemini signature recovery contract. Private Claude replay removes unsigned historical thinking while retaining signed thinking, text and tools; public Gemini histories are unaffected.
 - Do not mutate the input body, double-wrap native envelopes, or modify ordinary Gemini same-format traffic.
 
@@ -28,6 +30,9 @@ Public Gemini `generateContent` requests routed to Antigravity are adapted to a 
 | Existing `parameters` and aliases coexist | Keep existing precedence; clean selected Schema only |
 | Shared expansion budget exhausted | Reject private envelope with `ToolSchemaBudgetExceeded` |
 | Claude mixed union unsupported on private bridge | Preserve alternative guidance without selecting a branch |
+| Single typed string has array `items` | Drop the inapplicable keyword before private validation |
+| Type union has array/object constraints | Move each constraint to its corresponding typed branch |
+| Client functions coexist with private built-ins | Keep functions and remove built-ins/server invocation flags |
 | Same request uses a public Gemini provider | Preserve public wire schema semantics |
 
 ## 5. Good / Base / Bad Cases
@@ -39,6 +44,8 @@ Public Gemini `generateContent` requests routed to Antigravity are adapted to a 
 ## 6. Tests Required
 
 Inline `antigravity::request` and `antigravity::schema` tests cover twelve tools, alias precedence, all source formats, public/private isolation, both envelope branches, immutability, reference budgets and Claude-only unions. Retain exact corrupted/Base64 signature recovery tests and `same_format_gemini` coverage. `antigravity_combined_client_conversion_preserves_schemas_until_transport` verifies provider-aware deferral end to end.
+
+`type_unions_move_type_specific_keywords_into_their_branches`, `single_typed_nodes_drop_keywords_of_other_types`, and `antigravity_mixed_tools_keep_functions_and_drop_builtin_tool_config` cover the imported constraints, both private envelope branches, and input immutability. Responses-to-Gemini conversion uses canonical input directly so signature carriers survive intervening reasoning text; do not restore the lossy Responses-to-Chat detour.
 
 ## 7. Wrong vs Correct
 

@@ -30,7 +30,7 @@ Terminal usage events may contain four FULL HTTP bodies whose combined serialize
    - System settings `request_record_max_body_size_kb` defaults to `0`.
    - Gateway mapping maps `0` or null/absent values to `max_body_bytes: None`. When `record_level` is set to `Full`, captured body size remains completely unlimited by default; `record_level` (e.g. `Basic`) continues to gate whether HTTP bodies are stored at all.
    - Only when an administrator explicitly sets `request_record_max_body_size_kb > 0` are bodies truncated up front before queuing.
-   - Only when `request_record_compact_base64_images == true` are embedded Base64 image data URLs compacted.
+   - Only when `request_record_compact_base64_images == true` are recognized Base64 payloads, data URLs, and `body_bytes_b64` with decoded size $\ge 4096$ bytes, and `encrypted_content` with UTF-8 size $\ge 4096$ bytes, compacted in captured audit bodies.
 
 2. **Queue Omission & Bounded Direct Persistence**:
    When encoding would omit diagnostics, try existing bounded persistence with the original event before sending its stripped queue representation. Successful persistence returns `PersistedDirectly` and enqueues no duplicate. Otherwise reuse the already encoded bounded fields.
@@ -43,8 +43,8 @@ Terminal usage events may contain four FULL HTTP bodies whose combined serialize
 | --- | --- |
 | `request_record_max_body_size_kb` = 0 or unset | `max_body_bytes: None`, full bodies retained without upfront truncation |
 | `request_record_max_body_size_kb` = N (> 0) | Upfront truncation at $N \times 1024$ bytes; `reason: body_capture_limit_exceeded` |
-| `request_record_compact_base64_images` = false | Base64 image URLs preserved verbatim |
-| `request_record_compact_base64_images` = true | Base64 image URLs replaced with `<base64-image-data-omitted:...>` placeholder |
+| `request_record_compact_base64_images` = false | Base64 payloads and encoded audit fields preserved verbatim |
+| `request_record_compact_base64_images` = true | Recognized Base64 payloads/data URLs/`body_bytes_b64` ($\ge 4096$ decoded bytes) and `encrypted_content` ($\ge 4096$ UTF-8 bytes) replaced with `<... omitted; ... original size: ...>` placeholders (`reason: base64_payload_compacted`); smaller payloads remain inline |
 | Event fits queue | Existing queue path |
 | Diagnostic omission needed and bounded write succeeds | Original complete bodies persisted directly, no queue duplicate |
 | Writer unavailable, pressured, saturated or write fails | Bounded queue fallback; dropped bodies truthfully marked `Truncated` |

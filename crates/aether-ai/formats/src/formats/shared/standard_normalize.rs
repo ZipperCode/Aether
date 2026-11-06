@@ -651,6 +651,71 @@ mod tests {
     }
 
     #[test]
+    fn responses_to_gemini_chat_hop_keeps_replayed_tool_signatures() {
+        use crate::api::build_cross_format_openai_responses_request_body_with_provider_context as responses;
+        use crate::formats::openai::responses::{
+            encode_gemini_tool_signature_carrier_with_direction,
+            GeminiToolSignatureCarrierDirection,
+        };
+        let carrier = |signature: &str, direction| {
+            encode_gemini_tool_signature_carrier_with_direction(signature, direction).unwrap()
+        };
+        let input = json!({
+            "model": "client",
+            "include": ["reasoning.encrypted_content"],
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {"type": "reasoning", "summary": [],
+                 "encrypted_content": carrier("sig-a", GeminiToolSignatureCarrierDirection::Next)},
+                // omp replays reasoning text between the carrier and its call.
+                {"type": "reasoning", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "plan a"}]},
+                {"type": "function_call", "call_id": "call_a", "name": "read",
+                 "arguments": "{\"path\":\"a\"}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "A"},
+                {"type": "function_call", "call_id": "call_b", "name": "read",
+                 "arguments": "{\"path\":\"b\"}"},
+                {"type": "reasoning", "summary": [],
+                 "encrypted_content": carrier("sig-b", GeminiToolSignatureCarrierDirection::Previous)},
+                {"type": "function_call_output", "call_id": "call_b", "output": "B"}
+            ],
+            "tools": [{"type": "function", "name": "read",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]
+        });
+        for provider in ["antigravity", "gemini"] {
+            let output = responses(
+                &input,
+                "gemini-test",
+                "openai:responses",
+                provider,
+                "gemini:generate_content",
+                true,
+                false,
+                Some("signature-test"),
+            )
+            .unwrap();
+            let signatures = output["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|content| content["parts"].as_array().unwrap())
+                .filter(|part| part.get("functionCall").is_some())
+                .map(|part| {
+                    (
+                        part["functionCall"]["id"].as_str().unwrap(),
+                        part["thoughtSignature"].as_str().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                signatures,
+                vec![("call_a", "sig-a"), ("call_b", "sig-b")],
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
     fn provider_context_builders_keep_scoped_responses_history() {
         use crate::api::{
             build_cross_format_openai_chat_request_body_with_provider_context as chat,

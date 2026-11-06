@@ -49,3 +49,9 @@ Questions to answer:
 <!-- What reviewers should check -->
 
 (To be filled by the team)
+
+## Claude Code injected cache TTL
+
+`apply_claude_code_body_mimicry` scans protocol cache markers in `tools`, `system`, and message content before rewriting the system blocks. If any client marker uses `ttl: "1h"`, the injected expansion block also uses `1h`; otherwise it retains `5m`. Upstream requires longer-TTL blocks before shorter-TTL blocks. Do not scan arbitrary tool arguments or schema data, and keep genuine Claude Code requests idempotent.
+
+`injected_cache_ttl_follows_client_one_hour_markers_from_any_scope` covers all three scopes and repeated application; the existing system rewrite regression asserts the default `5m` path.

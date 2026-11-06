@@ -155,16 +155,35 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers_and
     // Keep the specialized OpenAI builders' compatibility/history preprocessing
     // when routing them through the provider-aware schema-preserving path.
     let antigravity_chat_body = if format_context.preserve_gemini_tool_schemas
-        && matches!(
-            aether_ai_formats::normalize_api_format_alias(source_api_format.as_ref()).as_str(),
-            "openai:chat" | "openai:responses" | "openai:responses:compact"
-        ) {
+        && aether_ai_formats::normalize_api_format_alias(source_api_format.as_ref())
+            == "openai:chat"
+    {
         Some(
             crate::formats::shared::standard_normalize::chat_compatible_body_for_standard_source(
                 body_json,
                 source_api_format.as_ref(),
                 user_api_key_id,
             )?,
+        )
+    } else {
+        None
+    };
+    let antigravity_responses_body = if format_context.preserve_gemini_tool_schemas
+        && matches!(
+            aether_ai_formats::normalize_api_format_alias(source_api_format.as_ref()).as_str(),
+            "openai:responses" | "openai:responses:compact"
+        )
+        && body_json
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
+    {
+        Some(
+            crate::formats::openai::responses::history::expand_previous_response_for_chat(
+                body_json,
+                user_api_key_id,
+            )
+            .ok()?,
         )
     } else {
         None
@@ -188,7 +207,10 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers_and
                 source_api_format.as_ref()
             },
             provider_api_format,
-            antigravity_chat_body.as_deref().unwrap_or(body_json),
+            antigravity_chat_body
+                .as_deref()
+                .or(antigravity_responses_body.as_ref())
+                .unwrap_or(body_json),
             &format_context,
         )
         .ok()?

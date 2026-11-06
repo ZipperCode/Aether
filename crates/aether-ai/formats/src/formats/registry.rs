@@ -6215,6 +6215,73 @@ mod tests {
     }
 
     #[test]
+    fn pre_call_gemini_signature_carrier_survives_interleaved_reasoning_text() {
+        // Clients replay reasoning text between the carrier and its call in either
+        // order; the text must not overwrite the pending signature.
+        let carrier = |signature: &str| {
+            crate::formats::openai::responses::encode_gemini_tool_signature_carrier_with_direction(
+                signature,
+                crate::formats::openai::responses::GeminiToolSignatureCarrierDirection::Next,
+            )
+            .expect("signature carrier")
+        };
+        let thought = |text: &str| {
+            json!({
+                "type": "reasoning",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": text}]
+            })
+        };
+        let body = json!({
+            "model": "gemini-3-flash-preview",
+            "input": [
+                {"role": "user", "content": "go"},
+                {"type": "reasoning", "summary": [], "encrypted_content": carrier("sig-a")},
+                thought("plan a"),
+                {"type": "function_call", "call_id": "call_a", "name": "read",
+                 "arguments": "{\"path\":\"a\"}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "A"},
+                thought("plan b"),
+                {"type": "reasoning", "summary": [], "encrypted_content": carrier("sig-b")},
+                {"type": "function_call", "call_id": "call_b", "name": "read",
+                 "arguments": "{\"path\":\"b\"}"},
+                {"type": "function_call_output", "call_id": "call_b", "output": "B"}
+            ]
+        });
+
+        let converted = convert_request(
+            "openai:responses",
+            "gemini:generate_content",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect("interleaved carriers should convert");
+        let parts = converted["contents"]
+            .as_array()
+            .expect("contents")
+            .iter()
+            .flat_map(|content| content["parts"].as_array().expect("parts"))
+            .collect::<Vec<_>>();
+        let calls = parts
+            .iter()
+            .filter(|part| part.get("functionCall").is_some())
+            .map(|part| {
+                (
+                    part["functionCall"]["id"].as_str().unwrap(),
+                    part["thoughtSignature"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec![("call_a", "sig-a"), ("call_b", "sig-b")]);
+        let thoughts = parts
+            .iter()
+            .filter(|part| part["thought"] == true)
+            .map(|part| part["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(thoughts, vec!["plan a", "plan b"]);
+    }
+
+    #[test]
     fn pure_gemini_to_openai_responses_blocks_thought_part_loss() {
         let body = json!({
             "contents": [{
@@ -6938,6 +7005,66 @@ mod tests {
             assert_eq!(converted["tools"][2]["function"]["name"], "existing");
             assert_eq!(converted["messages"][0]["role"], "user");
             assert_eq!(converted["messages"].as_array().map(Vec::len), Some(1));
+        }
+    }
+
+    #[test]
+    fn openai_responses_additional_tools_prefix_maps_to_gemini_tools() {
+        let body = json!({
+            "model": "gemini-3.7-flash",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "description": "Look up a value",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"]
+                        }
+                    }]
+                },
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+            ],
+            "tools": [{"type": "web_search"}]
+        });
+
+        for converted in [
+            convert_request_pure("openai:responses", "gemini:generate_content", &body)
+                .expect("pure conversion should map additional tools")
+                .value,
+            convert_request(
+                "openai:responses",
+                "gemini:generate_content",
+                &body,
+                &FormatContext::default(),
+            )
+            .expect("runtime conversion should map additional tools"),
+        ] {
+            let tools = converted["tools"]
+                .as_array()
+                .expect("Gemini tools should be present");
+            let declarations = tools
+                .iter()
+                .filter_map(|tool| tool.get("functionDeclarations"))
+                .filter_map(|value| value.as_array())
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(declarations.len(), 1, "{tools:?}");
+            assert_eq!(declarations[0]["name"], "lookup");
+            assert!(
+                tools.iter().any(|tool| tool.get("googleSearch").is_some()),
+                "built-in search should survive the Gemini conversion: {tools:?}"
+            );
+            assert_eq!(
+                converted["toolConfig"]["includeServerSideToolInvocations"],
+                true
+            );
+            assert_eq!(converted["contents"].as_array().map(Vec::len), Some(1));
+            assert_eq!(converted["contents"][0]["parts"][0]["text"], "hello");
         }
     }
 
