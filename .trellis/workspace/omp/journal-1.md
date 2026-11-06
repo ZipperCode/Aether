@@ -723,3 +723,25 @@ HTTP、Responses WebSocket 与前端默认开启 cancel_on_client_disconnect；�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 30: 同步上游主线并评估协议与审计 PR
+
+**Date**: 2026-11-06
+**Task**: 同步上游主线并评估协议与审计 PR
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+合并 upstream/main 0eb323390，保留本地模型账号隔离、配额准入、原生透传与流生命周期；修复前端拆分中的配额动作和 Antigravity 不适用窗口丢失。后端定向561项、隔离PostgreSQL9项通过；前端提供商+i18n 542项、最终配额渲染28项、类型检查、构建、Clippy及fmt通过，已观察本地mock页面。仅评估893/897/898/899，未集成这些PR。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `238940670` | (see git log) |
+
+### Status
+
+[OK] **Completed**

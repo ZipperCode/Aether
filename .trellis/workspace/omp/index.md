@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 29
-- **Last Active**: 2026-11-02
+- **Total Sessions**: 30
+- **Last Active**: 2026-11-06
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~725 | Active |
+| `journal-1.md` | ~747 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 30 | 2026-11-06 | 同步上游主线并评估协议与审计 PR | `238940670` | `master` |
 | 29 | 2026-11-02 | 默认开启客户端断连取消上游 | `380c3087c` | `master` |
 | 28 | 2026-11-02 | 修复长流生命周期与断流诊断 | `15caa3cdd` | `master` |
 | 27 | 2026-10-31 | 号池账号未激活提示与批量健康恢复 | `da50445ac` | `master` |
