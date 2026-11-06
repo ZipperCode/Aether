@@ -2,14 +2,14 @@
   <div class="space-y-3 rounded-lg border p-3">
     <div class="space-y-1.5">
       <div class="flex items-center justify-between gap-2">
-        <Label class="text-xs font-medium">目标 API 格式</Label>
+        <Label class="text-xs font-medium">{{ t('providers.local.targetAPIFormat') }}</Label>
         <span class="text-xs text-muted-foreground">{{ selectedFormats.length }}/{{ formatOptions.length }}</span>
       </div>
       <MultiSelect
         :model-value="selectedFormats"
         :options="formatOptions"
-        placeholder="选择目标格式"
-        empty-text="所选提供商暂无端点"
+        :placeholder="t('providers.local.selectTargetFormat')"
+        :empty-text="t('providers.local.theSelectedProvidersHaveNoEndpoints')"
         no-results-text="未找到格式"
         trigger-class="h-9 rounded-md"
         dropdown-min-width="18rem"
@@ -27,7 +27,7 @@
             :disabled="disabled"
             @update:checked="patchProxy({ include: $event })"
           />
-          <span>代理节点</span>
+          <span>{{ t('ui.proxyNodes23f1b6a') }}</span>
         </label>
         <div
           class="flex items-center gap-2"
@@ -45,7 +45,7 @@
             class="h-9"
             @click="patchProxy({ nodeId: '' })"
           >
-            清除
+            {{ t('ui.clear') }}
           </Button>
         </div>
       </div>
@@ -57,13 +57,13 @@
             :disabled="disabled"
             @update:checked="patchFormatConversion({ include: $event })"
           />
-          <span>格式转换</span>
+          <span>{{ t('guide.nav.advanced.formatConversion') }}</span>
         </label>
         <div
           class="flex items-center justify-between"
           :class="state.formatConversion.include ? '' : 'pointer-events-none opacity-45'"
         >
-          <span class="text-xs text-muted-foreground">统一开关格式转换</span>
+          <span class="text-xs text-muted-foreground">{{ t('providers.local.toggleFormatConversionForAll') }}</span>
           <Switch
             :model-value="state.formatConversion.enabled"
             @update:model-value="patchFormatConversion({ enabled: $event })"
@@ -78,7 +78,7 @@
             :disabled="disabled"
             @update:checked="patchUpstreamPolicy({ include: $event })"
           />
-          <span>上游流式策略</span>
+          <span>{{ t('providers.local.upstreamStreamingPolicy') }}</span>
         </label>
         <Select
           :model-value="state.upstreamPolicy.value"
@@ -86,17 +86,17 @@
           @update:model-value="patchUpstreamPolicy({ value: $event as EndpointBatchState['upstreamPolicy']['value'] })"
         >
           <SelectTrigger class="h-9">
-            <SelectValue placeholder="选择策略" />
+            <SelectValue :placeholder="t('providers.local.selectPolicy')" />
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="auto">
-              自动
+              {{ t('ui.automatic') }}
             </SelectItem>
             <SelectItem value="force_stream">
-              强制流式
+              {{ t('providers.local.forceStreaming') }}
             </SelectItem>
             <SelectItem value="force_non_stream">
-              强制非流式
+              {{ t('providers.local.forceNonStreaming') }}
             </SelectItem>
           </SelectContent>
         </Select>
@@ -109,13 +109,13 @@
             :disabled="disabled"
             @update:checked="patchActive({ include: $event })"
           />
-          <span>启用状态</span>
+          <span>{{ t('feedback.error.field.isActive') }}</span>
         </label>
         <div
           class="flex items-center justify-between"
           :class="state.active.include ? '' : 'pointer-events-none opacity-45'"
         >
-          <span class="text-xs text-muted-foreground">统一启用或停用端点</span>
+          <span class="text-xs text-muted-foreground">{{ t('providers.local.enableOrDisableAllEndpoints') }}</span>
           <Switch
             :model-value="state.active.value"
             @update:model-value="patchActive({ value: $event })"
@@ -132,7 +132,7 @@
             :disabled="disabled"
             @update:checked="patchRules({ include: $event })"
           />
-          <span>请求头 / 请求体规则</span>
+          <span>{{ t('providers.local.headerBodyRules') }}</span>
         </label>
         <div class="flex items-center gap-3 text-xs">
           <label class="flex items-center gap-1.5">
@@ -143,7 +143,7 @@
               :disabled="disabled || !state.rules.include"
               @change="patchRules({ mode: 'append' })"
             >
-            <span>追加</span>
+            <span>{{ t('ui.append') }}</span>
           </label>
           <label class="flex items-center gap-1.5">
             <input
@@ -153,7 +153,7 @@
               :disabled="disabled || !state.rules.include"
               @change="patchRules({ mode: 'overwrite' })"
             >
-            <span>覆盖</span>
+            <span>{{ t('providers.local.overwrite') }}</span>
           </label>
         </div>
       </div>
@@ -172,13 +172,15 @@
         {{ state.rules.error }}
       </p>
       <p class="text-xs text-muted-foreground">
-        响应头规则不在本期批量范围内。
+        {{ t('providers.local.responseHeaderRulesAreNotIncludedInThis') }}
       </p>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
+import { useI18n } from '@/i18n'
+
 import { ref, watch } from 'vue'
 import {
   Button,
@@ -208,6 +210,8 @@ const emit = defineEmits<{
   'update:state': [state: EndpointBatchState]
   'update:selectedFormats': [formats: string[]]
 }>()
+const { t } = useI18n()
+
 
 const proxySelectRef = ref<InstanceType<typeof ProxyNodeSelect> | null>(null)
 

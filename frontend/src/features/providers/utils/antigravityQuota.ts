@@ -2,6 +2,7 @@ import type {
   QuotaWindowSnapshot,
   UpstreamMetadata,
 } from '@/api/endpoints/types'
+import { translate as defaultTranslate } from '@/i18n'
 
 /** 可参与 Antigravity 排序和家族汇总的原始模型额度条目。 */
 export interface AntigravityQuotaSortableItem {
@@ -226,11 +227,11 @@ export function resolveAntigravityAccountTier(
  */
 export function resolveAntigravityAccountTierLabel(
   metadata?: UpstreamMetadata | null,
-  translate?: ((text: string) => string) | null,
+  translate: (key: 'chart.unknown') => string = defaultTranslate,
 ): string {
   const tier = resolveAntigravityAccountTier(metadata)
   if (tier === 'free') return 'Free'
   if (tier === 'pro') return 'Pro'
   if (tier === 'ultra') return 'Ultra'
-  return translate ? translate('未知') : 'Unknown'
+  return translate('chart.unknown')
 }

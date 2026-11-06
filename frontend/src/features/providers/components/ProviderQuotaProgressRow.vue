@@ -11,7 +11,7 @@
         :class="meterClass"
         data-testid="provider-quota-progress-meter"
       >
-        {{ meterText || (displayRemainingPercent == null ? legacyT('未知') : `${displayRemainingPercent.toFixed(1)}%`) }}
+        {{ meterText || (displayRemainingPercent == null ? t('chart.unknown') : `${displayRemainingPercent.toFixed(1)}%`) }}
       </span>
     </div>
     <div
@@ -41,7 +41,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from '@/i18n'
-import { finiteNumber } from '@/utils/providerKeyQuota'
+import { finiteNumber } from '@/features/providers/utils/providerKeyQuota'
 
 const props = withDefaults(defineProps<{
   label: string
@@ -65,7 +65,7 @@ const props = withDefaults(defineProps<{
   meterText: null,
 })
 
-const { legacyT } = useI18n()
+const { t } = useI18n()
 
 // 加成允许展示超过 100%，仅进度条宽度做截断；缺失比例不能变成 0%。
 const displayRemainingPercent = computed(() => {

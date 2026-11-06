@@ -4,25 +4,25 @@
     data-testid="claude-endpoint-operation-support"
   >
     <Label class="text-xs normal-case tracking-normal text-muted-foreground">
-      支持的操作
+      {{ t('providers.local.supportedOperations') }}
     </Label>
     <div class="flex flex-wrap items-center gap-x-5 gap-y-2">
       <div class="flex items-center gap-2">
-        <span class="text-xs text-foreground">消息</span>
+        <span class="text-xs text-foreground">{{ t('providers.local.messagesOp') }}</span>
         <Switch
           :model-value="true"
           disabled
-          aria-label="消息操作"
-          title="消息操作始终启用"
+          :aria-label="t('providers.local.messagesOperation')"
+          :title="t('providers.local.messagesOperationAlwaysEnabled')"
         />
       </div>
       <div class="flex items-center gap-2">
-        <span class="text-xs text-foreground">Token 计数</span>
+        <span class="text-xs text-foreground">{{ t('providers.local.countTokensOp') }}</span>
         <Switch
           :model-value="modelValue"
           :disabled="disabled || locked"
-          aria-label="Token 计数操作"
-          :title="locked ? '该提供商类型不支持 Token 计数' : (modelValue ? '已支持 Token 计数' : '不支持 Token 计数')"
+          :aria-label="t('providers.local.countTokensOperation')"
+          :title="locked ? t('providers.local.providerTypeDoesNotSupportCountTokens') : (modelValue ? t('providers.local.countTokensSupported') : t('providers.local.countTokensUnsupported'))"
           data-testid="claude-count-tokens-switch"
           @update:model-value="$emit('update:modelValue', $event)"
         />
@@ -33,6 +33,7 @@
 
 <script setup lang="ts">
 import { Label, Switch } from '@/components/ui'
+import { useI18n } from '@/i18n'
 
 defineProps<{
   modelValue: boolean
@@ -43,4 +44,6 @@ defineProps<{
 defineEmits<{
   'update:modelValue': [value: boolean]
 }>()
+const { t } = useI18n()
+
 </script>

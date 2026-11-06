@@ -1,3 +1,5 @@
+
+import { translate as t } from '@/i18n'
 import {
   apiFormatPermissionCovers,
   normalizeApiFormatAlias,
@@ -74,9 +76,9 @@ const MODEL_CAPABILITY_NON_TEXT_TYPES = new Set([
 ])
 
 const MODEL_TEST_DIAGNOSTIC_LABELS: Record<string, string> = {
-  key_model_not_allowed: 'Key 未允许当前模型，已跳过',
-  codex_plan_image_generation_unsupported: 'Codex Free 套餐不支持图片生成',
-  pool_account_blocked: '账号已失效，需重新授权',
+  get key_model_not_allowed() { return t('ui.skippedThisKeyDoesNotAllowTheCurrentModel') },
+  get codex_plan_image_generation_unsupported() { return t('providers.local.codexFreeImageUnsupported') },
+  get pool_account_blocked() { return t('ui.theAccountIsInvalidReauthorizeItToContinue') },
 }
 
 export function normalizeModelTestStringList(values: string[] | null | undefined): string[] {
@@ -175,14 +177,16 @@ export function selectPreferredModelTestEndpoint<T extends ModelTestEndpointSour
   model: ModelTestImageSource | null | undefined,
   endpoints: T[],
 ): T | null {
+  const activeEndpoints = endpoints.filter(endpoint => endpoint.is_active !== false)
+  const preferredEndpoints = activeEndpoints.length > 0 ? activeEndpoints : endpoints
   if (modelSupportsImageGeneration(model)) {
-    const imageEndpoint = endpoints.find(
+    const imageEndpoint = preferredEndpoints.find(
       endpoint => normalizeApiFormatAlias(endpoint.api_format) === 'openai:image',
     )
     if (imageEndpoint) return imageEndpoint
   }
 
-  return endpoints[0] ?? null
+  return preferredEndpoints[0] ?? null
 }
 
 export function getOpenAiImageModelTestCapability(

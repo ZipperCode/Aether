@@ -2,7 +2,7 @@
   <div
     v-if="score !== undefined && score !== null"
     class="inline-flex items-center gap-1"
-    :title="`Key 可用率 ${percent.toFixed(0)}%`"
+    :title="t('pool.keyAvailabilityPercent', { percent: percent.toFixed(0) })"
     data-testid="pool-key-health"
   >
     <div class="h-1.5 w-10 overflow-hidden rounded-full bg-border">
@@ -21,8 +21,10 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useI18n } from '@/i18n'
 
 const props = defineProps<{ score?: number | null }>()
+const { t } = useI18n()
 
 const percent = computed(() => {
   const value = Number(props.score ?? 0)

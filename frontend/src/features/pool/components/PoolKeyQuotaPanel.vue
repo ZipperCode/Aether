@@ -14,7 +14,7 @@
     class="rounded-xl border border-border/50 bg-muted/30 px-3 py-2 text-xs"
   >
     <div class="text-muted-foreground mb-1 flex items-center justify-between gap-2">
-      <span>{{ legacyT('配额') }}</span>
+      <span>{{ t('ui.quotae284fc9') }}</span>
       <QuotaRefreshButton v-if="refreshable" />
     </div>
     <div
@@ -150,8 +150,7 @@ const emit = defineEmits<{
   'refresh': []
 }>()
 
-
-const { legacyT } = useI18n()
+const { t } = useI18n()
 // 官方 API Key 额度与提供商抽屉共享完整来源分组，避免维护两套金额解析。
 const supportsStructuredQuota = computed(() => isOfficialQuotaProviderType(
   props.quota?.provider_type || props.providerType,
@@ -169,8 +168,8 @@ const QuotaRefreshButton = defineComponent({
       type: 'button',
       disabled: props.refreshDisabled || props.refreshLoading,
       class: 'inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60',
-      title: legacyT('刷新额度'),
-      'aria-label': legacyT('刷新额度'),
+      title: t('ui.refreshQuota'),
+      'aria-label': t('ui.refreshQuota'),
       'data-testid': 'pool-quota-refresh',
       onClick: () => emit('refresh'),
     }, [
@@ -198,7 +197,7 @@ const ResetCredits = defineComponent({
             disabled: props.consumingResetCredit,
             class: 'font-medium text-primary hover:underline disabled:pointer-events-none disabled:opacity-60',
             onClick: () => emit('consume-reset-credit'),
-          }, props.consumingResetCredit ? legacyT('重置中...') : legacyT('点击以进行重置'))
+          }, props.consumingResetCredit ? t('ui.resetting') : t('ui.clickToReset'))
           : null,
         h('span', props.resetCreditText),
       ]),

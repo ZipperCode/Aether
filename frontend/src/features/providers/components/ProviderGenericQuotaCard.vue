@@ -7,12 +7,12 @@
   >
     <ProviderQuotaSectionHeader
       v-if="!compact || refreshable"
-      :title="legacyT('额度')"
+      :title="t('providers.local.quotaTitle')"
       :loading="loading"
       :updated-text="updatedText"
       :refreshable="refreshable"
       :refresh-disabled="refreshDisabled"
-      :refresh-title="legacyT('刷新额度')"
+      :refresh-title="t('ui.refreshQuota')"
       @refresh="$emit('refresh')"
     />
     <div
@@ -26,12 +26,12 @@
         :data-quota-source="group.id"
       >
         <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[10px]">
-          <span class="font-medium">{{ legacyT(group.label) }}</span>
+          <span class="font-medium">{{ group.label }}</span>
           <span
             v-if="group.status"
-            :class="group.status === '查询成功' && !group.stale ? 'text-muted-foreground' : 'text-amber-600 dark:text-amber-400'"
+            :class="!group.stale && !group.error ? 'text-muted-foreground' : 'text-amber-600 dark:text-amber-400'"
           >
-            {{ legacyT(group.status) }}
+            {{ group.status }}
           </span>
         </div>
         <div
@@ -51,17 +51,17 @@
             class="min-w-0"
           >
             <div class="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1">
-              <span class="text-[10px] text-muted-foreground">{{ legacyT(balance.label) }}</span>
+              <span class="text-[10px] text-muted-foreground">{{ balance.label }}</span>
               <span
                 class="min-w-0 break-all text-right text-sm font-semibold tabular-nums"
                 :class="balance.insufficient && !group.stale ? 'text-amber-600 dark:text-amber-400' : 'text-foreground'"
                 data-testid="provider-quota-available"
-              >{{ legacyT(balance.available) }}</span>
+              >{{ balance.available }}</span>
             </div>
             <ProviderQuotaProgressRow
               v-if="balance.remainingPercent != null"
               class="mt-1"
-              :label="legacyT('剩余比例')"
+              :label="t('providers.local.remainingRatio')"
               :remaining-percent="balance.remainingPercent"
               :meter-class="remainingTone(balance.remainingPercent).meterClass"
               :bar-class="remainingTone(balance.remainingPercent).barClass"
@@ -82,9 +82,9 @@
           <ProviderQuotaProgressRow
             v-for="window in group.windows"
             :key="window.key"
-            :label="legacyT(window.label)"
+            :label="window.label"
             :remaining-percent="window.remainingPercent"
-            :meter-text="legacyT(window.meterText)"
+            :meter-text="window.meterText"
             :meter-class="remainingTone(window.remainingPercent).meterClass"
             :bar-class="remainingTone(window.remainingPercent).barClass"
             :reset-text="[window.detail, window.resetText].filter(Boolean).join(' · ')"
@@ -99,7 +99,7 @@
             v-for="note in group.notes"
             :key="note"
           >
-            {{ legacyT(note) }}
+            {{ note }}
           </div>
         </div>
         <div
@@ -107,20 +107,20 @@
           class="mt-1.5 break-words text-[10px] text-amber-600 dark:text-amber-400"
           data-testid="provider-generic-quota-status"
         >
-          {{ legacyT(group.error) }}
+          {{ group.error }}
         </div>
         <div
           v-if="group.updatedText"
           class="mt-1 text-[9px] text-muted-foreground/80"
         >
-          {{ legacyT('上次成功') }} {{ group.updatedText }}
+          {{ t('providers.local.lastSucceeded') }} {{ group.updatedText }}
         </div>
         <div
           v-if="!group.balances.length && !group.windows.length"
           class="mt-1 text-[10px] text-muted-foreground"
           data-testid="provider-quota-empty"
         >
-          {{ legacyT('额度未知') }}
+          {{ t('providers.local.quotaUnknown') }}
         </div>
       </section>
     </div>
@@ -142,7 +142,7 @@
       class="mt-1.5 text-[10px] text-muted-foreground"
       data-testid="provider-quota-empty"
     >
-      {{ loading ? legacyT('正在查询额度') : legacyT('尚未查询额度') }}
+      {{ loading ? t('providers.local.queryingQuota') : t('providers.local.quotaNotQueriedYet') }}
     </div>
   </div>
 </template>
@@ -156,7 +156,7 @@ import {
   formatQuotaDateTime,
   getGenericQuotaGroups,
   getGenericQuotaSections,
-} from '@/utils/providerKeyQuota'
+} from '@/features/providers/utils/providerKeyQuota'
 import ProviderQuotaProgressRow from './ProviderQuotaProgressRow.vue'
 import ProviderQuotaSectionHeader from './ProviderQuotaSectionHeader.vue'
 
@@ -179,7 +179,7 @@ const props = withDefaults(defineProps<{
 
 defineEmits<{ (e: 'refresh'): void }>()
 
-const { legacyT } = useI18n()
+const { t } = useI18n()
 const groups = computed(() => getGenericQuotaGroups(props.quota, props.providerType))
 const sections = computed(() => getGenericQuotaSections(props.quota, props.providerType))
 const updatedText = computed(() => formatQuotaDateTime(

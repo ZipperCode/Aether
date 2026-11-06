@@ -1,3 +1,5 @@
+
+import { translate as t } from '@/i18n'
 import {
   apiFormatPermissionCovers,
   normalizeApiFormatAlias,
@@ -299,7 +301,7 @@ function parseModelTestJsonObjectDraft(
   } catch (error) {
     return {
       value: null,
-      error: error instanceof Error ? error.message : '无效的 JSON',
+      error: error instanceof Error ? error.message : t('ui.invalidJsona177326'),
     }
   }
 }
@@ -309,8 +311,8 @@ export function parseModelTestRequestBodyDraft(
 ): { value: Record<string, unknown> | null; error: string | null } {
   return parseModelTestJsonObjectDraft(draft, {
     emptyValue: null,
-    emptyError: '测试请求体不能为空',
-    invalidTypeError: '测试请求体必须是 JSON 对象',
+    emptyError: t('ui.testRequestBodyIsRequired'),
+    invalidTypeError: t('ui.testRequestBodyMustBeAJsonObject'),
   })
 }
 
@@ -320,6 +322,6 @@ export function parseModelTestRequestHeadersDraft(
   return parseModelTestJsonObjectDraft(draft, {
     emptyValue: {},
     emptyError: null,
-    invalidTypeError: '测试请求头必须是 JSON 对象',
+    invalidTypeError: t('ui.testRequestHeadersMustBeAJsonObject'),
   })
 }

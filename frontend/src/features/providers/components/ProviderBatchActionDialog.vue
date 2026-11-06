@@ -1,7 +1,7 @@
 <template>
   <Dialog
     :model-value="modelValue"
-    title="提供商批量处理"
+    :title="t('ui.providerBulkActions')"
     :description="dialogDescription"
     :icon="Users"
     size="4xl"
@@ -11,14 +11,14 @@
     <div class="space-y-3.5">
       <div class="space-y-1.5">
         <div class="flex items-center justify-between gap-2">
-          <span class="text-xs font-medium text-muted-foreground">选择提供商</span>
+          <span class="text-xs font-medium text-muted-foreground">{{ t('ui.selectProvider') }}</span>
           <span class="text-xs text-muted-foreground">{{ selectedCount }}/{{ providers.length }}</span>
         </div>
         <MultiSelect
           :model-value="selectedProviderIds"
           :options="providerOptions"
-          placeholder="选择要批量处理的提供商"
-          empty-text="当前范围暂无提供商"
+          :placeholder="t('providers.local.selectProvidersForBatchProcessing')"
+          :empty-text="t('providers.local.noProvidersInTheCurrentScope')"
           no-results-text="未找到提供商"
           trigger-class="h-10 rounded-md"
           dropdown-min-width="28rem"
@@ -27,7 +27,7 @@
           @update:model-value="selectedProviderIds = $event"
         />
         <p class="text-xs text-muted-foreground">
-          选择范围来自当前列表页和筛选结果，不会跨页自动包含其它提供商。
+          {{ t('providers.local.selectionIsLimitedToTheCurrentPageAnd') }}
         </p>
       </div>
 
@@ -156,11 +156,11 @@
     <template #footer>
       <div class="flex w-full flex-wrap items-center justify-between gap-3">
         <div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-          <span>已选 <span class="font-semibold tabular-nums text-foreground">{{ selectedCount }}</span></span>
+          <span>{{ t('ui.selected') }} <span class="font-semibold tabular-nums text-foreground">{{ selectedCount }}</span></span>
           <span class="text-border">·</span>
-          <span>当前范围 <span class="tabular-nums">{{ providers.length }}</span></span>
-          <span class="text-emerald-600 dark:text-emerald-400">活跃 <span class="tabular-nums">{{ activeProviderCount }}</span></span>
-          <span>停用 <span class="tabular-nums">{{ inactiveProviderCount }}</span></span>
+          <span>{{ t('providers.local.currentScope') }} <span class="tabular-nums">{{ providers.length }}</span></span>
+          <span class="text-emerald-600 dark:text-emerald-400">{{ t('ui.activee85e590') }} <span class="tabular-nums">{{ activeProviderCount }}</span></span>
+          <span>{{ t('ui.disable4e6fd0e') }} <span class="tabular-nums">{{ inactiveProviderCount }}</span></span>
         </div>
         <div class="flex items-center gap-2">
           <Button
@@ -168,7 +168,7 @@
             :disabled="executing"
             @click="requestClose"
           >
-            关闭
+            {{ t('ui.close') }}
           </Button>
           <Button
             :variant="executeButtonVariant"
@@ -184,6 +184,8 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n } from '@/i18n'
+
 import { computed, ref, watch, type Component } from 'vue'
 import {
   Power,
@@ -267,6 +269,8 @@ const emit = defineEmits<{
   'update:modelValue': [value: boolean]
   changed: []
 }>()
+
+const { t } = useI18n()
 
 const { confirm } = useConfirm()
 const { success, warning, error: showError } = useToast()
@@ -745,7 +749,7 @@ async function executeBatchAction(): Promise<void> {
 async function executeStatusBatch(): Promise<void> {
   const targets = getSelectedTargets()
   if (targets.length === 0) {
-    warning('请先选择提供商')
+    warning(t('ui.selectProvidersFirst'))
     return
   }
 
@@ -778,7 +782,7 @@ async function executeStatusBatch(): Promise<void> {
 
     finishBatchResult('执行完成', successCount, failedCount)
   } catch (err) {
-    showError(parseApiError(err, '批量处理提供商失败'), '错误')
+    showError(parseApiError(err, t('ui.providerBulkActionFailed')), t('ui.error'))
   } finally {
     finishExecuting()
   }

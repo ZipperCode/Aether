@@ -5,6 +5,7 @@ import ProviderMonthlyQuotaCard from '@/features/providers/components/ProviderMo
 import ProviderQuotaProgressRow from '@/features/providers/components/ProviderQuotaProgressRow.vue'
 import ProviderQuotaSectionHeader from '@/features/providers/components/ProviderQuotaSectionHeader.vue'
 import ProviderGenericQuotaCard from '@/features/providers/components/ProviderGenericQuotaCard.vue'
+import ProviderKeyQuotaSummary from '@/features/providers/components/ProviderKeyQuotaSummary.vue'
 import { createI18n } from '@/i18n'
 
 function mount(component: Parameters<typeof createApp>[0], props?: Record<string, unknown>) {
@@ -24,6 +25,35 @@ function mount(component: Parameters<typeof createApp>[0], props?: Record<string
 }
 
 describe('provider quota display components', () => {
+  it('keeps non-applicable Antigravity windows visible without a fake percentage', () => {
+    const { root, unmount } = mount(ProviderKeyQuotaSummary, {
+      providerType: 'antigravity',
+      countdownTick: 0,
+      providerKey: {
+        status_snapshot: {
+          quota: {
+            provider_type: 'antigravity',
+            windows: [{
+              scope: 'quota_group',
+              code: 'group:0:gemini-weekly',
+              quota_group_label: 'Gemini models',
+              window: 'weekly',
+              is_included: false,
+            }],
+          },
+        },
+      },
+    })
+
+    try {
+      expect(root.textContent).toContain('Gemini Models · 周')
+      expect(root.querySelector('[data-testid="provider-quota-progress-meter"]')?.textContent).toBe('不适用')
+      expect(root.querySelector('[data-testid="provider-quota-progress-bar"]')).toBeNull()
+    } finally {
+      unmount()
+    }
+  })
+
   it('renders balance, subscription, rate limit and stale error separately', () => {
     const { root, unmount } = mount(ProviderGenericQuotaCard, {
       quota: {

@@ -1,8 +1,8 @@
 <template>
   <Dialog
     :model-value="open"
-    :title="providerName ? `批量管理模型 - ${providerName}` : '批量管理模型'"
-    description="选中的模型将被关联到提供商，取消选中将移除关联"
+    :title="providerName ? t('ui.manageModelsInBulkValue', { name: providerName }) : t('ui.manageModelsInBulk')"
+    :description="t('ui.selectedModelsAreLinkedToThisProviderDeselectingAModel')"
     :icon="Layers"
     size="2xl"
     @update:model-value="handleDialogUpdate"
@@ -15,7 +15,7 @@
             <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <Input
               v-model="searchQuery"
-              placeholder="搜索模型..."
+              :placeholder="t('ui.searchModelscd01488')"
               class="pl-8 h-9"
             />
           </div>
@@ -27,7 +27,7 @@
                 class="h-9 w-9 shrink-0"
                 :disabled="loadingGlobalModels || loadingProviderKeys || fetchingAutoMatchedModels || providerKeys.length === 0"
                 :title="autoMatchButtonTitle"
-                aria-label="按密钥匹配"
+                :aria-label="t('ui.matchByKey')"
               >
                 <Loader2
                   v-if="loadingProviderKeys || fetchingAutoMatchedModels"
@@ -69,8 +69,7 @@
             data-testid="batch-assign-create-model"
             @click="openCreateModelDialog"
           >
-            <Plus class="w-4 h-4" />
-            创建模型
+            <Plus class="w-4 h-4" /> {{ t('ui.createModel') }}
           </Button>
         </div>
 
@@ -91,7 +90,7 @@
                   class="flex items-center justify-between px-3 py-2 bg-muted sticky top-0 z-10"
                 >
                   <div class="flex items-center gap-2">
-                    <span class="text-xs font-medium">全局模型</span>
+                    <span class="text-xs font-medium">{{ t('ui.globalModel') }}</span>
                     <span class="text-xs text-muted-foreground">({{ filteredGlobalModels.length }})</span>
                   </div>
                   <button
@@ -100,7 +99,7 @@
                     class="text-xs text-primary hover:underline shrink-0"
                     @click.stop="toggleAllGlobalModels"
                   >
-                    {{ isAllGlobalModelsSelected ? '取消全选' : '全选' }}
+                    {{ isAllGlobalModelsSelected ? t('ui.deselectAll') : t('ui.selectAll') }}
                   </button>
                 </div>
                 <div class="space-y-1 p-2">
@@ -138,7 +137,7 @@
                             :for="`upstream-model-${model.id}`"
                             class="block text-xs text-muted-foreground"
                           >
-                            真实上游模型（可选）
+                            {{ t('providers.local.actualUpstreamModelOptional') }}
                           </label>
                           <select
                             :id="`upstream-model-${model.id}`"
@@ -148,10 +147,10 @@
                             @change="setUpstreamModelSelection(model.id, $event)"
                           >
                             <option value="">
-                              未指定（使用全局模型名自动推断）
+                              {{ t('providers.local.unspecifiedInferFromGlobalModelName') }}
                             </option>
                             <option :value="MANUAL_MODE_VALUE">
-                              手动指定模型与 Endpoint
+                              {{ t('providers.local.specifyModelAndEndpointsManually') }}
                             </option>
                             <option
                               v-for="upstreamModel in upstreamModels"
@@ -175,12 +174,12 @@
                               :for="`manual-model-name-${model.id}`"
                               class="block text-xs text-muted-foreground"
                             >
-                              真实上游模型名称
+                              {{ t('providers.local.actualUpstreamModelName') }}
                             </label>
                             <Input
                               :id="`manual-model-name-${model.id}`"
                               :model-value="getManualProviderModelName(model.id)"
-                              placeholder="例如 gpt-6.1-sol"
+                              :placeholder="t('providers.local.eGGpt61Sol')"
                               class="h-8 text-xs font-mono"
                               data-testid="manual-model-name-input"
                               :data-model-id="model.id"
@@ -191,7 +190,7 @@
                               class="text-xs text-destructive"
                               data-testid="manual-model-name-error"
                             >
-                              请输入真实上游模型名称（不可为空或仅包含空白字符）
+                              {{ t('providers.local.enterAnActualUpstreamModelNameItCannot') }}
                             </p>
                           </div>
 
@@ -202,7 +201,7 @@
                             :data-model-id="model.id"
                           >
                             <label class="block text-xs text-muted-foreground">
-                              选择 Endpoint（至少选择一个）
+                              {{ t('providers.local.selectEndpointsAtLeastOne') }}
                             </label>
 
                             <div
@@ -210,7 +209,7 @@
                               class="flex items-center gap-1.5 py-2 text-xs text-muted-foreground"
                             >
                               <Loader2 class="w-3.5 h-3.5 animate-spin text-primary" />
-                              <span>正在加载端点...</span>
+                              <span>{{ t('providers.local.loadingEndpoints') }}</span>
                             </div>
 
                             <div
@@ -224,7 +223,7 @@
                                 class="text-xs text-primary hover:underline ml-2 shrink-0"
                                 @click="retryLoadEndpoints"
                               >
-                                重试
+                                {{ t('vscodex.connection.retry') }}
                               </button>
                             </div>
 
@@ -233,7 +232,7 @@
                               class="text-xs text-destructive py-1"
                               data-testid="manual-endpoints-empty"
                             >
-                              当前提供商暂无可用 Endpoint，请先在提供商详情中添加端点
+                              {{ t('providers.local.thisProviderHasNoAvailableEndpointsAddOne') }}
                             </div>
 
                             <template v-else>
@@ -268,7 +267,7 @@
                                 class="text-xs text-destructive"
                                 data-testid="manual-endpoint-error"
                               >
-                                请至少选择一个 Endpoint
+                                {{ t('providers.local.selectAtLeastOneEndpoint') }}
                               </p>
                             </template>
                           </div>
@@ -286,10 +285,10 @@
               >
                 <Layers class="w-10 h-10 mb-2 opacity-30" />
                 <p class="text-sm">
-                  {{ searchQuery ? '无匹配结果' : '暂无可用全局模型' }}
+                  {{ searchQuery ? t('ui.noMatchingResults') : t('ui.noGlobalModelsAvailable') }}
                 </p>
                 <p class="text-xs mt-1">
-                  请先前往"模型目录"页面创建全局模型
+                  {{ t('ui.createAGlobalModelInTheModelCatalogFirst') }}
                 </p>
               </div>
             </template>
@@ -310,7 +309,7 @@
       <div class="flex items-center justify-between w-full">
         <div class="space-y-0.5">
           <p class="text-xs text-muted-foreground">
-            {{ hasChanges ? `${pendingChangesCount} 项更改待保存` : '' }}
+            {{ hasChanges ? t('ui.valueChangesToSave', { count: pendingChangesCount }) : '' }}
           </p>
           <p
             v-if="hasChanges && manualValidationErrorMessage"
@@ -329,13 +328,13 @@
               v-if="saving"
               class="w-4 h-4 mr-1 animate-spin"
             />
-            {{ saving ? '保存中...' : '保存' }}
+            {{ saving ? t('ui.saving') : t('ui.save') }}
           </Button>
           <Button
             variant="outline"
             @click="handleClose"
           >
-            关闭
+            {{ t('ui.close') }}
           </Button>
         </div>
       </div>
@@ -344,6 +343,8 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n } from '@/i18n'
+
 import { ref, computed, watch } from 'vue'
 import { Layers, Loader2, Search, Check, ListChecks, Plus } from 'lucide-vue-next'
 import Dialog from '@/components/ui/dialog/Dialog.vue'
@@ -357,7 +358,7 @@ import {
   DropdownMenuItem,
 } from '@/components/ui'
 import { useToast } from '@/composables/useToast'
-import { useConfirm } from '@/composables/useConfirm'
+import { useDiscardConfirm } from '@/composables/useDiscardConfirm'
 import { parseApiError } from '@/utils/errorParser'
 import { useUpstreamModelsCache } from '../composables/useUpstreamModelsCache'
 import {
@@ -392,6 +393,8 @@ const emit = defineEmits<{
   'changed': []
 }>()
 
+const { t } = useI18n()
+
 interface AutoMatchKeyLike {
   id: string
   name?: string | null
@@ -399,7 +402,7 @@ interface AutoMatchKeyLike {
 }
 
 const { error: showError, success, warning: showWarning } = useToast()
-const { confirmWarning } = useConfirm()
+const { confirmDiscard } = useDiscardConfirm(() => hasChanges.value)
 const { fetchModels: fetchCachedModels } = useUpstreamModelsCache()
 
 // 状态
@@ -576,9 +579,9 @@ const initialGlobalModelIds = ref<Set<string>>(new Set())
 const searchQuery = ref('')
 
 const autoMatchButtonTitle = computed(() => {
-  if (loadingProviderKeys.value) return '正在加载密钥'
-  if (providerKeys.value.length === 0) return '暂无可用于匹配的密钥'
-  return '选择密钥，获取真实上游模型并自动勾选同名模型'
+  if (loadingProviderKeys.value) return t('ui.loadingKeysdb73a97')
+  if (providerKeys.value.length === 0) return t('ui.noKeysAvailableForMatching')
+  return t('ui.selectAKeyToMatchGlobalModelsWithTheSame')
 })
 
 /**
@@ -619,16 +622,19 @@ function compareGlobalModelsByName(left: GlobalModelResponse, right: GlobalModel
   return nameA.localeCompare(nameB)
 }
 
-// 过滤后的全局模型：当前已勾选/已关联的排在可见结果顶部，便于取消关联
+// 仅将已保存关联且仍勾选的模型置顶，未保存的新勾选保持名称排序
 const filteredGlobalModels = computed(() => {
   const query = searchQuery.value.toLowerCase().trim()
   const selectedIds = selectedGlobalModelIds.value
+  const isPinned = (model: GlobalModelResponse) => (
+    initialGlobalModelIds.value.has(model.id) && selectedIds.has(model.id)
+  )
   const matched = allGlobalModels.value.filter(model => globalModelMatchesQuery(model, query))
   const pinned = matched
-    .filter(model => selectedIds.has(model.id))
+    .filter(isPinned)
     .sort(compareGlobalModelsByName)
   const rest = matched
-    .filter(model => !selectedIds.has(model.id))
+    .filter(model => !isPinned(model))
     .sort(compareGlobalModelsByName)
   return [...pinned, ...rest]
 })
@@ -824,7 +830,7 @@ async function applyAutoMatchFromKey(key: AutoMatchKey) {
     ) return
 
     if (result.warning) {
-      showWarning(`部分格式获取失败: ${result.warning}`)
+      showWarning(t('providers.migration.someFormatsCouldNotBe4b64a3', { value: String(result.warning) }))
     }
 
     upstreamModels.value = result.models
@@ -832,9 +838,9 @@ async function applyAutoMatchFromKey(key: AutoMatchKey) {
 
     if (result.models.length === 0) {
       if (result.error) {
-        showError(result.error, '获取上游模型失败')
+        showError(result.error, t('ui.failedToFetchUpstreamModels'))
       } else {
-        showWarning('此 Key 未返回可用模型')
+        showWarning(t('ui.thisKeyReturnedNoAvailableModels'))
       }
       return
     }
@@ -842,6 +848,7 @@ async function applyAutoMatchFromKey(key: AutoMatchKey) {
     const matchedGlobalModelIds = allGlobalModels.value
       .filter(model => uniqueUpstreamModelsByName.value.has(normalizeModelName(model.name)))
       .map(model => model.id)
+
 
     const nextSelected = new Set(selectedGlobalModelIds.value)
     let newlySelectedCount = 0
@@ -856,11 +863,11 @@ async function applyAutoMatchFromKey(key: AutoMatchKey) {
     searchQuery.value = ''
 
     if (matchedGlobalModelIds.length === 0) {
-      showWarning(`已获取 ${result.models.length} 个上游模型，请为新关联的全局模型选择对应模型`)
+      showWarning(t('providers.local.fetchedModelsChooseMapping', { count: result.models.length }))
     } else if (newlySelectedCount > 0) {
-      success(`已按 ${getAutoMatchKeyLabel(key)} 勾选 ${matchedGlobalModelIds.length} 个同名模型`)
+      success(t('providers.migration.selectedMatchingModelsFor0d8ce1', { value: getAutoMatchKeyLabel(key), value_2: String(matchedGlobalModelIds.length) }))
     } else {
-      success(`${matchedGlobalModelIds.length} 个同名模型已在选中列表中`)
+      success(t('providers.migration.matchingModelsAreAlreadySelected529aca', { value: String(matchedGlobalModelIds.length) }))
     }
   } catch (err: unknown) {
     if (
@@ -868,7 +875,7 @@ async function applyAutoMatchFromKey(key: AutoMatchKey) {
       && props.open
       && props.providerId === requestedProviderId
     ) {
-      showError(parseApiError(err, '自动匹配模型失败'), '错误')
+      showError(parseApiError(err, t('ui.failedToMatchModelsAutomatically')), t('ui.error'))
     }
   } finally {
     if (
@@ -893,19 +900,13 @@ async function handleGlobalModelCreated() {
 
 /** 关闭弹窗；存在未保存变更时先请求用户确认。 */
 async function handleClose() {
-  if (hasChanges.value) {
-    const confirmed = await confirmWarning('有未保存的更改，确定要关闭吗？', '放弃更改')
-    if (!confirmed) return
-  }
+  if (!(await confirmDiscard())) return
   emit('update:open', false)
 }
 
 /** 处理遮罩等外部关闭动作，并保持未保存变更确认语义。 */
 async function handleDialogUpdate(value: boolean) {
-  if (!value && hasChanges.value) {
-    const confirmed = await confirmWarning('有未保存的更改，确定要关闭吗？', '放弃更改')
-    if (!confirmed) return
-  }
+  if (!value && !(await confirmDiscard())) return
   emit('update:open', value)
 }
 
@@ -936,7 +937,7 @@ async function handleSave() {
           await deleteModel(props.providerId, existingModel.id)
           totalSuccess++
         } catch (err: unknown) {
-          allErrors.push(parseApiError(err, '移除失败'))
+          allErrors.push(parseApiError(err, t('ui.failedToRemove')))
         }
       }
     }
@@ -1000,22 +1001,22 @@ async function handleSave() {
           allErrors.push(...result.errors.map(e => e.error))
         }
       } catch (err: unknown) {
-        allErrors.push(parseApiError(err, '批量添加全局模型失败'))
+        allErrors.push(parseApiError(err, t('ui.failedToAddGlobalModelsInBulk')))
       }
     }
 
     if (totalSuccess > 0) {
-      success(`成功处理 ${totalSuccess} 个模型`)
+      success(t('providers.migration.processedModelsSuccessfullyef5475', { value: String(totalSuccess) }))
     }
 
     if (allErrors.length > 0) {
-      showError(`部分操作失败: ${allErrors.slice(0, 3).join(', ')}${allErrors.length > 3 ? '...' : ''}`, '警告')
+      showError(t('providers.migration.someOperationsFailed6e0167', { value: String(allErrors.slice(0, 3).join(', ')), value_2: String(allErrors.length > 3 ? '...' : '') }), t('ui.warning'))
     }
 
     emit('changed')
     emit('update:open', false)
   } catch (err: unknown) {
-    showError(parseApiError(err, '保存失败'), '错误')
+    showError(parseApiError(err, t('ui.failedToSave')), t('ui.error'))
     if (hasAnyOperation) {
       emit('changed')
     }
@@ -1126,7 +1127,7 @@ async function loadGlobalModels(providerId: string = props.providerId, session: 
     }
   } catch (err: unknown) {
     if (session === dialogSession && props.open && props.providerId === providerId) {
-      showError(parseApiError(err, '加载全局模型失败'), '错误')
+      showError(parseApiError(err, t('ui.failedToLoadGlobalModels')), t('ui.error'))
     }
   } finally {
     if (session === dialogSession && props.open && props.providerId === providerId) {
@@ -1144,7 +1145,7 @@ async function loadExistingModels(providerId: string, session: number) {
     }
   } catch (err: unknown) {
     if (session === dialogSession && props.open && props.providerId === providerId) {
-      showError(parseApiError(err, '加载已关联模型失败'), '错误')
+      showError(parseApiError(err, t('ui.failedToLoadLinkedModels')), t('ui.error'))
     }
   }
 }
@@ -1160,7 +1161,7 @@ async function loadProviderKeys(providerId: string, session: number) {
   } catch (err: unknown) {
     if (session === dialogSession && props.open && props.providerId === providerId) {
       providerKeys.value = []
-      showError(parseApiError(err, '加载密钥失败'), '错误')
+      showError(parseApiError(err, t('ui.failedToLoadKeys')), t('ui.error'))
     }
   } finally {
     if (session === dialogSession && props.open && props.providerId === providerId) {
@@ -1168,4 +1169,5 @@ async function loadProviderKeys(providerId: string, session: number) {
     }
   }
 }
+
 </script>

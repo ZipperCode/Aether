@@ -7,7 +7,6 @@ import {
   createEmptyModelPolicy,
   createEmptyRoutingGroupConfig,
   type RoutingGroupConfig,
-  type RoutingPriorityMode,
 } from '../../utils/routingPolicy'
 
 const apiMocks = vi.hoisted(() => ({
@@ -87,15 +86,12 @@ async function mountEditor(
   config = createConfig(),
   model = 'model-a',
   globalModelId: string | undefined = 'global-a',
-  priorityMode: RoutingPriorityMode = 'provider',
 ) {
   const emitted: RoutingGroupConfig[] = []
   const state = reactive({
     config,
     model,
     globalModelId: globalModelId as string | undefined,
-    priorityMode,
-    showPriorityMode: false,
     showSchedulingMode: false,
   })
   const root = document.createElement('div')

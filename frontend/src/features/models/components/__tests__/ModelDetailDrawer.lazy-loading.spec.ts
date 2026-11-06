@@ -25,14 +25,14 @@ describe('ModelDetailDrawer lazy loading', () => {
 
   it('keeps preview errors distinct from empty matches and exposes pagination', () => {
     expect(mappingsSource).toContain('v-else-if="previewError"')
-    expect(mappingsSource).toContain('预览失败')
+    expect(mappingsSource).toContain("t('models.mappings.previewFailed')")
     expect(mappingsSource).toContain('expandedTotalPages > 1')
     expect(mappingsSource).toContain('sequence !== previewSequence')
   })
 
   it('shows key-model mapping occurrences instead of collapsing duplicate model names', () => {
     expect(mappingsSource).toContain('matched_mapping_count')
-    expect(mappingsSource).toContain('{{ mappingMatchCounts[index] }} 匹配')
-    expect(mappingsSource).toContain('个上游模型名')
+    expect(mappingsSource).toContain("{{ mappingMatchCounts[index] }} {{ t('ui.match') }}")
+    expect(mappingsSource).toContain("t('models.mappings.matchSummary'")
   })
 })

@@ -8,14 +8,14 @@
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-2">
           <h3 class="text-sm font-semibold">
-            {{ legacyT('本地月度预算') }}
+            {{ t('providers.local.localMonthlyBudget') }}
           </h3>
           <Badge
             variant="outline"
             class="text-[10px] px-1.5 py-0 border-border/60 text-muted-foreground bg-muted/20"
             data-testid="provider-monthly-quota-local-badge"
           >
-            {{ legacyT('本地配置') }}
+            {{ t('providers.local.localConfigured') }}
           </Badge>
         </div>
         <Badge
@@ -45,7 +45,7 @@
           class="text-muted-foreground"
           data-testid="provider-monthly-quota-reset"
         >
-          {{ legacyT('每月') }} {{ resetDay }} {{ legacyT('号重置') }}
+          {{ t('ui.everyMonthOnDay') }} {{ resetDay }} {{ t('ui.reset87d368d') }}
         </span>
       </div>
     </div>
@@ -68,7 +68,7 @@ const props = withDefaults(defineProps<{
   resetDay: null,
 })
 
-const { legacyT } = useI18n()
+const { t } = useI18n()
 
 const used = computed(() => Number.isFinite(Number(props.used)) ? Number(props.used) : 0)
 const quota = computed(() => Number.isFinite(Number(props.quota)) ? Number(props.quota) : 0)

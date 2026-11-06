@@ -1,7 +1,7 @@
 <template>
   <Dialog
     :model-value="open"
-    :title="`配额详情 - ${keyName}`"
+    :title="t('ui.quotaDetailsValue', { name: keyName })"
     :icon="BarChart3"
     size="2xl"
     :z-index="70"
@@ -34,7 +34,7 @@
           v-else
           class="w-3 h-3 mr-1"
         />
-        初始化伴生项目
+        {{ t('providers.local.initCompanionProject') }}
       </Button>
       <DropdownMenu
         v-if="providerId && rawItems.length > 0"
@@ -45,7 +45,7 @@
             variant="ghost"
             size="icon"
             class="h-8 w-8"
-            title="测试模型"
+            :title="t('ui.testModel')"
             :disabled="!!testingModel"
           >
             <Loader2
@@ -79,13 +79,13 @@
       >
         <div class="flex items-center gap-1.5">
           <AlertCircle class="w-3.5 h-3.5 shrink-0" />
-          <span>账号状态查询失败</span>
+          <span>{{ t('providers.local.accountStatusQueryFailed') }}</span>
         </div>
         <span
           v-if="accountInfoCheckedAtText"
           class="text-[10px] text-muted-foreground"
         >
-          检查于 {{ accountInfoCheckedAtText }}
+          {{ t('providers.local.checkedAt', { time: accountInfoCheckedAtText }) }}
         </span>
       </div>
       <div
@@ -94,7 +94,7 @@
         data-testid="antigravity-account-info-pending"
       >
         <Loader2 class="w-3.5 h-3.5 shrink-0 animate-spin" />
-        <span>正在获取账号信息...</span>
+        <span>{{ t('providers.local.fetchingAccountInfo') }}</span>
       </div>
       <div
         v-if="displayItems.length > 0"
@@ -118,7 +118,7 @@
                 :class="item.notApplicable ? 'text-muted-foreground' : getQuotaRemainingClass(item.usedPercent)"
                 data-testid="antigravity-quota-item-meter"
               >
-                {{ item.notApplicable ? legacyT('不适用') : (item.detail || `${item.remainingPercent.toFixed(1)}%`) }}
+                {{ item.notApplicable ? t('ui.notApplicable') : (item.detail || `${item.remainingPercent.toFixed(1)}%`) }}
               </span>
             </div>
             <div
@@ -137,10 +137,10 @@
               class="text-[9px] text-muted-foreground/70 mt-0.5"
             >
               <template v-if="item.resetSeconds > 0">
-                {{ formatResetTime(item.resetSeconds) }}后重置
+                {{ formatResetTime(item.resetSeconds) }}{{ t('ui.untilReset') }}
               </template>
               <template v-else>
-                已重置
+                {{ t('ui.resetd2cd2e2') }}
               </template>
             </div>
           </div>
@@ -149,7 +149,7 @@
           class="border-t border-border/50 pt-2.5 text-[11px] leading-relaxed text-muted-foreground"
           data-testid="antigravity-quota-auto-group-note"
         >
-          配额组自动匹配：存在独立 Argon 配额组时优先使用，仅在该账号无独立 Argon 组时使用共享 Gemini 配额组。
+          {{ t('providers.local.antigravityAutoGroupNote') }}
         </p>
       </div>
       <div
@@ -158,7 +158,7 @@
         data-testid="antigravity-quota-empty"
       >
         <p class="text-sm text-muted-foreground">
-          {{ !hasProject ? '该账号尚未绑定或初始化伴生项目' : '暂无配额数据' }}
+          {{ !hasProject ? t('providers.local.antigravityNoCompanionProject') : t('ui.noQuotaData') }}
         </p>
       </div>
     </div>
@@ -167,16 +167,16 @@
         variant="outline"
         @click="$emit('update:open', false)"
       >
-        关闭
+        {{ t('ui.close') }}
       </Button>
     </template>
     <AlertDialog
       :model-value="showConfirm"
-      title="初始化伴生项目"
-      description="将为该 Google 账号在上游 Google Cloud Code 执行伴生项目发现与初始化（onboardUser）。此操作将在上游 Google 账号创建/激活伴生项目。确认继续吗？"
+      :title="t('providers.local.initCompanionProject')"
+      :description="t('providers.local.initCompanionProjectConfirmDesc')"
       :loading="isInitializing"
-      confirm-text="确认初始化"
-      cancel-text="取消"
+      :confirm-text="t('providers.local.confirmInit')"
+      :cancel-text="t('common.cancel')"
       @confirm="handleInitializeProject"
       @cancel="showConfirm = false"
     />
@@ -202,7 +202,7 @@ import type { UpstreamMetadata, QuotaStatusSnapshot, QuotaWindowSnapshot } from 
 import { useToast } from '@/composables/useToast'
 import { useI18n } from '@/i18n'
 import { parseApiError } from '@/utils/errorParser'
-import { getOAuthPlanTypeClass } from '@/utils/oauthPlanType'
+import { getOAuthPlanTypeClass } from '@/features/providers/utils/oauthPlanType'
 import {
   compareAntigravityQuotaItems,
   dedupeAntigravityQuotaItemsByLabel,
@@ -227,6 +227,8 @@ const emit = defineEmits<{
   'initialized': [value: InitializeAntigravityProjectResponse]
 }>()
 
+const { t } = useI18n()
+
 const showConfirm = ref(false)
 const isInitializing = ref(false)
 
@@ -243,10 +245,10 @@ function formatTimestampText(unixSecs?: number | null): string | null {
   const date = new Date(unixSecs * 1000)
   if (Number.isNaN(date.getTime())) return null
   const diffSec = Math.floor((Date.now() - date.getTime()) / 1000)
-  if (diffSec < 60) return '刚刚'
-  if (diffSec < 3600) return `${Math.floor(diffSec / 60)} 分钟前`
-  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} 小时前`
-  return `${Math.floor(diffSec / 86400)} 天前`
+  if (diffSec < 60) return t('providers.local.justNow')
+  if (diffSec < 3600) return t('providers.local.minutesAgo', { count: String(Math.floor(diffSec / 60)) })
+  if (diffSec < 86400) return t('providers.local.hoursAgo', { count: String(Math.floor(diffSec / 3600)) })
+  return t('providers.local.daysAgo', { count: String(Math.floor(diffSec / 86400)) })
 }
 
 const accountInfoCheckedAtText = computed(() => {
@@ -260,13 +262,13 @@ async function handleInitializeProject() {
   try {
     const res = await initializeAntigravityKeyProject(targetKeyId)
     if (props.keyId !== targetKeyId) return
-    showSuccess(res.message || '伴生项目初始化成功')
+    showSuccess(res.message || t('providers.local.initCompanionProjectSuccess'))
     emit('update:metadata', res.metadata)
     emit('initialized', res)
     showConfirm.value = false
   } catch (error) {
     if (props.keyId !== targetKeyId) return
-    showError(parseApiError(error, '伴生项目初始化失败'))
+    showError(parseApiError(error, t('providers.local.initCompanionProjectFailed')))
   } finally {
     if (props.keyId === targetKeyId) {
       isInitializing.value = false
@@ -288,9 +290,8 @@ interface QuotaItem {
 }
 
 const { error: showError, success: showSuccess } = useToast()
-const { t, legacyT } = useI18n()
 const accountTier = computed(() => resolveAntigravityAccountTier(props.metadata))
-const tierBadgeLabel = computed(() => resolveAntigravityAccountTierLabel(props.metadata, legacyT))
+const tierBadgeLabel = computed(() => resolveAntigravityAccountTierLabel(props.metadata, t))
 const tierBadgeClass = computed(() => getOAuthPlanTypeClass(accountTier.value))
 const testingModel = ref<string | null>(null)
 
@@ -409,7 +410,7 @@ function buildGroupedItemsFromQuotaSnapshot(
           usedPercent: 0,
           remainingPercent: 0,
           resetSeconds: null,
-          detail: legacyT('不适用'),
+          detail: t('ui.notApplicable'),
           notApplicable: true,
         } satisfies QuotaItem
       }
@@ -512,15 +513,15 @@ async function handleTestModel(modelName: string) {
         result.data?.response?.choices?.[0]?.message?.content
         || result.data?.content_preview
       if (content) {
-        showSuccess(`测试成功，响应: ${String(content).substring(0, 100)}${String(content).length > 100 ? '...' : ''}`)
+        showSuccess(t('providers.migration.testSucceededResponse50258c', { value: String(String(content).substring(0, 100)), value_2: String(String(content).length > 100 ? '...' : '') }))
       } else {
-        showSuccess(`模型 "${modelName}" 测试成功`)
+        showSuccess(t('providers.migration.modelTestedSuccessfullyf8fc2a', { value: String(modelName) }))
       }
     } else {
-      showError(`模型测试失败: ${result.error || '未知错误'}`)
+      showError(t('providers.migration.modelTestFailed42b317', { value: String(result.error || t('ui.unknownError')) }))
     }
   } catch (err: unknown) {
-    showError(`模型测试失败: ${parseApiError(err, '测试请求失败')}`)
+    showError(t('providers.migration.modelTestFailed42b317', { value: String(parseApiError(err, t('ui.testRequestFailed'))) }))
   } finally {
     testingModel.value = null
   }
@@ -545,8 +546,8 @@ function formatResetTime(seconds: number): string {
   const hours = Math.floor((seconds % 86400) / 3600)
   const minutes = Math.floor((seconds % 3600) / 60)
 
-  if (days > 0) return `${days}天 ${hours}小时`
-  if (hours > 0) return `${hours}小时 ${minutes}分钟`
-  return `${minutes}分钟`
+  if (days > 0) return t('providers.migration.dH1f8c72', { value: String(days), value_2: String(hours) })
+  if (hours > 0) return t('providers.migration.hMeeb579', { value: String(hours), value_2: String(minutes) })
+  return t('providers.migration.m248510', { value: String(minutes) })
 }
 </script>

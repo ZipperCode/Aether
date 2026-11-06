@@ -10,7 +10,7 @@
           <BrainCircuit class="h-5 w-5 text-primary" />
           <div class="min-w-0 flex-1">
             <div class="text-lg font-semibold">
-              模型能力检测
+              {{ t('providers.local.modelCapabilityTest') }}
             </div>
             <p class="mt-1 text-xs text-muted-foreground">
               {{ model?.global_model_display_name || model?.provider_model_name || '-' }}
@@ -20,8 +20,8 @@
             variant="ghost"
             size="icon"
             class="h-8 w-8 shrink-0"
-            title="关闭"
-            aria-label="关闭模型能力检测"
+            :title="t('ui.close')"
+            :aria-label="t('providers.local.closeModelCapabilityTest')"
             @click="handleDialogUpdate(false)"
           >
             <X class="h-4 w-4" />
@@ -32,7 +32,7 @@
 
     <div class="space-y-4">
       <div class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-800 dark:text-amber-200">
-        本检测只比较随机客观题上的能力表现，不是模型身份认证，也不能确认底层模型是否被替换或掺水。
+        {{ t('providers.local.thisTestComparesPerformanceOnRandomizedObjectiveQuestions') }}
       </div>
 
       <div
@@ -41,30 +41,30 @@
       >
         <div class="grid gap-4 sm:grid-cols-2">
           <label class="space-y-1.5 text-sm">
-            <span class="font-medium">检测模式</span>
+            <span class="font-medium">{{ t('providers.local.testMode') }}</span>
             <select
               v-model="mode"
               class="h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
             >
               <option value="quick">
-                快筛 · 40 题
+                {{ t('providers.local.quickScreen40Questions') }}
               </option>
               <option value="verify">
-                复核 · 100 题
+                {{ t('providers.local.review100Questions') }}
               </option>
             </select>
           </label>
           <label class="space-y-1.5 text-sm">
-            <span class="font-medium">题面语言</span>
+            <span class="font-medium">{{ t('providers.local.questionLanguage') }}</span>
             <select
               v-model="language"
               class="h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
             >
               <option value="bilingual">
-                中英双语（默认）
+                {{ t('providers.local.chineseAndEnglishDefault') }}
               </option>
               <option value="zh">
-                中文
+                {{ t('providers.local.chinese') }}
               </option>
               <option value="en">
                 English
@@ -75,7 +75,7 @@
 
         <div class="rounded-lg border border-border/60 p-4 space-y-3">
           <div class="font-medium text-sm">
-            目标固定候选
+            {{ t('providers.local.fixedTargetCandidate') }}
           </div>
           <div class="grid gap-3 sm:grid-cols-2">
             <label class="space-y-1.5 text-xs">
@@ -120,9 +120,9 @@
               class="mt-0.5 h-4 w-4 rounded border-border"
             >
             <span>
-              <span class="font-medium">与可信官方直连参考比较</span>
+              <span class="font-medium">{{ t('providers.local.compareAgainstATrustedDirectOfficialReference') }}</span>
               <span class="mt-0.5 block text-xs text-muted-foreground">
-                首次选择会保存到当前模型配置；后端每次都重新校验，不会自动换参考。
+                {{ t('providers.local.theFirstSelectionIsSavedToThisModel') }}
               </span>
             </span>
           </label>
@@ -132,14 +132,14 @@
             class="grid gap-3 sm:grid-cols-2"
           >
             <label class="space-y-1.5 text-xs">
-              <span class="text-muted-foreground">参考 Provider</span>
+              <span class="text-muted-foreground">{{ t('providers.local.referenceProvider') }}</span>
               <select
                 :value="referenceProviderId"
                 class="h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
                 @change="handleReferenceProviderChange"
               >
                 <option value="">
-                  请选择
+                  {{ t('ui.selectda590a8') }}
                 </option>
                 <option
                   v-for="item in referenceProviders"
@@ -151,14 +151,14 @@
               </select>
             </label>
             <label class="space-y-1.5 text-xs">
-              <span class="text-muted-foreground">参考模型</span>
+              <span class="text-muted-foreground">{{ t('providers.local.referenceModel') }}</span>
               <select
                 v-model="referenceModelId"
                 class="h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
                 :disabled="referenceLoading"
               >
                 <option value="">
-                  请选择
+                  {{ t('ui.selectda590a8') }}
                 </option>
                 <option
                   v-for="item in referenceModels"
@@ -170,7 +170,7 @@
               </select>
             </label>
             <label class="space-y-1.5 text-xs">
-              <span class="text-muted-foreground">参考 Endpoint</span>
+              <span class="text-muted-foreground">{{ t('providers.local.referenceEndpoint') }}</span>
               <select
                 v-model="referenceEndpointId"
                 class="h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
@@ -178,7 +178,7 @@
                 @change="selectDefaultReferenceKey"
               >
                 <option value="">
-                  请选择
+                  {{ t('ui.selectda590a8') }}
                 </option>
                 <option
                   v-for="endpoint in referenceEndpointOptions"
@@ -190,14 +190,14 @@
               </select>
             </label>
             <label class="space-y-1.5 text-xs">
-              <span class="text-muted-foreground">参考 Key</span>
+              <span class="text-muted-foreground">{{ t('providers.local.referenceKey') }}</span>
               <select
                 v-model="referenceKeyId"
                 class="h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
                 :disabled="referenceLoading"
               >
                 <option value="">
-                  请选择
+                  {{ t('ui.selectda590a8') }}
                 </option>
                 <option
                   v-for="key in referenceKeyOptions"
@@ -212,7 +212,7 @@
         </div>
 
         <div class="rounded-md border border-border/60 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-          本次 {{ questionCount }} 题；{{ useReference ? `${questionCount * 2} 次` : `${questionCount} 次` }}最大上游调用。所有调用共享并发上限 4，且每一方固定使用一个 Endpoint 与 Key。
+          {{ t('providers.local.thisRun') }} {{ questionCount }} {{ t('providers.local.questions') }}{{ useReference ? `${questionCount * 2} 次` : `${questionCount} 次` }}{{ t('providers.local.maximumUpstreamCallsAllCallsShareAConcurrency') }}
         </div>
         <div
           v-if="message"
@@ -225,7 +225,7 @@
           v-if="useReference && referenceEqualsTarget()"
           class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
-          可信参考不能与目标使用完全相同的 Provider、模型、Endpoint 和 Key。
+          {{ t('providers.local.theTrustedReferenceCannotUseTheExactSame') }}
         </div>
         <Button
           class="w-full"
@@ -236,7 +236,7 @@
             v-if="loading"
             class="mr-2 h-4 w-4 animate-spin"
           />
-          开始能力检测
+          {{ t('providers.local.startCapabilityTest') }}
         </Button>
       </div>
 
@@ -247,10 +247,10 @@
         <Loader2 class="mx-auto h-9 w-9 animate-spin text-primary" />
         <div>
           <div class="font-medium">
-            正在运行 {{ mode === 'quick' ? '40 题快筛' : '100 题复核' }}
+            {{ t('providers.local.running') }} {{ mode === 'quick' ? '40 题快筛' : '100 题复核' }}
           </div>
           <p class="mt-1 text-xs text-muted-foreground">
-            进度取决于上游响应；{{ mode === 'quick' ? '最长 10 分钟' : '最长 20 分钟' }}。
+            {{ t('providers.local.progressDependsOnUpstreamResponses') }}{{ mode === 'quick' ? '最长 10 分钟' : '最长 20 分钟' }}。
           </p>
         </div>
         <div class="h-2 overflow-hidden rounded-full bg-muted">
@@ -260,7 +260,7 @@
           variant="outline"
           @click="cancelRun"
         >
-          取消检测
+          {{ t('providers.local.cancelTest') }}
         </Button>
       </div>
 
@@ -271,7 +271,7 @@
         <div class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 p-4">
           <div>
             <div class="text-xs text-muted-foreground">
-              检测结论
+              {{ t('providers.local.testConclusion') }}
             </div>
             <div class="mt-1 text-lg font-semibold">
               {{ verdictLabel(result.verdict) }}
@@ -305,7 +305,7 @@
             <div class="grid grid-cols-2 gap-3 text-xs">
               <div>
                 <div class="text-muted-foreground">
-                  总分
+                  {{ t('providers.local.totalScore') }}
                 </div>
                 <div class="mt-1 text-lg font-semibold tabular-nums">
                   {{ formatPercent(card.metrics.score) }}
@@ -313,7 +313,7 @@
               </div>
               <div>
                 <div class="text-muted-foreground">
-                  覆盖率
+                  {{ t('providers.local.coverage') }}
                 </div>
                 <div class="mt-1 text-lg font-semibold tabular-nums">
                   {{ formatPercent(card.metrics.coverage) }}
@@ -321,7 +321,7 @@
               </div>
             </div>
             <div class="text-xs text-muted-foreground">
-              95% Wilson：{{ formatPercent(card.metrics.wilson_low) }}–{{ formatPercent(card.metrics.wilson_high) }} · {{ card.metrics.correct }}/{{ card.metrics.scored }} 正确
+              95% Wilson：{{ formatPercent(card.metrics.wilson_low) }}–{{ formatPercent(card.metrics.wilson_high) }} · {{ card.metrics.correct }}/{{ card.metrics.scored }} {{ t('providers.local.correct') }}
             </div>
           </div>
         </div>
@@ -331,16 +331,16 @@
             <thead class="bg-muted/40 text-muted-foreground">
               <tr>
                 <th class="px-3 py-2 text-left">
-                  维度
+                  {{ t('providers.local.dimension') }}
                 </th>
                 <th class="px-3 py-2 text-right">
-                  目标
+                  {{ t('ui.target') }}
                 </th>
                 <th
                   v-if="result.reference_metrics"
                   class="px-3 py-2 text-right"
                 >
-                  参考
+                  {{ t('providers.local.reference') }}
                 </th>
               </tr>
             </thead>
@@ -373,7 +373,7 @@
         >
           <div>
             <div class="text-muted-foreground">
-              配对覆盖
+              {{ t('providers.local.pairedCoverage') }}
             </div>
             <div class="mt-1 font-medium tabular-nums">
               {{ formatPercent(result.comparison.paired_coverage) }}
@@ -381,7 +381,7 @@
           </div>
           <div>
             <div class="text-muted-foreground">
-              参考 − 目标
+              {{ t('providers.local.referenceTarget') }}
             </div>
             <div class="mt-1 font-medium tabular-nums">
               {{ formatSignedPercent(result.comparison.score_gap) }}
@@ -400,7 +400,7 @@
         <div class="grid gap-3 text-xs sm:grid-cols-2">
           <div class="rounded-lg border border-border/60 p-3">
             <div class="font-medium">
-              目标失败分类
+              {{ t('providers.local.targetFailureCategories') }}
             </div>
             <div class="mt-2 text-muted-foreground">
               {{ failureSummary(result.target_metrics.failures) }}
@@ -411,7 +411,7 @@
             class="rounded-lg border border-border/60 p-3"
           >
             <div class="font-medium">
-              参考失败分类
+              {{ t('providers.local.referenceFailureCategories') }}
             </div>
             <div class="mt-2 text-muted-foreground">
               {{ failureSummary(result.reference_metrics.failures) }}
@@ -419,10 +419,10 @@
           </div>
           <div class="rounded-lg border border-border/60 p-3">
             <div class="font-medium">
-              目标用量与耗时
+              {{ t('providers.local.targetUsageAndDuration') }}
             </div>
             <div class="mt-2 text-muted-foreground">
-              {{ usageSummary(result.target_metrics.usage) }} · 上游累计 {{ formatDuration(result.target_metrics.elapsed_ms) }}
+              {{ usageSummary(result.target_metrics.usage) }} {{ t('providers.local.cumulativeUpstreamTime') }} {{ formatDuration(result.target_metrics.elapsed_ms) }}
             </div>
           </div>
           <div
@@ -430,15 +430,15 @@
             class="rounded-lg border border-border/60 p-3"
           >
             <div class="font-medium">
-              参考用量与耗时
+              {{ t('providers.local.referenceUsageAndDuration') }}
             </div>
             <div class="mt-2 text-muted-foreground">
-              {{ usageSummary(result.reference_metrics.usage) }} · 上游累计 {{ formatDuration(result.reference_metrics.elapsed_ms) }}
+              {{ usageSummary(result.reference_metrics.usage) }} {{ t('providers.local.cumulativeUpstreamTime') }} {{ formatDuration(result.reference_metrics.elapsed_ms) }}
             </div>
           </div>
         </div>
         <div class="text-right text-xs text-muted-foreground">
-          总墙钟耗时 {{ formatDuration(result.elapsed_ms) }} · Seed {{ result.seed }}
+          {{ t('providers.local.totalWallClockTime') }} {{ formatDuration(result.elapsed_ms) }} · Seed {{ result.seed }}
         </div>
 
         <div class="flex flex-wrap justify-end gap-2">
@@ -446,19 +446,19 @@
             variant="outline"
             @click="backToSetup"
           >
-            返回配置
+            {{ t('providers.local.backToConfiguration') }}
           </Button>
           <Button
             v-if="result.verdict === 'needs_verification'"
             @click="startVerification"
           >
-            开始 100 题复核
+            {{ t('providers.local.start100QuestionReview') }}
           </Button>
           <Button
             v-else
             @click="startRun(mode)"
           >
-            使用新 Seed 重测
+            {{ t('providers.local.retestWithANewSeed') }}
           </Button>
         </div>
       </div>
@@ -467,6 +467,8 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n } from '@/i18n'
+
 import { computed, ref, watch } from 'vue'
 import { BrainCircuit, Loader2, X } from 'lucide-vue-next'
 import { Dialog } from '@/components/ui'
@@ -521,6 +523,8 @@ const emit = defineEmits<{
   /** 模型 config 已合并保存。 */
   saved: []
 }>()
+const { t } = useI18n()
+
 
 /** 对话框只在配置、运行与结果三种互斥阶段间切换。 */
 type DialogPhase = 'setup' | 'running' | 'result'

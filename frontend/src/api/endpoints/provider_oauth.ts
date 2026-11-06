@@ -1,3 +1,4 @@
+import { translate } from '@/i18n'
 import client from '../client'
 import type { UpstreamMetadata } from './types'
 
@@ -190,7 +191,7 @@ function parseImportCredentialLines(
 export function normalizeBatchImportCredentials(text: string): BatchImportCredentialsNormalization {
   const trimmed = text.trim()
   if (!trimmed) {
-    return { ok: false, message: '请输入凭据数据' }
+    return { ok: false, get message() { return translate('ui.enterCredentialData') } }
   }
 
   const firstChar = trimmed[0]

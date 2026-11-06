@@ -8,7 +8,7 @@
             :disabled="disabled"
             @update:checked="patchMaxRetries({ include: $event === true })"
           />
-          <span>最大重试次数</span>
+          <span>{{ t('feedback.error.field.maxRetries') }}</span>
         </label>
         <Input
           :model-value="state.maxRetries.value ?? ''"
@@ -29,7 +29,7 @@
             :disabled="disabled"
             @update:checked="patchStreamFirstByteTimeout({ include: $event === true })"
           />
-          <span>流式首字节超时 <span class="text-xs text-muted-foreground">(秒)</span></span>
+          <span>{{ t('ui.streamingFirstByteTimeouta94bd47') }} <span class="text-xs text-muted-foreground">{{ t('ui.seconds') }}</span></span>
         </label>
         <Input
           :model-value="state.streamFirstByteTimeout.value ?? ''"
@@ -37,7 +37,7 @@
           min="1"
           max="300"
           step="1"
-          placeholder="使用全局"
+          :placeholder="t('ui.useDefault')"
           :disabled="disabled || !state.streamFirstByteTimeout.include"
           @update:model-value="patchStreamFirstByteTimeout({ value: parseNumberInput($event, { min: 1, max: 300 }) })"
         />
@@ -50,7 +50,7 @@
             :disabled="disabled"
             @update:checked="patchRequestTimeout({ include: $event === true })"
           />
-          <span>非流式请求超时 <span class="text-xs text-muted-foreground">(秒)</span></span>
+          <span>{{ t('ui.nonStreamingRequestTimeoutc0f0f63') }} <span class="text-xs text-muted-foreground">{{ t('ui.seconds') }}</span></span>
         </label>
         <Input
           :model-value="state.requestTimeout.value ?? ''"
@@ -58,7 +58,7 @@
           min="1"
           max="600"
           step="1"
-          placeholder="使用全局"
+          :placeholder="t('ui.useDefault')"
           :disabled="disabled || !state.requestTimeout.include"
           @update:model-value="patchRequestTimeout({ value: parseNumberInput($event, { min: 1, max: 600 }) })"
         />
@@ -71,13 +71,13 @@
             :disabled="disabled"
             @update:checked="patchKeepPriorityOnConversion({ include: $event === true })"
           />
-          <span>格式转换保持优先级</span>
+          <span>{{ t('ui.keepPriorityOnFormatConversion') }}</span>
         </label>
         <div
           class="flex items-center justify-between"
           :class="state.keepPriorityOnConversion.include ? '' : 'pointer-events-none opacity-45'"
         >
-          <span class="text-xs text-muted-foreground">跨格式请求时保持原优先级排名</span>
+          <span class="text-xs text-muted-foreground">{{ t('providers.local.preservePriorityRankingForCrossFormatRequests') }}</span>
           <Switch
             :model-value="state.keepPriorityOnConversion.value"
             @update:model-value="patchKeepPriorityOnConversion({ value: $event })"
@@ -89,6 +89,8 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n } from '@/i18n'
+
 import {
   Checkbox,
   Input,
@@ -105,6 +107,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   'update:state': [state: ProviderBasicBatchState]
 }>()
+const { t } = useI18n()
+
 
 function patchState(patch: Partial<ProviderBasicBatchState>): void {
   emit('update:state', { ...props.state, ...patch })

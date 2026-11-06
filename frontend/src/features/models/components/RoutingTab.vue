@@ -5,7 +5,7 @@
       <div class="flex items-center justify-between gap-4">
         <div class="flex items-baseline gap-2">
           <h4 class="text-sm font-semibold">
-            链路预览
+            {{ t('ui.routePreview') }}
           </h4>
           <template v-if="routingData">
             <span class="text-xs text-muted-foreground">·</span>
@@ -23,7 +23,7 @@
             variant="ghost"
             size="icon"
             class="h-8 w-8"
-            title="关联提供商"
+            :title="t('ui.linkedProviders')"
             @click="$emit('addProvider')"
           >
             <Link class="w-3.5 h-3.5" />
@@ -32,7 +32,7 @@
             variant="ghost"
             size="icon"
             class="h-8 w-8"
-            title="刷新"
+            :title="t('ui.refresh')"
             @click="loadRoutingData"
           >
             <RefreshCw
@@ -61,10 +61,10 @@
         >
           <Route class="w-10 h-10 mx-auto text-muted-foreground/30 mb-3" />
           <p class="text-sm text-muted-foreground">
-            暂无关联提供商
+            {{ t('ui.noLinkedProviders') }}
           </p>
           <p class="text-xs text-muted-foreground mt-1">
-            请先为此模型添加提供商关联
+            {{ t('ui.linkAProviderToThisModelFirst') }}
           </p>
         </div>
 
@@ -94,8 +94,7 @@
               <span class="text-sm text-muted-foreground">
                 {{ formatGroup.active_keys }}/{{ formatGroup.total_keys }} Keys
                 <span class="mx-1.5">·</span>
-                {{ formatGroup.active_providers }}/{{ formatGroup.total_providers }} 提供商
-              </span>
+                {{ formatGroup.active_providers }}/{{ formatGroup.total_providers }} {{ t('nav.providers') }} </span>
               <ChevronDown
                 class="w-4 h-4 text-muted-foreground transition-transform"
                 :class="isFormatExpanded(formatGroup.api_format) ? 'rotate-180' : ''"
@@ -135,39 +134,39 @@
                             v-if="providerEntry.is_cross_format"
                             class="text-[9px] text-amber-600 dark:text-amber-400"
                           >
-                            格式转换链路
+                            {{ t('models.routing.crossFormatRoute') }}
                           </span>
                           <span
                             v-if="!isEndpointBindingActive(providerEntry.provider, providerEntry.endpoint)"
                             class="text-[9px] text-muted-foreground"
                           >
-                            当前模型已禁用
+                            {{ t('models.routing.disabledForCurrentModel') }}
                           </span>
                         </div>
                         <div class="text-[10px] text-muted-foreground break-all">
                           {{ formatEndpointUrl(providerEntry.endpoint) }}
                         </div>
                         <div class="text-[9px] text-muted-foreground/70 break-all">
-                          Endpoint ID · {{ providerEntry.endpoint.id }} · 绑定来源 · {{ getBindingSourceLabel(providerEntry.provider, providerEntry.endpoint) }}
+                          Endpoint ID · {{ providerEntry.endpoint.id }} · {{ t('models.routing.bindingSource') }} · {{ getBindingSourceLabel(providerEntry.provider, providerEntry.endpoint) }}
                         </div>
                         <div
                           v-if="(providerEntry.endpoint.runtime_capability_quarantines || []).length > 0"
                           class="text-[9px] text-amber-600 dark:text-amber-400"
                         >
-                          运行时能力暂不可用 · {{ formatRuntimeCapabilityQuarantines(providerEntry.endpoint) }}
+                          {{ t('models.routing.runtimeCapabilityQuarantined') }} · {{ formatRuntimeCapabilityQuarantines(providerEntry.endpoint) }}
                         </div>
                       </div>
                       <div
                         data-testid="endpoint-binding-control"
                         class="flex items-center gap-2 shrink-0"
-                        title="仅控制当前模型与此 Endpoint 的绑定"
+                        :title="t('models.routing.endpointBindingOnlyHint')"
                         @click.stop
                       >
-                        <span class="text-[10px] font-medium whitespace-nowrap">Endpoint 链路</span>
+                        <span class="text-[10px] font-medium whitespace-nowrap">{{ t('models.routing.endpointRoute') }}</span>
                         <Switch
                           :model-value="isEndpointBindingActive(providerEntry.provider, providerEntry.endpoint)"
                           :disabled="isBindingSaving(providerEntry.provider, providerEntry.endpoint)"
-                          :aria-label="`允许当前模型使用 ${providerEntry.provider.name} 的 Endpoint ${providerEntry.endpoint.id}`"
+                          :aria-label="t('models.routing.allowEndpointForCurrentModel', { provider: providerEntry.provider.name, endpointId: providerEntry.endpoint.id })"
                           @update:model-value="handleEndpointBindingToggle(providerEntry.provider, providerEntry.endpoint, $event)"
                         />
                       </div>
@@ -230,7 +229,7 @@
                                 ? 'bg-primary text-primary-foreground'
                                 : 'bg-muted-foreground/20 text-muted-foreground'"
                             >
-                              <span v-if="groupIndex === 0 && keyIndex === 0">首选</span>
+                              <span v-if="groupIndex === 0 && keyIndex === 0">{{ t('ui.preferred') }}</span>
                               <span v-else>P{{ keyGroup.priority ?? '?' }}</span>
                             </div>
 
@@ -270,7 +269,7 @@
                               variant="destructive"
                               class="text-[10px] px-1.5 py-0 shrink-0 tabular-nums"
                             >
-                              熔断{{ getKeyProbeCountdown(keyEntry.key) }}
+                              {{ t('ui.circuitOpen') }}{{ getKeyProbeCountdown(keyEntry.key) }}
                             </Badge>
 
                             <!-- 健康度 -->
@@ -297,7 +296,7 @@
                                 variant="ghost"
                                 size="icon"
                                 class="h-6 w-6 text-green-600"
-                                title="刷新健康状态"
+                                :title="t('ui.refreshHealthStatus')"
                                 @click.stop="handleRecoverKey(keyEntry.key.id, keyEntry.endpoint?.api_format || formatGroup.api_format)"
                               >
                                 <RefreshCw class="w-3 h-3" />
@@ -306,7 +305,7 @@
                                 variant="ghost"
                                 size="icon"
                                 class="h-6 w-6"
-                                :title="keyEntry.provider.model_is_active ? '停用此关联' : '启用此关联'"
+                                :title="keyEntry.provider.model_is_active ? t('ui.disableThisLink') : t('ui.enableThisLink')"
                                 @click.stop="$emit('toggleProviderStatus', keyEntry.provider)"
                               >
                                 <Power class="w-3 h-3" />
@@ -391,7 +390,7 @@
                                   ? 'bg-primary text-primary-foreground'
                                   : 'bg-muted-foreground/20 text-muted-foreground'"
                               >
-                                <span v-if="providerIndex === 0">首选</span>
+                                <span v-if="providerIndex === 0">{{ t('ui.preferred') }}</span>
                                 <span v-else>P{{ providerEntry.provider.provider_priority }}</span>
                               </div>
 
@@ -429,17 +428,17 @@
                                   <span>·</span>
                                   <span>Endpoint ID · {{ providerEntry.endpoint.id }}</span>
                                   <span>·</span>
-                                  <span>绑定来源 · {{ getBindingSourceLabel(providerEntry.provider, providerEntry.endpoint) }}</span>
+                                  <span>{{ t('models.routing.bindingSource') }} · {{ getBindingSourceLabel(providerEntry.provider, providerEntry.endpoint) }}</span>
                                   <template v-if="!isEndpointBindingActive(providerEntry.provider, providerEntry.endpoint)">
                                     <span>·</span>
-                                    <span>当前模型已禁用</span>
+                                    <span>{{ t('models.routing.disabledForCurrentModel') }}</span>
                                   </template>
                                 </div>
                                 <div
                                   v-if="providerEntry.endpoint && (providerEntry.endpoint.runtime_capability_quarantines || []).length > 0"
                                   class="text-[9px] text-amber-600 dark:text-amber-400"
                                 >
-                                  运行时能力暂不可用 · {{ formatRuntimeCapabilityQuarantines(providerEntry.endpoint) }}
+                                  {{ t('models.routing.runtimeCapabilityQuarantined') }} · {{ formatRuntimeCapabilityQuarantines(providerEntry.endpoint) }}
                                 </div>
                               </div>
 
@@ -449,14 +448,14 @@
                                   v-if="providerEntry.endpoint"
                                   data-testid="endpoint-binding-control"
                                   class="flex items-center gap-1.5 rounded-md border border-border/50 bg-background/60 px-1.5 py-0.5 mr-1"
-                                  title="仅控制当前模型与此 Endpoint 的绑定"
+                                  :title="t('models.routing.endpointBindingOnlyHint')"
                                   @click.stop
                                 >
-                                  <span class="text-[9px] font-medium whitespace-nowrap">Endpoint 链路</span>
+                                  <span class="text-[9px] font-medium whitespace-nowrap">{{ t('models.routing.endpointRoute') }}</span>
                                   <Switch
                                     :model-value="isEndpointBindingActive(providerEntry.provider, providerEntry.endpoint)"
                                     :disabled="isBindingSaving(providerEntry.provider, providerEntry.endpoint)"
-                                    :aria-label="`允许当前模型使用 ${providerEntry.provider.name} 的 Endpoint ${providerEntry.endpoint.id}`"
+                                    :aria-label="t('models.routing.allowEndpointForCurrentModel', { provider: providerEntry.provider.name, endpointId: providerEntry.endpoint.id })"
                                     @update:model-value="handleEndpointBindingToggle(providerEntry.provider, providerEntry.endpoint, $event)"
                                   />
                                 </div>
@@ -476,7 +475,7 @@
                                   variant="ghost"
                                   size="icon"
                                   class="h-6 w-6"
-                                  :title="providerEntry.provider.model_is_active ? '停用此关联' : '启用此关联'"
+                                  :title="providerEntry.provider.model_is_active ? t('ui.disableThisLink') : t('ui.enableThisLink')"
                                   @click.stop="$emit('toggleProviderStatus', providerEntry.provider)"
                                 >
                                   <Power class="w-3 h-3" />
@@ -502,7 +501,7 @@
                                 v-if="hasModelMapping(providerEntry.provider)"
                                 class="flex items-center gap-1.5 text-[10px] text-muted-foreground mb-2 px-1"
                               >
-                                <span class="text-muted-foreground/60">映射:</span>
+                                <span class="text-muted-foreground/60">{{ t('ui.mapping40df04b') }}</span>
                                 <span class="text-primary/70 font-medium">{{ providerEntry.provider.provider_model_name }}</span>
                               </div>
                               <!-- Keys 列表 -->
@@ -589,7 +588,7 @@
                                           variant="destructive"
                                           class="text-[9px] px-1 py-0 h-4 shrink-0 tabular-nums"
                                         >
-                                          熔断{{ getKeyProbeCountdown(key) }}
+                                          {{ t('ui.circuitOpen') }}{{ getKeyProbeCountdown(key) }}
                                         </Badge>
                                         <!-- 健康度（进度条 + 百分比） -->
                                         <div class="flex items-center gap-1 shrink-0">
@@ -611,7 +610,7 @@
                                         <button
                                           v-if="key.circuit_breaker_open || (key.health_score ?? 1) < 0.5"
                                           class="p-0.5 rounded hover:bg-muted/50 text-green-600 shrink-0"
-                                          title="刷新健康状态"
+                                          :title="t('ui.refreshHealthStatus')"
                                           @click.stop="handleRecoverKey(key.id, providerEntry.endpoint?.api_format || formatGroup.api_format)"
                                         >
                                           <RefreshCw class="w-3 h-3" />
@@ -640,7 +639,7 @@
                                 v-else
                                 class="text-[10px] text-muted-foreground"
                               >
-                                暂无可用 Key
+                                {{ t('ui.noKeysAvailable') }}
                               </div>
                             </div>
                           </Transition>
@@ -658,7 +657,7 @@
                       </div>
                       <div class="flex items-center gap-1 text-[10px] text-muted-foreground/50">
                         <ArrowDown class="w-3 h-3" />
-                        <span>降级</span>
+                        <span>{{ t('ui.fallback') }}</span>
                       </div>
                     </div>
                   </div>
@@ -685,13 +684,15 @@
         class="mt-4"
         @click="loadRoutingData"
       >
-        重试
+        {{ t('vscodex.connection.retry') }}
       </Button>
     </div>
   </Card>
 </template>
 
 <script setup lang="ts">
+import { useI18n } from '@/i18n'
+
 import { ref, computed, watch, onMounted } from 'vue'
 import {
   RefreshCw,
@@ -736,6 +737,8 @@ const emit = defineEmits<{
   addProvider: []
   refresh: []
 }>()
+
+const { t } = useI18n()
 
 const { success: showSuccess, error: showError } = useToast()
 const { tick: countdownTick, start: startCountdownTimer } = useCountdownTimer()
@@ -831,18 +834,20 @@ function getBindingSourceLabel(
   provider: RoutingProviderInfo,
   endpoint: RoutingEndpointInfo
 ): string {
-  if (endpointBindingOverrides.value.has(bindingKey(provider, endpoint))) return '人工设置'
+  if (endpointBindingOverrides.value.has(bindingKey(provider, endpoint))) {
+    return t('models.routing.bindingSourceManual')
+  }
   switch (endpoint.model_binding?.source) {
     case 'manual':
-      return '人工设置'
+      return t('models.routing.bindingSourceManual')
     case 'discovered':
-      return '上游发现'
+      return t('models.routing.bindingSourceDiscovered')
     case 'mapping':
-      return '模型映射'
+      return t('guide.nav.concepts.modelMapping')
     case 'migration':
-      return '兼容迁移'
+      return t('models.routing.bindingSourceMigration')
     default:
-      return '未绑定'
+      return t('ui.notBound')
   }
 }
 
@@ -851,7 +856,7 @@ function formatRuntimeCapabilityQuarantines(endpoint: RoutingEndpointInfo): stri
     .map(entry => [
       `Key ${entry.key_id}`,
       formatApiFormat(entry.client_api_format),
-      entry.request_mode === 'stream' ? '流式' : '非流式',
+      entry.request_mode === 'stream' ? t('models.routing.streamMode') : t('models.routing.nonStreamMode'),
       entry.request_operation || null,
     ].filter(Boolean).join(' / '))
     .join('、')
@@ -873,14 +878,14 @@ async function handleEndpointBindingToggle(
     await updateModel(provider.id, provider.model_id, {
       endpoint_bindings: [{ endpoint_id: endpoint.id, is_active: isActive }]
     })
-    showSuccess(isActive ? '已启用模型 Endpoint 链路' : '已禁用模型 Endpoint 链路')
+    showSuccess(isActive ? t('models.routing.endpointRouteEnabled') : t('models.routing.endpointRouteDisabled'))
   } catch (err: unknown) {
     if (hadOverride && previousOverride !== undefined) {
       endpointBindingOverrides.value.set(key, previousOverride)
     } else {
       endpointBindingOverrides.value.delete(key)
     }
-    showError(parseApiError(err, '链路设置失败'), '错误')
+    showError(parseApiError(err, t('models.routing.endpointRouteUpdateFailed')), t('ui.error'))
   } finally {
     savingBindings.value.delete(key)
   }
@@ -1211,7 +1216,7 @@ async function loadRoutingData() {
   try {
     internalRoutingData.value = await getGlobalModelRoutingPreview(props.globalModelId)
   } catch (err: unknown) {
-    internalError.value = parseApiError(err, '加载失败')
+    internalError.value = parseApiError(err, t('ui.failedToLoad'))
   } finally {
     internalLoading.value = false
   }
@@ -1220,9 +1225,9 @@ async function loadRoutingData() {
 // 获取调度模式标签
 function getSchedulingModeLabel(mode: string): string {
   const labels: Record<string, string> = {
-    cache_affinity: '缓存亲和',
-    fixed_order: '固定顺序',
-    load_balance: '负载均衡'
+    get cache_affinity() { return t('ui.cacheAffinity951ca1e') },
+    get fixed_order() { return t('ui.fixedOrder2d32d74') },
+    get load_balance() { return t('ui.loadBalancing9550295') }
   }
   return labels[mode] || mode
 }
@@ -1237,14 +1242,14 @@ function getDemoteLabel(nextGroupKeyCount: number): string {
   if (nextGroupKeyCount > 1) {
     return `降级 · ${samePriorityLabel.value}`
   }
-  return '降级'
+  return t('ui.fallback')
 }
 
 // 获取优先级模式标签
 function getPriorityModeLabel(mode: string): string {
   const labels: Record<string, string> = {
-    provider: '提供商优先',
-    global_key: '全局 Key 优先'
+    get provider() { return t('ui.providerFirst') },
+    get global_key() { return t('ui.globalKeyFirst') }
   }
   return labels[mode] || mode
 }
@@ -1398,9 +1403,9 @@ function getBillingLabel(provider: RoutingProviderInfo): string {
     return quota ? `$${used.toFixed(0)}/$${quota.toFixed(0)}` : '月卡'
   }
   if (provider.billing_type === 'pay_as_you_go') {
-    return '按量'
+    return t('ui.payAsYouGo')
   }
-  return '免费'
+  return t('ui.free')
 }
 
 // 获取 Key 状态样式（score 为 0-1 小数格式）
@@ -1447,9 +1452,9 @@ async function handleRecoverKey(keyId: string, apiFormat: string) {
     const result = await recoverKeyHealth(keyId, apiFormat)
     // 通知父组件刷新数据
     emit('refresh')
-    showSuccess(result.message || 'Key 已恢复')
+    showSuccess(result.message || t('ui.keyRestored'))
   } catch (err: unknown) {
-    showError(parseApiError(err, 'Key 恢复失败'), '错误')
+    showError(parseApiError(err, t('ui.failedToRestoreKeyb310eed')), t('ui.error'))
   }
 }
 
@@ -1480,6 +1485,7 @@ onMounted(() => {
 defineExpose({
   loadRoutingData
 })
+
 </script>
 
 <style scoped>

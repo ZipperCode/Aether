@@ -1,13 +1,13 @@
 <template>
   <div class="mt-2 rounded-md bg-muted/30 p-2" data-testid="nous-quota-card">
     <ProviderQuotaSectionHeader
-      title="Nous 账号额度"
+      :title="t('providers.local.nousAccountQuota')"
       :loading="loading"
       :updated-text="updatedText"
     />
 
     <div v-if="quota.plan_type" class="mb-2 text-[10px] font-medium">
-      套餐：{{ quota.plan_type }}
+      {{ t('providers.local.nousPlanPrefix') }}{{ quota.plan_type }}
     </div>
 
     <div v-if="progressItems.length" class="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -32,13 +32,13 @@
     </div>
 
     <div v-if="rateLimitsText" class="mt-2 text-[10px] text-muted-foreground">
-      配置速率上限：{{ rateLimitsText }}
+      {{ t('providers.local.configuredRateLimitsPrefix') }}{{ rateLimitsText }}
     </div>
     <div v-if="quota.exhausted" class="mt-1 text-[10px] font-medium text-red-600">
-      {{ quota.exhausted_reason === 'no_usable_credits' ? '无可用推理 Credits' : '账号额度不可用' }}
+      {{ quota.exhausted_reason === 'no_usable_credits' ? t('providers.local.noUsableInferenceCredits') : t('providers.local.accountQuotaUnavailable') }}
     </div>
-    <div v-if="quota.billing_available === false && !quota.billing_stale" class="mt-1 text-[10px] text-muted-foreground">账单信息暂不可用</div>
-    <div v-if="rateLimitRecovery" class="mt-1 text-[10px] text-amber-600">临时限流，{{ rateLimitRecovery }}</div>
+    <div v-if="quota.billing_available === false && !quota.billing_stale" class="mt-1 text-[10px] text-muted-foreground">{{ t('providers.local.billingInfoUnavailable') }}</div>
+    <div v-if="rateLimitRecovery" class="mt-1 text-[10px] text-amber-600">{{ t('providers.local.tempRateLimitedPrefix') }}{{ rateLimitRecovery }}</div>
   </div>
 </template>
 
@@ -47,8 +47,11 @@ import { computed } from 'vue'
 import type { QuotaStatusSnapshot, QuotaWindowSnapshot } from '@/api/endpoints/types'
 import ProviderQuotaProgressRow from './ProviderQuotaProgressRow.vue'
 import ProviderQuotaSectionHeader from './ProviderQuotaSectionHeader.vue'
+import { useI18n } from '@/i18n'
 
 const props = defineProps<{ quota: QuotaStatusSnapshot; loading?: boolean }>()
+const { t } = useI18n()
+
 
 function decimal(value: unknown): number | null {
   if ((typeof value !== 'string' && typeof value !== 'number') || String(value).trim() === '') return null

@@ -3,11 +3,11 @@
     <div class="px-4 py-3 border-b border-border/60">
       <div class="flex items-center justify-between">
         <div class="flex items-baseline gap-2">
-          <h4 class="text-sm font-semibold">映射规则</h4>
+          <h4 class="text-sm font-semibold">
+            {{ t('ui.mappingRules') }}
+          </h4>
           <span class="text-xs text-muted-foreground">
-            支持正则表达式 ({{ localMappings.length }}/{{
-              MAX_MAPPINGS_PER_MODEL
-            }})
+            {{ t('ui.supportsRegularExpressions') }}{{ localMappings.length }}/{{ MAX_MAPPINGS_PER_MODEL }})
           </span>
         </div>
         <div class="flex items-center gap-1">
@@ -15,7 +15,7 @@
             variant="ghost"
             size="icon"
             class="h-7 w-7"
-            title="添加规则"
+            :title="t('ui.addRule')"
             :disabled="localMappings.length >= MAX_MAPPINGS_PER_MODEL"
             @click="addMapping"
           >
@@ -25,7 +25,7 @@
             variant="ghost"
             size="icon"
             class="h-7 w-7"
-            title="刷新"
+            :title="t('ui.refresh')"
             :disabled="loadingPreview"
             @click="loadMatchPreview"
           >
@@ -51,7 +51,7 @@
           <div class="flex-1 min-w-0">
             <Input
               v-model="localMappings[index]"
-              placeholder="例如: claude-haiku-.*"
+              :placeholder="t('ui.eGClaudeHaiku')"
               :class="`font-mono text-sm ${normalizedMappings[index] && !mappingValidations[index].valid ? 'border-destructive' : ''}`"
               @click.stop
               @input="markDirty"
@@ -63,7 +63,7 @@
               class="flex items-center gap-1 mt-1 text-xs text-destructive"
             >
               <AlertCircle class="w-3 h-3" />
-              <span>无效正则表达式</span>
+              <span>{{ t('models.mappings.invalidRegex') }}</span>
             </div>
           </div>
 
@@ -71,39 +71,38 @@
             v-if="loadingPreview"
             variant="outline"
             class="text-xs text-muted-foreground flex-shrink-0 h-6 leading-none"
-            >计算中</Badge
           >
+            {{ t('models.mappings.calculating') }}
+          </Badge>
           <Badge
             v-else-if="previewError"
             variant="destructive"
             class="text-xs flex-shrink-0 h-6 leading-none"
-            >预览失败</Badge
           >
+            {{ t('models.mappings.previewFailed') }}
+          </Badge>
           <Badge
-            v-else-if="
-              mappingValidations[index].valid && mappingMatchCounts[index] > 0
-            "
+            v-else-if="mappingValidations[index].valid && mappingMatchCounts[index] > 0"
             variant="secondary"
             class="text-xs flex-shrink-0 h-6 leading-none"
             :title="getMappingMatchTitle(index)"
-            >{{ mappingMatchCounts[index] }} 匹配</Badge
           >
+            {{ mappingMatchCounts[index] }} {{ t('ui.match') }}
+          </Badge>
           <Badge
-            v-else-if="
-              normalizedMappings[index] && mappingValidations[index].valid
-            "
+            v-else-if="normalizedMappings[index] && mappingValidations[index].valid"
             variant="outline"
             class="text-xs text-muted-foreground flex-shrink-0 h-6 leading-none"
-            >无匹配</Badge
           >
-
+            {{ t('ui.noMatches') }}
+          </Badge>
           <div class="flex items-center gap-1 flex-shrink-0">
             <Button
               v-if="isDirty"
               variant="ghost"
               size="icon"
               class="h-7 w-7 text-muted-foreground hover:text-primary"
-              title="保存"
+              :title="t('ui.save')"
               :disabled="saving || loadingPreview || hasValidationErrors"
               @click.stop="saveMappings"
             >
@@ -114,7 +113,7 @@
               variant="ghost"
               size="icon"
               class="h-7 w-7 text-muted-foreground hover:text-destructive"
-              title="删除"
+              :title="t('ui.delete')"
               :disabled="saving"
               @click.stop="removeMapping(index)"
             >
@@ -138,11 +137,7 @@
           </div>
           <div v-else-if="expandedGroups.length === 0" class="text-center py-4">
             <p class="text-sm text-muted-foreground">
-              {{
-                normalizedMappings[index]
-                  ? "此规则暂无匹配的 Key 白名单"
-                  : "请输入映射规则"
-              }}
+              {{ normalizedMappings[index] ? t('ui.noKeyAllowlistsMatchThisRule') : t('ui.enterAMappingRule') }}
             </p>
           </div>
           <div v-else class="space-y-3">
@@ -162,15 +157,19 @@
                     >({{ group.keys.length }} Key)</span
                   >
                 </div>
-                <Badge v-if="group.isLinked" variant="secondary" class="text-xs"
-                  >已关联</Badge
+                <Badge
+                  v-if="group.isLinked"
+                  variant="secondary"
+                  class="text-xs"
                 >
+                  {{ t('ui.linked59b1cc0') }}
+                </Badge>
                 <Button
                   v-else
                   variant="ghost"
                   size="icon"
                   class="h-7 w-7"
-                  title="关联到当前模型"
+                  :title="t('ui.linkToCurrentModel')"
                   @click="$emit('linkProvider', group.providerId)"
                 >
                   <Link class="w-3.5 h-3.5" />
@@ -210,8 +209,9 @@
                 size="sm"
                 :disabled="expandedPage <= 1 || loadingPreview"
                 @click="changeExpandedPage(expandedPage - 1)"
-                >上一页</Button
               >
+                {{ t('userStats.pagination.previous') }}
+              </Button>
               <span class="text-xs text-muted-foreground">
                 {{ expandedPage }} / {{ expandedTotalPages }}（{{
                   previewData?.expanded?.total_keys || 0
@@ -223,8 +223,9 @@
                 size="sm"
                 :disabled="expandedPage >= expandedTotalPages || loadingPreview"
                 @click="changeExpandedPage(expandedPage + 1)"
-                >下一页</Button
               >
+                {{ t('userStats.pagination.next') }}
+              </Button>
             </div>
           </div>
         </div>
@@ -233,13 +234,16 @@
 
     <div v-else class="text-center py-32">
       <GitMerge class="w-10 h-10 mx-auto text-muted-foreground/30 mb-3" />
-      <p class="text-sm text-muted-foreground">暂无映射规则</p>
+      <p class="text-sm text-muted-foreground">
+        {{ t('ui.noMappingRules') }}
+      </p>
     </div>
   </Card>
 </template>
 
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from "vue";
+import { useI18n } from '@/i18n'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import {
   AlertCircle,
   ChevronRight,
@@ -279,11 +283,13 @@ const props = withDefaults(
 );
 
 const emit = defineEmits<{
-  update: [mappings: string[]];
-  refresh: [];
-  linkProvider: [providerId: string];
-  linkProviders: [providerIds: string[]];
-}>();
+  update: [mappings: string[]]
+  refresh: []
+  linkProvider: [providerId: string]
+  linkProviders: [providerIds: string[]]
+}>()
+
+const { t } = useI18n()
 
 interface MatchedKeyForMapping {
   keyId: string;
@@ -343,9 +349,13 @@ const mappingMatchCounts = computed(() =>
 );
 
 function getMappingMatchTitle(index: number): string {
-  const rule = previewRules.value[index];
-  if (!rule) return "";
-  return `${rule.matched_model_count} 个上游模型名 · ${rule.matched_key_count} Key · ${rule.matched_provider_count} 个提供商`;
+  const rule = previewRules.value[index]
+  if (!rule) return ''
+  return t('models.mappings.matchSummary', {
+    models: rule.matched_model_count,
+    keys: rule.matched_key_count,
+    providers: rule.matched_provider_count,
+  })
 }
 const expandedTotalPages = computed(() =>
   Math.max(
@@ -411,7 +421,7 @@ async function loadMatchPreview() {
   } catch (error: unknown) {
     if (sequence !== previewSequence) return false;
     log.error("加载匹配预览失败:", error);
-    previewError.value = parseApiError(error, "加载映射预览失败");
+    previewError.value = parseApiError(error, t('models.mappings.previewLoadFailed'))
     return false;
   } finally {
     if (sequence === previewSequence) loadingPreview.value = false;
@@ -426,7 +436,7 @@ function markDirty() {
 
 function addMapping() {
   if (localMappings.value.length >= MAX_MAPPINGS_PER_MODEL) {
-    toastError(`最多支持 ${MAX_MAPPINGS_PER_MODEL} 条映射规则`);
+    toastError(t('models.mappings.maxRulesLimit', { max: MAX_MAPPINGS_PER_MODEL }))
     return;
   }
   localMappings.value.push("");
@@ -448,18 +458,18 @@ function changeExpandedPage(page: number) {
 }
 
 async function removeMapping(index: number) {
-  localMappings.value.splice(index, 1);
-  if (expandedIndex.value === index) expandedIndex.value = null;
+  localMappings.value.splice(index, 1)
+  if (expandedIndex.value === index) expandedIndex.value = null
   else if (expandedIndex.value !== null && expandedIndex.value > index)
-    expandedIndex.value--;
-  isDirty.value = true;
-  await saveMappings();
+    expandedIndex.value--
+  isDirty.value = true
+  await saveMappings()
 }
 
 async function saveMappings() {
   if (!(await loadMatchPreview()) || hasValidationErrors.value) {
-    toastError(previewError.value || "存在无效映射规则，无法保存");
-    return;
+    toastError(previewError.value || t('ui.cannotSaveInvalidMappingRules'))
+    return
   }
   const cleanedMappings = normalizedMappings.value.filter(Boolean);
   saving.value = true;
@@ -485,20 +495,20 @@ async function saveMappings() {
     isDirty.value = false;
     if (unlinkedProviderIds.length > 0) {
       toastSuccess(
-        `映射规则已保存，正在关联 ${unlinkedProviderIds.length} 个提供商...`,
-      );
-      emit("linkProviders", unlinkedProviderIds);
+        t('models.mappings.savedLinkingProviders', { count: unlinkedProviderIds.length }),
+      )
+      emit('linkProviders', unlinkedProviderIds)
     } else {
-      toastSuccess("映射规则已保存");
+      toastSuccess(t('ui.mappingRulesSaved'))
     }
-    emit("update", cleanedMappings);
-    emit("refresh");
-    await loadMatchPreview();
+    emit('update', cleanedMappings)
+    emit('refresh')
+    await loadMatchPreview()
   } catch (error) {
-    log.error("保存映射规则失败:", error);
-    toastError("保存失败，请重试");
-    localMappings.value = [...originalMappings.value];
-    isDirty.value = false;
+    log.error('保存映射规则失败:', error)
+    toastError(t('ui.failedToSaveTryAgain'))
+    localMappings.value = [...originalMappings.value]
+    isDirty.value = false
   } finally {
     saving.value = false;
   }
@@ -539,5 +549,7 @@ onUnmounted(() => {
   if (previewTimer) clearTimeout(previewTimer);
 });
 
-defineExpose({ refresh: loadMatchPreview });
+defineExpose({
+  refresh: loadMatchPreview,
+})
 </script>

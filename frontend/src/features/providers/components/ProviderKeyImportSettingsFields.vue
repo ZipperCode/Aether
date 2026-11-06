@@ -1,7 +1,7 @@
 <template>
   <div class="space-y-4">
     <div class="space-y-2">
-      <Label class="text-xs font-medium">支持的 API 格式</Label>
+      <Label class="text-xs font-medium">{{ t('ui.supportedApiFormatscc32a02') }}</Label>
       <div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
         <label
           v-for="format in availableApiFormats"
@@ -22,7 +22,7 @@
 
     <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
       <div class="space-y-1.5">
-        <Label class="text-xs">认证类型</Label>
+        <Label class="text-xs">{{ t('ui.authType') }}</Label>
         <Select v-model="authTypeModel">
           <SelectTrigger class="h-10">
             <SelectValue />
@@ -38,7 +38,7 @@
         </Select>
       </div>
       <div class="space-y-1.5">
-        <Label class="text-xs">优先级</Label>
+        <Label class="text-xs">{{ t('ui.priority565d646') }}</Label>
         <Input
           :model-value="settings.internal_priority"
           type="number"
@@ -48,30 +48,30 @@
         />
       </div>
       <div class="space-y-1.5">
-        <Label class="text-xs">RPM 限制</Label>
+        <Label class="text-xs">{{ t('ui.rpmLimit50b7143') }}</Label>
         <Input
           :model-value="settings.rpm_limit ?? ''"
           type="number"
           min="1"
           max="10000"
           class="h-10"
-          placeholder="自适应"
+          :placeholder="t('ui.adaptive')"
           @update:model-value="updateSetting('rpm_limit', parseNullableNumberInput($event, { min: 1, max: 10000 }))"
         />
       </div>
       <div class="space-y-1.5">
-        <Label class="text-xs">并发请求上限</Label>
+        <Label class="text-xs">{{ t('ui.concurrentRequestLimit') }}</Label>
         <Input
           :model-value="settings.concurrent_limit ?? ''"
           type="number"
           min="0"
           class="h-10"
-          placeholder="不限制"
+          :placeholder="t('ui.noRestriction')"
           @update:model-value="updateSetting('concurrent_limit', parseNullableNumberInput($event, { min: 0 }))"
         />
       </div>
       <div class="space-y-1.5">
-        <Label class="text-xs">缓存 TTL（分钟）</Label>
+        <Label class="text-xs">{{ t('ui.cacheTtlMinutes') }}</Label>
         <Input
           :model-value="settings.cache_ttl_minutes"
           type="number"
@@ -82,7 +82,7 @@
         />
       </div>
       <div class="space-y-1.5">
-        <Label class="text-xs">熔断探测（分钟）</Label>
+        <Label class="text-xs">{{ t('ui.circuitBreakerProbeIntervalMinutes') }}</Label>
         <Input
           :model-value="settings.max_probe_interval_minutes"
           type="number"
@@ -96,7 +96,7 @@
 
     <div class="grid gap-3 sm:grid-cols-2">
       <div class="space-y-1.5">
-        <Label class="text-xs">代理节点</Label>
+        <Label class="text-xs">{{ t('ui.proxyNodes23f1b6a') }}</Label>
         <ProxyNodeSelect
           :model-value="settings.proxy_node_id ?? ''"
           trigger-class="h-10"
@@ -104,11 +104,11 @@
         />
       </div>
       <div class="space-y-1.5">
-        <Label class="text-xs">备注</Label>
+        <Label class="text-xs">{{ t('ui.notes') }}</Label>
         <Input
           :model-value="settings.note ?? ''"
           class="h-10"
-          placeholder="可选"
+          :placeholder="t('ui.optional')"
           @update:model-value="updateSetting('note', String($event))"
         />
       </div>
@@ -121,10 +121,10 @@
             class="text-xs font-medium"
             :for="autoFetchSwitchId"
           >
-            自动获取上游可用模型
+            {{ t('ui.autoFetchUpstreamModels') }}
           </Label>
           <div class="text-[11px] text-muted-foreground">
-            导入后立即获取一次，之后定时更新上游模型，配合模型映射使用
+            {{ t('providers.local.importAutoFetchModelsHint') }}
           </div>
         </div>
         <Switch
@@ -143,12 +143,12 @@
               class="text-xs"
               :for="modelIncludePatternsId"
             >
-              包含规则
+              {{ t('ui.includeRules') }}
             </Label>
             <Input
               :id="modelIncludePatternsId"
               :model-value="settings.model_include_patterns_text"
-              placeholder="gpt-*, claude-*, 留空包含全部"
+              :placeholder="t('ui.gptClaudeLeaveEmptyToIncludeAll')"
               class="h-10"
               @update:model-value="updateSetting('model_include_patterns_text', String($event))"
             />
@@ -158,7 +158,7 @@
               class="text-xs"
               :for="modelExcludePatternsId"
             >
-              排除规则
+              {{ t('ui.excludeRules') }}
             </Label>
             <Input
               :id="modelExcludePatternsId"
@@ -170,7 +170,7 @@
           </div>
         </div>
         <p class="text-[11px] text-muted-foreground">
-          逗号分隔，支持 * ? 通配符，不区分大小写
+          {{ t('ui.commaSeparatedSupportsAndWildcardsCaseInsensitive') }}
         </p>
       </div>
     </div>
@@ -178,10 +178,10 @@
     <div class="flex min-h-12 items-center justify-between gap-3 rounded-lg bg-background px-3 shadow-[0_0_0_1px_rgb(0_0_0/0.06),0_1px_2px_rgb(0_0_0/0.04)] dark:shadow-[0_0_0_1px_rgb(255_255_255/0.08)]">
       <div>
         <div class="text-xs font-medium">
-          导入后立即启用
+          {{ t('ui.enableImmediatelyAfterImport') }}
         </div>
         <div class="text-[11px] text-muted-foreground">
-          关闭后仍会创建，但不会进入调度
+          {{ t('ui.whenDisabledKeysAreCreatedButExcludedFromScheduling') }}
         </div>
       </div>
       <Switch
@@ -193,6 +193,8 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n } from '@/i18n'
+
 import { computed } from 'vue'
 import {
   Checkbox,
@@ -233,6 +235,8 @@ const emit = defineEmits<{
   'update:settings': [value: ImportSettings]
 }>()
 
+const { t } = useI18n()
+
 // 每个实例唯一的字段 id，供 label[for] 关联（统一配置与逐项编辑会同时存在多个实例）
 const fieldNonce = Math.random().toString(36).slice(2, 10)
 const autoFetchSwitchId = `provider-key-import-auto-fetch-${fieldNonce}`
@@ -257,4 +261,5 @@ function updateSetting<Key extends keyof ImportSettings>(
 ): void {
   emit('update:settings', { ...props.settings, [key]: value })
 }
+
 </script>

@@ -1,3 +1,5 @@
+
+import { translate as t } from '@/i18n'
 import { ref, onUnmounted } from 'vue'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
 import { batchQueryBalance, getArchitectures, type ActionResultResponse, type ArchitectureInfo } from '@/api/providerOps'
@@ -209,7 +211,7 @@ export function useProviderBalance() {
     if (result.status === 'auth_failed' || result.status === 'auth_expired') {
       return {
         status: result.status,
-        message: result.message || '认证失败',
+        message: result.message || t('providers.migration.authenticationFaileddda97a'),
         isNeutral: false,
       }
     }
@@ -217,8 +219,8 @@ export function useProviderBalance() {
     if (result.status !== 'success') {
       return {
         status: result.status,
-        message: result.message || '查询失败',
-        isNeutral: false,
+      message: result.message || t('providers.migration.queryFailed381ea3'),
+      isNeutral: false,
       }
     }
     return null
@@ -267,7 +269,7 @@ export function useProviderBalance() {
     }
     return {
       expired: true,
-      message: typeof extra.cookie_expired_message === 'string' ? extra.cookie_expired_message : 'Cookie 已失效',
+      message: typeof extra.cookie_expired_message === 'string' ? extra.cookie_expired_message : t('providers.migration.cookieExpiredd72730'),
     }
   }
 
@@ -288,7 +290,7 @@ export function useProviderBalance() {
     const now = Date.now() / 1000
     const diff = resetsAt - now
 
-    if (diff <= 0) return '即将重置'
+    if (diff <= 0) return t('ui.resettingSoon')
 
     const totalHours = Math.floor(diff / 3600)
     const minutes = Math.floor((diff % 3600) / 60)
