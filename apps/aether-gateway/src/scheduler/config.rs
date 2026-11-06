@@ -320,6 +320,7 @@ mod tests {
                 "scheduling_mode": "cache_affinity",
                 "keep_priority_on_conversion": false,
                 "sticky_key_attempts": DEFAULT_STICKY_KEY_ATTEMPTS,
+                "cancel_on_client_disconnect": true,
                 "max_transfer_count": 0,
                 "max_transfer_timeout_seconds": 0,
                 "failover_rules": {
@@ -375,6 +376,7 @@ mod tests {
                 "scheduling_mode": "cache_affinity",
                 "keep_priority_on_conversion": false,
                 "sticky_key_attempts": DEFAULT_STICKY_KEY_ATTEMPTS,
+                "cancel_on_client_disconnect": true,
                 "max_transfer_count": 0,
                 "max_transfer_timeout_seconds": 0,
                 "failover_rules": {
