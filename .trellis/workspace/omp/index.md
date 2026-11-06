@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 30
-- **Last Active**: 2026-11-06
+- **Total Sessions**: 31
+- **Last Active**: 2026-11-07
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~747 | Active |
+| `journal-1.md` | ~769 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 31 | 2026-11-07 | 集成协议兼容与审计优化 PR | `b945b8f55` | `master` |
 | 30 | 2026-11-06 | 同步上游主线并评估协议与审计 PR | `238940670` | `master` |
 | 29 | 2026-11-02 | 默认开启客户端断连取消上游 | `380c3087c` | `master` |
 | 28 | 2026-11-02 | 修复长流生命周期与断流诊断 | `15caa3cdd` | `master` |

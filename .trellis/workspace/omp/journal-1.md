@@ -745,3 +745,25 @@ HTTP、Responses WebSocket 与前端默认开启 cancel_on_client_disconnect；�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 31: 集成协议兼容与审计优化 PR
+
+**Date**: 2026-11-07
+**Task**: 集成协议兼容与审计优化 PR
+**Package**: aether-tunnel
+**Branch**: `master`
+
+### Summary
+
+适配893签名回放与私有Schema、897客户端1h缓存TTL、898混合工具函数优先、899审计大载荷精简；保留本地canonical/native边界、账号历史作用域及审计原始流转。Rust定向157项、前端18项通过；三个受影响crate Clippy、fmt和diff检查通过，设置文案中英文实测。无真实上游调用或生产配置修改。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b945b8f55` | (see git log) |
+
+### Status
+
+[OK] **Completed**
