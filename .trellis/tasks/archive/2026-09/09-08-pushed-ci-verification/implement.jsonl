@@ -1,3 +1,0 @@
-{"file": ".trellis/spec/aether-gateway/backend/quality-guidelines.md", "reason": "Preserve previous verified scope; fix only live CI failures"}
-{"file": ".trellis/tasks/archive/2026-09/09-08-ci-reliability-speed/research/check.md", "reason": "Preserve previous verified scope; fix only live CI failures"}
-{"file": ".trellis/tasks/09-08-pushed-ci-verification/research/run-34210248162.md", "reason": "Complete immutable CI failure list and exact test locations"}

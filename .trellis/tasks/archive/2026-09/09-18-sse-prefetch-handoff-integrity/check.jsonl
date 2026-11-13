@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/aether-gateway/backend/quality-guidelines.md", "reason": "Scoped gateway quality gates"}
-{"file": ".trellis/spec/aether-ai-formats/backend/codex-http-responses-contract.md", "reason": "SSE fidelity and failover acceptance"}

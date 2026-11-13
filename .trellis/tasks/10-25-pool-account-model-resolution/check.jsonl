@@ -1,2 +1,0 @@
-{"file":".trellis/spec/aether-gateway/backend/quality-guidelines.md","reason":"Verification and Rust runner requirements"}
-{"file":".trellis/spec/aether-gateway/backend/skipped-candidate-observability-contract.md","reason":"Pool failures must preserve attempted vs skipped semantics"}
