@@ -157,6 +157,7 @@
         {{ t('ui.accountNotActivated') }}
       </span>
     </div>
+    <ProviderAccountRecoveryLink :account="apiKey.status_snapshot?.account" />
   </div>
 </template>
 
@@ -169,6 +170,7 @@ import { useI18n } from '@/i18n'
 import type { EndpointAPIKey } from '@/api/endpoints'
 import type { OAuthStatusInfo } from '@/composables/useCountdownTimer'
 import { getQuotaStatusBadgeInfo } from '@/features/providers/utils/providerKeyQuota'
+import ProviderAccountRecoveryLink from './ProviderAccountRecoveryLink.vue'
 interface OAuthOrgBadgeDisplay {
   label: string
   title: string

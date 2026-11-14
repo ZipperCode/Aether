@@ -2268,6 +2268,20 @@ async fn record_oauth_invalidation_effect(
     ) else {
         return;
     };
+    let recovery_metadata = if transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("antigravity")
+        && invalid_reason.starts_with("[ACCOUNT_BLOCK]")
+    {
+        let body = effect
+            .response_text
+            .and_then(|text| serde_json::from_str(text).ok());
+        Some(admin_provider_quota_pure::antigravity_oauth_recovery_metadata(body.as_ref()))
+    } else {
+        None
+    };
     let request_started_at_unix_ms = report_context_u64_field(
         context.report_context,
         "provider_request_started_at_unix_ms",
@@ -2284,6 +2298,7 @@ async fn record_oauth_invalidation_effect(
             request_started_at_unix_ms,
             request_order_id,
             observed_credential_generation,
+            recovery_metadata.as_ref(),
         )
         .await
     {

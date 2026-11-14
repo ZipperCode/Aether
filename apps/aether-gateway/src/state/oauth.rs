@@ -2068,6 +2068,7 @@ impl AppState {
         request_started_at_unix_ms: Option<u64>,
         request_order_id: Option<&str>,
         observed_credential_generation: Option<&str>,
+        antigravity_recovery_metadata: Option<&Value>,
     ) -> Result<bool, GatewayError> {
         let invalid_reason = invalid_reason.trim();
         let key_id = transport.key.id.trim();
@@ -2085,6 +2086,14 @@ impl AppState {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let is_codex = provider_type.trim().eq_ignore_ascii_case("codex");
+        let antigravity_recovery_update =
+            if provider_type.trim().eq_ignore_ascii_case("antigravity") {
+                antigravity_recovery_metadata
+                    .and_then(|value| value.get("antigravity"))
+                    .and_then(Value::as_object)
+            } else {
+                None
+            };
         let now_unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -2142,6 +2151,25 @@ impl AppState {
                 return Ok(false);
             }
 
+            let expected_antigravity = antigravity_recovery_update.and_then(|_| {
+                latest_key
+                    .upstream_metadata
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|metadata| metadata.get("antigravity"))
+                    .cloned()
+            });
+            let next_antigravity = antigravity_recovery_update.map(|update| {
+                let mut merged = expected_antigravity
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                merged.extend(update.clone());
+                Value::Object(merged)
+            });
+            let antigravity_metadata_changed = next_antigravity != expected_antigravity;
+
             let (oauth_invalid_at_unix_secs, oauth_invalid_reason) =
                 merge_runtime_oauth_invalid_state(
                     provider_type,
@@ -2171,7 +2199,7 @@ impl AppState {
                 }
                 Value::Object(codex)
             });
-            if !invalid_state_changed && next_codex.is_none() {
+            if !invalid_state_changed && next_codex.is_none() && !antigravity_metadata_changed {
                 return Ok(false);
             }
 
@@ -2190,12 +2218,19 @@ impl AppState {
                             expected_credential_fence.encrypted_auth_config.clone(),
                         ),
                         expected_credential: Some(expected_credential_fence.credential.clone()),
-                        expected_upstream_metadata_namespace: is_codex.then(|| {
-                            ProviderCatalogUpstreamMetadataNamespaceExpectation {
+                        expected_upstream_metadata_namespace: if is_codex {
+                            Some(ProviderCatalogUpstreamMetadataNamespaceExpectation {
                                 namespace: "codex".to_string(),
                                 expected_value: expected_codex.clone(),
-                            }
-                        }),
+                            })
+                        } else {
+                            next_antigravity.as_ref().map(|_| {
+                                ProviderCatalogUpstreamMetadataNamespaceExpectation {
+                                    namespace: "antigravity".to_string(),
+                                    expected_value: expected_antigravity.clone(),
+                                }
+                            })
+                        },
                         encrypted_auth_config: expected_credential_fence
                             .encrypted_auth_config
                             .clone(),
@@ -2205,7 +2240,12 @@ impl AppState {
                         oauth_invalid_reason: latest_key.oauth_invalid_reason.clone(),
                         upstream_metadata_patch: next_codex
                             .as_ref()
-                            .map(|codex| json!({"codex": codex})),
+                            .map(|codex| json!({"codex": codex}))
+                            .or_else(|| {
+                                next_antigravity
+                                    .as_ref()
+                                    .map(|antigravity| json!({"antigravity": antigravity}))
+                            }),
                         upstream_metadata_namespace_to_remove: None,
                         status_snapshot_patch: provider_key_oauth_status_snapshot_update(
                             &latest_key,
@@ -3413,7 +3453,12 @@ fn merge_runtime_oauth_invalid_state(
         .as_deref()
         .map(str::trim)
         .unwrap_or_default();
-    if current_reason == candidate_reason {
+    if current_reason == candidate_reason
+        || (provider_type.trim().eq_ignore_ascii_case("antigravity")
+            && oauth_invalid_reason_is_account_block(Some(current_reason))
+            && !oauth_invalid_reason_is_account_block(Some(candidate_reason)))
+    {
+        // Antigravity 的短期 Token 错误不能覆盖仍需人工处理的账号验证或封禁状态。
         return (
             key.oauth_invalid_at_unix_secs,
             (!current_reason.is_empty()).then_some(current_reason.to_string()),
@@ -5062,6 +5107,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("stale invalidation should be ignored"));
@@ -5100,6 +5146,7 @@ mod tests {
                 "[OAUTH_EXPIRED] stale request",
                 Some(1_000),
                 Some("01900000-0000-7000-8000-000000000010"),
+                None,
                 None,
             )
             .await
@@ -5234,6 +5281,7 @@ mod tests {
                 Some(1_001),
                 Some("01900000-0000-7000-8000-000000000011"),
                 None,
+                None,
             )
             .await
             .expect("newer invalidation should persist"));
@@ -5279,6 +5327,7 @@ mod tests {
                 "[OAUTH_EXPIRED] same millisecond request",
                 Some(1_000),
                 Some("01900000-0000-7000-8000-000000000010"),
+                None,
                 None,
             )
             .await
@@ -5730,6 +5779,7 @@ mod tests {
                 Some(1_000),
                 Some("01900000-0000-7000-8000-000000000010"),
                 None,
+                None,
             )
             .await
             .expect("runtime invalid should persist"));
@@ -5866,6 +5916,7 @@ mod tests {
                 "[ACCOUNT_BLOCK] account deactivated",
                 Some(1_000),
                 Some("01900000-0000-7000-8000-000000000010"),
+                None,
                 None,
             )
             .await

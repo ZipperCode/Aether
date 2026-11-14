@@ -145,6 +145,32 @@ describe('ProviderKeyIdentityBlock', () => {
     unmount()
   })
 
+  it('exposes the verification action from the account status snapshot', () => {
+    const { root, unmount } = mount({
+      apiKey: createProviderKey({
+        status_snapshot: {
+          oauth: { code: 'valid' },
+          quota: { code: 'ok', exhausted: false },
+          account: {
+            code: 'account_verification',
+            blocked: true,
+            validation_url: 'https://accounts.google.com/verify?case=example',
+          },
+        },
+      }),
+      maskedSecretLabel: 'oauth:***',
+      showOAuthRefreshControl: true,
+      accountLevelBlock: true,
+    })
+
+    try {
+      expect(root.querySelector('a')?.getAttribute('href')).toBe('https://accounts.google.com/verify?case=example')
+      expect(root.querySelector('a')?.textContent).toContain('验证账号')
+    } finally {
+      unmount()
+    }
+  })
+
   it('does not offer generic copy or export actions for Agent Identity', () => {
     const { root, unmount } = mount({
       apiKey: createProviderKey({ agent_identity: true }),

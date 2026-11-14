@@ -17,6 +17,8 @@ export interface AccountStatusSnapshot {
   blocked: boolean
   source?: string | null
   recoverable?: boolean
+  validation_url?: string | null
+  appeal_url?: string | null
 }
 
 export interface QuotaWindowUsageSnapshot {

@@ -272,6 +272,8 @@ pub fn antigravity_oauth_invalid_reason(
         || message.contains("account has been deactivated")
     {
         "Account is disabled"
+    } else if has_reason("TOS_VIOLATION") {
+        "Account is suspended (TOS_VIOLATION)"
     } else if has_reason("ACCOUNT_SUSPENDED") || message.contains("account has been suspended") {
         "Account is suspended"
     } else if error.get("status").and_then(serde_json::Value::as_str) == Some("UNAUTHENTICATED") {
@@ -282,6 +284,50 @@ pub fn antigravity_oauth_invalid_reason(
         return None;
     };
     Some(format!("{OAUTH_ACCOUNT_BLOCK_PREFIX}{reason}"))
+}
+
+/// Build the complete recovery-field patch for a structured account block. Nulls clear
+/// stale links when a newer block has no corresponding verified URL.
+pub fn antigravity_oauth_recovery_metadata(body: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut recovery = serde_json::Map::from_iter([
+        ("validation_url".to_string(), serde_json::Value::Null),
+        ("appeal_url".to_string(), serde_json::Value::Null),
+    ]);
+    let details = body
+        .and_then(|body| body.get("error"))
+        .and_then(|error| error.get("details"))
+        .and_then(serde_json::Value::as_array);
+    for detail in details.into_iter().flatten() {
+        if detail.get("@type").and_then(serde_json::Value::as_str)
+            != Some("type.googleapis.com/google.rpc.ErrorInfo")
+        {
+            continue;
+        }
+        let Some(metadata) = detail
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for field in ["validation_url", "appeal_url"] {
+            if recovery
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            {
+                continue;
+            }
+            let Some(url) = metadata
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| provider_status::antigravity_account_recovery_url(field, value))
+            else {
+                continue;
+            };
+            recovery.insert(field.to_string(), serde_json::Value::String(url));
+        }
+    }
+    json!({"antigravity": serde_json::Value::Object(recovery)})
 }
 
 pub fn parse_antigravity_usage_response(
@@ -4622,12 +4668,83 @@ mod tests {
                 );
             }
         }
+        let tos = json!({"error": {
+            "message": "Account access is restricted",
+            "details": [{"reason": "TOS_VIOLATION"}]
+        }});
+        assert_eq!(
+            antigravity_oauth_invalid_reason(403, Some(&tos)),
+            Some(format!(
+                "{OAUTH_ACCOUNT_BLOCK_PREFIX}Account is suspended (TOS_VIOLATION)"
+            ))
+        );
+        assert_eq!(
+            antigravity_oauth_invalid_reason(
+                429,
+                Some(&json!({"error": {"message": "permission denied"}}))
+            ),
+            None
+        );
         assert_eq!(
             antigravity_oauth_invalid_reason(
                 502,
                 Some(&json!({"error": {"message": "verify your account"}}))
             ),
             None
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_urls_require_google_error_info_and_approved_hosts() {
+        use super::{antigravity_oauth_invalid_reason, antigravity_oauth_recovery_metadata};
+
+        let body = json!({"error": {
+            "message": "Terms violation; see https://accounts.google.com/not-used?source=text",
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "TOS_VIOLATION",
+                "metadata": {
+                    "validation_url": "https://accounts.google.com/ServiceLogin?continue=signed%2Bvalue#fragment",
+                    "appeal_url": "https://support.google.com/accounts/appeal?ticket=signed%2Bvalue"
+                }
+            }, {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "metadata": {
+                    "validation_url": "https://sub.accounts.google.com/ignored",
+                    "appeal_url": "https://evil.example/ignored"
+                }
+            }]
+        }});
+        let metadata = antigravity_oauth_recovery_metadata(Some(&body));
+        assert_eq!(
+            metadata.pointer("/antigravity/validation_url"),
+            Some(&json!(
+                "https://accounts.google.com/ServiceLogin?continue=signed%2Bvalue"
+            ))
+        );
+        assert_eq!(
+            metadata.pointer("/antigravity/appeal_url"),
+            Some(&json!(
+                "https://support.google.com/accounts/appeal?ticket=signed%2Bvalue"
+            ))
+        );
+        let reason = antigravity_oauth_invalid_reason(403, Some(&body)).unwrap();
+        assert!(!reason.contains("https://"));
+
+        let text_only = json!({"error": {
+            "message": "https://accounts.google.com/ServiceLogin?continue=text-only",
+            "details": [{"@type": "type.googleapis.com/google.rpc.Help", "metadata": {
+                "appeal_url": "https://support.google.com/accounts/appeal?ticket=not-error-info"
+            }}]
+        }});
+        let metadata = antigravity_oauth_recovery_metadata(Some(&text_only));
+        assert_eq!(
+            metadata.pointer("/antigravity/validation_url"),
+            Some(&json!(null))
+        );
+        assert_eq!(
+            metadata.pointer("/antigravity/appeal_url"),
+            Some(&json!(null))
         );
     }
 

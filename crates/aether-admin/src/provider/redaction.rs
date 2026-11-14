@@ -122,6 +122,25 @@ pub fn admin_provider_upstream_metadata_safe_json(value: Option<&Value>) -> Valu
         *chatgpt_web = project_chatgpt_web_metadata(chatgpt_web);
     }
     redact_upstream_diagnostic_fields(&mut projected);
+    if let Some(target) = projected
+        .get_mut("antigravity")
+        .and_then(Value::as_object_mut)
+    {
+        let source = value
+            .and_then(|value| value.get("antigravity"))
+            .and_then(Value::as_object);
+        for field in ["validation_url", "appeal_url"] {
+            let url = source
+                .and_then(|source| source.get(field))
+                .and_then(Value::as_str)
+                .and_then(|value| super::status::antigravity_account_recovery_url(field, value));
+            if let Some(url) = url {
+                target.insert(field.to_string(), Value::String(url));
+            } else {
+                target.remove(field);
+            }
+        }
+    }
     projected
 }
 
@@ -852,6 +871,22 @@ fn project_account_status_snapshot(value: Option<&Value>) -> Value {
     if let Some(source) = source {
         copy_safe_token_string_or_null(source, &mut projected, "source");
         copy_json_bool_or_null(source, &mut projected, "recoverable");
+        if blocked
+            && matches!(
+                code,
+                "account_verification" | "account_suspended" | "account_banned"
+            )
+        {
+            for field in ["validation_url", "appeal_url"] {
+                if let Some(url) = source
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .and_then(|value| super::status::antigravity_account_recovery_url(field, value))
+                {
+                    projected.insert(field.to_string(), Value::String(url));
+                }
+            }
+        }
     }
     Value::Object(projected)
 }
@@ -2676,6 +2711,65 @@ mod tests {
         let serialized = projected.to_string();
         assert!(!serialized.contains("upstream-secret"));
         assert!(!serialized.contains("user:password"));
+    }
+
+    #[test]
+    fn antigravity_recovery_projection_preserves_only_approved_signed_links() {
+        let validation = "https://accounts.google.com/ServiceLogin?continue=signed%2Bvalue";
+        let appeal = "https://support.google.com/accounts/appeal?ticket=signed%2Bvalue";
+        let projected = admin_provider_status_snapshot_safe_json(Some(&json!({
+            "account": {
+                "code": "account_suspended",
+                "blocked": true,
+                "reason": "https://internal.test/diagnostic?secret=value",
+                "validation_url": format!("{validation}#fragment"),
+                "appeal_url": appeal,
+                "diagnostic_url": "https://evil.example/secret"
+            }
+        })));
+        assert_eq!(
+            projected.pointer("/account/validation_url"),
+            Some(&json!(validation))
+        );
+        assert_eq!(
+            projected.pointer("/account/appeal_url"),
+            Some(&json!(appeal))
+        );
+        assert_eq!(
+            projected.pointer("/account/reason"),
+            Some(&json!("Account is suspended"))
+        );
+        assert!(projected.pointer("/account/diagnostic_url").is_none());
+
+        for code in ["ok", "account_disabled"] {
+            let projected = admin_provider_status_snapshot_safe_json(Some(&json!({
+                "account": {
+                    "code": code,
+                    "blocked": code != "ok",
+                    "validation_url": validation,
+                    "appeal_url": appeal
+                }
+            })));
+            assert!(projected.pointer("/account/validation_url").is_none());
+            assert!(projected.pointer("/account/appeal_url").is_none());
+        }
+
+        let metadata = admin_provider_upstream_metadata_safe_json(Some(&json!({
+            "antigravity": {
+                "validation_url": validation,
+                "appeal_url": "https://support.google.com.evil.example/appeal?ticket=secret",
+                "forbidden_reason": "arbitrary upstream diagnostic"
+            }
+        })));
+        assert_eq!(
+            metadata.pointer("/antigravity/validation_url"),
+            Some(&json!(validation))
+        );
+        assert!(metadata.pointer("/antigravity/appeal_url").is_none());
+        assert_eq!(
+            metadata.pointer("/antigravity/forbidden_reason"),
+            Some(&json!("[REDACTED upstream diagnostic]"))
+        );
     }
 
     /// 余额金额和单位经过重复管理端投影仍精确保留，未知字段及伪装成金额的诊断不得透出。

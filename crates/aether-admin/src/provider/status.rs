@@ -70,6 +70,8 @@ pub struct AccountStatusSnapshot {
     pub blocked: bool,
     pub source: Option<String>,
     pub recoverable: bool,
+    pub validation_url: Option<String>,
+    pub appeal_url: Option<String>,
 }
 
 impl Default for AccountStatusSnapshot {
@@ -81,8 +83,43 @@ impl Default for AccountStatusSnapshot {
             blocked: false,
             source: None,
             recoverable: false,
+            validation_url: None,
+            appeal_url: None,
         }
     }
+}
+
+/// Only the two recovery channels used by Antigravity are exposed. Signed query
+/// parameters survive, while credentials, explicit ports, fragments and other hosts do not.
+pub fn antigravity_account_recovery_url(field: &str, value: &str) -> Option<String> {
+    let expected_host = match field {
+        "validation_url" => "accounts.google.com",
+        "appeal_url" => "support.google.com",
+        _ => return None,
+    };
+    let value = value.trim();
+    let mut parsed = url::Url::parse(value).ok()?;
+    let explicit_port = value
+        .split_once("://")
+        .and_then(|(_, suffix)| suffix.split(['/', '?', '#']).next())
+        .and_then(|authority| {
+            authority
+                .rsplit_once('@')
+                .map(|(_, host)| host)
+                .or(Some(authority))
+        })
+        .is_some_and(|host| host.contains(':'));
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some(expected_host)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || explicit_port
+    {
+        return None;
+    }
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
 }
 
 fn clean_text(value: Option<&str>) -> Option<String> {
@@ -521,17 +558,57 @@ pub fn resolve_account_status_snapshot(
     upstream_metadata: Option<&Value>,
     oauth_invalid_reason: Option<&str>,
 ) -> AccountStatusSnapshot {
-    if let Some(metadata_state) = resolve_from_metadata(provider_type, upstream_metadata) {
-        return AccountStatusSnapshot {
-            code: metadata_state
-                .code
-                .unwrap_or_else(|| "account_blocked".to_string()),
-            label: metadata_state.label,
-            reason: metadata_state.reason,
-            blocked: metadata_state.blocked,
-            source: metadata_state.source,
-            recoverable: metadata_state.recoverable,
+    fn with_recovery_urls(
+        mut snapshot: AccountStatusSnapshot,
+        provider_type: Option<&str>,
+        upstream_metadata: Option<&Value>,
+    ) -> AccountStatusSnapshot {
+        if !provider_type.is_some_and(|value| value.trim().eq_ignore_ascii_case("antigravity"))
+            || !snapshot.blocked
+            || !matches!(
+                snapshot.code.as_str(),
+                "account_verification" | "account_suspended" | "account_banned"
+            )
+        {
+            return snapshot;
+        }
+        let Some(metadata) = upstream_metadata
+            .and_then(|value| value.get("antigravity"))
+            .and_then(Value::as_object)
+        else {
+            return snapshot;
         };
+        for field in ["validation_url", "appeal_url"] {
+            let url = metadata
+                .get(field)
+                .and_then(Value::as_str)
+                .and_then(|value| antigravity_account_recovery_url(field, value));
+            match field {
+                "validation_url" => snapshot.validation_url = url,
+                "appeal_url" => snapshot.appeal_url = url,
+                _ => unreachable!(),
+            }
+        }
+        snapshot
+    }
+
+    if let Some(metadata_state) = resolve_from_metadata(provider_type, upstream_metadata) {
+        return with_recovery_urls(
+            AccountStatusSnapshot {
+                code: metadata_state
+                    .code
+                    .unwrap_or_else(|| "account_blocked".to_string()),
+                label: metadata_state.label,
+                reason: metadata_state.reason,
+                blocked: metadata_state.blocked,
+                source: metadata_state.source,
+                recoverable: metadata_state.recoverable,
+                validation_url: None,
+                appeal_url: None,
+            },
+            provider_type,
+            upstream_metadata,
+        );
     }
 
     let Some(text) = clean_text(oauth_invalid_reason) else {
@@ -545,14 +622,20 @@ pub fn resolve_account_status_snapshot(
             cleaned
         };
         let (code, label) = classify_block_reason(&reason);
-        return AccountStatusSnapshot {
-            code: code.to_string(),
-            label: Some(label.to_string()),
-            reason: Some(reason),
-            blocked: true,
-            source: Some("oauth_invalid".to_string()),
-            recoverable: false,
-        };
+        return with_recovery_urls(
+            AccountStatusSnapshot {
+                code: code.to_string(),
+                label: Some(label.to_string()),
+                reason: Some(reason),
+                blocked: true,
+                source: Some("oauth_invalid".to_string()),
+                recoverable: false,
+                validation_url: None,
+                appeal_url: None,
+            },
+            provider_type,
+            upstream_metadata,
+        );
     }
 
     if let Some(cleaned) = tagged_reason(&text, "OAUTH_EXPIRED") {
@@ -569,6 +652,8 @@ pub fn resolve_account_status_snapshot(
             blocked: true,
             source: Some("oauth_invalid".to_string()),
             recoverable: code == "oauth_token_expired",
+            validation_url: None,
+            appeal_url: None,
         };
     }
 
@@ -586,6 +671,8 @@ pub fn resolve_account_status_snapshot(
                 blocked: true,
                 source: Some("oauth_invalid".to_string()),
                 recoverable: false,
+                validation_url: None,
+                appeal_url: None,
             };
         }
     }
@@ -604,14 +691,20 @@ pub fn resolve_account_status_snapshot(
         .any(|keyword| lowered.contains(keyword))
     {
         let (code, label) = classify_block_reason(&text);
-        return AccountStatusSnapshot {
-            code: code.to_string(),
-            label: Some(label.to_string()),
-            reason: Some(text),
-            blocked: true,
-            source: Some("oauth_invalid".to_string()),
-            recoverable: false,
-        };
+        return with_recovery_urls(
+            AccountStatusSnapshot {
+                code: code.to_string(),
+                label: Some(label.to_string()),
+                reason: Some(text),
+                blocked: true,
+                source: Some("oauth_invalid".to_string()),
+                recoverable: false,
+                validation_url: None,
+                appeal_url: None,
+            },
+            provider_type,
+            upstream_metadata,
+        );
     }
 
     AccountStatusSnapshot::default()
@@ -893,5 +986,55 @@ mod tests {
         );
         assert_eq!(verification.code.as_deref(), Some("account_verification"));
         assert!(!should_auto_remove_account_state(&verification));
+    }
+
+    #[test]
+    fn antigravity_recovery_links_require_safe_urls_and_an_active_matching_block() {
+        let metadata = json!({"antigravity": {
+            "validation_url": "https://accounts.google.com/ServiceLogin?continue=signed",
+            "appeal_url": "https://support.google.com/accounts/appeal?ticket=signed"
+        }});
+        for reason in [
+            "[ACCOUNT_BLOCK] Account verification is required (VALIDATION_REQUIRED)",
+            "[ACCOUNT_BLOCK] Account is suspended (TOS_VIOLATION)",
+        ] {
+            let snapshot =
+                resolve_account_status_snapshot(Some("antigravity"), Some(&metadata), Some(reason));
+            assert!(snapshot.blocked);
+            assert!(snapshot
+                .validation_url
+                .is_some_and(|url| url.contains("continue=signed")));
+            assert!(snapshot
+                .appeal_url
+                .is_some_and(|url| url.contains("ticket=signed")));
+        }
+
+        let cleared = resolve_account_status_snapshot(Some("antigravity"), Some(&metadata), None);
+        assert!(!cleared.blocked);
+        assert_eq!(cleared.validation_url, None);
+        assert_eq!(cleared.appeal_url, None);
+
+        for (field, url) in [
+            ("validation_url", "http://accounts.google.com/ServiceLogin"),
+            (
+                "validation_url",
+                "https://user:pass@accounts.google.com/ServiceLogin",
+            ),
+            (
+                "validation_url",
+                "https://accounts.google.com:443/ServiceLogin",
+            ),
+            (
+                "validation_url",
+                "https://sub.accounts.google.com/ServiceLogin",
+            ),
+            ("appeal_url", "https://accounts.google.com/ServiceLogin"),
+            (
+                "appeal_url",
+                "https://support.google.com.evil.example/appeal",
+            ),
+        ] {
+            assert_eq!(super::antigravity_account_recovery_url(field, url), None);
+        }
     }
 }

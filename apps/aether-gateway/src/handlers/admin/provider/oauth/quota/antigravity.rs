@@ -10,8 +10,8 @@ use super::shared::{
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::GatewayError;
 use aether_admin::provider::quota::{
-    antigravity_oauth_invalid_reason, parse_antigravity_quota_summary_response,
-    parse_antigravity_usage_response,
+    antigravity_oauth_invalid_reason, antigravity_oauth_recovery_metadata,
+    parse_antigravity_quota_summary_response, parse_antigravity_usage_response,
 };
 use aether_admin::provider::redaction::admin_provider_metadata_bucket_safe_json;
 use aether_contracts::ProxySnapshot;
@@ -463,21 +463,15 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
                     .as_deref()
                     .is_some_and(|value| value.starts_with("[ACCOUNT_BLOCK]"))
                 {
+                    if reason.starts_with("[ACCOUNT_BLOCK]") {
+                        quota_metadata = Some(merge_upstream_metadata(
+                            quota_metadata.as_ref(),
+                            &antigravity_oauth_recovery_metadata(body),
+                        ));
+                    }
                     oauth_invalid_at_unix_secs = Some(now_unix_secs);
                     oauth_invalid_reason = Some(reason);
                 }
-            }
-            if status_code == Some(403) && oauth_invalid_reason.is_none() {
-                let reason = "账户访问被禁止".to_string();
-                oauth_invalid_at_unix_secs = Some(now_unix_secs);
-                oauth_invalid_reason = Some(format!("账户访问被禁止: {reason}"));
-                let anti_meta = json!({
-                    "is_forbidden": true,
-                    "forbidden_reason": reason,
-                    "forbidden_at": now_unix_secs,
-                    "updated_at": now_unix_secs,
-                });
-                quota_metadata = Some(json!({ "antigravity": anti_meta }));
             }
         }
 

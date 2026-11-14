@@ -153,6 +153,7 @@
         <Trash2 class="w-3.5 h-3.5" />
       </Button>
     </div>
+    <ProviderAccountRecoveryLink :account="poolKey.status_snapshot?.account" />
   </div>
 </template>
 
@@ -165,6 +166,7 @@ import type { PoolKeyDetail } from '@/api/endpoints/pool'
 import { canExportOAuthCredential } from '@/features/providers/utils/providerKeyAuth'
 import type { PoolMobileActionId } from '../utils/poolMobilePresentation'
 import PoolKeyProxyPopover from './PoolKeyProxyPopover.vue'
+import ProviderAccountRecoveryLink from '@/features/providers/components/ProviderAccountRecoveryLink.vue'
 
 export type PoolKeyActionId = PoolMobileActionId
 

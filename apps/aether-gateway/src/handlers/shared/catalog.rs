@@ -459,6 +459,8 @@ fn build_provider_key_account_status_snapshot(
         "blocked": snapshot.blocked,
         "source": snapshot.source,
         "recoverable": snapshot.recoverable,
+        "validation_url": snapshot.validation_url,
+        "appeal_url": snapshot.appeal_url,
     })
 }
 
