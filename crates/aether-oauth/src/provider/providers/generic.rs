@@ -308,7 +308,11 @@ impl GenericProviderOAuthAdapter {
     ) -> Result<ProviderOAuthTokenSet, OAuthError> {
         let client_id = self.client_id();
         let client_secret = self.client_secret()?;
-        let scope = (!self.template.scopes.is_empty()).then(|| self.template.scopes.join(" "));
+        // 刷新必须沿用账号原授权范围，不能用模板 scope 扩权，否则窄授权凭据会被上游拒绝。
+        let scope = (grant_type == "authorization_code"
+            && self.template.include_scope_in_token_request
+            && !self.template.scopes.is_empty())
+        .then(|| self.template.scopes.join(" "));
         let request_id = match grant_type {
             "authorization_code" => "provider-oauth:exchange-code".to_string(),
             "refresh_token" => "provider-oauth:refresh-token".to_string(),
@@ -355,10 +359,8 @@ impl GenericProviderOAuthAdapter {
                     Value::String(code_or_refresh_token.to_string()),
                 );
             }
-            if self.template.include_scope_in_token_request {
-                if let Some(scope) = scope.as_ref() {
-                    body.insert("scope".to_string(), Value::String(scope.clone()));
-                }
+            if let Some(scope) = scope.as_ref() {
+                body.insert("scope".to_string(), Value::String(scope.clone()));
             }
             executor
                 .execute(OAuthHttpRequest {
@@ -387,10 +389,8 @@ impl GenericProviderOAuthAdapter {
                 } else {
                     form.append_pair("refresh_token", code_or_refresh_token);
                 }
-                if self.template.include_scope_in_token_request {
-                    if let Some(scope) = scope.as_ref() {
-                        form.append_pair("scope", scope);
-                    }
+                if let Some(scope) = scope.as_ref() {
+                    form.append_pair("scope", scope);
                 }
                 if let Some(client_secret) = client_secret.as_deref() {
                     form.append_pair("client_secret", client_secret);
@@ -987,7 +987,9 @@ mod tests {
     use crate::core::OAuthError;
     use crate::network::{OAuthHttpExecutor, OAuthHttpRequest, OAuthHttpResponse};
     use crate::provider::ProviderOAuthAdapter;
-    use crate::provider::{ProviderOAuthAccount, ProviderOAuthTransportContext};
+    use crate::provider::{
+        ProviderOAuthAccount, ProviderOAuthImportInput, ProviderOAuthTransportContext,
+    };
     use async_trait::async_trait;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use serde_json::{json, Value};
@@ -1066,6 +1068,125 @@ mod tests {
             );
             assert_eq!(fields["refresh_token"], "old-refresh-token");
             assert!(!format!("{adapter:?}").contains(&fields["client_secret"]));
+        }
+    }
+
+    /// 同时检查 JSON/form 请求，避免刷新与授权码交换的 scope 策略在编码分支间漂移。
+    fn captured_token_fields(
+        seen_request: &Arc<Mutex<Option<OAuthHttpRequest>>>,
+    ) -> BTreeMap<String, String> {
+        let request = seen_request.lock().expect("lock").take().expect("request");
+        if let Some(body) = request.json_body {
+            body.as_object()
+                .expect("json object")
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        value.as_str().expect("string field").to_string(),
+                    )
+                })
+                .collect()
+        } else {
+            url::form_urlencoded::parse(&request.body_bytes.expect("form body"))
+                .into_owned()
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_token_grants_omit_template_scope_for_both_encodings() {
+        for provider_type in ["antigravity", "gemini_cli", "codex", "chatgpt_web"] {
+            for uses_json_payload in [false, true] {
+                let mut template = template_for_provider_type(provider_type).expect("template");
+                template.uses_json_payload = uses_json_payload;
+                let adapter = GenericProviderOAuthAdapter::new(template)
+                    .with_oauth_credentials_for_tests("test-client", "test-secret");
+                let ctx = transport_context(provider_type);
+                let seen_request = Arc::new(Mutex::new(None));
+                let executor = StaticExecutor {
+                    seen_request: Arc::clone(&seen_request),
+                    response_payload: json!({"access_token": "new-token", "expires_in": 3600}),
+                };
+
+                adapter
+                    .import_credentials(
+                        &executor,
+                        &ctx,
+                        ProviderOAuthImportInput {
+                            provider_type: provider_type.to_string(),
+                            name: None,
+                            refresh_token: Some("import-refresh-token".to_string()),
+                            raw_credentials: None,
+                            network: ctx.network.clone(),
+                        },
+                    )
+                    .await
+                    .expect("import");
+                let fields = captured_token_fields(&seen_request);
+                assert_eq!(fields["grant_type"], "refresh_token");
+                assert_eq!(fields["refresh_token"], "import-refresh-token");
+                assert!(
+                    !fields.contains_key("scope"),
+                    "import must not request scope"
+                );
+
+                adapter
+                    .refresh(&executor, &ctx, &oauth_account(provider_type))
+                    .await
+                    .expect("refresh");
+                let fields = captured_token_fields(&seen_request);
+                assert_eq!(fields["grant_type"], "refresh_token");
+                assert_eq!(fields["refresh_token"], "old-refresh-token");
+                assert!(
+                    !fields.contains_key("scope"),
+                    "refresh must not request scope"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_code_preserves_template_scope_policy_for_both_encodings() {
+        for provider_type in ["antigravity", "gemini_cli", "codex", "chatgpt_web"] {
+            for uses_json_payload in [false, true] {
+                for include_scope in [false, true] {
+                    let mut template = template_for_provider_type(provider_type).expect("template");
+                    template.uses_json_payload = uses_json_payload;
+                    template.include_scope_in_token_request = include_scope;
+                    let adapter = GenericProviderOAuthAdapter::new(template)
+                        .with_oauth_credentials_for_tests("test-client", "test-secret");
+                    let ctx = transport_context(provider_type);
+                    let authorize = adapter
+                        .build_authorize_url(&ctx, "state", Some("challenge"))
+                        .expect("authorize");
+                    let authorize_url = url::Url::parse(&authorize.authorize_url).expect("url");
+                    let query = authorize_url
+                        .query_pairs()
+                        .into_owned()
+                        .collect::<BTreeMap<_, _>>();
+                    assert_eq!(query["scope"], template.scopes.join(" "));
+
+                    let seen_request = Arc::new(Mutex::new(None));
+                    let executor = StaticExecutor {
+                        seen_request: Arc::clone(&seen_request),
+                        response_payload: json!({"access_token": "new-token", "expires_in": 3600}),
+                    };
+                    adapter
+                        .exchange_code(&executor, &ctx, "test-code", "state", Some("verifier"))
+                        .await
+                        .expect("exchange code");
+                    let fields = captured_token_fields(&seen_request);
+                    assert_eq!(fields["grant_type"], "authorization_code");
+                    assert_eq!(fields["code"], "test-code");
+                    assert_eq!(fields["code_verifier"], "verifier");
+                    if include_scope {
+                        assert_eq!(fields["scope"], template.scopes.join(" "));
+                    } else {
+                        assert!(!fields.contains_key("scope"));
+                    }
+                }
+            }
         }
     }
 
