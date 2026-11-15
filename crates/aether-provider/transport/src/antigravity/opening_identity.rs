@@ -28,6 +28,10 @@ use regex::Regex;
 
 pub(super) const OFFICIAL_ANTIGRAVITY_IDENTITY: &str = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.";
 
+// 最近的受控 A/B 仅确认这段完整 OMP 元说明触发 429，不泛化删除 RFC 或强制约束关键词。
+const OMP_RFC_CONVENTIONS: &str = "RFC 2119 keywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL. `NEVER` = `MUST NOT`; `AVOID` = `SHOULD NOT`.";
+const OMP_NEUTRAL_CONVENTIONS: &str = "Follow mandatory requirements and prohibitions strictly. Treat recommendations as defaults and optional actions as discretionary.";
+
 const MAX_TEXT_BYTES: usize = 1_000_000;
 const MAX_IDENTITY_REPLACEMENTS: usize = 64;
 const IDENTITY_SENTENCE_LIMIT: usize = 2_048;
@@ -158,6 +162,7 @@ struct Matchers {
     atx_heading: Regex,
     fence_open: Regex,
     fence_close: Regex,
+    xml_wrapper: Regex,
 }
 
 fn matchers() -> &'static Matchers {
@@ -223,6 +228,9 @@ fn matchers() -> &'static Matchers {
             atx_heading: re(r"^#{1,6}(?:[ \t]|$)"),
             fence_open: re(r"^(`{3,}|~{3,})(.*)$"),
             fence_close: re(r"^(`{3,}|~{3,})[ \t]*$"),
+            xml_wrapper: re(
+                r#"^([ \t]*<([A-Za-z][A-Za-z0-9_.:-]*)(?:[ \t]+(?:[^<>"']|"[^"]*"|'[^']*')*)?>)(.*)(</([A-Za-z][A-Za-z0-9_.:-]*)>)(.*)$"#,
+            ),
         }
     });
     &MATCHERS
@@ -442,7 +450,85 @@ fn unwrap_emphasis(content: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// 只穿透系统语义标签，不把 example/document 等引用容器当成客户端身份。
+fn system_xml_wrapper(line: &str) -> Option<(&str, &str, &str)> {
+    let captures = matchers().xml_wrapper.captures(line)?;
+    let name = captures.get(2)?.as_str();
+    if !name.eq_ignore_ascii_case(captures.get(5)?.as_str()) {
+        return None;
+    }
+    let lowercase = name.to_ascii_lowercase();
+    if !["system", "identity", "environment"].iter().any(|base| {
+        lowercase == *base
+            || lowercase.strip_prefix(base).is_some_and(|suffix| {
+                suffix.starts_with(['-', '_', '.'])
+                    || suffix.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+            })
+    }) {
+        return None;
+    }
+    let inner = captures.get(3)?;
+    Some((&line[..inner.start()], inner.as_str(), &line[inner.end()..]))
+}
+
+fn rewrite_convention_line(line: &str, depth: usize) -> String {
+    if line.trim() == OMP_RFC_CONVENTIONS {
+        return line.replacen(OMP_RFC_CONVENTIONS, OMP_NEUTRAL_CONVENTIONS, 1);
+    }
+    if depth < 16 {
+        if let Some((prefix, inner, suffix)) = system_xml_wrapper(line) {
+            return format!(
+                "{prefix}{}{suffix}",
+                rewrite_convention_line(inner, depth + 1)
+            );
+        }
+    }
+    line.to_string()
+}
+
+/// RFC 说明自身含行内反引号，只改写完整说明行；跨行代码跨度仍原样保留。
+fn rewrite_system_conventions(text: &str) -> String {
+    if !text.contains(OMP_RFC_CONVENTIONS) {
+        return text.to_string();
+    }
+    let spans = find_code_spans(text);
+    let mut output = String::with_capacity(text.len());
+    let mut offset = 0;
+    for raw in text.split_inclusive('\n') {
+        let (line, terminator) = split_line_terminator(raw);
+        let end = offset + line.len();
+        let span_index = spans.partition_point(|&(_, stop)| stop <= offset);
+        let crosses_code = spans
+            .get(span_index)
+            .is_some_and(|&(start, stop)| start < end && (start < offset || stop > end));
+        if crosses_code {
+            output.push_str(line);
+        } else {
+            output.push_str(&rewrite_convention_line(line, 0));
+        }
+        output.push_str(terminator);
+        offset += raw.len();
+    }
+    output
+}
+
 fn process_line(line: &str, skip_identity: bool, partial_tail: bool) -> Option<String> {
+    process_line_inner(line, skip_identity, partial_tail, 0)
+}
+
+fn process_line_inner(
+    line: &str,
+    skip_identity: bool,
+    partial_tail: bool,
+    depth: usize,
+) -> Option<String> {
+    if depth < 16 {
+        if let Some((prefix, inner, suffix)) = system_xml_wrapper(line) {
+            let cleaned = process_line_inner(inner, skip_identity, partial_tail, depth + 1)
+                .unwrap_or_default();
+            return Some(format!("{prefix}{cleaned}{suffix}"));
+        }
+    }
     if !partial_tail && !line.contains('`') && matchers().billing.is_match(line) {
         return None;
     }
@@ -614,6 +700,8 @@ fn sanitize_fragment(fragment: &str, starts_after_code: bool, ends_before_code: 
 
 /// 行内代码按实体内容原样复制，身份匹配只作用于其两侧的散文。
 fn sanitize_paragraph(text: &str) -> String {
+    let rewritten = rewrite_system_conventions(text);
+    let text = rewritten.as_str();
     let spans = find_code_spans(text);
     if spans.is_empty() {
         return sanitize_fragment(text, false, false);
