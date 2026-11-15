@@ -8154,15 +8154,13 @@ mod tests {
                     vec!["key-paid".to_string()],
                     "page_size={page_size}, sticky={sticky}"
                 );
-                assert!(
-                    cursor
-                        .skip_reason_counts
-                        .get("key_model_disabled")
-                        .copied()
-                        .unwrap_or(0)
-                        >= 2,
-                    "page_size={page_size}, sticky={sticky}"
-                );
+                // 目录未就绪与已发现但无权限的账号必须保留不同诊断。
+                for reason in ["key_model_disabled", "codex_model_catalog_not_ready"] {
+                    assert!(
+                        cursor.skip_reason_counts.get(reason).copied().unwrap_or(0) >= 1,
+                        "page_size={page_size}, sticky={sticky}, reason={reason}"
+                    );
+                }
             }
         }
 

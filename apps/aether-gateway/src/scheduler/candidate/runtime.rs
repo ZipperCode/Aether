@@ -1030,7 +1030,7 @@ mod tests {
         };
         assert_eq!(
             current_candidate_runtime_skip_reason(&candidate, &snapshot, 100),
-            Some("key_model_disabled")
+            Some("codex_model_catalog_not_ready")
         );
 
         snapshot

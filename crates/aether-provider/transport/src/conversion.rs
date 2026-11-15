@@ -1050,7 +1050,7 @@ mod tests {
                 advanced_candidate,
                 Some("codex-pro-alias"),
             ),
-            Some("key_model_disabled")
+            Some("codex_model_catalog_not_ready")
         );
 
         for text_format in ["openai:responses:compact", "openai:search"] {
@@ -1066,7 +1066,7 @@ mod tests {
                     },
                     Some("gpt-basic-test"),
                 ),
-                Some("key_model_disabled")
+                Some("codex_model_catalog_not_ready")
             );
         }
 
