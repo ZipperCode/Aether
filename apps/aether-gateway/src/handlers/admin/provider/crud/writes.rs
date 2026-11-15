@@ -180,6 +180,21 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
         else {
             return Ok(Some(build_admin_providers_data_unavailable_response()));
         };
+        if existing_provider
+            .config
+            .as_ref()
+            .and_then(|config| config.pointer("/pool_advanced/antigravity/tos_pause_enabled"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && updated_record
+                .config
+                .as_ref()
+                .and_then(|config| config.pointer("/pool_advanced/antigravity/tos_pause_enabled"))
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            crate::orchestration::clear_antigravity_pool_pause(state.app(), &provider_id).await?;
+        }
         if state
             .fixed_provider_template(&updated_record.provider_type)
             .is_some()

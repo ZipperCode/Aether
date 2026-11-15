@@ -6,6 +6,7 @@ use crate::AppState;
 
 mod adaptive;
 mod antigravity_model_quota;
+mod antigravity_pool_pause;
 mod attempt;
 mod classifier;
 mod codex_quota_breaker;
@@ -31,11 +32,16 @@ pub(crate) use self::antigravity_model_quota::{
     record_antigravity_model_quota_exhaustion_with_auth_config, AntigravityModelQuotaCandidate,
     AntigravityModelQuotaEvidence, AntigravityModelQuotaRefreshCapture,
 };
+pub(crate) use self::antigravity_pool_pause::{
+    antigravity_pool_pause_blocks_plan, antigravity_pool_pause_stops_failover,
+    antigravity_tos_violation_response, clear_antigravity_pool_pause,
+};
 pub(crate) use self::attempt::{
     attempt_identity_from_report_context, insert_pool_key_lease_report_context_fields,
     local_execution_candidate_metadata_from_report_context, next_same_key_retry_attempt,
-    ExecutionAttemptIdentity, LocalExecutionCandidateMetadata, POOL_KEY_RETRY_INDEX_STRIDE,
-    ROUTING_POOL_POLICY_OVERRIDE_REPORT_FIELD, SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
+    next_same_key_retry_index, ExecutionAttemptIdentity, LocalExecutionCandidateMetadata,
+    POOL_KEY_RETRY_INDEX_STRIDE, ROUTING_POOL_POLICY_OVERRIDE_REPORT_FIELD,
+    SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
 };
 pub(crate) use self::classifier::{
     classify_anthropic_failure_disposition, classify_failure_disposition, classify_local_failover,

@@ -1,5 +1,6 @@
 mod account;
 mod auth;
+mod neutralization;
 mod policy;
 mod request;
 mod schema;
@@ -19,6 +20,7 @@ pub use auth::{
     resolve_local_antigravity_request_auth, AntigravityRequestAuth, AntigravityRequestAuthSupport,
     AntigravityRequestAuthUnsupportedReason, ANTIGRAVITY_PROVIDER_TYPE,
 };
+pub use neutralization::apply_antigravity_identity_neutralization;
 pub use policy::{
     classify_local_antigravity_request_support, is_antigravity_provider_transport,
     AntigravityRequestSideSpec, AntigravityRequestSideSupport,

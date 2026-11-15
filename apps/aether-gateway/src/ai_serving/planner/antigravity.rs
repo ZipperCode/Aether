@@ -6,11 +6,12 @@ use sha2::{Digest, Sha256};
 
 use crate::ai_serving::transport::antigravity::{
     antigravity_account_observation_due, antigravity_model_thinking_variant,
-    build_antigravity_safe_v1internal_request, build_antigravity_static_identity_headers,
-    classify_local_antigravity_request_support, AntigravityEnvelopeRequestType,
-    AntigravityRequestAuth, AntigravityRequestAuthUnsupportedReason,
-    AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
-    AntigravityRequestSideUnsupportedReason, AntigravityThinkingLevel,
+    apply_antigravity_identity_neutralization, build_antigravity_safe_v1internal_request,
+    build_antigravity_static_identity_headers, classify_local_antigravity_request_support,
+    AntigravityEnvelopeRequestType, AntigravityRequestAuth,
+    AntigravityRequestAuthUnsupportedReason, AntigravityRequestEnvelopeSupport,
+    AntigravityRequestSideSupport, AntigravityRequestSideUnsupportedReason,
+    AntigravityThinkingLevel,
 };
 use crate::ai_serving::transport::{
     build_standard_provider_request_headers, GatewayProviderTransportSnapshot,
@@ -66,6 +67,7 @@ pub(crate) async fn build_antigravity_v1internal_provider_request(
         input.trace_id,
         input.mapped_model,
         input.gemini_request_body,
+        input.same_format,
     )
     .await?;
     apply_antigravity_session_continuity(
@@ -129,6 +131,7 @@ async fn build_antigravity_v1internal_payload(
     trace_id: &str,
     mapped_model: &str,
     gemini_request_body: &Value,
+    same_format: bool,
 ) -> Result<AntigravityV1InternalPayload, AntigravityV1InternalRequestError> {
     let mut resolved_transport = Arc::clone(transport);
     let mut antigravity_support = classify_local_antigravity_request_support(
@@ -175,7 +178,7 @@ async fn build_antigravity_v1internal_payload(
         }
     };
 
-    let body = match build_antigravity_safe_v1internal_request(
+    let mut body = match build_antigravity_safe_v1internal_request(
         &auth,
         trace_id,
         mapped_model,
@@ -187,6 +190,11 @@ async fn build_antigravity_v1internal_payload(
             return Err(AntigravityV1InternalRequestError::EnvelopeUnsupported);
         }
     };
+    apply_antigravity_identity_neutralization(
+        &mut body,
+        resolved_transport.provider.config.as_ref(),
+        same_format,
+    );
 
     Ok(AntigravityV1InternalPayload {
         transport: resolved_transport,

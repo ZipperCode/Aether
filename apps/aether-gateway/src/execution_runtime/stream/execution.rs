@@ -7145,6 +7145,50 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             };
         let error_response_text =
             local_failover_response_text(client_body_json.as_ref(), &client_error_body, None);
+        // 已提交输出或超出原预算时不得短重试；成功调度只走现有 Candidate 路径。
+        if retry_scope_out.is_some()
+            && crate::execution_runtime::antigravity_retry::wait_for_short_retry(
+                state,
+                &plan,
+                report_context.as_ref(),
+                status_code,
+                provider_body_json.as_ref(),
+                error_response_text.as_deref(),
+                stream_started_at,
+                stream_precommit_committed,
+            )
+            .await
+        {
+            if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
+                *retry_scope = AiAttemptRetryScope::Candidate;
+            }
+            record_local_request_candidate_status(
+                state,
+                &plan,
+                report_context.as_ref(),
+                SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Failed,
+                    status_code: Some(status_code),
+                    error_type: Some("retryable_upstream_status".to_string()),
+                    error_message: Some(format!(
+                        "execution runtime stream returned retryable status {status_code}"
+                    )),
+                    latency_ms: Some(stream_elapsed_ms_since(stream_started_at)),
+                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                    finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+                },
+            )
+            .await;
+            debug!(
+                event_name = "local_stream_antigravity_short_retry_scheduled",
+                log_type = "event",
+                trace_id = %trace_id,
+                request_id = %request_id_for_log,
+                candidate_index = candidate_index.as_str(),
+                "gateway scheduling existing same-key retry after Antigravity RetryInfo delay"
+            );
+            return Ok(None);
+        }
         if endpoint_capability_mismatch {
             apply_local_execution_effect(
                 state,
@@ -7339,7 +7383,18 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             )
             .await;
         }
-        let failover_decision = failover_analysis.decision;
+        let tos_pool_paused = crate::orchestration::antigravity_pool_pause_stops_failover(
+            state,
+            &plan,
+            status_code,
+            error_response_text.as_deref(),
+        )
+        .await;
+        let failover_decision = if tos_pool_paused {
+            LocalFailoverDecision::RetryNextCandidate
+        } else {
+            failover_analysis.decision
+        };
         debug!(
             event_name = "execution_runtime_stream_failover_decided",
             log_type = "debug",
@@ -7363,14 +7418,14 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 status_code,
             );
             if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
-                *retry_scope = if crate::execution_runtime::antigravity_signature::is_antigravity_signature_plan(&plan, report_context.as_ref())
-                    && provider_body_json.as_ref().is_some_and(|body| aether_provider_transport::antigravity::classify_antigravity_thought_signature_rejection(status_code, body).is_some()) {
+                *retry_scope = if tos_pool_paused || (crate::execution_runtime::antigravity_signature::is_antigravity_signature_plan(&plan, report_context.as_ref())
+                    && provider_body_json.as_ref().is_some_and(|body| aether_provider_transport::antigravity::classify_antigravity_thought_signature_rejection(status_code, body).is_some())) {
                     AiAttemptRetryScope::Provider
                 } else {
                     ai_attempt_retry_scope_from_failure_disposition(failure_disposition)
                 };
             }
-            if failure_disposition.preserve_upstream_error {
+            if tos_pool_paused || failure_disposition.preserve_upstream_error {
                 if let Some(retry_fallback) = retry_fallback_out.as_deref_mut() {
                     let mut fallback_headers = headers.clone();
                     apply_endpoint_response_header_rules(

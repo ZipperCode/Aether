@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub(crate) mod admission;
+pub(crate) mod antigravity_retry;
 pub(crate) mod antigravity_signature;
 pub(crate) mod attempt_cancellation;
 pub(crate) mod attempt_lifecycle;

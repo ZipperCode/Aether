@@ -866,6 +866,15 @@ export interface PoolScoreRules {
   probe_failure_cooldown_threshold?: number | null
 }
 
+export interface AntigravityAdvancedConfig {
+  tos_pause_enabled?: boolean
+  tos_pause_seconds?: number
+  short_retry_enabled?: boolean
+  short_retry_max_delay_ms?: number
+  identity_neutralization_enabled?: boolean
+  identity_neutralization_rules?: Array<{ match: string, replacement: string }>
+}
+
 export interface PoolAdvancedConfig {
   // deprecated: hidden from pool advanced dialog, retained for backward-compatible reads
   global_priority?: number | null
@@ -914,6 +923,7 @@ export interface PoolAdvancedConfig {
   account_self_check_concurrency?: number | null
   auto_remove_banned_keys?: boolean
   auto_remove_quota_exhausted_keys?: boolean
+  antigravity?: AntigravityAdvancedConfig
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

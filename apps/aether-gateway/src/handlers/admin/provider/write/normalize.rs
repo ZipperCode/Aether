@@ -217,9 +217,71 @@ pub(crate) fn normalize_pool_advanced_config(
     match value {
         serde_json::Value::Null => Ok(None),
         // `pool_advanced: {}` still means "enable pool mode with defaults".
-        serde_json::Value::Object(map) => Ok(Some(serde_json::Value::Object(map))),
+        serde_json::Value::Object(map) => {
+            if let Some(settings) = map.get("antigravity") {
+                validate_antigravity_advanced_config(settings)?;
+            }
+            Ok(Some(serde_json::Value::Object(map)))
+        }
         _ => Err("pool_advanced 必须是 JSON 对象".to_string()),
     }
+}
+
+pub(crate) fn validate_antigravity_advanced_config(
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let config = value
+        .as_object()
+        .ok_or("pool_advanced.antigravity 必须是 JSON 对象")?;
+    for field in [
+        "tos_pause_enabled",
+        "short_retry_enabled",
+        "identity_neutralization_enabled",
+    ] {
+        if config.get(field).is_some_and(|value| !value.is_boolean()) {
+            return Err(format!("antigravity.{field} 必须是布尔值"));
+        }
+    }
+    for (field, max) in [
+        ("tos_pause_seconds", 86400),
+        ("short_retry_max_delay_ms", 7000),
+    ] {
+        if let Some(value) = config.get(field) {
+            if !value
+                .as_u64()
+                .is_some_and(|value| (1..=max).contains(&value))
+            {
+                return Err(format!("antigravity.{field} 必须是 1 到 {max} 之间的整数"));
+            }
+        }
+    }
+    if let Some(rules) = config.get("identity_neutralization_rules") {
+        let rules = rules.as_array().ok_or("身份中和规则必须是数组")?;
+        if rules.len() > 32 {
+            return Err("身份中和规则不能超过 32 条".to_string());
+        }
+        let mut matches = std::collections::BTreeSet::new();
+        for rule in rules {
+            let rule = rule.as_object().ok_or("身份中和规则必须是对象")?;
+            let source = rule
+                .get("match")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty() && text.len() <= 16384)
+                .ok_or("身份中和 match 必须是非空字符串，且不超过 16384 字节")?;
+            let replacement = rule
+                .get("replacement")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("身份中和 replacement 必须是字符串")?;
+            if replacement.len() > 16384 {
+                return Err("身份中和 replacement 不能超过 16384 字节".to_string());
+            }
+            // 重复匹配没有隐式优先级；拒绝歧义而不是依赖规则顺序。
+            if !matches.insert(source) {
+                return Err("身份中和 match 不能重复".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_chat_pii_redaction_config(
@@ -354,6 +416,37 @@ mod tests {
             normalize_pool_advanced_config(Some(json!({}))).expect("empty object should normalize"),
             Some(json!({}))
         );
+    }
+
+    #[test]
+    fn normalize_pool_advanced_validates_antigravity_boundaries() {
+        let config = json!({"antigravity": {
+            "tos_pause_enabled": true, "tos_pause_seconds": 900,
+            "short_retry_enabled": true, "short_retry_max_delay_ms": 2000,
+            "identity_neutralization_enabled": true,
+            "identity_neutralization_rules": [{"match": "exact system text", "replacement": ""}]
+        }, "unrelated": {"preserve": true}});
+        assert_eq!(
+            normalize_pool_advanced_config(Some(config.clone())).unwrap(),
+            Some(config)
+        );
+        for settings in [
+            json!(true),
+            json!({"tos_pause_enabled": "true"}),
+            json!({"tos_pause_seconds": 0}),
+            json!({"tos_pause_seconds": 86401}),
+            json!({"short_retry_max_delay_ms": 7001}),
+            json!({"short_retry_max_delay_ms": 1.5}),
+            json!({"identity_neutralization_rules": [{"match": "", "replacement": "x"}]}),
+            json!({"identity_neutralization_rules": [{"match": "x"}]}),
+            json!({"identity_neutralization_rules": [
+                {"match": "x", "replacement": "a"}, {"match": "x", "replacement": "b"}
+            ]}),
+        ] {
+            assert!(
+                normalize_pool_advanced_config(Some(json!({"antigravity": settings}))).is_err()
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,116 @@
     @update:model-value="emit('update:modelValue', $event)"
   >
     <div class="max-h-[calc(100dvh-13rem)] space-y-5 overflow-y-auto overscroll-contain pr-1 sm:max-h-[min(72vh,42rem)] sm:space-y-6 sm:pr-2">
+      <section
+        v-if="isAntigravity"
+        class="space-y-4 rounded-2xl border border-border/60 bg-card/70 p-4 sm:p-5"
+      >
+        <div class="space-y-1">
+          <h3 class="text-sm font-semibold">
+            {{ t('providers.local.antigravityProtection') }}
+          </h3>
+          <p class="text-xs leading-5 text-muted-foreground">
+            {{ t('providers.local.antigravityProtectionHint') }}
+          </p>
+        </div>
+        <div class="space-y-2">
+          <div class="flex items-center justify-between gap-3">
+            <Label for="antigravity-tos-pause">{{ t('providers.local.antigravityTosPause') }}</Label>
+            <Switch
+              id="antigravity-tos-pause"
+              v-model="antigravityForm.tos_pause_enabled"
+            />
+          </div>
+          <p class="text-xs leading-5 text-muted-foreground">
+            {{ t('providers.local.antigravityTosPauseHint') }}
+          </p>
+          <div
+            v-if="antigravityForm.tos_pause_enabled"
+            class="space-y-1.5"
+          >
+            <Label for="antigravity-pause-seconds">{{ t('providers.local.antigravityPauseSeconds') }}</Label>
+            <Input
+              id="antigravity-pause-seconds"
+              v-model="antigravityForm.tos_pause_seconds"
+              type="number"
+              min="1"
+              max="86400"
+            />
+          </div>
+        </div>
+        <div class="space-y-2">
+          <div class="flex items-center justify-between gap-3">
+            <Label for="antigravity-short-retry">{{ t('providers.local.antigravityShortRetry') }}</Label>
+            <Switch
+              id="antigravity-short-retry"
+              v-model="antigravityForm.short_retry_enabled"
+            />
+          </div>
+          <p class="text-xs leading-5 text-muted-foreground">
+            {{ t('providers.local.antigravityShortRetryHint') }}
+          </p>
+          <div
+            v-if="antigravityForm.short_retry_enabled"
+            class="space-y-1.5"
+          >
+            <Label for="antigravity-retry-ms">{{ t('providers.local.antigravityRetryDelayMs') }}</Label>
+            <Input
+              id="antigravity-retry-ms"
+              v-model="antigravityForm.short_retry_max_delay_ms"
+              type="number"
+              min="1"
+              max="7000"
+            />
+          </div>
+        </div>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between gap-3">
+            <Label for="antigravity-neutralization">{{ t('providers.local.antigravityNeutralization') }}</Label>
+            <Switch
+              id="antigravity-neutralization"
+              v-model="antigravityForm.identity_neutralization_enabled"
+            />
+          </div>
+          <p class="text-xs leading-5 text-muted-foreground">
+            {{ t('providers.local.antigravityNeutralizationHint') }}
+          </p>
+          <template v-if="antigravityForm.identity_neutralization_enabled">
+            <div
+              v-for="(rule, index) in antigravityForm.identity_neutralization_rules"
+              :key="index"
+              class="space-y-2 rounded-xl border border-border/60 p-3"
+            >
+              <Label :for="`antigravity-rule-match-${index}`">{{ t('providers.local.antigravityRuleMatch') }}</Label>
+              <textarea
+                :id="`antigravity-rule-match-${index}`"
+                v-model="rule.match"
+                rows="3"
+                class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+              <Label :for="`antigravity-rule-replacement-${index}`">{{ t('providers.local.antigravityRuleReplacement') }}</Label>
+              <textarea
+                :id="`antigravity-rule-replacement-${index}`"
+                v-model="rule.replacement"
+                rows="3"
+                class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+              <Button
+                variant="outline"
+                @click="antigravityForm.identity_neutralization_rules.splice(index, 1)"
+              >
+                {{ t('providers.local.antigravityRemoveRule') }}
+              </Button>
+            </div>
+            <Button
+              variant="outline"
+              :disabled="antigravityForm.identity_neutralization_rules.length >= 32"
+              @click="antigravityForm.identity_neutralization_rules.push({ match: '', replacement: '' })"
+            >
+              {{ t('providers.local.antigravityAddRule') }}
+            </Button>
+          </template>
+        </div>
+      </section>
       <section class="space-y-4 rounded-2xl border border-border/60 bg-card/70 p-4 sm:p-5">
         <div class="space-y-1">
           <div class="flex flex-wrap items-center gap-2">
@@ -538,6 +648,16 @@ const isClaudeCode = computed(() => {
   return (props.providerType || '').trim().toLowerCase() === 'claude_code'
 })
 
+const isAntigravity = computed(() => (props.providerType || '').trim().toLowerCase() === 'antigravity')
+const antigravityForm = ref({
+  tos_pause_enabled: false,
+  tos_pause_seconds: 900 as number | string,
+  short_retry_enabled: false,
+  short_retry_max_delay_ms: 2000 as number | string,
+  identity_neutralization_enabled: false,
+  identity_neutralization_rules: [] as Array<{ match: string, replacement: string }>,
+})
+
 const healthToggleCards = buildPoolHealthToggleCards()
 const cooldownFieldLayout = buildPoolCooldownFieldLayout()
 
@@ -636,6 +756,15 @@ watch([() => props.modelValue, () => props.providerId], ([open]) => {
   const cfg = props.currentConfig
   const scoreRules = cfg?.score_rules
   const scoreWeights = scoreRules?.weights
+  const antigravity = cfg?.antigravity
+  antigravityForm.value = {
+    tos_pause_enabled: antigravity?.tos_pause_enabled ?? false,
+    tos_pause_seconds: antigravity?.tos_pause_seconds ?? 900,
+    short_retry_enabled: antigravity?.short_retry_enabled ?? false,
+    short_retry_max_delay_ms: antigravity?.short_retry_max_delay_ms ?? 2000,
+    identity_neutralization_enabled: antigravity?.identity_neutralization_enabled ?? false,
+    identity_neutralization_rules: antigravity?.identity_neutralization_rules?.map(rule => ({ ...rule })) ?? [],
+  }
   form.value = {
     rate_limit_cooldown_seconds: cfg?.rate_limit_cooldown_seconds ?? null,
     overload_cooldown_seconds: cfg?.overload_cooldown_seconds ?? null,
@@ -731,6 +860,15 @@ async function handleSave() {
       ignore_exhausted_accounts: form.value.ignore_exhausted_accounts,
     })
 
+    if (isAntigravity.value) {
+      poolAdvanced.antigravity = {
+        ...latestAdvanced?.antigravity,
+        ...antigravityForm.value,
+        tos_pause_seconds: Number(antigravityForm.value.tos_pause_seconds),
+        short_retry_max_delay_ms: Number(antigravityForm.value.short_retry_max_delay_ms),
+        identity_neutralization_rules: antigravityForm.value.identity_neutralization_rules.map(rule => ({ ...rule })),
+      }
+    }
     const payload: Parameters<typeof updateProvider>[1] = {
       pool_advanced: poolAdvanced as PoolAdvancedConfig,
     }

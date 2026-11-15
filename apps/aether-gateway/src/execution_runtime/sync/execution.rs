@@ -3065,6 +3065,48 @@ async fn execute_execution_runtime_sync_impl(
             }
         }
 
+        // 短等待只消费现有 Candidate 预算；不得先写 429 冷却再绕过调度器重发。
+        if retry_scope_out.is_some() && crate::execution_runtime::antigravity_retry::wait_for_short_retry(
+            state,
+            &plan,
+            report_context.as_ref(),
+            result.status_code,
+            body_json.as_ref(),
+            local_failover_response_text.as_deref(),
+            candidate_started_at,
+            false,
+        )
+        .await
+        {
+            if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
+                *retry_scope = AiAttemptRetryScope::Candidate;
+            }
+            record_local_request_candidate_status(
+                state,
+                &plan,
+                report_context.as_ref(),
+                SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Failed,
+                    status_code: Some(result.status_code),
+                    error_type: result_error_type.clone(),
+                    error_message: result_error_message.clone(),
+                    latency_ms: Some(elapsed_ms_since(candidate_started_at)),
+                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                    finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+                },
+            )
+            .await;
+            debug!(
+                event_name = "local_sync_antigravity_short_retry_scheduled",
+                log_type = "event",
+                trace_id = %trace_id,
+                request_id = %plan_request_id_for_log,
+                candidate_index = candidate_index.as_str(),
+                "gateway scheduling existing same-key retry after Antigravity RetryInfo delay"
+            );
+            return Ok(None);
+        }
+
         let local_failover_analysis = analyze_local_candidate_failover_sync(
             state,
             &plan,
@@ -3327,7 +3369,10 @@ async fn execute_execution_runtime_sync_impl(
         .await;
         return Ok(None);
     }
-    if matches!(
+    let tos_pool_paused = crate::orchestration::antigravity_pool_pause_stops_failover(
+        state, &plan, result.status_code, local_failover_response_text.as_deref(),
+    ).await;
+    if tos_pool_paused || matches!(
         local_failover_analysis.decision,
         LocalFailoverDecision::RetryNextCandidate
     ) {
@@ -3337,11 +3382,11 @@ async fn execute_execution_runtime_sync_impl(
             result.status_code,
         );
         if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
-            *retry_scope = if signature_rejected { AiAttemptRetryScope::Provider } else {
+            *retry_scope = if signature_rejected || tos_pool_paused { AiAttemptRetryScope::Provider } else {
                 ai_attempt_retry_scope_from_failure_disposition(failure_disposition)
             };
         }
-        if failure_disposition.preserve_upstream_error {
+        if tos_pool_paused || failure_disposition.preserve_upstream_error {
             if let Some(retry_fallback) = retry_fallback_out.as_deref_mut() {
                 let mut fallback_headers = headers.clone();
                 apply_endpoint_response_header_rules(

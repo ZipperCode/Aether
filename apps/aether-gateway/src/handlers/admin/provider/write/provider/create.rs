@@ -192,6 +192,14 @@ pub(crate) async fn build_admin_create_provider_record(
         set_responses_websocket_enabled(&mut config_map, enabled)?;
     }
     validate_responses_websocket_config(&config_map)?;
+    if let Some(settings) = config_map
+        .get("pool_advanced")
+        .and_then(|pool| pool.get("antigravity"))
+    {
+        crate::handlers::admin::provider::write::normalize::validate_antigravity_advanced_config(
+            settings,
+        )?;
+    }
     let config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
     crate::provider_transport::validate_anthropic_compatibility_profile_config(config.as_ref())
         .map_err(|_| "无效的 Anthropic compatibility profile".to_string())?;

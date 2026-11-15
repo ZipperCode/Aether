@@ -273,6 +273,15 @@ where
     type Error = GatewayError;
 
     async fn should_skip_attempt(&self, attempt: &T) -> Result<bool, Self::Error> {
+        if crate::orchestration::antigravity_pool_pause_blocks_plan(
+            self.state,
+            attempt.execution_plan(),
+        )
+        .await
+        .unwrap_or(false)
+        {
+            return Ok(true);
+        }
         Ok(should_skip_provider_transfer_attempt(
             self.transfer_tracker,
             self.trace_id,
@@ -309,7 +318,30 @@ where
         &self,
         attempt: &T,
     ) -> Result<AiAttemptExecutionOutcome<Self::Response>, Self::Error> {
-        let plan = attempt.execution_plan();
+        let elapsed = self
+            .transfer_tracker
+            .state
+            .lock()
+            .await
+            .global
+            .first_attempt_started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let Some(adjusted_plan) =
+            crate::execution_runtime::antigravity_retry::plan_with_remaining_budget(
+                self.state,
+                attempt.execution_plan(),
+                attempt.report_context_ref(),
+                elapsed,
+            )
+            .await
+        else {
+            return Ok(AiAttemptExecutionOutcome::Retry {
+                scope: AiAttemptRetryScope::Provider,
+                fallback_response: None,
+            });
+        };
+        let plan = &adjusted_plan;
         let report_context = attach_plan_usage_reservation_token(
             attempt.report_context(),
             self.transfer_tracker.usage_policy_reservation_token(),
@@ -1266,6 +1298,15 @@ where
     type Error = GatewayError;
 
     async fn should_skip_attempt(&self, attempt: &T) -> Result<bool, Self::Error> {
+        if crate::orchestration::antigravity_pool_pause_blocks_plan(
+            self.state,
+            attempt.execution_plan(),
+        )
+        .await
+        .unwrap_or(false)
+        {
+            return Ok(true);
+        }
         Ok(should_skip_provider_transfer_attempt(
             self.transfer_tracker,
             self.trace_id,
@@ -1302,7 +1343,30 @@ where
         &self,
         attempt: &T,
     ) -> Result<AiAttemptExecutionOutcome<Self::Response>, Self::Error> {
-        let plan = attempt.execution_plan();
+        let elapsed = self
+            .transfer_tracker
+            .state
+            .lock()
+            .await
+            .global
+            .first_attempt_started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let Some(adjusted_plan) =
+            crate::execution_runtime::antigravity_retry::plan_with_remaining_budget(
+                self.state,
+                attempt.execution_plan(),
+                attempt.report_context_ref(),
+                elapsed,
+            )
+            .await
+        else {
+            return Ok(AiAttemptExecutionOutcome::Retry {
+                scope: AiAttemptRetryScope::Provider,
+                fallback_response: None,
+            });
+        };
+        let plan = &adjusted_plan;
         let report_context = attach_plan_usage_reservation_token(
             attempt.report_context(),
             self.transfer_tracker.usage_policy_reservation_token(),
