@@ -259,7 +259,7 @@ fn is_simple_owner(owner: &str) -> bool {
         return false;
     }
     let words: Vec<&str> = owner
-        .split(|character| character == ' ' || character == '\t')
+        .split([' ', '\t'])
         .filter(|word| !word.is_empty())
         .collect();
     if words.is_empty() || words.len() > MAX_OWNER_WORDS {
@@ -360,7 +360,7 @@ fn match_identity(sentence: &str, punctuation: Option<char>) -> Option<String> {
         }
         if matchers.non_authorship.is_match(clause) {
             let first = owner
-                .split(|character| character == ' ' || character == '\t')
+                .split([' ', '\t'])
                 .next()
                 .unwrap_or_default()
                 .to_lowercase();
