@@ -27,6 +27,7 @@ export const CANDIDATE_SKIP_REASON_LABELS: Record<string, string> = {
   key_rpm_exhausted: '密钥本分钟请求数已达上限',
   key_model_disabled: '该密钥已停用此模型',
   key_model_not_allowed: '该密钥不允许使用此模型',
+  codex_model_catalog_not_ready: 'Codex 账号模型目录未就绪，请获取模型；若获取失败请检查账号授权',
   codex_plan_image_generation_unsupported: 'Codex Free 套餐不支持图片生成',
   key_api_format_disabled: '该密钥已停用此 API 格式',
   get api_key_concurrency_limit_reached() { return translate('ui.theCallerApiKeyConcurrencyLimitHasBeenReached') },

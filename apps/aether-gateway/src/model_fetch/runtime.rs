@@ -47,11 +47,7 @@ pub(crate) fn spawn_model_fetch_worker(state: AppState) -> Option<tokio::task::J
         crate::task_runtime::TASK_KEY_MODEL_FETCH_WORKER,
         |state| async move {
             if model_fetch_startup_enabled() {
-                let startup_delay = model_fetch_startup_delay_seconds();
-                if startup_delay > 0 {
-                    tokio::time::sleep(Duration::from_secs(startup_delay)).await;
-                }
-                if let Err(err) = run_model_fetch_cycle(&state, "startup").await {
+                if let Err(err) = run_startup_model_fetch_cycle(&state).await {
                     warn!(
                         error = %safe_model_fetch_error(&err.clone().into_message()),
                         "gateway model fetch startup failed"
@@ -205,7 +201,7 @@ where
     S: ModelFetchRuntimeState + ?Sized,
 {
     let targets = collect_fetch_targets(state, None, None).await?;
-    execute_fetch_targets(state, targets, true).await
+    execute_fetch_targets(state, targets, true, false).await
 }
 
 async fn perform_model_fetch_for_keys_with_state<S>(
@@ -217,7 +213,7 @@ where
     S: ModelFetchRuntimeState + ?Sized,
 {
     let targets = collect_fetch_targets(state, Some(provider_id), Some(key_ids)).await?;
-    execute_fetch_targets(state, targets, false).await
+    execute_fetch_targets(state, targets, false, false).await
 }
 
 async fn collect_fetch_targets<S>(
@@ -311,6 +307,40 @@ where
     Ok(targets)
 }
 
+/// 旧 Codex OAuth 账号没有真实目录时无法服务，先补抓，再延迟处理普通刷新目标。
+/// 复用自动抓取目标筛选，绝不绕过账号开关，也不在请求路径触发远端调用。
+async fn run_startup_model_fetch_cycle<S>(state: &S) -> Result<(), GatewayError>
+where
+    S: ModelFetchRuntimeState + ?Sized,
+{
+    let targets = collect_fetch_targets(state, None, None).await?;
+    execute_fetch_targets(state, targets, true, true).await?;
+    Ok(())
+}
+
+fn target_needs_codex_catalog(target: &SelectedFetchTarget) -> bool {
+    target
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+        && target.key.auth_type.trim().eq_ignore_ascii_case("oauth")
+        && !crate::provider_transport::codex_oauth_model_catalog_ready(
+            target.key.upstream_metadata.as_ref(),
+        )
+        && target.endpoints.iter().any(|endpoint| {
+            aether_ai_formats::api_format_alias_matches(&endpoint.api_format, "openai:responses")
+                || aether_ai_formats::api_format_alias_matches(
+                    &endpoint.api_format,
+                    "openai:responses:compact",
+                )
+                || aether_ai_formats::api_format_alias_matches(
+                    &endpoint.api_format,
+                    "openai:search",
+                )
+        })
+}
+
 /// Keep only non-secret provider metadata in a background fetch target.  The
 /// authoritative transport snapshot is reopened by ID immediately before a
 /// request, so carrying stored proxy/config JSON here would needlessly retain
@@ -340,8 +370,9 @@ fn sanitize_model_fetch_endpoint(
 /// 顺序执行本轮抓取目标，并将 Provider 全量白名单可用性核对合并为每个成功 Provider 一次。
 async fn execute_fetch_targets<S>(
     state: &S,
-    targets: Vec<SelectedFetchTarget>,
+    mut targets: Vec<SelectedFetchTarget>,
     reconcile_automatic_bindings: bool,
+    startup: bool,
 ) -> Result<ModelFetchRunSummary, GatewayError>
 where
     S: ModelFetchRuntimeState + ?Sized,
@@ -356,7 +387,19 @@ where
     let mut provider_fetch_authority = BTreeMap::<String, (bool, BTreeSet<String>)>::new();
     let mut provider_failed_endpoint_ids = BTreeMap::<String, BTreeSet<String>>::new();
     let mut successful_provider_ids = BTreeSet::new();
+    if startup {
+        // 稳定分组保留原顺序，并在同一轮汇总全部账号，避免分批覆盖 Provider 模型集合。
+        targets.sort_by_key(|target| !target_needs_codex_catalog(target));
+    }
+    let mut startup_delay_pending = startup;
     for target in targets {
+        if startup_delay_pending && !target_needs_codex_catalog(&target) {
+            startup_delay_pending = false;
+            let delay = model_fetch_startup_delay_seconds();
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+            }
+        }
         let target_endpoint_ids = target
             .endpoints
             .iter()
@@ -1763,6 +1806,76 @@ mod tests {
         let mut model = sample_provider_model(id, provider_id, provider_model_name);
         model.provider_model_mappings = Some(json!([{ "name": alias }]));
         model
+    }
+
+    #[tokio::test]
+    async fn startup_backfills_missing_codex_catalog_before_regular_refresh() {
+        let provider = sample_provider("provider-codex", "codex");
+        let endpoint = sample_endpoint("responses", "provider-codex", "openai:responses");
+        let mut ready = sample_key("ready", "provider-codex", "oauth", &["openai:responses"]);
+        ready.upstream_metadata = Some(json!({"codex_model_discovery": {"model_ids": ["old"]}}));
+        let missing = sample_key("missing", "provider-codex", "oauth", &["openai:responses"]);
+        let mut disabled = sample_key("disabled", "provider-codex", "oauth", &["openai:responses"]);
+        disabled.auto_fetch_models = false;
+        let transports = ["ready", "missing"]
+            .into_iter()
+            .map(|key_id| {
+                (
+                    (
+                        "provider-codex".to_string(),
+                        "responses".to_string(),
+                        key_id.to_string(),
+                    ),
+                    sample_transport(
+                        "codex",
+                        "provider-codex",
+                        "responses",
+                        key_id,
+                        "openai:responses",
+                        "oauth",
+                        Some(r#"{"access_token":"test-token","account_id":"test-account"}"#),
+                    ),
+                )
+            })
+            .collect();
+        let state = TestState::new(
+            vec![provider],
+            vec![endpoint],
+            vec![ready, missing, disabled],
+            transports,
+            vec![
+                execution_result(json!({"models": [{"slug": "discovered"}]})),
+                execution_result(json!({"models": [{"slug": "regular"}]})),
+            ],
+        );
+        let worker_state = state.clone();
+        let worker =
+            tokio::spawn(async move { super::run_startup_model_fetch_cycle(&worker_state).await });
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if crate::provider_transport::codex_oauth_model_catalog_ready(
+                    state.key("missing").upstream_metadata.as_ref(),
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        worker.abort();
+        let _ = worker.await;
+        observed.expect("missing catalog must not wait for the normal startup delay");
+        let updates = state
+            .upstream_metadata_updates
+            .lock()
+            .expect("updates mutex");
+        assert_eq!(updates[0].0, "missing");
+        assert!(updates.iter().all(|update| update.0 != "disabled"));
+        assert_eq!(
+            state.key("missing").upstream_metadata.unwrap()["codex_model_discovery"]["model_ids"],
+            json!(["discovered"])
+        );
+        assert!(state.key("disabled").upstream_metadata.is_none());
     }
 
     #[tokio::test]

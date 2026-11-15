@@ -1814,8 +1814,8 @@ async fn codex_model_discovery_denies_missing_or_failed_initial_catalog_and_reco
         .expect("candidates should load");
     let missing_diag = format!("{missing_candidates:?}");
     assert!(
-        missing_diag.contains("key_model_disabled"),
-        "missing evidence must record key_model_disabled: {missing_diag}"
+        missing_diag.contains("codex_model_catalog_not_ready"),
+        "missing evidence must record catalog readiness: {missing_diag}"
     );
 
     let free_summary = harness.fetch_key_models(&harness.free_key_id).await;
@@ -1850,7 +1850,7 @@ async fn codex_model_discovery_denies_missing_or_failed_initial_catalog_and_reco
         .list_by_request_id(failed_trace)
         .await
         .expect("candidates should load");
-    assert!(format!("{failed_candidates:?}").contains("key_model_disabled"));
+    assert!(format!("{failed_candidates:?}").contains("codex_model_catalog_not_ready"));
 
     harness.set_paid_catalog(UpstreamCatalogReply::models(
         "etag-paid-recovered",
@@ -1882,6 +1882,47 @@ async fn codex_model_discovery_denies_missing_or_failed_initial_catalog_and_reco
             .load_stored_key(&harness.paid_key_id)
             .await
             .auto_fetch_models
+    );
+}
+
+#[test]
+fn codex_model_discovery_startup_backfill_restores_serving_without_manual_refresh() {
+    run_async_test_on_large_stack(
+        "codex_model_discovery_startup_backfill_restores_serving_without_manual_refresh",
+        async {
+            let mut builder = FixtureBuilder::new("startup-backfill");
+            builder.free_account.auto_fetch_models = false;
+            let harness = builder.build().await;
+            let worker =
+                crate::model_fetch::spawn_model_fetch_worker(harness.gateway_state.clone())
+                    .expect("model fetch worker should spawn");
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let key = harness.load_stored_key(&harness.paid_key_id).await;
+                    if crate::provider_transport::codex_oauth_model_catalog_ready(
+                        key.upstream_metadata.as_ref(),
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            worker.abort();
+            let _ = worker.await;
+            result.expect("legacy account must be fetched before normal startup delay");
+            assert_eq!(harness.counts().free_catalog, 0);
+            assert_eq!(harness.counts().paid_catalog, 1);
+            let (status, body, _) = harness
+                .post_responses(
+                    "trace-codex-startup-backfill",
+                    &json!({"model": ADVANCED_MODEL, "input": "Reply OK", "stream": true}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(harness.counts().paid_gen, 1);
+            assert_eq!(harness.counts().free_gen, 0);
+        },
     );
 }
 

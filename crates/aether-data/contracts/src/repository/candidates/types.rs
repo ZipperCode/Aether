@@ -28,6 +28,7 @@ define_candidate_diagnostic_categories!(
         "auth_api_key_concurrency_limit_reached",
         "auth_channel_mismatch",
         "auth_snapshot_missing",
+        "codex_model_catalog_not_ready",
         "codex_plan_image_generation_unsupported",
         "endpoint_api_format_changed",
         "endpoint_capability_quarantined",

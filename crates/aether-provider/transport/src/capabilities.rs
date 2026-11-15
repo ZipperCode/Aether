@@ -132,40 +132,39 @@ pub fn codex_oauth_discovered_model_skip_reason(
         return Some("key_model_disabled");
     }
 
-    let Some(model_ids) = upstream_metadata
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get(CODEX_MODEL_DISCOVERY_NAMESPACE))
-        .and_then(Value::as_object)
-        .and_then(|discovery| discovery.get("model_ids"))
-        .and_then(Value::as_array)
-    else {
-        return Some("key_model_disabled");
+    let Some(model_ids) = codex_oauth_discovered_model_ids(upstream_metadata) else {
+        return Some("codex_model_catalog_not_ready");
     };
 
-    if model_ids.is_empty() {
-        return Some("key_model_disabled");
-    }
-
-    // 命中后仍检查剩余条目，避免混入畸形身份的目录被部分放行。
-    let mut matched = false;
-    for entry in model_ids {
-        let Some(model_id) = entry.as_str() else {
-            return Some("key_model_disabled");
-        };
-        let trimmed = model_id.trim();
-        if trimmed.is_empty() || trimmed.len() != model_id.len() {
-            return Some("key_model_disabled");
-        }
-        if model_id == selected_model {
-            matched = true;
-        }
-    }
-
-    if matched {
+    if model_ids
+        .iter()
+        .any(|entry| entry.as_str() == Some(selected_model))
+    {
         None
     } else {
         Some("key_model_disabled")
     }
+}
+
+/// 判断账号是否已有结构有效的真实发现目录，不以旧模型卡片或允许名单代替。
+pub fn codex_oauth_model_catalog_ready(upstream_metadata: Option<&Value>) -> bool {
+    codex_oauth_discovered_model_ids(upstream_metadata).is_some()
+}
+
+/// 空目录是成功抓取的有效结果；缺失或畸形目录不能作为账号模型准入证据。
+fn codex_oauth_discovered_model_ids(upstream_metadata: Option<&Value>) -> Option<&Vec<Value>> {
+    let model_ids = upstream_metadata?
+        .get(CODEX_MODEL_DISCOVERY_NAMESPACE)?
+        .get("model_ids")?
+        .as_array()?;
+    model_ids
+        .iter()
+        .all(|entry| {
+            entry
+                .as_str()
+                .is_some_and(|id| !id.trim().is_empty() && id.trim() == id)
+        })
+        .then_some(model_ids)
 }
 
 #[cfg(test)]
@@ -285,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_model_discovery_helper_rejects_missing_malformed_empty_and_tainted_arrays() {
+    fn codex_model_discovery_helper_distinguishes_unready_from_empty_and_restricted_catalogs() {
         assert_eq!(
             codex_oauth_discovered_model_skip_reason(
                 "codex",
@@ -294,7 +293,7 @@ mod tests {
                 "gpt-6.1-sol",
                 None,
             ),
-            Some("key_model_disabled")
+            Some("codex_model_catalog_not_ready")
         );
 
         for invalid_metadata in [
@@ -314,7 +313,6 @@ mod tests {
             json!({"codex_model_discovery": {"model_ids": null}}),
             json!({"codex_model_discovery": {"model_ids": "gpt-6.1-sol"}}),
             json!({"codex_model_discovery": {"model_ids": {"gpt-6.1-sol": true}}}),
-            json!({"codex_model_discovery": {"model_ids": []}}),
             json!({"codex_model_discovery": {"model_ids": ["gpt-6.1-sol", 123]}}),
             json!({"codex_model_discovery": {"model_ids": ["gpt-6.1-sol", null]}}),
             json!({"codex_model_discovery": {"model_ids": ["gpt-6.1-sol", false]}}),
@@ -334,10 +332,23 @@ mod tests {
                     "gpt-6.1-sol",
                     Some(&invalid_metadata),
                 ),
-                Some("key_model_disabled"),
+                Some("codex_model_catalog_not_ready"),
                 "invalid metadata should be rejected: {invalid_metadata}"
             );
         }
+
+        let empty_catalog = json!({"codex_model_discovery": {"model_ids": []}});
+        assert!(codex_oauth_model_catalog_ready(Some(&empty_catalog)));
+        assert_eq!(
+            codex_oauth_discovered_model_skip_reason(
+                "codex",
+                "oauth",
+                "openai:responses",
+                "gpt-6.1-sol",
+                Some(&empty_catalog),
+            ),
+            Some("key_model_disabled")
+        );
 
         let valid_metadata = json!({
             "codex_model_discovery": {

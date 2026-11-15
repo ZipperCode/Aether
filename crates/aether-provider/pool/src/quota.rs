@@ -680,9 +680,10 @@ fn provider_pool_quota_reaches_reserve(
             })
             .collect::<Vec<_>>();
         if !generic_matches.is_empty() {
-            let exhausted = account_signal.unwrap_or_else(|| {
-                provider_pool_any_window_exhausted(generic_matches, observed_at, reserve_ratio)
-            });
+            // 乐观账号摘要不能覆盖仍有效的短窗或周窗；任一适用窗口耗尽都必须阻断。
+            let windows_exhausted =
+                provider_pool_any_window_exhausted(generic_matches, observed_at, reserve_ratio);
+            let exhausted = windows_exhausted || account_signal.unwrap_or(false);
             if resolved.is_none()
                 || provider_pool_should_replace_model_quota_resolution(
                     resolved.as_ref().and_then(|(observed_at, _)| *observed_at),

@@ -16,6 +16,7 @@ describe('candidate skip reason formatting', () => {
     expect(formatCandidateSkipReason('pool_key_quota_exhausted')).toContain('需管理员手动恢复')
     expect(formatCandidateSkipReason('pool_key_state_unavailable')).toBe('无法读取号池密钥状态')
     expect(formatCandidateSkipReason('codex_plan_image_generation_unsupported')).toBe('Codex Free 套餐不支持图片生成')
+    expect(formatCandidateSkipReason('codex_model_catalog_not_ready')).toContain('模型目录未就绪')
     expect(formatCandidateSkipReason(UNCLASSIFIED_CANDIDATE_SKIP_REASON)).toBe('未归类的调度原因')
   })
 

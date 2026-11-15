@@ -62,6 +62,12 @@ impl ProviderPoolAdapter for CodexProviderPoolAdapter {
         if let Some(quota_snapshot) =
             provider_pool_member_quota_snapshot(input.key, input.provider_type)
         {
+            if provider_pool_source_account_quota_exhausted(quota_snapshot) == Some(true)
+                || codex_window_used_percent_exhausted(quota_snapshot, "primary")
+                || codex_window_used_percent_exhausted(quota_snapshot, "secondary")
+            {
+                return true;
+            }
             let explicitly_exhausted = provider_pool_json_bool(quota_snapshot.get("allowed"))
                 == Some(false)
                 || provider_pool_json_bool(quota_snapshot.get("limit_reached")) == Some(true);
@@ -95,7 +101,6 @@ impl ProviderPoolAdapter for CodexProviderPoolAdapter {
         }
         codex_explicit_quota_block_active(input.key, input.provider_type)
     }
-
     fn quota_refresh_endpoint(
         &self,
         endpoints: &[StoredProviderCatalogEndpoint],
@@ -105,7 +110,6 @@ impl ProviderPoolAdapter for CodexProviderPoolAdapter {
             provider_pool_endpoint_format_matches(endpoint, "openai:responses")
         })
     }
-
     fn quota_refresh_missing_endpoint_message(&self) -> String {
         "找不到有效的 openai:responses 端点".to_string()
     }
@@ -349,20 +353,24 @@ pub(crate) fn quota_exhausted_from_bucket(bucket: &Map<String, Value>) -> bool {
             return true;
         }
     }
-    if allowed == Some(true) || limit_reached == Some(false) {
+    let account_windows_exhausted = provider_pool_source_account_quota_exhausted(bucket);
+    let flat_windows_exhausted = codex_window_used_percent_exhausted(bucket, "primary")
+        || codex_window_used_percent_exhausted(bucket, "secondary");
+    // allowed/limit_reached 的乐观组合不能否定仍有效的五小时或周窗口。
+    if (allowed == Some(true) || limit_reached == Some(false))
+        && account_windows_exhausted != Some(true)
+        && !flat_windows_exhausted
+    {
         return false;
     }
     if provider_pool_json_bool(bucket.get("credits_unlimited")) == Some(true) {
         return false;
     }
-    let account_windows_exhausted = provider_pool_source_account_quota_exhausted(bucket);
     let has_window_data = provider_pool_json_f64(bucket.get("primary_used_percent")).is_some()
         || provider_pool_json_f64(bucket.get("secondary_used_percent")).is_some()
         || account_windows_exhausted.is_some();
     if !has_window_data && provider_pool_json_bool(bucket.get("has_credits")) == Some(false) {
         return true;
     }
-    account_windows_exhausted == Some(true)
-        || codex_window_used_percent_exhausted(bucket, "primary")
-        || codex_window_used_percent_exhausted(bucket, "secondary")
+    account_windows_exhausted == Some(true) || flat_windows_exhausted
 }

@@ -1474,7 +1474,7 @@ mod tests {
             }))),
             "codex",
         ));
-        assert!(!provider_pool_key_account_quota_exhausted(
+        assert!(provider_pool_key_account_quota_exhausted(
             &sample_key(Some(json!({
                 "codex": {
                     "allowed": true,
@@ -1503,6 +1503,55 @@ mod tests {
             &explicit_codex_limit,
             "codex",
         ));
+    }
+
+    #[test]
+    fn codex_optimistic_summary_cannot_override_either_active_window() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let service = ProviderPoolService::with_builtin_adapters();
+        for exhausted_code in ["5h", "weekly"] {
+            for expired in [false, true] {
+                for snapshot in [false, true] {
+                    let quota = json!({
+                        "provider_type": "codex", "version": 2,
+                        "allowed": true, "limit_reached": false, "exhausted": false,
+                        "updated_at": now,
+                        "windows": [
+                            {"code": "5h", "used_ratio": if exhausted_code == "5h" {1.0} else {0.2},
+                             "reset_at": if expired && exhausted_code == "5h" {now - 1} else {now + 3600}},
+                            {"code": "weekly", "used_ratio": if exhausted_code == "weekly" {1.0} else {0.2},
+                             "reset_at": if expired && exhausted_code == "weekly" {now - 1} else {now + 7200}},
+                            {"code": "spark_weekly", "used_ratio": 0.1, "reset_at": now + 7200}
+                        ]
+                    });
+                    let mut key = sample_key(None);
+                    if snapshot {
+                        key.status_snapshot = Some(json!({"quota": quota}));
+                    } else {
+                        key.upstream_metadata = Some(json!({"codex": quota}));
+                    }
+                    assert_eq!(
+                        provider_pool_key_account_quota_exhausted(&key, "codex"),
+                        !expired
+                    );
+                    assert_eq!(
+                        provider_pool_key_model_quota_exhausted(&key, "codex", "gpt-standard"),
+                        Some(!expired)
+                    );
+                    let standard =
+                        service.member_signals("codex", &key, None, Some("gpt-standard"));
+                    assert_eq!(standard.quota_exhausted, !expired);
+                    assert!(!standard.quota_hard_blocked);
+                    let independent =
+                        service.member_signals("codex", &key, None, Some("gpt-spark"));
+                    assert!(!independent.quota_exhausted);
+                    assert!(!independent.quota_hard_blocked);
+                }
+            }
+        }
     }
 
     #[test]
@@ -3833,8 +3882,8 @@ mod tests {
     fn codex_account_and_model_quota_agree_on_explicit_allow_and_deny_flags() {
         let service = ProviderPoolService::with_builtin_adapters();
         for (flags, exhausted) in [
-            (json!({ "allowed": true }), false),
-            (json!({ "limit_reached": false }), false),
+            (json!({ "allowed": true }), true),
+            (json!({ "limit_reached": false }), true),
             (json!({ "allowed": true, "limit_reached": true }), true),
             (json!({ "allowed": false, "limit_reached": false }), true),
         ] {
@@ -3855,8 +3904,6 @@ mod tests {
                         exhausted,
                         "flags={flags}, use_windows={use_windows}, model={model:?}"
                     );
-                    // The opt-in reserve still protects a numerically full
-                    // window even when the upstream reports it as allowed.
                     assert!(provider_pool_key_minimum_quota_reached(
                         &key, "codex", model
                     ));

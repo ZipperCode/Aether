@@ -2772,6 +2772,7 @@ fn local_execution_runtime_miss_skip_reason_label(reason: &str) -> &str {
         }
         "auth_channel_mismatch" => "认证通道不匹配",
         "auth_snapshot_missing" => "API Key 本地执行配置缺失",
+        "codex_model_catalog_not_ready" => "Codex 账号模型目录未就绪，请获取模型并检查账号授权",
         "endpoint_api_format_changed" => "端点 API 格式已变更",
         "endpoint_capability_quarantined" => "端点能力已被运行时隔离",
         "endpoint_inactive" => "端点未启用",
