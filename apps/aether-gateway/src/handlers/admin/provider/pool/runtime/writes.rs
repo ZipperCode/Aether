@@ -548,15 +548,13 @@ pub(crate) async fn record_admin_provider_pool_error(
 
 fn error_body_indicates_quota_exhaustion(error_body: Option<&str>) -> bool {
     let body = error_body.unwrap_or_default().to_ascii_lowercase();
+    // RESOURCE_EXHAUSTED 不是明确的额度耗尽证据，裸错误仍按临时限流冷却。
     [
         "quota exhausted",
         "quota_exhausted",
         "quota exceeded",
         "quota_exceeded",
         "insufficient_quota",
-        "resource exhausted",
-        "resource has been exhausted",
-        "resource_exhausted",
         "usage_limit_reached",
         "limit_reached",
         "quota limit reached",
@@ -832,6 +830,17 @@ mod tests {
         assert!(!error_body_indicates_quota_exhaustion(Some(
             r#"{"error":{"message":"temporary rate limit"}}"#,
         )));
+        for message in [
+            "Resource exhausted",
+            "Resource has been exhausted",
+            "RESOURCE_EXHAUSTED",
+        ] {
+            let body =
+                serde_json::json!({"error": {"status": "RESOURCE_EXHAUSTED", "message": message}});
+            assert!(!error_body_indicates_quota_exhaustion(Some(
+                &body.to_string()
+            )));
+        }
     }
 
     #[tokio::test]

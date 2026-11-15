@@ -1525,11 +1525,7 @@ fn probe_result_hard_state(item: &Value) -> Option<PoolMemberHardState> {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    // Providers frequently encode an exhausted account as HTTP 429 with a
-    // provider-specific status/message (for example RESOURCE_EXHAUSTED or
-    // `quota exceeded`) rather than the normalized `quota_exhausted` status.
-    // Preserve that distinction in the score so the member stays out of the
-    // scheduler until a successful quota probe observes a reset.
+    // 仅明确额度耗尽证据才能形成持久阻断；RESOURCE_EXHAUSTED 也可能是瞬时限流。
     let serialized_item = item.to_string().to_ascii_lowercase();
     let status_code = item.get("status_code").and_then(Value::as_u64);
     if status == "quota_exhausted"
@@ -1663,9 +1659,6 @@ fn contains_quota_exhaustion_marker(value: &str) -> bool {
         "quota exceeded",
         "quota_exceeded",
         "insufficient_quota",
-        "resource exhausted",
-        "resource has been exhausted",
-        "resource_exhausted",
         "usage_limit_reached",
         "limit_reached",
         "quota limit reached",
@@ -2728,6 +2721,24 @@ mod tests {
         // When / Then: OAuth serving probes continue to drive their historical hard states.
         for (outcome, expected) in outcomes {
             assert_eq!(probe_result_hard_state(&outcome), Some(expected));
+        }
+    }
+
+    #[test]
+    fn bare_resource_exhaustion_keeps_transient_probe_hard_state() {
+        for message in [
+            "Resource exhausted",
+            "Resource has been exhausted",
+            "RESOURCE_EXHAUSTED",
+        ] {
+            assert_eq!(
+                probe_result_hard_state(&json!({
+                    "status": "failed",
+                    "status_code": 429,
+                    "error": {"status": "RESOURCE_EXHAUSTED", "message": message}
+                })),
+                Some(PoolMemberHardState::Cooldown)
+            );
         }
     }
 

@@ -73,6 +73,7 @@ struct AccountMockPolicy {
 enum AntigravityUpstreamErrorKind {
     ModelQuota,
     AccountRateLimit,
+    BareResourceExhausted,
     AccountVerification,
     AccountTosViolation,
     GenericForbidden,
@@ -91,8 +92,21 @@ impl AntigravityUpstreamErrorFixture {
             AntigravityUpstreamErrorKind::AccountTosViolation
             | AntigravityUpstreamErrorKind::GenericForbidden => 403,
             AntigravityUpstreamErrorKind::ModelQuota
-            | AntigravityUpstreamErrorKind::AccountRateLimit => 429,
+            | AntigravityUpstreamErrorKind::AccountRateLimit
+            | AntigravityUpstreamErrorKind::BareResourceExhausted => 429,
         }
+    }
+
+    fn headers(self) -> BTreeMap<String, String> {
+        let mut headers =
+            BTreeMap::from([("content-type".to_string(), "application/json".to_string())]);
+        if self.kind != AntigravityUpstreamErrorKind::BareResourceExhausted {
+            headers.insert(
+                "retry-after".to_string(),
+                self.retry_after_seconds.to_string(),
+            );
+        }
+        headers
     }
 
     fn body(self, model: &str) -> serde_json::Value {
@@ -103,6 +117,11 @@ impl AntigravityUpstreamErrorFixture {
             AntigravityUpstreamErrorKind::AccountRateLimit => {
                 antigravity_rate_limit_error_body(model, self.retry_after_seconds)
             }
+            AntigravityUpstreamErrorKind::BareResourceExhausted => json!({"error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "message": "Resource has been exhausted"
+            }}),
             AntigravityUpstreamErrorKind::AccountVerification => {
                 antigravity_account_verification_body()
             }
@@ -934,6 +953,7 @@ impl AntigravityHttpHarness {
         is_account_a: bool,
         provider_model: &str,
         retry_after_seconds: u64,
+        kind: AntigravityUpstreamErrorKind,
     ) {
         self.mock_state
             .lock()
@@ -943,7 +963,7 @@ impl AntigravityHttpHarness {
                 (is_account_a, provider_model.to_string()),
                 AntigravityUpstreamErrorFixture {
                     retry_after_seconds,
-                    kind: AntigravityUpstreamErrorKind::AccountRateLimit,
+                    kind,
                 },
             );
     }
@@ -1414,22 +1434,12 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
                                 .copied()
                         };
                         if let Some(generation_error) = generation_error {
-                            let retry_after_seconds = generation_error.retry_after_seconds;
                             let error_body = generation_error.body(&plan_model);
                             let result = aether_contracts::ExecutionResult {
                                 request_id: plan.request_id,
                                 candidate_id: plan.candidate_id,
                                 status_code: generation_error.status_code(),
-                                headers: BTreeMap::from([
-                                    (
-                                        "content-type".to_string(),
-                                        "application/json".to_string(),
-                                    ),
-                                    (
-                                        "retry-after".to_string(),
-                                        retry_after_seconds.to_string(),
-                                    ),
-                                ]),
+                                headers: generation_error.headers(),
                                 response_observation: None,
                                 body: Some(aether_contracts::ResponseBody {
                                     json_body: Some(error_body),
@@ -1691,17 +1701,13 @@ async fn start_antigravity_http_harness(config: AntigravityHttpConfig) -> Antigr
                             .copied()
                     };
                     if let Some(generation_error) = generation_error {
-                        let retry_after_seconds = generation_error.retry_after_seconds;
                         let error_text = generation_error.body(&plan_model).to_string();
                         frames.push(json!({
                             "type": "headers",
                             "payload": {
                                 "kind": "headers",
                                 "status_code": generation_error.status_code(),
-                                "headers": {
-                                    "content-type": "application/json",
-                                    "retry-after": retry_after_seconds.to_string()
-                                }
+                                "headers": generation_error.headers()
                             }
                         }));
                         frames.push(json!({
@@ -3570,11 +3576,30 @@ async fn run_antigravity_runtime_quota_isolation_mode(pool_enabled: bool) {
 fn gateway_antigravity_generic_rate_limit_remains_account_scoped() {
     run_gemini_cli_sync_test(
         "gateway_antigravity_generic_rate_limit_remains_account_scoped",
-        gateway_antigravity_generic_rate_limit_remains_account_scoped_impl,
+        || {
+            gateway_antigravity_generic_rate_limit_remains_account_scoped_impl(
+                AntigravityUpstreamErrorKind::AccountRateLimit,
+            )
+        },
     );
 }
 
-async fn gateway_antigravity_generic_rate_limit_remains_account_scoped_impl() {
+// 没有 Retry-After、模型标识或额度证据的 429 只能触发临时冷却，不能标为额度耗尽。
+#[test]
+fn gateway_antigravity_bare_resource_exhausted_remains_transient() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_bare_resource_exhausted_remains_transient",
+        || {
+            gateway_antigravity_generic_rate_limit_remains_account_scoped_impl(
+                AntigravityUpstreamErrorKind::BareResourceExhausted,
+            )
+        },
+    );
+}
+
+async fn gateway_antigravity_generic_rate_limit_remains_account_scoped_impl(
+    error_kind: AntigravityUpstreamErrorKind,
+) {
     let mode_label = "pool";
     let primary_model = ANTIGRAVITY_RUNTIME_PRIMARY_MODEL;
     let secondary_model = ANTIGRAVITY_RUNTIME_SECONDARY_MODEL;
@@ -3616,7 +3641,7 @@ async fn gateway_antigravity_generic_rate_limit_remains_account_scoped_impl() {
         "{mode_label}: both models should warm on account A"
     );
 
-    harness.set_generation_rate_limit_error(true, primary_model, 20);
+    harness.set_generation_rate_limit_error(true, primary_model, 20, error_kind);
     assert_gemini_model_completion(
         harness
             .send_generate_model_with_thinking_level(

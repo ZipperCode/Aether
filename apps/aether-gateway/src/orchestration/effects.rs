@@ -2771,15 +2771,13 @@ fn pool_score_hard_state_for_status(
 
 fn error_body_indicates_quota_exhaustion(error_body: Option<&str>) -> bool {
     let body = error_body.unwrap_or_default().to_ascii_lowercase();
+    // RESOURCE_EXHAUSTED 也可能表示瞬时容量或限流，不能单凭它写入持久额度阻断。
     [
         "quota exhausted",
         "quota_exhausted",
         "quota exceeded",
         "quota_exceeded",
         "insufficient_quota",
-        "resource exhausted",
-        "resource has been exhausted",
-        "resource_exhausted",
         "usage_limit_reached",
         "limit_reached",
         "quota limit reached",
@@ -4380,6 +4378,21 @@ mod tests {
             ),
             Some(PoolMemberHardState::QuotaExhausted)
         );
+    }
+
+    #[test]
+    fn bare_resource_exhaustion_keeps_transient_pool_hard_state() {
+        for message in [
+            "Resource exhausted",
+            "Resource has been exhausted",
+            "RESOURCE_EXHAUSTED",
+        ] {
+            let body = json!({"error": {"status": "RESOURCE_EXHAUSTED", "message": message}});
+            assert_eq!(
+                pool_score_hard_state_for_status(429, Some(&body.to_string())),
+                Some(PoolMemberHardState::Cooldown)
+            );
+        }
     }
 
     #[tokio::test]
