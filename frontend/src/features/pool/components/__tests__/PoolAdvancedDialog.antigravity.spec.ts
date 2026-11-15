@@ -66,6 +66,7 @@ describe('Antigravity advanced settings', () => {
       future_option: true, tos_pause_enabled: true, tos_pause_seconds: 900,
       short_retry_enabled: true, short_retry_max_delay_ms: 2000,
       identity_neutralization_enabled: true,
+      identity_neutralization_mode: 'exact',
       identity_neutralization_rules: [{ match: 'Exact system text', replacement: '' }],
     })
   })
@@ -85,6 +86,37 @@ describe('Antigravity advanced settings', () => {
     button('移除规则').click()
     await settle()
     expect(config.antigravity.identity_neutralization_rules).toEqual([{ match: 'x', replacement: 'y' }])
+    expect(document.getElementById('antigravity-rule-match-0')).toBeNull()
+  })
+  it('shows and saves opening identity mode while retaining inactive exact rules', async () => {
+    const config: PoolAdvancedConfig = { antigravity: {
+      identity_neutralization_enabled: true,
+      identity_neutralization_rules: [{ match: 'keep exact rule', replacement: 'replacement' }],
+    } }
+    mountDialog('antigravity', config)
+    await settle()
+    const mode = document.getElementById('antigravity-neutralization-mode') as HTMLSelectElement
+    expect(mode.value).toBe('exact')
+    mode.value = 'opening_identity'
+    mode.dispatchEvent(new Event('change', { bubbles: true }))
+    await settle()
+    expect(document.getElementById('antigravity-rule-match-0')).toBeNull()
+    expect(document.body.textContent).toContain('不保证上游接受或避免账号限制')
+    button('保存').click()
+    await settle()
+    const saved = api.updateProvider.mock.calls[0]![1].pool_advanced.antigravity
+    expect(saved.identity_neutralization_mode).toBe('opening_identity')
+    expect(saved.identity_neutralization_enabled).toBe(true)
+    expect(saved.identity_neutralization_rules).toEqual(config.antigravity!.identity_neutralization_rules)
+    expect(config.antigravity!.identity_neutralization_mode).toBeUndefined()
+  })
+  it('loads saved opening identity mode', async () => {
+    mountDialog('antigravity', { antigravity: {
+      identity_neutralization_enabled: true,
+      identity_neutralization_mode: 'opening_identity',
+    } })
+    await settle()
+    expect((document.getElementById('antigravity-neutralization-mode') as HTMLSelectElement).value).toBe('opening_identity')
     expect(document.getElementById('antigravity-rule-match-0')).toBeNull()
   })
 })

@@ -872,6 +872,7 @@ export interface AntigravityAdvancedConfig {
   short_retry_enabled?: boolean
   short_retry_max_delay_ms?: number
   identity_neutralization_enabled?: boolean
+  identity_neutralization_mode?: 'exact' | 'opening_identity'
   identity_neutralization_rules?: Array<{ match: string, replacement: string }>
 }
 

@@ -2,11 +2,23 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
+#[path = "opening_identity.rs"]
+mod opening_identity;
+
+use opening_identity::sanitize_system_text;
+
 const MAX_IDENTITY_NEUTRALIZATION_RULES: usize = 32;
 const MAX_IDENTITY_NEUTRALIZATION_TEXT_BYTES: usize = 16_384;
 
-/// 仅在跨格式 Antigravity 请求中按显式规则替换完整的系统指令文本 part。
-/// 同格式请求保持透传；未启用、缺少配置或规则格式无效时均不修改请求。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NeutralizationMode {
+    Exact,
+    OpeningIdentity,
+}
+
+/// 仅在跨格式 Antigravity 请求中处理系统指令文本 part。
+/// exact 保持完整 part 显式规则替换；opening_identity 只归一化明确的开场身份。
+/// 同格式请求保持透传；未启用、模式无效或对应配置无效时均不修改请求。
 pub fn apply_antigravity_identity_neutralization(
     envelope: &mut Value,
     provider_config: Option<&Value>,
@@ -29,6 +41,52 @@ pub fn apply_antigravity_identity_neutralization(
     {
         return;
     }
+    let mode = match antigravity.get("identity_neutralization_mode") {
+        None => NeutralizationMode::Exact,
+        Some(Value::String(mode)) if mode == "exact" => NeutralizationMode::Exact,
+        Some(Value::String(mode)) if mode == "opening_identity" => {
+            NeutralizationMode::OpeningIdentity
+        }
+        _ => return,
+    };
+
+    if mode == NeutralizationMode::OpeningIdentity {
+        // 新模式不读取、不校验也不串联 exact 规则；每个 part 独立处理。
+        let Some(parts) = envelope
+            .get_mut("request")
+            .and_then(Value::as_object_mut)
+            .and_then(|request| request.get_mut("systemInstruction"))
+            .and_then(Value::as_object_mut)
+            .and_then(|system_instruction| system_instruction.get_mut("parts"))
+            .and_then(Value::as_array_mut)
+        else {
+            return;
+        };
+        for part in parts {
+            let Some(part) = part.as_object_mut() else {
+                continue;
+            };
+            // 与 Gemini 系统 part 语义一致：思维、签名及显式非文本 part 不属于处理范围。
+            if part.get("thought").and_then(Value::as_bool) == Some(true)
+                || part.contains_key("thoughtSignature")
+                || part.contains_key("thought_signature")
+                || part
+                    .get("type")
+                    .is_some_and(|kind| kind.as_str() != Some("text"))
+            {
+                continue;
+            }
+            let Some(text) = part.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            let sanitized = sanitize_system_text(text);
+            if sanitized != text {
+                part.insert("text".to_string(), Value::String(sanitized));
+            }
+        }
+        return;
+    }
+
     let Some(rules) = antigravity
         .get("identity_neutralization_rules")
         .and_then(Value::as_array)
@@ -92,7 +150,9 @@ pub fn apply_antigravity_identity_neutralization(
 mod tests {
     use serde_json::{json, Value};
 
-    use super::apply_antigravity_identity_neutralization;
+    use super::{
+        apply_antigravity_identity_neutralization, opening_identity::OFFICIAL_ANTIGRAVITY_IDENTITY,
+    };
 
     fn envelope(system_text: &str) -> Value {
         json!({
@@ -115,6 +175,21 @@ mod tests {
             antigravity["identity_neutralization_enabled"] = Value::Bool(enabled);
         }
         json!({"pool_advanced": {"antigravity": antigravity}})
+    }
+
+    fn opening_config() -> Value {
+        json!({
+            "pool_advanced": {"antigravity": {
+                "identity_neutralization_enabled": true,
+                "identity_neutralization_mode": "opening_identity"
+            }}
+        })
+    }
+
+    fn opening_text(body: &Value) -> &str {
+        body["request"]["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .expect("首个系统 part 必须包含文本")
     }
 
     #[test]
@@ -242,5 +317,218 @@ mod tests {
             cross_format["request"]["systemInstruction"]["parts"][0]["text"],
             "neutral system prompt"
         );
+    }
+
+    #[test]
+    fn opening_identity_transforms_supported_clients_and_retains_following_text() {
+        let cases = [
+            (
+                "You are DSH, an automated software development harness designed for agentic coding workflows.",
+                OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
+            ),
+            (
+                "You are opencode, an interactive CLI tool that helps users with software engineering tasks. Use the available tools.",
+                format!("{OFFICIAL_ANTIGRAVITY_IDENTITY} Use the available tools."),
+            ),
+            (
+                "You are Codex, a coding agent based on GPT-5. You and the user share one workspace.",
+                format!("{OFFICIAL_ANTIGRAVITY_IDENTITY} You and the user share one workspace."),
+            ),
+            (
+                "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+                OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
+            ),
+            (
+                "You are Hermes Agent, an intelligent AI assistant created by Nous Research. Be direct.",
+                format!("{OFFICIAL_ANTIGRAVITY_IDENTITY} Be direct."),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let mut body = envelope(input);
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+            assert_eq!(opening_text(&body), expected, "输入：{input}");
+        }
+    }
+
+    #[test]
+    fn opening_identity_handles_multiple_identities_without_rewriting_constraints() {
+        let stem = OFFICIAL_ANTIGRAVITY_IDENTITY
+            .strip_suffix('.')
+            .expect("官方身份必须有句号");
+        let mut body = envelope(
+            "You are an AI agent powered by DeepSeek Harness.\nYou are an assistant created by Acme, keep /tmp/Aether, tool_call and x-anthropic-billing-header: required.",
+        );
+
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+
+        assert_eq!(
+            opening_text(&body),
+            format!(
+                "{OFFICIAL_ANTIGRAVITY_IDENTITY}\n{stem}, keep /tmp/Aether, tool_call and x-anthropic-billing-header: required."
+            )
+        );
+    }
+
+    #[test]
+    fn opening_identity_preserves_fenced_inline_and_indented_code() {
+        let input = "You are DSH.\n```text\nYou are Codex.\nx-anthropic-billing-header: secret\n```\n\n`You are DSH.` and ``You are Codex.``\n\n    You are DSH.\n\tx-anthropic-billing-header: code";
+        let expected = input.replacen("You are DSH.", OFFICIAL_ANTIGRAVITY_IDENTITY, 1);
+        let mut body = envelope(input);
+
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+
+        assert_eq!(opening_text(&body), expected);
+    }
+
+    #[test]
+    fn opening_identity_removes_only_standalone_billing_lines() {
+        let stem = OFFICIAL_ANTIGRAVITY_IDENTITY
+            .strip_suffix('.')
+            .expect("官方身份必须有句号");
+        let mut body = envelope(
+            "   x-anthropic-billing-header: cc_version=2; cch=123;\nYou are an assistant created by Acme, retain x-anthropic-billing-header: as a tool rule.\nMetadata x-anthropic-billing-header: keep this path /tmp/a.",
+        );
+
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+
+        assert_eq!(
+            opening_text(&body),
+            format!(
+                "{stem}, retain x-anthropic-billing-header: as a tool rule.\nMetadata x-anthropic-billing-header: keep this path /tmp/a."
+            )
+        );
+    }
+
+    #[test]
+    fn opening_identity_preserves_uncertain_and_non_identity_text() {
+        let cases = [
+            "You are DSH?",
+            "Are you an AI assistant created by OpenAI?",
+            "You are Clineage.",
+            "You are an assistant created by Acme and Bob.",
+            "You are an assistant created by acme.com.",
+            "You are a coding agent running in read-only mode.",
+            "You are an assistant designed for secure code review.",
+            "You are an AI agent created by `Acme`. Follow rules.",
+            "Use OpenAI at https://api.openai.com/v1 and retain Anthropic tool documentation.",
+            "Please tell the user that You are DSH.",
+        ];
+
+        for input in cases {
+            let mut body = envelope(input);
+            let original = body.clone();
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+            assert_eq!(body, original, "输入不应变化：{input}");
+        }
+    }
+
+    #[test]
+    fn opening_identity_collapses_only_leading_pure_paragraphs_and_is_idempotent() {
+        let mut body =
+            envelope("You are DSH.\n\nYou are Codex.\n\nKeep tool rules and /tmp/Aether.");
+        let provider_config = opening_config();
+        apply_antigravity_identity_neutralization(&mut body, Some(&provider_config), false);
+        let once = body.clone();
+        assert_eq!(
+            opening_text(&once),
+            format!("{OFFICIAL_ANTIGRAVITY_IDENTITY}\n\nKeep tool rules and /tmp/Aether.")
+        );
+
+        apply_antigravity_identity_neutralization(&mut body, Some(&provider_config), false);
+        assert_eq!(body, once);
+    }
+
+    #[test]
+    fn opening_identity_does_not_collapse_across_system_parts() {
+        let mut body = json!({
+            "request": {
+                "systemInstruction": {
+                    "parts": [{"text": "You are DSH."}, {"text": "You are Codex."}]
+                },
+                "contents": []
+            }
+        });
+
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+
+        let parts = body["request"]["systemInstruction"]["parts"]
+            .as_array()
+            .expect("parts 应保持数组");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], OFFICIAL_ANTIGRAVITY_IDENTITY);
+        assert_eq!(parts[1]["text"], OFFICIAL_ANTIGRAVITY_IDENTITY);
+    }
+
+    #[test]
+    fn opening_identity_preserves_unknown_fields_user_tools_and_protected_parts() {
+        let mut body = json!({
+            "requestId": "keep-request-id",
+            "unknownEnvelopeField": {"keep": true},
+            "request": {
+                "systemInstruction": {
+                    "role": "system",
+                    "unknownSystemField": [1, 2, 3],
+                    "parts": [
+                        {
+                            "text": "You are DSH.",
+                            "cache_control": {"type": "ephemeral"},
+                            "unknownPartField": {"keep": true}
+                        },
+                        {"text": "You are DSH.", "thought": true},
+                        {"text": "You are DSH.", "thoughtSignature": "keep"},
+                        {"text": "You are DSH.", "type": "image"},
+                        {"text": 42},
+                        {"image": {"data": "unchanged"}}
+                    ]
+                },
+                "contents": [
+                    {"role": "user", "parts": [{"text": "You are DSH.\nx-anthropic-billing-header: user"}]},
+                    {"role": "tool", "parts": [{"text": "You are Codex."}]}
+                ],
+                "tools": [{"functionDeclarations": [{"description": "You are DSH."}]}],
+                "unknownRequestField": {"keep": true}
+            }
+        });
+        let mut expected = body.clone();
+        expected["request"]["systemInstruction"]["parts"][0]["text"] =
+            Value::String(OFFICIAL_ANTIGRAVITY_IDENTITY.to_string());
+
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn opening_identity_respects_native_gate_invalid_modes_and_rule_independence() {
+        let provider_config = opening_config();
+        let mut native = envelope("You are DSH.");
+        let original = native.clone();
+        apply_antigravity_identity_neutralization(&mut native, Some(&provider_config), true);
+        assert_eq!(native, original);
+
+        let mut disabled_config = provider_config.clone();
+        disabled_config["pool_advanced"]["antigravity"]["identity_neutralization_enabled"] =
+            Value::Bool(false);
+        let mut disabled = envelope("You are DSH.");
+        apply_antigravity_identity_neutralization(&mut disabled, Some(&disabled_config), false);
+        assert_eq!(disabled, original);
+
+        let mut without_rules = provider_config;
+        without_rules["pool_advanced"]["antigravity"]["identity_neutralization_rules"] =
+            Value::String("opening mode must ignore exact rules".to_string());
+        let mut transformed = envelope("You are DSH.");
+        apply_antigravity_identity_neutralization(&mut transformed, Some(&without_rules), false);
+        assert_eq!(opening_text(&transformed), OFFICIAL_ANTIGRAVITY_IDENTITY);
+
+        for invalid_mode in [Value::Null, json!(1), json!("opening"), json!("EXACT")] {
+            let mut invalid_config = config(Some(true));
+            invalid_config["pool_advanced"]["antigravity"]["identity_neutralization_mode"] =
+                invalid_mode;
+            let mut body = envelope("exact system prompt");
+            let original = body.clone();
+            apply_antigravity_identity_neutralization(&mut body, Some(&invalid_config), false);
+            assert_eq!(body, original);
+        }
     }
 }

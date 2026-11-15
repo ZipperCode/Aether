@@ -81,39 +81,58 @@
             {{ t('providers.local.antigravityNeutralizationHint') }}
           </p>
           <template v-if="antigravityForm.identity_neutralization_enabled">
-            <div
-              v-for="(rule, index) in antigravityForm.identity_neutralization_rules"
-              :key="index"
-              class="space-y-2 rounded-xl border border-border/60 p-3"
-            >
-              <Label :for="`antigravity-rule-match-${index}`">{{ t('providers.local.antigravityRuleMatch') }}</Label>
-              <textarea
-                :id="`antigravity-rule-match-${index}`"
-                v-model="rule.match"
-                rows="3"
+            <div class="space-y-1.5">
+              <Label for="antigravity-neutralization-mode">{{ t('providers.local.antigravityNeutralizationMode') }}</Label>
+              <select
+                id="antigravity-neutralization-mode"
+                v-model="antigravityForm.identity_neutralization_mode"
                 class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-              />
-              <Label :for="`antigravity-rule-replacement-${index}`">{{ t('providers.local.antigravityRuleReplacement') }}</Label>
-              <textarea
-                :id="`antigravity-rule-replacement-${index}`"
-                v-model="rule.replacement"
-                rows="3"
-                class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-              />
+              >
+                <option value="exact">{{ t('providers.local.antigravityNeutralizationExact') }}</option>
+                <option value="opening_identity">{{ t('providers.local.antigravityNeutralizationOpening') }}</option>
+              </select>
+              <p
+                v-if="antigravityForm.identity_neutralization_mode === 'opening_identity'"
+                class="text-xs leading-5 text-muted-foreground"
+              >
+                {{ t('providers.local.antigravityNeutralizationOpeningHint') }}
+              </p>
+            </div>
+            <template v-if="antigravityForm.identity_neutralization_mode === 'exact'">
+              <div
+                v-for="(rule, index) in antigravityForm.identity_neutralization_rules"
+                :key="index"
+                class="space-y-2 rounded-xl border border-border/60 p-3"
+              >
+                <Label :for="`antigravity-rule-match-${index}`">{{ t('providers.local.antigravityRuleMatch') }}</Label>
+                <textarea
+                  :id="`antigravity-rule-match-${index}`"
+                  v-model="rule.match"
+                  rows="3"
+                  class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                />
+                <Label :for="`antigravity-rule-replacement-${index}`">{{ t('providers.local.antigravityRuleReplacement') }}</Label>
+                <textarea
+                  :id="`antigravity-rule-replacement-${index}`"
+                  v-model="rule.replacement"
+                  rows="3"
+                  class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                />
+                <Button
+                  variant="outline"
+                  @click="antigravityForm.identity_neutralization_rules.splice(index, 1)"
+                >
+                  {{ t('providers.local.antigravityRemoveRule') }}
+                </Button>
+              </div>
               <Button
                 variant="outline"
-                @click="antigravityForm.identity_neutralization_rules.splice(index, 1)"
+                :disabled="antigravityForm.identity_neutralization_rules.length >= 32"
+                @click="antigravityForm.identity_neutralization_rules.push({ match: '', replacement: '' })"
               >
-                {{ t('providers.local.antigravityRemoveRule') }}
+                {{ t('providers.local.antigravityAddRule') }}
               </Button>
-            </div>
-            <Button
-              variant="outline"
-              :disabled="antigravityForm.identity_neutralization_rules.length >= 32"
-              @click="antigravityForm.identity_neutralization_rules.push({ match: '', replacement: '' })"
-            >
-              {{ t('providers.local.antigravityAddRule') }}
-            </Button>
+            </template>
           </template>
         </div>
       </section>
@@ -655,6 +674,7 @@ const antigravityForm = ref({
   short_retry_enabled: false,
   short_retry_max_delay_ms: 2000 as number | string,
   identity_neutralization_enabled: false,
+  identity_neutralization_mode: 'exact' as 'exact' | 'opening_identity',
   identity_neutralization_rules: [] as Array<{ match: string, replacement: string }>,
 })
 
@@ -763,6 +783,7 @@ watch([() => props.modelValue, () => props.providerId], ([open]) => {
     short_retry_enabled: antigravity?.short_retry_enabled ?? false,
     short_retry_max_delay_ms: antigravity?.short_retry_max_delay_ms ?? 2000,
     identity_neutralization_enabled: antigravity?.identity_neutralization_enabled ?? false,
+    identity_neutralization_mode: antigravity?.identity_neutralization_mode ?? 'exact',
     identity_neutralization_rules: antigravity?.identity_neutralization_rules?.map(rule => ({ ...rule })) ?? [],
   }
   form.value = {

@@ -255,6 +255,11 @@ pub(crate) fn validate_antigravity_advanced_config(
             }
         }
     }
+    if let Some(mode) = config.get("identity_neutralization_mode") {
+        if !matches!(mode.as_str(), Some("exact" | "opening_identity")) {
+            return Err("身份中和模式必须是 exact 或 opening_identity".to_string());
+        }
+    }
     if let Some(rules) = config.get("identity_neutralization_rules") {
         let rules = rules.as_array().ok_or("身份中和规则必须是数组")?;
         if rules.len() > 32 {
@@ -424,6 +429,7 @@ mod tests {
             "tos_pause_enabled": true, "tos_pause_seconds": 900,
             "short_retry_enabled": true, "short_retry_max_delay_ms": 2000,
             "identity_neutralization_enabled": true,
+            "identity_neutralization_mode": "opening_identity",
             "identity_neutralization_rules": [{"match": "exact system text", "replacement": ""}]
         }, "unrelated": {"preserve": true}});
         assert_eq!(
@@ -437,6 +443,8 @@ mod tests {
             json!({"tos_pause_seconds": 86401}),
             json!({"short_retry_max_delay_ms": 7001}),
             json!({"short_retry_max_delay_ms": 1.5}),
+            json!({"identity_neutralization_mode": "unknown"}),
+            json!({"identity_neutralization_mode": true}),
             json!({"identity_neutralization_rules": [{"match": "", "replacement": "x"}]}),
             json!({"identity_neutralization_rules": [{"match": "x"}]}),
             json!({"identity_neutralization_rules": [
@@ -445,6 +453,21 @@ mod tests {
         ] {
             assert!(
                 normalize_pool_advanced_config(Some(json!({"antigravity": settings}))).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_pool_advanced_accepts_identity_modes_without_changing_legacy_defaults() {
+        for settings in [
+            json!({"identity_neutralization_enabled": true}),
+            json!({"identity_neutralization_mode": "exact"}),
+            json!({"identity_neutralization_mode": "opening_identity"}),
+        ] {
+            let config = json!({"antigravity": settings});
+            assert_eq!(
+                normalize_pool_advanced_config(Some(config.clone())).unwrap(),
+                Some(config)
             );
         }
     }
