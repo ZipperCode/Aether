@@ -265,6 +265,11 @@ pub fn antigravity_oauth_invalid_reason(
             })
         })
     };
+    // Google 的封禁响应可能只有文案，且 Terms of Service 中间包含换行。
+    // 必须同时命中账号级禁用与违规原因，不能把模型/项目权限错误升级为封号。
+    let normalized_message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let account_tos_violation = normalized_message.contains("has been disabled in this account")
+        && normalized_message.contains("violation of terms of service");
     let reason = if has_reason("VALIDATION_REQUIRED") || message.contains("verify your account") {
         "Account verification is required (VALIDATION_REQUIRED)"
     } else if has_reason("ACCOUNT_DISABLED")
@@ -272,7 +277,7 @@ pub fn antigravity_oauth_invalid_reason(
         || message.contains("account has been deactivated")
     {
         "Account is disabled"
-    } else if has_reason("TOS_VIOLATION") {
+    } else if has_reason("TOS_VIOLATION") || account_tos_violation {
         "Account is suspended (TOS_VIOLATION)"
     } else if has_reason("ACCOUNT_SUSPENDED") || message.contains("account has been suspended") {
         "Account is suspended"
@@ -4678,6 +4683,20 @@ mod tests {
                 "{OAUTH_ACCOUNT_BLOCK_PREFIX}Account is suspended (TOS_VIOLATION)"
             ))
         );
+        for message in [
+            "Gemini has been disabled in this account for violation of Terms of Service.",
+            "Gemini has been disabled in this account for violation of Terms of\n\tService. If you believe this is an error, please contact Google Cloud Support.",
+        ] {
+            assert_eq!(
+                antigravity_oauth_invalid_reason(
+                    403,
+                    Some(&json!({"error": {"message": message, "status": "PERMISSION_DENIED"}}))
+                ),
+                Some(format!(
+                    "{OAUTH_ACCOUNT_BLOCK_PREFIX}Account is suspended (TOS_VIOLATION)"
+                ))
+            );
+        }
         assert_eq!(
             antigravity_oauth_invalid_reason(
                 429,

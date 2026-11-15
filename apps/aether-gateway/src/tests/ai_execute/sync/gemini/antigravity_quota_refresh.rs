@@ -76,6 +76,7 @@ enum AntigravityUpstreamErrorKind {
     BareResourceExhausted,
     AccountVerification,
     AccountTosViolation,
+    AccountTosViolationMessageOnly,
     GenericForbidden,
 }
 
@@ -90,6 +91,7 @@ impl AntigravityUpstreamErrorFixture {
         match self.kind {
             AntigravityUpstreamErrorKind::AccountVerification => 400,
             AntigravityUpstreamErrorKind::AccountTosViolation
+            | AntigravityUpstreamErrorKind::AccountTosViolationMessageOnly
             | AntigravityUpstreamErrorKind::GenericForbidden => 403,
             AntigravityUpstreamErrorKind::ModelQuota
             | AntigravityUpstreamErrorKind::AccountRateLimit
@@ -128,6 +130,11 @@ impl AntigravityUpstreamErrorFixture {
             AntigravityUpstreamErrorKind::AccountTosViolation => {
                 antigravity_account_tos_violation_body()
             }
+            AntigravityUpstreamErrorKind::AccountTosViolationMessageOnly => json!({"error": {
+                "code": 403,
+                "status": "PERMISSION_DENIED",
+                "message": "Gemini has been disabled in this account for violation of Terms of\n\tService. If you believe this is an error, please contact Google Cloud Support."
+            }}),
             AntigravityUpstreamErrorKind::GenericForbidden => json!({"error": {
                 "code": 403,
                 "status": "PERMISSION_DENIED",
@@ -4193,16 +4200,24 @@ fn gateway_antigravity_runtime_account_verification_blocks_serving() {
 }
 
 async fn gateway_antigravity_runtime_account_verification_blocks_serving_impl() {
-    for (kind, expected_code, block_label) in [
+    for (kind, expected_code, block_label, has_recovery_links) in [
         (
             AntigravityUpstreamErrorKind::AccountVerification,
             "account_verification",
             "verification",
+            true,
         ),
         (
             AntigravityUpstreamErrorKind::AccountTosViolation,
             "account_suspended",
             "tos",
+            true,
+        ),
+        (
+            AntigravityUpstreamErrorKind::AccountTosViolationMessageOnly,
+            "account_suspended",
+            "tos-message-only",
+            false,
         ),
     ] {
         for pool_enabled in [false, true] {
@@ -4269,17 +4284,24 @@ async fn gateway_antigravity_runtime_account_verification_blocks_serving_impl() 
                 );
                 assert_eq!(snapshot["account"]["code"], expected_code);
                 assert_eq!(snapshot["account"]["blocked"], true);
+                let expected_validation_url =
+                    has_recovery_links.then_some(ANTIGRAVITY_VALIDATION_URL);
+                let expected_appeal_url = has_recovery_links.then_some(ANTIGRAVITY_APPEAL_URL);
                 assert_eq!(
-                    snapshot["account"]["validation_url"],
-                    ANTIGRAVITY_VALIDATION_URL
+                    snapshot["account"]["validation_url"].as_str(),
+                    expected_validation_url
                 );
-                assert_eq!(snapshot["account"]["appeal_url"], ANTIGRAVITY_APPEAL_URL);
+                assert_eq!(
+                    snapshot["account"]["appeal_url"].as_str(),
+                    expected_appeal_url
+                );
                 assert_eq!(
                     invalid
                         .upstream_metadata
                         .as_ref()
-                        .and_then(|value| value.pointer("/antigravity/validation_url")),
-                    Some(&json!(ANTIGRAVITY_VALIDATION_URL))
+                        .and_then(|value| value.pointer("/antigravity/validation_url"))
+                        .and_then(serde_json::Value::as_str),
+                    expected_validation_url
                 );
                 let before = harness.generation_counts();
                 let a_before = before
@@ -4316,12 +4338,12 @@ async fn gateway_antigravity_runtime_account_verification_blocks_serving_impl() 
                         "antigravity",
                     );
                 assert_eq!(
-                    preserved_snapshot["account"]["validation_url"],
-                    ANTIGRAVITY_VALIDATION_URL
+                    preserved_snapshot["account"]["validation_url"].as_str(),
+                    expected_validation_url
                 );
                 assert_eq!(
-                    preserved_snapshot["account"]["appeal_url"],
-                    ANTIGRAVITY_APPEAL_URL
+                    preserved_snapshot["account"]["appeal_url"].as_str(),
+                    expected_appeal_url
                 );
                 assert_reset_only_serving_step(
                     &harness,
