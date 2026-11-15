@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::ai_serving::transport::antigravity::{
     antigravity_account_observation_due, antigravity_model_thinking_variant,
@@ -43,6 +44,9 @@ pub(crate) struct AntigravityV1InternalRequestInput<'a> {
     pub(crate) gemini_request_body: &'a Value,
     pub(crate) upstream_is_stream: bool,
     pub(crate) same_format: bool,
+    pub(crate) user_id: &'a str,
+    pub(crate) api_key_id: &'a str,
+    pub(crate) client_session_affinity: Option<&'a aether_scheduler_core::ClientSessionAffinity>,
 }
 
 pub(crate) struct AntigravityV1InternalRequest {
@@ -56,7 +60,7 @@ pub(crate) async fn build_antigravity_v1internal_provider_request(
     input: AntigravityV1InternalRequestInput<'_>,
 ) -> Result<AntigravityV1InternalRequest, AntigravityV1InternalRequestError> {
     ensure_converted_openai_antigravity_thinking_resolved(&input)?;
-    let payload = build_antigravity_v1internal_payload(
+    let mut payload = build_antigravity_v1internal_payload(
         input.state,
         input.transport,
         input.trace_id,
@@ -64,6 +68,13 @@ pub(crate) async fn build_antigravity_v1internal_provider_request(
         input.gemini_request_body,
     )
     .await?;
+    apply_antigravity_session_continuity(
+        &mut payload.body,
+        input.user_id,
+        input.api_key_id,
+        &payload.transport.key.id,
+        input.client_session_affinity,
+    );
 
     let upstream_url = crate::ai_serving::build_provider_transport_request_url_for_request_body(
         &payload.transport,
@@ -182,6 +193,43 @@ async fn build_antigravity_v1internal_payload(
         auth,
         body,
     })
+}
+
+pub(crate) fn apply_antigravity_session_continuity(
+    envelope: &mut Value,
+    user_id: &str,
+    api_key_id: &str,
+    provider_key_id: &str,
+    affinity: Option<&aether_scheduler_core::ClientSessionAffinity>,
+) {
+    let Some(request) = envelope.get_mut("request").and_then(Value::as_object_mut) else {
+        return;
+    };
+    // 原生会话字段（包括未知类型）保持透传，不用网关派生值覆盖客户端意图。
+    if request.contains_key("sessionId") || request.contains_key("session_id") {
+        return;
+    }
+    let Some(affinity) = affinity.filter(|affinity| affinity.has_session_key()) else {
+        // 无显式信号时无法识别跨请求会话；不使用请求 ID 或提示词猜测。
+        return;
+    };
+    if [user_id, api_key_id, provider_key_id]
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        return;
+    }
+    // JSON 元组消除拼接歧义，租户凭证和上游账号共同隔离相同客户端会话名。
+    let seed = serde_json::json!([
+        "aether:antigravity-session:v1",
+        user_id,
+        api_key_id,
+        provider_key_id,
+        affinity.client_family,
+        affinity.session_key,
+    ]);
+    let session = format!("{:x}", Sha256::digest(seed.to_string().as_bytes()));
+    request.insert("sessionId".to_string(), Value::String(session));
 }
 
 const GEMINI_MODEL_PREFIX: &[u8] = b"gemini-";
@@ -385,4 +433,74 @@ fn inject_gemini_thinking_level(body: &mut Value, level: AntigravityThinkingLeve
         level_key.to_string(),
         Value::String(level.as_str().to_string()),
     );
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::apply_antigravity_session_continuity;
+    use aether_scheduler_core::ClientSessionAffinity;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn antigravity_sessions_are_continuous_and_scoped_without_prompt_or_request_ids() {
+        let affinity = ClientSessionAffinity::from_session_key("client-session");
+        let build = |user: &str,
+                     key: &str,
+                     account: &str,
+                     session: &ClientSessionAffinity,
+                     id: &str| {
+            let mut envelope =
+                json!({"requestId": id, "request": {"contents": [{"text": "same prompt"}]}});
+            apply_antigravity_session_continuity(&mut envelope, user, key, account, Some(session));
+            envelope
+        };
+        let first = build("tenant-a", "key-a", "account-a", &affinity, "request-a");
+        let later = build("tenant-a", "key-a", "account-a", &affinity, "request-b");
+        assert_eq!(first["request"]["sessionId"], later["request"]["sessionId"]);
+        assert_ne!(first["request"]["sessionId"], first["requestId"]);
+        for other in [
+            build("tenant-b", "key-a", "account-a", &affinity, "request-a"),
+            build("tenant-a", "key-b", "account-a", &affinity, "request-a"),
+            build("tenant-a", "key-a", "account-b", &affinity, "request-a"),
+            build(
+                "tenant-a",
+                "key-a",
+                "account-a",
+                &ClientSessionAffinity::from_session_key("other-session"),
+                "request-a",
+            ),
+        ] {
+            assert_ne!(first["request"]["sessionId"], other["request"]["sessionId"]);
+        }
+        let mut no_signal =
+            json!({"requestId": "request-a", "request": {"contents": [{"text": "same prompt"}]}});
+        let original = no_signal.clone();
+        apply_antigravity_session_continuity(
+            &mut no_signal,
+            "tenant-a",
+            "key-a",
+            "account-a",
+            None,
+        );
+        assert_eq!(no_signal, original);
+    }
+
+    #[test]
+    fn antigravity_native_session_fields_are_preserved_verbatim() {
+        let affinity = ClientSessionAffinity::from_session_key("header-session");
+        for field in ["sessionId", "session_id"] {
+            for value in [json!("native-session"), Value::Null, json!(42)] {
+                let mut envelope = json!({"request": {field: value, "unknown": {"keep": true}}});
+                let original = envelope.clone();
+                apply_antigravity_session_continuity(
+                    &mut envelope,
+                    "tenant",
+                    "key",
+                    "account",
+                    Some(&affinity),
+                );
+                assert_eq!(envelope, original);
+            }
+        }
+    }
 }

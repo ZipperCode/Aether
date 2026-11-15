@@ -1067,6 +1067,9 @@ async fn build_antigravity_openai_chat_cross_format_payload_parts(
             gemini_request_body: &gemini_request_body,
             upstream_is_stream,
             same_format: false,
+            user_id: &input.auth_context.user_id,
+            api_key_id: &input.auth_context.api_key_id,
+            client_session_affinity: input.client_session_affinity.as_ref(),
         })
         .await
         {
@@ -2713,13 +2716,16 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true
         });
+        let mut input = sample_input();
+        input.client_session_affinity =
+            Some(aether_scheduler_core::ClientSessionAffinity::from_session_key("chat-session-1"));
 
         let payload = resolve_local_openai_chat_candidate_payload_parts(
             &state,
             &parts,
             "trace-openai-chat-antigravity",
             &body_json,
-            &sample_input(),
+            &input,
             None,
             &sample_antigravity_eligible(),
             0,
@@ -2764,6 +2770,18 @@ mod tests {
                 .get("x-vscode-sessionid")
                 .map(String::as_str),
             Some("sess-antigravity-chat")
+        );
+        assert_eq!(
+            payload.provider_request_body["userAgent"].as_str(),
+            payload
+                .provider_request_headers
+                .get("user-agent")
+                .map(String::as_str),
+        );
+        assert!(payload.provider_request_body["request"]["sessionId"].is_string());
+        assert_ne!(
+            payload.provider_request_body["request"]["sessionId"],
+            payload.provider_request_body["requestId"],
         );
         assert_eq!(
             payload.provider_request_body["project"],

@@ -969,6 +969,9 @@ async fn build_antigravity_openai_responses_payload_parts(
             gemini_request_body: &gemini_request_body,
             upstream_is_stream,
             same_format: api_format_alias_matches(provider_api_format, client_api_format),
+            user_id: &input.auth_context.user_id,
+            api_key_id: &input.auth_context.api_key_id,
+            client_session_affinity: input.client_session_affinity.as_ref(),
         })
         .await
         {

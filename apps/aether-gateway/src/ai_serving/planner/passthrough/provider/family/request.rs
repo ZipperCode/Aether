@@ -505,6 +505,15 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     } else {
         base_provider_request_body
     };
+    if prepared.is_antigravity {
+        crate::ai_serving::planner::antigravity::apply_antigravity_session_continuity(
+            &mut provider_request_body,
+            &input.auth_context.user_id,
+            &input.auth_context.api_key_id,
+            &transport.key.id,
+            input.client_session_affinity.as_ref(),
+        );
+    }
     if crate::ai_serving::transport::enforce_same_format_provider_api_operation_body_policy(
         &mut provider_request_body,
         spec.operation,

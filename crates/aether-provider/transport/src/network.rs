@@ -162,6 +162,7 @@ pub fn resolve_transport_profile(
     }
 
     resolve_claude_code_transport_profile(transport)
+        .or_else(|| resolve_antigravity_transport_profile(transport))
         .or_else(|| resolve_grok_browser_transport_profile(transport))
 }
 
@@ -180,6 +181,28 @@ fn resolve_claude_code_transport_profile(
     let identity_profile = current_claude_code_transport_identity_profile();
     Some(ResolvedTransportProfile {
         profile_id: identity_profile.transport_profile_id().to_string(),
+        backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.to_string(),
+        http_mode: TRANSPORT_HTTP_MODE_AUTO.to_string(),
+        pool_scope: TRANSPORT_POOL_SCOPE_KEY.to_string(),
+        header_fingerprint: None,
+        extra: None,
+    })
+}
+
+fn resolve_antigravity_transport_profile(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<ResolvedTransportProfile> {
+    if !transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("antigravity")
+    {
+        return None;
+    }
+
+    Some(ResolvedTransportProfile {
+        profile_id: "antigravity_cli".to_string(),
         backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.to_string(),
         http_mode: TRANSPORT_HTTP_MODE_AUTO.to_string(),
         pool_scope: TRANSPORT_POOL_SCOPE_KEY.to_string(),
@@ -760,6 +783,58 @@ mod tests {
             "transport_profile": {"backend": "reqwest_rustls"}
         }));
 
+        assert!(transport_profile_is_configured(&transport));
+        assert!(resolve_transport_profile(&transport).is_none());
+    }
+
+    #[test]
+    fn resolves_native_antigravity_transport_profile_when_unconfigured() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "antigravity".to_string();
+        transport.key.fingerprint = None;
+        transport.provider.config = None;
+
+        let profile = resolve_transport_profile(&transport).expect("native Antigravity profile");
+
+        assert_eq!(profile.profile_id, "antigravity_cli");
+        assert_eq!(profile.backend, "reqwest_rustls");
+        assert_eq!(profile.http_mode, "auto");
+        assert_eq!(profile.pool_scope, "key");
+        assert!(profile.header_fingerprint.is_none());
+        assert!(profile.extra.is_none());
+        assert!(!transport_profile_is_configured(&transport));
+    }
+
+    #[test]
+    fn antigravity_explicit_profile_precedes_native_default_and_invalid_fails_closed() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "antigravity".to_string();
+        transport.provider.config = Some(json!({
+            "fingerprint": {"transport_profile": "provider_antigravity_profile"}
+        }));
+        transport.key.fingerprint = Some(json!({
+            "transport_profile": "key_antigravity_profile"
+        }));
+
+        assert_eq!(
+            resolve_transport_profile(&transport)
+                .expect("key profile")
+                .profile_id,
+            "key_antigravity_profile"
+        );
+
+        transport.key.fingerprint = None;
+        assert_eq!(
+            resolve_transport_profile(&transport)
+                .expect("provider profile")
+                .profile_id,
+            "provider_antigravity_profile"
+        );
+
+        transport.provider.config = None;
+        transport.key.fingerprint = Some(json!({
+            "transport_profile": {"backend": "reqwest_rustls"}
+        }));
         assert!(transport_profile_is_configured(&transport));
         assert!(resolve_transport_profile(&transport).is_none());
     }

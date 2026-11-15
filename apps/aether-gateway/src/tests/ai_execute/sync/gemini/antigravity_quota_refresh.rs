@@ -3103,6 +3103,65 @@ fn antigravity_runtime_quota_http_config(
 }
 
 #[test]
+fn gateway_antigravity_session_continuity() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_session_continuity",
+        gateway_antigravity_session_continuity_impl,
+    );
+}
+
+async fn gateway_antigravity_session_continuity_impl() {
+    let harness = start_antigravity_http_harness(antigravity_runtime_quota_http_config(
+        "session-continuity",
+        false,
+    ))
+    .await;
+    let body = json!({
+        "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+        "generationConfig": {"temperature": 0.2, "thinkingConfig": {"thinkingLevel": "HIGH"}},
+        "unknown_client_field": {"preserve": true},
+    });
+    for step in ["turn-one", "turn-two"] {
+        let response = harness
+            .send_generate_body(ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL, &body, step)
+            .await;
+        assert_eq!(
+            drain_antigravity_response_status(response).await,
+            StatusCode::OK
+        );
+    }
+    let plans = harness.captured_generation_plans();
+    assert_eq!(plans.len(), 2);
+    let session = plans[0]["request"]["sessionId"]
+        .as_str()
+        .expect("explicit session header should reach upstream");
+    assert_eq!(plans[1]["request"]["sessionId"], session);
+    assert_ne!(plans[0]["requestId"], plans[1]["requestId"]);
+    assert_eq!(
+        plans[0]["request"]["unknown_client_field"],
+        body["unknown_client_field"]
+    );
+
+    let mut explicit = body;
+    explicit["sessionId"] = json!("native-session");
+    let response = harness
+        .send_generate_body(
+            ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+            &explicit,
+            "native-session",
+        )
+        .await;
+    assert_eq!(
+        drain_antigravity_response_status(response).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        harness.captured_generation_plans().last().unwrap()["request"]["sessionId"],
+        "native-session"
+    );
+}
+
+#[test]
 fn gateway_antigravity_runtime_quota_isolation() {
     run_gemini_cli_sync_test(
         "gateway_antigravity_runtime_quota_isolation",

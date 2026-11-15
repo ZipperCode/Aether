@@ -5234,7 +5234,10 @@ fn apply_transport_profile(
         return builder;
     };
     let profile_id = profile.profile_id.trim();
-    if profile_id.is_empty() || transport_profile_h2c_prior_knowledge(Some(profile)) {
+    if profile_id.is_empty()
+        || profile_id == "antigravity_cli"
+        || transport_profile_h2c_prior_knowledge(Some(profile))
+    {
         return builder;
     }
 
@@ -5253,7 +5256,10 @@ fn apply_transport_profile_cache_key(
     let Some(profile) = transport_profile else {
         return builder;
     };
-    if profile.profile_id.is_empty() || profile.http_mode == TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE
+    // Antigravity 默认 profile 仅隔离连接池，不切换 TLS 实现或重写 ALPN。
+    if profile.profile_id.is_empty()
+        || profile.profile_id == "antigravity_cli"
+        || profile.http_mode == TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE
     {
         return builder;
     }
@@ -5720,7 +5726,7 @@ mod tests {
     };
     use axum::body::{Body, Bytes};
     use axum::extract::ws::Message;
-    use axum::extract::Path;
+    use axum::extract::{ConnectInfo, Path};
     use axum::http::HeaderMap as AxumHeaderMap;
     use axum::routing::{any, post};
     use axum::{Json, Router};
@@ -8109,6 +8115,115 @@ mod tests {
         assert_eq!(
             result.body.and_then(|body| body.json_body),
             Some(json!({"error": {"message": "slow down"}}))
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_sync_antigravity_profile_reuses_same_account_and_isolates_distinct_keys() {
+        async fn execute_and_read_connection(
+            runtime: &DirectSyncExecutionRuntime,
+            plan: ExecutionPlan,
+        ) -> String {
+            let result = runtime
+                .execute_sync(&plan)
+                .await
+                .expect("local Antigravity request should succeed");
+            assert_eq!(result.status_code, 200);
+            result
+                .body
+                .and_then(|body| body.json_body)
+                .and_then(|body| {
+                    body.get("connection")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .expect("response should identify the upstream connection")
+        }
+
+        let _guard = direct_reqwest_env_lock().lock().await;
+        let _shards = set_test_env_var(super::DIRECT_REQWEST_CLIENT_SHARDS_ENV, "1");
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let app = Router::new().route(
+            "/generate",
+            post(
+                |ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>| async move {
+                    Json(json!({"connection": remote_addr.to_string()}))
+                },
+            ),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("test server should run");
+        });
+
+        let profile = ResolvedTransportProfile {
+            profile_id: "antigravity_cli".into(),
+            backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.into(),
+            http_mode: TRANSPORT_HTTP_MODE_AUTO.into(),
+            pool_scope: "key".into(),
+            header_fingerprint: None,
+            extra: None,
+        };
+        let plan = |request_id: &str, key_id: &str| ExecutionPlan {
+            request_id: request_id.into(),
+            candidate_id: Some(format!("candidate-{request_id}")),
+            provider_name: Some("antigravity".into()),
+            provider_id: "provider-antigravity-pool-test".into(),
+            endpoint_id: "endpoint-antigravity-pool-test".into(),
+            key_id: key_id.into(),
+            method: "POST".into(),
+            url: format!("http://{addr}/generate"),
+            headers: BTreeMap::from([("content-type".into(), "application/json".into())]),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}]
+            })),
+            stream: false,
+            client_api_format: "gemini:generate_content".into(),
+            provider_api_format: "gemini:generate_content".into(),
+            model_name: Some("gemini-3-flash".into()),
+            proxy: None,
+            transport_profile: Some(profile.clone()),
+            timeouts: Some(ExecutionTimeouts {
+                connect_ms: Some(5_000),
+                total_ms: Some(LOCAL_HTTP_SUCCESS_TIMEOUT_MS),
+                ..ExecutionTimeouts::default()
+            }),
+        };
+        let runtime = DirectSyncExecutionRuntime::new();
+
+        let first = execute_and_read_connection(
+            &runtime,
+            plan("antigravity-account-a-first", "antigravity-account-a"),
+        )
+        .await;
+        let same_account = execute_and_read_connection(
+            &runtime,
+            plan("antigravity-account-a-second", "antigravity-account-a"),
+        )
+        .await;
+        let distinct_account = execute_and_read_connection(
+            &runtime,
+            plan("antigravity-account-b-first", "antigravity-account-b"),
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(
+            first, same_account,
+            "same account must reuse its connection"
+        );
+        assert_ne!(
+            first, distinct_account,
+            "different Antigravity keys must use isolated pools"
         );
     }
 

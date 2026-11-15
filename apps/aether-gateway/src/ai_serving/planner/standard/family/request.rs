@@ -1150,6 +1150,9 @@ async fn build_antigravity_cross_format_payload_parts(
             gemini_request_body: &gemini_request_body,
             upstream_is_stream,
             same_format: false,
+            user_id: &input.auth_context.user_id,
+            api_key_id: &input.auth_context.api_key_id,
+            client_session_affinity: input.client_session_affinity.as_ref(),
         })
         .await
         {
