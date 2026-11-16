@@ -329,12 +329,12 @@ fn target_needs_codex_catalog(target: &SelectedFetchTarget) -> bool {
             target.key.upstream_metadata.as_ref(),
         )
         && target.endpoints.iter().any(|endpoint| {
-            aether_ai_formats::api_format_alias_matches(&endpoint.api_format, "openai:responses")
-                || aether_ai_formats::api_format_alias_matches(
+            crate::ai_serving::api_format_alias_matches(&endpoint.api_format, "openai:responses")
+                || crate::ai_serving::api_format_alias_matches(
                     &endpoint.api_format,
                     "openai:responses:compact",
                 )
-                || aether_ai_formats::api_format_alias_matches(
+                || crate::ai_serving::api_format_alias_matches(
                     &endpoint.api_format,
                     "openai:search",
                 )
