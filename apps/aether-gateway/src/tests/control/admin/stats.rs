@@ -1460,7 +1460,8 @@ async fn gateway_defaults_admin_stats_leaderboard_models_to_bounded_recent_windo
         50,
         0.4,
         0.4,
-        recent_unix_secs(10),
+        // 默认窗口是今天；零点附近不能用“十分钟前”代表今天的记录。
+        recent_unix_secs(0),
     );
     let stale_row = sample_usage_row(
         "usage-model-stale",

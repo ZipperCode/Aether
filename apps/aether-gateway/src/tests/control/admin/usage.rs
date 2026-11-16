@@ -1306,7 +1306,7 @@ async fn gateway_handles_admin_usage_heatmap_locally_with_trusted_admin_principa
             30,
             0.3,
             0.36,
-            now_unix_secs.saturating_sub(600),
+            now_unix_secs,
         ),
         sample_usage_row(
             "usage-2",
@@ -1321,7 +1321,7 @@ async fn gateway_handles_admin_usage_heatmap_locally_with_trusted_admin_principa
             10,
             0.1,
             0.12,
-            now_unix_secs.saturating_sub(480),
+            now_unix_secs,
         ),
     ]));
 
