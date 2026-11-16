@@ -2752,6 +2752,53 @@ mod tests {
         resolve_provider_pool_key_thinking_model(key, "antigravity", requested, selected, level)
     }
 
+    #[test]
+    fn antigravity_claude_thinking_variants_respect_account_catalog_and_allowlist() {
+        let mut key = antigravity_thinking_key(json!({
+            "claude-opus-5-5-low": {},
+            "claude-opus-5-5-medium": {},
+            "claude-opus-5-5-high": { "disabled": true },
+            "claude-sonnet-5-5-high": {}
+        }));
+        let base = "claude-opus-5-5";
+        key.allowed_models = Some(json!(["claude-opus-5-5-medium"]));
+        let medium = Some(AntigravityThinkingLevel::Medium);
+        assert_eq!(
+            resolve_antigravity_thinking(&key, base, base, medium),
+            Some("claude-opus-5-5-medium")
+        );
+        // 已发现 low 仍必须满足账号权限，禁用 high 也不能借用 Sonnet 的档位。
+        assert_eq!(
+            resolve_antigravity_thinking(&key, base, base, Some(AntigravityThinkingLevel::Low)),
+            None
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(&key, base, base, Some(AntigravityThinkingLevel::High)),
+            None
+        );
+        key.allowed_models = Some(json!([]));
+        assert_eq!(resolve_antigravity_thinking(&key, base, base, medium), None);
+        let sibling = antigravity_thinking_key(json!({ "claude-opus-5-5-low": {} }));
+        assert_eq!(
+            resolve_antigravity_thinking(&sibling, base, base, medium),
+            None
+        );
+        assert_eq!(
+            resolve_antigravity_thinking(&sibling, base, "claude-opus-5-5-low", medium),
+            Some("claude-opus-5-5-low")
+        );
+        let legacy = antigravity_thinking_key(json!({ "claude-opus-4-6-thinking": {} }));
+        assert_eq!(
+            resolve_antigravity_thinking(
+                &legacy,
+                "claude-opus-4-6-thinking",
+                "claude-opus-4-6-thinking",
+                medium
+            ),
+            Some("claude-opus-4-6-thinking")
+        );
+    }
+
     /// 账号隔离、权威首映射、空映射与禁用条目都由解析器直接消费。
     #[test]
     fn antigravity_thinking_model_resolution_uses_only_authoritative_account_map() {
@@ -3202,7 +3249,7 @@ mod tests {
             resolve_antigravity_thinking(&empty_list, selected, "gemini-4-argon", None),
             Some(selected)
         );
-        // 其他 Provider 与非 Gemini 模型的既有选择完全不受该 allowlist 复核影响。
+        // 其他 Provider 与不支持档位的模型族不受该 allowlist 复核影响。
         assert_eq!(
             resolve_provider_pool_key_thinking_model(
                 &empty_list,
@@ -3214,8 +3261,8 @@ mod tests {
             Some(selected)
         );
         assert_eq!(
-            resolve_antigravity_thinking(&empty_list, "claude-4", "gemini-4-argon", low),
-            Some("claude-4")
+            resolve_antigravity_thinking(&empty_list, "gpt-5", "gemini-4-argon", low),
+            Some("gpt-5")
         );
         let mut unrestricted = key.clone();
         unrestricted.allowed_models = None;

@@ -746,6 +746,122 @@ async fn run_native_alias_variants_mode(pool_enabled: bool) {
 }
 
 #[test]
+fn gateway_antigravity_dynamic_effort_claude_account_variants() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_dynamic_effort_claude_account_variants",
+        gateway_antigravity_dynamic_effort_claude_account_variants_impl,
+    );
+}
+
+async fn gateway_antigravity_dynamic_effort_claude_account_variants_impl() {
+    const BASE: &str = "claude-opus-5-5";
+    const LOW: &str = "claude-opus-5-5-low";
+    const MEDIUM: &str = "claude-opus-5-5-medium";
+    for pool_enabled in [false, true] {
+        let mode = if pool_enabled { "pool" } else { "ordinary" };
+        let mut config = dynamic_effort_http_config(
+            "claude-variants",
+            mode,
+            pool_enabled,
+            false,
+            effort_models(&[(LOW, 0.9)]),
+            effort_models(&[(MEDIUM, 0.9)]),
+        );
+        config.global_model_name = BASE.to_string();
+        config.provider_model_name = BASE.to_string();
+        config.secondary_global_model_name = Some(LOW.to_string());
+        config.secondary_provider_model_name = Some(LOW.to_string());
+        config.key_a.allowed_models = Some(vec![LOW.to_string()]);
+        config.key_b.allowed_models = Some(vec![MEDIUM.to_string()]);
+        config.key_a.auto_fetch_models = true;
+        config.key_b.auto_fetch_models = true;
+        let harness = start_antigravity_http_harness(config).await;
+        harness.materialize_pool_scores().await;
+
+        // 复现裸名 + 自动预算；A 只有 low，必须由 B 用自己的 medium 服务，
+        // 不能因代表账号不支持 medium 而淘汰整池，也不能向上游发送裸名。
+        for (step, model, thinking, expected, account_a, stream) in [
+            (
+                "auto-budget",
+                BASE,
+                Some(json!({"thinkingBudget": -1, "includeThoughts": true})),
+                MEDIUM,
+                false,
+                false,
+            ),
+            ("bare-default", BASE, None, MEDIUM, false, false),
+            (
+                "explicit-low",
+                LOW,
+                Some(json!({"thinkingLevel": "high"})),
+                LOW,
+                true,
+                false,
+            ),
+            (
+                "stream-auto-budget",
+                BASE,
+                Some(json!({"thinkingBudget": -1})),
+                MEDIUM,
+                false,
+                true,
+            ),
+        ] {
+            let mut body = native_effort_body(&harness.client_session_id, None);
+            if let Some(thinking) = thinking {
+                body["generationConfig"]["thinkingConfig"] = thinking;
+            }
+            let counts_before = harness.generation_counts();
+            let plans_before = harness.captured_generation_plans().len();
+            if stream {
+                let response = harness.send_stream_generate_body(model, &body, step).await;
+                assert_gemini_stream_model_completion(
+                    response,
+                    mode,
+                    step,
+                    expected,
+                    EFFORT_COMPLETION_TEXT,
+                )
+                .await;
+            } else {
+                let response = harness.send_generate_body(model, &body, step).await;
+                assert_gemini_model_completion(response, mode, step, expected).await;
+            }
+            let plans = harness.captured_generation_plans();
+            assert_eq!(plans.len(), plans_before + 1, "{mode}/{step}");
+            assert_eq!(plans[plans_before]["model"], expected, "{mode}/{step}");
+            // Claude 的选档只改变模型身份，不引入 Gemini 专属 thinkingLevel 改写。
+            assert_eq!(
+                plans[plans_before]["request"]["generationConfig"]["thinkingConfig"],
+                body["generationConfig"]["thinkingConfig"],
+                "{mode}/{step}"
+            );
+            assert_native_probe_preserved(&plans[plans_before], mode, step);
+            assert_eq!(
+                generation_deltas(&counts_before, &harness.generation_counts()),
+                vec![expected_generation(account_a, expected, 1)],
+                "{mode}/{step}"
+            );
+        }
+        let counts_before = harness.generation_counts();
+        let response = harness
+            .send_generate_body(
+                BASE,
+                &native_effort_body(&harness.client_session_id, Some("high")),
+                "missing-high",
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            harness.generation_counts(),
+            counts_before,
+            "missing tier must send nothing"
+        );
+        assert_no_unsupported_upstream_plan(&harness, mode);
+    }
+}
+
+#[test]
 fn gateway_antigravity_dynamic_effort_legacy_budget_alias_variants() {
     run_gemini_cli_sync_test(
         "gateway_antigravity_dynamic_effort_legacy_budget_alias_variants",

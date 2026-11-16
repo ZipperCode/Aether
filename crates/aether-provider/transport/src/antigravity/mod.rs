@@ -35,8 +35,8 @@ pub use request::{
     AntigravityRequestEnvelopeUnsupportedReason, AntigravityThoughtSignatureRejection,
 };
 pub use thinking::{
-    antigravity_model_thinking_variant, antigravity_request_thinking_level,
-    AntigravityThinkingLevel,
+    antigravity_model_supports_thinking_variants, antigravity_model_thinking_variant,
+    antigravity_request_thinking_level, AntigravityThinkingLevel,
 };
 pub use url::{
     build_antigravity_v1internal_url, AntigravityRequestUrlAction,

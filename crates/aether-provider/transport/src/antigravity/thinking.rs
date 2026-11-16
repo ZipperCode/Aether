@@ -66,7 +66,7 @@ const THINKING_SUFFIXES: [(&str, AntigravityThinkingLevel); 9] = [
 /// 1. Explicit client model suffix (`-low`, `-medium`, `-high`, `-xhigh`, ...).
 /// 2. Format-native body field (`thinkingLevel` > `thinkingBudget` for Gemini,
 ///    `reasoning_effort` for OpenAI Chat, `reasoning.effort` for Responses).
-/// 3. `Medium` default for a bare `gemini-` model when the native thinking
+/// 3. `Medium` default for a bare Gemini or Claude model when the native thinking
 ///    field is absent.
 ///
 /// An explicit malformed setting returns `None` rather than silently falling
@@ -80,7 +80,7 @@ pub fn antigravity_request_thinking_level(
     if let Some((_, level)) = antigravity_model_thinking_variant(requested_model) {
         return Some(level);
     }
-    let default_level = default_bare_gemini_thinking_level(requested_model);
+    let default_level = default_bare_antigravity_thinking_level(requested_model);
     match aether_ai_formats::normalize_api_format_alias(api_format).as_str() {
         "gemini:generate_content" => {
             let payload = gemini_request_payload(body).as_object()?;
@@ -111,11 +111,11 @@ pub fn antigravity_request_thinking_level(
 }
 
 /// Split a client model into its borrowed family and a recognized terminal
-/// thinking suffix. Only `gemini-` IDs participate and only complete suffix
-/// words are removed; unknown suffixes and non-Gemini families are untouched.
+/// thinking suffix. Gemini and Claude IDs participate; only complete suffix
+/// words are removed, and unknown suffixes remain part of the model identity.
 pub fn antigravity_model_thinking_variant(model: &str) -> Option<(&str, AntigravityThinkingLevel)> {
     let model = model.trim();
-    if !has_gemini_model_prefix(model) {
+    if !antigravity_model_supports_thinking_variants(model) {
         return None;
     }
     for (suffix, level) in THINKING_SUFFIXES {
@@ -123,7 +123,7 @@ pub fn antigravity_model_thinking_variant(model: &str) -> Option<(&str, Antigrav
             continue;
         };
         let candidate = candidate.trim_end();
-        if candidate.is_empty() || candidate.ends_with('-') || !has_gemini_model_prefix(candidate) {
+        if !antigravity_model_supports_thinking_variants(candidate) {
             return None;
         }
         return Some((candidate, level));
@@ -152,9 +152,10 @@ pub(super) fn normalize_antigravity_gemini_thinking_level(
         // `thinkingLevel` capability so Gemini 2.5 budget-only wire payloads
         // never acquire an unsupported `thinkingLevel` field.
         None if aether_ai_formats::gemini_model_uses_thinking_level(model) => {
-            let Some(level) =
-                gemini_payload_thinking_level(request, default_bare_gemini_thinking_level(model))
-            else {
+            let Some(level) = gemini_payload_thinking_level(
+                request,
+                default_bare_antigravity_thinking_level(model),
+            ) else {
                 return;
             };
             level
@@ -282,12 +283,8 @@ fn parse_gemini_thinking_budget(raw: &Value) -> Option<AntigravityThinkingLevel>
     AntigravityThinkingLevel::parse(effort)
 }
 
-fn default_bare_gemini_thinking_level(model: &str) -> Option<AntigravityThinkingLevel> {
-    let model = model.trim();
-    (has_gemini_model_prefix(model)
-        && model.len() > GEMINI_MODEL_PREFIX.len()
-        && !model.ends_with('-'))
-    .then_some(AntigravityThinkingLevel::Medium)
+fn default_bare_antigravity_thinking_level(model: &str) -> Option<AntigravityThinkingLevel> {
+    antigravity_model_supports_thinking_variants(model).then_some(AntigravityThinkingLevel::Medium)
 }
 
 fn gemini_request_payload(body: &Value) -> &Value {
@@ -300,6 +297,19 @@ fn gemini_request_payload(body: &Value) -> &Value {
         }
     }
     body
+}
+
+/// 档位选择与行级清单延迟校验必须使用同一模型族范围；实际变体仍只取账号发现目录。
+/// 此处包含 Claude，但 Gemini envelope 的 thinkingLevel 写入仍仅适用于 Gemini。
+pub fn antigravity_model_supports_thinking_variants(model: &str) -> bool {
+    let model = model.trim();
+    ["gemini-", "claude-"].iter().any(|prefix| {
+        model.len() > prefix.len()
+            && !model.ends_with('-')
+            && model
+                .get(..prefix.len())
+                .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+    })
 }
 
 fn has_gemini_model_prefix(value: &str) -> bool {
@@ -384,7 +394,50 @@ mod tests {
     }
 
     #[test]
-    fn model_suffix_parser_keeps_borrowed_family_and_only_strips_known_gemini_words() {
+    fn claude_thinking_selection_uses_native_effort_and_medium_default() {
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+            for format in ["gemini:generate_content", "openai:chat", "openai:responses"] {
+                assert_eq!(
+                    antigravity_request_thinking_level(format, &json!({}), model),
+                    Some(AntigravityThinkingLevel::Medium)
+                );
+            }
+            for (body, expected) in [
+                (
+                    json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":-1}}}),
+                    Some(AntigravityThinkingLevel::Medium),
+                ),
+                (
+                    json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"max"}}}),
+                    Some(AntigravityThinkingLevel::High),
+                ),
+                (
+                    json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"xhigh"}}}),
+                    Some(AntigravityThinkingLevel::High),
+                ),
+                (
+                    json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":-2}}}),
+                    None,
+                ),
+            ] {
+                assert_eq!(
+                    antigravity_request_thinking_level("gemini:generate_content", &body, model),
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            antigravity_request_thinking_level(
+                "openai:chat",
+                &json!({"reasoning_effort":"high"}),
+                "claude-opus-5-5-low"
+            ),
+            Some(AntigravityThinkingLevel::Low)
+        );
+    }
+
+    #[test]
+    fn model_suffix_parser_keeps_borrowed_family_and_only_strips_known_words() {
         for (model, base, level) in [
             (
                 "gemini-3.8-flash-high",
@@ -431,6 +484,16 @@ mod tests {
                 "gemini-3-flash",
                 AntigravityThinkingLevel::Minimal,
             ),
+            (
+                "Claude-Opus-5-5-XHigh",
+                "Claude-Opus-5-5",
+                AntigravityThinkingLevel::High,
+            ),
+            (
+                "claude-sonnet-5-5-low",
+                "claude-sonnet-5-5",
+                AntigravityThinkingLevel::Low,
+            ),
         ] {
             assert_eq!(
                 antigravity_model_thinking_variant(model),
@@ -451,7 +514,9 @@ mod tests {
             "gemini-3-flash-extra-lowest",
             "gemini-low",
             "gemini--high",
-            "claude-opus-4-6-high",
+            "claude-opus-4-6-thinking",
+            "claude-low",
+            "claude--high",
             "gpt-5.2-high",
             "",
         ] {
@@ -549,13 +614,9 @@ mod tests {
                 "gemini body={body}"
             );
             assert_eq!(
-                antigravity_request_thinking_level(
-                    "gemini:generate_content",
-                    &body,
-                    "claude-opus-4-6",
-                ),
+                antigravity_request_thinking_level("gemini:generate_content", &body, "gpt-5.2",),
                 None,
-                "non-gemini body={body}"
+                "non-thinking-family body={body}"
             );
         }
 

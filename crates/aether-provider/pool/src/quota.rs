@@ -4,7 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_provider_transport::antigravity::{
-    antigravity_model_thinking_variant, AntigravityThinkingLevel,
+    antigravity_model_supports_thinking_variants, antigravity_model_thinking_variant,
+    AntigravityThinkingLevel,
 };
 use serde_json::{json, Map, Value};
 
@@ -183,7 +184,7 @@ fn provider_pool_model_entry_disabled(entry: &Value) -> bool {
 /// 无 effort 时保留默认映射；映射缺失或格式不符时保留既有基础模型行为。
 /// 解析结果一旦改变默认上游模型，还必须仍被该 Key 的强 `allowed_models` 允许
 /// （或客户端显式请求的别名本身就被允许），避免只授权 high 的 Key 被低档请求借用；
-/// 对网关延迟行级 allowlist 的 effort 敏感 Gemini 请求，即使解析结果仍是默认映射，
+/// 对网关延迟行级 allowlist 的 effort 敏感请求，即使解析结果仍是默认映射，
 /// 也必须命中解析目标或显式别名。非 effort 敏感请求及其他 Provider 保持枚举语义。
 pub fn resolve_provider_pool_key_thinking_model<'a>(
     key: &'a StoredProviderCatalogKey,
@@ -199,10 +200,10 @@ pub fn resolve_provider_pool_key_thinking_model<'a>(
         selected_provider_model,
         thinking_level,
     )?;
-    // 网关只为 Antigravity 的 Gemini thinking 请求延迟行级 allowlist，因此这些
-    // 请求必须由这里的强 Key allowlist 做最终判定；其余路径沿用枚举结果。
+    // 网关只为 Antigravity 的 Gemini/Claude thinking 模型延迟行级 allowlist，
+    // 因此这些请求必须由这里的强 Key allowlist 做最终判定；其余路径沿用枚举结果。
     let effort_sensitive = provider_type.trim().eq_ignore_ascii_case("antigravity")
-        && provider_pool_antigravity_thinking_model(selected_provider_model.trim())
+        && antigravity_model_supports_thinking_variants(selected_provider_model)
         && (thinking_level.is_some()
             || antigravity_model_thinking_variant(requested_model.trim()).is_some());
     if !effort_sensitive {
@@ -233,7 +234,7 @@ fn provider_pool_resolve_thinking_model<'a>(
     };
 
     let selected = selected_provider_model.trim();
-    if !provider_pool_antigravity_thinking_model(selected) {
+    if !antigravity_model_supports_thinking_variants(selected) {
         return Some(selected_provider_model);
     }
     // 权威空映射没有可服务的模型。
@@ -368,13 +369,6 @@ where
         }
         _ => false,
     }
-}
-
-/// Antigravity 只有 `gemini-` 模型标识带可识别的 thinking 后缀。
-fn provider_pool_antigravity_thinking_model(model: &str) -> bool {
-    model
-        .get(.."gemini-".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gemini-"))
 }
 
 /// 是否存在仅剥离已识别终结后缀后与目标族完全相同的已发现 thinking 变体。

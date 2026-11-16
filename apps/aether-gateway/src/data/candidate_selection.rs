@@ -3,7 +3,9 @@ use aether_data_contracts::repository::candidate_selection::{
     StoredApiFormatCandidateRowsQuery, StoredMinimalCandidateSelectionRow,
     StoredPoolKeyCandidateRowsQuery, StoredRequestedModelCandidateRowsQuery,
 };
-use aether_provider_transport::antigravity::AntigravityThinkingLevel;
+use aether_provider_transport::antigravity::{
+    antigravity_model_supports_thinking_variants, AntigravityThinkingLevel,
+};
 use aether_scheduler_core::{
     auth_constraints_allow_api_format, collect_global_model_names_for_required_capability,
     enumerate_minimal_candidate_selection_with_model_directives, normalize_api_format,
@@ -304,30 +306,22 @@ pub(crate) async fn read_api_format_rows_fallback_page(
     })
 }
 
-/// 该行是否属于 effort 敏感且可能动态换模型的 Antigravity Gemini 账号。
+/// 该行是否属于 effort 敏感且可能动态换模型的 Antigravity 账号。
 ///
-/// 只有全部候选静态模型都在 gemini 族内时才放开清单，避免把非 Gemini 模型的
-/// 管理员限制绕过强解析器的适用范围。
+/// 只有全部静态候选都属于强解析器支持的模型族才放开清单，避免绕过管理员限制。
 pub(crate) fn row_is_dynamic_thinking_antigravity(
     row: &StoredMinimalCandidateSelectionRow,
 ) -> bool {
-    fn is_gemini(model: &str) -> bool {
-        model
-            .trim()
-            .get(.."gemini-".len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gemini-"))
-    }
-
     row.provider_type.trim().eq_ignore_ascii_case("antigravity")
         && normalize_api_format(row.endpoint_api_format.as_str()) == "gemini:generate_content"
-        && is_gemini(row.model_provider_model_name.as_str())
+        && antigravity_model_supports_thinking_variants(row.model_provider_model_name.as_str())
         && row
             .model_provider_model_mappings
             .as_ref()
             .is_none_or(|mappings| {
-                mappings
-                    .iter()
-                    .all(|mapping| is_gemini(mapping.name.as_str()))
+                mappings.iter().all(|mapping| {
+                    antigravity_model_supports_thinking_variants(mapping.name.as_str())
+                })
             })
 }
 
