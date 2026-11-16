@@ -7,17 +7,22 @@ mod opening_identity;
 
 use opening_identity::sanitize_system_text;
 
+#[cfg(test)]
+#[path = "neutralization_literal_tests.rs"]
+mod literal_tests;
+
 const MAX_IDENTITY_NEUTRALIZATION_RULES: usize = 32;
 const MAX_IDENTITY_NEUTRALIZATION_TEXT_BYTES: usize = 16_384;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NeutralizationMode {
     Exact,
+    Literal,
     OpeningIdentity,
 }
 
 /// 按提供商显式配置处理 Antigravity 系统指令文本 part，与是否跨格式无关。
-/// exact 保持完整 part 显式规则替换；opening_identity 归一化明确身份与已确认的客户端元说明。
+/// exact 保持完整 part 替换；literal 按配置顺序替换文本内的字面片段；opening_identity 归一化身份。
 /// 未启用、模式无效或对应配置无效时均不修改请求。
 pub fn apply_antigravity_identity_neutralization(
     envelope: &mut Value,
@@ -40,6 +45,7 @@ pub fn apply_antigravity_identity_neutralization(
     let mode = match antigravity.get("identity_neutralization_mode") {
         None => NeutralizationMode::Exact,
         Some(Value::String(mode)) if mode == "exact" => NeutralizationMode::Exact,
+        Some(Value::String(mode)) if mode == "literal" => NeutralizationMode::Literal,
         Some(Value::String(mode)) if mode == "opening_identity" => {
             NeutralizationMode::OpeningIdentity
         }
@@ -151,9 +157,30 @@ pub fn apply_antigravity_identity_neutralization(
         let Some(part) = part.as_object_mut() else {
             continue;
         };
+        if mode == NeutralizationMode::Literal
+            && (part.get("thought").and_then(Value::as_bool) == Some(true)
+                || part.contains_key("thoughtSignature")
+                || part.contains_key("thought_signature")
+                || part
+                    .get("type")
+                    .is_some_and(|kind| kind.as_str() != Some("text")))
+        {
+            continue;
+        }
         let Some(text) = part.get("text").and_then(Value::as_str) else {
             continue;
         };
+        if mode == NeutralizationMode::Literal {
+            // 仅处理系统文本，保留首尾空白；不解释正则、占位符或特殊替换符号。
+            let mut replaced = text.to_string();
+            for (source, replacement) in &parsed_rules {
+                replaced = replaced.replace(source, replacement);
+            }
+            if replaced != text {
+                part.insert("text".to_string(), Value::String(replaced));
+            }
+            continue;
+        }
         // 仅比较整个字符串，不做 trim、子串或品牌词替换；每个 part 至多应用一条规则。
         let replacement = parsed_rules
             .iter()

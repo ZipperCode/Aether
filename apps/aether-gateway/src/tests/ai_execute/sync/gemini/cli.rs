@@ -1813,7 +1813,12 @@ fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_after_oa
     run_gemini_cli_sync_test(
         "gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_after_oauth_refresh",
         || async {
-            for mode in [None, Some("exact"), Some("opening_identity")] {
+            for mode in [
+                None,
+                Some("exact"),
+                Some("literal"),
+                Some("opening_identity"),
+            ] {
                 gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_after_oauth_refresh_impl(mode).await;
             }
         },
@@ -2252,7 +2257,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
     provider.config = Some(json!({"pool_advanced": {"antigravity": {
         "identity_neutralization_enabled": mode.is_some(),
         "identity_neutralization_mode": mode.unwrap_or("opening_identity"),
-        "identity_neutralization_rules": [{"match": SYSTEM, "replacement": "Neutral instructions"}]
+        "identity_neutralization_rules": [{"match": if mode == Some("literal") { "Keep constraints" } else { SYSTEM }, "replacement": "Neutral instructions"}]
     }}}));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
@@ -2408,6 +2413,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
     assert!(!seen_execution_runtime_request.request_has_model);
     let expected_system = match mode {
         Some("exact") => "Neutral instructions",
+        Some("literal") => "You are Codex.\nNeutral instructions and /tmp/Aether.",
         Some("opening_identity") => "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\nKeep constraints and /tmp/Aether.",
         _ => SYSTEM,
     };

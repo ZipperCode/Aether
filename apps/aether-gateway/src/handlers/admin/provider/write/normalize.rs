@@ -256,8 +256,11 @@ pub(crate) fn validate_antigravity_advanced_config(
         }
     }
     if let Some(mode) = config.get("identity_neutralization_mode") {
-        if !matches!(mode.as_str(), Some("exact" | "opening_identity")) {
-            return Err("身份中和模式必须是 exact 或 opening_identity".to_string());
+        if !matches!(
+            mode.as_str(),
+            Some("exact" | "literal" | "opening_identity")
+        ) {
+            return Err("身份中和模式必须是 exact、literal 或 opening_identity".to_string());
         }
     }
     if let Some(rules) = config.get("identity_neutralization_rules") {
@@ -462,6 +465,7 @@ mod tests {
         for settings in [
             json!({"identity_neutralization_enabled": true}),
             json!({"identity_neutralization_mode": "exact"}),
+            json!({"identity_neutralization_mode": "literal"}),
             json!({"identity_neutralization_mode": "opening_identity"}),
         ] {
             let config = json!({"antigravity": settings});

@@ -89,6 +89,7 @@
                 class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
               >
                 <option value="exact">{{ t('providers.local.antigravityNeutralizationExact') }}</option>
+                <option value="literal">{{ t('providers.local.antigravityNeutralizationLiteral') }}</option>
                 <option value="opening_identity">{{ t('providers.local.antigravityNeutralizationOpening') }}</option>
               </select>
               <p
@@ -97,14 +98,20 @@
               >
                 {{ t('providers.local.antigravityNeutralizationOpeningHint') }}
               </p>
+              <p
+                v-if="antigravityForm.identity_neutralization_mode === 'literal'"
+                class="text-xs leading-5 text-muted-foreground"
+              >
+                {{ t('providers.local.antigravityNeutralizationLiteralHint') }}
+              </p>
             </div>
-            <template v-if="antigravityForm.identity_neutralization_mode === 'exact'">
+            <template v-if="antigravityForm.identity_neutralization_mode !== 'opening_identity'">
               <div
                 v-for="(rule, index) in antigravityForm.identity_neutralization_rules"
                 :key="index"
                 class="space-y-2 rounded-xl border border-border/60 p-3"
               >
-                <Label :for="`antigravity-rule-match-${index}`">{{ t('providers.local.antigravityRuleMatch') }}</Label>
+                <Label :for="`antigravity-rule-match-${index}`">{{ t(antigravityForm.identity_neutralization_mode === 'literal' ? 'providers.local.antigravityLiteralMatch' : 'providers.local.antigravityRuleMatch') }}</Label>
                 <textarea
                   :id="`antigravity-rule-match-${index}`"
                   v-model="rule.match"
@@ -674,7 +681,7 @@ const antigravityForm = ref({
   short_retry_enabled: false,
   short_retry_max_delay_ms: 2000 as number | string,
   identity_neutralization_enabled: false,
-  identity_neutralization_mode: 'exact' as 'exact' | 'opening_identity',
+  identity_neutralization_mode: 'exact' as 'exact' | 'literal' | 'opening_identity',
   identity_neutralization_rules: [] as Array<{ match: string, replacement: string }>,
 })
 

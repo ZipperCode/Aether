@@ -119,4 +119,34 @@ describe('Antigravity advanced settings', () => {
     expect((document.getElementById('antigravity-neutralization-mode') as HTMLSelectElement).value).toBe('opening_identity')
     expect(document.getElementById('antigravity-rule-match-0')).toBeNull()
   })
+  it('edits and saves literal rules without changing inactive configuration', async () => {
+    const config: PoolAdvancedConfig = { antigravity: {
+      identity_neutralization_enabled: true,
+      identity_neutralization_mode: 'opening_identity',
+      identity_neutralization_rules: [{ match: 'old', replacement: 'new' }],
+    } }
+    mountDialog('antigravity', config)
+    await settle()
+    const mode = document.getElementById('antigravity-neutralization-mode') as HTMLSelectElement
+    mode.value = 'literal'
+    mode.dispatchEvent(new Event('change', { bubbles: true }))
+    await settle()
+    expect(document.body.textContent).toContain('字面匹配片段（区分大小写）')
+    const match = document.getElementById('antigravity-rule-match-0') as HTMLTextAreaElement
+    match.value = 'Read xd://<tool> for full docs + JSON schema before first use.'
+    match.dispatchEvent(new Event('input', { bubbles: true }))
+    const replacement = document.getElementById('antigravity-rule-replacement-0') as HTMLTextAreaElement
+    replacement.value = '工具首次使用前，先读取对应的 xd:// 文档，确认使用说明和参数结构。'
+    replacement.dispatchEvent(new Event('input', { bubbles: true }))
+    button('保存').click()
+    await settle()
+    expect(api.updateProvider.mock.calls[0]![1].pool_advanced.antigravity).toMatchObject({
+      identity_neutralization_enabled: true,
+      identity_neutralization_mode: 'literal',
+      identity_neutralization_rules: [{ match: match.value, replacement: replacement.value }],
+      future_option: true,
+    })
+    expect(config.antigravity!.identity_neutralization_mode).toBe('opening_identity')
+    expect(config.antigravity!.identity_neutralization_rules![0]!.match).toBe('old')
+  })
 })
