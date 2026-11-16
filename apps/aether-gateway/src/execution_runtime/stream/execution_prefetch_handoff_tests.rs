@@ -20,7 +20,6 @@ use super::tests::{
 use super::{
     execute_stream_from_frame_stream, maybe_build_provider_private_stream_normalizer,
     maybe_build_stream_response_rewriter, normalize_provider_private_report_context,
-    SSE_KEEPALIVE_BYTES,
 };
 use crate::stage_metrics::RequestStageTrace;
 use crate::AppState;
@@ -288,12 +287,9 @@ async fn private_normalizer_prefetch_handoff_preserves_full_fragments() {
             context.clone(),
         )
         .await;
-        // 原生 Gemini 在首条完整记录前发送一次保活；业务字节仍须逐字保留。
-        let business_body = body
-            .strip_prefix(SSE_KEEPALIVE_BYTES)
-            .expect("Gemini should emit its initial keepalive before the incomplete record");
+        // Gemini 不注入代理心跳，去除私有封装后的业务字节须逐字保留。
         assert!(
-            business_body == expected_wire.as_bytes(),
+            body == expected_wire.as_bytes(),
             "private normalizer lost bytes at chunk={chunk_size}"
         );
     }
