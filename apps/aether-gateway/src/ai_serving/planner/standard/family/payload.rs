@@ -90,6 +90,12 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         .resolve_transport_proxy_snapshot_with_tunnel_affinity(&resolved.transport)
         .await;
     let mut extra_fields = serde_json::Map::new();
+    if spec_metadata.api_format == crate::ai_serving::AUDIO_API_FORMAT {
+        extra_fields.insert(
+            "response_format".to_string(),
+            body_json["response_format"].clone(),
+        );
+    }
     if let Some(proxy_value) =
         build_request_trace_proxy_value(Some(&resolved.transport), proxy.as_ref())
     {

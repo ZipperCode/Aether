@@ -53,6 +53,9 @@ pub fn request_candidate_api_format_preference(
 ) -> Option<(u8, u8)> {
     let client_api_format = normalize_api_format_alias(client_api_format);
     let provider_api_format = normalize_api_format_alias(provider_api_format);
+    if client_api_format == crate::formats::openai::audio::AUDIO_API_FORMAT {
+        return (provider_api_format == "gemini:generate_content").then_some((1, 0));
+    }
 
     if client_api_format == "openai:responses:compact" {
         return (provider_api_format == "openai:responses:compact").then_some((0, 0));
@@ -112,6 +115,9 @@ pub fn request_candidate_api_formats(
     _require_streaming: bool,
 ) -> Vec<&'static str> {
     let client_api_format = normalize_api_format_alias(client_api_format);
+    if client_api_format == crate::formats::openai::audio::AUDIO_API_FORMAT {
+        return vec!["gemini:generate_content"];
+    }
     if client_api_format == "openai:responses:compact" {
         return vec!["openai:responses:compact"];
     }
@@ -161,6 +167,10 @@ pub fn request_conversion_kind(
 ) -> Option<RequestConversionKind> {
     let client_api_format = normalize_api_format_alias(client_api_format);
     let provider_api_format = normalize_api_format_alias(provider_api_format);
+    if client_api_format == crate::formats::openai::audio::AUDIO_API_FORMAT {
+        return (provider_api_format == "gemini:generate_content")
+            .then_some(RequestConversionKind::ToGeminiStandard);
+    }
     if client_api_format == provider_api_format {
         return None;
     }

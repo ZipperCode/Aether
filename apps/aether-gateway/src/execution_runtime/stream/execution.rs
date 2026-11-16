@@ -5430,14 +5430,10 @@ fn should_limit_direct_finalize_prefetch(plan_kind: &str, has_local_stream_rewri
 }
 
 fn client_format_allows_proxy_generated_sse_control_blocks(plan: &ExecutionPlan) -> bool {
-    // OpenAI-compatible clients commonly parse every client-visible SSE event as
-    // an OpenAI JSON payload or [DONE]. Keep the downstream wire format strict:
-    // do not inject proxy-generated comments, pings, or keepalives for openai:*.
-    !plan
-        .client_api_format
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("openai:")
+    // OpenAI 与 Gemini 客户端可能逐帧解析 JSON；官方 agy 也会拒绝 SSE 注释心跳。
+    // 只限制代理注入的控制帧，不改变正常业务数据或上游完成语义。
+    let client_format = plan.client_api_format.trim().to_ascii_lowercase();
+    !client_format.starts_with("openai:") && !client_format.starts_with("gemini:")
 }
 
 fn build_sse_body_stream(
@@ -16158,7 +16154,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn openai_client_formats_disallow_proxy_generated_sse_control_blocks() {
+    fn strict_client_formats_disallow_proxy_generated_sse_control_blocks() {
         let mut plan = ExecutionPlan {
             request_id: "req-openai-keepalive".into(),
             candidate_id: Some("cand-openai-keepalive".into()),
@@ -16188,6 +16184,12 @@ pub(crate) mod tests {
         assert!(!client_format_allows_proxy_generated_sse_control_blocks(
             &plan
         ));
+        for format in ["gemini:generate_content", "gemini:interactions"] {
+            plan.client_api_format = format.into();
+            assert!(!client_format_allows_proxy_generated_sse_control_blocks(
+                &plan
+            ));
+        }
         plan.client_api_format = "claude:messages".into();
         assert!(client_format_allows_proxy_generated_sse_control_blocks(
             &plan

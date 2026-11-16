@@ -65,6 +65,7 @@ pub struct AntigravityRequestAuth {
     pub project_id: String,
     pub client_version: Option<String>,
     pub session_id: Option<String>,
+    pub hub_identity: Option<VersionedClientIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +81,7 @@ pub enum AntigravityRequestAuthUnsupportedReason {
     InvalidAuthConfigJson,
     ComplexDynamicAuthConfig,
     MissingProjectId,
+    InvalidClientIdentity,
 }
 
 pub fn resolve_local_antigravity_request_auth(
@@ -102,11 +104,16 @@ pub fn resolve_local_antigravity_request_auth(
     };
     let (client_version, session_id) =
         find_antigravity_identity_fields(upstream_metadata, &auth_config);
+    let hub_identity = match resolve_hub_identity(&auth_config) {
+        Ok(identity) => identity,
+        Err(reason) => return AntigravityRequestAuthSupport::Unsupported(reason),
+    };
 
     AntigravityRequestAuthSupport::Supported(AntigravityRequestAuth {
         project_id,
         client_version,
         session_id,
+        hub_identity,
     })
 }
 
@@ -121,6 +128,97 @@ pub fn resolve_antigravity_identity_fields(
             find_antigravity_identity_fields(transport.key.upstream_metadata.as_ref(), &auth_config)
         })
         .unwrap_or((None, None))
+}
+
+/// Hub 指纹仅从账号认证配置读取，整组选择，禁止与 CLI 版本或抓取元数据拼接。
+fn resolve_hub_identity(
+    config: &Value,
+) -> Result<Option<VersionedClientIdentity>, AntigravityRequestAuthUnsupportedReason> {
+    let invalid = || AntigravityRequestAuthUnsupportedReason::InvalidClientIdentity;
+    match config.get("client_profile").and_then(Value::as_str) {
+        None if config.get("client_profile").is_none()
+            && config.get("hub_fingerprint").is_none() =>
+        {
+            return Ok(None)
+        }
+        Some("cli") if config.get("hub_fingerprint").is_none() => return Ok(None),
+        Some("hub") => {}
+        _ => return Err(invalid()),
+    }
+    let (version, cl, os, arch) = if let Some(tuple) = config.get("hub_fingerprint") {
+        let tuple = tuple.as_object().ok_or_else(invalid)?;
+        if tuple.len() != 4 {
+            return Err(invalid());
+        }
+        let field = |name| {
+            tuple
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(invalid)
+        };
+        (
+            field("version")?,
+            field("cl")?,
+            field("os")?,
+            field("arch")?,
+        )
+    } else {
+        // 同源校准基线；更新时必须同时替换版本、CL 与平台段。
+        ("2.32.1", "1021296516", "windows", "amd64")
+    };
+    if !cl.bytes().all(|byte| byte.is_ascii_digit())
+        || !matches!(os, "windows" | "linux" | "darwin")
+        || !matches!(arch, "amd64" | "arm64")
+    {
+        return Err(invalid());
+    }
+    VersionedClientIdentity::new(
+        version,
+        "antigravity/hub",
+        &format!(" (aidev_client; os_type={os}; arch={arch}; cl={cl})"),
+    )
+    .map(Some)
+    .map_err(|_| invalid())
+}
+
+pub fn resolve_antigravity_account_client_identity(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<VersionedClientIdentity, AntigravityRequestAuthUnsupportedReason> {
+    let config = resolve_antigravity_auth_config(transport)?;
+    Ok(resolve_hub_identity(&config)?.unwrap_or_else(|| {
+        let (version, _) =
+            find_antigravity_identity_fields(transport.key.upstream_metadata.as_ref(), &config);
+        antigravity_client_identity(version.as_deref())
+    }))
+}
+/// 无项目的发现／初始化请求也使用同一账号身份，错误配置不得静默切回 CLI。
+pub fn resolve_antigravity_account_identity_headers(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<BTreeMap<String, String>, AntigravityRequestAuthUnsupportedReason> {
+    let config = resolve_antigravity_auth_config(transport)?;
+    if let Some(identity) = resolve_hub_identity(&config)? {
+        return Ok(BTreeMap::from([(
+            "user-agent".to_string(),
+            identity.user_agent,
+        )]));
+    }
+    let (version, session) =
+        find_antigravity_identity_fields(transport.key.upstream_metadata.as_ref(), &config);
+    Ok(build_antigravity_static_client_headers(
+        version.as_deref(),
+        session.as_deref(),
+    ))
+}
+
+impl AntigravityRequestAuth {
+    pub fn envelope_user_agent(&self) -> String {
+        if self.hub_identity.is_some() {
+            "antigravity".to_string()
+        } else {
+            antigravity_client_identity(self.client_version.as_deref()).user_agent
+        }
+    }
 }
 
 fn resolve_antigravity_auth_config(
@@ -159,6 +257,9 @@ fn resolve_antigravity_auth_config(
 pub fn build_antigravity_static_identity_headers(
     auth: &AntigravityRequestAuth,
 ) -> BTreeMap<String, String> {
+    if let Some(identity) = &auth.hub_identity {
+        return BTreeMap::from([("user-agent".to_string(), identity.user_agent.clone())]);
+    }
     build_antigravity_static_client_headers(
         auth.client_version.as_deref(),
         auth.session_id.as_deref(),
@@ -417,6 +518,7 @@ mod tests {
                 project_id: "project-from-auth-config".to_string(),
                 client_version: None,
                 session_id: None,
+                hub_identity: None,
             })
         );
     }
@@ -443,6 +545,7 @@ mod tests {
                 project_id: "project-from-metadata".to_string(),
                 client_version: Some("1.99.0".to_string()),
                 session_id: Some("session-from-metadata".to_string()),
+                hub_identity: None,
             })
         );
     }
@@ -515,5 +618,51 @@ mod tests {
             headers.get("user-agent").map(String::as_str),
             Some(format!("antigravity/cli/1.4.7{}", antigravity_cli_platform_suffix()).as_str())
         );
+    }
+
+    #[test]
+    fn hub_identity_is_atomic_account_local_and_shared_with_projectless_requests() {
+        let transport = sample_transport(
+            r#"{"project_id":"p","client_profile":"hub","client_version":"9.9.9","session_id":"cli-session"}"#,
+        );
+        let AntigravityRequestAuthSupport::Supported(auth) =
+            resolve_local_antigravity_request_auth(&transport)
+        else {
+            panic!("Hub account should resolve")
+        };
+        let headers = super::build_antigravity_static_identity_headers(&auth);
+        assert_eq!(
+            headers["user-agent"],
+            "antigravity/hub/2.32.1 (aidev_client; os_type=windows; arch=amd64; cl=1021296516)"
+        );
+        assert_eq!(headers.len(), 1, "Hub must not carry CLI identity headers");
+        assert_eq!(auth.envelope_user_agent(), "antigravity");
+        assert_eq!(
+            super::resolve_antigravity_account_identity_headers(&transport).unwrap(),
+            headers
+        );
+        assert_eq!(
+            super::resolve_antigravity_account_client_identity(&transport)
+                .unwrap()
+                .version,
+            "2.32.1"
+        );
+        let other = sample_transport(r#"{"project_id":"p"}"#);
+        assert!(
+            super::resolve_antigravity_account_identity_headers(&other).unwrap()["user-agent"]
+                .starts_with("antigravity/cli/")
+        );
+        for profile in [
+            json!({"client_profile":"hub","hub_fingerprint":{"version":"2.32.1"}}),
+            json!({"client_profile":"cli","hub_fingerprint":{"version":"2.32.1"}}),
+            json!({"client_profile":"other"}),
+            json!({"client_profile":"hub","hub_fingerprint":{"version":"2.32.1","cl":"bad","os":"windows","arch":"amd64"}}),
+        ] {
+            assert!(super::resolve_hub_identity(&profile).is_err(), "{profile}");
+            let invalid = sample_transport(&profile.to_string());
+            assert!(super::resolve_antigravity_account_identity_headers(&invalid).is_err());
+        }
+        assert_eq!(super::resolve_hub_identity(&json!({"client_profile":"hub","hub_fingerprint":{"version":"2.32.2","cl":"1021296517","os":"linux","arch":"arm64"}})).unwrap().unwrap().user_agent,
+            "antigravity/hub/2.32.2 (aidev_client; os_type=linux; arch=arm64; cl=1021296517)");
     }
 }

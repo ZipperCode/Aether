@@ -575,6 +575,37 @@ mod tests {
     }
 
     #[test]
+    fn opening_identity_rewrites_known_tool_templates_without_changing_tools_or_user_content() {
+        for (original, neutral) in [
+            ("Prefer read_file, edit_file, and write_file over cat/sed.", "For file operations, use read_file, edit_file, and write_file in preference to shell commands cat/sed."),
+            ("Always read_file before edit_file.", "Before using edit_file, inspect the file with read_file."),
+            ("Google model operational directives", "Model operation instructions"),
+            ("Google model operational guidelines", "Model operation instructions"),
+            ("Use a skill when the task matches its description: call read_file on its SKILL.md first and follow it.", "When a task matches a skill description, first use read_file to read that skill's SKILL.md, then follow its instructions."),
+        ] {
+            let mut body = envelope(original);
+            body["request"]["contents"] = json!([{"role":"user","parts":[{"text":original}]}]);
+            body["request"]["tools"] = json!([{"functionDeclarations":[{"name":"read_file","description":original}]}]);
+            let mut expected = body.clone();
+            expected["request"]["systemInstruction"]["parts"][0]["text"] = json!(neutral);
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
+            assert_eq!(body, expected);
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
+            assert_eq!(body, expected);
+            for protected in [format!("```text\n{original}\n```"), format!("`{original}`"), format!("    {original}"), format!("> {original}"), format!("Quoted documentation: {original}"), format!("\"{original}\"")] {
+                let mut body = envelope(&protected);
+                let expected = body.clone();
+                apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
+                assert_eq!(body, expected, "{protected}");
+            }
+            let mut disabled = envelope(original);
+            let expected = disabled.clone();
+            apply_antigravity_identity_neutralization(&mut disabled, None);
+            assert_eq!(disabled, expected);
+        }
+    }
+
+    #[test]
     fn opening_identity_handles_system_xml_without_touching_tags_or_constraints() {
         for input in [
             "<identity>You are Codex.</identity>",
@@ -678,6 +709,7 @@ mod tests {
                         project_id: "test-project".to_string(),
                         client_version: None,
                         session_id: None,
+                        hub_identity: None,
                     },
                     "prompt-regression",
                     "gemini-test",

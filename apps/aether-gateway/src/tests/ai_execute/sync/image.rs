@@ -318,11 +318,15 @@ async fn assert_image_sync_heartbeat_runtime_miss(
 fn gateway_converts_openai_image_sync_to_gemini_image_provider() {
     run_image_sync_test(
         "gateway_converts_openai_image_sync_to_gemini_image_provider",
-        gateway_converts_openai_image_sync_to_gemini_image_provider_impl,
+        || async {
+            for antigravity in [false, true] {
+                gateway_converts_openai_image_sync_to_gemini_image_provider_impl(antigravity).await;
+            }
+        },
     );
 }
 
-async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
+async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl(antigravity: bool) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -497,6 +501,18 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
                     .and_then(|value| value.get("json_body"))
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                let body_json = if antigravity {
+                    assert_eq!(body_json["model"], "gemini-2.5-flash-image-upstream");
+                    assert_eq!(body_json["project"], "image-project");
+                    assert_eq!(body_json["requestType"], "image_gen");
+                    assert_eq!(body_json["userAgent"], "antigravity");
+                    if parts.headers.get(TRACE_ID_HEADER).and_then(|value| value.to_str().ok()) == Some("trace-image-edit") {
+                        assert!(body_json["request"]["contents"][0]["parts"].as_array().unwrap().iter().any(|part|
+                            part.pointer("/inlineData/data").and_then(serde_json::Value::as_str) == Some("aGVsbG8=")));
+                    }
+                    assert!(payload["headers"]["user-agent"].as_str().unwrap().starts_with("antigravity/hub/2.32.1 "));
+                    body_json["request"].clone()
+                } else { body_json };
                 *seen_execution_runtime_inner
                     .lock()
                     .expect("mutex should lock") = Some(SeenExecutionRuntimeSyncRequest {
@@ -513,7 +529,7 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
                         .to_string(),
                     auth_header_value: payload
                         .get("headers")
-                        .and_then(|value| value.get("x-goog-api-key"))
+                        .and_then(|value| value.get(if antigravity { "authorization" } else { "x-goog-api-key" }))
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
@@ -545,7 +561,7 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
                         .unwrap_or_default()
                         .to_string(),
                 });
-                Json(json!({
+                let mut result = json!({
                     "request_id": "trace-openai-image-to-gemini-123",
                     "status_code": 200,
                     "headers": {
@@ -574,7 +590,12 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
                     "telemetry": {
                         "elapsed_ms": 37
                     }
-                }))
+                });
+                if antigravity {
+                    let response = result["body"]["json_body"].take();
+                    result["body"]["json_body"] = json!({"response": response, "traceId":"upstream-image"});
+                }
+                Json(result)
             }
         }),
     );
@@ -587,15 +608,30 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
             "user-openai-image-bridge-1",
         ),
     )]));
+    let mut row = sample_candidate_row();
+    let mut provider = sample_provider_catalog_provider();
+    let mut endpoint = sample_provider_catalog_endpoint();
+    let mut key = sample_provider_catalog_key();
+    if antigravity {
+        row.provider_type = "antigravity".into();
+        row.key_auth_type = "oauth".into();
+        provider.provider_type = "antigravity".into();
+        endpoint.base_url = "https://daily-cloudcode-pa.googleapis.com".into();
+        endpoint.body_rules = None;
+        key.auth_type = "oauth".into();
+        key.encrypted_auth_config = Some(encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY,
+            &json!({"provider_type":"antigravity","project_id":"image-project","access_token_import_temporary":true,"headers":{"Authorization":"Bearer sk-upstream-gemini-image"},"client_profile":"hub"}).to_string()).unwrap());
+    }
     let candidate_selection_repository =
         Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
-            sample_candidate_row(),
+            row,
         ]));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider_catalog_provider()],
-        vec![sample_provider_catalog_endpoint()],
-        vec![sample_provider_catalog_key()],
+        vec![provider],
+        vec![endpoint],
+        vec![key],
     ));
+    let candidates = Arc::new(InMemoryRequestCandidateRepository::default());
 
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let gateway_state = build_state_with_execution_runtime_override(execution_runtime_url)
@@ -604,7 +640,7 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
                 auth_repository,
                 candidate_selection_repository,
                 provider_catalog_repository,
-                Arc::new(InMemoryRequestCandidateRepository::default()),
+                Arc::clone(&candidates),
                 DEVELOPMENT_ENCRYPTION_KEY,
             ),
         );
@@ -628,7 +664,14 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
 
     let response_status = response.status();
     let response_body = response.text().await.expect("body should read");
-    assert_eq!(response_status, StatusCode::OK, "{response_body}");
+    if response_status != StatusCode::OK {
+        use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
+        let records = candidates
+            .list_by_request_id("trace-openai-image-to-gemini-123")
+            .await
+            .unwrap();
+        panic!("image antigravity={antigravity} status={response_status} body={response_body} candidates={records:?}");
+    }
     let response_json: serde_json::Value =
         serde_json::from_str(&response_body).expect("body should parse");
     assert_eq!(response_json["data"][0]["b64_json"], "aGVsbG8=");
@@ -651,11 +694,19 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
     );
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-upstream:generateContent"
+        if antigravity {
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent"
+        } else {
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-upstream:generateContent"
+        }
     );
     assert_eq!(
         seen_execution_runtime_request.auth_header_value,
-        "sk-upstream-gemini-image"
+        if antigravity {
+            "Bearer sk-upstream-gemini-image"
+        } else {
+            "sk-upstream-gemini-image"
+        }
     );
     assert!(!seen_execution_runtime_request.has_model_field);
     assert_eq!(seen_execution_runtime_request.prompt, "Draw a red kite");
@@ -664,6 +715,31 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
         vec!["TEXT".to_string(), "IMAGE".to_string()]
     );
     assert_eq!(seen_execution_runtime_request.image_size, "1024x1024");
+    if antigravity {
+        let multipart = concat!("--audio-image-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-image-2\r\n",
+            "--audio-image-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nDraw a red kite\r\n",
+            "--audio-image-boundary\r\nContent-Disposition: form-data; name=\"image\"; filename=\"input.png\"\r\nContent-Type: image/png\r\n\r\nhello\r\n",
+            "--audio-image-boundary--\r\n");
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_url}/v1/images/edits"))
+            .bearer_auth(client_api_key)
+            .header(TRACE_ID_HEADER, "trace-image-edit")
+            .header(
+                "content-type",
+                "multipart/form-data; boundary=audio-image-boundary",
+            )
+            .body(multipart)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"][0]["b64_json"],
+            "aGVsbG8="
+        );
+    }
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

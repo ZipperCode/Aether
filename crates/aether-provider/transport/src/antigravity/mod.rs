@@ -16,7 +16,8 @@ pub use account::{
 };
 pub use auth::{
     antigravity_client_identity, build_antigravity_static_client_headers,
-    build_antigravity_static_identity_headers, resolve_antigravity_identity_fields,
+    build_antigravity_static_identity_headers, resolve_antigravity_account_client_identity,
+    resolve_antigravity_account_identity_headers, resolve_antigravity_identity_fields,
     resolve_local_antigravity_request_auth, AntigravityRequestAuth, AntigravityRequestAuthSupport,
     AntigravityRequestAuthUnsupportedReason, ANTIGRAVITY_PROVIDER_TYPE,
 };

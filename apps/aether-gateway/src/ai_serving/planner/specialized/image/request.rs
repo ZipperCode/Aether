@@ -345,24 +345,6 @@ async fn resolve_local_openai_image_to_gemini_candidate_payload_parts(
     let transport = &attempt.eligible.transport;
     let provider_api_format = "gemini:generate_content";
 
-    // The gemini:generate_content URL hook rewrites an Antigravity endpoint to
-    // /v1internal:, and this image path has no v1internal envelope to match it.
-    // Skip the candidate instead of posting a bare Gemini body that upstream
-    // would only reject.
-    if is_antigravity_provider_transport(transport) {
-        mark_skipped_local_openai_image_candidate(
-            state,
-            input,
-            trace_id,
-            candidate,
-            attempt.candidate_index,
-            &attempt.candidate_id,
-            "transport_unsupported",
-        )
-        .await;
-        return None;
-    }
-
     let effective_headers = input.effective_headers(&parts.headers);
 
     let prepared_candidate = match prepare_header_authenticated_candidate(
@@ -470,6 +452,62 @@ async fn resolve_local_openai_image_to_gemini_candidate_payload_parts(
             spec_metadata.require_streaming && candidate.supports_streaming,
             false,
         );
+    if is_antigravity_provider_transport(transport) {
+        use crate::ai_serving::planner::antigravity::{
+            build_antigravity_v1internal_provider_request, AntigravityV1InternalRequestInput,
+        };
+        let Ok(mut request) =
+            build_antigravity_v1internal_provider_request(AntigravityV1InternalRequestInput {
+                state,
+                parts,
+                transport,
+                trace_id,
+                client_api_format: spec_metadata.api_format,
+                requested_model: &converted.requested_model,
+                antigravity_thinking_level: None,
+                mapped_model: &converted.mapped_model,
+                provider_api_format,
+                auth_header: &prepared_candidate.auth_header,
+                auth_value: &prepared_candidate.auth_value,
+                request_headers: effective_headers,
+                original_request_body: body_json,
+                gemini_request_body: &converted.body_json,
+                upstream_is_stream,
+                same_format: false,
+                user_id: &input.auth_context.user_id,
+                api_key_id: &input.auth_context.api_key_id,
+                client_session_affinity: input.client_session_affinity.as_ref(),
+            })
+            .await
+        else {
+            mark_skipped_local_openai_image_candidate(
+                state,
+                input,
+                trace_id,
+                candidate,
+                attempt.candidate_index,
+                &attempt.candidate_id,
+                "transport_unsupported",
+            )
+            .await;
+            return None;
+        };
+        request.body["requestType"] = Value::String("image_gen".to_string());
+        return Some(LocalOpenAiImageCandidatePayloadParts {
+            transport: request.transport,
+            auth_header: request.headers.auth_header,
+            auth_value: request.headers.auth_value,
+            requested_model: converted.requested_model,
+            mapped_model: converted.mapped_model,
+            provider_api_format: provider_api_format.to_string(),
+            provider_request_headers: request.headers.headers,
+            provider_request_body: request.body,
+            upstream_url: request.upstream_url,
+            input_summary: converted.summary_json,
+            transport_profile: None,
+            upstream_is_stream,
+        });
+    }
     let Some(upstream_url) = crate::ai_serving::planner::standard::build_standard_upstream_url(
         parts,
         transport,

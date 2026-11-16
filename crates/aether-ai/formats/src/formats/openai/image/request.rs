@@ -1618,10 +1618,10 @@ fn mask_payload(mask: &Value) -> Value {
 }
 
 #[derive(Debug, Clone)]
-struct MultipartField {
-    name: String,
-    content_type: Option<String>,
-    data: Vec<u8>,
+pub(crate) struct MultipartField {
+    pub(crate) name: String,
+    pub(crate) content_type: Option<String>,
+    pub(crate) data: Vec<u8>,
 }
 
 fn multipart_file_to_input_image(field: &MultipartField) -> Value {
@@ -1683,7 +1683,7 @@ fn decode_multipart_body_base64_with_limit(
     (body.len() <= decoded_limit).then_some(body)
 }
 
-fn parse_multipart_fields(body: &[u8], boundary: &str) -> Vec<MultipartField> {
+pub(crate) fn parse_multipart_fields(body: &[u8], boundary: &str) -> Vec<MultipartField> {
     let delimiter = format!("--{boundary}").into_bytes();
     let mut parts = Vec::new();
     let mut cursor = 0usize;
@@ -1729,7 +1729,7 @@ fn parse_multipart_fields(body: &[u8], boundary: &str) -> Vec<MultipartField> {
     parts
 }
 
-fn multipart_boundary(content_type: &str) -> Option<String> {
+pub(crate) fn multipart_boundary(content_type: &str) -> Option<String> {
     let segments = split_multipart_content_type_parameters(content_type)?;
     let media_type = segments.first()?.trim();
     if !media_type.eq_ignore_ascii_case("multipart/form-data") {

@@ -1,6 +1,7 @@
 pub(crate) fn normalized_signature(api_format: &str) -> Option<&'static str> {
     match crate::ai_serving::normalize_api_format_alias(api_format).as_str() {
         "openai:chat" => Some("openai:chat"),
+        "openai:audio:transcriptions" => Some("openai:audio:transcriptions"),
         "openai:embedding" => Some("openai:embedding"),
         "openai:rerank" => Some("openai:rerank"),
         "openai:responses" => Some("openai:responses"),
@@ -17,6 +18,7 @@ pub(crate) fn normalized_signature(api_format: &str) -> Option<&'static str> {
 pub(crate) fn local_path(api_format: &str) -> Option<&'static str> {
     match crate::ai_serving::normalize_api_format_alias(api_format).as_str() {
         "openai" | "openai:chat" => Some("/v1/chat/completions"),
+        "openai:audio:transcriptions" => Some("/v1/audio/transcriptions"),
         "openai:embedding" => Some("/v1/embeddings"),
         "openai:rerank" => Some("/v1/rerank"),
         "openai:responses" => Some("/v1/responses"),

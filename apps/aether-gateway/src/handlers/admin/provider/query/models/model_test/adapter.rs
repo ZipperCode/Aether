@@ -149,6 +149,9 @@ pub(super) fn provider_query_antigravity_unsupported_reason(
         AntigravityRequestSideUnsupportedReason::UnsupportedAuth(
             AntigravityRequestAuthUnsupportedReason::MissingProjectId,
         ) => "transport_antigravity_project_id_missing",
+        AntigravityRequestSideUnsupportedReason::UnsupportedAuth(
+            AntigravityRequestAuthUnsupportedReason::InvalidClientIdentity,
+        ) => "transport_antigravity_client_identity_invalid",
         AntigravityRequestSideUnsupportedReason::UnsupportedEnvelope(_) => {
             "transport_antigravity_envelope_unsupported"
         }

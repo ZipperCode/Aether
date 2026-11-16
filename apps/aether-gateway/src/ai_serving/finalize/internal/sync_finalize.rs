@@ -39,6 +39,46 @@ pub(crate) fn maybe_build_local_core_sync_finalize_response(
         return Ok(None);
     };
     let payload = &normalized_payload;
+    if payload.report_kind == crate::ai_serving::AUDIO_REPORT_KIND {
+        let Some(product) = crate::ai_serving::maybe_build_transcription_sync_product(
+            payload.status_code,
+            payload.body_json.as_ref(),
+            payload.body_base64.as_deref(),
+        )
+        .map_err(GatewayError::from)?
+        else {
+            return Ok(None);
+        };
+        let context = payload.report_context.as_ref();
+        let text = product.client_body_json["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let mut outcome = build_local_success_outcome_with_conversion_report(
+            trace_id,
+            decision,
+            payload,
+            product.client_body_json,
+            product.provider_body_json,
+        )?;
+        if context
+            .and_then(|value| value.get("response_format"))
+            .and_then(serde_json::Value::as_str)
+            == Some("text")
+        {
+            *outcome.response.body_mut() = axum::body::Body::from(text.clone());
+            outcome.response.headers_mut().insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            outcome.response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(&text.len().to_string())
+                    .map_err(|error| GatewayError::Internal(error.to_string()))?,
+            );
+        }
+        return Ok(Some(outcome));
+    }
     let Some(report_context) = payload.report_context.as_ref() else {
         return Ok(None);
     };
@@ -93,6 +133,11 @@ fn maybe_build_local_openai_image_sync_finalize_response(
     decision: &GatewayControlDecision,
     payload: &GatewaySyncReportRequest,
 ) -> Result<Option<LocalCoreSyncFinalizeOutcome>, GatewayError> {
+    if payload.report_kind != "openai_image_sync_finalize" {
+        return Ok(None);
+    }
+    let Some(normalized) = crate::ai_serving::adaptation::private_envelope::maybe_normalize_provider_private_sync_report_payload(payload)? else { return Ok(None); };
+    let payload = &normalized;
     let Some(product) = maybe_build_openai_image_sync_finalize_product(
         payload.report_kind.as_str(),
         payload.status_code,

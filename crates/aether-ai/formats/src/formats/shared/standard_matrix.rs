@@ -133,6 +133,21 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers_and
     enable_model_directives: bool,
     reasoning_replay_policy: crate::formats::openai::responses::OpenAiResponsesReasoningReplayPolicy,
 ) -> Option<Value> {
+    if client_api_format == crate::formats::openai::audio::AUDIO_API_FORMAT {
+        if !provider_type.eq_ignore_ascii_case("antigravity")
+            || provider_api_format != "gemini:generate_content"
+        {
+            return None;
+        }
+        let mut request = serde_json::json!({"contents": body_json.get("contents")?});
+        return apply_local_body_rules_with_request_headers(
+            &mut request,
+            body_rules,
+            Some(body_json),
+            request_headers,
+        )
+        .then_some(request);
+    }
     let reasoning_replay_policy = if provider_type.trim().eq_ignore_ascii_case("xai") {
         crate::formats::openai::responses::OpenAiResponsesReasoningReplayPolicy::XaiEncrypted
     } else {

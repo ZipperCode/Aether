@@ -12,6 +12,14 @@ pub(super) fn classify_ai_public_route(
 ) -> Option<ClassifiedRoute> {
     if let Some(route) = classify_antigravity_v1internal_route(method, normalized_path) {
         Some(route)
+    } else if method == http::Method::POST && normalized_path == "/v1/audio/transcriptions" {
+        Some(classified(
+            "ai_public",
+            "openai",
+            "audio:transcriptions",
+            "openai:audio:transcriptions",
+            true,
+        ))
     } else if method == http::Method::POST && normalized_path == "/v1/chat/completions" {
         Some(classified(
             "ai_public",

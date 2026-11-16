@@ -313,6 +313,24 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     let transport = &attempt.eligible.transport;
     let transport_profile = crate::ai_serving::transport::resolve_transport_profile(transport);
     let provider_api_format = attempt.eligible.provider_api_format.as_str();
+    if spec_metadata.api_format == crate::ai_serving::AUDIO_API_FORMAT
+        && !transport
+            .provider
+            .provider_type
+            .eq_ignore_ascii_case("antigravity")
+    {
+        mark_skipped_local_standard_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            attempt.candidate_index,
+            &attempt.candidate_id,
+            "transcription_provider_unsupported",
+        )
+        .await;
+        return Ok(None);
+    }
     let effective_headers = input.effective_headers(&parts.headers);
     let is_grok = transport
         .provider

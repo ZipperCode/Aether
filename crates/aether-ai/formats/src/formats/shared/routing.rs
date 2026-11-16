@@ -258,6 +258,13 @@ pub fn resolve_execution_runtime_sync_plan_kind_with_client_surface(
     if route_class != Some("ai_public") {
         return None;
     }
+    if route_family == Some("openai")
+        && route_kind == Some("audio:transcriptions")
+        && *method == Method::POST
+        && path == "/v1/audio/transcriptions"
+    {
+        return Some(crate::formats::openai::audio::AUDIO_SYNC_PLAN_KIND);
+    }
 
     if route_family == Some("openai")
         && route_kind == Some("memories")
@@ -662,6 +669,7 @@ pub fn supports_sync_execution_decision_kind(plan_kind: &str) -> bool {
     matches!(
         plan_kind,
         OPENAI_CHAT_SYNC_PLAN_KIND
+            | crate::formats::openai::audio::AUDIO_SYNC_PLAN_KIND
             | OPENAI_MEMORIES_SYNC_PLAN_KIND
             | OPENAI_EMBEDDING_SYNC_PLAN_KIND
             | OPENAI_RERANK_SYNC_PLAN_KIND

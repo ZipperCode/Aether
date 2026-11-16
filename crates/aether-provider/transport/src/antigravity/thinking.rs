@@ -336,6 +336,7 @@ mod tests {
             project_id: "project-ant-123".to_string(),
             client_version: None,
             session_id: None,
+            hub_identity: None,
         }
     }
 

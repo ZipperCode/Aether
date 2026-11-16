@@ -75,6 +75,16 @@ pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidat
         extra_fields.insert("proxy".to_string(), proxy_value);
     }
     extra_fields.insert("image_request".to_string(), resolved.input_summary.clone());
+    let has_envelope =
+        crate::ai_serving::transport::antigravity::is_antigravity_provider_transport(&transport);
+    if has_envelope {
+        extra_fields.insert(
+            "envelope_name".to_string(),
+            serde_json::json!(
+                crate::ai_serving::planner::antigravity::ANTIGRAVITY_V1INTERNAL_ENVELOPE_NAME
+            ),
+        );
+    }
     if transport
         .provider
         .provider_type
@@ -126,7 +136,7 @@ pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidat
             sticky_key_attempts: eligible.orchestration.sticky_key_attempts,
             client_requested_stream: spec_metadata.require_streaming,
             upstream_is_stream,
-            has_envelope: false,
+            has_envelope,
             needs_conversion,
             extra_fields,
         }),

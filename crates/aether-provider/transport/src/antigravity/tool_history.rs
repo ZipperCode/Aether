@@ -528,6 +528,7 @@ mod tests {
             project_id: "project-ant-123".to_string(),
             client_version: None,
             session_id: Some("session-ant-456".to_string()),
+            hub_identity: None,
         }
     }
 

@@ -48,8 +48,33 @@ pub(crate) async fn maybe_execute_via_sync_decision_path(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
 
-    let Some((body_json, body_base64)) = parse_local_request_body(parts, body_bytes) else {
-        return Ok(LocalExecutionRequestOutcome::NoPath);
+    let (body_json, body_base64) = if parts.uri.path() == "/v1/audio/transcriptions" {
+        match crate::ai_serving::normalize_transcription(
+            parts
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or(""),
+            body_bytes,
+        ) {
+            Ok(body) => (body, None),
+            Err(message) => {
+                let response =
+                    crate::api::response::build_local_http_error_response_with_request_path(
+                        trace_id,
+                        Some(decision),
+                        Some(parts.uri.path()),
+                        http::StatusCode::BAD_REQUEST,
+                        message,
+                    )?;
+                return Ok(LocalExecutionRequestOutcome::Responded(response));
+            }
+        }
+    } else {
+        let Some(body) = parse_local_request_body(parts, body_bytes) else {
+            return Ok(LocalExecutionRequestOutcome::NoPath);
+        };
+        body
     };
 
     let mut planning_parts = parts.clone();

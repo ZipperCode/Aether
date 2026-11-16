@@ -23,6 +23,7 @@ use super::{
     UsageRuntimeConfig, VideoTaskTruthSourceMode,
 };
 
+mod audio;
 mod chat;
 mod claude;
 mod cli;

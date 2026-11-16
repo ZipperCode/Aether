@@ -139,6 +139,9 @@ pub fn infer_internal_finalize_signature(payload: &GatewaySyncReportRequest) -> 
     }
 
     let report_kind = payload.report_kind.trim().to_ascii_lowercase();
+    if report_kind.starts_with("openai_audio_transcriptions_") {
+        return Some("openai:audio:transcriptions".to_string());
+    }
     if report_kind.starts_with("openai_chat_") {
         return Some("openai:chat".to_string());
     }
@@ -186,6 +189,11 @@ pub fn infer_internal_finalize_signature(payload: &GatewaySyncReportRequest) -> 
 
 pub fn resolve_internal_finalize_route(signature: &str) -> Option<InternalFinalizeRoute> {
     match aether_ai_formats::normalize_api_format_alias(signature).as_str() {
+        "openai:audio:transcriptions" => Some(InternalFinalizeRoute {
+            public_path: "/v1/audio/transcriptions",
+            route_family: "openai",
+            route_kind: "audio:transcriptions",
+        }),
         "openai:chat" => Some(InternalFinalizeRoute {
             public_path: "/v1/chat/completions",
             route_family: "openai",
@@ -296,6 +304,8 @@ pub fn is_local_ai_sync_report_kind(report_kind: &str) -> bool {
     matches!(
         report_kind,
         "openai_chat_sync_success"
+            | "openai_audio_transcriptions_sync_success"
+            | "openai_audio_transcriptions_sync_error"
             | "claude_chat_sync_success"
             | "gemini_chat_sync_success"
             | "gemini_count_tokens_sync_success"
@@ -965,6 +975,24 @@ mod tests {
         ));
         assert!(is_local_ai_sync_report_kind("gemini_files_delete_mapping"));
         assert!(!is_local_ai_sync_report_kind("unknown_sync_kind"));
+    }
+
+    #[test]
+    fn audio_transcription_reports_retain_usage_finalize_route() {
+        for kind in [
+            "openai_audio_transcriptions_sync_success",
+            "openai_audio_transcriptions_sync_error",
+        ] {
+            assert!(is_local_ai_sync_report_kind(kind));
+            let signature = infer_internal_finalize_signature(&sample_sync_report_with_context(
+                kind,
+                serde_json::json!({}),
+            ))
+            .unwrap();
+            let route = resolve_internal_finalize_route(&signature).unwrap();
+            assert_eq!(route.public_path, "/v1/audio/transcriptions");
+            assert_eq!(route.route_kind, "audio:transcriptions");
+        }
     }
 
     #[test]

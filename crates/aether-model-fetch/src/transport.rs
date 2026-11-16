@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot, RequestBody};
 use aether_provider_transport::antigravity::{
-    build_antigravity_fetch_available_models_body, build_antigravity_static_client_headers,
-    build_antigravity_static_identity_headers, resolve_antigravity_identity_fields,
-    resolve_local_antigravity_request_auth, AntigravityRequestAuthSupport,
+    build_antigravity_fetch_available_models_body, build_antigravity_static_identity_headers,
+    resolve_antigravity_account_identity_headers, resolve_local_antigravity_request_auth,
+    AntigravityRequestAuthSupport,
 };
 use aether_provider_transport::auth::{
     ensure_upstream_auth_header, resolve_local_gemini_auth, resolve_local_openai_bearer_auth,
@@ -277,9 +277,8 @@ pub async fn build_antigravity_load_code_assist_plan(
 
     // Projectless account request: the account's `client_version` / `session_id` must still
     // shape the identity so load matches every other request from the same account.
-    let (client_version, session_id) = resolve_antigravity_identity_fields(transport);
-    let mut headers =
-        build_antigravity_static_client_headers(client_version.as_deref(), session_id.as_deref());
+    let mut headers = resolve_antigravity_account_identity_headers(transport)
+        .map_err(|_| "Invalid Antigravity account client identity".to_string())?;
     headers.insert(authorization.0.clone(), authorization.1.clone());
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("accept".to_string(), "application/json".to_string());
@@ -1294,6 +1293,59 @@ mod tests {
         assert_eq!(
             plan.headers.get("x-vscode-sessionid").map(String::as_str),
             Some("sess-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_hub_identity_is_shared_by_model_fetch_and_projectless_discovery() {
+        let runtime = TestRuntime {
+            oauth_auth: Some(
+                aether_provider_transport::LocalResolvedOAuthRequestAuth::Header {
+                    name: "authorization".to_string(),
+                    value: "Bearer oauth-token".to_string(),
+                },
+            ),
+            proxy: None,
+        };
+        let mut transport = sample_transport("antigravity", "gemini:generate_content", "oauth");
+        transport.key.decrypted_auth_config = Some(json!({
+            "project_id":"project-1", "client_profile":"hub", "client_version":"9.9.9", "session_id":"cli-session",
+            "hub_fingerprint":{"version":"2.32.2","cl":"1021296517","os":"linux","arch":"arm64"}
+        }).to_string());
+        let fetch = build_antigravity_fetch_available_models_plan(
+            &runtime,
+            &transport,
+            "https://cloudcode-pa.googleapis.com",
+            "project-1",
+            None,
+        )
+        .await
+        .unwrap();
+        let load = build_antigravity_load_code_assist_plan(&runtime, &transport)
+            .await
+            .unwrap();
+        for plan in [&fetch, &load] {
+            assert_eq!(
+                plan.headers["user-agent"],
+                "antigravity/hub/2.32.2 (aidev_client; os_type=linux; arch=arm64; cl=1021296517)"
+            );
+            assert_eq!(plan.headers["authorization"], "Bearer oauth-token");
+            for cli_header in [
+                "x-client-name",
+                "x-goog-api-client",
+                "x-client-version",
+                "x-vscode-sessionid",
+            ] {
+                assert!(!plan.headers.contains_key(cli_header));
+            }
+        }
+        transport.key.decrypted_auth_config = Some(
+            json!({"client_profile":"hub", "hub_fingerprint":{"version":"2.32.2"}}).to_string(),
+        );
+        assert!(
+            build_antigravity_load_code_assist_plan(&runtime, &transport)
+                .await
+                .is_err()
         );
     }
 

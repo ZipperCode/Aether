@@ -74,6 +74,11 @@ pub fn request_pair_allowed_for_transport(
 ) -> bool {
     let client_api_format = normalize_api_format_alias(client_api_format);
     let provider_api_format = normalize_api_format_alias(provider_api_format);
+    if client_api_format == aether_ai_formats::formats::openai::audio::AUDIO_API_FORMAT
+        && !is_antigravity_provider_transport(transport)
+    {
+        return false;
+    }
     if client_api_format == provider_api_format {
         return true;
     }

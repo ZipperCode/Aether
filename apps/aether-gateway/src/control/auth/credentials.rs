@@ -29,6 +29,14 @@ pub(crate) fn extract_requested_model(
             return Some(model);
         }
     }
+    if uri.path() == "/v1/audio/transcriptions" {
+        let content_type = headers.get(http::header::CONTENT_TYPE)?.to_str().ok()?;
+        return crate::ai_serving::normalize_transcription(content_type, body)
+            .ok()?
+            .get("model")?
+            .as_str()
+            .map(str::to_string);
+    }
 
     if !is_json_request(headers) || body.is_empty() {
         return None;

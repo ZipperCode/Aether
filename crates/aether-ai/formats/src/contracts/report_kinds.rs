@@ -65,6 +65,9 @@ pub const GEMINI_CLI_SYNC_ERROR_REPORT_KIND: &str = "gemini_cli_sync_error";
 
 pub fn implicit_sync_finalize_report_kind(plan_kind: &str) -> Option<&'static str> {
     match plan_kind {
+        crate::formats::openai::audio::AUDIO_SYNC_PLAN_KIND => {
+            Some(crate::formats::openai::audio::AUDIO_REPORT_KIND)
+        }
         super::plan_kinds::OPENAI_MEMORIES_SYNC_PLAN_KIND => {
             Some(OPENAI_MEMORIES_SYNC_FINALIZE_REPORT_KIND)
         }
@@ -86,6 +89,9 @@ pub fn implicit_sync_finalize_report_kind(plan_kind: &str) -> Option<&'static st
 
 pub fn core_error_default_client_api_format(report_kind: &str) -> Option<&'static str> {
     match report_kind {
+        crate::formats::openai::audio::AUDIO_REPORT_KIND => {
+            Some(crate::formats::openai::audio::AUDIO_API_FORMAT)
+        }
         OPENAI_MEMORIES_SYNC_FINALIZE_REPORT_KIND => Some("openai:responses"),
         OPENAI_CHAT_SYNC_FINALIZE_REPORT_KIND => Some("openai:chat"),
         CLAUDE_CHAT_SYNC_FINALIZE_REPORT_KIND => Some("claude:messages"),
@@ -105,6 +111,9 @@ pub fn core_error_default_client_api_format(report_kind: &str) -> Option<&'stati
 
 pub fn core_error_background_report_kind(report_kind: &str) -> Option<&'static str> {
     match report_kind {
+        crate::formats::openai::audio::AUDIO_REPORT_KIND => {
+            Some("openai_audio_transcriptions_sync_error")
+        }
         OPENAI_MEMORIES_SYNC_FINALIZE_REPORT_KIND => Some(OPENAI_RESPONSES_SYNC_ERROR_REPORT_KIND),
         OPENAI_CHAT_SYNC_FINALIZE_REPORT_KIND => Some(OPENAI_CHAT_SYNC_ERROR_REPORT_KIND),
         CLAUDE_CHAT_SYNC_FINALIZE_REPORT_KIND => Some(CLAUDE_CHAT_SYNC_ERROR_REPORT_KIND),
@@ -132,6 +141,9 @@ pub fn core_error_background_report_kind(report_kind: &str) -> Option<&'static s
 
 pub fn core_success_background_report_kind(report_kind: &str) -> Option<&'static str> {
     match report_kind {
+        crate::formats::openai::audio::AUDIO_REPORT_KIND => {
+            Some("openai_audio_transcriptions_sync_success")
+        }
         OPENAI_MEMORIES_SYNC_FINALIZE_REPORT_KIND => Some(OPENAI_MEMORIES_SYNC_SUCCESS_REPORT_KIND),
         OPENAI_CHAT_SYNC_FINALIZE_REPORT_KIND => Some(OPENAI_CHAT_SYNC_SUCCESS_REPORT_KIND),
         CLAUDE_CHAT_SYNC_FINALIZE_REPORT_KIND => Some(CLAUDE_CHAT_SYNC_SUCCESS_REPORT_KIND),

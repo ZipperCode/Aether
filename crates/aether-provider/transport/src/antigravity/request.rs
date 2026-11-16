@@ -1,6 +1,6 @@
 use serde_json::{Map, Value};
 
-use super::auth::{antigravity_client_identity, AntigravityRequestAuth};
+use super::auth::AntigravityRequestAuth;
 use super::schema::{normalize_claude_unions, normalize_tool_parameters, SchemaBudget};
 use super::thinking::normalize_antigravity_gemini_thinking_level;
 use super::tool_history::normalize_antigravity_claude_tool_history;
@@ -260,14 +260,10 @@ pub fn build_antigravity_safe_v1internal_request(
         }
         normalize_antigravity_gemini_thinking_level(&mut inner_request, model);
         let request_id = non_empty_string_field(source, "requestId").unwrap_or(request_id);
-        // Pre-enveloped v1internal bodies keep their explicit `userAgent` byte-for-byte so
-        // passthrough callers stay wire-compatible; only a missing one falls back to the
-        // account CLI identity.
+        // 已封装请求保留显式 userAgent；仅缺失时使用账号选择的整套身份。
         let user_agent = non_empty_string_field(source, "userAgent")
             .map(str::to_string)
-            .unwrap_or_else(|| {
-                antigravity_client_identity(auth.client_version.as_deref()).user_agent
-            });
+            .unwrap_or_else(|| auth.envelope_user_agent());
         let existing_request_type = existing_v1internal_request_type(source);
 
         let mut envelope = serde_json::json!({
@@ -304,7 +300,7 @@ pub fn build_antigravity_safe_v1internal_request(
         "requestId": request_id,
         "request": Value::Object(inner_request),
         "model": model,
-        "userAgent": antigravity_client_identity(auth.client_version.as_deref()).user_agent,
+        "userAgent": auth.envelope_user_agent(),
     });
     if request_type != AntigravityEnvelopeRequestType::Agent {
         envelope["requestType"] = Value::String(request_type.as_str().to_string());
@@ -942,6 +938,7 @@ mod tests {
             project_id: "project-ant-123".to_string(),
             client_version: None,
             session_id: None,
+            hub_identity: None,
         }
     }
 
@@ -1861,6 +1858,38 @@ mod tests {
             user_agent.starts_with("antigravity/cli/1.5.2 "),
             "envelope userAgent should carry the account client_version override: {user_agent}"
         );
+    }
+
+    #[test]
+    fn hub_identity_applies_to_generated_and_existing_envelopes() {
+        let mut auth = sample_auth();
+        auth.client_version = Some("9.9.9".to_string());
+        auth.hub_identity = Some(
+            crate::client_identity::VersionedClientIdentity::new(
+                "2.32.1",
+                "antigravity/hub",
+                " (aidev_client; os_type=windows; arch=amd64; cl=1021296516)",
+            )
+            .unwrap(),
+        );
+        for body in [
+            json!({"contents":[{"role":"user","parts":[{"text":"hello"}]}]}),
+            json!({"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}),
+        ] {
+            let AntigravityRequestEnvelopeSupport::Supported(envelope) =
+                build_antigravity_safe_v1internal_request(
+                    &auth,
+                    "request-hub",
+                    "account-model",
+                    &body,
+                    AntigravityEnvelopeRequestType::Agent,
+                )
+            else {
+                panic!("Hub envelope should build")
+            };
+            assert_eq!(envelope["userAgent"], "antigravity");
+            assert_eq!(envelope["model"], "account-model");
+        }
     }
 
     /// 用十二个合成工具复现线上元声明错误，覆盖公开 Gemini、两种声明拼写及已有 envelope。

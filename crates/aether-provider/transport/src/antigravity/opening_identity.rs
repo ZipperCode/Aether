@@ -475,6 +475,21 @@ fn rewrite_convention_line(line: &str, depth: usize) -> String {
     if line.trim() == OMP_RFC_CONVENTIONS {
         return line.replacen(OMP_RFC_CONVENTIONS, OMP_NEUTRAL_CONVENTIONS, 1);
     }
+    // 仅改写完整已知模板行，保留真实工具名、执行顺序和技能路径语义。
+    let (body, punctuation) = line
+        .trim()
+        .strip_suffix('.')
+        .map_or((line.trim(), ""), |body| (body, "."));
+    let replacement = match body {
+        "Prefer read_file, edit_file, and write_file over cat/sed" => Some("For file operations, use read_file, edit_file, and write_file in preference to shell commands cat/sed"),
+        "Always read_file before edit_file" => Some("Before using edit_file, inspect the file with read_file"),
+        "Google model operational directives" | "Google model operational guidelines" => Some("Model operation instructions"),
+        "Use a skill when the task matches its description: call read_file on its SKILL.md first and follow it" => Some("When a task matches a skill description, first use read_file to read that skill's SKILL.md, then follow its instructions"),
+        _ => None,
+    };
+    if let Some(replacement) = replacement {
+        return line.replacen(line.trim(), &format!("{replacement}{punctuation}"), 1);
+    }
     if depth < 16 {
         if let Some((prefix, inner, suffix)) = system_xml_wrapper(line) {
             return format!(
@@ -488,7 +503,10 @@ fn rewrite_convention_line(line: &str, depth: usize) -> String {
 
 /// RFC 说明自身含行内反引号，只改写完整说明行；跨行代码跨度仍原样保留。
 fn rewrite_system_conventions(text: &str) -> String {
-    if !text.contains(OMP_RFC_CONVENTIONS) {
+    if ![OMP_RFC_CONVENTIONS, "read_file", "Google model operational"]
+        .iter()
+        .any(|trigger| text.contains(trigger))
+    {
         return text.to_string();
     }
     let spans = find_code_spans(text);

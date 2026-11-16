@@ -21,6 +21,7 @@ use crate::{
 // which describe operational compatibility surfaces rather than the concrete axum mount list.
 const AI_POST_ROUTE_PATTERNS: &[&str] = &[
     "/v1/chat/completions",
+    "/v1/audio/transcriptions",
     "/v1/embeddings",
     "/v1/rerank",
     "/v1/responses",
