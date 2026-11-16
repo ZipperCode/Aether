@@ -67,7 +67,6 @@ pub(crate) async fn build_antigravity_v1internal_provider_request(
         input.trace_id,
         input.mapped_model,
         input.gemini_request_body,
-        input.same_format,
     )
     .await?;
     apply_antigravity_session_continuity(
@@ -131,7 +130,6 @@ async fn build_antigravity_v1internal_payload(
     trace_id: &str,
     mapped_model: &str,
     gemini_request_body: &Value,
-    same_format: bool,
 ) -> Result<AntigravityV1InternalPayload, AntigravityV1InternalRequestError> {
     let mut resolved_transport = Arc::clone(transport);
     let mut antigravity_support = classify_local_antigravity_request_support(
@@ -193,7 +191,6 @@ async fn build_antigravity_v1internal_payload(
     apply_antigravity_identity_neutralization(
         &mut body,
         resolved_transport.provider.config.as_ref(),
-        same_format,
     );
 
     Ok(AntigravityV1InternalPayload {

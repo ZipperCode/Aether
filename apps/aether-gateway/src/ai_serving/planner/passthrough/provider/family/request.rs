@@ -14,11 +14,12 @@ use crate::ai_serving::planner::redaction::{
     request_identity_response_encoding_when_redacted, resolve_provider_chat_pii_redaction,
 };
 use crate::ai_serving::transport::antigravity::{
-    antigravity_account_observation_due, build_antigravity_safe_v1internal_request,
-    build_antigravity_static_identity_headers, classify_local_antigravity_request_support,
-    AntigravityEnvelopeRequestType, AntigravityRequestAuthUnsupportedReason,
-    AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
-    AntigravityRequestSideUnsupportedReason, AntigravityThinkingLevel,
+    antigravity_account_observation_due, apply_antigravity_identity_neutralization,
+    build_antigravity_safe_v1internal_request, build_antigravity_static_identity_headers,
+    classify_local_antigravity_request_support, AntigravityEnvelopeRequestType,
+    AntigravityRequestAuthUnsupportedReason, AntigravityRequestEnvelopeSupport,
+    AntigravityRequestSideSupport, AntigravityRequestSideUnsupportedReason,
+    AntigravityThinkingLevel,
 };
 use crate::ai_serving::transport::{
     apply_local_body_rules_with_request_headers, body_rules_have_enabled_rules,
@@ -506,6 +507,11 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         base_provider_request_body
     };
     if prepared.is_antigravity {
+        // 显式提示词处理独立于格式转换，原生路径也必须在封装后应用。
+        apply_antigravity_identity_neutralization(
+            &mut provider_request_body,
+            transport.provider.config.as_ref(),
+        );
         crate::ai_serving::planner::antigravity::apply_antigravity_session_continuity(
             &mut provider_request_body,
             &input.auth_context.user_id,

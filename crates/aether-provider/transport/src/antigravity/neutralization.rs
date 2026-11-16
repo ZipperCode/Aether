@@ -16,17 +16,13 @@ enum NeutralizationMode {
     OpeningIdentity,
 }
 
-/// 仅在跨格式 Antigravity 请求中处理系统指令文本 part。
+/// 按提供商显式配置处理 Antigravity 系统指令文本 part，与是否跨格式无关。
 /// exact 保持完整 part 显式规则替换；opening_identity 归一化明确身份与已确认的客户端元说明。
-/// 同格式请求保持透传；未启用、模式无效或对应配置无效时均不修改请求。
+/// 未启用、模式无效或对应配置无效时均不修改请求。
 pub fn apply_antigravity_identity_neutralization(
     envelope: &mut Value,
     provider_config: Option<&Value>,
-    same_format: bool,
 ) {
-    if same_format {
-        return;
-    }
     let Some(antigravity) = provider_config
         .and_then(|config| config.get("pool_advanced"))
         .and_then(|pool_advanced| pool_advanced.get("antigravity"))
@@ -219,7 +215,7 @@ mod tests {
         for provider_config in [None, Some(config(None)), Some(config(Some(false)))] {
             let mut body = envelope("exact system prompt");
             let original = body.clone();
-            apply_antigravity_identity_neutralization(&mut body, provider_config.as_ref(), false);
+            apply_antigravity_identity_neutralization(&mut body, provider_config.as_ref());
             assert_eq!(body, original);
         }
     }
@@ -242,7 +238,7 @@ mod tests {
             }
         });
 
-        apply_antigravity_identity_neutralization(&mut body, Some(&config(Some(true))), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&config(Some(true))));
 
         let parts = body["request"]["systemInstruction"]["parts"]
             .as_array()
@@ -281,7 +277,7 @@ mod tests {
         expected["request"]["systemInstruction"]["parts"][0]["text"] =
             Value::String("neutral system prompt".to_string());
 
-        apply_antigravity_identity_neutralization(&mut body, Some(&config(Some(true))), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&config(Some(true))));
 
         assert_eq!(body, expected);
     }
@@ -320,25 +316,9 @@ mod tests {
             });
             let mut body = envelope("exact system prompt");
             let original = body.clone();
-            apply_antigravity_identity_neutralization(&mut body, Some(&provider_config), false);
+            apply_antigravity_identity_neutralization(&mut body, Some(&provider_config));
             assert_eq!(body, original);
         }
-    }
-
-    #[test]
-    fn same_format_native_gate_preserves_exact_match() {
-        let provider_config = config(Some(true));
-        let mut native = envelope("exact system prompt");
-        let original = native.clone();
-        apply_antigravity_identity_neutralization(&mut native, Some(&provider_config), true);
-        assert_eq!(native, original);
-
-        let mut cross_format = envelope("exact system prompt");
-        apply_antigravity_identity_neutralization(&mut cross_format, Some(&provider_config), false);
-        assert_eq!(
-            cross_format["request"]["systemInstruction"]["parts"][0]["text"],
-            "neutral system prompt"
-        );
     }
 
     #[test]
@@ -368,7 +348,7 @@ mod tests {
 
         for (input, expected) in cases {
             let mut body = envelope(input);
-            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
             assert_eq!(opening_text(&body), expected, "输入：{input}");
         }
     }
@@ -382,7 +362,7 @@ mod tests {
             "You are an AI agent powered by DeepSeek Harness.\nYou are an assistant created by Acme, keep /tmp/Aether, tool_call and x-anthropic-billing-header: required.",
         );
 
-        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
 
         assert_eq!(
             opening_text(&body),
@@ -398,7 +378,7 @@ mod tests {
         let expected = input.replacen("You are DSH.", OFFICIAL_ANTIGRAVITY_IDENTITY, 1);
         let mut body = envelope(input);
 
-        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
 
         assert_eq!(opening_text(&body), expected);
     }
@@ -412,7 +392,7 @@ mod tests {
             "   x-anthropic-billing-header: cc_version=2; cch=123;\nYou are an assistant created by Acme, retain x-anthropic-billing-header: as a tool rule.\nMetadata x-anthropic-billing-header: keep this path /tmp/a.",
         );
 
-        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
 
         assert_eq!(
             opening_text(&body),
@@ -440,7 +420,7 @@ mod tests {
         for input in cases {
             let mut body = envelope(input);
             let original = body.clone();
-            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
             assert_eq!(body, original, "输入不应变化：{input}");
         }
     }
@@ -450,14 +430,14 @@ mod tests {
         let mut body =
             envelope("You are DSH.\n\nYou are Codex.\n\nKeep tool rules and /tmp/Aether.");
         let provider_config = opening_config();
-        apply_antigravity_identity_neutralization(&mut body, Some(&provider_config), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&provider_config));
         let once = body.clone();
         assert_eq!(
             opening_text(&once),
             format!("{OFFICIAL_ANTIGRAVITY_IDENTITY}\n\nKeep tool rules and /tmp/Aether.")
         );
 
-        apply_antigravity_identity_neutralization(&mut body, Some(&provider_config), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&provider_config));
         assert_eq!(body, once);
     }
 
@@ -472,7 +452,7 @@ mod tests {
             }
         });
 
-        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
 
         let parts = body["request"]["systemInstruction"]["parts"]
             .as_array()
@@ -516,31 +496,31 @@ mod tests {
         expected["request"]["systemInstruction"]["parts"][0]["text"] =
             Value::String(OFFICIAL_ANTIGRAVITY_IDENTITY.to_string());
 
-        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
 
         assert_eq!(body, expected);
     }
 
     #[test]
-    fn opening_identity_respects_native_gate_invalid_modes_and_rule_independence() {
+    fn opening_identity_respects_disabled_invalid_modes_and_rule_independence() {
         let provider_config = opening_config();
         let mut native = envelope("You are DSH.");
         let original = native.clone();
-        apply_antigravity_identity_neutralization(&mut native, Some(&provider_config), true);
-        assert_eq!(native, original);
+        apply_antigravity_identity_neutralization(&mut native, Some(&provider_config));
+        assert_eq!(opening_text(&native), OFFICIAL_ANTIGRAVITY_IDENTITY);
 
         let mut disabled_config = provider_config.clone();
         disabled_config["pool_advanced"]["antigravity"]["identity_neutralization_enabled"] =
             Value::Bool(false);
         let mut disabled = envelope("You are DSH.");
-        apply_antigravity_identity_neutralization(&mut disabled, Some(&disabled_config), false);
+        apply_antigravity_identity_neutralization(&mut disabled, Some(&disabled_config));
         assert_eq!(disabled, original);
 
         let mut without_rules = provider_config;
         without_rules["pool_advanced"]["antigravity"]["identity_neutralization_rules"] =
             Value::String("opening mode must ignore exact rules".to_string());
         let mut transformed = envelope("You are DSH.");
-        apply_antigravity_identity_neutralization(&mut transformed, Some(&without_rules), false);
+        apply_antigravity_identity_neutralization(&mut transformed, Some(&without_rules));
         assert_eq!(opening_text(&transformed), OFFICIAL_ANTIGRAVITY_IDENTITY);
 
         for invalid_mode in [Value::Null, json!(1), json!("opening"), json!("EXACT")] {
@@ -549,7 +529,7 @@ mod tests {
                 invalid_mode;
             let mut body = envelope("exact system prompt");
             let original = body.clone();
-            apply_antigravity_identity_neutralization(&mut body, Some(&invalid_config), false);
+            apply_antigravity_identity_neutralization(&mut body, Some(&invalid_config));
             assert_eq!(body, original);
         }
     }
@@ -574,9 +554,9 @@ mod tests {
                 json!([{"functionDeclarations": [{"name": "read", "description": original}]}]);
             let mut expected_body = body.clone();
             expected_body["request"]["systemInstruction"]["parts"][0]["text"] = json!(expected);
-            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
             assert_eq!(body, expected_body);
-            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
             assert_eq!(body, expected_body);
         }
         for input in [
@@ -589,13 +569,9 @@ mod tests {
         ] {
             let mut body = envelope(&input);
             let expected = body.clone();
-            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
             assert_eq!(body, expected, "引用和变体不得被泛化删除：{input}");
         }
-        let mut native = envelope(original);
-        let expected = native.clone();
-        apply_antigravity_identity_neutralization(&mut native, Some(&opening_config()), true);
-        assert_eq!(native, expected);
     }
 
     #[test]
@@ -607,7 +583,7 @@ mod tests {
             "<system>\nYou are Codex.\n</system>",
         ] {
             let mut body = envelope(input);
-            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
             assert_eq!(opening_text(&body), input.replace("You are Codex.", OFFICIAL_ANTIGRAVITY_IDENTITY));
         }
         for input in [
@@ -619,7 +595,7 @@ mod tests {
         ] {
             let mut body = envelope(input);
             let expected = body.clone();
-            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+            apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
             assert_eq!(body, expected);
         }
     }
@@ -628,7 +604,7 @@ mod tests {
     fn opening_identity_removes_new_empty_plain_parts_but_keeps_metadata() {
         let billing = "x-anthropic-billing-header: cc_version=2;";
         let mut body = envelope(billing);
-        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
         assert!(body["request"].get("systemInstruction").is_none());
 
         let mut body = envelope(billing);
@@ -645,13 +621,13 @@ mod tests {
             .remove(0);
         expected["request"]["systemInstruction"]["parts"][0]["text"] =
             json!(OFFICIAL_ANTIGRAVITY_IDENTITY);
-        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
         assert_eq!(body, expected);
 
         let mut body = envelope(billing);
         body["request"]["systemInstruction"]["unknown"] = json!({"keep": true});
         let expected = body.clone();
-        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()), false);
+        apply_antigravity_identity_neutralization(&mut body, Some(&opening_config()));
         assert_eq!(body, expected);
     }
 
@@ -725,7 +701,7 @@ mod tests {
                         .replace("You are Codex.", OFFICIAL_ANTIGRAVITY_IDENTITY));
                 }
             }
-            apply_antigravity_identity_neutralization(&mut output, Some(&opening_config()), false);
+            apply_antigravity_identity_neutralization(&mut output, Some(&opening_config()));
             assert_eq!(output, expected, "system/developer/instructions must normalize without changing user content: {format}");
         }
     }

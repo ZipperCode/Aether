@@ -1812,12 +1812,18 @@ async fn gateway_executes_vertex_ai_gemini_cli_sync_via_local_decision_gate_with
 fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_after_oauth_refresh() {
     run_gemini_cli_sync_test(
         "gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_after_oauth_refresh",
-        gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_after_oauth_refresh_impl,
+        || async {
+            for mode in [None, Some("exact"), Some("opening_identity")] {
+                gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_after_oauth_refresh_impl(mode).await;
+            }
+        },
     );
 }
 
 async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_after_oauth_refresh_impl(
+    mode: Option<&str>,
 ) {
+    const SYSTEM: &str = "You are Codex.\nKeep constraints and /tmp/Aether.";
     use base64::Engine as _;
 
     #[derive(Debug, Clone)]
@@ -1838,6 +1844,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
         contents_len: usize,
         exact_temperature: f64,
         request_has_model: bool,
+        request: serde_json::Value,
     }
 
     #[derive(Debug, Clone)]
@@ -2205,6 +2212,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
                             .and_then(|value| value.get("request"))
                             .and_then(|value| value.get("model"))
                             .is_some(),
+                        request: payload["body"]["json_body"]["request"].clone(),
                     });
                 Json(json!({
                     "request_id": "trace-antigravity-cli-oauth-local-sync-123",
@@ -2240,8 +2248,14 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
             sample_candidate_row(),
         ]));
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+    let mut provider = sample_provider_catalog_provider();
+    provider.config = Some(json!({"pool_advanced": {"antigravity": {
+        "identity_neutralization_enabled": mode.is_some(),
+        "identity_neutralization_mode": mode.unwrap_or("opening_identity"),
+        "identity_neutralization_rules": [{"match": SYSTEM, "replacement": "Neutral instructions"}]
+    }}}));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider_catalog_provider()],
+        vec![provider],
         vec![sample_provider_catalog_endpoint()],
         vec![sample_provider_catalog_key()],
     ));
@@ -2287,7 +2301,13 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
             TRACE_ID_HEADER,
             "trace-antigravity-cli-oauth-local-sync-123",
         )
-        .body("{\"contents\":[],\"generationConfig\":{\"temperature\":0.2}}")
+        .json(&json!({
+            "contents": [],
+            "systemInstruction": {"parts": [{"text": SYSTEM}], "customSystem": true},
+            "tools": [{"functionDeclarations": [{"name": "read", "description": SYSTEM}]}],
+            "customRequest": {"keep": true},
+            "generationConfig": {"temperature": 0.2}
+        }))
         .send()
         .await
         .expect("request should succeed");
@@ -2386,6 +2406,29 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
     assert_eq!(seen_execution_runtime_request.contents_len, 0);
     assert!((seen_execution_runtime_request.exact_temperature - 0.2).abs() < f64::EPSILON);
     assert!(!seen_execution_runtime_request.request_has_model);
+    let expected_system = match mode {
+        Some("exact") => "Neutral instructions",
+        Some("opening_identity") => "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\nKeep constraints and /tmp/Aether.",
+        _ => SYSTEM,
+    };
+    assert_eq!(
+        seen_execution_runtime_request.request["systemInstruction"]["parts"][0]["text"],
+        expected_system,
+        "mode={mode:?}"
+    );
+    assert_eq!(
+        seen_execution_runtime_request.request["systemInstruction"]["customSystem"],
+        true
+    );
+    assert_eq!(
+        seen_execution_runtime_request.request["tools"][0]["functionDeclarations"][0]
+            ["description"],
+        SYSTEM
+    );
+    assert_eq!(
+        seen_execution_runtime_request.request["customRequest"],
+        json!({"keep": true})
+    );
 
     let stored_candidates = request_candidate_repository
         .list_by_request_id("trace-antigravity-cli-oauth-local-sync-123")
