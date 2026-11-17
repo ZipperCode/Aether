@@ -1,12 +1,16 @@
 use super::domain::{AttemptResult, PersistedSnapshot, QuotaKind, SourceAttempt, StableErrorClass};
 use super::routing::retry_after_eligibility;
+use crate::handlers::admin::provider::shared::quota_recovery::reconcile_quota_recovery;
 use crate::{handlers::admin::request::AdminAppState, GatewayError};
-use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
+use aether_data_contracts::repository::provider_catalog::{
+    ProviderCatalogKeySchedulingStateCasUpdate, StoredProviderCatalogKey,
+};
 use aether_provider_pool::{
     official_balance_backoff_with_jitter_secs, provider_pool_key_account_quota_exhausted,
     provider_pool_key_balance_below_minimum, provider_quota_snapshot_exhausted,
-    ProviderQuotaQueryStatus, ProviderQuotaRefreshState, ProviderQuotaSnapshotContract,
-    ProviderQuotaSource, PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
+    provider_quota_snapshot_has_available_quota, ProviderQuotaQueryStatus,
+    ProviderQuotaRefreshState, ProviderQuotaSnapshotContract, ProviderQuotaSource,
+    PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -54,7 +58,95 @@ pub(super) async fn persist_attempt(
     if invalidation_scope == QuotaCacheInvalidationScope::CandidateRouting {
         state.app().invalidate_provider_quota_candidate_caches();
     }
+    if provider_quota_snapshot_has_available_quota(&persisted.snapshot, now_unix_secs) {
+        recover_quota_scheduling(state, &update, &persisted.snapshot).await?;
+    }
     Ok(persisted)
+}
+
+async fn recover_quota_scheduling(
+    state: &AdminAppState<'_>,
+    update: &SnapshotUpdate<'_>,
+    snapshot: &Value,
+) -> Result<(), GatewayError> {
+    let key_id = &update.key.id;
+    let provider_id = &update.key.provider_id;
+    let projection_lock = state
+        .app()
+        .acquire_provider_key_quota_projection_lock(provider_id, key_id)
+        .await?;
+    let result = async {
+        let Some(key) = state
+            .app()
+            .list_provider_catalog_keys_by_ids_strong(std::slice::from_ref(key_id))
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(());
+        };
+        // 查询期间换凭据或出现更新的额度错误时，旧查询不能解除新的阻断。
+        if key.provider_id != *provider_id
+            || key.encrypted_api_key != update.key.encrypted_api_key
+            || key.encrypted_auth_config != update.key.encrypted_auth_config
+            || key.auth_type != update.key.auth_type
+            || key
+                .status_snapshot
+                .as_ref()
+                .and_then(|status| status.get("quota"))
+                != Some(snapshot)
+        {
+            return Ok(());
+        }
+        let scheduling = key
+            .status_snapshot
+            .as_ref()
+            .and_then(|status| status.get("scheduling"));
+        if let Some(scheduling) = scheduling.filter(|value| !value.is_null()) {
+            if !matches!(
+                scheduling.get("code").and_then(Value::as_str),
+                Some("quota_suspected" | "quota_exhausted")
+            ) || scheduling
+                .get("last_observed_at")
+                .and_then(Value::as_u64)
+                .is_none_or(|observed| observed >= update.now_unix_secs)
+            {
+                return Ok(());
+            }
+            let cleared = state
+                .app()
+                .compare_and_update_provider_catalog_key_scheduling_state(
+                    &ProviderCatalogKeySchedulingStateCasUpdate {
+                        key_id: key.id.clone(),
+                        expected_encrypted_api_key: key.encrypted_api_key.clone(),
+                        expected_encrypted_auth_config: key.encrypted_auth_config.clone(),
+                        expected_auth_type: key.auth_type.clone(),
+                        expected_scheduling: Some(scheduling.clone()),
+                        scheduling: None,
+                        updated_at_unix_secs: Some(update.now_unix_secs),
+                    },
+                )
+                .await?;
+            if !cleared {
+                return Ok(());
+            }
+        }
+        if let Some(provider) = state
+            .read_provider_catalog_providers_by_ids(std::slice::from_ref(provider_id))
+            .await?
+            .into_iter()
+            .next()
+        {
+            reconcile_quota_recovery(state, &provider, key_id).await?;
+        }
+        Ok(())
+    }
+    .await;
+    state
+        .app()
+        .release_provider_key_quota_projection_lock(projection_lock)
+        .await;
+    result
 }
 
 /// 计算额度写入的缓存失效范围；测试与非持久化调用复用实际快照装饰结果。

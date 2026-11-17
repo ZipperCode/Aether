@@ -82,7 +82,9 @@ pub use quota_snapshot::{
     ProviderQuotaSnapshotContract, ProviderQuotaSnapshotKind, ProviderQuotaSource,
     ProviderQuotaValue, ProviderQuotaWindow, PROVIDER_QUOTA_SNAPSHOT_SCHEMA_VERSION,
 };
-pub use quota_sources::provider_quota_snapshot_exhausted;
+pub use quota_sources::{
+    provider_quota_snapshot_exhausted, provider_quota_snapshot_has_available_quota,
+};
 pub use service::ProviderPoolService;
 
 #[cfg(test)]

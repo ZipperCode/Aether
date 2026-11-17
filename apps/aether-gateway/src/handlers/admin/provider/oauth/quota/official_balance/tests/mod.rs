@@ -35,6 +35,7 @@ use std::{
 };
 
 mod manual_http;
+mod quota_recovery;
 mod response_persistence;
 mod routing_security;
 

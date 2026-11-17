@@ -14,7 +14,7 @@ use crate::quota_sources::{source_account_exhausted, source_balance_below_minimu
 use crate::service::ProviderPoolService;
 
 /// 标准余额快照的固定内部调度下限；各币种独立比较，不做汇率换算。
-const PROVIDER_POOL_MINIMUM_SCHEDULABLE_BALANCE: f64 = 1.0;
+pub(crate) const PROVIDER_POOL_MINIMUM_SCHEDULABLE_BALANCE: f64 = 1.0;
 
 /// 在没有请求模型上下文时判断 Key 的账号级可恢复额度是否耗尽。
 pub fn provider_pool_key_account_quota_exhausted(

@@ -13,6 +13,106 @@ pub fn provider_quota_snapshot_exhausted(snapshot: &Value, now_unix_secs: u64) -
         .unwrap_or_else(|| provider_pool_json_bool(snapshot.get("exhausted")) == Some(true))
 }
 
+/// 恢复持久阻断需要本次查询的正向证据；fail-open 的“未耗尽”不等于额度可用。
+pub fn provider_quota_snapshot_has_available_quota(snapshot: &Value, observed_at: u64) -> bool {
+    let Some(snapshot) = snapshot.as_object() else {
+        return false;
+    };
+    let source_available = |id: Option<&str>, product: &str| {
+        let belongs = |item: &&Value| item.get("source_id").and_then(Value::as_str) == id;
+        match product {
+            "account_balance" | "key_spending_limit" => snapshot
+                .get("balances")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(belongs)
+                .any(|balance| {
+                    matches!(
+                        balance.get("unit").and_then(Value::as_str),
+                        Some("CNY" | "USD")
+                    ) && provider_pool_json_f64(balance.get("available")).is_some()
+                        && !decimal_at_most(
+                            balance.get("available"),
+                            crate::quota::PROVIDER_POOL_MINIMUM_SCHEDULABLE_BALANCE,
+                        )
+                }),
+            "coding_plan" | "token_plan" => {
+                let windows = snapshot
+                    .get("windows")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(belongs)
+                    .filter(|window| {
+                        matches!(
+                            window.get("scope").and_then(Value::as_str),
+                            Some("account" | "key")
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                !windows.is_empty()
+                    && windows.iter().all(|window| {
+                        if provider_pool_json_bool(window.get("is_included")) == Some(false)
+                            || provider_pool_json_bool(window.get("is_exhausted")) == Some(true)
+                            || !matches!(
+                                window.get("unit").and_then(Value::as_str),
+                                Some("percent" | "credits" | "count" | "tokens" | "quota")
+                            )
+                        {
+                            return false;
+                        }
+                        let observations = [
+                            provider_pool_json_f64(window.get("remaining_value")),
+                            provider_pool_json_f64(window.get("remaining_ratio")),
+                            provider_pool_json_f64(window.get("used_ratio")).map(|used| 1.0 - used),
+                        ];
+                        provider_pool_json_bool(window.get("unlimited")) == Some(true)
+                            || (observations.iter().any(Option::is_some)
+                                && observations
+                                    .into_iter()
+                                    .flatten()
+                                    .all(|remaining| remaining > 0.0))
+                    })
+            }
+            _ => false,
+        }
+    };
+    if let Some(sources) = sources(snapshot) {
+        return sources.iter().filter_map(Value::as_object).any(|source| {
+            source_is_fresh(source)
+                && source
+                    .get("refresh_state")
+                    .and_then(|state| state.get("last_success_at"))
+                    .and_then(Value::as_u64)
+                    == Some(observed_at)
+                && source.get("id").and_then(Value::as_str).is_some_and(|id| {
+                    source_available(
+                        Some(id),
+                        source
+                            .get("product")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+                })
+        });
+    }
+    snapshot.get("freshness").and_then(Value::as_str) == Some("fresh")
+        && snapshot
+            .get("refresh_state")
+            .and_then(|state| state.get("last_success_at"))
+            .and_then(Value::as_u64)
+            == Some(observed_at)
+        && source_available(
+            None,
+            match snapshot.get("kind").and_then(Value::as_str) {
+                Some("balance") => "account_balance",
+                Some("subscription") => "coding_plan",
+                _ => "",
+            },
+        )
+}
+
 fn sources(snapshot: &Map<String, Value>) -> Option<&[Value]> {
     let value = snapshot.get("sources")?;
     match value.as_array() {
