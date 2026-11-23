@@ -1,4 +1,4 @@
-use aether_ai_formats::formats::shared::sse::SseRecordReader;
+use crate::ai_serving::SseRecordReader;
 use aether_contracts::StandardizedUsage;
 use aether_data_contracts::repository::usage::extract_provider_actual_service_tier_from_response;
 use aether_usage_runtime::{map_usage, map_usage_from_response};

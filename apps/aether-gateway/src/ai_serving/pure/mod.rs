@@ -183,6 +183,7 @@ pub(crate) use aether_ai_formats::formats::openai::audio::{
     maybe_build_transcription_sync_product, normalize_transcription, AUDIO_API_FORMAT,
     AUDIO_REPORT_KIND,
 };
+pub(crate) use aether_ai_formats::formats::shared::sse::SseRecordReader;
 pub(crate) use aether_ai_formats::{
     agent_bridge_prompt_cache_identity, api_format_defaults_to_client_error_failover,
     api_format_defaults_to_non_stream, api_format_permission_covers,
