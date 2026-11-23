@@ -7,6 +7,8 @@ export type RoutingSortingScope = 'unified' | 'per_model'
 
 /** 首个候选（粘性 Key）的总尝试次数默认值：失败后同 Key 重试 1 次 */
 export const DEFAULT_STICKY_KEY_ATTEMPTS = 2
+/** 与后端 sticky_key_attempts 的 u32 范围一致。 */
+export const MAX_STICKY_KEY_ATTEMPTS = 0xffff_ffff
 
 /** 路由组默认使用的优先级、调度、粘性重试及全局故障切换策略。 */
 export interface RoutingDefaultPolicy extends RoutingFailoverPolicy {
@@ -110,11 +112,16 @@ export function parseBillingMultiplier(value: unknown): number | null {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null
 }
 
-/** 将用户输入规范为 0 到 99 的整数；非法值回退默认总尝试数。 */
+/** 编辑时区分无效输入和有效的零次设置，不对输入截断或取整。 */
+export function parseStickyKeyAttempts(value: unknown): number | null {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= MAX_STICKY_KEY_ATTEMPTS ? parsed : null
+}
+
+/** 读取配置时保留有效的尝试次数，非法值回退到默认值。 */
 export function normalizeStickyKeyAttempts(value: unknown): number {
-  const parsed = Math.trunc(Number(value))
-  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_STICKY_KEY_ATTEMPTS
-  return Math.min(parsed, 99)
+  return parseStickyKeyAttempts(value) ?? DEFAULT_STICKY_KEY_ATTEMPTS
 }
 
 /** 创建指定模型的空优先级策略，并初始化格式级 Key 覆盖容器。 */
