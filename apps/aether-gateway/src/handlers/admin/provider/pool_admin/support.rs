@@ -152,6 +152,7 @@ pub(crate) fn parse_admin_pool_status_value(value: Option<&str>) -> Result<Strin
         | "expired"
         | "account_banned"
         | "quota_exhausted"
+        | "quota_reserved"
         | "account_forbidden"
         | "account_disabled"
         | "workspace_deactivated"
@@ -165,7 +166,7 @@ pub(crate) fn parse_admin_pool_status_value(value: Option<&str>) -> Result<Strin
         // scheduling/account state. Treat it as the visible "可用" bucket.
         "active" => Ok("available".to_string()),
         _ => Err(
-            "status must be one of: all, available, cooldown, inactive, invalid, expired, account_banned, quota_exhausted, account_forbidden, account_disabled, workspace_deactivated, account_verification, account_quarantined, account_blocked, rate_limited, cost_exhausted".to_string(),
+            "status must be one of: all, available, cooldown, inactive, invalid, expired, account_banned, quota_exhausted, quota_reserved, account_forbidden, account_disabled, workspace_deactivated, account_verification, account_quarantined, account_blocked, rate_limited, cost_exhausted".to_string(),
         ),
     }
 }

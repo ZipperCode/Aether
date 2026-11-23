@@ -157,6 +157,7 @@ export interface PoolKeyDetail {
   concurrent_limit?: number | null
   cache_ttl_minutes?: number
   max_probe_interval_minutes?: number
+  weekly_quota_reserve_percent?: number
   note?: string | null
   allowed_models?: AllowedModels
   capabilities?: Record<string, boolean> | null
@@ -263,6 +264,7 @@ export type PoolScoreHardState =
   | 'unknown'
   | 'cooldown'
   | 'quota_exhausted'
+  | 'quota_reserved'
   | 'auth_invalid'
   | 'banned'
   | 'inactive'
@@ -312,6 +314,7 @@ export interface PoolKeysQuery {
     | 'expired'
     | 'account_banned'
     | 'quota_exhausted'
+    | 'quota_reserved'
     | 'account_forbidden'
     | 'account_disabled'
     | 'workspace_deactivated'
@@ -411,6 +414,7 @@ export interface PoolKeySharedSettingsPatch {
   concurrent_limit?: number | null
   cache_ttl_minutes?: number
   max_probe_interval_minutes?: number
+  weekly_quota_reserve_percent?: number
   is_active?: boolean
   note?: string | null
 }

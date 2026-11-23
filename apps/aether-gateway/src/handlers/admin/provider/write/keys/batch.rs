@@ -22,6 +22,7 @@ const BATCH_EDITABLE_KEY_FIELDS: &[&str] = &[
     "proxy",
     "rate_multipliers",
     "rpm_limit",
+    "weekly_quota_reserve_percent",
 ];
 
 pub(crate) fn parse_admin_provider_key_batch_update_patch(

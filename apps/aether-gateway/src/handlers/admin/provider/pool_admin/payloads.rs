@@ -1007,6 +1007,7 @@ fn admin_pool_scheduling_payload(
     account_status_source: Option<&str>,
     scheduling_snapshot: Option<&serde_json::Map<String, serde_json::Value>>,
     account_quota_exhausted: bool,
+    account_quota_reserved: bool,
     oauth_status_code: Option<&str>,
     oauth_status_label: Option<&str>,
     oauth_status_reason: Option<&str>,
@@ -1082,6 +1083,24 @@ fn admin_pool_scheduling_payload(
                 "source": "quota",
                 "ttl_seconds": serde_json::Value::Null,
                 "detail": serde_json::Value::Null,
+            })],
+        );
+    }
+    if account_quota_reserved {
+        return (
+            "blocked".to_string(),
+            "account_quota_reserved".to_string(),
+            "已达预留线".to_string(),
+            vec![json!({
+                "code": "account_quota_reserved",
+                "label": "已达预留线",
+                "blocking": true,
+                "source": "quota",
+                "ttl_seconds": serde_json::Value::Null,
+                "detail": format!(
+                    "周限剩余额度已达预留线（{}%）",
+                    key.weekly_quota_reserve_percent
+                ),
             })],
         );
     }
@@ -1177,6 +1196,12 @@ pub(super) fn build_admin_pool_key_payload(
                     None,
                 ))
     });
+    let account_quota_reserved = !account_quota_exhausted
+        && admin_provider_pool_pure::admin_pool_key_weekly_quota_reserve_reached(
+            key,
+            provider_type,
+            None,
+        );
     let auth_config = state.parse_catalog_auth_config_json(key);
     let oauth_expires_at =
         admin_pool_derive_oauth_expires_at(provider_type, key, auth_config.as_ref());
@@ -1275,6 +1300,7 @@ pub(super) fn build_admin_pool_key_payload(
             account_status_source.as_deref(),
             scheduling_snapshot,
             account_quota_exhausted,
+            account_quota_reserved,
             oauth_status_code.as_deref(),
             oauth_status_label.as_deref(),
             oauth_status_reason.as_deref(),
@@ -1470,6 +1496,10 @@ pub(super) fn build_admin_pool_key_payload(
     payload.insert(
         "max_probe_interval_minutes".to_string(),
         json!(key.max_probe_interval_minutes),
+    );
+    payload.insert(
+        "weekly_quota_reserve_percent".to_string(),
+        json!(key.weekly_quota_reserve_percent),
     );
     payload.insert("note".to_string(), json!(key.note));
     payload.insert(

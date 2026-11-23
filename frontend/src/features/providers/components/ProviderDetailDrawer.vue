@@ -422,6 +422,7 @@
     v-if="open && oauthKeyEditDialogOpen"
     :open="oauthKeyEditDialogOpen"
     :editing-key="editingKey"
+    :provider-type="provider?.provider_type ?? null"
     @close="oauthKeyEditDialogOpen = false"
     @saved="handleKeyChanged"
   />

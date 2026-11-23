@@ -1236,13 +1236,19 @@ impl<'a> PoolKeyCursor<'a> {
             return None;
         };
 
-        if pool_config.reserve_minimum_quota
+        let weekly_reserve_reached =
+            admin_provider_pool_pure::admin_pool_key_weekly_quota_reserve_reached(
+                &key,
+                self.group.candidate.provider_type.as_str(),
+                Some(member_model.0.as_str()),
+            );
+        let minimum_reserve_reached = pool_config.reserve_minimum_quota
             && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
                 &key,
                 self.group.candidate.provider_type.as_str(),
                 Some(member_model.0.as_str()),
-            )
-        {
+            );
+        if weekly_reserve_reached || minimum_reserve_reached {
             self.seen_key_ids.insert(key.id.clone());
             self.record_skip_reason(POOL_ACCOUNT_EXHAUSTED_SKIP_REASON);
             self.skipped_candidates
@@ -2214,12 +2220,16 @@ async fn read_pool_catalog_key_contexts_by_id(
             provider_type.as_str(),
             provider_model_name,
         );
-        let reserve_reached = reserve_minimum_quota_key_ids.contains(&key.id)
+        let reserve_reached = admin_provider_pool_pure::admin_pool_key_weekly_quota_reserve_reached(
+            key,
+            provider_type.as_str(),
+            provider_model_name,
+        ) || (reserve_minimum_quota_key_ids.contains(&key.id)
             && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
                 key,
                 provider_type.as_str(),
                 provider_model_name,
-            );
+            ));
         context.quota_exhausted |= reserve_reached;
         context.quota_hard_blocked |= reserve_reached;
         contexts.insert(key.id.clone(), context);
@@ -6315,6 +6325,92 @@ mod tests {
                     } else if sticky {
                         assert_eq!(returned.first().map(String::as_str), Some("key-low"));
                     }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_account_weekly_quota_reserve_filters_pages_and_sticky_hits() {
+        for (reserve_percent, primary_used, weekly_used, should_skip) in [
+            (0, 95.0, 95.0, false),
+            (10, 99.0, 50.0, false),
+            (10, 20.0, 89.9, false),
+            (10, 20.0, 90.0, true),
+            (10, 20.0, 95.0, true),
+        ] {
+            for sticky in [false, true] {
+                let provider_config = Some(json!({
+                    "pool_advanced": {
+                        "reserve_minimum_quota": false,
+                        "skip_exhausted_accounts": false
+                    }
+                }));
+                let provider =
+                    sample_codex_pool_provider("provider-pool", 0, provider_config.clone());
+                let endpoint = sample_codex_pool_endpoint("provider-pool", "endpoint-1");
+                let mut reserved = sample_codex_pool_key("provider-pool", "key-weekly");
+                reserved.weekly_quota_reserve_percent = reserve_percent;
+                reserved.upstream_metadata = Some(json!({
+                    "codex_model_discovery": {"model_ids": ["gpt-5"]},
+                    "codex": {
+                        "updated_at": 200,
+                        "primary_used_percent": primary_used,
+                        "primary_window_minutes": 300,
+                        "primary_reset_at": 4_102_444_800u64,
+                        "secondary_used_percent": weekly_used,
+                        "secondary_window_minutes": 10080,
+                        "secondary_reset_at": 4_102_444_800u64
+                    }
+                }));
+                let ready = sample_codex_pool_key("provider-pool", "key-ready");
+                let rows = vec![
+                    sample_codex_pool_row("provider-pool", "endpoint-1", "key-weekly", 0),
+                    sample_codex_pool_row("provider-pool", "endpoint-1", "key-ready", 0),
+                ];
+                let data_state = GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![provider], vec![endpoint], vec![reserved, ready],
+                    )),
+                    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                )
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+                let app = AppState::new()
+                    .expect("state should build")
+                    .with_data_state_for_tests(data_state);
+                let group =
+                    sample_codex_pool_group("provider-pool", "endpoint-1", 0, provider_config);
+                let pool_config =
+                    pool_config_for_candidate(&group).expect("pool config should parse");
+                let sticky_token = sticky.then_some("weekly-reserve-session");
+                if sticky {
+                    record_admin_provider_pool_success(
+                        app.runtime_state.as_ref(),
+                        "provider-pool",
+                        "key-weekly",
+                        &pool_config,
+                        sticky_token,
+                        0,
+                        None,
+                    )
+                    .await;
+                }
+                let mut cursor =
+                    PoolKeyCursor::new(PlannerAppState::new(&app), group, sticky_token, None, None);
+                cursor.window_size = 1;
+                cursor.page_size = 1;
+                let mut returned = Vec::new();
+                while let Some(candidate) = cursor.next_key().await {
+                    returned.push(candidate.candidate.key_id);
+                }
+                assert_eq!(
+                    returned.contains(&"key-weekly".to_string()),
+                    !should_skip,
+                    "reserve={reserve_percent}, primary={primary_used}, weekly={weekly_used}, sticky={sticky}"
+                );
+                assert!(returned.contains(&"key-ready".to_string()));
+                if !should_skip && sticky {
+                    assert_eq!(returned.first().map(String::as_str), Some("key-weekly"));
                 }
             }
         }

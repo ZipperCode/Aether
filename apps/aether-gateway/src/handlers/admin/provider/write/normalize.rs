@@ -208,6 +208,14 @@ pub(crate) fn normalize_max_probe_interval_minutes(value: i32) -> Result<i32, St
     }
 }
 
+pub(crate) fn normalize_weekly_quota_reserve_percent(value: i32) -> Result<i32, String> {
+    if (0..=99).contains(&value) {
+        Ok(value)
+    } else {
+        Err("weekly_quota_reserve_percent 必须在 0 到 99 之间".to_string())
+    }
+}
+
 pub(crate) fn normalize_pool_advanced_config(
     value: Option<serde_json::Value>,
 ) -> Result<Option<serde_json::Value>, String> {

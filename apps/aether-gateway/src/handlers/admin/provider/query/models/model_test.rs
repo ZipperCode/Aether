@@ -1512,12 +1512,17 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
             };
             let mut key_context =
                 provider_query_pool_catalog_key_context(state, &key, &provider.provider_type);
-            key_context.quota_exhausted |= reserve_minimum_quota
-                && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
+            key_context.quota_exhausted |=
+                admin_provider_pool_pure::admin_pool_key_weekly_quota_reserve_reached(
                     &key,
                     &provider.provider_type,
                     Some(effective_model),
-                );
+                ) || (reserve_minimum_quota
+                    && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
+                        &key,
+                        &provider.provider_type,
+                        Some(effective_model),
+                    ));
             AiPoolCandidateInput {
                 facts: AiPoolCandidateFacts {
                     provider_id: provider.id.clone(),

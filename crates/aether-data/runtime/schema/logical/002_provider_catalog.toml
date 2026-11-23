@@ -375,6 +375,11 @@ type = "int32"
 default = 32
 
 [[table.provider_api_keys.columns]]
+name = "weekly_quota_reserve_percent"
+type = "int32"
+default = 0
+
+[[table.provider_api_keys.columns]]
 name = "proxy"
 type = "json"
 nullable = true

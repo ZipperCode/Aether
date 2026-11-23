@@ -500,7 +500,32 @@ pub(crate) fn provider_pool_model_quota_exhausted(
             return Some(false);
         }
     }
-    provider_pool_quota_reaches_reserve(key, provider_type, Some(provider_model_name), 0.0)
+    provider_pool_quota_reaches_reserve(key, provider_type, Some(provider_model_name), 0.0, false)
+}
+
+const CODEX_WEEKLY_WINDOW_MINUTES: f64 = 10_080.0;
+const CODEX_WEEKLY_WINDOW_SECONDS: f64 = 604_800.0;
+
+fn provider_pool_codex_window_is_weekly(window: &Map<String, Value>) -> bool {
+    if let Some(window_minutes) = provider_pool_json_f64(window.get("window_minutes")) {
+        return (window_minutes - CODEX_WEEKLY_WINDOW_MINUTES).abs() < 1e-6;
+    }
+    if let Some(window_seconds) = provider_pool_json_f64(window.get("window_seconds")) {
+        return (window_seconds - CODEX_WEEKLY_WINDOW_SECONDS).abs() < 1e-6;
+    }
+    let code = window
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(code.as_str(), "weekly" | "secondary")
+        || code.ends_with("_weekly")
+        || code.ends_with(":weekly")
+        || code.ends_with("/weekly")
+        || code.ends_with("_secondary")
+        || code.ends_with(":secondary")
+        || code.ends_with("/secondary")
 }
 
 fn provider_pool_quota_reaches_reserve(
@@ -508,6 +533,7 @@ fn provider_pool_quota_reaches_reserve(
     provider_type: &str,
     provider_model_name: Option<&str>,
     reserve_ratio: f64,
+    weekly_only: bool,
 ) -> Option<bool> {
     let is_codex = provider_type.trim().eq_ignore_ascii_case("codex");
     let is_antigravity = provider_type.trim().eq_ignore_ascii_case("antigravity");
@@ -563,6 +589,8 @@ fn provider_pool_quota_reaches_reserve(
                     ("used_percent".to_string(), json!(used_percent)),
                 ]);
                 for field in [
+                    "window_minutes",
+                    "window_seconds",
                     "reset_at",
                     "next_reset_at",
                     "reset_seconds",
@@ -575,6 +603,9 @@ fn provider_pool_quota_reaches_reserve(
                 windows.push(window);
             }
             windows.retain(provider_pool_quota_window_has_observation);
+            if weekly_only {
+                windows.retain(provider_pool_codex_window_is_weekly);
+            }
             if let Some(exhausted) = account_signal {
                 if !windows.iter().any(provider_pool_window_is_generic) {
                     // A flags-only quota refresh is still a newer account
@@ -851,8 +882,35 @@ pub fn provider_pool_key_minimum_quota_reached(
     if !provider_type.trim().eq_ignore_ascii_case("codex") {
         return false;
     }
-    provider_pool_quota_reaches_reserve(key, provider_type, provider_model_name, 0.01)
+    provider_pool_quota_reaches_reserve(key, provider_type, provider_model_name, 0.01, false)
         .unwrap_or(false)
+}
+
+/// Whether an applicable Codex weekly window has remaining quota at or below
+/// the account's configured `weekly_quota_reserve_percent` threshold.
+/// Setting `weekly_quota_reserve_percent` to 0 disables this guard; 5-hour
+/// windows, missing weekly quota data, and elapsed resets do not trigger it.
+pub fn provider_pool_key_weekly_quota_reserve_reached(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    provider_model_name: Option<&str>,
+) -> bool {
+    if !provider_type.trim().eq_ignore_ascii_case("codex") {
+        return false;
+    }
+    let reserve_percent = key.weekly_quota_reserve_percent;
+    if reserve_percent <= 0 {
+        return false;
+    }
+    let reserve_ratio = f64::from(reserve_percent.min(99)) / 100.0;
+    provider_pool_quota_reaches_reserve(
+        key,
+        provider_type,
+        provider_model_name,
+        reserve_ratio,
+        true,
+    )
+    .unwrap_or(false)
 }
 
 fn provider_pool_quota_window_reaches_reserve(
@@ -890,7 +948,7 @@ fn provider_pool_quota_window_reaches_reserve(
             )?;
             (limit > 0.0).then_some(1.0 - remaining / limit)
         });
-    used_ratio.is_some_and(|used_ratio| used_ratio >= 1.0 - reserve_ratio)
+    used_ratio.is_some_and(|used_ratio| used_ratio + reserve_ratio >= 1.0 - 1e-9)
 }
 
 fn provider_pool_window_is_generic(window: &Map<String, Value>) -> bool {

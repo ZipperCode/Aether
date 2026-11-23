@@ -178,6 +178,7 @@ const schedulingLabelKeys: Partial<Record<string, MessageKey>> = {
   manual_disabled: 'ui.disable',
   cooldown: 'ui.coolingDown',
   account_quota_exhausted: 'ui.quotaExhausted',
+  account_quota_reserved: 'ui.quotaReserved',
   cost_exhausted: 'ui.limitExceeded',
   invalid: 'ui.invalid',
   expired: 'ui.expired',
@@ -196,6 +197,7 @@ const schedulingLabelKeys: Partial<Record<string, MessageKey>> = {
   account_quarantined: 'ui.accountIsolation',
   account_blocked: 'ui.accountIssue',
   quota_exhausted: 'ui.quotaExhausted',
+  quota_reserved: 'ui.quotaReserved',
   key_quota_exhausted: 'pool.status.quotaExhaustedManualRecovery',
   quota_suspected: 'pool.status.quotaSuspected',
 }
@@ -459,6 +461,7 @@ export function getSchedulingBadgeVariant(
   const reason = getVisibleSchedulingReason(key)
   if (reason === 'manual_disabled' || reason === 'inactive') return 'secondary'
   if (reason === 'account_blocked' || reason === 'account_quota_exhausted' || reason === 'key_quota_exhausted' || reason === 'quota_exhausted' || reason === 'cost_exhausted') return 'destructive'
+  if (reason === 'account_quota_reserved' || reason === 'quota_reserved') return 'warning'
   if (reason === 'cooldown') return 'warning'
   if (reason === 'cost_soft' || reason === 'cost') return 'warning'
   if (isPoolKeyCostExhausted(key)) return 'destructive'

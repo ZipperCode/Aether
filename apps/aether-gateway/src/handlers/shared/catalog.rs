@@ -3570,6 +3570,10 @@ pub(crate) fn build_admin_provider_key_response(
         json!(key.max_probe_interval_minutes),
     );
     payload.insert(
+        "weekly_quota_reserve_percent".to_string(),
+        json!(key.weekly_quota_reserve_percent),
+    );
+    payload.insert(
         "health_by_format".to_string(),
         admin_secret_safe_json(key.health_by_format.as_ref()),
     );

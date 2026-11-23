@@ -4,7 +4,8 @@ use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
     normalize_max_probe_interval_minutes, normalize_rate_multipliers,
-    reconcile_allow_auth_channel_mismatch_formats, validate_vertex_api_formats,
+    normalize_weekly_quota_reserve_percent, reconcile_allow_auth_channel_mismatch_formats,
+    validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -342,6 +343,10 @@ pub(crate) fn build_admin_update_provider_key_record_with_existing_keys(
     if let Some(max_probe_interval_minutes) = payload.max_probe_interval_minutes {
         updated.max_probe_interval_minutes =
             normalize_max_probe_interval_minutes(max_probe_interval_minutes)?;
+    }
+    if let Some(weekly_quota_reserve_percent) = payload.weekly_quota_reserve_percent {
+        updated.weekly_quota_reserve_percent =
+            normalize_weekly_quota_reserve_percent(weekly_quota_reserve_percent)?;
     }
     if let Some(is_active) = payload.is_active {
         updated.is_active = is_active;

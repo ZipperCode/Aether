@@ -89,4 +89,18 @@ describe('pool status localization', () => {
     expect(getSchedulingBadgeLabel(poolKey({ scheduling_reason: 'inactive', scheduling_label: '已禁用' }), 0)).toBe('Disabled')
     expect(getSchedulingBadgeLabel(poolKey({ scheduling_reason: 'provider_custom', scheduling_label: ' 保存：用户自定义状态 ' }), 0)).toBe(' 保存：用户自定义状态 ')
   })
+
+  it('localizes account_quota_reserved scheduling state in both zh-CN and en-US', () => {
+    const reservedKey = poolKey({
+      scheduling_status: 'blocked',
+      scheduling_reason: 'account_quota_reserved',
+      scheduling_label: '已达预留线',
+      weekly_quota_reserve_percent: 10,
+    })
+    expect(getSchedulingStatus(reservedKey, 0)).toBe('blocked')
+    expect(getSchedulingBadgeLabel(reservedKey, 0)).toBe('已达预留线')
+
+    setI18nLocale('en-US')
+    expect(getSchedulingBadgeLabel(reservedKey, 0)).toBe('Quota reserved')
+  })
 })

@@ -67,10 +67,10 @@ pub use quota::{
     provider_pool_key_minimum_quota_reached, provider_pool_key_model_quota_exhausted,
     provider_pool_key_model_quota_hard_blocked, provider_pool_key_quota_hard_blocked,
     provider_pool_key_runtime_quota_blocked, provider_pool_key_scheduling_label,
-    provider_pool_key_supports_discovered_model, provider_pool_member_quota_snapshot,
-    provider_pool_quota_metadata_provider_type, provider_pool_quota_metadata_updated_at,
-    provider_pool_quota_snapshot_updated_at, provider_pool_reset_deadline_elapsed,
-    resolve_provider_pool_key_thinking_model,
+    provider_pool_key_supports_discovered_model, provider_pool_key_weekly_quota_reserve_reached,
+    provider_pool_member_quota_snapshot, provider_pool_quota_metadata_provider_type,
+    provider_pool_quota_metadata_updated_at, provider_pool_quota_snapshot_updated_at,
+    provider_pool_reset_deadline_elapsed, resolve_provider_pool_key_thinking_model,
 };
 pub use quota_refresh::{
     official_balance_backoff_secs, official_balance_backoff_with_jitter_secs,
@@ -1227,6 +1227,148 @@ mod tests {
                 assert!(!provider_pool_key_account_quota_exhausted(&key, "codex"));
             }
         }
+    }
+
+    #[test]
+    fn codex_weekly_quota_reserve_enforces_account_threshold_and_ignores_five_hour_window() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
+
+        // 0% disables the guard even when weekly remaining is 1%.
+        let mut disabled_key = sample_key(Some(json!({
+            "codex": {
+                "primary_used_percent": 99.0,
+                "primary_window_minutes": 300,
+                "secondary_used_percent": 99.0,
+                "secondary_window_minutes": 10080,
+                "secondary_reset_at": now + 3600
+            }
+        })));
+        disabled_key.weekly_quota_reserve_percent = 0;
+        assert!(!provider_pool_key_weekly_quota_reserve_reached(
+            &disabled_key,
+            "codex",
+            None
+        ));
+
+        // 10% threshold: boundary at 90.0% used (10.0% remaining) vs 89.9% used (10.1% remaining).
+        for (weekly_used, expected) in [(89.9, false), (90.0, true), (95.0, true), (100.0, true)] {
+            let mut key = sample_key(Some(json!({
+                "codex": {
+                    "primary_used_percent": 20.0,
+                    "primary_window_minutes": 300,
+                    "secondary_used_percent": weekly_used,
+                    "secondary_window_minutes": 10080,
+                    "secondary_reset_at": now + 3600
+                }
+            })));
+            key.weekly_quota_reserve_percent = 10;
+            assert_eq!(
+                provider_pool_key_weekly_quota_reserve_reached(&key, "codex", Some("gpt-5.4")),
+                expected,
+                "weekly_used={weekly_used}"
+            );
+            assert!(!provider_pool_key_weekly_quota_reserve_reached(
+                &key,
+                "kiro",
+                Some("gpt-5.4")
+            ));
+        }
+
+        // 5-hour window at 99% used (1% remaining) must NOT trigger weekly reserve when weekly is healthy.
+        let mut five_hour_low_key = sample_key(Some(json!({
+            "codex": {
+                "primary_used_percent": 99.0,
+                "primary_window_minutes": 300,
+                "primary_reset_at": now + 3600,
+                "secondary_used_percent": 50.0,
+                "secondary_window_minutes": 10080,
+                "secondary_reset_at": now + 7200
+            }
+        })));
+        five_hour_low_key.weekly_quota_reserve_percent = 10;
+        assert!(!provider_pool_key_weekly_quota_reserve_reached(
+            &five_hour_low_key,
+            "codex",
+            None
+        ));
+
+        // Weekly-only accounts store the 7-day window in primary_window_minutes = 10080.
+        let mut weekly_primary_key = sample_key(Some(json!({
+            "codex": {
+                "primary_used_percent": 90.0,
+                "primary_window_minutes": 10080,
+                "primary_reset_at": now + 3600
+            }
+        })));
+        weekly_primary_key.weekly_quota_reserve_percent = 10;
+        assert!(provider_pool_key_weekly_quota_reserve_reached(
+            &weekly_primary_key,
+            "codex",
+            None
+        ));
+        // Lowering threshold from 10% to 5% immediately recovers the account.
+        weekly_primary_key.weekly_quota_reserve_percent = 5;
+        assert!(!provider_pool_key_weekly_quota_reserve_reached(
+            &weekly_primary_key,
+            "codex",
+            None
+        ));
+    }
+
+    #[test]
+    fn codex_weekly_quota_reserve_recovers_on_reset_and_respects_model_weekly_windows() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
+
+        for (reset_at, expected) in [(now + 3600, true), (now - 60, false)] {
+            let mut key = sample_key(None);
+            key.weekly_quota_reserve_percent = 10;
+            key.status_snapshot = Some(json!({
+                "quota": {
+                    "provider_type": "codex",
+                    "updated_at": now - 600,
+                    "windows": [
+                        { "code": "5h", "window_minutes": 300, "used_ratio": 0.99, "reset_at": now + 3600 },
+                        { "code": "weekly", "window_minutes": 10080, "used_ratio": 0.90, "reset_at": reset_at }
+                    ]
+                }
+            }));
+            assert_eq!(
+                provider_pool_key_weekly_quota_reserve_reached(&key, "codex", None),
+                expected
+            );
+        }
+
+        // Independent spark model uses its own weekly window while standard models use account weekly.
+        let mut spark_key = sample_key(Some(json!({
+            "codex": {
+                "primary_used_percent": 99.0,
+                "primary_window_minutes": 300,
+                "secondary_used_percent": 40.0,
+                "secondary_window_minutes": 10080,
+                "spark_primary_used_percent": 20.0,
+                "spark_primary_window_minutes": 300,
+                "spark_secondary_used_percent": 90.0,
+                "spark_secondary_window_minutes": 10080,
+                "spark_secondary_reset_at": now + 3600
+            }
+        })));
+        spark_key.weekly_quota_reserve_percent = 10;
+        assert!(!provider_pool_key_weekly_quota_reserve_reached(
+            &spark_key,
+            "codex",
+            Some("gpt-5.4")
+        ));
+        assert!(provider_pool_key_weekly_quota_reserve_reached(
+            &spark_key,
+            "codex",
+            Some("gpt-5.3-codex-spark")
+        ));
     }
 
     #[test]

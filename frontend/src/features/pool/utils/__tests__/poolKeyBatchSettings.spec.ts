@@ -57,4 +57,25 @@ describe('pool key batch settings', () => {
     selection.proxy_node_id = true
     expect(validatePoolKeyBatchSettings(selection, draft)).toEqual(['请选择要设置的代理节点'])
   })
+
+  it('validates and serializes weekly_quota_reserve_percent within 0..99', () => {
+    const selection = createPoolKeyBatchSettingSelection()
+    const draft = createPoolKeyBatchSettingsDraft()
+    selection.weekly_quota_reserve_percent = true
+    draft.weekly_quota_reserve_percent = 10
+
+    expect(validatePoolKeyBatchSettings(selection, draft)).toEqual([])
+    expect(buildPoolKeySettingsPatch(selection, draft)).toEqual({
+      weekly_quota_reserve_percent: 10,
+    })
+
+    draft.weekly_quota_reserve_percent = 0
+    expect(validatePoolKeyBatchSettings(selection, draft)).toEqual([])
+    expect(buildPoolKeySettingsPatch(selection, draft)).toEqual({
+      weekly_quota_reserve_percent: 0,
+    })
+
+    draft.weekly_quota_reserve_percent = 100
+    expect(validatePoolKeyBatchSettings(selection, draft)).toEqual(['周限预留必须是 0 到 99 之间的整数'])
+  })
 })

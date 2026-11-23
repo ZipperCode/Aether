@@ -734,6 +734,13 @@ pub(super) fn admin_pool_key_visible_status_filter(
     if !key.is_active {
         return "inactive";
     }
+    if admin_provider_pool_pure::admin_pool_key_weekly_quota_reserve_reached(
+        key,
+        provider_type,
+        None,
+    ) {
+        return "quota_reserved";
+    }
     if runtime.cooldown_reason_by_key.contains_key(&key.id) {
         return "cooldown";
     }

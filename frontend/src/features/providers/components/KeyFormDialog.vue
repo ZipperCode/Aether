@@ -291,6 +291,13 @@
         </div>
       </div>
 
+      <!-- Codex 周限额度预留 -->
+      <CodexWeeklyQuotaReserveField
+        v-if="isCodexProvider"
+        v-model="form.weekly_quota_reserve_percent"
+        input-id="weekly_quota_reserve_percent"
+      />
+
       <!-- 自动获取模型 -->
       <div class="space-y-3 py-2 px-3 rounded-md border border-border/60 bg-muted/30">
         <div class="flex items-center justify-between">
@@ -377,6 +384,7 @@ import { useI18n } from '@/i18n'
 import { parseApiError } from '@/utils/errorParser'
 import { parseNumberInput, parseNullableNumberInput, parsePatternText } from '@/utils/form'
 import JsonImportInput from '@/components/common/JsonImportInput.vue'
+import CodexWeeklyQuotaReserveField from './CodexWeeklyQuotaReserveField.vue'
 import {
   addProviderKey,
   updateProviderKey,
@@ -538,6 +546,9 @@ const visibleApiFormats = computed(() => getSelectableApiFormats())
 
 const authTypeOptions = computed(() => getAuthTypeOptions(props.providerType))
 const showAuthTypeSelector = computed(() => props.providerType === 'vertex_ai')
+const isCodexProvider = computed(() => (
+  String(props.providerType || '').trim().toLowerCase() === 'codex'
+))
 
 const apiFormatHelpOpen = ref(false)
 const apiFormatHelpHovered = ref(false)
@@ -713,6 +724,7 @@ const form = ref({
   concurrent_limit: undefined as number | null | undefined,  // 并发请求上限（null/0=不限制，undefined=保持原值）
   cache_ttl_minutes: 5,
   max_probe_interval_minutes: 32,
+  weekly_quota_reserve_percent: 0,
   note: '',
   is_active: true,
   auto_fetch_models: false,
@@ -806,6 +818,7 @@ function resetForm() {
     concurrent_limit: undefined,
     cache_ttl_minutes: 5,
     max_probe_interval_minutes: 32,
+    weekly_quota_reserve_percent: 0,
     note: '',
     is_active: true,
     auto_fetch_models: defaultAutoFetchModels.value,
@@ -857,6 +870,7 @@ function loadKeyData() {
     concurrent_limit: props.editingKey.concurrent_limit ?? undefined,
     cache_ttl_minutes: props.editingKey.cache_ttl_minutes ?? 5,
     max_probe_interval_minutes: props.editingKey.max_probe_interval_minutes ?? 32,
+    weekly_quota_reserve_percent: props.editingKey.weekly_quota_reserve_percent ?? 0,
     note: props.editingKey.note || '',
     is_active: props.editingKey.is_active,
     auto_fetch_models: props.editingKey.auto_fetch_models ?? false,
@@ -971,6 +985,7 @@ async function handleSave() {
         concurrent_limit: form.value.concurrent_limit,
         cache_ttl_minutes: form.value.cache_ttl_minutes,
         max_probe_interval_minutes: form.value.max_probe_interval_minutes,
+        ...(isCodexProvider.value ? { weekly_quota_reserve_percent: form.value.weekly_quota_reserve_percent } : {}),
         note: form.value.note,
         is_active: form.value.is_active,
         allowed_models: shouldClearAllowedModels ? null : undefined,
@@ -1006,6 +1021,7 @@ async function handleSave() {
         concurrent_limit: form.value.concurrent_limit,
         cache_ttl_minutes: form.value.cache_ttl_minutes,
         max_probe_interval_minutes: form.value.max_probe_interval_minutes,
+        ...(isCodexProvider.value ? { weekly_quota_reserve_percent: form.value.weekly_quota_reserve_percent } : {}),
         note: form.value.note,
         auto_fetch_models: form.value.auto_fetch_models,
         model_include_patterns: parsePatternText(form.value.model_include_patterns_text),

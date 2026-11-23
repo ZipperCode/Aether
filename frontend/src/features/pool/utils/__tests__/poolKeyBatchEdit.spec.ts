@@ -25,6 +25,8 @@ function state(overrides: Partial<PoolKeyBatchEditState> = {}): PoolKeyBatchEdit
     cacheTtlMinutes: '5',
     applyProbeInterval: false,
     maxProbeIntervalMinutes: '32',
+    applyWeeklyQuotaReserve: false,
+    weeklyQuotaReservePercent: '0',
     applyNote: false,
     note: '',
     applyAutoFetchModels: false,
@@ -131,6 +133,33 @@ describe('buildPoolKeyBatchUpdatePatch', () => {
     const result = buildPoolKeyBatchUpdatePatch(state({ applyAllowedModels: true, unrestrictedModels: false }))
     expect(result.error).toBe('Select at least one available model')
     expect(result.errorField).toBe('allowed_models')
+  })
+
+  it('validates and emits weekly_quota_reserve_percent when enabled', () => {
+    const valid = buildPoolKeyBatchUpdatePatch(state({
+      applyWeeklyQuotaReserve: true,
+      weeklyQuotaReservePercent: '10',
+    }))
+    expect(valid.error).toBeNull()
+    expect(valid.patch).toEqual({
+      weekly_quota_reserve_percent: 10,
+    })
+
+    const disabled = buildPoolKeyBatchUpdatePatch(state({
+      applyWeeklyQuotaReserve: true,
+      weeklyQuotaReservePercent: '0',
+    }))
+    expect(disabled.error).toBeNull()
+    expect(disabled.patch).toEqual({
+      weekly_quota_reserve_percent: 0,
+    })
+
+    const invalid = buildPoolKeyBatchUpdatePatch(state({
+      applyWeeklyQuotaReserve: true,
+      weeklyQuotaReservePercent: '100',
+    }))
+    expect(invalid.patch).toBeNull()
+    expect(invalid.error).toContain('0-99')
   })
 })
 

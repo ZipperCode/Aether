@@ -777,6 +777,9 @@ pub struct StoredProviderCatalogKey {
     pub expires_at_unix_secs: Option<u64>,
     pub cache_ttl_minutes: i32,
     pub max_probe_interval_minutes: i32,
+    /// Account-level Codex weekly quota reserve percentage (0 disables the guard).
+    #[serde(default)]
+    pub weekly_quota_reserve_percent: i32,
     pub proxy: Option<serde_json::Value>,
     pub fingerprint: Option<serde_json::Value>,
     pub rpm_limit: Option<u32>,
@@ -1005,6 +1008,7 @@ impl StoredProviderCatalogKey {
             expires_at_unix_secs: None,
             cache_ttl_minutes: 5,
             max_probe_interval_minutes: 32,
+            weekly_quota_reserve_percent: 0,
             proxy: None,
             fingerprint: None,
             rpm_limit: None,

@@ -221,6 +221,18 @@ pub fn admin_pool_key_minimum_quota_reached(
     )
 }
 
+pub fn admin_pool_key_weekly_quota_reserve_reached(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    provider_model_name: Option<&str>,
+) -> bool {
+    aether_provider_pool::provider_pool_key_weekly_quota_reserve_reached(
+        key,
+        provider_type,
+        provider_model_name,
+    )
+}
+
 pub fn admin_pool_key_quota_hard_blocked(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
@@ -578,6 +590,7 @@ const ADMIN_POOL_KEY_SETTING_FIELDS: &[&str] = &[
     "concurrent_limit",
     "cache_ttl_minutes",
     "max_probe_interval_minutes",
+    "weekly_quota_reserve_percent",
     "is_active",
     "note",
     "proxy_node_id",
@@ -635,6 +648,7 @@ pub fn validate_admin_pool_key_settings_payload(payload: &Value) -> Result<(), S
     }
     admin_pool_setting_i64(settings, "cache_ttl_minutes", 0, 60)?;
     admin_pool_setting_i64(settings, "max_probe_interval_minutes", 0, 32)?;
+    admin_pool_setting_i64(settings, "weekly_quota_reserve_percent", 0, 99)?;
     if settings
         .get("is_active")
         .is_some_and(|value| !value.is_boolean())
@@ -729,6 +743,9 @@ pub fn apply_admin_pool_key_settings(
     }
     if let Some(value) = admin_pool_setting_i64(settings, "max_probe_interval_minutes", 0, 32)? {
         key.max_probe_interval_minutes = value as i32;
+    }
+    if let Some(value) = admin_pool_setting_i64(settings, "weekly_quota_reserve_percent", 0, 99)? {
+        key.weekly_quota_reserve_percent = value as i32;
     }
     if let Some(value) = settings.get("is_active").and_then(Value::as_bool) {
         key.is_active = value;

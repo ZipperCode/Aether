@@ -207,6 +207,7 @@ export async function addProviderKey(
     concurrent_limit?: number | null  // 并发请求上限（留空或 0=不限制）
     cache_ttl_minutes?: number
     max_probe_interval_minutes?: number
+    weekly_quota_reserve_percent?: number
     allowed_models?: AllowedModels
     capabilities?: Record<string, boolean>
     note?: string
@@ -239,6 +240,7 @@ export async function updateProviderKey(
     concurrent_limit: number | null  // 并发请求上限（留空或 0=不限制）
     cache_ttl_minutes: number
     max_probe_interval_minutes: number
+    weekly_quota_reserve_percent: number
     allowed_models: AllowedModels
     locked_models: string[]  // 被锁定的模型列表
     capabilities: Record<string, boolean> | null

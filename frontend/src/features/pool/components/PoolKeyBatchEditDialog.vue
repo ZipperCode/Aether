@@ -153,6 +153,27 @@
                   <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">{{ t('ui.minutesbd957bc') }}</span>
                 </div>
               </BatchFieldToggle>
+
+              <BatchFieldToggle
+                v-if="isCodexProvider"
+                v-model="form.applyWeeklyQuotaReserve"
+                :label="t('ui.weeklyQuotaReserve')"
+              >
+                <div class="relative">
+                  <Input
+                    v-model="form.weeklyQuotaReservePercent"
+                    type="number"
+                    min="0"
+                    max="99"
+                    class="h-9 pr-8 tabular-nums"
+                    :disabled="!form.applyWeeklyQuotaReserve"
+                  />
+                  <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">%</span>
+                </div>
+                <p class="mt-1 text-[11px] text-muted-foreground">
+                  {{ t('ui.weeklyQuotaReserveShortHint') }}
+                </p>
+              </BatchFieldToggle>
             </div>
           </section>
 
@@ -430,6 +451,7 @@ const props = defineProps<{
   open: boolean
   providerId: string
   providerName?: string
+  providerType?: string | null
   keyIds: string[]
   availableApiFormats: string[]
 }>()
@@ -469,6 +491,8 @@ function createInitialForm(): PoolKeyBatchEditState {
     cacheTtlMinutes: '5',
     applyProbeInterval: false,
     maxProbeIntervalMinutes: '32',
+    applyWeeklyQuotaReserve: false,
+    weeklyQuotaReservePercent: '0',
     applyNote: false,
     note: '',
     applyAutoFetchModels: false,
@@ -484,6 +508,9 @@ function createInitialForm(): PoolKeyBatchEditState {
 
 const form = reactive<PoolKeyBatchEditState>(createInitialForm())
 
+const isCodexProvider = computed(() => (
+  String(props.providerType || '').trim().toLowerCase() === 'codex'
+))
 const dialogDescription = computed(() => {
   const providerName = props.providerName?.trim()
   const prefix = providerName ? `${providerName} · ` : ''

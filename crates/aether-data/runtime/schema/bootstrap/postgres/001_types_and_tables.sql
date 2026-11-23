@@ -586,6 +586,7 @@ CREATE TABLE IF NOT EXISTS public.provider_api_keys (
     last_probe_increase_at timestamp with time zone,
     cache_ttl_minutes integer DEFAULT 5 NOT NULL,
     max_probe_interval_minutes integer DEFAULT 32 NOT NULL,
+    weekly_quota_reserve_percent integer DEFAULT 0 NOT NULL,
     request_count bigint DEFAULT 0,
     success_count bigint DEFAULT 0,
     error_count bigint DEFAULT 0,

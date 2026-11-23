@@ -4052,6 +4052,151 @@ async fn gateway_reserve_minimum_quota_recovers_after_config_update_with_cached_
 }
 
 #[tokio::test]
+async fn gateway_account_weekly_quota_reserve_marks_filters_and_recovers_codex_keys() {
+    let mut provider = sample_provider("provider-codex", "codex", 10);
+    provider.provider_type = "codex".to_string();
+    provider.config = Some(json!({
+        "pool_advanced": {
+            "reserve_minimum_quota": false,
+            "skip_exhausted_accounts": true
+        }
+    }));
+    let mut key = sample_key(
+        "key-codex-weekly",
+        "provider-codex",
+        "openai:responses",
+        "oauth-placeholder",
+    );
+    key.auth_type = "oauth".to_string();
+    key.weekly_quota_reserve_percent = 10;
+    key.upstream_metadata = Some(json!({
+        "codex": {
+            "updated_at": 200,
+            "primary_used_percent": 95.0,
+            "primary_window_minutes": 300,
+            "primary_reset_at": 4_102_444_800u64,
+            "secondary_used_percent": 90.0,
+            "secondary_window_minutes": 10080,
+            "secondary_reset_at": 4_102_444_800u64
+        }
+    }));
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key.clone()],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(&repository))
+                .with_cached_provider_catalog_reader_for_tests(repository),
+        );
+
+    // 1. Weekly remaining 10% <= 10% reserve -> blocked as quota_reserved (not available / not exhausted).
+    for (status, expected_len) in [
+        ("all", 1usize),
+        ("quota_reserved", 1),
+        ("available", 0),
+        ("quota_exhausted", 0),
+    ] {
+        let response = local_admin_pool_response(
+            &state,
+            http::Method::GET,
+            &format!("/api/admin/pool/provider-codex/keys?status={status}"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should read"),
+        )
+        .expect("json should parse");
+        let keys = payload["keys"].as_array().expect("keys should be array");
+        assert_eq!(keys.len(), expected_len, "status={status}");
+        if expected_len == 1 {
+            assert_eq!(keys[0]["weekly_quota_reserve_percent"], json!(10));
+            assert_eq!(keys[0]["scheduling_status"], json!("blocked"));
+            assert_eq!(
+                keys[0]["scheduling_reason"],
+                json!("account_quota_reserved")
+            );
+            assert_eq!(keys[0]["scheduling_label"], json!("已达预留线"));
+        }
+    }
+
+    // 2. Setting reserve to 0% disables the guard immediately.
+    key.weekly_quota_reserve_percent = 0;
+    state
+        .update_provider_catalog_key(&key)
+        .await
+        .expect("key should update");
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-codex/keys?status=available",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json should parse");
+    let keys = payload["keys"].as_array().expect("keys should be array");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["weekly_quota_reserve_percent"], json!(0));
+    assert_eq!(keys[0]["scheduling_status"], json!("available"));
+
+    // 3. Re-enabling 10% and refreshing weekly quota to 80% used (20% remaining) keeps it available.
+    key.weekly_quota_reserve_percent = 10;
+    state
+        .update_provider_catalog_key(&key)
+        .await
+        .expect("key should update");
+    let refreshed_metadata = json!({
+        "codex": {
+            "updated_at": 300,
+            "primary_used_percent": 99.0,
+            "primary_window_minutes": 300,
+            "primary_reset_at": 4_102_444_800u64,
+            "secondary_used_percent": 80.0,
+            "secondary_window_minutes": 10080,
+            "secondary_reset_at": 4_102_444_800u64
+        }
+    });
+    assert!(state
+        .update_provider_catalog_key_upstream_metadata(
+            &key.id,
+            Some(&refreshed_metadata),
+            Some(300),
+        )
+        .await
+        .expect("upstream metadata should update"));
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-codex/keys?status=available",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json should parse");
+    let keys = payload["keys"].as_array().expect("keys should be array");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["weekly_quota_reserve_percent"], json!(10));
+    assert_eq!(keys[0]["scheduling_status"], json!("available"));
+}
+
+#[tokio::test]
 async fn gateway_codex_pool_filter_clears_stale_exhausted_summary_with_remaining_quota() {
     let mut provider = sample_provider("provider-codex", "codex", 10);
     provider.provider_type = "codex".to_string();

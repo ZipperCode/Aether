@@ -35,6 +35,8 @@ pub(crate) struct AdminProviderKeyCreateRequest {
     #[serde(default)]
     pub(crate) max_probe_interval_minutes: Option<i32>,
     #[serde(default)]
+    pub(crate) weekly_quota_reserve_percent: Option<i32>,
+    #[serde(default)]
     pub(crate) note: Option<String>,
     #[serde(default)]
     pub(crate) auto_fetch_models: Option<bool>,
@@ -106,6 +108,8 @@ pub(crate) struct AdminProviderKeyUpdateRequest {
     pub(crate) cache_ttl_minutes: Option<i32>,
     #[serde(default)]
     pub(crate) max_probe_interval_minutes: Option<i32>,
+    #[serde(default)]
+    pub(crate) weekly_quota_reserve_percent: Option<i32>,
     #[serde(default)]
     pub(crate) is_active: Option<bool>,
     #[serde(default)]

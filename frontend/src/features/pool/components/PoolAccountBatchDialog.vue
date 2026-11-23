@@ -172,6 +172,31 @@
             />
           </div>
 
+          <div
+            v-if="isCodexProvider"
+            class="space-y-2 rounded-md border bg-background p-3"
+          >
+            <div class="flex min-h-6 items-center gap-2">
+              <Checkbox
+                :checked="settingsSelection.weekly_quota_reserve_percent"
+                @update:checked="settingsSelection.weekly_quota_reserve_percent = $event === true"
+              />
+              <Label class="text-xs">{{ t('ui.weeklyQuotaReservePercent') }}</Label>
+            </div>
+            <Input
+              :model-value="settingsDraft.weekly_quota_reserve_percent"
+              type="number"
+              min="0"
+              max="99"
+              class="h-9 tabular-nums"
+              :disabled="!settingsSelection.weekly_quota_reserve_percent"
+              @update:model-value="settingsDraft.weekly_quota_reserve_percent = parseNumberInput($event, { min: 0, max: 99 }) ?? 0"
+            />
+            <p class="text-[11px] text-muted-foreground">
+              {{ t('ui.weeklyQuotaReserveShortHint') }}
+            </p>
+          </div>
+
           <div class="space-y-2 rounded-md border bg-background p-3">
             <div class="flex min-h-6 items-center gap-2">
               <Checkbox
@@ -408,6 +433,9 @@ const dialogDescription = computed(() => {
   return name ? t('feedback.pool.batchDescriptionNamed', { name }) : t('feedback.pool.batchDescription')
 })
 
+const isCodexProvider = computed(() => (
+  String(props.providerType || '').trim().toLowerCase() === 'codex'
+))
 const selectedCount = computed(() => Math.max(0, Number(props.selectedCount || 0)))
 const selectAllFiltered = computed(() => props.selectAllFiltered)
 const settingsErrors = computed(() => validatePoolKeyBatchSettings(settingsSelection, settingsDraft))

@@ -32,6 +32,12 @@
         {{ accountQuotaText }}
       </div>
       <ResetCredits />
+      <div
+        v-if="weeklyReserveLabel"
+        class="text-[10px] leading-none text-amber-600 dark:text-amber-400 tabular-nums"
+      >
+        {{ weeklyReserveLabel }}
+      </div>
     </div>
     <div
       v-else-if="accountQuotaText || fallbackText"
@@ -63,6 +69,12 @@
           {{ accountQuotaText }}
         </div>
         <ResetCredits />
+        <div
+          v-if="weeklyReserveLabel"
+          class="text-[10px] leading-none text-amber-600 dark:text-amber-400 tabular-nums"
+        >
+          {{ weeklyReserveLabel }}
+        </div>
       </div>
       <QuotaRefreshButton v-if="refreshable" />
     </div>
@@ -128,6 +140,8 @@ const props = withDefaults(defineProps<{
   refreshLoading?: boolean
   /** 其他 Key 或页级额度刷新进行中时的互斥禁用。 */
   refreshDisabled?: boolean
+  /** Codex 账号级周限预留百分比（0 表示不生效）。 */
+  weeklyQuotaReservePercent?: number | null
 }>(), {
   accountQuotaText: null,
   quota: null,
@@ -142,6 +156,7 @@ const props = withDefaults(defineProps<{
   refreshable: false,
   refreshLoading: false,
   refreshDisabled: false,
+  weeklyQuotaReservePercent: 0,
 })
 
 /** 将重置与额度刷新动作交给页面级流程处理，展示组件不直接访问接口。 */
@@ -158,6 +173,12 @@ const supportsStructuredQuota = computed(() => isOfficialQuotaProviderType(
 const hasNumericOnlyItems = computed(() => (
   props.items.length > 0 && props.items.every(item => item.numericOnly)
 ))
+const weeklyReserveLabel = computed(() => {
+  const provider = String(props.quota?.provider_type || props.providerType || '').trim().toLowerCase()
+  const percent = Number(props.weeklyQuotaReservePercent ?? 0)
+  if (provider !== 'codex' || !Number.isFinite(percent) || percent <= 0) return null
+  return t('ui.weeklyQuotaReserveBadge', { percent: String(Math.floor(percent)) })
+})
 
 /** 单 Key 额度刷新入口；视觉与官方额度卡头部刷新一致，加载时图标旋转。 */
 const QuotaRefreshButton = defineComponent({

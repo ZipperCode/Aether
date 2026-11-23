@@ -358,6 +358,7 @@
                     :quota="getQuotaSnapshot(key)"
                     :provider-type="selectedProviderType"
                     :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
+                    :weekly-quota-reserve-percent="key.weekly_quota_reserve_percent ?? 0"
                     :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
                     :text-class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
                     :reset-credit-text="getCodexResetCreditCountText(key)"
@@ -636,6 +637,7 @@
                 :quota="getQuotaSnapshot(key)"
                 :provider-type="selectedProviderType"
                 :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
+                :weekly-quota-reserve-percent="key.weekly_quota_reserve_percent ?? 0"
                 :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
                 :text-class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
                 :reset-credit-text="getCodexResetCreditCountText(key)"
@@ -815,6 +817,7 @@
       :open="keyBatchEditDialogOpen"
       :provider-id="selectedProviderId"
       :provider-name="selectedProviderData?.name || ''"
+      :provider-type="selectedProviderType"
       :key-ids="keyBatchEditKeyIds"
       :available-api-formats="selectedProviderData?.api_formats || []"
       @close="closeKeyBatchEditDialog"
@@ -834,6 +837,7 @@
     <OAuthKeyEditDialog
       :open="oauthKeyEditDialogOpen"
       :editing-key="editingKey"
+      :provider-type="selectedProviderType"
       @close="closeOAuthEditDialog"
       @saved="handleDialogSaved"
     />
@@ -1186,6 +1190,7 @@ const poolKeyStatusFilterOptions: Array<{ value: PoolManagementViewState['status
   { value: 'expired', get label() { return t('ui.expired') } },
   { value: 'account_banned', get label() { return t('ui.accountBanned') } },
   { value: 'quota_exhausted', get label() { return t('ui.quotaExhausted') } },
+  { value: 'quota_reserved', get label() { return t('ui.quotaReserved') } },
   { value: 'account_forbidden', get label() { return t('ui.accessRestricted') } },
   { value: 'account_disabled', get label() { return t('ui.accountDisabled') } },
   { value: 'workspace_deactivated', get label() { return t('ui.workspaceDisabled') } },
@@ -2980,6 +2985,7 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     capabilities: key.capabilities ?? null,
     cache_ttl_minutes: key.cache_ttl_minutes ?? 5,
     max_probe_interval_minutes: key.max_probe_interval_minutes ?? 32,
+    weekly_quota_reserve_percent: key.weekly_quota_reserve_percent ?? 0,
     health_score: key.health_score ?? 1,
     circuit_breaker_open: key.circuit_breaker_open ?? false,
     consecutive_failures: 0,

@@ -739,12 +739,17 @@ fn candidate_account_quota_exhausted(
                 .get(candidate.provider_id.as_str())
                 .copied()
                 .unwrap_or_default();
-            let reserve_reached = pool_state.reserve_minimum_quota
-                && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
+            let reserve_reached =
+                admin_provider_pool_pure::admin_pool_key_weekly_quota_reserve_reached(
                     key,
                     candidate.provider_type.as_str(),
                     Some(candidate.selected_provider_model_name.as_str()),
-                );
+                ) || (pool_state.reserve_minimum_quota
+                    && admin_provider_pool_pure::admin_pool_key_minimum_quota_reached(
+                        key,
+                        candidate.provider_type.as_str(),
+                        Some(candidate.selected_provider_model_name.as_str()),
+                    ));
             hard_blocked
                 || reserve_reached
                 || (pool_state.skip_exhausted_accounts && account_exhausted)
@@ -1764,6 +1769,82 @@ mod reserve_minimum_quota_tests {
                     Some(reserve_enabled && used_percent >= 99.0)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn account_weekly_quota_reserve_blocks_only_weekly_window_and_respects_zero() {
+        let candidate = SchedulerMinimalCandidateSelectionCandidate {
+            provider_id: "provider-codex".to_string(),
+            provider_name: "codex".to_string(),
+            provider_type: "codex".to_string(),
+            provider_priority: 0,
+            endpoint_id: "endpoint-codex".to_string(),
+            endpoint_api_format: "openai:responses".to_string(),
+            key_id: "key-codex".to_string(),
+            key_name: "codex".to_string(),
+            key_auth_type: "oauth".to_string(),
+            key_internal_priority: 0,
+            key_global_priority_for_format: None,
+            key_capabilities: None,
+            routing_facts: Default::default(),
+            model_id: "model-codex".to_string(),
+            global_model_id: "global-model-codex".to_string(),
+            global_model_name: "gpt-5".to_string(),
+            selected_provider_model_name: "gpt-5".to_string(),
+            supports_streaming: true,
+            mapping_matched_model: None,
+        };
+        let mut key = StoredProviderCatalogKey::new(
+            candidate.key_id.clone(),
+            candidate.provider_id.clone(),
+            "codex".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+
+        for (reserve_percent, primary_used, weekly_used, expected_blocked) in [
+            (0, 99.0, 95.0, false),
+            (10, 99.0, 50.0, false),
+            (10, 20.0, 89.9, false),
+            (10, 20.0, 90.0, true),
+            (10, 20.0, 95.0, true),
+            (5, 20.0, 90.0, false),
+        ] {
+            key.weekly_quota_reserve_percent = reserve_percent;
+            key.upstream_metadata = Some(json!({
+                "codex": {
+                    "primary_used_percent": primary_used,
+                    "primary_window_minutes": 300,
+                    "secondary_used_percent": weekly_used,
+                    "secondary_window_minutes": 10080,
+                    "secondary_reset_at": 4_102_444_800u64
+                }
+            }));
+            let exhausted = read_key_account_quota_exhaustion_map(
+                std::slice::from_ref(&candidate),
+                &BTreeMap::from([(key.id.clone(), key.clone())]),
+                &BTreeMap::from([(
+                    candidate.provider_id.clone(),
+                    ProviderPoolState {
+                        pool_enabled: true,
+                        reserve_minimum_quota: false,
+                        skip_exhausted_accounts: false,
+                    },
+                )]),
+            );
+            assert_eq!(
+                exhausted
+                    .get(key.id.as_str())
+                    .and_then(|models| {
+                        models.get(candidate.selected_provider_model_name.as_str())
+                    })
+                    .copied(),
+                Some(expected_blocked),
+                "reserve={reserve_percent}, primary={primary_used}, weekly={weekly_used}"
+            );
         }
     }
 }

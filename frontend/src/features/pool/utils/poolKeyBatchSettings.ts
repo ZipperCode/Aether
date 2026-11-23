@@ -7,6 +7,7 @@ export type PoolKeyBatchSettingField =
   | 'concurrent_limit'
   | 'cache_ttl_minutes'
   | 'max_probe_interval_minutes'
+  | 'weekly_quota_reserve_percent'
   | 'is_active'
   | 'note'
   | 'proxy_node_id'
@@ -19,6 +20,7 @@ export interface PoolKeyBatchSettingsDraft {
   concurrent_limit: number | null
   cache_ttl_minutes: number
   max_probe_interval_minutes: number
+  weekly_quota_reserve_percent: number
   is_active: boolean
   note: string
   proxy_mode: 'set' | 'clear'
@@ -32,6 +34,7 @@ export function createPoolKeyBatchSettingSelection(): PoolKeyBatchSettingSelecti
     concurrent_limit: false,
     cache_ttl_minutes: false,
     max_probe_interval_minutes: false,
+    weekly_quota_reserve_percent: false,
     is_active: false,
     note: false,
     proxy_node_id: false,
@@ -45,6 +48,7 @@ export function createPoolKeyBatchSettingsDraft(): PoolKeyBatchSettingsDraft {
     concurrent_limit: null,
     cache_ttl_minutes: 5,
     max_probe_interval_minutes: 32,
+    weekly_quota_reserve_percent: 0,
     is_active: true,
     note: '',
     proxy_mode: 'set',
@@ -83,6 +87,13 @@ export function validatePoolKeyBatchSettings(
   )) {
     errors.push(translate('ui.circuitBreakerProbeIntervalMustBeBetween0And32'))
   }
+  if (selection.weekly_quota_reserve_percent && (
+    !Number.isInteger(draft.weekly_quota_reserve_percent)
+    || draft.weekly_quota_reserve_percent < 0
+    || draft.weekly_quota_reserve_percent > 99
+  )) {
+    errors.push(translate('ui.weeklyQuotaReserveRangeError'))
+  }
   if (selection.proxy_node_id && draft.proxy_mode === 'set' && !draft.proxy_node_id.trim()) {
     errors.push(translate('ui.selectAProxyNodeToAssign57701f8'))
   }
@@ -100,6 +111,9 @@ export function buildPoolKeySettingsPatch(
   if (selection.cache_ttl_minutes) patch.cache_ttl_minutes = draft.cache_ttl_minutes
   if (selection.max_probe_interval_minutes) {
     patch.max_probe_interval_minutes = draft.max_probe_interval_minutes
+  }
+  if (selection.weekly_quota_reserve_percent) {
+    patch.weekly_quota_reserve_percent = draft.weekly_quota_reserve_percent
   }
   if (selection.is_active) patch.is_active = draft.is_active
   if (selection.note) patch.note = draft.note.trim() || null

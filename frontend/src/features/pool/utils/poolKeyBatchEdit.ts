@@ -16,6 +16,8 @@ export interface PoolKeyBatchEditState {
   cacheTtlMinutes: string
   applyProbeInterval: boolean
   maxProbeIntervalMinutes: string
+  applyWeeklyQuotaReserve: boolean
+  weeklyQuotaReservePercent: string
   applyNote: boolean
   note: string
   applyAutoFetchModels: boolean
@@ -115,6 +117,13 @@ export function buildPoolKeyBatchUpdatePatch(
     if (parsed.error) return { patch: null, fieldLabels, error: parsed.error }
     patch.max_probe_interval_minutes = parsed.value as number
     fieldLabels.push(translate('ui.circuitProbe'))
+  }
+
+  if (state.applyWeeklyQuotaReserve) {
+    const parsed = parseIntegerField(state.weeklyQuotaReservePercent ?? '', translate('ui.weeklyQuotaReserve'), 0, 99)
+    if (parsed.error) return { patch: null, fieldLabels, error: parsed.error }
+    patch.weekly_quota_reserve_percent = parsed.value as number
+    fieldLabels.push(translate('ui.weeklyQuotaReserve'))
   }
 
   if (state.applyNote) {

@@ -170,6 +170,7 @@ SELECT
   EXTRACT(EPOCH FROM expires_at)::bigint AS expires_at_unix_secs,
   cache_ttl_minutes,
   max_probe_interval_minutes,
+  weekly_quota_reserve_percent,
   proxy,
   fingerprint,
   rpm_limit,
@@ -229,6 +230,7 @@ SELECT
   EXTRACT(EPOCH FROM expires_at)::bigint AS expires_at_unix_secs,
   cache_ttl_minutes,
   max_probe_interval_minutes,
+  weekly_quota_reserve_percent,
   proxy,
   fingerprint,
   rpm_limit,
@@ -291,6 +293,7 @@ SELECT
   NULL::bigint AS expires_at_unix_secs,
   NULL::integer AS cache_ttl_minutes,
   NULL::integer AS max_probe_interval_minutes,
+  NULL::integer AS weekly_quota_reserve_percent,
   NULL::jsonb AS proxy,
   NULL::jsonb AS fingerprint,
   NULL::integer AS rpm_limit,
@@ -420,7 +423,8 @@ SET
     ELSE TO_TIMESTAMP($26::double precision)
   END,
   auth_type_by_format = $27,
-  allow_auth_channel_mismatch_formats = $28
+  allow_auth_channel_mismatch_formats = $28,
+  weekly_quota_reserve_percent = $29
 WHERE id = $1
   AND provider_id = $2
   AND auth_type = $4
@@ -604,6 +608,7 @@ fn key_update_query(key: &StoredProviderCatalogKey) -> Query<'_, Postgres, PgArg
         .bind(key.updated_at_unix_secs.map(|value| value as f64))
         .bind(&key.auth_type_by_format)
         .bind(&key.allow_auth_channel_mismatch_formats)
+        .bind(key.weekly_quota_reserve_percent)
 }
 
 fn push_admin_key_assignments<'args>(
@@ -667,7 +672,9 @@ fn push_admin_key_assignments<'args>(
         .push("::double precision) END, auth_type_by_format = ")
         .push_bind(&key.auth_type_by_format)
         .push(", allow_auth_channel_mismatch_formats = ")
-        .push_bind(&key.allow_auth_channel_mismatch_formats);
+        .push_bind(&key.allow_auth_channel_mismatch_formats)
+        .push(", weekly_quota_reserve_percent = ")
+        .push_bind(key.weekly_quota_reserve_percent);
 }
 
 fn validate_admin_key_cas_update(
@@ -1848,7 +1855,8 @@ INSERT INTO provider_api_keys (
   is_active,
   created_at,
   updated_at,
-  allow_auth_channel_mismatch_formats
+  allow_auth_channel_mismatch_formats,
+  weekly_quota_reserve_percent
 ) VALUES (
   $1,
   $2,
@@ -1926,7 +1934,8 @@ INSERT INTO provider_api_keys (
     WHEN $52::double precision IS NULL THEN NOW()
     ELSE TO_TIMESTAMP($52::double precision)
   END,
-  $53
+  $53,
+  $54
 )
 "#,
         )
@@ -2001,6 +2010,7 @@ INSERT INTO provider_api_keys (
         .bind(key.created_at_unix_ms.map(|value| value as f64))
         .bind(key.updated_at_unix_secs.map(|value| value as f64))
         .bind(&key.allow_auth_channel_mismatch_formats)
+        .bind(key.weekly_quota_reserve_percent)
         .execute(&self.pool)
         .await
         .map_postgres_err()?;
@@ -4052,6 +4062,7 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
         key.internal_priority = row.try_get("internal_priority").unwrap_or(50);
         key.cache_ttl_minutes = row.try_get("cache_ttl_minutes").unwrap_or(5);
         key.max_probe_interval_minutes = row.try_get("max_probe_interval_minutes").unwrap_or(32);
+        key.weekly_quota_reserve_percent = row.try_get("weekly_quota_reserve_percent").unwrap_or(0);
         key.last_429_type = row.try_get("last_429_type").ok();
         key.utilization_samples = row.try_get("utilization_samples").ok();
         key.last_probe_increase_at_unix_secs = last_probe_increase_at_unix_secs;
